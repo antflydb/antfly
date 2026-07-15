@@ -23,7 +23,7 @@
       "tokenized_test": "sql adapter parsed sql rejects malformed generated graph and antfly source metadata",
       "valid_sql": "MATCH (doc)-[:cites]->(target) WITH GRAPH docs_edge_graph ON usage_records START 'doc:root' RETURN target",
       "malformed_sql": "MATCH (doc)-[:cites]-> RETURN target",
-      "contextual_identifier_sql": "SELECT return FROM usage_records"
+      "contextual_identifier_sql": "SELECT type FROM usage_records"
     }
   ]
 }

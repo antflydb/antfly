@@ -24,6 +24,15 @@ const types = @import("types.zig");
 
 const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
 
+fn bytesToHexAlloc(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const out = try alloc.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |byte, idx| {
+        out[idx * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        out[idx * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+    return out;
+}
+
 test "db graph runtime index materializes relation asset artifacts into graph edge artifacts" {
     const alloc = std.testing.allocator;
 
@@ -68,6 +77,61 @@ test "db graph runtime index materializes relation asset artifacts into graph ed
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("doc:b", edges[0].target);
     try std.testing.expectApproxEqAbs(@as(f64, 0.75), edges[0].weight, 0.0001);
+}
+
+test "db graph index materializes unit-derived chunk artifacts into graph edge artifacts" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 64,
+    });
+    try db.addIndex(.{
+        .name = "chunk_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"document_chunks_v1","format":"extraction_relation"},
+        \\  "nodes":{"source":"{{ _artifact.value._parent_unit_key }}","target":"{{ _artifact.value.text }}"},
+        \\  "edge":{"type":"mentions","metadata":{"unit":"{{ _artifact.value._parent_unit_id }}","artifact":"{{ _artifact.name }}"}}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,ZG9jOmI=\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "document:000001");
+    defer alloc.free(unit_key);
+    const edges = try db.getEdges(alloc, "chunk_graph", unit_key, "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("doc:b", edges[0].target);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"unit\":\"document:000001\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"artifact\":\"document_chunks_v1\"") != null);
 }
 
 test "db graph runtime relation artifact materializer uses mapping templates" {
@@ -650,6 +714,144 @@ test "db graph runtime edge artifact replay catches up after reopen" {
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("doc:b", edges[0].target);
     try std.testing.expectApproxEqAbs(@as(f64, 0.8), edges[0].weight, 0.0001);
+}
+
+test "db artifact repair records corrupt graph edge artifacts during replay" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var appended_sequence: u64 = 0;
+    const artifact_key = blk: {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json =
+            \\{
+            \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+            \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+            \\}
+            ,
+        });
+
+        const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
+        errdefer alloc.free(key);
+        var ctx = db.batchContext();
+        const sequence = db.core.store.reserveNextReplaySequence(1);
+        const replay_payload = try DB.derivedAsyncEncodeChangeRecordPayloadForContext(&ctx, .{
+            .changed_artifact_keys = &.{key},
+        }, sequence);
+        defer alloc.free(replay_payload);
+        try db.core.store.putBatchWithReplay(null, &.{
+            .{ .key = key, .value = "bad-graph-artifact" },
+        }, &.{}, .{
+            .sequence = sequence,
+            .payload = replay_payload,
+        });
+        appended_sequence = sequence;
+        break :blk key;
+    };
+    defer alloc.free(artifact_key);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const issues = try reopened.listArtifactRepairIssues(alloc, .graph, "relations_graph", 0);
+    defer types.freeArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expectEqual(.graph, issues[0].artifact_kind);
+    try std.testing.expectEqual(.corrupt_artifact, issues[0].reason);
+    try std.testing.expectEqualStrings("doc:a", issues[0].doc_key);
+    try std.testing.expectEqualStrings("mentions:doc:b", issues[0].artifact_name);
+    const artifact_key_hex = try bytesToHexAlloc(alloc, artifact_key);
+    defer alloc.free(artifact_key_hex);
+    try std.testing.expectEqualStrings(artifact_key_hex, issues[0].artifact_key);
+
+    const raw_artifact = try reopened.core.store.get(alloc, artifact_key);
+    defer alloc.free(raw_artifact);
+    try std.testing.expectEqualStrings("bad-graph-artifact", raw_artifact);
+
+    const graph_applied = try reopened.core.loadAppliedSequence(alloc, "relations_graph");
+    try std.testing.expectEqual(@as(u64, 0), graph_applied);
+    try std.testing.expect(appended_sequence > graph_applied);
+}
+
+test "db artifact repair records corrupt graph source asset artifacts during replay" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var appended_sequence: u64 = 0;
+    const artifact_key = blk: {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json =
+            \\{
+            \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+            \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+            \\}
+            ,
+        });
+
+        const key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+        errdefer alloc.free(key);
+        var ctx = db.batchContext();
+        const sequence = db.core.store.reserveNextReplaySequence(1);
+        const replay_payload = try DB.derivedAsyncEncodeChangeRecordPayloadForContext(&ctx, .{
+            .changed_artifact_keys = &.{key},
+        }, sequence);
+        defer alloc.free(replay_payload);
+        try db.core.store.putBatchWithReplay(null, &.{
+            .{ .key = key, .value = "bad-json" },
+        }, &.{}, .{
+            .sequence = sequence,
+            .payload = replay_payload,
+        });
+        appended_sequence = sequence;
+        break :blk key;
+    };
+    defer alloc.free(artifact_key);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const issues = try reopened.listArtifactRepairIssues(alloc, .asset, "relations_graph", 0);
+    defer types.freeArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expectEqual(.asset, issues[0].artifact_kind);
+    try std.testing.expectEqual(.corrupt_artifact, issues[0].reason);
+    try std.testing.expectEqualStrings("doc:a", issues[0].doc_key);
+    try std.testing.expectEqualStrings("relations_v1", issues[0].artifact_name);
+    const artifact_key_hex = try bytesToHexAlloc(alloc, artifact_key);
+    defer alloc.free(artifact_key_hex);
+    try std.testing.expectEqualStrings(artifact_key_hex, issues[0].artifact_key);
+
+    const raw_artifact = try reopened.core.store.get(alloc, artifact_key);
+    defer alloc.free(raw_artifact);
+    try std.testing.expectEqualStrings("bad-json", raw_artifact);
+
+    const graph_applied = try reopened.core.loadAppliedSequence(alloc, "relations_graph");
+    try std.testing.expectEqual(@as(u64, 0), graph_applied);
+    try std.testing.expect(appended_sequence > graph_applied);
 }
 
 test "db graph runtime helpers expose edges neighbors and shortest path" {

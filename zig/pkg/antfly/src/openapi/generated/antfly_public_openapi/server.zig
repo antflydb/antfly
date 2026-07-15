@@ -8,164 +8,6 @@ const antfly_indexes_openapi = @import("antfly_indexes_openapi");
 const antfly_schema_openapi = @import("antfly_schema_openapi");
 
 /// --- Extractors (framework-agnostic) ---
-pub const ListConnectionsParams = struct {
-    /// Comma-separated list of connection kinds to include (e.g. "inference,external_io,cdc"). Defaults to all kinds. This filters by the response "kind" field.
-    types: ?[]const u8 = null,
-    /// Comma-separated list of expansions. Supported value: "models" — live-query each inference provider's model listing API.
-    include: ?[]const u8 = null,
-    /// Set to "true" to bypass the short server-side cache for live provider model listings and probes. This does not force a node config or metadata reload.
-    refresh: ?[]const u8 = null,
-};
-
-/// Store a secret
-pub const PutSecretPathParams = struct {
-    /// Secret key name (e.g., openai.api_key)
-    key: []const u8,
-};
-
-/// Parse the JSON request body for putSecret.
-pub fn parsePutSecretBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SecretWriteRequest) {
-    return std.json.parseFromSlice(types.SecretWriteRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Delete a secret
-pub const DeleteSecretPathParams = struct {
-    /// Secret key name (e.g., openai.api_key)
-    key: []const u8,
-};
-
-/// Parse the JSON request body for multiBatchWrite.
-pub fn parseMultiBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.MultiBatchRequest) {
-    return std.json.parseFromSlice(types.MultiBatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Execute a graph metric operational action
-pub const ExecuteGraphMetricActionPathParams = struct {
-    /// Name of the table
-    table_name: []const u8,
-    /// Name of the graph index
-    index_name: []const u8,
-    /// Name of the configured graph metric
-    metric_name: []const u8,
-    /// Operational action to apply to the graph metric materialization
-    action: []const u8,
-};
-
-/// Parse the JSON request body for commitTransaction.
-pub fn parseCommitTransactionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionCommitRequest) {
-    return std.json.parseFromSlice(types.TransactionCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-pub const CleanupTransactionSessionsParams = struct {
-    cutoff_ns: ?[]const u8 = null,
-};
-
-/// Parse the JSON request body for beginTransaction.
-pub fn parseBeginTransactionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionBeginRequest) {
-    return std.json.parseFromSlice(types.TransactionBeginRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Get transaction session details
-pub const GetTransactionSessionPathParams = struct {
-    transaction_id: []const u8,
-};
-
-/// Stage a transaction commit request
-pub const StageTransactionSessionPathParams = struct {
-    transaction_id: []const u8,
-};
-
-/// Parse the JSON request body for stageTransactionSession.
-pub fn parseStageTransactionSessionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionCommitRequest) {
-    return std.json.parseFromSlice(types.TransactionCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Stage a transaction read version
-pub const StageTransactionReadPathParams = struct {
-    transaction_id: []const u8,
-};
-
-/// Parse the JSON request body for stageTransactionRead.
-pub fn parseStageTransactionReadBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionStageReadRequest) {
-    return std.json.parseFromSlice(types.TransactionStageReadRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Stage a transaction write
-pub const StageTransactionWritePathParams = struct {
-    transaction_id: []const u8,
-};
-
-/// Parse the JSON request body for stageTransactionWrite.
-pub fn parseStageTransactionWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionStageWriteRequest) {
-    return std.json.parseFromSlice(types.TransactionStageWriteRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Stage a transaction delete
-pub const StageTransactionDeletePathParams = struct {
-    transaction_id: []const u8,
-};
-
-/// Parse the JSON request body for stageTransactionDelete.
-pub fn parseStageTransactionDeleteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionStageDeleteRequest) {
-    return std.json.parseFromSlice(types.TransactionStageDeleteRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Create a transaction savepoint
-pub const CreateTransactionSavepointPathParams = struct {
-    transaction_id: []const u8,
-};
-
-/// Roll back a transaction session to a savepoint
-pub const RollbackTransactionSavepointPathParams = struct {
-    transaction_id: []const u8,
-    savepoint_id: []const u8,
-};
-
-/// Commit a transaction session
-pub const CommitTransactionSessionPathParams = struct {
-    transaction_id: []const u8,
-};
-
-/// Parse the JSON request body for commitTransactionSession.
-pub fn parseCommitTransactionSessionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionCommitRequest) {
-    return std.json.parseFromSlice(types.TransactionCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Abort a transaction session
-pub const AbortTransactionSessionPathParams = struct {
-    transaction_id: []const u8,
-};
-
-/// Parse the JSON request body for backup.
-pub fn parseBackupBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ClusterBackupRequest) {
-    return std.json.parseFromSlice(types.ClusterBackupRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for restore.
-pub fn parseRestoreBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ClusterRestoreRequest) {
-    return std.json.parseFromSlice(types.ClusterRestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-pub const ListBackupsParams = struct {
-    /// Storage location to search for backups. - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup`
-    location: []const u8,
-};
-
-/// Parse the JSON request body for executeSql.
-pub fn parseExecuteSqlBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SqlStatementRequest) {
-    return std.json.parseFromSlice(types.SqlStatementRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for globalQuery.
-pub fn parseGlobalQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.QueryRequest) {
-    return std.json.parseFromSlice(types.QueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for evaluate.
-pub fn parseEvaluateBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_eval_openapi.EvalRequest) {
-    return std.json.parseFromSlice(antfly_eval_openapi.EvalRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
 /// Parse the JSON request body for queryBuilderAgent.
 pub fn parseQueryBuilderAgentBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.QueryBuilderRequest) {
     return std.json.parseFromSlice(types.QueryBuilderRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -176,27 +18,215 @@ pub fn parseRetrievalAgentBody(allocator: std.mem.Allocator, body: []const u8) !
     return std.json.parseFromSlice(types.RetrievalAgentRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Get tablespace
-pub const GetTablespacePathParams = struct {
-    /// Tablespace name
-    tablespace_name: []const u8,
+/// List row filters for an auth subject
+pub const ListSubjectRowFiltersPathParams = struct {
+    /// Casbin subject name, such as role:tenant_reader or group:eng.
+    subject: []const u8,
 };
 
-/// Create tablespace
-pub const CreateTablespacePathParams = struct {
-    /// Tablespace name
-    tablespace_name: []const u8,
+/// Get row filter for an auth subject on a table
+pub const GetSubjectRowFilterPathParams = struct {
+    /// Casbin subject name, such as role:tenant_reader or group:eng.
+    subject: []const u8,
+    /// Table name (or '*' for all tables).
+    table: []const u8,
 };
 
-/// Parse the JSON request body for createTablespace.
-pub fn parseCreateTablespaceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CreateTablespaceRequest) {
-    return std.json.parseFromSlice(types.CreateTablespaceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+/// Set row filter for an auth subject on a table
+pub const SetSubjectRowFilterPathParams = struct {
+    /// Casbin subject name, such as role:tenant_reader or group:eng.
+    subject: []const u8,
+    /// Table name (or '*' for all tables).
+    table: []const u8,
+};
+
+/// Parse the JSON request body for setSubjectRowFilter.
+pub fn parseSetSubjectRowFilterBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.ArrayHashMap(std.json.Value)) {
+    return std.json.parseFromSlice(std.json.ArrayHashMap(std.json.Value), allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Drop tablespace
-pub const DropTablespacePathParams = struct {
-    /// Tablespace name
-    tablespace_name: []const u8,
+/// Remove row filter for an auth subject on a table
+pub const RemoveSubjectRowFilterPathParams = struct {
+    /// Casbin subject name, such as role:tenant_reader or group:eng.
+    subject: []const u8,
+    /// Table name (or '*' for all tables).
+    table: []const u8,
+};
+
+/// Get user details
+pub const GetUserByNamePathParams = struct {
+    /// The username.
+    user_name: []const u8,
+};
+
+/// Create a new user
+pub const CreateUserPathParams = struct {
+    /// The username.
+    user_name: []const u8,
+};
+
+/// Parse the JSON request body for createUser.
+pub fn parseCreateUserBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CreateUserRequest) {
+    return std.json.parseFromSlice(types.CreateUserRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Delete a user
+pub const DeleteUserPathParams = struct {
+    /// The username.
+    user_name: []const u8,
+};
+
+/// List API keys for a user
+pub const ListApiKeysPathParams = struct {
+    /// The username.
+    user_name: []const u8,
+};
+
+/// Create a new API key
+pub const CreateApiKeyPathParams = struct {
+    /// The username.
+    user_name: []const u8,
+};
+
+/// Parse the JSON request body for createApiKey.
+pub fn parseCreateApiKeyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CreateApiKeyRequest) {
+    return std.json.parseFromSlice(types.CreateApiKeyRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Delete an API key
+pub const DeleteApiKeyPathParams = struct {
+    /// The username.
+    user_name: []const u8,
+    /// The API key ID.
+    key_id: []const u8,
+};
+
+/// Update user password
+pub const UpdateUserPasswordPathParams = struct {
+    /// The username.
+    user_name: []const u8,
+};
+
+/// Parse the JSON request body for updateUserPassword.
+pub fn parseUpdateUserPasswordBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.UpdatePasswordRequest) {
+    return std.json.parseFromSlice(types.UpdatePasswordRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Get user permissions
+pub const GetUserPermissionsPathParams = struct {
+    /// The username.
+    user_name: []const u8,
+};
+
+/// Add permission to user
+pub const AddPermissionToUserPathParams = struct {
+    /// The username.
+    user_name: []const u8,
+};
+
+/// Parse the JSON request body for addPermissionToUser.
+pub fn parseAddPermissionToUserBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.Permission) {
+    return std.json.parseFromSlice(types.Permission, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Remove permission from user
+pub const RemovePermissionFromUserPathParams = struct {
+    /// The username.
+    user_name: []const u8,
+};
+
+pub const RemovePermissionFromUserParams = struct {
+    /// The name of the resource for the permission to be removed.
+    resource: []const u8,
+    /// The type of the resource for the permission to be removed.
+    resource_type: []const u8,
+};
+
+/// List user roles
+pub const ListUserRolesPathParams = struct {
+    /// The username.
+    user_name: []const u8,
+};
+
+/// Add role to user
+pub const AddRoleToUserPathParams = struct {
+    /// The username.
+    user_name: []const u8,
+};
+
+/// Parse the JSON request body for addRoleToUser.
+pub fn parseAddRoleToUserBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RoleAssignment) {
+    return std.json.parseFromSlice(types.RoleAssignment, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Remove role from user
+pub const RemoveRoleFromUserPathParams = struct {
+    /// The username.
+    user_name: []const u8,
+};
+
+pub const RemoveRoleFromUserParams = struct {
+    /// Role or group subject to remove.
+    role: []const u8,
+};
+
+/// List row filters for a user
+pub const ListRowFiltersPathParams = struct {
+    /// The username.
+    user_name: []const u8,
+};
+
+/// Get row filter for a user on a table
+pub const GetRowFilterPathParams = struct {
+    /// The username.
+    user_name: []const u8,
+    /// Table name (or '*' for all tables).
+    table: []const u8,
+};
+
+/// Set row filter for a user on a table
+pub const SetRowFilterPathParams = struct {
+    /// The username.
+    user_name: []const u8,
+    /// Table name (or '*' for all tables).
+    table: []const u8,
+};
+
+/// Parse the JSON request body for setRowFilter.
+pub fn parseSetRowFilterBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.ArrayHashMap(std.json.Value)) {
+    return std.json.parseFromSlice(std.json.ArrayHashMap(std.json.Value), allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Remove row filter for a user on a table
+pub const RemoveRowFilterPathParams = struct {
+    /// The username.
+    user_name: []const u8,
+    /// Table name (or '*' for all tables).
+    table: []const u8,
+};
+
+/// Parse the JSON request body for backup.
+pub fn parseBackupBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ClusterBackupRequest) {
+    return std.json.parseFromSlice(types.ClusterBackupRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+pub const ListBackupsParams = struct {
+    /// Storage location to search for backups. - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup`
+    location: []const u8,
+};
+
+/// Parse the JSON request body for multiBatchWrite.
+pub fn parseMultiBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.MultiBatchRequest) {
+    return std.json.parseFromSlice(types.MultiBatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+pub const ListConnectionsParams = struct {
+    /// Comma-separated list of connection kinds to include (e.g. "inference,external_io,cdc"). Defaults to all kinds. This filters by the response "kind" field.
+    types: ?[]const u8 = null,
+    /// Comma-separated list of expansions. Supported value: "models" — live-query each inference provider's model listing API.
+    include: ?[]const u8 = null,
+    /// Set to "true" to bypass the short server-side cache for live provider model listings and probes. This does not force a node config or metadata reload.
+    refresh: ?[]const u8 = null,
 };
 
 /// Get database
@@ -217,23 +247,6 @@ pub const DropDatabasePathParams = struct {
     database_name: []const u8,
 };
 
-/// Set database tablespace
-pub const SetDatabaseTablespacePathParams = struct {
-    /// Database name
-    database_name: []const u8,
-};
-
-/// Parse the JSON request body for setDatabaseTablespace.
-pub fn parseSetDatabaseTablespaceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CatalogTablespaceBindingRequest) {
-    return std.json.parseFromSlice(types.CatalogTablespaceBindingRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Clear database tablespace
-pub const ClearDatabaseTablespacePathParams = struct {
-    /// Database name
-    database_name: []const u8,
-};
-
 /// List namespaces
 pub const ListNamespacesPathParams = struct {
     /// Database name
@@ -250,27 +263,6 @@ pub const CreateNamespacePathParams = struct {
 
 /// Drop namespace
 pub const DropNamespacePathParams = struct {
-    /// Database name
-    database_name: []const u8,
-    /// Namespace name
-    namespace_name: []const u8,
-};
-
-/// Set namespace tablespace
-pub const SetNamespaceTablespacePathParams = struct {
-    /// Database name
-    database_name: []const u8,
-    /// Namespace name
-    namespace_name: []const u8,
-};
-
-/// Parse the JSON request body for setNamespaceTablespace.
-pub fn parseSetNamespaceTablespaceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CatalogTablespaceBindingRequest) {
-    return std.json.parseFromSlice(types.CatalogTablespaceBindingRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Clear namespace tablespace
-pub const ClearNamespaceTablespacePathParams = struct {
     /// Database name
     database_name: []const u8,
     /// Namespace name
@@ -325,78 +317,6 @@ pub const DropNamespaceTablePathParams = struct {
     table_name: []const u8,
 };
 
-/// Query an explicit namespace table
-pub const QueryNamespaceTablePathParams = struct {
-    /// Database name
-    database_name: []const u8,
-    /// Namespace name
-    namespace_name: []const u8,
-    /// Table name
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for queryNamespaceTable.
-pub fn parseQueryNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.QueryRequest) {
-    return std.json.parseFromSlice(types.QueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Perform batch inserts and deletes on an explicit namespace table
-pub const BatchNamespaceTablePathParams = struct {
-    /// Database name
-    database_name: []const u8,
-    /// Namespace name
-    namespace_name: []const u8,
-    /// Table name
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for batchNamespaceTable.
-pub fn parseBatchNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BatchRequest) {
-    return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Perform structured relational row writes on an explicit namespace table
-pub const RowsBatchNamespaceTablePathParams = struct {
-    /// Database name
-    database_name: []const u8,
-    /// Namespace name
-    namespace_name: []const u8,
-    /// Table name
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for rowsBatchNamespaceTable.
-pub fn parseRowsBatchNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsBatchRequest) {
-    return std.json.parseFromSlice(types.RowsBatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Repair relational column-backed index entries for an explicit namespace table
-pub const RepairNamespaceTableRelationalColumnBackedIndexPathParams = struct {
-    /// Database name
-    database_name: []const u8,
-    /// Namespace name
-    namespace_name: []const u8,
-    /// Table name
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for repairNamespaceTableRelationalColumnBackedIndex.
-pub fn parseRepairNamespaceTableRelationalColumnBackedIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalColumnBackedIndexRepairRequest) {
-    return std.json.parseFromSlice(types.RelationalColumnBackedIndexRepairRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Get relational index repair job status for an explicit namespace table
-pub const GetNamespaceTableRelationalIndexRepairJobPathParams = struct {
-    /// Database name
-    database_name: []const u8,
-    /// Namespace name
-    namespace_name: []const u8,
-    /// Table name
-    table_name: []const u8,
-    /// Durable relational index repair job identifier.
-    job_id: []const u8,
-};
-
 /// Backup an explicit namespace table
 pub const BackupNamespaceTablePathParams = struct {
     /// Database name
@@ -412,8 +332,8 @@ pub fn parseBackupNamespaceTableBody(allocator: std.mem.Allocator, body: []const
     return std.json.parseFromSlice(types.BackupRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Restore an explicit namespace table from backup
-pub const RestoreNamespaceTablePathParams = struct {
+/// Perform batch inserts and deletes on an explicit namespace table
+pub const BatchNamespaceTablePathParams = struct {
     /// Database name
     database_name: []const u8,
     /// Namespace name
@@ -422,9 +342,9 @@ pub const RestoreNamespaceTablePathParams = struct {
     table_name: []const u8,
 };
 
-/// Parse the JSON request body for restoreNamespaceTable.
-pub fn parseRestoreNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RestoreRequest) {
-    return std.json.parseFromSlice(types.RestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
+/// Parse the JSON request body for batchNamespaceTable.
+pub fn parseBatchNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BatchRequest) {
+    return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Retrieve a document by key from an explicit namespace table
@@ -495,6 +415,153 @@ pub const DropNamespaceTableIndexPathParams = struct {
     index_name: []const u8,
 };
 
+/// Query an explicit namespace table
+pub const QueryNamespaceTablePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for queryNamespaceTable.
+pub fn parseQueryNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.QueryRequest) {
+    return std.json.parseFromSlice(types.QueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Repair relational column-backed index entries for an explicit namespace table
+pub const RepairNamespaceTableRelationalColumnBackedIndexPathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for repairNamespaceTableRelationalColumnBackedIndex.
+pub fn parseRepairNamespaceTableRelationalColumnBackedIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalColumnBackedIndexRepairRequest) {
+    return std.json.parseFromSlice(types.RelationalColumnBackedIndexRepairRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Get relational index repair job status for an explicit namespace table
+pub const GetNamespaceTableRelationalIndexRepairJobPathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+    /// Durable relational index repair job identifier.
+    job_id: []const u8,
+};
+
+/// Restore an explicit namespace table from backup
+pub const RestoreNamespaceTablePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for restoreNamespaceTable.
+pub fn parseRestoreNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RestoreRequest) {
+    return std.json.parseFromSlice(types.RestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Perform structured relational row writes on an explicit namespace table
+pub const RowsBatchNamespaceTablePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsBatchNamespaceTable.
+pub fn parseRowsBatchNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsBatchRequest) {
+    return std.json.parseFromSlice(types.RowsBatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Set namespace tablespace
+pub const SetNamespaceTablespacePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+};
+
+/// Parse the JSON request body for setNamespaceTablespace.
+pub fn parseSetNamespaceTablespaceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CatalogTablespaceBindingRequest) {
+    return std.json.parseFromSlice(types.CatalogTablespaceBindingRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Clear namespace tablespace
+pub const ClearNamespaceTablespacePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+};
+
+/// Set database tablespace
+pub const SetDatabaseTablespacePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+};
+
+/// Parse the JSON request body for setDatabaseTablespace.
+pub fn parseSetDatabaseTablespaceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CatalogTablespaceBindingRequest) {
+    return std.json.parseFromSlice(types.CatalogTablespaceBindingRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Clear database tablespace
+pub const ClearDatabaseTablespacePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+};
+
+/// Parse the JSON request body for executeSql.
+pub fn parseExecuteSqlBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SqlStatementRequest) {
+    return std.json.parseFromSlice(types.SqlStatementRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for evaluate.
+pub fn parseEvaluateBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_eval_openapi.EvalRequest) {
+    return std.json.parseFromSlice(antfly_eval_openapi.EvalRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for globalQuery.
+pub fn parseGlobalQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.QueryRequest) {
+    return std.json.parseFromSlice(types.QueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for restore.
+pub fn parseRestoreBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ClusterRestoreRequest) {
+    return std.json.parseFromSlice(types.ClusterRestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Store a secret
+pub const PutSecretPathParams = struct {
+    /// Secret key name (e.g., openai.api_key)
+    key: []const u8,
+};
+
+/// Parse the JSON request body for putSecret.
+pub fn parsePutSecretBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SecretWriteRequest) {
+    return std.json.parseFromSlice(types.SecretWriteRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Delete a secret
+pub const DeleteSecretPathParams = struct {
+    /// Secret key name (e.g., openai.api_key)
+    key: []const u8,
+};
+
 pub const ListTablesParams = struct {
     /// Filter tables by name prefix (e.g., "prod_")
     prefix: ?[]const u8 = null,
@@ -525,247 +592,11 @@ pub const DropTablePathParams = struct {
     table_name: []const u8,
 };
 
-/// Query a specific table
-pub const QueryTablePathParams = struct {
-    /// Name of the table to query
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for queryTable.
-pub fn parseQueryTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.QueryRequest) {
-    return std.json.parseFromSlice(types.QueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Perform batch inserts and deletes on a table
-pub const BatchWritePathParams = struct {
-    /// Name of the table for batch operation
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for batchWrite.
-pub fn parseBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BatchRequest) {
-    return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Perform structured relational row writes by row identity
-pub const RowsBatchWritePathParams = struct {
-    /// Name of the relational table
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for rowsBatchWrite.
-pub fn parseRowsBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsBatchRequest) {
-    return std.json.parseFromSlice(types.RowsBatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Repair relational column-backed index entries
-pub const RepairRelationalColumnBackedIndexPathParams = struct {
-    /// Name of the relational table
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for repairRelationalColumnBackedIndex.
-pub fn parseRepairRelationalColumnBackedIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalColumnBackedIndexRepairRequest) {
-    return std.json.parseFromSlice(types.RelationalColumnBackedIndexRepairRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Get relational index repair job status
-pub const GetRelationalIndexRepairJobPathParams = struct {
-    /// Name of the relational table
-    table_name: []const u8,
-    /// Durable relational index repair job identifier.
-    job_id: []const u8,
-};
-
-/// Stage typed relational update/delete operations from a claimed row source
-pub const RowsMutationSourcePathParams = struct {
-    /// Name of the relational table
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for rowsMutationSource.
-pub fn parseRowsMutationSourceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
-    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Lookup relational rows by structured row identity
-pub const RowsGetPathParams = struct {
-    /// Name of the relational table
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for rowsGet.
-pub fn parseRowsGetBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsGetRequest) {
-    return std.json.parseFromSlice(types.RowsGetRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Execute a typed relational row read plan
-pub const RowsPlanPathParams = struct {
-    /// Name of the relational table
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for rowsPlan.
-pub fn parseRowsPlanBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsPlanRequest) {
-    return std.json.parseFromSlice(types.RowsPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Execute a typed relational row query plan
-pub const RowsQueryPathParams = struct {
-    /// Name of the relational table
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for rowsQuery.
-pub fn parseRowsQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsQueryPlanRequest) {
-    return std.json.parseFromSlice(types.RowsQueryPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Execute a typed relational row aggregate plan
-pub const RowsAggregatePathParams = struct {
-    /// Name of the relational table
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for rowsAggregate.
-pub fn parseRowsAggregateBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsAggregatePlanRequest) {
-    return std.json.parseFromSlice(types.RowsAggregatePlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Execute a typed relational row window plan
-pub const RowsWindowPathParams = struct {
-    /// Name of the relational table
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for rowsWindow.
-pub fn parseRowsWindowBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsWindowPlanRequest) {
-    return std.json.parseFromSlice(types.RowsWindowPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Execute a typed relational row join plan
-pub const RowsJoinPathParams = struct {
-    /// Name of the relational table
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for rowsJoin.
-pub fn parseRowsJoinBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsJoinPlanRequest) {
-    return std.json.parseFromSlice(types.RowsJoinPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Execute a typed relational row lateral plan
-pub const RowsLateralPathParams = struct {
-    /// Name of the relational table
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for rowsLateral.
-pub fn parseRowsLateralBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsLateralPlanRequest) {
-    return std.json.parseFromSlice(types.RowsLateralPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
-pub const LinearMergePathParams = struct {
-    /// Name of the table
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for linearMerge.
-pub fn parseLinearMergeBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.LinearMergeRequest) {
-    return std.json.parseFromSlice(types.LinearMergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Backup a table
-pub const BackupTablePathParams = struct {
-    /// Name of the table to backup
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for backupTable.
-pub fn parseBackupTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BackupRequest) {
-    return std.json.parseFromSlice(types.BackupRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Restore a table from backup
-pub const RestoreTablePathParams = struct {
-    /// Name of the table to restore into
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for restoreTable.
-pub fn parseRestoreTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RestoreRequest) {
-    return std.json.parseFromSlice(types.RestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Update a table's schema
-pub const UpdateSchemaPathParams = struct {
-    /// Name of the table
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for updateSchema.
-pub fn parseUpdateSchemaBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_schema_openapi.TableSchema) {
-    return std.json.parseFromSlice(antfly_schema_openapi.TableSchema, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Scan keys in a table within a key range
-pub const ScanKeysPathParams = struct {
-    /// Name of the table
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for scanKeys.
-pub fn parseScanKeysBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ScanKeysRequest) {
-    return std.json.parseFromSlice(types.ScanKeysRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Retrieve a document by key
-pub const LookupKeyPathParams = struct {
-    /// Name of the table
-    table_name: []const u8,
-    /// Key of the document to retrieve
-    key: []const u8,
-};
-
-pub const LookupKeyParams = struct {
-    /// Comma-separated list of fields to include in the response. If not specified, returns the full document. Supports: - Simple fields: "title,author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings,_summaries,_chunks"
-    fields: ?[]const u8 = null,
-    /// Read consistency for the lookup. The default `read_index` routes to the primary for linearizable reads. `stale` allows a hot standby to serve the lookup at its safe-read LSN.
-    consistency: ?[]const u8 = null,
-};
-
-/// List derived document artifact manifests
-pub const ListDocumentArtifactManifestsPathParams = struct {
-    /// Name of the table
-    table_name: []const u8,
-    /// Percent-encoded source document key.
-    key: []const u8,
-};
-
-pub const ListDocumentArtifactManifestsParams = struct {
-    /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
-    detail: ?[]const u8 = null,
-};
-
 /// List table artifact enrichments
 pub const ListArtifactEnrichmentsPathParams = struct {
     /// Name of the table
     table_name: []const u8,
 };
-
-/// Reprocess a derived document artifact across a table range
-pub const ReprocessDocumentArtifactRangePathParams = struct {
-    /// Name of the table
-    table_name: []const u8,
-    /// Name of the derived document artifact.
-    artifact_name: []const u8,
-};
-
-/// Parse the JSON request body for reprocessDocumentArtifactRange.
-pub fn parseReprocessDocumentArtifactRangeBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.DocumentArtifactTableReprocessRequest) {
-    return std.json.parseFromSlice(types.DocumentArtifactTableReprocessRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
 
 /// Register or replace an artifact enrichment
 pub const PutArtifactEnrichmentPathParams = struct {
@@ -787,6 +618,19 @@ pub const DeleteArtifactEnrichmentPathParams = struct {
     /// Stable generated artifact name.
     artifact_name: []const u8,
 };
+
+/// Reprocess a derived document artifact across a table range
+pub const ReprocessDocumentArtifactRangePathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
+};
+
+/// Parse the JSON request body for reprocessDocumentArtifactRange.
+pub fn parseReprocessDocumentArtifactRangeBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.DocumentArtifactTableReprocessRequest) {
+    return std.json.parseFromSlice(types.DocumentArtifactTableReprocessRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
 
 /// Create a derived document artifact reprocess job
 pub const StartDocumentArtifactReprocessJobPathParams = struct {
@@ -829,6 +673,67 @@ pub const CancelDocumentArtifactReprocessJobPathParams = struct {
     artifact_name: []const u8,
     /// Reprocess job identifier.
     job_id: []const u8,
+};
+
+/// Backup a table
+pub const BackupTablePathParams = struct {
+    /// Name of the table to backup
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for backupTable.
+pub fn parseBackupTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BackupRequest) {
+    return std.json.parseFromSlice(types.BackupRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Perform batch inserts and deletes on a table
+pub const BatchWritePathParams = struct {
+    /// Name of the table for batch operation
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for batchWrite.
+pub fn parseBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BatchRequest) {
+    return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Scan documents in a table within a key range
+pub const ScanKeysPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for scanKeys.
+pub fn parseScanKeysBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ScanKeysRequest) {
+    return std.json.parseFromSlice(types.ScanKeysRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Retrieve a document by key
+pub const LookupKeyPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Key of the document to retrieve
+    key: []const u8,
+};
+
+pub const LookupKeyParams = struct {
+    /// Comma-separated list of fields to include in the response. If not specified, returns the full document. Supports: - Simple fields: "title,author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings,_summaries,_chunks"
+    fields: ?[]const u8 = null,
+    /// Read consistency for the lookup. The default `read_index` routes to the primary for linearizable reads. `stale` allows a hot standby to serve the lookup at its safe-read LSN.
+    consistency: ?[]const u8 = null,
+};
+
+/// List derived document artifact manifests
+pub const ListDocumentArtifactManifestsPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Percent-encoded source document key.
+    key: []const u8,
+};
+
+pub const ListDocumentArtifactManifestsParams = struct {
+    /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
+    detail: ?[]const u8 = null,
 };
 
 /// Inspect a derived document artifact manifest
@@ -891,192 +796,344 @@ pub const DropIndexPathParams = struct {
     index_name: []const u8,
 };
 
-/// Get user details
-pub const GetUserByNamePathParams = struct {
-    /// The username.
-    user_name: []const u8,
+/// Execute a graph metric operational action
+pub const ExecuteGraphMetricActionPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Name of the graph index
+    index_name: []const u8,
+    /// Name of the configured graph metric
+    metric_name: []const u8,
+    /// Operational action to apply to the graph metric materialization
+    action: []const u8,
 };
 
-/// Create a new user
-pub const CreateUserPathParams = struct {
-    /// The username.
-    user_name: []const u8,
+/// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
+pub const LinearMergePathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
 };
 
-/// Parse the JSON request body for createUser.
-pub fn parseCreateUserBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CreateUserRequest) {
-    return std.json.parseFromSlice(types.CreateUserRequest, allocator, body, .{ .ignore_unknown_fields = true });
+/// Parse the JSON request body for linearMerge.
+pub fn parseLinearMergeBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.LinearMergeRequest) {
+    return std.json.parseFromSlice(types.LinearMergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Delete a user
-pub const DeleteUserPathParams = struct {
-    /// The username.
-    user_name: []const u8,
+/// Query a specific table
+pub const QueryTablePathParams = struct {
+    /// Name of the table to query
+    table_name: []const u8,
 };
 
-/// Update user password
-pub const UpdateUserPasswordPathParams = struct {
-    /// The username.
-    user_name: []const u8,
-};
-
-/// Parse the JSON request body for updateUserPassword.
-pub fn parseUpdateUserPasswordBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.UpdatePasswordRequest) {
-    return std.json.parseFromSlice(types.UpdatePasswordRequest, allocator, body, .{ .ignore_unknown_fields = true });
+/// Parse the JSON request body for queryTable.
+pub fn parseQueryTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.QueryRequest) {
+    return std.json.parseFromSlice(types.QueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Get user permissions
-pub const GetUserPermissionsPathParams = struct {
-    /// The username.
-    user_name: []const u8,
+/// Repair relational column-backed index entries
+pub const RepairRelationalColumnBackedIndexPathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
 };
 
-/// Add permission to user
-pub const AddPermissionToUserPathParams = struct {
-    /// The username.
-    user_name: []const u8,
-};
-
-/// Parse the JSON request body for addPermissionToUser.
-pub fn parseAddPermissionToUserBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.Permission) {
-    return std.json.parseFromSlice(types.Permission, allocator, body, .{ .ignore_unknown_fields = true });
+/// Parse the JSON request body for repairRelationalColumnBackedIndex.
+pub fn parseRepairRelationalColumnBackedIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalColumnBackedIndexRepairRequest) {
+    return std.json.parseFromSlice(types.RelationalColumnBackedIndexRepairRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Remove permission from user
-pub const RemovePermissionFromUserPathParams = struct {
-    /// The username.
-    user_name: []const u8,
+/// Get relational index repair job status
+pub const GetRelationalIndexRepairJobPathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+    /// Durable relational index repair job identifier.
+    job_id: []const u8,
 };
 
-pub const RemovePermissionFromUserParams = struct {
-    /// The name of the resource for the permission to be removed.
-    resource: []const u8,
-    /// The type of the resource for the permission to be removed.
-    resource_type: []const u8,
+/// List table repair issues
+pub const ListTableRepairIssuesPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
 };
 
-/// List row filters for a user
-pub const ListRowFiltersPathParams = struct {
-    /// The username.
-    user_name: []const u8,
-};
-
-/// List user roles
-pub const ListUserRolesPathParams = struct {
-    /// The username.
-    user_name: []const u8,
-};
-
-/// Add role to user
-pub const AddRoleToUserPathParams = struct {
-    /// The username.
-    user_name: []const u8,
-};
-
-/// Parse the JSON request body for addRoleToUser.
-pub fn parseAddRoleToUserBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RoleAssignment) {
-    return std.json.parseFromSlice(types.RoleAssignment, allocator, body, .{ .ignore_unknown_fields = true });
+/// Parse the JSON request body for listTableRepairIssues.
+pub fn parseListTableRepairIssuesBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RepairIssueListRequest) {
+    return std.json.parseFromSlice(types.RepairIssueListRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Remove role from user
-pub const RemoveRoleFromUserPathParams = struct {
-    /// The username.
-    user_name: []const u8,
+/// Start a durable table repair job
+pub const StartTableRepairJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
 };
 
-pub const RemoveRoleFromUserParams = struct {
-    /// Role or group subject to remove.
-    role: []const u8,
-};
-
-/// List row filters for an auth subject
-pub const ListSubjectRowFiltersPathParams = struct {
-    /// Casbin subject name, such as role:tenant_reader or group:eng.
-    subject: []const u8,
-};
-
-/// Get row filter for an auth subject on a table
-pub const GetSubjectRowFilterPathParams = struct {
-    /// Casbin subject name, such as role:tenant_reader or group:eng.
-    subject: []const u8,
-    /// Table name (or '*' for all tables).
-    table: []const u8,
-};
-
-/// Set row filter for an auth subject on a table
-pub const SetSubjectRowFilterPathParams = struct {
-    /// Casbin subject name, such as role:tenant_reader or group:eng.
-    subject: []const u8,
-    /// Table name (or '*' for all tables).
-    table: []const u8,
-};
-
-/// Parse the JSON request body for setSubjectRowFilter.
-pub fn parseSetSubjectRowFilterBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.ArrayHashMap(std.json.Value)) {
-    return std.json.parseFromSlice(std.json.ArrayHashMap(std.json.Value), allocator, body, .{ .ignore_unknown_fields = true });
+/// Parse the JSON request body for startTableRepairJob.
+pub fn parseStartTableRepairJobBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TableRepairJobStartRequest) {
+    return std.json.parseFromSlice(types.TableRepairJobStartRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Remove row filter for an auth subject on a table
-pub const RemoveSubjectRowFilterPathParams = struct {
-    /// Casbin subject name, such as role:tenant_reader or group:eng.
-    subject: []const u8,
-    /// Table name (or '*' for all tables).
-    table: []const u8,
+/// Get a table repair job
+pub const GetTableRepairJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Repair job identifier.
+    job_id: []const u8,
 };
 
-/// Get row filter for a user on a table
-pub const GetRowFilterPathParams = struct {
-    /// The username.
-    user_name: []const u8,
-    /// Table name (or '*' for all tables).
-    table: []const u8,
+/// Advance a table repair job
+pub const AdvanceTableRepairJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Repair job identifier.
+    job_id: []const u8,
 };
 
-/// Set row filter for a user on a table
-pub const SetRowFilterPathParams = struct {
-    /// The username.
-    user_name: []const u8,
-    /// Table name (or '*' for all tables).
-    table: []const u8,
+/// Cancel a table repair job
+pub const CancelTableRepairJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Repair job identifier.
+    job_id: []const u8,
 };
 
-/// Parse the JSON request body for setRowFilter.
-pub fn parseSetRowFilterBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.ArrayHashMap(std.json.Value)) {
-    return std.json.parseFromSlice(std.json.ArrayHashMap(std.json.Value), allocator, body, .{ .ignore_unknown_fields = true });
+/// Run a bounded table repair pass
+pub const RunTableRepairPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for runTableRepair.
+pub fn parseRunTableRepairBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RepairRunRequest) {
+    return std.json.parseFromSlice(types.RepairRunRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Remove row filter for a user on a table
-pub const RemoveRowFilterPathParams = struct {
-    /// The username.
-    user_name: []const u8,
-    /// Table name (or '*' for all tables).
-    table: []const u8,
+/// Restore a table from backup
+pub const RestoreTablePathParams = struct {
+    /// Name of the table to restore into
+    table_name: []const u8,
 };
 
-/// List API keys for a user
-pub const ListApiKeysPathParams = struct {
-    /// The username.
-    user_name: []const u8,
-};
-
-/// Create a new API key
-pub const CreateApiKeyPathParams = struct {
-    /// The username.
-    user_name: []const u8,
-};
-
-/// Parse the JSON request body for createApiKey.
-pub fn parseCreateApiKeyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CreateApiKeyRequest) {
-    return std.json.parseFromSlice(types.CreateApiKeyRequest, allocator, body, .{ .ignore_unknown_fields = true });
+/// Parse the JSON request body for restoreTable.
+pub fn parseRestoreTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RestoreRequest) {
+    return std.json.parseFromSlice(types.RestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Delete an API key
-pub const DeleteApiKeyPathParams = struct {
-    /// The username.
-    user_name: []const u8,
-    /// The API key ID.
-    key_id: []const u8,
+/// Execute a typed relational row aggregate plan
+pub const RowsAggregatePathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
 };
+
+/// Parse the JSON request body for rowsAggregate.
+pub fn parseRowsAggregateBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsAggregatePlanRequest) {
+    return std.json.parseFromSlice(types.RowsAggregatePlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Perform structured relational row writes by row identity
+pub const RowsBatchWritePathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsBatchWrite.
+pub fn parseRowsBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsBatchRequest) {
+    return std.json.parseFromSlice(types.RowsBatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Lookup relational rows by structured row identity
+pub const RowsGetPathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsGet.
+pub fn parseRowsGetBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsGetRequest) {
+    return std.json.parseFromSlice(types.RowsGetRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Execute a typed relational row join plan
+pub const RowsJoinPathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsJoin.
+pub fn parseRowsJoinBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsJoinPlanRequest) {
+    return std.json.parseFromSlice(types.RowsJoinPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Execute a typed relational row lateral plan
+pub const RowsLateralPathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsLateral.
+pub fn parseRowsLateralBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsLateralPlanRequest) {
+    return std.json.parseFromSlice(types.RowsLateralPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Stage typed relational update/delete operations from a claimed row source
+pub const RowsMutationSourcePathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsMutationSource.
+pub fn parseRowsMutationSourceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Execute a typed relational row read plan
+pub const RowsPlanPathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsPlan.
+pub fn parseRowsPlanBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsPlanRequest) {
+    return std.json.parseFromSlice(types.RowsPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Execute a typed relational row query plan
+pub const RowsQueryPathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsQuery.
+pub fn parseRowsQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsQueryPlanRequest) {
+    return std.json.parseFromSlice(types.RowsQueryPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Execute a typed relational row window plan
+pub const RowsWindowPathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsWindow.
+pub fn parseRowsWindowBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsWindowPlanRequest) {
+    return std.json.parseFromSlice(types.RowsWindowPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Update a table's schema
+pub const UpdateSchemaPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for updateSchema.
+pub fn parseUpdateSchemaBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_schema_openapi.TableSchema) {
+    return std.json.parseFromSlice(antfly_schema_openapi.TableSchema, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Get tablespace
+pub const GetTablespacePathParams = struct {
+    /// Tablespace name
+    tablespace_name: []const u8,
+};
+
+/// Create tablespace
+pub const CreateTablespacePathParams = struct {
+    /// Tablespace name
+    tablespace_name: []const u8,
+};
+
+/// Parse the JSON request body for createTablespace.
+pub fn parseCreateTablespaceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CreateTablespaceRequest) {
+    return std.json.parseFromSlice(types.CreateTablespaceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Drop tablespace
+pub const DropTablespacePathParams = struct {
+    /// Tablespace name
+    tablespace_name: []const u8,
+};
+
+/// Parse the JSON request body for beginTransaction.
+pub fn parseBeginTransactionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionBeginRequest) {
+    return std.json.parseFromSlice(types.TransactionBeginRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+pub const CleanupTransactionSessionsParams = struct {
+    cutoff_ns: ?[]const u8 = null,
+};
+
+/// Parse the JSON request body for commitTransaction.
+pub fn parseCommitTransactionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionCommitRequest) {
+    return std.json.parseFromSlice(types.TransactionCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Get transaction session details
+pub const GetTransactionSessionPathParams = struct {
+    transaction_id: []const u8,
+};
+
+/// Abort a transaction session
+pub const AbortTransactionSessionPathParams = struct {
+    transaction_id: []const u8,
+};
+
+/// Commit a transaction session
+pub const CommitTransactionSessionPathParams = struct {
+    transaction_id: []const u8,
+};
+
+/// Parse the JSON request body for commitTransactionSession.
+pub fn parseCommitTransactionSessionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionCommitRequest) {
+    return std.json.parseFromSlice(types.TransactionCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Stage a transaction delete
+pub const StageTransactionDeletePathParams = struct {
+    transaction_id: []const u8,
+};
+
+/// Parse the JSON request body for stageTransactionDelete.
+pub fn parseStageTransactionDeleteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionStageDeleteRequest) {
+    return std.json.parseFromSlice(types.TransactionStageDeleteRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Stage a transaction read version
+pub const StageTransactionReadPathParams = struct {
+    transaction_id: []const u8,
+};
+
+/// Parse the JSON request body for stageTransactionRead.
+pub fn parseStageTransactionReadBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionStageReadRequest) {
+    return std.json.parseFromSlice(types.TransactionStageReadRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Create a transaction savepoint
+pub const CreateTransactionSavepointPathParams = struct {
+    transaction_id: []const u8,
+};
+
+/// Roll back a transaction session to a savepoint
+pub const RollbackTransactionSavepointPathParams = struct {
+    transaction_id: []const u8,
+    savepoint_id: []const u8,
+};
+
+/// Stage a transaction commit request
+pub const StageTransactionSessionPathParams = struct {
+    transaction_id: []const u8,
+};
+
+/// Parse the JSON request body for stageTransactionSession.
+pub fn parseStageTransactionSessionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionCommitRequest) {
+    return std.json.parseFromSlice(types.TransactionCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Stage a transaction write
+pub const StageTransactionWritePathParams = struct {
+    transaction_id: []const u8,
+};
+
+/// Parse the JSON request body for stageTransactionWrite.
+pub fn parseStageTransactionWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionStageWriteRequest) {
+    return std.json.parseFromSlice(types.TransactionStageWriteRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
 
 /// Route metadata for all operations.
 pub const Route = struct {
@@ -1086,251 +1143,263 @@ pub const Route = struct {
 };
 
 pub const routes = [_]Route{
-    .{ .method = "GET", .path = "/status", .operation_id = "getStatus" },
-    .{ .method = "GET", .path = "/cluster", .operation_id = "getCluster" },
-    .{ .method = "GET", .path = "/connections", .operation_id = "listConnections" },
-    .{ .method = "GET", .path = "/secrets", .operation_id = "listSecrets" },
-    .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret" },
-    .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret" },
-    .{ .method = "POST", .path = "/batch", .operation_id = "multiBatchWrite" },
-    .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}/actions/{action}", .operation_id = "executeGraphMetricAction" },
-    .{ .method = "POST", .path = "/transactions/commit", .operation_id = "commitTransaction" },
-    .{ .method = "GET", .path = "/transactions", .operation_id = "listTransactionSessions" },
-    .{ .method = "POST", .path = "/transactions/cleanup", .operation_id = "cleanupTransactionSessions" },
-    .{ .method = "POST", .path = "/transactions/begin", .operation_id = "beginTransaction" },
-    .{ .method = "GET", .path = "/transactions/{transaction_id}", .operation_id = "getTransactionSession" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/stage", .operation_id = "stageTransactionSession" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/read", .operation_id = "stageTransactionRead" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/write", .operation_id = "stageTransactionWrite" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/delete", .operation_id = "stageTransactionDelete" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/savepoints", .operation_id = "createTransactionSavepoint" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/savepoints/{savepoint_id}/rollback", .operation_id = "rollbackTransactionSavepoint" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/commit", .operation_id = "commitTransactionSession" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/abort", .operation_id = "abortTransactionSession" },
-    .{ .method = "POST", .path = "/backup", .operation_id = "backup" },
-    .{ .method = "POST", .path = "/restore", .operation_id = "restore" },
-    .{ .method = "GET", .path = "/backups", .operation_id = "listBackups" },
-    .{ .method = "POST", .path = "/db/v1/sql", .operation_id = "executeSql" },
-    .{ .method = "POST", .path = "/query", .operation_id = "globalQuery" },
-    .{ .method = "POST", .path = "/eval", .operation_id = "evaluate" },
     .{ .method = "POST", .path = "/agents/query-builder", .operation_id = "queryBuilderAgent" },
     .{ .method = "POST", .path = "/agents/retrieval", .operation_id = "retrievalAgent" },
-    .{ .method = "GET", .path = "/tablespaces", .operation_id = "listTablespaces" },
-    .{ .method = "GET", .path = "/tablespaces/{tablespaceName}", .operation_id = "getTablespace" },
-    .{ .method = "POST", .path = "/tablespaces/{tablespaceName}", .operation_id = "createTablespace" },
-    .{ .method = "DELETE", .path = "/tablespaces/{tablespaceName}", .operation_id = "dropTablespace" },
+    .{ .method = "GET", .path = "/auth/v1/me", .operation_id = "getCurrentUser" },
+    .{ .method = "GET", .path = "/auth/v1/subjects", .operation_id = "listAuthSubjects" },
+    .{ .method = "GET", .path = "/auth/v1/subjects/{subject}/row-filters", .operation_id = "listSubjectRowFilters" },
+    .{ .method = "GET", .path = "/auth/v1/subjects/{subject}/row-filters/{table}", .operation_id = "getSubjectRowFilter" },
+    .{ .method = "PUT", .path = "/auth/v1/subjects/{subject}/row-filters/{table}", .operation_id = "setSubjectRowFilter" },
+    .{ .method = "DELETE", .path = "/auth/v1/subjects/{subject}/row-filters/{table}", .operation_id = "removeSubjectRowFilter" },
+    .{ .method = "GET", .path = "/auth/v1/users", .operation_id = "listUsers" },
+    .{ .method = "GET", .path = "/auth/v1/users/{userName}", .operation_id = "getUserByName" },
+    .{ .method = "POST", .path = "/auth/v1/users/{userName}", .operation_id = "createUser" },
+    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}", .operation_id = "deleteUser" },
+    .{ .method = "GET", .path = "/auth/v1/users/{userName}/api-keys", .operation_id = "listApiKeys" },
+    .{ .method = "POST", .path = "/auth/v1/users/{userName}/api-keys", .operation_id = "createApiKey" },
+    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}/api-keys/{keyId}", .operation_id = "deleteApiKey" },
+    .{ .method = "PUT", .path = "/auth/v1/users/{userName}/password", .operation_id = "updateUserPassword" },
+    .{ .method = "GET", .path = "/auth/v1/users/{userName}/permissions", .operation_id = "getUserPermissions" },
+    .{ .method = "POST", .path = "/auth/v1/users/{userName}/permissions", .operation_id = "addPermissionToUser" },
+    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}/permissions", .operation_id = "removePermissionFromUser" },
+    .{ .method = "GET", .path = "/auth/v1/users/{userName}/roles", .operation_id = "listUserRoles" },
+    .{ .method = "POST", .path = "/auth/v1/users/{userName}/roles", .operation_id = "addRoleToUser" },
+    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}/roles", .operation_id = "removeRoleFromUser" },
+    .{ .method = "GET", .path = "/auth/v1/users/{userName}/row-filters", .operation_id = "listRowFilters" },
+    .{ .method = "GET", .path = "/auth/v1/users/{userName}/row-filters/{table}", .operation_id = "getRowFilter" },
+    .{ .method = "PUT", .path = "/auth/v1/users/{userName}/row-filters/{table}", .operation_id = "setRowFilter" },
+    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}/row-filters/{table}", .operation_id = "removeRowFilter" },
+    .{ .method = "POST", .path = "/backup", .operation_id = "backup" },
+    .{ .method = "GET", .path = "/backups", .operation_id = "listBackups" },
+    .{ .method = "POST", .path = "/batch", .operation_id = "multiBatchWrite" },
+    .{ .method = "GET", .path = "/cluster", .operation_id = "getCluster" },
+    .{ .method = "GET", .path = "/connections", .operation_id = "listConnections" },
     .{ .method = "GET", .path = "/databases", .operation_id = "listDatabases" },
     .{ .method = "GET", .path = "/databases/{databaseName}", .operation_id = "getDatabase" },
     .{ .method = "POST", .path = "/databases/{databaseName}", .operation_id = "createDatabase" },
     .{ .method = "DELETE", .path = "/databases/{databaseName}", .operation_id = "dropDatabase" },
-    .{ .method = "PUT", .path = "/databases/{databaseName}/tablespace", .operation_id = "setDatabaseTablespace" },
-    .{ .method = "DELETE", .path = "/databases/{databaseName}/tablespace", .operation_id = "clearDatabaseTablespace" },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces", .operation_id = "listNamespaces" },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}", .operation_id = "createNamespace" },
     .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}", .operation_id = "dropNamespace" },
-    .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tablespace", .operation_id = "setNamespaceTablespace" },
-    .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tablespace", .operation_id = "clearNamespaceTablespace" },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables", .operation_id = "listNamespaceTables" },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}", .operation_id = "getNamespaceTable" },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}", .operation_id = "createNamespaceTable" },
     .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}", .operation_id = "dropNamespaceTable" },
-    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query", .operation_id = "queryNamespaceTable" },
-    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/batch", .operation_id = "batchNamespaceTable" },
-    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/batch", .operation_id = "rowsBatchNamespaceTable" },
-    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/relational-column-backed-index-repair", .operation_id = "repairNamespaceTableRelationalColumnBackedIndex" },
-    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/relational-column-backed-index-repair/jobs/{jobId}", .operation_id = "getNamespaceTableRelationalIndexRepairJob" },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/backup", .operation_id = "backupNamespaceTable" },
-    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore", .operation_id = "restoreNamespaceTable" },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/batch", .operation_id = "batchNamespaceTable" },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}", .operation_id = "lookupNamespaceTableDocument" },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes", .operation_id = "listNamespaceTableIndexes" },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "getNamespaceTableIndex" },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "createNamespaceTableIndex" },
     .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "dropNamespaceTableIndex" },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query", .operation_id = "queryNamespaceTable" },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/relational-column-backed-index-repair", .operation_id = "repairNamespaceTableRelationalColumnBackedIndex" },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/relational-column-backed-index-repair/jobs/{jobId}", .operation_id = "getNamespaceTableRelationalIndexRepairJob" },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore", .operation_id = "restoreNamespaceTable" },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/batch", .operation_id = "rowsBatchNamespaceTable" },
+    .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tablespace", .operation_id = "setNamespaceTablespace" },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tablespace", .operation_id = "clearNamespaceTablespace" },
+    .{ .method = "PUT", .path = "/databases/{databaseName}/tablespace", .operation_id = "setDatabaseTablespace" },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/tablespace", .operation_id = "clearDatabaseTablespace" },
+    .{ .method = "POST", .path = "/db/v1/sql", .operation_id = "executeSql" },
+    .{ .method = "POST", .path = "/eval", .operation_id = "evaluate" },
+    .{ .method = "POST", .path = "/query", .operation_id = "globalQuery" },
+    .{ .method = "POST", .path = "/restore", .operation_id = "restore" },
+    .{ .method = "GET", .path = "/secrets", .operation_id = "listSecrets" },
+    .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret" },
+    .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret" },
+    .{ .method = "GET", .path = "/status", .operation_id = "getStatus" },
     .{ .method = "GET", .path = "/tables", .operation_id = "listTables" },
     .{ .method = "GET", .path = "/tables/{tableName}", .operation_id = "getTable" },
     .{ .method = "POST", .path = "/tables/{tableName}", .operation_id = "createTable" },
     .{ .method = "DELETE", .path = "/tables/{tableName}", .operation_id = "dropTable" },
-    .{ .method = "POST", .path = "/tables/{tableName}/query", .operation_id = "queryTable" },
-    .{ .method = "POST", .path = "/tables/{tableName}/batch", .operation_id = "batchWrite" },
-    .{ .method = "POST", .path = "/tables/{tableName}/rows/batch", .operation_id = "rowsBatchWrite" },
-    .{ .method = "POST", .path = "/tables/{tableName}/relational-column-backed-index-repair", .operation_id = "repairRelationalColumnBackedIndex" },
-    .{ .method = "GET", .path = "/tables/{tableName}/relational-column-backed-index-repair/jobs/{jobId}", .operation_id = "getRelationalIndexRepairJob" },
-    .{ .method = "POST", .path = "/tables/{tableName}/rows/mutation-source", .operation_id = "rowsMutationSource" },
-    .{ .method = "POST", .path = "/tables/{tableName}/rows/get", .operation_id = "rowsGet" },
-    .{ .method = "POST", .path = "/tables/{tableName}/rows/plan", .operation_id = "rowsPlan" },
-    .{ .method = "POST", .path = "/tables/{tableName}/rows/query", .operation_id = "rowsQuery" },
-    .{ .method = "POST", .path = "/tables/{tableName}/rows/aggregate", .operation_id = "rowsAggregate" },
-    .{ .method = "POST", .path = "/tables/{tableName}/rows/window", .operation_id = "rowsWindow" },
-    .{ .method = "POST", .path = "/tables/{tableName}/rows/join", .operation_id = "rowsJoin" },
-    .{ .method = "POST", .path = "/tables/{tableName}/rows/lateral", .operation_id = "rowsLateral" },
-    .{ .method = "POST", .path = "/tables/{tableName}/merge", .operation_id = "linearMerge" },
-    .{ .method = "POST", .path = "/tables/{tableName}/backup", .operation_id = "backupTable" },
-    .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable" },
-    .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema" },
-    .{ .method = "POST", .path = "/tables/{tableName}/lookup", .operation_id = "scanKeys" },
-    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey" },
-    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests" },
     .{ .method = "GET", .path = "/tables/{tableName}/artifacts", .operation_id = "listArtifactEnrichments" },
-    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifactRange" },
     .{ .method = "PUT", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "putArtifactEnrichment" },
     .{ .method = "DELETE", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "deleteArtifactEnrichment" },
+    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifactRange" },
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs", .operation_id = "startDocumentArtifactReprocessJob" },
     .{ .method = "GET", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}", .operation_id = "getDocumentArtifactReprocessJob" },
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/advance", .operation_id = "advanceDocumentArtifactReprocessJob" },
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel", .operation_id = "cancelDocumentArtifactReprocessJob" },
+    .{ .method = "POST", .path = "/tables/{tableName}/backup", .operation_id = "backupTable" },
+    .{ .method = "POST", .path = "/tables/{tableName}/batch", .operation_id = "batchWrite" },
+    .{ .method = "POST", .path = "/tables/{tableName}/documents", .operation_id = "scanKeys" },
+    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey" },
+    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests" },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest" },
     .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifact" },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes", .operation_id = "listIndexes" },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "getIndex" },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex" },
     .{ .method = "DELETE", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "dropIndex" },
-    .{ .method = "GET", .path = "/auth/v1/me", .operation_id = "getCurrentUser" },
-    .{ .method = "GET", .path = "/auth/v1/users", .operation_id = "listUsers" },
-    .{ .method = "GET", .path = "/auth/v1/users/{userName}", .operation_id = "getUserByName" },
-    .{ .method = "POST", .path = "/auth/v1/users/{userName}", .operation_id = "createUser" },
-    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}", .operation_id = "deleteUser" },
-    .{ .method = "PUT", .path = "/auth/v1/users/{userName}/password", .operation_id = "updateUserPassword" },
-    .{ .method = "GET", .path = "/auth/v1/users/{userName}/permissions", .operation_id = "getUserPermissions" },
-    .{ .method = "POST", .path = "/auth/v1/users/{userName}/permissions", .operation_id = "addPermissionToUser" },
-    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}/permissions", .operation_id = "removePermissionFromUser" },
-    .{ .method = "GET", .path = "/auth/v1/users/{userName}/row-filters", .operation_id = "listRowFilters" },
-    .{ .method = "GET", .path = "/auth/v1/users/{userName}/roles", .operation_id = "listUserRoles" },
-    .{ .method = "POST", .path = "/auth/v1/users/{userName}/roles", .operation_id = "addRoleToUser" },
-    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}/roles", .operation_id = "removeRoleFromUser" },
-    .{ .method = "GET", .path = "/auth/v1/subjects", .operation_id = "listAuthSubjects" },
-    .{ .method = "GET", .path = "/auth/v1/subjects/{subject}/row-filters", .operation_id = "listSubjectRowFilters" },
-    .{ .method = "GET", .path = "/auth/v1/subjects/{subject}/row-filters/{table}", .operation_id = "getSubjectRowFilter" },
-    .{ .method = "PUT", .path = "/auth/v1/subjects/{subject}/row-filters/{table}", .operation_id = "setSubjectRowFilter" },
-    .{ .method = "DELETE", .path = "/auth/v1/subjects/{subject}/row-filters/{table}", .operation_id = "removeSubjectRowFilter" },
-    .{ .method = "GET", .path = "/auth/v1/users/{userName}/row-filters/{table}", .operation_id = "getRowFilter" },
-    .{ .method = "PUT", .path = "/auth/v1/users/{userName}/row-filters/{table}", .operation_id = "setRowFilter" },
-    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}/row-filters/{table}", .operation_id = "removeRowFilter" },
-    .{ .method = "GET", .path = "/auth/v1/users/{userName}/api-keys", .operation_id = "listApiKeys" },
-    .{ .method = "POST", .path = "/auth/v1/users/{userName}/api-keys", .operation_id = "createApiKey" },
-    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}/api-keys/{keyId}", .operation_id = "deleteApiKey" },
+    .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}/actions/{action}", .operation_id = "executeGraphMetricAction" },
+    .{ .method = "POST", .path = "/tables/{tableName}/merge", .operation_id = "linearMerge" },
+    .{ .method = "POST", .path = "/tables/{tableName}/query", .operation_id = "queryTable" },
+    .{ .method = "POST", .path = "/tables/{tableName}/relational-column-backed-index-repair", .operation_id = "repairRelationalColumnBackedIndex" },
+    .{ .method = "GET", .path = "/tables/{tableName}/relational-column-backed-index-repair/jobs/{jobId}", .operation_id = "getRelationalIndexRepairJob" },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/issues", .operation_id = "listTableRepairIssues" },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs", .operation_id = "startTableRepairJob" },
+    .{ .method = "GET", .path = "/tables/{tableName}/repair/jobs/{jobId}", .operation_id = "getTableRepairJob" },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs/{jobId}/advance", .operation_id = "advanceTableRepairJob" },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs/{jobId}/cancel", .operation_id = "cancelTableRepairJob" },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/run", .operation_id = "runTableRepair" },
+    .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows/aggregate", .operation_id = "rowsAggregate" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows/batch", .operation_id = "rowsBatchWrite" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows/get", .operation_id = "rowsGet" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows/join", .operation_id = "rowsJoin" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows/lateral", .operation_id = "rowsLateral" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows/mutation-source", .operation_id = "rowsMutationSource" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows/plan", .operation_id = "rowsPlan" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows/query", .operation_id = "rowsQuery" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows/window", .operation_id = "rowsWindow" },
+    .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema" },
+    .{ .method = "GET", .path = "/tablespaces", .operation_id = "listTablespaces" },
+    .{ .method = "GET", .path = "/tablespaces/{tablespaceName}", .operation_id = "getTablespace" },
+    .{ .method = "POST", .path = "/tablespaces/{tablespaceName}", .operation_id = "createTablespace" },
+    .{ .method = "DELETE", .path = "/tablespaces/{tablespaceName}", .operation_id = "dropTablespace" },
+    .{ .method = "GET", .path = "/transactions", .operation_id = "listTransactionSessions" },
+    .{ .method = "POST", .path = "/transactions/begin", .operation_id = "beginTransaction" },
+    .{ .method = "POST", .path = "/transactions/cleanup", .operation_id = "cleanupTransactionSessions" },
+    .{ .method = "POST", .path = "/transactions/commit", .operation_id = "commitTransaction" },
+    .{ .method = "GET", .path = "/transactions/{transaction_id}", .operation_id = "getTransactionSession" },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/abort", .operation_id = "abortTransactionSession" },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/commit", .operation_id = "commitTransactionSession" },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/delete", .operation_id = "stageTransactionDelete" },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/read", .operation_id = "stageTransactionRead" },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/savepoints", .operation_id = "createTransactionSavepoint" },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/savepoints/{savepoint_id}/rollback", .operation_id = "rollbackTransactionSavepoint" },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/stage", .operation_id = "stageTransactionSession" },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/write", .operation_id = "stageTransactionWrite" },
 };
 
 // Handler interface. Implement these methods on your Impl struct:
 //
-//   fn getStatus(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn getCluster(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn listConnections(self: *Impl, ctx: *httpx.Context, params: ListConnectionsParams) !httpx.Response
-//   fn listSecrets(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn putSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
-//   fn deleteSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
-//   fn multiBatchWrite(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn executeGraphMetricAction(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
-//   fn commitTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn listTransactionSessions(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn cleanupTransactionSessions(self: *Impl, ctx: *httpx.Context, params: CleanupTransactionSessionsParams) !httpx.Response
-//   fn beginTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn getTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
-//   fn stageTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
-//   fn stageTransactionRead(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
-//   fn stageTransactionWrite(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
-//   fn stageTransactionDelete(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
-//   fn createTransactionSavepoint(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
-//   fn rollbackTransactionSavepoint(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8, savepoint_id: []const u8) !httpx.Response
-//   fn commitTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
-//   fn abortTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
-//   fn backup(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn restore(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn listBackups(self: *Impl, ctx: *httpx.Context, params: ListBackupsParams) !httpx.Response
-//   fn executeSql(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn globalQuery(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn evaluate(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn queryBuilderAgent(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn retrievalAgent(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn listTablespaces(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn getTablespace(self: *Impl, ctx: *httpx.Context, tablespace_name: []const u8) !httpx.Response
-//   fn createTablespace(self: *Impl, ctx: *httpx.Context, tablespace_name: []const u8) !httpx.Response
-//   fn dropTablespace(self: *Impl, ctx: *httpx.Context, tablespace_name: []const u8) !httpx.Response
+//   fn getCurrentUser(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listAuthSubjects(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listSubjectRowFilters(self: *Impl, ctx: *httpx.Context, subject: []const u8) !httpx.Response
+//   fn getSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response
+//   fn setSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response
+//   fn removeSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response
+//   fn listUsers(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getUserByName(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
+//   fn createUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
+//   fn deleteUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
+//   fn listApiKeys(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
+//   fn createApiKey(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
+//   fn deleteApiKey(self: *Impl, ctx: *httpx.Context, user_name: []const u8, key_id: []const u8) !httpx.Response
+//   fn updateUserPassword(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
+//   fn getUserPermissions(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
+//   fn addPermissionToUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
+//   fn removePermissionFromUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8, params: RemovePermissionFromUserParams) !httpx.Response
+//   fn listUserRoles(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
+//   fn addRoleToUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
+//   fn removeRoleFromUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8, params: RemoveRoleFromUserParams) !httpx.Response
+//   fn listRowFilters(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
+//   fn getRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response
+//   fn setRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response
+//   fn removeRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response
+//   fn backup(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listBackups(self: *Impl, ctx: *httpx.Context, params: ListBackupsParams) !httpx.Response
+//   fn multiBatchWrite(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getCluster(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listConnections(self: *Impl, ctx: *httpx.Context, params: ListConnectionsParams) !httpx.Response
 //   fn listDatabases(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getDatabase(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
 //   fn createDatabase(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
 //   fn dropDatabase(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
-//   fn setDatabaseTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
-//   fn clearDatabaseTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
 //   fn listNamespaces(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
 //   fn createNamespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
 //   fn dropNamespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
-//   fn setNamespaceTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
-//   fn clearNamespaceTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
 //   fn listNamespaceTables(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, params: ListNamespaceTablesParams) !httpx.Response
 //   fn getNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn createNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn dropNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
-//   fn queryNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
-//   fn batchNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
-//   fn rowsBatchNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
-//   fn repairNamespaceTableRelationalColumnBackedIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
-//   fn getNamespaceTableRelationalIndexRepairJob(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn backupNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
-//   fn restoreNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn batchNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn lookupNamespaceTableDocument(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, params: LookupNamespaceTableDocumentParams) !httpx.Response
 //   fn listNamespaceTableIndexes(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn getNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn dropNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
+//   fn queryNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn repairNamespaceTableRelationalColumnBackedIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn getNamespaceTableRelationalIndexRepairJob(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, job_id: []const u8) !httpx.Response
+//   fn restoreNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn rowsBatchNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn setNamespaceTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
+//   fn clearNamespaceTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
+//   fn setDatabaseTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
+//   fn clearDatabaseTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
+//   fn executeSql(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn evaluate(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn globalQuery(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn restore(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listSecrets(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn putSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
+//   fn deleteSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
+//   fn getStatus(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listTables(self: *Impl, ctx: *httpx.Context, params: ListTablesParams) !httpx.Response
 //   fn getTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn createTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn dropTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn queryTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn batchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn rowsBatchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn repairRelationalColumnBackedIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn getRelationalIndexRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
-//   fn rowsMutationSource(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn rowsGet(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn rowsPlan(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn rowsQuery(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn rowsAggregate(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn rowsWindow(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn rowsJoin(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn rowsLateral(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn linearMerge(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn backupTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn restoreTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
-//   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
 //   fn listArtifactEnrichments(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn reprocessDocumentArtifactRange(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn putArtifactEnrichment(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn deleteArtifactEnrichment(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn reprocessDocumentArtifactRange(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn startDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn getDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn advanceDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn cancelDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
+//   fn backupTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn batchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
+//   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
 //   fn getDocumentArtifactManifest(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetDocumentArtifactManifestParams) !httpx.Response
 //   fn reprocessDocumentArtifact(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn listIndexes(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn dropIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
-//   fn getCurrentUser(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn listUsers(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn getUserByName(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
-//   fn createUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
-//   fn deleteUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
-//   fn updateUserPassword(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
-//   fn getUserPermissions(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
-//   fn addPermissionToUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
-//   fn removePermissionFromUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8, params: RemovePermissionFromUserParams) !httpx.Response
-//   fn listRowFilters(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
-//   fn listUserRoles(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
-//   fn addRoleToUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
-//   fn removeRoleFromUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8, params: RemoveRoleFromUserParams) !httpx.Response
-//   fn listAuthSubjects(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn listSubjectRowFilters(self: *Impl, ctx: *httpx.Context, subject: []const u8) !httpx.Response
-//   fn getSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response
-//   fn setSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response
-//   fn removeSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response
-//   fn getRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response
-//   fn setRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response
-//   fn removeRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response
-//   fn listApiKeys(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
-//   fn createApiKey(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
-//   fn deleteApiKey(self: *Impl, ctx: *httpx.Context, user_name: []const u8, key_id: []const u8) !httpx.Response
+//   fn executeGraphMetricAction(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
+//   fn linearMerge(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn queryTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn repairRelationalColumnBackedIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn getRelationalIndexRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
+//   fn listTableRepairIssues(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn startTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn getTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
+//   fn advanceTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
+//   fn cancelTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
+//   fn runTableRepair(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn restoreTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsAggregate(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsBatchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsGet(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsJoin(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsLateral(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsMutationSource(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsPlan(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsQuery(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsWindow(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn listTablespaces(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getTablespace(self: *Impl, ctx: *httpx.Context, tablespace_name: []const u8) !httpx.Response
+//   fn createTablespace(self: *Impl, ctx: *httpx.Context, tablespace_name: []const u8) !httpx.Response
+//   fn dropTablespace(self: *Impl, ctx: *httpx.Context, tablespace_name: []const u8) !httpx.Response
+//   fn listTransactionSessions(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn beginTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn cleanupTransactionSessions(self: *Impl, ctx: *httpx.Context, params: CleanupTransactionSessionsParams) !httpx.Response
+//   fn commitTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
+//   fn abortTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
+//   fn commitTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
+//   fn stageTransactionDelete(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
+//   fn stageTransactionRead(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
+//   fn createTransactionSavepoint(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
+//   fn rollbackTransactionSavepoint(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8, savepoint_id: []const u8) !httpx.Response
+//   fn stageTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
+//   fn stageTransactionWrite(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response

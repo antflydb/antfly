@@ -35,6 +35,7 @@ const schema_runtime = @import("schema_runtime.zig");
 const relational_integrity = @import("relational_integrity.zig");
 const relational_rows = @import("relational_rows.zig");
 const search_runtime = @import("search_runtime.zig");
+const artifact_repair = @import("artifact_repair.zig");
 const doc_identity = @import("doc_identity.zig");
 const doc_set = @import("doc_set.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
@@ -67,6 +68,9 @@ const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
 const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
 const sparse_compaction_runtime_mod = @import("maintenance/sparse_compaction_runtime.zig");
 const graph_metric_runtime_mod = @import("maintenance/graph_metric_runtime.zig");
+const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
+    pub const sim = struct {};
+};
 
 pub const OpenOptions = lifecycle_mod.OpenOptions;
 pub const OpenMode = lifecycle_mod.OpenOptions.OpenMode;
@@ -169,15 +173,32 @@ pub const DB = struct {
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
     graph_metric_runtime: ?*graph_metric_runtime_mod.GraphMetricRuntime,
+    artifact_repair_metadata_future: ?std.Io.Future(void) = null,
+    artifact_repair_metadata_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    quarantine_retry_future: ?std.Io.Future(void) = null,
+    quarantine_retry_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     shadow: ?split_restore.ShadowState,
     bulk_ingest_coalescer: write_path.BulkIngestCoalescer(@This()) = .{},
     flushing_bulk_ingest_coalescer: bool = false,
     bulk_ingest_identity_all_new: bool = false,
     bulk_ingest_identity_state: doc_identity.AllNewTrustedState = .{},
     identity_visibility_summary_cache: ?doc_identity.VisibilitySummary = null,
+    live_doc_set_cache_mutex: std.atomic.Mutex = .unlocked,
+    live_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
+    live_doc_set_cache_generation: ?u64 = null,
     bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
     foreign_key_stats: ForeignKeyRuntimeStats = .{},
+    index_repair_barriers: std.atomic.Value(u32) = .init(0),
+    published_dense_searches: std.atomic.Value(u32) = .init(0),
+    index_repair_mutex: std.atomic.Mutex = .unlocked,
+    active_index_repairs: std.StringHashMapUnmanaged(void) = .{},
+    shadow_index_repair_hook: ?@This().ShadowIndexRepairHook = null,
+
+    pub const ShadowIndexRepairHook = struct {
+        ptr: *anyopaque,
+        after_snapshot_build: *const fn (ptr: *anyopaque, db: *DB, index_name: []const u8, build_floor_sequence: u64) anyerror!void,
+    };
 
     const split_restore_impl = split_restore.Impl(@This());
     const internal_impl = db_internal.Impl(@This());
@@ -189,6 +210,7 @@ pub const DB = struct {
     const relational_integrity_impl = relational_integrity.Impl(@This());
     const relational_rows_impl = relational_rows.Impl(@This());
     const search_runtime_impl = search_runtime.Impl(@This());
+    const artifact_repair_impl = artifact_repair.Impl(@This());
     const derived_async_impl = derived_async.Impl(@This());
     pub const LifecycleCallbacks = struct {
         pub const apply_derived_batch_to_index_async = derived_async_impl.applyDerivedBatchToIndexAsync;
@@ -198,6 +220,7 @@ pub const DB = struct {
         pub const finish_derived_catch_up_session_async = derived_async_impl.finishDerivedCatchUpSessionAsync;
         pub const can_advance_derived_to_target_async = derived_async_impl.canAdvanceDerivedToTargetAsync;
         pub const append_derived_batch_from_enrichment = derived_async_impl.appendDerivedBatchFromEnrichment;
+        pub const append_generated_batch_from_enrichment = derived_async_impl.appendGeneratedBatchFromEnrichment;
         pub const notify_derived_executor_sequence = derived_async_impl.notifyDerivedExecutorSequence;
         pub const delete_expired_documents_from_candidates = write_path_impl.deleteExpiredDocumentsFromCandidates;
         pub const notify_async_context_visibility_hook = internal_impl.notifyAsyncContextVisibilityHook;
@@ -223,6 +246,11 @@ pub const DB = struct {
         pub const save_index_status_snapshots = db_internal.saveIndexStatusSnapshots;
         pub const async_index_profile_enabled = db_internal.asyncIndexProfileEnabled;
         pub const replay_pending_derived_batches_context = derived_async_impl.replayPendingDerivedBatchesContext;
+        pub const catch_up_managed_index_with_batch_context = derived_async_impl.catchUpManagedIndexWithBatchContext;
+        pub const can_advance_derived_replay_target_for_batch_context = derived_async_impl.canAdvanceDerivedReplayTargetForBatchContext;
+        pub const rebuild_dense_index_for_target_coverage_context = derived_async_impl.rebuildDenseIndexForTargetCoverageContext;
+        pub const rebuild_sparse_index_from_stored_embedding_artifacts_context = derived_async_impl.rebuildSparseIndexFromStoredEmbeddingArtifactsContext;
+        pub const save_applied_sequences_batch_context = derived_async_impl.saveAppliedSequencesBatchContext;
         pub const open_profile_enabled = lifecycle_mod.openProfileEnabled;
         pub const log_replay_catch_up_profile = derived_async.logReplayCatchUpProfile;
         pub const log_derived_worker_profile = derived_async.logDerivedWorkerProfile;
@@ -297,6 +325,7 @@ pub const DB = struct {
         pub const append_generated_enrichments = write_path_impl.appendGeneratedEnrichments;
         pub const append_derived_batch_record = derivedAsyncAppendDerivedBatchRecord;
         pub const save_index_status_snapshot = schema_runtime_impl.saveIndexStatusSnapshot;
+        pub const no_pending_enrichment_replay_through = lifecycle_impl.noPendingEnrichmentReplayThrough;
         pub const notify_resolver_replay_runtimes = lifecycle_impl.notifyResolverReplayRuntimes;
         pub const mirror_ha_schema_metadata_commit = ha_replication_impl.mirrorDBSchemaMetadataCommit;
         pub const mirror_ha_schema_json_metadata_commit = ha_replication_impl.mirrorDBSchemaJsonMetadataCommit;
@@ -336,6 +365,10 @@ pub const DB = struct {
 
     pub fn setQueryVisibilityHook(self: *DB, hook: ?QueryVisibilityHook) void {
         lifecycle_impl.setQueryVisibilityHook(self, hook);
+    }
+
+    pub fn clearLiveDocSetCache(self: *DB) void {
+        search_runtime_impl.clearLiveDocSetCache(self);
     }
 
     pub fn runTransactionRecoveryOnce(self: *DB, config: transaction_runtime_mod.Config) !types.TransactionRecoveryStats {
@@ -412,8 +445,16 @@ pub const DB = struct {
         return lifecycle_impl.lsmMaintenanceDebtHint(self);
     }
 
+    pub fn primaryLsmMaintenanceDebtHint(self: *DB) u64 {
+        return lifecycle_impl.primaryLsmMaintenanceDebtHint(self);
+    }
+
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *DB) ?u64 {
         return lifecycle_impl.nextLsmMaintenanceWakeDelayNsBestEffort(self);
+    }
+
+    pub fn nextPrimaryLsmMaintenanceWakeDelayNsBestEffort(self: *DB) ?u64 {
+        return lifecycle_impl.nextPrimaryLsmMaintenanceWakeDelayNsBestEffort(self);
     }
 
     pub fn snapshotAsyncIndexingStats(self: *DB) types.AsyncIndexingStats {
@@ -448,6 +489,36 @@ pub const DB = struct {
         return lifecycle_impl.trySnapshotTextMemoryAttributionStats(self);
     }
 
+    pub fn observedDynamicFieldCapabilitiesAlloc(
+        self: *DB,
+        alloc: Allocator,
+        index_name: ?[]const u8,
+    ) ![]schema_mod.FieldCapability {
+        return try lifecycle_impl.observedDynamicFieldCapabilitiesAlloc(self, alloc, index_name);
+    }
+
+    pub fn tryObservedDynamicFieldCapabilitiesAlloc(
+        self: *DB,
+        alloc: Allocator,
+        index_name: ?[]const u8,
+    ) ?[]schema_mod.FieldCapability {
+        return lifecycle_impl.tryObservedDynamicFieldCapabilitiesAlloc(self, alloc, index_name);
+    }
+
+    pub fn observedDynamicFieldCapabilitySetsAlloc(
+        self: *DB,
+        alloc: Allocator,
+    ) ![]index_manager_mod.IndexManager.ObservedDynamicFieldCapabilitySet {
+        return try lifecycle_impl.observedDynamicFieldCapabilitySetsAlloc(self, alloc);
+    }
+
+    pub fn tryObservedDynamicFieldCapabilitySetsAlloc(
+        self: *DB,
+        alloc: Allocator,
+    ) ?[]index_manager_mod.IndexManager.ObservedDynamicFieldCapabilitySet {
+        return lifecycle_impl.tryObservedDynamicFieldCapabilitySetsAlloc(self, alloc);
+    }
+
     pub fn snapshotTextMergeStats(self: *DB) types.TextMergeStats {
         return lifecycle_impl.snapshotTextMergeStats(self);
     }
@@ -478,6 +549,11 @@ pub const DB = struct {
         return try lifecycle_impl.runPrimaryLsmMaintenanceStep(self);
     }
 
+    pub fn runPrimaryLsmMaintenanceStepBestEffort(self: *DB) !bool {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try lifecycle_impl.runPrimaryLsmMaintenanceStepBestEffort(self);
+    }
+
     pub fn runLsmMaintenanceStepBestEffort(self: *DB) !bool {
         try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.runLsmMaintenanceStepBestEffort(self);
@@ -500,6 +576,14 @@ pub const DB = struct {
     pub fn retryQuarantinedIndexLoads(self: *DB, force: bool) !index_manager_mod.IndexManager.QuarantineRetryResult {
         try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.retryQuarantinedIndexLoads(self, force);
+    }
+
+    pub fn startQuarantineRetryWorkerIfNeeded(self: *DB) void {
+        lifecycle_impl.startQuarantineRetryWorkerIfNeeded(self);
+    }
+
+    pub fn stopQuarantineRetryWorker(self: *DB) void {
+        lifecycle_impl.stopQuarantineRetryWorker(self);
     }
 
     pub fn runDueLsmObsoleteReclaimUntilIdle(self: *DB, max_steps: usize) !usize {
@@ -723,6 +807,16 @@ pub const DB = struct {
         return try write_path_impl.reprocessDocumentArtifactAfterGate(self, alloc, doc_key, artifact_name);
     }
 
+    pub fn reprocessDocumentEmbeddingArtifact(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !bool {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try artifact_repair_impl.reprocessDocumentEmbeddingArtifact(self, alloc, doc_key, artifact_name);
+    }
+
     pub fn reprocessDocumentArtifactRange(
         self: *DB,
         alloc: Allocator,
@@ -731,6 +825,149 @@ pub const DB = struct {
     ) !types.DocumentArtifactTableReprocessResult {
         try ha_replication_impl.enforceDurableMutationGate(self);
         return try write_path_impl.reprocessDocumentArtifactRangeAfterGate(self, alloc, artifact_name, req);
+    }
+
+    pub fn recordArtifactRepairIssue(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) !void {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try artifact_repair_impl.recordArtifactRepairIssue(self, alloc, issue);
+    }
+
+    pub fn listArtifactRepairIssuesPage(
+        self: *DB,
+        alloc: Allocator,
+        req: types.ArtifactRepairListRequest,
+    ) !types.ArtifactRepairListResult {
+        return try artifact_repair_impl.listArtifactRepairIssuesPage(self, alloc, req);
+    }
+
+    pub fn listArtifactRepairIssues(
+        self: *DB,
+        alloc: Allocator,
+        artifact_kind: ?types.ArtifactRepairKind,
+        index_name: ?[]const u8,
+        limit: usize,
+    ) ![]types.ArtifactRepairIssue {
+        return try artifact_repair_impl.listArtifactRepairIssues(self, alloc, artifact_kind, index_name, limit);
+    }
+
+    pub fn listEmbeddingArtifactRepairIssues(
+        self: *DB,
+        alloc: Allocator,
+        index_name: ?[]const u8,
+        limit: usize,
+    ) ![]types.EmbeddingArtifactRepairIssue {
+        return try artifact_repair_impl.listEmbeddingArtifactRepairIssues(self, alloc, index_name, limit);
+    }
+
+    pub fn repairArtifactIssuesWithRequest(
+        self: *DB,
+        alloc: Allocator,
+        req: types.ArtifactRepairRunRequest,
+    ) !types.ArtifactRepairResult {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try artifact_repair_impl.repairArtifactIssuesWithRequest(self, alloc, req);
+    }
+
+    pub fn repairArtifactIssuesWithRequestOptions(
+        self: *DB,
+        alloc: Allocator,
+        req: types.ArtifactRepairRunRequest,
+        options: types.ArtifactRepairRunOptions,
+    ) !types.ArtifactRepairResult {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try artifact_repair_impl.repairArtifactIssuesWithRequestOptions(self, alloc, req, options);
+    }
+
+    pub fn repairArtifactIssues(
+        self: *DB,
+        alloc: Allocator,
+        artifact_kind: ?types.ArtifactRepairKind,
+        limit: usize,
+    ) !types.ArtifactRepairResult {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try artifact_repair_impl.repairArtifactIssues(self, alloc, artifact_kind, limit);
+    }
+
+    pub fn repairEmbeddingArtifactIssues(self: *DB, alloc: Allocator, limit: usize) !types.EmbeddingArtifactRepairResult {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try artifact_repair_impl.repairEmbeddingArtifactIssues(self, alloc, limit);
+    }
+
+    pub fn beginPublishedDenseSearch(self: *DB) bool {
+        return search_runtime_impl.beginPublishedDenseSearch(self);
+    }
+
+    pub fn endPublishedDenseSearch(self: *DB) void {
+        search_runtime_impl.endPublishedDenseSearch(self);
+    }
+
+    pub fn beginIndexRepairBarrier(self: *DB) void {
+        artifact_repair_impl.beginIndexRepairBarrier(self);
+    }
+
+    pub fn endIndexRepairBarrier(self: *DB) void {
+        artifact_repair_impl.endIndexRepairBarrier(self);
+    }
+
+    pub fn runArtifactRepairMetadataMaintenancePass(self: *DB) !bool {
+        return try artifact_repair_impl.runArtifactRepairMetadataMaintenancePass(self);
+    }
+
+    pub fn runArtifactRepairMetadataMaintenanceUntilIdle(self: *DB) !void {
+        return try artifact_repair_impl.runArtifactRepairMetadataMaintenanceUntilIdle(self);
+    }
+
+    pub fn artifactRepairMetadataRebuildPending(self: *DB) bool {
+        return artifact_repair_impl.artifactRepairMetadataRebuildPending(self);
+    }
+
+    pub fn loadPersistedIndexLoadFailure(self: *DB, alloc: Allocator, index_name: []const u8) !?[]u8 {
+        return try artifact_repair_impl.loadPersistedIndexLoadFailure(self, alloc, index_name);
+    }
+
+    pub fn persistIndexLoadFailuresFromManager(self: *DB, alloc: Allocator) !void {
+        return try artifact_repair_impl.persistIndexLoadFailuresFromManager(self, alloc);
+    }
+
+    pub fn artifactRepairSummaryReadyForStats(self: *DB, alloc: Allocator) !bool {
+        return try artifact_repair_impl.artifactRepairSummaryReadyForStats(self, alloc);
+    }
+
+    pub fn artifactRepairSummaryRootCountForStats(self: *DB, alloc: Allocator) !u64 {
+        return try artifact_repair_impl.artifactRepairSummaryRootCountForStats(self, alloc);
+    }
+
+    pub const ArtifactRepairSummarySnapshot = artifact_repair_impl.ArtifactRepairSummarySnapshot;
+    pub const ArtifactRepairIndexFallbackCounts = artifact_repair_impl.ArtifactRepairIndexFallbackCounts;
+
+    pub fn artifactRepairSummaryRootSnapshot(self: *DB, alloc: Allocator) !ArtifactRepairSummarySnapshot {
+        return try artifact_repair_impl.artifactRepairSummaryRootSnapshot(self, alloc);
+    }
+
+    pub fn artifactRepairSummaryIndexSnapshotForStats(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        ready: bool,
+        fallback: *ArtifactRepairIndexFallbackCounts,
+    ) !ArtifactRepairSummarySnapshot {
+        return try artifact_repair_impl.artifactRepairSummaryIndexSnapshotForStats(self, alloc, index_name, ready, fallback);
+    }
+
+    pub fn artifactRepairSummaryIndexCountForStats(self: *DB, alloc: Allocator, index_name: []const u8) !u64 {
+        return try artifact_repair_impl.artifactRepairSummaryIndexCountForStats(self, alloc, index_name);
+    }
+
+    pub fn startArtifactRepairMetadataWorkerIfNeeded(self: *DB) void {
+        artifact_repair_impl.startArtifactRepairMetadataWorkerIfNeeded(self);
+    }
+
+    pub fn stopArtifactRepairMetadataWorker(self: *DB) void {
+        artifact_repair_impl.stopArtifactRepairMetadataWorker(self);
+    }
+
+    pub fn clearActiveIndexRepairsLocked(self: *DB) void {
+        artifact_repair_impl.clearActiveIndexRepairsLocked(self);
     }
 
     pub fn getDocument(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
@@ -880,6 +1117,17 @@ pub const DB = struct {
         group_id: u64,
     ) !void {
         try split_restore_impl.markRestorePrimaryRestoredForPath(alloc, path, backup_id, location, snapshot_path, group_id);
+    }
+
+    pub fn markRestoreCompleteForPath(
+        alloc: Allocator,
+        path: []const u8,
+        backup_id: []const u8,
+        location: []const u8,
+        snapshot_path: []const u8,
+        group_id: u64,
+    ) !void {
+        try split_restore_impl.markRestoreCompleteForPath(alloc, path, backup_id, location, snapshot_path, group_id);
     }
 
     pub fn restoreRuntimeRepairNeededForPath(alloc: Allocator, path: []const u8) !bool {
@@ -1473,6 +1721,11 @@ pub const DB = struct {
         return try schema_runtime_impl.upsertEnrichment(self, cfg);
     }
 
+    pub fn reconfigureEnrichmentRuntime(self: *DB, cfg: enrichment_runtime_mod.Config) !void {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try lifecycle_impl.reconfigureEnrichmentRuntime(self, cfg);
+    }
+
     pub fn addResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
         try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.addResolver(self, cfg);
@@ -1989,6 +2242,30 @@ pub const DB = struct {
         derived_async_impl.freeDenseArtifactRebuildWrites(alloc, writes);
     }
 
+    pub fn loadDenseArtifactTargetCounter(alloc: Allocator, store: *docstore_mod.DocStore, index_name: []const u8) !?u64 {
+        return try derived_async_impl.loadDenseArtifactTargetCounter(alloc, store, index_name);
+    }
+
+    pub fn appendDenseArtifactCounterMutations(
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        index_manager: *const index_manager_mod.IndexManager,
+        store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+        delete_keys: []const []const u8,
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+        owned_values: *std.ArrayListUnmanaged([]u8),
+    ) !void {
+        return try derived_async_impl.appendDenseArtifactCounterMutations(
+            alloc,
+            store,
+            index_manager,
+            store_writes,
+            delete_keys,
+            owned_keys,
+            owned_values,
+        );
+    }
+
     pub fn derivedAsyncApplyDerivedBatchToIndexReplay(
         ctx_ptr: *anyopaque,
         derived_batch: derived_types.DerivedBatch,
@@ -2000,6 +2277,15 @@ pub const DB = struct {
     pub fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: Allocator) !usize {
         try ha_replication_impl.enforceDurableMutationGate(self);
         return try schema_runtime_impl.replayGeneratedEnrichmentsFromStoredDocs(self, alloc);
+    }
+
+    pub fn reprocessGeneratedEnrichmentFromStoredDocs(
+        self: *DB,
+        alloc: Allocator,
+        artifact_name: ?[]const u8,
+    ) !usize {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try schema_runtime_impl.reprocessGeneratedEnrichmentFromStoredDocs(self, alloc, artifact_name);
     }
 
     pub fn overlayRuntimeStatusBestEffort(self: *DB, stats_alloc: Allocator, runtime_stats: *types.DBStats) void {
@@ -2016,6 +2302,10 @@ pub const DB = struct {
 
     pub fn runtimeStatusStatsConsistent(self: *DB, alloc: Allocator) !types.DBStats {
         return try lifecycle_impl.runtimeStatusStatsConsistent(self, alloc);
+    }
+
+    pub fn runtimeStatusStatsConsistentIfAvailable(self: *DB, alloc: Allocator) !?types.DBStats {
+        return try lifecycle_impl.tryRuntimeStatusStatsConsistent(self, alloc);
     }
 
     pub fn tryRuntimeStatusStatsConsistent(self: *DB, alloc: Allocator) !?types.DBStats {

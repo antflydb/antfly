@@ -233,7 +233,9 @@ func buildCapabilities(text, visual, audio *pipelines.EmbeddingPipeline) embeddi
 		caps.SupportedMIMETypes = append(caps.SupportedMIMETypes,
 			embeddings.MIMETypeSupport{MIMEType: "image/jpeg"},
 			embeddings.MIMETypeSupport{MIMEType: "image/png"},
-			embeddings.MIMETypeSupport{MIMEType: "image/*"})
+			embeddings.MIMETypeSupport{MIMEType: "image/gif"},
+			embeddings.MIMETypeSupport{MIMEType: "image/bmp"},
+			embeddings.MIMETypeSupport{MIMEType: "image/webp"})
 	}
 
 	if audio != nil {

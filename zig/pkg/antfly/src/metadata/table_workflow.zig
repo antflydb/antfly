@@ -347,7 +347,11 @@ fn reconcileForService(loop: *control_loop.MetadataControlLoop, service: anytype
 }
 
 fn validateSplitIntentDocIdentity(current: metadata_reconciler.CurrentMetadataState, intent: table_manager.SplitIntent) !void {
-    const source = findMergedGroupStatus(current.merged_group_statuses, intent.source_group_id) orelse return error.DocIdentityNamespaceMismatch;
+    const source = findMergedGroupStatus(current.merged_group_statuses, intent.source_group_id) orelse {
+        if (!currentHasDocIdentityTelemetry(current)) return;
+        return error.DocIdentityNamespaceMismatch;
+    };
+    if (!runtimeDocIdentityHasFacts(source.doc_identity)) return;
     if (source.doc_identity_reassignment_active) return error.DocIdentityNamespaceMismatch;
     if (source.doc_identity_namespace_conflict) return error.DocIdentityNamespaceMismatch;
     if (source.doc_identity.rebuild_required) return error.DocIdentityNamespaceMismatch;
@@ -374,6 +378,41 @@ fn findMergedGroupStatus(
         if (status.group_id == group_id) return status;
     }
     return null;
+}
+
+fn currentHasDocIdentityTelemetry(current: metadata_reconciler.CurrentMetadataState) bool {
+    for (current.merged_group_statuses) |status| {
+        if (runtimeDocIdentityHasFacts(status.doc_identity)) return true;
+    }
+    for (current.stores) |store| {
+        for (store.runtime_statuses) |status| {
+            if (runtimeDocIdentityHasFacts(status.doc_identity)) return true;
+        }
+    }
+    return false;
+}
+
+fn runtimeDocIdentityHasFacts(stats: table_manager.RuntimeDocIdentityStatusReport) bool {
+    return stats.namespace_table_id != 0 or
+        stats.namespace_shard_id != 0 or
+        stats.namespace_range_id != 0 or
+        stats.next_ordinal != 1 or
+        stats.allocated_ordinals != 0 or
+        stats.ordinal_capacity_remaining != 0 or
+        stats.ordinal_capacity_exhausted or
+        stats.rebuild_required or
+        stats.state_rows != 0 or
+        stats.live_ordinals != 0 or
+        stats.tombstone_ordinals != 0 or
+        stats.min_created_generation != 0 or
+        stats.max_created_generation != 0 or
+        stats.min_deleted_generation != 0 or
+        stats.max_deleted_generation != 0 or
+        stats.scanned_primary_docs != 0 or
+        stats.primary_docs_missing_ordinals != 0 or
+        stats.primary_docs_missing_identity_state != 0 or
+        stats.primary_docs_with_tombstone_ordinals != 0 or
+        stats.complete;
 }
 
 fn runtimeDocIdentityHasOrdinalRows(stats: table_manager.RuntimeDocIdentityStatusReport) bool {

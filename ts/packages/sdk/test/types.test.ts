@@ -2,6 +2,9 @@
  * Type tests for Antfly query integration
  * These tests verify that the Antfly query types are properly integrated
  */
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, expectTypeOf, it } from "vitest";
 import type {
   AntflyQuery,
@@ -14,6 +17,7 @@ import type {
   MatchQuery,
   NumericRangeQuery,
   QueryRequest,
+  QueryResult,
   QueryStringQuery,
   RowFilterEntry,
   RowOperation,
@@ -66,8 +70,26 @@ import type {
   RowsWhereBranchAtom,
   RowsWindowFrame,
   RowsWindowRequest,
+  SortProfile,
   TermQuery,
 } from "../src/types.js";
+import {
+  formatQueryHitsTotal,
+  queryHitsTotalIsExact,
+  queryResultHitsTotal,
+  queryResultTotalHits,
+} from "../src/types.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+function generatedSortProfileDeclaration(): string {
+  const generatedApi = readFileSync(join(__dirname, "../src/public-api.d.ts"), "utf8");
+  const match = generatedApi.match(/SortProfile: \{[\s\S]*?\n        \};/);
+  if (!match) {
+    throw new Error("generated SortProfile declaration not found");
+  }
+  return match[0];
+}
 
 describe("Antfly Query Type Integration", () => {
   describe("QueryRequest type safety", () => {
@@ -127,6 +149,25 @@ describe("Antfly Query Type Integration", () => {
 
       expect(query.exclusion_query).toBeDefined();
       expectTypeOf(query.exclusion_query).toMatchTypeOf<AntflyQuery | undefined>();
+    });
+  });
+
+  describe("SortProfile diagnostics", () => {
+    it("keeps the public diagnostic surface closed to stable fields", () => {
+      const profile: SortProfile = {
+        plan: "native_doc_values_top_n",
+        candidate_count: 7,
+      };
+
+      expect(profile.plan).toBe("native_doc_values_top_n");
+      expectTypeOf(profile.plan).toEqualTypeOf<string | undefined>();
+      expectTypeOf(profile.candidate_count).toEqualTypeOf<number | undefined>();
+
+      const declaration = generatedSortProfileDeclaration();
+      expect(declaration).toContain("plan?: string");
+      expect(declaration).toContain("candidate_count?: number");
+      expect(declaration).not.toContain("native_doc_value_load_us");
+      expect(declaration).not.toContain("collector_heap_peak");
     });
   });
 
@@ -873,5 +914,22 @@ describe("Relational row plan type integration", () => {
     expect(batch.operations[0]?.on_conflict?.json_set?.[0]?.path).toEqual(["billing", "plan"]);
     expect(batch.operations[0]?.on_conflict?.json_set?.[1]?.expr).toMatchObject({ op: "lower" });
     expect(batch.operations[0]?.on_conflict?.array_update?.[0]?.op).toBe("add_to_set");
+  });
+});
+
+describe("Query total helpers", () => {
+  it("preserves lower-bound total semantics for display", () => {
+    const result: QueryResult = {
+      hits: {
+        total: { value: 42, relation: "gte" },
+        hits: [],
+      },
+    };
+
+    expect(queryResultHitsTotal(result)).toEqual({ value: 42, relation: "gte" });
+    expect(queryHitsTotalIsExact(result.hits?.total)).toBe(false);
+    expect(formatQueryHitsTotal(result.hits?.total)).toBe(">= 42 hits");
+    expect(formatQueryHitsTotal({ value: 1, relation: "exact" })).toBe("1 hit");
+    expect(queryResultTotalHits(result)).toBe(42);
   });
 });

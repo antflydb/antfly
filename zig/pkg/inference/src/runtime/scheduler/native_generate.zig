@@ -152,6 +152,7 @@ pub const NativeGenerateCoordinator = struct {
     max_decode_streak_before_prefill: usize = 4,
     base_prefill_chunk_size: usize = 256,
     min_prefill_chunk_size: usize = 32,
+    max_idle_prefill_chunk_size: usize = 2048,
 
     pub fn init(allocator: std.mem.Allocator) NativeGenerateCoordinator {
         return .{ .allocator = allocator };
@@ -611,7 +612,16 @@ pub const NativeGenerateCoordinator = struct {
         const prompt_token_estimate = @max(prompt_bytes / 4, 1);
 
         var target = self.base_prefill_chunk_size;
-        if (state.decode_requests > 0) {
+        if (state.decode_requests == 0 and state.prefill_requests <= 1 and state.waiting_requests == 0) {
+            // Sole request on an idle scheduler: no fairness pressure, so run
+            // the prompt in as few passes as possible. Chunked prefill costs
+            // several full per-layer passes and starves large-GEMM
+            // efficiency. Still capped: activation scratch scales with chunk
+            // rows, so an unbounded chunk turns very long prompts into a
+            // single allocation spike that the memory budget was never sized
+            // for.
+            target = @min(prompt_token_estimate, self.max_idle_prefill_chunk_size);
+        } else if (state.decode_requests > 0) {
             target = self.min_prefill_chunk_size;
         } else if (state.prefill_requests >= 3 or state.active_units >= 12) {
             target = self.min_prefill_chunk_size;

@@ -151,9 +151,16 @@ pub const Routes = struct {
     pub const lookup_marker = "/lookup/";
     pub const temporal_unique_owner_suffix = "/relational-temporal-unique-owner";
     pub const temporal_unique_overlap_owner_suffix = "/relational-temporal-unique-overlap-owner";
+    pub const documents_suffix = "/documents";
     pub const documents_marker = "/documents/";
     pub const artifacts_marker = "/artifacts/";
     pub const artifacts_suffix = "/artifacts";
+    pub const artifact_repair_suffix = "/repair/issues";
+    pub const artifact_repair_run_suffix = "/repair/run";
+    pub const repair_jobs_suffix = "/repair/jobs";
+    pub const repair_jobs_marker = "/repair/jobs/";
+    pub const repair_attempts_marker = "/attempts/";
+    pub const repair_cancel_state_suffix = "/cancel-state";
     pub const reprocess_suffix = "/reprocess";
     pub const placement_update_suffix = ":placement";
     pub const tablespace_binding_suffix = "/tablespace";
@@ -270,6 +277,15 @@ pub const Routes = struct {
 
     pub const TableArtifacts = struct {
         table_name: []const u8,
+    };
+
+    pub const TableArtifactRepair = struct {
+        table_name: []const u8,
+    };
+
+    pub const TableRepairJob = struct {
+        table_name: []const u8,
+        job_id: []const u8,
     };
 
     pub const TableIndex = struct {
@@ -475,6 +491,11 @@ pub const Routes = struct {
         artifact_name: []const u8,
     };
 
+    pub const GroupTableArtifactRepair = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
     pub const GroupBatch = struct {
         group_id: u64,
         table_name: []const u8,
@@ -588,6 +609,12 @@ pub const Routes = struct {
         table_name: []const u8,
     };
 
+    pub const InternalTableRepairCancelState = struct {
+        table_name: []const u8,
+        job_id: []const u8,
+        attempt_id: []const u8,
+    };
+
     pub const TransactionSession = struct {
         txn_id: []const u8,
     };
@@ -613,8 +640,8 @@ pub const Routes = struct {
 
     pub fn matchTableScan(path: []const u8) ?TableScan {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
-        if (!std.mem.endsWith(u8, path, lookup_suffix)) return null;
-        const table_name = path[tables_prefix.len .. path.len - lookup_suffix.len];
+        if (!std.mem.endsWith(u8, path, documents_suffix)) return null;
+        const table_name = path[tables_prefix.len .. path.len - documents_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .table_name = table_name };
     }
@@ -865,6 +892,56 @@ pub const Routes = struct {
         const job_id = rest[marker_index + marker.len ..];
         if (table_name.len == 0 or job_id.len == 0) return null;
         if (std.mem.indexOfScalar(u8, table_name, '/') != null or std.mem.indexOfScalar(u8, job_id, '/') != null) return null;
+        return .{ .table_name = table_name, .job_id = job_id };
+    }
+
+    pub fn matchTableArtifactRepair(path: []const u8) ?TableArtifactRepair {
+        return matchTableArtifactRepairWithSuffix(path, artifact_repair_suffix);
+    }
+
+    pub fn matchTableArtifactRepairRun(path: []const u8) ?TableArtifactRepair {
+        return matchTableArtifactRepairWithSuffix(path, artifact_repair_run_suffix);
+    }
+
+    pub fn matchTableRepairJobs(path: []const u8) ?TableArtifactRepair {
+        return matchTableArtifactRepairWithSuffix(path, repair_jobs_suffix);
+    }
+
+    pub fn matchTableRepairJob(path: []const u8) ?TableRepairJob {
+        return matchTableRepairJobPath(path, "");
+    }
+
+    pub fn matchTableRepairJobAdvance(path: []const u8) ?TableRepairJob {
+        return matchTableRepairJobPath(path, advance_suffix);
+    }
+
+    pub fn matchTableRepairJobCancel(path: []const u8) ?TableRepairJob {
+        return matchTableRepairJobPath(path, cancel_suffix);
+    }
+
+    fn matchTableArtifactRepairWithSuffix(path: []const u8, suffix: []const u8) ?TableArtifactRepair {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, suffix)) return null;
+        const table_name = path[tables_prefix.len .. path.len - suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .table_name = table_name };
+    }
+
+    fn matchTableRepairJobPath(path: []const u8, suffix: []const u8) ?TableRepairJob {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        const rest = path[tables_prefix.len..];
+        const marker_index = std.mem.indexOf(u8, rest, repair_jobs_marker) orelse return null;
+        if (marker_index == 0) return null;
+        const table_name = rest[0..marker_index];
+        var job_id = rest[marker_index + repair_jobs_marker.len ..];
+        if (suffix.len > 0) {
+            const expected_suffix = if (std.mem.eql(u8, suffix, advance_suffix)) "/advance" else "/cancel";
+            if (job_id.len <= expected_suffix.len) return null;
+            if (!std.mem.endsWith(u8, job_id, expected_suffix)) return null;
+            job_id = job_id[0 .. job_id.len - expected_suffix.len];
+        } else if (std.mem.indexOfScalar(u8, job_id, '/') != null) return null;
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        if (job_id.len == 0 or std.mem.indexOfScalar(u8, job_id, '/') != null) return null;
         return .{ .table_name = table_name, .job_id = job_id };
     }
 
@@ -1477,6 +1554,24 @@ pub const Routes = struct {
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
 
+    pub fn matchGroupTableArtifactRepair(path: []const u8) ?GroupTableArtifactRepair {
+        return matchGroupTableArtifactRepairWithSuffix(path, artifact_repair_suffix);
+    }
+
+    pub fn matchGroupTableArtifactRepairRun(path: []const u8) ?GroupTableArtifactRepair {
+        return matchGroupTableArtifactRepairWithSuffix(path, artifact_repair_run_suffix);
+    }
+
+    fn matchGroupTableArtifactRepairWithSuffix(path: []const u8, suffix: []const u8) ?GroupTableArtifactRepair {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
     pub fn matchGroupDocumentArtifact(path: []const u8) ?GroupDocumentArtifact {
         return matchGroupDocumentArtifactWithReprocess(path, false);
     }
@@ -1640,6 +1735,23 @@ pub const Routes = struct {
         const table_name = path[internal_tables_prefix.len .. path.len - corrupt_embedding_artifact_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .table_name = table_name };
+    }
+
+    pub fn matchInternalTableRepairCancelState(path: []const u8) ?InternalTableRepairCancelState {
+        if (!std.mem.startsWith(u8, path, internal_tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, repair_cancel_state_suffix)) return null;
+        const rest = path[internal_tables_prefix.len..];
+        const job_marker_index = std.mem.indexOf(u8, rest, repair_jobs_marker) orelse return null;
+        if (job_marker_index == 0) return null;
+        const table_name = rest[0..job_marker_index];
+        const job_and_attempt = rest[job_marker_index + repair_jobs_marker.len .. path.len - internal_tables_prefix.len - repair_cancel_state_suffix.len];
+        const attempts_index = std.mem.indexOf(u8, job_and_attempt, repair_attempts_marker) orelse return null;
+        const job_id = job_and_attempt[0..attempts_index];
+        const attempt_id = job_and_attempt[attempts_index + repair_attempts_marker.len ..];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        if (job_id.len == 0 or std.mem.indexOfScalar(u8, job_id, '/') != null) return null;
+        if (attempt_id.len == 0 or std.mem.indexOfScalar(u8, attempt_id, '/') != null) return null;
+        return .{ .table_name = table_name, .job_id = job_id, .attempt_id = attempt_id };
     }
 
     pub fn matchGroupGraphExpand(path: []const u8) ?GroupGraphExpand {
@@ -1853,7 +1965,7 @@ test "public api routes compile" {
     const lookup = Routes.matchTableLookup("/tables/docs/lookup/doc:a").?;
     try std.testing.expectEqualStrings("docs", lookup.table_name);
     try std.testing.expectEqualStrings("doc:a", lookup.key);
-    const scan = Routes.matchTableScan("/tables/docs/lookup").?;
+    const scan = Routes.matchTableScan("/tables/docs/documents").?;
     try std.testing.expectEqualStrings("docs", scan.table_name);
     const query = Routes.matchTableQuery("/tables/docs/query").?;
     try std.testing.expectEqualStrings("docs", query.table_name);

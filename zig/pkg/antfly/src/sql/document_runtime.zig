@@ -77,6 +77,13 @@ pub const QueryResponse = struct {
     }
 };
 
+fn documentSqlScanLineKey(value: std.json.Value) ![]const u8 {
+    if (value != .object) return error.InvalidRowsRequest;
+    const key_value = value.object.get("_id") orelse value.object.get("key") orelse return error.InvalidRowsRequest;
+    if (key_value != .string) return error.InvalidRowsRequest;
+    return key_value.string;
+}
+
 pub const AlgebraicAggregateRequest = struct {
     index_name: []const u8,
     materialization_name: []const u8,
@@ -362,10 +369,9 @@ pub fn executeReadPlanAlloc(
                 var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
                 defer parsed.deinit();
                 if (parsed.value != .object) return error.InvalidRowsRequest;
-                const key_value = parsed.value.object.get("key") orelse return error.InvalidRowsRequest;
-                if (key_value != .string) return error.InvalidRowsRequest;
+                const key = try documentSqlScanLineKey(parsed.value);
 
-                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
+                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key, .{}, consistency)) orelse continue;
                 defer lookup.deinit(alloc);
                 if (scan_plan.residual_filter_json) |filter| {
                     if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
@@ -373,7 +379,7 @@ pub fn executeReadPlanAlloc(
                 var lateral_match = try documentSqlLateralSubqueryMatchesAlloc(alloc, source, native_table_name, public_table_name, lookup.json, lowered.lateral_subquery, consistency);
                 defer lateral_match.deinitOwned(alloc);
                 if (!lateral_match.matched and lowered.lateral_subquery.?.join_kind != .left) continue;
-                try rows.append(alloc, try documentSqlProjectedRowJsonWithLateralAlloc(alloc, key_value.string, lookup.json, lowered.projection, lateral_match));
+                try rows.append(alloc, try documentSqlProjectedRowJsonWithLateralAlloc(alloc, key, lookup.json, lowered.projection, lateral_match));
                 if (lowered.limit) |limit| {
                     if (rows.items.len >= limit) break;
                 }
@@ -509,15 +515,14 @@ fn collectDocumentProducerCandidateIdsAlloc(
                 var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
                 defer parsed.deinit();
                 if (parsed.value != .object) return error.InvalidRowsRequest;
-                const key_value = parsed.value.object.get("key") orelse return error.InvalidRowsRequest;
-                if (key_value != .string) return error.InvalidRowsRequest;
+                const key = try documentSqlScanLineKey(parsed.value);
 
                 if (scan_plan.residual_filter_json) |filter| {
-                    var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
+                    var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key, .{}, consistency)) orelse continue;
                     defer lookup.deinit(alloc);
                     if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
                 }
-                try appendDocumentCandidateIdAlloc(alloc, &ids, key_value.string);
+                try appendDocumentCandidateIdAlloc(alloc, &ids, key);
             }
             try documentSqlAdmitBoundedRowCount(scanned, scan_plan.max_rows);
         },
@@ -1788,6 +1793,7 @@ pub fn materializeDocumentMergeMutationBatchAlloc(
                     .key = key,
                     .value = value,
                 });
+                try appendDocumentMergeVersionPredicateAlloc(alloc, &predicates, source_candidate.id, 0);
             } else if (arm.insert_assignments.len != 0) {
                 const key = try alloc.dupe(u8, source_candidate.id);
                 errdefer alloc.free(key);
@@ -1801,6 +1807,7 @@ pub fn materializeDocumentMergeMutationBatchAlloc(
                     .key = key,
                     .value = value,
                 });
+                try appendDocumentMergeVersionPredicateAlloc(alloc, &predicates, source_candidate.id, 0);
             }
         }
     }
@@ -1870,7 +1877,7 @@ pub fn materializeDocumentMergeMutationBatchAlloc(
             .transforms = transform_slice,
             .predicates = predicate_slice,
             .sync_level = lowered.sync_level,
-            .write_mode = .create_only,
+            .write_mode = if (delete_slice.len == 0 and transform_slice.len == 0) .create_only else .upsert,
         },
         .inserted = @intCast(write_slice.len),
         .deleted = @intCast(delete_slice.len),
@@ -2219,6 +2226,8 @@ fn documentConflictReturningRowAfterOperationsAlloc(
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRowsRequest;
+    var doc = try json_helpers.cloneJsonValue(alloc, parsed.value);
+    defer json_helpers.deinitJsonValue(alloc, &doc);
     for (operations) |op| {
         if (op.op != .set) return error.InvalidRowsRequest;
         const value_json = op.value_json orelse return error.InvalidRowsRequest;
@@ -2226,9 +2235,9 @@ fn documentConflictReturningRowAfterOperationsAlloc(
         defer parsed_value.deinit();
         var cloned = try json_helpers.cloneJsonValue(alloc, parsed_value.value);
         errdefer json_helpers.deinitJsonValue(alloc, &cloned);
-        try documentConflictApplySetValueAlloc(alloc, &parsed.value, op.path, 0, &cloned);
+        try documentConflictApplySetValueAlloc(alloc, &doc, op.path, 0, &cloned);
     }
-    return try documentConflictReturningRowFromValueAlloc(alloc, key, parsed.value, fields, version);
+    return try documentConflictReturningRowFromValueAlloc(alloc, key, doc, fields, version);
 }
 
 pub fn materializeDocumentConflictWriteBatchAlloc(
@@ -2524,10 +2533,9 @@ pub fn executeAggregatePlanAlloc(
                 var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
                 defer parsed.deinit();
                 if (parsed.value != .object) return error.InvalidRowsRequest;
-                const key_value = parsed.value.object.get("key") orelse return error.InvalidRowsRequest;
-                if (key_value != .string) return error.InvalidRowsRequest;
+                const key = try documentSqlScanLineKey(parsed.value);
 
-                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
+                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key, .{}, consistency)) orelse continue;
                 defer lookup.deinit(alloc);
                 scanned_docs += 1;
                 try documentSqlAdmitBoundedRowCount(scanned_docs, scan_plan.max_rows);
@@ -2685,10 +2693,9 @@ fn executeLoweredDocumentSqlNumericAggregatePlanAlloc(
                 var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
                 defer parsed.deinit();
                 if (parsed.value != .object) return error.InvalidRowsRequest;
-                const key_value = parsed.value.object.get("key") orelse return error.InvalidRowsRequest;
-                if (key_value != .string) return error.InvalidRowsRequest;
+                const key = try documentSqlScanLineKey(parsed.value);
 
-                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
+                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key, .{}, consistency)) orelse continue;
                 defer lookup.deinit(alloc);
                 scanned_docs += 1;
                 try documentSqlAdmitBoundedRowCount(scanned_docs, scan_plan.max_rows);
@@ -2768,10 +2775,9 @@ fn executeLoweredDocumentSqlGroupedCountAggregatePlanAlloc(
                 var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
                 defer parsed.deinit();
                 if (parsed.value != .object) return error.InvalidRowsRequest;
-                const key_value = parsed.value.object.get("key") orelse return error.InvalidRowsRequest;
-                if (key_value != .string) return error.InvalidRowsRequest;
+                const key = try documentSqlScanLineKey(parsed.value);
 
-                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
+                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key, .{}, consistency)) orelse continue;
                 defer lookup.deinit(alloc);
                 scanned_docs += 1;
                 try documentSqlAdmitBoundedRowCount(scanned_docs, scan_plan.max_rows);
@@ -2850,10 +2856,9 @@ fn executeLoweredDocumentSqlGroupedNumericAggregatePlanAlloc(
                 var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
                 defer parsed.deinit();
                 if (parsed.value != .object) return error.InvalidRowsRequest;
-                const key_value = parsed.value.object.get("key") orelse return error.InvalidRowsRequest;
-                if (key_value != .string) return error.InvalidRowsRequest;
+                const key = try documentSqlScanLineKey(parsed.value);
 
-                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
+                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key, .{}, consistency)) orelse continue;
                 defer lookup.deinit(alloc);
                 scanned_docs += 1;
                 try documentSqlAdmitBoundedRowCount(scanned_docs, scan_plan.max_rows);
@@ -3120,10 +3125,9 @@ fn executeOrderedLoweredDocumentSqlReadPlanAlloc(
                 var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
                 defer parsed.deinit();
                 if (parsed.value != .object) return error.InvalidRowsRequest;
-                const key_value = parsed.value.object.get("key") orelse return error.InvalidRowsRequest;
-                if (key_value != .string) return error.InvalidRowsRequest;
+                const key = try documentSqlScanLineKey(parsed.value);
 
-                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
+                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key, .{}, consistency)) orelse continue;
                 defer lookup.deinit(alloc);
                 if (scan_plan.residual_filter_json) |filter| {
                     if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
@@ -3131,7 +3135,7 @@ fn executeOrderedLoweredDocumentSqlReadPlanAlloc(
                 var lateral_match = try documentSqlLateralSubqueryMatchesAlloc(alloc, source, native_table_name, public_table_name, lookup.json, lowered.lateral_subquery, consistency);
                 defer lateral_match.deinitOwned(alloc);
                 if (!lateral_match.matched and lowered.lateral_subquery.?.join_kind != .left) continue;
-                try appendOrderedDocumentSqlCandidateAlloc(alloc, &candidates, key_value.string, lookup.json, order_by, lateral_match);
+                try appendOrderedDocumentSqlCandidateAlloc(alloc, &candidates, key, lookup.json, order_by, lateral_match);
             }
             try documentSqlAdmitBoundedRowProbeCount(scanned, scan_plan.max_rows);
         },
@@ -3769,6 +3773,14 @@ fn documentSqlTotalHitsFromQueryResponse(alloc: std.mem.Allocator, response_json
     return switch (total_value) {
         .integer => |value| if (value >= 0 and value <= std.math.maxInt(u32)) @intCast(value) else error.InvalidRowsRequest,
         .number_string => |text| try std.fmt.parseUnsigned(u32, text, 10),
+        .object => |object| blk: {
+            const value = object.get("value") orelse return error.InvalidRowsRequest;
+            break :blk switch (value) {
+                .integer => |int| if (int >= 0 and int <= std.math.maxInt(u32)) @intCast(int) else error.InvalidRowsRequest,
+                .number_string => |text| try std.fmt.parseUnsigned(u32, text, 10),
+                else => error.InvalidRowsRequest,
+            };
+        },
         else => error.InvalidRowsRequest,
     };
 }
@@ -4411,15 +4423,14 @@ fn executeOrderedLoweredDocumentSqlUnnestReadPlanAlloc(
                 var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
                 defer parsed.deinit();
                 if (parsed.value != .object) return error.InvalidRowsRequest;
-                const key_value = parsed.value.object.get("key") orelse return error.InvalidRowsRequest;
-                if (key_value != .string) return error.InvalidRowsRequest;
+                const key = try documentSqlScanLineKey(parsed.value);
 
-                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
+                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key, .{}, consistency)) orelse continue;
                 defer lookup.deinit(alloc);
                 if (scan_plan.residual_filter_json) |filter| {
                     if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
                 }
-                try appendOrderedDocumentSqlUnnestCandidatesAlloc(alloc, &candidates, key_value.string, lookup.json, lowered.projection, unnest, order_by);
+                try appendOrderedDocumentSqlUnnestCandidatesAlloc(alloc, &candidates, key, lookup.json, lowered.projection, unnest, order_by);
             }
             try documentSqlAdmitBoundedRowProbeCount(scanned, scan_plan.max_rows);
         },
@@ -4514,15 +4525,14 @@ fn executeLoweredDocumentSqlUnnestReadPlanAlloc(
                 var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
                 defer parsed.deinit();
                 if (parsed.value != .object) return error.InvalidRowsRequest;
-                const key_value = parsed.value.object.get("key") orelse return error.InvalidRowsRequest;
-                if (key_value != .string) return error.InvalidRowsRequest;
+                const key = try documentSqlScanLineKey(parsed.value);
 
-                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
+                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key, .{}, consistency)) orelse continue;
                 defer lookup.deinit(alloc);
                 if (scan_plan.residual_filter_json) |filter| {
                     if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
                 }
-                try appendDocumentSqlUnnestRowsAlloc(alloc, key_value.string, lookup.json, lowered.projection, unnest, lowered.limit, &rows);
+                try appendDocumentSqlUnnestRowsAlloc(alloc, key, lookup.json, lowered.projection, unnest, lowered.limit, &rows);
                 if (lowered.limit) |limit| {
                     if (rows.items.len >= limit) break;
                 }
@@ -4921,7 +4931,7 @@ fn documentSqlProjectedParsedRowJsonWithUnnestAndLateralAlloc(
                     try writer.writeAll("null");
                     continue;
                 }
-                const number = try documentSqlJsonNumber(value);
+                const number = try documentSqlNumericCastValue(value);
                 try writer.print("{d}", .{@abs(number)});
             },
             .numeric_round, .numeric_trunc, .numeric_floor, .numeric_ceil, .numeric_sqrt, .numeric_sign => {
@@ -4933,7 +4943,7 @@ fn documentSqlProjectedParsedRowJsonWithUnnestAndLateralAlloc(
                     try writer.writeAll("null");
                     continue;
                 }
-                const number = try documentSqlJsonNumber(value);
+                const number = try documentSqlNumericCastValue(value);
                 const result = try documentSqlNumericUnaryResult(number, item.kind);
                 try writer.print("{d}", .{result});
             },
@@ -4946,7 +4956,7 @@ fn documentSqlProjectedParsedRowJsonWithUnnestAndLateralAlloc(
                     try writer.writeAll("null");
                     continue;
                 }
-                const number = try documentSqlJsonNumber(value);
+                const number = try documentSqlNumericCastValue(value);
                 const operand = std.fmt.parseFloat(f64, item.numeric_operand) catch return error.InvalidRowsRequest;
                 const result = switch (item.numeric_operator) {
                     .add => number + operand,
@@ -5231,6 +5241,10 @@ fn documentSqlProjectedParsedRowJsonWithUnnestAndLateralAlloc(
                     try writer.writeAll("null");
                     continue;
                 };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
                 const text = try documentSqlFilterStringValue(value);
                 const length = std.unicode.utf8CountCodepoints(text) catch return error.InvalidRowsRequest;
                 try writer.print("{d}", .{length});
@@ -5240,6 +5254,10 @@ fn documentSqlProjectedParsedRowJsonWithUnnestAndLateralAlloc(
                     try writer.writeAll("null");
                     continue;
                 };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
                 const text = try documentSqlFilterStringValue(value);
                 const length = if (item.kind == .text_bit_length) text.len * 8 else text.len;
                 try writer.print("{d}", .{length});
@@ -5249,6 +5267,10 @@ fn documentSqlProjectedParsedRowJsonWithUnnestAndLateralAlloc(
                     try writer.writeAll("null");
                     continue;
                 };
+                if (value == .null) {
+                    try writer.writeAll("null");
+                    continue;
+                }
                 const text = try documentSqlFilterStringValue(value);
                 if (!documentSqlAsciiOnly(text)) return error.UnsupportedSqlShape;
                 const titled = try documentSqlInitcapAsciiAlloc(alloc, text);
@@ -6535,7 +6557,12 @@ fn documentSqlUtcDateFromDatetimeAlloc(alloc: std.mem.Allocator, value: std.json
     const epoch_days = timestamp_ns / document_sql_nanoseconds_per_day;
     if (epoch_days > std.math.maxInt(i64)) return error.InvalidRowsRequest;
     const day = documentSqlUtcDateFromEpochDays(@intCast(epoch_days));
-    return try std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}", .{ day.year, day.month, day.day });
+    if (day.year < 0 or day.year > 9999 or day.month < 1 or day.day < 1) return error.InvalidRowsRequest;
+    return try std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+        @as(u64, @intCast(day.year)),
+        @as(u64, @intCast(day.month)),
+        @as(u64, @intCast(day.day)),
+    });
 }
 
 const DocumentSqlUtcDate = struct {
@@ -8034,7 +8061,7 @@ test "document SQL residual pad term filters match rows" {
     try std.testing.expect(try residualFilterMatchesAlloc(
         alloc,
         "{\"status\":\"abc\"}",
-        "{\"text_pad_term\":{\"path\":\"/status\",\"side\":\"right\",\"width\":6,\"fill\":\"-+\",\"value\":\"abc-+a\"}}",
+        "{\"text_pad_term\":{\"path\":\"/status\",\"side\":\"right\",\"width\":6,\"fill\":\"-+\",\"value\":\"abc-+-\"}}",
     ));
     try std.testing.expect(try residualFilterMatchesAlloc(
         alloc,
@@ -8395,7 +8422,7 @@ test "document SQL residual chr term filters match rows" {
         alloc,
         "{\"amount\":65}",
         "{\"text_chr_term\":{\"codepoint\":233,\"value\":\"\\u00e9\"}}",
-    ) == false);
+    ));
     try std.testing.expect(try residualFilterMatchesAlloc(
         alloc,
         "{}",
@@ -8473,7 +8500,7 @@ test "document SQL residual text unary term filters match rows" {
     try std.testing.expect(try residualFilterMatchesAlloc(
         alloc,
         "{\"status\":\"héllo\"}",
-        "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"md5\",\"value\":\"9f6ec78061f7655b2782d3e5b8cd77a2\"}}",
+        "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"md5\",\"value\":\"be50e8478cf24ff3595bc7307fb91b50\"}}",
     ));
     try std.testing.expect(try residualFilterMatchesAlloc(
         alloc,
@@ -8523,14 +8550,11 @@ test "document SQL residual text unary term filters match rows" {
             "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"initcap\",\"value\":\"Caf\"}}",
         ),
     );
-    try std.testing.expectError(
-        error.InvalidRowsRequest,
-        residualFilterMatchesAlloc(
-            alloc,
-            "{\"status\":\"hello\"}",
-            "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"reverse\",\"value\":\"olleh\"}}",
-        ),
-    );
+    try std.testing.expect(try residualFilterMatchesAlloc(
+        alloc,
+        "{\"status\":\"hello\"}",
+        "{\"text_unary_term\":{\"path\":\"/status\",\"operator\":\"reverse\",\"value\":\"olleh\"}}",
+    ));
     try std.testing.expectError(
         error.InvalidRowsRequest,
         residualFilterMatchesAlloc(
@@ -10274,7 +10298,7 @@ test "document SQL materializes md5 projections" {
     };
     const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
     defer alloc.free(row);
-    try std.testing.expectEqualStrings("{\"status_md5\":\"5d41402abc4b2a76b9719d911017c592\",\"accent_md5\":\"9f6ec78061f7655b2782d3e5b8cd77a2\",\"missing_md5\":null,\"absent_md5\":null}", row);
+    try std.testing.expectEqualStrings("{\"status_md5\":\"5d41402abc4b2a76b9719d911017c592\",\"accent_md5\":\"be50e8478cf24ff3595bc7307fb91b50\",\"missing_md5\":null,\"absent_md5\":null}", row);
 
     var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
     defer wrong_type.deinit();
@@ -10515,7 +10539,7 @@ test "document SQL materializes text binary projections" {
     };
     const row = try documentSqlProjectedParsedRowJsonAlloc(alloc, "doc:a", parsed.value, null, projection[0..]);
     defer alloc.free(row);
-    try std.testing.expectEqualStrings("{\"has_prefix\":true,\"has_suffix\":true,\"bad_prefix\":false,\"accent_pos\":3,\"missing_pos\":0,\"empty_pos\":1,\"position_equivalent\":5,\"missing_prefix\":null,\"absent_suffix\":null}", row);
+    try std.testing.expectEqualStrings("{\"has_prefix\":true,\"has_suffix\":true,\"bad_prefix\":false,\"accent_pos\":3,\"missing_pos\":0,\"empty_pos\":1,\"position_equivalent\":4,\"missing_prefix\":null,\"absent_suffix\":null}", row);
 
     var wrong_type = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":42}", .{ .allocate = .alloc_always });
     defer wrong_type.deinit();

@@ -24,17 +24,6 @@
       "release_gate": "relational-release-gate"
     },
     {
-      "id": "tokenized-wrapper-deletion",
-      "relational_slices_section": "SQL adapter and cutover contract removal",
-      "surface": "tokenized_wrapper_deletion",
-      "status": "release_evidence",
-      "current_evidence": "Compatibility wrapper and production-ingress cutover inventories now leave no migration-blocker wrappers and no parser-cutover cutover contracts. Runtime bounded-scan contracts are tracked outside parser fallback removal in document_sql_bounded_scan_inventory.json, which is currently empty.",
-      "missing_evidence": "",
-      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/sql_production_ingress_cutover.json",
-      "evidence_symbol": "sql_production_ingress_cutover",
-      "release_gate": "relational-release-gate"
-    },
-    {
       "id": "structural-sql-normalization",
       "relational_slices_section": "SQL adapter and cutover contract removal",
       "surface": "structural_sql_normalization",
@@ -43,6 +32,17 @@
       "missing_evidence": "",
       "evidence_file": "zig/pkg/antfly/src/sql/lower_dml.zig",
       "evidence_symbol": "generatedDmlAstSurfaceEqual",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "tokenized-contract-deletion",
+      "relational_slices_section": "SQL adapter and cutover contract removal",
+      "surface": "tokenized_contract_deletion",
+      "status": "release_evidence",
+      "current_evidence": "Compatibility wrapper and production-ingress cutover inventories now leave no migration-blocker wrappers and no parser-cutover cutover contracts. Runtime bounded-scan contracts are tracked outside parser fallback removal in document_sql_bounded_scan_inventory.json, which is currently empty.",
+      "missing_evidence": "",
+      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/sql_production_ingress_cutover.json",
+      "evidence_symbol": "sql_production_ingress_cutover",
       "release_gate": "relational-release-gate"
     }
   ]

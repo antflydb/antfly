@@ -1215,11 +1215,11 @@ export class AntflyClient {
     scan: (
       tableName: string,
       request?: ScanKeysRequest
-    ): AsyncGenerator<{ _key: string; [key: string]: unknown }> => {
+    ): AsyncGenerator<{ _id: string; [key: string]: unknown }> => {
       const config = this.config;
       const authHeader = this.getAuthHeader();
 
-      async function* scanGenerator(): AsyncGenerator<{ _key: string; [key: string]: unknown }> {
+      async function* scanGenerator(): AsyncGenerator<{ _id: string; [key: string]: unknown }> {
         const headers: Record<string, string> = {
           "Content-Type": "application/json",
           Accept: "application/x-ndjson",
@@ -1234,7 +1234,7 @@ export class AntflyClient {
         Object.assign(headers, config.headers);
 
         const response = await fetch(
-          `${normalizeBaseUrl(config.baseUrl)}/db/v1/tables/${tableName}/lookup`,
+          `${normalizeBaseUrl(config.baseUrl)}/db/v1/tables/${tableName}/documents`,
           {
             method: "POST",
             headers,
@@ -1289,8 +1289,8 @@ export class AntflyClient {
     scanAll: async (
       tableName: string,
       request?: ScanKeysRequest
-    ): Promise<Array<{ _key: string; [key: string]: unknown }>> => {
-      const results: Array<{ _key: string; [key: string]: unknown }> = [];
+    ): Promise<Array<{ _id: string; [key: string]: unknown }>> => {
+      const results: Array<{ _id: string; [key: string]: unknown }> = [];
       for await (const doc of this.tables.scan(tableName, request)) {
         results.push(doc);
       }

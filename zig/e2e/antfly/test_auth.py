@@ -36,12 +36,15 @@ from conftest import (
     find_free_port,
     lookup_key_path,
     maybe_preserve_tempdir,
+    raise_if_server_process_exited,
     raise_request_error_with_logs,
     resolve_binary_path,
     wait_for_server,
 )
 
 AUTH_PUBLIC_API_ROOT = "/auth/v1"
+AUTH_STARTUP_TIMEOUT_SECONDS = 30.0
+AUTH_SETUP_RETRY_TIMEOUT_SECONDS = 30.0
 
 
 def _basic_auth(username: str, password: str) -> str:
@@ -57,6 +60,23 @@ def _wait_for_auth_server(url: str, timeout: float = 30.0) -> bool:
             if resp.status_code in (200, 401):
                 return True
         except requests.ConnectionError:
+            pass
+        time.sleep(0.25)
+    return False
+
+
+def _wait_for_admin_auth(auth_url: str, timeout: float = AUTH_STARTUP_TIMEOUT_SECONDS) -> bool:
+    deadline = time.monotonic() + timeout
+    session = requests.Session()
+    session.headers["Connection"] = "close"
+    session.headers["Authorization"] = _basic_auth("admin", "admin")
+    while time.monotonic() < deadline:
+        try:
+            request_timeout = max(0.1, min(2.0, deadline - time.monotonic()))
+            response = session.get(f"{auth_url}/me", timeout=request_timeout)
+            if response.status_code == 200 and response.json().get("username") == "admin":
+                return True
+        except (ValueError, requests.RequestException):
             pass
         time.sleep(0.25)
     return False
@@ -123,15 +143,22 @@ class AuthApi:
         return response.json()
 
     def get(self, path: str):
+        deadline = time.monotonic() + 5.0
         with self._request_lock:
-            try:
-                response = self.s.get(self._url_for(path), timeout=30)
-            except requests.RequestException as err:
-                raise_request_error_with_logs(err, self._server)
+            while True:
+                raise_if_server_process_exited(self._server)
+                try:
+                    response = self.s.get(self._url_for(path), timeout=30)
+                    break
+                except requests.RequestException as err:
+                    if time.monotonic() >= deadline:
+                        raise_request_error_with_logs(err, self._server)
+                    time.sleep(0.1)
             return self._check(response)
 
     def post(self, path: str, payload: dict):
         with self._request_lock:
+            raise_if_server_process_exited(self._server)
             try:
                 response = self.s.post(self._url_for(path), json=payload, timeout=30)
             except requests.RequestException as err:
@@ -140,6 +167,7 @@ class AuthApi:
 
     def put(self, path: str, payload: dict):
         with self._request_lock:
+            raise_if_server_process_exited(self._server)
             try:
                 response = self.s.put(self._url_for(path), json=payload, timeout=30)
             except requests.RequestException as err:
@@ -148,6 +176,7 @@ class AuthApi:
 
     def delete(self, path: str):
         with self._request_lock:
+            raise_if_server_process_exited(self._server)
             try:
                 response = self.s.delete(self._url_for(path), timeout=30)
             except requests.RequestException as err:
@@ -156,17 +185,18 @@ class AuthApi:
 
     def create_table(self, table_name: str, payload: dict | None = None):
         body = payload or {"num_shards": 1}
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + AUTH_SETUP_RETRY_TIMEOUT_SECONDS
         while True:
+            raise_if_server_process_exited(self._server)
             try:
                 with self._request_lock:
                     response = self.s.post(f"{self.url}/tables/{table_name}", json=body, timeout=30)
-            except requests.RequestException:
+            except requests.RequestException as err:
                 if time.monotonic() >= deadline:
-                    raise
+                    raise_request_error_with_logs(err, self._server)
                 time.sleep(0.1)
                 continue
-            if response.status_code not in (404, 500):
+            if response.status_code not in (404, 500, 503):
                 return self._check(response)
             if time.monotonic() >= deadline:
                 return self._check(response)
@@ -179,7 +209,8 @@ class AuthApi:
         return self.get(lookup_key_path(table_name, key))
 
     def scan_keys(self, table_name: str, payload: dict) -> list[dict]:
-        response = self.s.post(f"{self.url}/tables/{table_name}/lookup", json=payload, timeout=30)
+        raise_if_server_process_exited(self._server)
+        response = self.s.post(f"{self.url}/tables/{table_name}/documents", json=payload, timeout=30)
         if response.status_code >= 400:
             self._check(response)
         if not response.content:
@@ -209,6 +240,10 @@ class SwarmAuthServer:
             out = _read_log_tail(self.log_path)
             raise RuntimeError(f"Auth swarm failed to start at {self.api_url}\n{out}")
         self.metadata_admin_url = self._poll_metadata_admin_url()
+        if not _wait_for_admin_auth(AuthApi._auth_url_from_db_url(self.api_url)):
+            out = self.debug_logs()
+            self.stop()
+            raise RuntimeError(f"Auth swarm failed to initialize admin auth at {self.api_url}\n{out}")
 
     def debug_logs(self) -> str:
         self.log_file.flush()
@@ -242,6 +277,10 @@ class SplitAuthServer:
         self._server = StatefulAntflyServer(binary, host, port, auth_enabled=True)
         self.url = self._server.url
         self.api_url = self._server.api_url
+        if not _wait_for_admin_auth(AuthApi._auth_url_from_db_url(self.api_url)):
+            out = self.debug_logs()
+            self.stop()
+            raise RuntimeError(f"Stateful auth server failed to initialize admin auth at {self.api_url}\n{out}")
 
     def debug_logs(self) -> str:
         return self._server.debug_logs()
@@ -505,7 +544,7 @@ def test_swarm_auth_enforces_row_filters_on_lookup_and_scan(auth_api: AuthApi):
         )
     )
     assert scan_result is not None
-    assert [entry["key"] for entry in scan_result] == ["doc:gold"]
+    assert [entry["_id"] for entry in scan_result] == ["doc:gold"]
     assert scan_result[0]["tier"] == "gold"
     assert scan_result[0]["title"] == "gold doc"
 
@@ -629,7 +668,7 @@ def test_stateful_auth_enforces_row_filters_on_lookup_and_scan(stateful_auth_api
         )
     )
     assert scan_result is not None
-    assert [entry["key"] for entry in scan_result] == ["doc:gold"]
+    assert [entry["_id"] for entry in scan_result] == ["doc:gold"]
     assert scan_result[0]["tier"] == "gold"
     assert scan_result[0]["title"] == "gold doc"
 

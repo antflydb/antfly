@@ -89,6 +89,9 @@ fn executeCreate(
         }
         return try noopRecordAlloc(alloc);
     }
+    if (plan.if_not_exists and plan.version == null and isBuiltInCompatibilityExtension(plan.extension_name)) {
+        return try noopRecordAlloc(alloc);
+    }
 
     const package_name = try packageNameForSqlExtension(&snapshot, plan.extension_name, plan.version);
     var installed = try extension_domain.lifecycle.installPackageOnService(service, alloc, plan.extension_name, package_name, .{
@@ -169,6 +172,10 @@ fn packageMatchesSqlName(package: extension_domain.PackageManifest, sql_name: []
         if (std.ascii.eqlIgnoreCase(alias, sql_name)) return true;
     }
     return false;
+}
+
+fn isBuiltInCompatibilityExtension(extension_name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(extension_name, "pgcrypto");
 }
 
 fn findInstalledExtension(snapshot: *const metadata_api.AdminSnapshot, name: []const u8) ?*const extension_domain.InstalledExtension {

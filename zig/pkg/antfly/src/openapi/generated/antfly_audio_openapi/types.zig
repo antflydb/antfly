@@ -4,62 +4,12 @@
 const std = @import("std");
 const antfly_s3_openapi = @import("antfly_s3_openapi");
 
-/// The TTS provider to use.
-pub const TTSProvider = enum {
-    openai,
-    vertex,
-    elevenlabs,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .openai => "openai",
-            .vertex => "vertex",
-            .elevenlabs => "elevenlabs",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "openai", .openai },
-            .{ "vertex", .vertex },
-            .{ "elevenlabs", .elevenlabs },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// The STT provider to use.
-pub const STTProvider = enum {
-    openai,
-    vertex,
-    antfly,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .openai => "openai",
-            .vertex => "vertex",
-            .antfly => "antfly",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "openai", .openai },
-            .{ "vertex", .vertex },
-            .{ "antfly", .antfly },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
+/// Configuration for Antfly inference STT (Whisper, Wav2Vec2, HuBERT) provider. Uses the Antfly inference service for speech-to-text inference. **Supported Models:** openai/whisper-tiny, openai/whisper-base, facebook/wav2vec2-base **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC **Docs:** See inference documentation
+pub const AntflySTTConfig = struct {
+    /// Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    /// Transcriber model name (e.g., 'openai/whisper-tiny'). If empty, uses default.
+    model: ?[]const u8 = null,
 };
 
 /// Audio encoding format.
@@ -104,6 +54,61 @@ pub const AudioFormat = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+/// TTS model to use.
+pub const ElevenLabsTTSConfigModelId = enum {
+    eleven_monolingual_v1,
+    eleven_multilingual_v2,
+    eleven_turbo_v2_5,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .eleven_monolingual_v1 => "eleven_monolingual_v1",
+            .eleven_multilingual_v2 => "eleven_multilingual_v2",
+            .eleven_turbo_v2_5 => "eleven_turbo_v2_5",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "eleven_monolingual_v1", .eleven_monolingual_v1 },
+            .{ "eleven_multilingual_v2", .eleven_multilingual_v2 },
+            .{ "eleven_turbo_v2_5", .eleven_turbo_v2_5 },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Configuration for ElevenLabs TTS provider. API key via `api_key` field or `ELEVENLABS_API_KEY` environment variable. **Models:** eleven_monolingual_v1, eleven_multilingual_v2, eleven_turbo_v2_5 (fastest) **Docs:** https://elevenlabs.io/docs/api-reference
+pub const ElevenLabsTTSConfig = struct {
+    /// ElevenLabs API key. Falls back to ELEVENLABS_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// Default ElevenLabs voice ID.
+    voice_id: []const u8,
+    /// TTS model to use.
+    model_id: ?ElevenLabsTTSConfigModelId = null,
+    /// Voice stability (0.0-1.0). Higher = more consistent.
+    stability: ?f64 = null,
+    /// Similarity boost (0.0-1.0). Higher = more similar to original voice.
+    similarity_boost: ?f64 = null,
+    /// Speaking style exaggeration (0.0-1.0). Only for v2 models.
+    style: ?f64 = null,
+};
+
+/// Configuration for OpenAI STT (Whisper) provider. API key via `api_key` field or `OPENAI_API_KEY` environment variable. **Model:** whisper-1 **Supported Formats:** mp3, wav, webm, ogg, flac (max 25MB) **Docs:** https://platform.openai.com/docs/guides/speech-to-text
+pub const OpenAISTTConfig = struct {
+    /// Whisper model to use.
+    model: ?[]const u8 = null,
+    /// OpenAI API key. Falls back to OPENAI_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// API base URL. Falls back to OPENAI_BASE_URL environment variable.
+    base_url: ?[]const u8 = null,
 };
 
 /// TTS model to use. tts-1 is faster, tts-1-hd has higher quality.
@@ -182,77 +187,14 @@ pub const OpenAITTSConfig = struct {
     base_url: ?[]const u8 = null,
 };
 
-/// Configuration for Google Cloud Text-to-Speech provider (Vertex AI). Uses Application Default Credentials (ADC) for authentication. **Voice Types:** Neural2 (best), WaveNet (high quality), Standard **Docs:** https://cloud.google.com/text-to-speech/docs
-pub const VertexTTSConfig = struct {
-    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location.
-    location: ?[]const u8 = null,
-    /// Path to service account JSON key file.
-    credentials_path: ?[]const u8 = null,
-    /// Default language code (e.g., 'en-US', 'es-ES').
-    language_code: ?[]const u8 = null,
-    /// Default voice name (e.g., 'en-US-Neural2-A').
-    voice_name: ?[]const u8 = null,
-};
-
-/// TTS model to use.
-pub const ElevenLabsTTSConfigModelId = enum {
-    eleven_monolingual_v1,
-    eleven_multilingual_v2,
-    eleven_turbo_v2_5,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .eleven_monolingual_v1 => "eleven_monolingual_v1",
-            .eleven_multilingual_v2 => "eleven_multilingual_v2",
-            .eleven_turbo_v2_5 => "eleven_turbo_v2_5",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "eleven_monolingual_v1", .eleven_monolingual_v1 },
-            .{ "eleven_multilingual_v2", .eleven_multilingual_v2 },
-            .{ "eleven_turbo_v2_5", .eleven_turbo_v2_5 },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Configuration for ElevenLabs TTS provider. API key via `api_key` field or `ELEVENLABS_API_KEY` environment variable. **Models:** eleven_monolingual_v1, eleven_multilingual_v2, eleven_turbo_v2_5 (fastest) **Docs:** https://elevenlabs.io/docs/api-reference
-pub const ElevenLabsTTSConfig = struct {
-    /// ElevenLabs API key. Falls back to ELEVENLABS_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
-    /// Default ElevenLabs voice ID.
-    voice_id: []const u8,
-    /// TTS model to use.
-    model_id: ?ElevenLabsTTSConfigModelId = null,
-    /// Voice stability (0.0-1.0). Higher = more consistent.
-    stability: ?f64 = null,
-    /// Similarity boost (0.0-1.0). Higher = more similar to original voice.
-    similarity_boost: ?f64 = null,
-    /// Speaking style exaggeration (0.0-1.0). Only for v2 models.
-    style: ?f64 = null,
-};
-
-/// Configuration for OpenAI STT (Whisper) provider. API key via `api_key` field or `OPENAI_API_KEY` environment variable. **Model:** whisper-1 **Supported Formats:** mp3, wav, webm, ogg, flac (max 25MB) **Docs:** https://platform.openai.com/docs/guides/speech-to-text
-pub const OpenAISTTConfig = struct {
+/// Unified configuration for an STT provider. Select the provider type and configure provider-specific settings. **Supported Providers:** - `openai` - OpenAI Whisper (whisper-1) - `vertex` - Google Cloud Speech-to-Text (Vertex AI) - `antfly` - Antfly inference service (Whisper, Wav2Vec2, HuBERT) **Example:** ```yaml provider: antfly api_url: "http://localhost:8080" model: openai/whisper-base ```
+pub const STTConfig = struct {
     /// Whisper model to use.
     model: ?[]const u8 = null,
     /// OpenAI API key. Falls back to OPENAI_API_KEY environment variable.
     api_key: ?[]const u8 = null,
     /// API base URL. Falls back to OPENAI_BASE_URL environment variable.
     base_url: ?[]const u8 = null,
-};
-
-/// Configuration for Google Cloud Speech-to-Text provider (Vertex AI). Uses Application Default Credentials (ADC) for authentication. **Features:** Streaming, speaker diarization, automatic punctuation **Docs:** https://cloud.google.com/speech-to-text/docs
-pub const VertexSTTConfig = struct {
     /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
     /// Google Cloud location.
@@ -265,41 +207,22 @@ pub const VertexSTTConfig = struct {
     enable_automatic_punctuation: ?bool = null,
     /// Use enhanced models for better accuracy (costs more).
     use_enhanced: ?bool = null,
-    /// Recognition model (e.g., 'latest_long', 'telephony', 'medical_dictation').
-    model: ?[]const u8 = null,
-};
-
-/// Configuration for Antfly inference STT (Whisper, Wav2Vec2, HuBERT) provider. Uses the Antfly inference service for speech-to-text inference. **Supported Models:** openai/whisper-tiny, openai/whisper-base, facebook/wav2vec2-base **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC **Docs:** See inference documentation
-pub const AntflySTTConfig = struct {
     /// Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
-    /// Transcriber model name (e.g., 'openai/whisper-tiny'). If empty, uses default.
-    model: ?[]const u8 = null,
+    provider: STTProvider,
 };
 
-pub const WordTimestamp = struct {
-    word: ?[]const u8 = null,
-    start_ms: ?i64 = null,
-    end_ms: ?i64 = null,
-};
-
-pub const Speaker = struct {
-    id: ?[]const u8 = null,
-    label: ?[]const u8 = null,
-};
-
-pub const VoiceGender = enum {
-    male,
-    female,
-    neutral,
-    unknown,
+/// The STT provider to use.
+pub const STTProvider = enum {
+    openai,
+    vertex,
+    antfly,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
-            .male => "male",
-            .female => "female",
-            .neutral => "neutral",
-            .unknown => "unknown",
+            .openai => "openai",
+            .vertex => "vertex",
+            .antfly => "antfly",
         };
         try jw.write(s);
     }
@@ -310,53 +233,12 @@ pub const VoiceGender = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "male", .male },
-            .{ "female", .female },
-            .{ "neutral", .neutral },
-            .{ "unknown", .unknown },
+            .{ "openai", .openai },
+            .{ "vertex", .vertex },
+            .{ "antfly", .antfly },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
-};
-
-/// An available TTS voice.
-pub const Voice = struct {
-    /// Voice ID.
-    id: ?[]const u8 = null,
-    /// Human-readable voice name.
-    name: ?[]const u8 = null,
-    /// Primary language code.
-    language: ?[]const u8 = null,
-    gender: ?VoiceGender = null,
-    description: ?[]const u8 = null,
-    /// URL to preview audio sample.
-    preview_url: ?[]const u8 = null,
-};
-
-/// Request to synthesize speech from text.
-pub const TTSRequest = struct {
-    /// Text to convert to speech.
-    text: []const u8,
-    /// Voice ID to use.
-    voice: ?[]const u8 = null,
-    format: ?AudioFormat = null,
-    /// Playback speed multiplier.
-    speed: ?f64 = null,
-    /// Optional S3 URI to write audio output (s3://bucket/key).
-    s3_output: ?[]const u8 = null,
-    /// Optional S3 credentials. Falls back to server-configured defaults.
-    s3_credentials: ?antfly_s3_openapi.Credentials = null,
-};
-
-/// Response from speech synthesis.
-pub const TTSResponse = struct {
-    format: ?AudioFormat = null,
-    /// Duration of synthesized audio in milliseconds.
-    duration_ms: ?i64 = null,
-    /// Number of characters processed.
-    characters_used: ?i64 = null,
-    /// S3 URI where audio was written (if s3_output was specified).
-    s3_url: ?[]const u8 = null,
 };
 
 /// Request to transcribe audio to text.
@@ -372,6 +254,23 @@ pub const STTRequest = struct {
     timestamps: ?bool = null,
     /// Enable speaker diarization.
     diarization: ?bool = null,
+};
+
+/// Response from speech transcription.
+pub const STTResponse = struct {
+    /// Full transcribed text.
+    text: ?[]const u8 = null,
+    /// Detected or specified language code.
+    language: ?[]const u8 = null,
+    /// Duration of audio in milliseconds.
+    duration_ms: ?i64 = null,
+    segments: ?[]const TranscriptSegment = null,
+    speakers: ?[]const Speaker = null,
+};
+
+pub const Speaker = struct {
+    id: ?[]const u8 = null,
+    label: ?[]const u8 = null,
 };
 
 /// TTS model to use. tts-1 is faster, tts-1-hd has higher quality.
@@ -500,14 +399,71 @@ pub const TTSConfig = struct {
     provider: TTSProvider,
 };
 
-/// Unified configuration for an STT provider. Select the provider type and configure provider-specific settings. **Supported Providers:** - `openai` - OpenAI Whisper (whisper-1) - `vertex` - Google Cloud Speech-to-Text (Vertex AI) - `antfly` - Antfly inference service (Whisper, Wav2Vec2, HuBERT) **Example:** ```yaml provider: antfly api_url: "http://localhost:8080" model: openai/whisper-base ```
-pub const STTConfig = struct {
-    /// Whisper model to use.
-    model: ?[]const u8 = null,
-    /// OpenAI API key. Falls back to OPENAI_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
-    /// API base URL. Falls back to OPENAI_BASE_URL environment variable.
-    base_url: ?[]const u8 = null,
+/// The TTS provider to use.
+pub const TTSProvider = enum {
+    openai,
+    vertex,
+    elevenlabs,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .openai => "openai",
+            .vertex => "vertex",
+            .elevenlabs => "elevenlabs",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "openai", .openai },
+            .{ "vertex", .vertex },
+            .{ "elevenlabs", .elevenlabs },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Request to synthesize speech from text.
+pub const TTSRequest = struct {
+    /// Text to convert to speech.
+    text: []const u8,
+    /// Voice ID to use.
+    voice: ?[]const u8 = null,
+    format: ?AudioFormat = null,
+    /// Playback speed multiplier.
+    speed: ?f64 = null,
+    /// Optional S3 URI to write audio output (s3://bucket/key).
+    s3_output: ?[]const u8 = null,
+    /// Optional S3 credentials. Falls back to server-configured defaults.
+    s3_credentials: ?antfly_s3_openapi.Credentials = null,
+};
+
+/// Response from speech synthesis.
+pub const TTSResponse = struct {
+    format: ?AudioFormat = null,
+    /// Duration of synthesized audio in milliseconds.
+    duration_ms: ?i64 = null,
+    /// Number of characters processed.
+    characters_used: ?i64 = null,
+    /// S3 URI where audio was written (if s3_output was specified).
+    s3_url: ?[]const u8 = null,
+};
+
+pub const TranscriptSegment = struct {
+    text: ?[]const u8 = null,
+    start_ms: ?i64 = null,
+    end_ms: ?i64 = null,
+    speaker: ?[]const u8 = null,
+    words: ?[]const WordTimestamp = null,
+};
+
+/// Configuration for Google Cloud Speech-to-Text provider (Vertex AI). Uses Application Default Credentials (ADC) for authentication. **Features:** Streaming, speaker diarization, automatic punctuation **Docs:** https://cloud.google.com/speech-to-text/docs
+pub const VertexSTTConfig = struct {
     /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
     /// Google Cloud location.
@@ -520,27 +476,71 @@ pub const STTConfig = struct {
     enable_automatic_punctuation: ?bool = null,
     /// Use enhanced models for better accuracy (costs more).
     use_enhanced: ?bool = null,
-    /// Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
-    api_url: ?[]const u8 = null,
-    provider: STTProvider,
+    /// Recognition model (e.g., 'latest_long', 'telephony', 'medical_dictation').
+    model: ?[]const u8 = null,
 };
 
-pub const TranscriptSegment = struct {
-    text: ?[]const u8 = null,
+/// Configuration for Google Cloud Text-to-Speech provider (Vertex AI). Uses Application Default Credentials (ADC) for authentication. **Voice Types:** Neural2 (best), WaveNet (high quality), Standard **Docs:** https://cloud.google.com/text-to-speech/docs
+pub const VertexTTSConfig = struct {
+    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location.
+    location: ?[]const u8 = null,
+    /// Path to service account JSON key file.
+    credentials_path: ?[]const u8 = null,
+    /// Default language code (e.g., 'en-US', 'es-ES').
+    language_code: ?[]const u8 = null,
+    /// Default voice name (e.g., 'en-US-Neural2-A').
+    voice_name: ?[]const u8 = null,
+};
+
+pub const VoiceGender = enum {
+    male,
+    female,
+    neutral,
+    unknown,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .male => "male",
+            .female => "female",
+            .neutral => "neutral",
+            .unknown => "unknown",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "male", .male },
+            .{ "female", .female },
+            .{ "neutral", .neutral },
+            .{ "unknown", .unknown },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// An available TTS voice.
+pub const Voice = struct {
+    /// Voice ID.
+    id: ?[]const u8 = null,
+    /// Human-readable voice name.
+    name: ?[]const u8 = null,
+    /// Primary language code.
+    language: ?[]const u8 = null,
+    gender: ?VoiceGender = null,
+    description: ?[]const u8 = null,
+    /// URL to preview audio sample.
+    preview_url: ?[]const u8 = null,
+};
+
+pub const WordTimestamp = struct {
+    word: ?[]const u8 = null,
     start_ms: ?i64 = null,
     end_ms: ?i64 = null,
-    speaker: ?[]const u8 = null,
-    words: ?[]const WordTimestamp = null,
-};
-
-/// Response from speech transcription.
-pub const STTResponse = struct {
-    /// Full transcribed text.
-    text: ?[]const u8 = null,
-    /// Detected or specified language code.
-    language: ?[]const u8 = null,
-    /// Duration of audio in milliseconds.
-    duration_ms: ?i64 = null,
-    segments: ?[]const TranscriptSegment = null,
-    speakers: ?[]const Speaker = null,
 };

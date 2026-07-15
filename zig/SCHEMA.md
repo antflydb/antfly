@@ -30,7 +30,7 @@ Table-level dynamic templates may use:
 - `mapping.index`
 - `mapping.store`
 - `mapping.include_in_all`
-- `mapping.doc_values`
+- `mapping.sortable`
 
 Relational schemas are stricter. Top-level dynamic templates are rejected in
 `storage_mode: "relational"` because the row shape must stay closed. Flexible
@@ -211,7 +211,7 @@ version bump or a reindex.
 Template-only updates propagate without a recreate on two levels:
 
 - the durable table `indexes_json` is regenerated on every schema update
-  (`api/tables.zig: regenerateAlgebraicIndexesFromSchemaAlloc`), which carries
+  (`metadata/catalog/table_ddl.zig: regenerateAlgebraicIndexesFromSchemaAlloc`), which carries
   forward user-tunable runtime knobs (adaptive policy, planner/result limits,
   and configured HLL cardinalities) so a schema change does not reset tuning or
   drop approximate-cardinality sketches; fresh opens, new replicas, and restarts

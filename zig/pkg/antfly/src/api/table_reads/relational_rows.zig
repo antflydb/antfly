@@ -384,8 +384,12 @@ pub fn executeLoweredSqlReadPlanWithSessionAlloc(
             break :blk .{ .query = result };
         },
         .document_query => |lowered| blk: {
-            const target = try catalogTargetForLoweredSqlTable(session, default_table_name, lowered.table_name);
-            const owned_schema = try catalogRuntimeSchemaUnlessDefaultAlloc(alloc, catalog, default_table_name, lowered.table_name);
+            const catalog_table_name = if (lowered.view_mapping) |view_mapping|
+                view_mapping.source_table
+            else
+                lowered.table_name;
+            const target = try catalogTargetForLoweredSqlTable(session, default_table_name, catalog_table_name);
+            const owned_schema = try catalogRuntimeSchemaUnlessDefaultAlloc(alloc, catalog, default_table_name, catalog_table_name);
             defer if (owned_schema) |schema| storage_schema.freeSchema(alloc, schema);
             const runtime_schema = owned_schema orelse default_schema;
             if (try executeRelationalFullTextDocumentReadAsRowsAlloc(alloc, source, lowered, runtime_schema, consistency)) |result| {
@@ -399,7 +403,7 @@ pub fn executeLoweredSqlReadPlanWithSessionAlloc(
                 .source = source,
                 .target = target,
                 .native_table_name = native_table_name,
-                .public_table_name = target.table_name,
+                .public_table_name = lowered.table_name,
             };
             var runtime_result = (try document_sql_runtime.executeReadPlanAlloc(
                 alloc,
@@ -4483,11 +4487,12 @@ fn mergeScanRowFromScanLineAlloc(alloc: std.mem.Allocator, line: []const u8) !db
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always });
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRemoteResponse;
-    const key_value = parsed.value.object.get("key") orelse return error.InvalidRemoteResponse;
+    const key_field = if (parsed.value.object.get("_id") != null) "_id" else "key";
+    const key_value = parsed.value.object.get(key_field) orelse return error.InvalidRemoteResponse;
     if (key_value != .string) return error.InvalidRemoteResponse;
     const key = try alloc.dupe(u8, key_value.string);
     errdefer alloc.free(key);
-    if (parsed.value.object.fetchOrderedRemove("key") == null) return error.InvalidRemoteResponse;
+    if (parsed.value.object.fetchOrderedRemove(key_field) == null) return error.InvalidRemoteResponse;
     const version_value = parsed.value.object.get("version") orelse return error.InvalidRemoteResponse;
     const version: u64 = switch (version_value) {
         .integer => |int| std.math.cast(u64, int) orelse return error.InvalidRemoteResponse,
@@ -6018,7 +6023,11 @@ fn rowJsonFromScanLineAlloc(alloc: std.mem.Allocator, line: []const u8) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always });
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRemoteResponse;
-    if (parsed.value.object.fetchOrderedRemove("key") == null) return error.InvalidRemoteResponse;
+    if (parsed.value.object.fetchOrderedRemove("_id") == null and
+        parsed.value.object.fetchOrderedRemove("key") == null)
+    {
+        return error.InvalidRemoteResponse;
+    }
     return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
 }
 

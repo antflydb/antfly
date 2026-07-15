@@ -111,6 +111,12 @@ fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
     };
 }
 
+fn parsePositiveUsize(value: []const u8) !usize {
+    const parsed = try std.fmt.parseInt(usize, value, 10);
+    if (parsed == 0) return error.InvalidArguments;
+    return parsed;
+}
+
 fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConfig.WarmModelConfig) ![]inference.server.WarmModel {
     if (values.len == 0) return &.{};
     const out = try allocator.alloc(inference.server.WarmModel, values.len);
@@ -226,6 +232,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var models_dir: []const u8 = defaultModelsDir(allocator);
     var ml_dir: []const u8 = defaultMlDir(allocator);
     var config_path: ?[]const u8 = null;
+    var max_concurrent_requests_override: ?usize = null;
     var models_overridden = false;
     var ml_overridden = false;
     var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
@@ -249,6 +256,9 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--config") and i + 1 < args.len) {
             config_path = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--max-concurrent-requests") and i + 1 < args.len) {
+            max_concurrent_requests_override = try parsePositiveUsize(args[i + 1]);
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--preload-model") and i + 1 < args.len) {
             try preload_models.append(allocator, try parsePreloadModelFlag(args[i + 1]));
@@ -301,6 +311,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         if (cfg.max_concurrent_requests) |value| node_cfg.max_concurrent_requests = value;
         if (cfg.pool_size) |value| node_cfg.pool_size = value;
     }
+    if (max_concurrent_requests_override) |value| node_cfg.max_concurrent_requests = value;
 
     var node = try inference.server.Node.init(allocator, node_cfg);
     defer node.deinit();
@@ -441,6 +452,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  --port <port>     Listen port (default: 8090)
         \\  --models-dir <dir>    AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>        Traditional ML directory (default: ~/.antfly/inference/ml)
+        \\  --max-concurrent-requests <n> Bound weighted in-flight request capacity before returning 503
         \\  --preload-model <kind:name|kind:backend:name> Preload and warm a configured model before serving
         \\
         \\Pull options:
@@ -495,4 +507,10 @@ test "run config parses shared scraping fields and ignores api_url" {
     try std.testing.expectEqualStrings("q4_k", parsed.value.preload[0].quantization.?);
     try std.testing.expectEqual(@as(?usize, 8), parsed.value.max_loaded_models);
     try std.testing.expectEqual(@as(?usize, 4), parsed.value.pool_size);
+}
+
+test "run max concurrent request parser rejects zero" {
+    try std.testing.expectEqual(@as(usize, 6), try parsePositiveUsize("6"));
+    try std.testing.expectError(error.InvalidArguments, parsePositiveUsize("0"));
+    try std.testing.expectError(error.InvalidCharacter, parsePositiveUsize("six"));
 }

@@ -26954,7 +26954,8 @@ pub fn lowerWritePlanWithBoundStatementAndFunctionBindingsAlloc(
     function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredWritePlan {
     if (schema.storage_mode == .document) {
-        return try lowerDocumentWritePlanParsedSqlAlloc(alloc, parsed_sql, schema, params, .{});
+        const write = try bound.writeCatalog();
+        return try lowerDocumentWritePlanParsedSqlAlloc(alloc, parsed_sql, schema, params, write.options);
     }
     var context = lowering_context.CatalogWritePlanLoweringContext{
         .alloc = alloc,
@@ -26977,7 +26978,10 @@ pub fn lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(
     function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredWritePlan {
     if (schema.storage_mode == .document) {
-        return try lowerDocumentWritePlanParsedSqlAlloc(alloc, parsed_sql, schema, params, .{});
+        return switch (logical.*) {
+            .catalog_write => |catalog_write| try lowerDocumentWritePlanParsedSqlAlloc(alloc, parsed_sql, schema, params, catalog_write.options),
+            else => error.UnsupportedSqlShape,
+        };
     }
     var context = lowering_context.CatalogWritePlanLoweringContext{
         .alloc = alloc,
@@ -28069,6 +28073,8 @@ test "document SQL catalog index proofs report relational index lifecycle shape"
     index.where = &.{};
     index.access_method = .ordered_tuple;
     index.keys = desc_keys[0..];
+    index.generation = 7;
+    index.generation_record = .{ .generation = 7, .lifecycle = .ready };
     indexes[0] = index;
     try std.testing.expectError(error.DocumentSqlWriteJoinOrderedIndexProof, documentJoinedMappedJoinIndexProof(schema, column));
 }
@@ -32088,6 +32094,22 @@ fn generatedDmlRequiredIdentifierNameMatches(
     return try generatedDmlIdentifierNameMatches(tokens, name_tokens, identifier);
 }
 
+fn generatedDmlExpressionIdentifierNameMatches(
+    tokens: []const Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    identifier: []const u8,
+) !bool {
+    if (expression.identifier_name_tokens) |name_tokens| {
+        return try generatedDmlIdentifierNameMatches(tokens, name_tokens, identifier);
+    }
+    const range = expression.tokens orelse return false;
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (expression.kind == .token_range and range.start + 1 == range.end and tokens[range.start].kind == .identifier) {
+        return error.UnsupportedSqlShape;
+    }
+    return false;
+}
+
 fn documentWriteOperationForParsedSql(parsed_sql: *const tokenized.ParsedSql) !document_write.DocumentWriteOperation {
     const dml_ast = (try generatedDmlAstForDocumentWriteParsedSql(parsed_sql)) orelse return error.UnsupportedSqlShape;
     return try documentWriteOperationFromGeneratedDmlAst(parsed_sql.items(), dml_ast);
@@ -32308,8 +32330,9 @@ fn generatedDmlOptionalWhereStartsDocumentIdentitySelector(
         error.UnsupportedSqlShape => return false,
         else => |other| return other,
     };
-    const left_expression = atom.expression.left_expression orelse return error.UnsupportedSqlShape;
-    if (!try generatedDmlRequiredIdentifierNameMatches(tokens, left_expression.identifier_name_tokens, "_id")) return false;
+    const left_expression = atom.expression.left_expression orelse return false;
+    const left_is_id = try generatedDmlExpressionIdentifierNameMatches(tokens, left_expression.*, "_id");
+    if (!left_is_id) return false;
     return switch (atom.kind) {
         .comparison => blk: {
             const operator = atom.expression.operator_tokens orelse return error.UnsupportedSqlShape;
@@ -47482,7 +47505,7 @@ test "sql adapter lower dml rejects catalog writes to document tables" {
 
     var residual_bounded_delete = try lowerWritePlanWithCatalogForDmlTestAlloc(
         alloc,
-        "DELETE FROM docs WHERE status = 'draft' AND lower(title) = 'launch'",
+        "DELETE FROM docs WHERE lower(title) = 'launch'",
         schema,
         &.{},
         .{},
@@ -49193,7 +49216,7 @@ test "sql adapter lower dml rejects catalog writes to document tables" {
 
     var residual_bounded_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
         alloc,
-        "UPDATE docs SET title = 'Launch' WHERE status = 'draft' AND lower(title) = 'launch'",
+        "UPDATE docs SET title = 'Launch' WHERE category = 'release'",
         schema,
         &.{},
         .{},

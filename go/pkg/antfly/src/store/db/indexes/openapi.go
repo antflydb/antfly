@@ -194,11 +194,12 @@ func (a AlgebraicIndexStats) AsIndexStats() IndexStats {
 
 func (bc FullTextIndexStats) Equal(oc FullTextIndexStats) bool {
 	return bc.Rebuilding == oc.Rebuilding &&
-		bc.DiskUsage == oc.DiskUsage &&
+		bc.BackfillActive == oc.BackfillActive &&
 		bc.Error == oc.Error &&
 		bc.TotalIndexed == oc.TotalIndexed &&
 		bc.BackfillProgress == oc.BackfillProgress &&
-		bc.BackfillItemsProcessed == oc.BackfillItemsProcessed
+		bc.BackfillState == oc.BackfillState &&
+		bc.DocCount == oc.DocCount
 }
 
 func (bc EmbeddingsIndexStats) Equal(oc EmbeddingsIndexStats) bool {
@@ -206,11 +207,13 @@ func (bc EmbeddingsIndexStats) Equal(oc EmbeddingsIndexStats) bool {
 		bc.TotalIndexed == oc.TotalIndexed &&
 		bc.TotalNodes == oc.TotalNodes &&
 		bc.TotalTerms == oc.TotalTerms &&
-		bc.DiskUsage == oc.DiskUsage &&
 		bc.Rebuilding == oc.Rebuilding &&
-		bc.WalBacklog == oc.WalBacklog &&
+		bc.BackfillActive == oc.BackfillActive &&
+		bc.DensePublishPending == oc.DensePublishPending &&
 		bc.BackfillProgress == oc.BackfillProgress &&
-		bc.BackfillItemsProcessed == oc.BackfillItemsProcessed
+		bc.BackfillState == oc.BackfillState &&
+		bc.DocCount == oc.DocCount &&
+		bc.QueryVisibleDocCount == oc.QueryVisibleDocCount
 }
 
 func (gc GraphIndexConfig) Equal(oc GraphIndexConfig) bool {
@@ -225,9 +228,14 @@ func (gc GraphIndexStats) Equal(oc GraphIndexStats) bool {
 		gc.TotalEdges == oc.TotalEdges &&
 		reflect.DeepEqual(gc.EdgeTypes, oc.EdgeTypes) &&
 		gc.Rebuilding == oc.Rebuilding &&
+		gc.BackfillActive == oc.BackfillActive &&
 		gc.BackfillProgress == oc.BackfillProgress &&
 		gc.BackfillItemsProcessed == oc.BackfillItemsProcessed &&
-		reflect.DeepEqual(gc.GraphMetricRuntime, oc.GraphMetricRuntime)
+		reflect.DeepEqual(gc.GraphMetricRuntime, oc.GraphMetricRuntime) &&
+		gc.BackfillState == oc.BackfillState &&
+		gc.DocCount == oc.DocCount &&
+		gc.EdgeCount == oc.EdgeCount &&
+		gc.NodeCount == oc.NodeCount
 }
 
 func (g GraphIndexStats) AsIndexStats() IndexStats {
@@ -242,10 +250,11 @@ func (g GraphIndexStats) AsIndexStats() IndexStats {
 func (ac AlgebraicIndexStats) Equal(oc AlgebraicIndexStats) bool {
 	return ac.Error == oc.Error &&
 		ac.TotalIndexed == oc.TotalIndexed &&
-		ac.DiskUsage == oc.DiskUsage &&
 		ac.Rebuilding == oc.Rebuilding &&
+		ac.BackfillActive == oc.BackfillActive &&
 		ac.BackfillProgress == oc.BackfillProgress &&
-		ac.BackfillItemsProcessed == oc.BackfillItemsProcessed &&
+		ac.BackfillState == oc.BackfillState &&
+		ac.DocCount == oc.DocCount &&
 		ac.Healthy == oc.Healthy &&
 		ac.ParseErrorCount == oc.ParseErrorCount &&
 		ac.SchemaVersion == oc.SchemaVersion &&
@@ -277,8 +286,8 @@ type indexStatsKind int
 
 const (
 	indexStatsUnknown    indexStatsKind = iota
-	indexStatsFullText                  // has "total_indexed" but not "total_edges" or "wal_backlog"/"total_nodes"
-	indexStatsEmbeddings                // has "wal_backlog" or "total_nodes" or "total_terms"
+	indexStatsFullText                  // has "total_indexed" but not graph, embedding, or algebraic discriminator fields
+	indexStatsEmbeddings                // has vector-specific fields such as "total_nodes", "total_terms", or "dense_publish_pending"
 	indexStatsGraph                     // has "total_edges" or "edge_types"
 	indexStatsAlgebraic                 // has index_type "algebraic" or algebraic-specific planner/adaptive keys
 )
@@ -307,7 +316,7 @@ func detectIndexStatsKind(union []byte) indexStatsKind {
 		return indexStatsGraph
 	}
 	// Embeddings-unique keys
-	if bytes.Contains(union, []byte(`"wal_backlog"`)) || bytes.Contains(union, []byte(`"total_nodes"`)) || bytes.Contains(union, []byte(`"total_terms"`)) {
+	if bytes.Contains(union, []byte(`"dense_publish_pending"`)) || bytes.Contains(union, []byte(`"total_nodes"`)) || bytes.Contains(union, []byte(`"total_terms"`)) {
 		return indexStatsEmbeddings
 	}
 	// If it has any content, assume FullText (the default/first oneOf variant)
@@ -329,17 +338,17 @@ func mergeErrors(dst *string, src string) {
 	}
 }
 
-// mergeBackfillFields merges backfill state across shards: OR for rebuilding,
-// sum for items processed, min progress among rebuilding shards only.
+// mergeBackfillFields merges backfill state across shards: OR for activity and
+// min progress among active shards only.
 func mergeBackfillFields(
-	dstRebuilding *bool, dstProgress *float64, dstItems *uint64,
-	srcRebuilding bool, srcProgress float64, srcItems uint64,
+	dstRebuilding *bool, dstActive *bool, dstProgress *float64,
+	srcRebuilding bool, srcActive bool, srcProgress float64,
 ) {
-	dstWasRebuilding := *dstRebuilding
+	dstWasActive := *dstRebuilding || *dstActive
 	*dstRebuilding = *dstRebuilding || srcRebuilding
-	*dstItems += srcItems
-	if srcRebuilding {
-		if !dstWasRebuilding || srcProgress < *dstProgress {
+	*dstActive = *dstActive || srcActive
+	if srcRebuilding || srcActive {
+		if !dstWasActive || srcProgress < *dstProgress {
 			*dstProgress = srcProgress
 		}
 	}
@@ -525,9 +534,9 @@ func MergeIndexStats(dst *IndexStats, src IndexStats) {
 		dstFT, _ := dst.AsFullTextIndexStats()
 		srcFT, _ := src.AsFullTextIndexStats()
 		dstFT.TotalIndexed += srcFT.TotalIndexed
-		dstFT.DiskUsage += srcFT.DiskUsage
-		mergeBackfillFields(&dstFT.Rebuilding, &dstFT.BackfillProgress, &dstFT.BackfillItemsProcessed,
-			srcFT.Rebuilding, srcFT.BackfillProgress, srcFT.BackfillItemsProcessed)
+		dstFT.DocCount += srcFT.DocCount
+		mergeBackfillFields(&dstFT.Rebuilding, &dstFT.BackfillActive, &dstFT.BackfillProgress,
+			srcFT.Rebuilding, srcFT.BackfillActive, srcFT.BackfillProgress)
 		mergeErrors(&dstFT.Error, srcFT.Error)
 		_ = dst.FromFullTextIndexStats(dstFT)
 
@@ -537,10 +546,11 @@ func MergeIndexStats(dst *IndexStats, src IndexStats) {
 		dstEmb.TotalIndexed += srcEmb.TotalIndexed
 		dstEmb.TotalNodes += srcEmb.TotalNodes
 		dstEmb.TotalTerms += srcEmb.TotalTerms
-		dstEmb.DiskUsage += srcEmb.DiskUsage
-		dstEmb.WalBacklog += srcEmb.WalBacklog
-		mergeBackfillFields(&dstEmb.Rebuilding, &dstEmb.BackfillProgress, &dstEmb.BackfillItemsProcessed,
-			srcEmb.Rebuilding, srcEmb.BackfillProgress, srcEmb.BackfillItemsProcessed)
+		dstEmb.DocCount += srcEmb.DocCount
+		dstEmb.QueryVisibleDocCount += srcEmb.QueryVisibleDocCount
+		dstEmb.DensePublishPending = dstEmb.DensePublishPending || srcEmb.DensePublishPending
+		mergeBackfillFields(&dstEmb.Rebuilding, &dstEmb.BackfillActive, &dstEmb.BackfillProgress,
+			srcEmb.Rebuilding, srcEmb.BackfillActive, srcEmb.BackfillProgress)
 		mergeErrors(&dstEmb.Error, srcEmb.Error)
 		_ = dst.FromEmbeddingsIndexStats(dstEmb)
 
@@ -548,8 +558,11 @@ func MergeIndexStats(dst *IndexStats, src IndexStats) {
 		dstGraph, _ := dst.AsGraphIndexStats()
 		srcGraph, _ := src.AsGraphIndexStats()
 		dstGraph.TotalEdges += srcGraph.TotalEdges
-		mergeBackfillFields(&dstGraph.Rebuilding, &dstGraph.BackfillProgress, &dstGraph.BackfillItemsProcessed,
-			srcGraph.Rebuilding, srcGraph.BackfillProgress, srcGraph.BackfillItemsProcessed)
+		dstGraph.DocCount += srcGraph.DocCount
+		dstGraph.EdgeCount += srcGraph.EdgeCount
+		dstGraph.NodeCount += srcGraph.NodeCount
+		mergeBackfillFields(&dstGraph.Rebuilding, &dstGraph.BackfillActive, &dstGraph.BackfillProgress,
+			srcGraph.Rebuilding, srcGraph.BackfillActive, srcGraph.BackfillProgress)
 		if srcGraph.EdgeTypes != nil {
 			if dstGraph.EdgeTypes == nil {
 				dstGraph.EdgeTypes = srcGraph.EdgeTypes
@@ -567,7 +580,7 @@ func MergeIndexStats(dst *IndexStats, src IndexStats) {
 		dstAlg, _ := dst.AsAlgebraicIndexStats()
 		srcAlg, _ := src.AsAlgebraicIndexStats()
 		dstAlg.TotalIndexed += srcAlg.TotalIndexed
-		dstAlg.DiskUsage += srcAlg.DiskUsage
+		dstAlg.DocCount += srcAlg.DocCount
 		dstAlg.ParseErrorCount += srcAlg.ParseErrorCount
 		dstAlg.PlannerSelected += srcAlg.PlannerSelected
 		dstAlg.PlannerFallbackCount += srcAlg.PlannerFallbackCount
@@ -580,8 +593,8 @@ func MergeIndexStats(dst *IndexStats, src IndexStats) {
 		dstAlg.ActiveProgressRowsProcessed += srcAlg.ActiveProgressRowsProcessed
 		dstAlg.ActiveProgressTargetRows += srcAlg.ActiveProgressTargetRows
 		dstAlg.Healthy = dstAlg.Healthy && srcAlg.Healthy
-		mergeBackfillFields(&dstAlg.Rebuilding, &dstAlg.BackfillProgress, &dstAlg.BackfillItemsProcessed,
-			srcAlg.Rebuilding, srcAlg.BackfillProgress, srcAlg.BackfillItemsProcessed)
+		mergeBackfillFields(&dstAlg.Rebuilding, &dstAlg.BackfillActive, &dstAlg.BackfillProgress,
+			srcAlg.Rebuilding, srcAlg.BackfillActive, srcAlg.BackfillProgress)
 		if srcAlg.SchemaVersion > dstAlg.SchemaVersion {
 			dstAlg.SchemaVersion = srcAlg.SchemaVersion
 		}

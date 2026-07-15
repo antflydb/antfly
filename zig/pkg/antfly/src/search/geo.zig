@@ -24,6 +24,11 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const math = std.math;
 
+pub const min_index_geohash_precision: u8 = 2;
+pub const max_index_geohash_precision: u8 = 9;
+pub const index_geohash_precision: u8 = max_index_geohash_precision;
+pub const max_filter_geohash_cells: usize = 4096;
+
 pub const GeoPoint = struct {
     lat: f64,
     lon: f64,
@@ -219,12 +224,60 @@ pub fn coverBoundingBox(
     max_lon: f64,
     precision: u8,
 ) ![][12]u8 {
+    return (try coverBoundingBoxBudgeted(alloc, min_lat, min_lon, max_lat, max_lon, precision, std.math.maxInt(usize))) orelse
+        error.InvalidArgument;
+}
+
+pub fn estimateBoundingBoxCellCount(
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+    precision: u8,
+) ?usize {
+    if (min_lat > max_lat or min_lon > max_lon) return null;
+    const prec = @min(precision, 12);
+    if (prec == 0) return null;
+
+    const sample = encode(.{ .lat = 0, .lon = 0 }, prec);
+    const sample_bounds = bounds(sample[0..prec]);
+    const lat_step = (sample_bounds.lat_max - sample_bounds.lat_min) * 0.9;
+    const lon_step = (sample_bounds.lon_max - sample_bounds.lon_min) * 0.9;
+    if (lat_step <= 0 or lon_step <= 0) return null;
+
+    const lat_count = @ceil((max_lat - min_lat) / lat_step) + 2.0;
+    const lon_count = @ceil((max_lon - min_lon) / lon_step) + 2.0;
+    if (!std.math.isFinite(lat_count) or !std.math.isFinite(lon_count)) return null;
+    if (lat_count <= 0 or lon_count <= 0) return null;
+    const count = lat_count * lon_count;
+    if (count > @as(f64, @floatFromInt(std.math.maxInt(usize)))) return null;
+    return @intFromFloat(count);
+}
+
+pub fn coverBoundingBoxBudgeted(
+    alloc: Allocator,
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+    precision: u8,
+    max_cells: usize,
+) !?[][12]u8 {
+    const prec = @min(precision, 12);
+    if (prec == 0 or max_cells == 0) return null;
+    const estimated = estimateBoundingBoxCellCount(min_lat, min_lon, max_lat, max_lon, prec) orelse return null;
+    if (estimated > max_cells) return null;
+
     var cells = std.ArrayListUnmanaged([12]u8).empty;
     defer cells.deinit(alloc);
+    var seen = std.AutoHashMap([12]u8, void).init(alloc);
+    defer seen.deinit();
+    try cells.ensureTotalCapacity(alloc, estimated);
+    try seen.ensureTotalCapacity(@intCast(estimated));
 
     // Determine cell dimensions at this precision
-    const sample = encode(.{ .lat = 0, .lon = 0 }, precision);
-    const sample_bounds = bounds(sample[0..precision]);
+    const sample = encode(.{ .lat = 0, .lon = 0 }, prec);
+    const sample_bounds = bounds(sample[0..prec]);
     const lat_step = sample_bounds.lat_max - sample_bounds.lat_min;
     const lon_step = sample_bounds.lon_max - sample_bounds.lon_min;
 
@@ -237,16 +290,12 @@ pub fn coverBoundingBox(
             const cell = encode(.{
                 .lat = @min(@max(lat, -90.0), 90.0),
                 .lon = @min(@max(lon, -180.0), 180.0),
-            }, precision);
-            // Deduplicate
-            var found = false;
-            for (cells.items) |existing| {
-                if (std.mem.eql(u8, existing[0..precision], cell[0..precision])) {
-                    found = true;
-                    break;
-                }
+            }, prec);
+            const gop = try seen.getOrPut(cell);
+            if (!gop.found_existing) {
+                if (cells.items.len >= max_cells) return null;
+                try cells.append(alloc, cell);
             }
-            if (!found) try cells.append(alloc, cell);
         }
     }
 
@@ -406,6 +455,23 @@ test "cover bounding box" {
         try std.testing.expect(p.lat >= 37.5 and p.lat <= 38.0);
         try std.testing.expect(p.lon >= -122.7 and p.lon <= -122.2);
     }
+}
+
+test "cover bounding box enforces budget with hashed deduplication" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expect(try coverBoundingBoxBudgeted(alloc, 37.7, -122.5, 37.8, -122.4, 9, 1) == null);
+
+    const cells = (try coverBoundingBoxBudgeted(alloc, 37.7, -122.5, 37.8, -122.4, 5, 128)) orelse return error.TestExpectedEqual;
+    defer alloc.free(cells);
+    try std.testing.expect(cells.len >= 1);
+    try std.testing.expect(cells.len <= 128);
+}
+
+test "cover bounding box rejects invalid bounds" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.InvalidArgument, coverBoundingBox(alloc, 10.0, -122.0, 9.0, -121.0, 5));
 }
 
 test "cover circle" {

@@ -1473,13 +1473,15 @@ test "postgres source runtime builds select queries through executor" {
     const fields = try alloc.alloc([]u8, 2);
     fields[0] = try alloc.dupe(u8, "id");
     fields[1] = try alloc.dupe(u8, "name");
-    var result = try src.query(alloc, .{
+    var params = foreign_source.QueryParams{
         .table = try alloc.dupe(u8, "customers"),
         .fields = fields,
         .limit = 5,
         .offset = 2,
         .order_by = order_by,
-    });
+    };
+    defer params.deinit(alloc);
+    var result = try src.query(alloc, params);
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
@@ -1614,11 +1616,13 @@ test "postgres source runtime translates filter_query_json and validates fields"
         .data_type = try alloc.dupe(u8, "text"),
         .nullable = false,
     };
-    var result = try src.query(alloc, .{
+    var params = foreign_source.QueryParams{
         .table = try alloc.dupe(u8, "customers"),
         .filter_query_json = try alloc.dupe(u8, "{\"term\":\"active\",\"field\":\"status\"}"),
         .columns = columns,
-    });
+    };
+    defer params.deinit(alloc);
+    var result = try src.query(alloc, params);
     defer result.deinit(alloc);
 
     try std.testing.expectEqualStrings(
@@ -1636,11 +1640,13 @@ test "postgres source runtime translates filter_query_json and validates fields"
     };
     var fields = try alloc.alloc([]u8, 1);
     fields[0] = try alloc.dupe(u8, "missing");
-    try std.testing.expectError(error.UnknownColumn, src.query(alloc, .{
+    var bad_params = foreign_source.QueryParams{
         .table = try alloc.dupe(u8, "customers"),
         .columns = bad_columns,
         .fields = fields,
-    }));
+    };
+    defer bad_params.deinit(alloc);
+    try std.testing.expectError(error.UnknownColumn, src.query(alloc, bad_params));
 }
 
 test "postgres source runtime discovers columns when config omits them" {
@@ -1704,11 +1710,13 @@ test "postgres source runtime discovers columns when config omits them" {
 
     var fields = try alloc.alloc([]u8, 1);
     fields[0] = try alloc.dupe(u8, "id");
-    var result = try src.query(alloc, .{
+    var params = foreign_source.QueryParams{
         .table = try alloc.dupe(u8, "customers"),
         .fields = fields,
         .filter_query_json = try alloc.dupe(u8, "{\"term\":\"active\",\"field\":\"status\"}"),
-    });
+    };
+    defer params.deinit(alloc);
+    var result = try src.query(alloc, params);
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), executor.discover_count);
@@ -1797,12 +1805,14 @@ test "postgres source runtime batches simple aggregations into one query" {
         },
     };
 
-    var result = try src.aggregate(alloc, .{
+    var params = foreign_source.AggregateParams{
         .table = try alloc.dupe(u8, "customers"),
         .filter_query_json = try alloc.dupe(u8, "{\"term\":\"active\",\"field\":\"status\"}"),
         .columns = columns,
         .aggregations = aggregations,
-    });
+    };
+    defer params.deinit(alloc);
+    var result = try src.aggregate(alloc, params);
     defer result.deinit(alloc);
 
     try std.testing.expectEqualStrings(
@@ -1927,12 +1937,14 @@ test "postgres source runtime executes stats and terms aggregations with transla
         },
     };
 
-    var result = try src.aggregate(alloc, .{
+    var params = foreign_source.AggregateParams{
         .table = try alloc.dupe(u8, "customers"),
         .filter_query_json = try alloc.dupe(u8, "{\"term\":\"active\",\"field\":\"status\"}"),
         .columns = columns,
         .aggregations = aggregations,
-    });
+    };
+    defer params.deinit(alloc);
+    var result = try src.aggregate(alloc, params);
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 2), executor.sql_texts.items.len);

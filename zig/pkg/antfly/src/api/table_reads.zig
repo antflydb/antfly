@@ -30,6 +30,7 @@ pub const ScanResponse = table_read_core.ScanResponse;
 pub const TextStatsResponse = table_read_core.TextStatsResponse;
 pub const BackgroundTextStatsResponse = table_read_core.BackgroundTextStatsResponse;
 pub const LsmStorageStats = table_read_core.LsmStorageStats;
+pub const ObservedDynamicFieldCapabilitySet = table_read_core.ObservedDynamicFieldCapabilitySet;
 pub const ParsedTextStatsHttpResponse = table_read_core.ParsedTextStatsHttpResponse;
 pub const HAReadGate = table_read_core.HAReadGate;
 pub const ReadPreparation = table_read_core.ReadPreparation;
@@ -40,6 +41,7 @@ pub const PrimaryLookupDbSource = table_read_core.PrimaryLookupDbSource;
 pub const RelationalRowsSourceGroupRequest = table_read_core.RelationalRowsSourceGroupRequest;
 pub const RelationalRowsSourceGroupSystemTime = table_read_core.RelationalRowsSourceGroupSystemTime;
 pub const TableReadSource = table_read_core.TableReadSource;
+pub const appendScanLine = table_read_core.appendScanLine;
 
 pub const testing = table_read_sources.testing;
 pub const BoundTableReadSource = table_read_sources.BoundTableReadSource;

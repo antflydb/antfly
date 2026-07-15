@@ -376,6 +376,7 @@ fn computeAlgebraicAggregation(
     }
     if (schema_mod.relationalAccessMethodQueryBlockReason(ctx.runtime_schema, .algebraic_filter, entry.config.name)) |reason| {
         index.recordPlannerFallback(reason, null, null);
+        if (std.mem.eql(u8, request.type, "cardinality") and request.cardinality_mode == .approximate) return error.UnsupportedAggregation;
         return null;
     }
     if (std.mem.eql(u8, request.type, "stats")) {
@@ -14748,16 +14749,29 @@ test "algebraic aggregations fail closed when relational generation record is st
         \\  "version": 1,
         \\  "table": "orders",
         \\  "group_fields": [{"name":"customer","path":"customer","type":"string"}],
-        \\  "hll_cardinalities": [{"name":"customer_ndv","field":"customer"}]
+        \\  "hll_cardinalities": [{"name":"customer_ndv","value_field":"customer"}]
         \\}
     ;
     var manager = try index_manager_mod.IndexManager.init(alloc, ".");
     defer manager.deinit();
     const mutex = try alloc.create(std.atomic.Mutex);
+    var owns_mutex = true;
+    errdefer if (owns_mutex) alloc.destroy(mutex);
     mutex.* = .unlocked;
-    const config = try types.IndexConfig.clone(alloc, .{ .name = "alg", .kind = .algebraic, .config_json = cfg });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
-    try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .rebuild_root_path = try alloc.dupe(u8, "."), .index = alg_index });
+    var config = try types.IndexConfig.clone(alloc, .{ .name = "alg", .kind = .algebraic, .config_json = cfg });
+    var owns_config = true;
+    errdefer if (owns_config) config.deinit(alloc);
+    var alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    var owns_alg_index = true;
+    errdefer if (owns_alg_index) alg_index.close();
+    const rebuild_root_path = try alloc.dupe(u8, ".");
+    var owns_rebuild_root_path = true;
+    errdefer if (owns_rebuild_root_path) alloc.free(rebuild_root_path);
+    try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .rebuild_root_path = rebuild_root_path, .index = alg_index });
+    owns_mutex = false;
+    owns_config = false;
+    owns_alg_index = false;
+    owns_rebuild_root_path = false;
 
     const stale_algebraic_index = schema_mod.RelationalIndex{
         .name = "alg",

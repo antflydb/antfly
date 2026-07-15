@@ -967,3 +967,56 @@ test "db ttl cleanup can run with manual clock" {
     try std.testing.expect(stats.ttl_cleanup.runs > 0);
     try std.testing.expect(stats.ttl_cleanup.deleted_docs > 0);
 }
+
+test "db ttl cleanup background worker starts and deletes with manual clock" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var clock = platform_clock.ManualClock{
+        .now_realtime_ns = 10 * std.time.ns_per_s,
+    };
+
+    const ttl_cfg: Config = .{
+        .enabled = true,
+        .interval_ms = 1_000,
+        .batch_size = 8,
+        .grace_period_ns = 0,
+        .clock = clock.clock(),
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = ttl_cfg,
+    });
+    defer db.close();
+    try std.testing.expect(db.ttl_runtime != null);
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = std.time.ns_per_s,
+    });
+
+    const now_ns = clock.clock().nowRealtimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:expired_worker", .value = "{\"title\":\"gone\"}" }},
+        .timestamp_ns = now_ns - 2 * std.time.ns_per_s,
+    });
+
+    try TestHelpers.waitForRawDelete(alloc, &db, "doc:expired_worker", 200);
+
+    var stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    var attempts: usize = 0;
+    while (stats.ttl_cleanup.deleted_docs == 0 and attempts < 200) : (attempts += 1) {
+        platform.time.sleepMs(10);
+        types.freeDBStats(alloc, stats);
+        stats = try db.stats(alloc);
+    }
+
+    try std.testing.expect(stats.ttl_cleanup.enabled);
+    try std.testing.expect(stats.ttl_cleanup.runs > 0);
+    try std.testing.expect(stats.ttl_cleanup.deleted_docs > 0);
+}

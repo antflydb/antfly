@@ -16,18 +16,22 @@ const std = @import("std");
 const batch_api = @import("batch.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const distributed_txn = @import("distributed_txn.zig");
+const http_client = @import("http_client.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
+const internal_keys = @import("../storage/internal_keys.zig");
 const metadata_mod = @import("../metadata/mod.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const raft_mod = @import("../raft/mod.zig");
+const repair_jobs = @import("repair_jobs.zig");
 const routes = @import("http_routes.zig");
 const relational_rows_api = @import("relational_rows.zig");
 const schema_api = @import("../schema/mod.zig");
 const storage_schema = @import("../storage/schema.zig");
 const table_writes = @import("table_writes.zig");
+const platform_time = @import("../platform/time.zig");
 
 pub const BatchValidator = struct {
     ptr: *anyopaque,
@@ -52,14 +56,158 @@ pub const Context = struct {
     shard_ops: ?raft_mod.ShardOperationAdapter,
     shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     writes: ?table_writes.TableWriteSource,
+    repair_job_store: ?*repair_jobs.Store = null,
+    repair_cancel_executor: ?http_common.RequestExecutor = null,
     batch_validator: BatchValidator,
     txn_validator: TxnValidator,
+};
+
+const RepairJobCancelProbe = struct {
+    alloc: std.mem.Allocator,
+    store: *repair_jobs.Store,
+    job_id: u64,
+    attempt_id: u64,
+    cached_requested: std.atomic.Value(bool) = .init(false),
+    last_check_ns: std.atomic.Value(u64) = .init(0),
+
+    const check_interval_ns: u64 = 100 * std.time.ns_per_ms;
+
+    fn check(ptr: *anyopaque) bool {
+        const self: *RepairJobCancelProbe = @ptrCast(@alignCast(ptr));
+        if (self.cached_requested.load(.acquire)) return true;
+        const now_ns = platform_time.monotonicNs();
+        const last_ns = self.last_check_ns.load(.acquire);
+        if (last_ns != 0 and now_ns -| last_ns < check_interval_ns) return false;
+        self.last_check_ns.store(now_ns, .release);
+
+        const encoded = self.store.loadJobAlloc(self.alloc, self.job_id) catch return false;
+        defer if (encoded) |buf| self.alloc.free(buf);
+        const body = encoded orelse {
+            self.cached_requested.store(true, .release);
+            return true;
+        };
+        var parsed = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, body, .{ .ignore_unknown_fields = true }) catch return false;
+        defer parsed.deinit();
+        const state = parsed.value;
+        const requested = state.cancel_requested or
+            repair_jobs.isTerminalPhase(state.phase) or
+            state.attempt_id != self.attempt_id;
+        if (requested) self.cached_requested.store(true, .release);
+        return requested;
+    }
+};
+
+const RemoteRepairJobCancelProbe = struct {
+    alloc: std.mem.Allocator,
+    executor: http_common.RequestExecutor,
+    base_uri: []const u8,
+    table_name: []const u8,
+    job_id: u64,
+    attempt_id: u64,
+    cached_requested: std.atomic.Value(bool) = .init(false),
+    last_check_ns: std.atomic.Value(u64) = .init(0),
+
+    const check_interval_ns: u64 = 100 * std.time.ns_per_ms;
+
+    fn check(ptr: *anyopaque) bool {
+        const self: *RemoteRepairJobCancelProbe = @ptrCast(@alignCast(ptr));
+        if (self.cached_requested.load(.acquire)) return true;
+        const now_ns = platform_time.monotonicNs();
+        const last_ns = self.last_check_ns.load(.acquire);
+        if (last_ns != 0 and now_ns -| last_ns < check_interval_ns) return false;
+        self.last_check_ns.store(now_ns, .release);
+
+        var client = http_client.ApiHttpClient.init(self.alloc, self.executor);
+        const requested = client.fetchTableRepairCancelRequested(
+            self.base_uri,
+            self.table_name,
+            self.job_id,
+            self.attempt_id,
+        ) catch return false;
+        if (requested) self.cached_requested.store(true, .release);
+        return requested;
+    }
 };
 
 const CorruptEmbeddingArtifactRequest = struct {
     doc_key: []const u8,
     index_name: []const u8,
 };
+
+const DocumentArtifactChildKeyPrefixes = struct {
+    unit: []u8,
+    chunk: []u8,
+
+    fn deinit(self: *DocumentArtifactChildKeyPrefixes, alloc: std.mem.Allocator) void {
+        alloc.free(self.unit);
+        alloc.free(self.chunk);
+        self.* = undefined;
+    }
+};
+
+fn documentArtifactChildKeyPrefixesAlloc(
+    alloc: std.mem.Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) !DocumentArtifactChildKeyPrefixes {
+    var unit = std.ArrayListUnmanaged(u8).empty;
+    errdefer unit.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&unit, alloc, doc_key);
+    try unit.append(alloc, internal_keys.artifact_kind);
+    try internal_keys.appendEncodedComponent(&unit, alloc, "asset");
+    try internal_keys.appendEncodedComponent(&unit, alloc, artifact_name);
+    try unit.append(alloc, internal_keys.document_unit_record_kind);
+
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    errdefer chunk.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&chunk, alloc, doc_key);
+    try chunk.append(alloc, internal_keys.artifact_kind);
+    try internal_keys.appendEncodedComponent(&chunk, alloc, "chunk");
+    try internal_keys.appendEncodedComponent(&chunk, alloc, artifact_name);
+    try chunk.append(alloc, internal_keys.document_unit_record_kind);
+
+    const owned_unit = try unit.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_unit);
+    const owned_chunk = try chunk.toOwnedSlice(alloc);
+    return .{
+        .unit = owned_unit,
+        .chunk = owned_chunk,
+    };
+}
+
+fn documentArtifactChildKeyMatches(prefixes: DocumentArtifactChildKeyPrefixes, key: []const u8) bool {
+    return std.mem.startsWith(u8, key, prefixes.unit) or std.mem.startsWith(u8, key, prefixes.chunk);
+}
+
+fn validateDocumentArtifactChildRangeBatchScope(
+    alloc: std.mem.Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+) !void {
+    var prefixes = try documentArtifactChildKeyPrefixesAlloc(alloc, doc_key, artifact_name);
+    defer prefixes.deinit(alloc);
+
+    for (child_batch.artifact_writes) |write| {
+        if (!documentArtifactChildKeyMatches(prefixes, write.key)) return error.InvalidBatchRequest;
+    }
+    for (child_batch.artifact_delete_keys) |key| {
+        if (!documentArtifactChildKeyMatches(prefixes, key)) return error.InvalidBatchRequest;
+    }
+    for (child_batch.documents) |doc| {
+        if (!documentArtifactChildKeyMatches(prefixes, doc.key)) return error.InvalidBatchRequest;
+    }
+    for (child_batch.dense_embeddings) |embedding| {
+        if (embedding.artifact_key) |artifact_key| {
+            if (!documentArtifactChildKeyMatches(prefixes, artifact_key)) return error.InvalidBatchRequest;
+        }
+    }
+    for (child_batch.sparse_embeddings) |embedding| {
+        if (embedding.artifact_key) |artifact_key| {
+            if (!documentArtifactChildKeyMatches(prefixes, artifact_key)) return error.InvalidBatchRequest;
+        }
+    }
+}
 
 const ForeignKeyIntegrityRequestWire = struct {
     action: ?[]const u8 = null,
@@ -323,6 +471,172 @@ fn handleImpl(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             .transformed = result.transformed,
         };
         return try http_route_helpers.jsonResponseWithStatus(ctx.alloc, 201, response);
+    }
+    if (routes.Routes.matchGroupTableArtifactRepair(path)) |repair_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var parsed = std.json.parseFromSlice(db_mod.types.ArtifactRepairListRequest, ctx.alloc, if (req.body.len > 0) req.body else "{}", .{}) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid artifact repair list request");
+        };
+        defer parsed.deinit();
+        var result = (writes.listArtifactRepairIssuesGroupLocal(
+            ctx.alloc,
+            repair_route.group_id,
+            repair_route.table_name,
+            parsed.value,
+        ) catch |err| switch (err) {
+            error.InvalidArgument => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid artifact repair list request"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        defer result.deinit(ctx.alloc);
+        return try http_route_helpers.jsonResponse(ctx.alloc, result);
+    }
+    if (routes.Routes.matchGroupTableArtifactRepairRun(path)) |repair_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var parsed = std.json.parseFromSlice(db_mod.types.ArtifactRepairRunRequest, ctx.alloc, if (req.body.len > 0) req.body else "{}", .{}) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid artifact repair request");
+        };
+        defer parsed.deinit();
+        if (parsed.value.repair_job_id != null or parsed.value.repair_attempt_id != null) {
+            const job_id = parsed.value.repair_job_id orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid repair cancel token");
+            const attempt_id = parsed.value.repair_attempt_id orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid repair cancel token");
+            if (parsed.value.repair_cancel_base_uri) |base_uri| {
+                const executor = ctx.repair_cancel_executor orelse return try http_route_helpers.textResponse(ctx.alloc, 503, "repair cancel unavailable");
+                var probe = RemoteRepairJobCancelProbe{
+                    .alloc = ctx.alloc,
+                    .executor = executor,
+                    .base_uri = base_uri,
+                    .table_name = repair_route.table_name,
+                    .job_id = job_id,
+                    .attempt_id = attempt_id,
+                };
+                var result = (writes.repairArtifactIssuesGroupLocalControlled(
+                    ctx.alloc,
+                    repair_route.group_id,
+                    repair_route.table_name,
+                    parsed.value,
+                    .{
+                        .cancel_check = .{
+                            .ptr = &probe,
+                            .is_requested = RemoteRepairJobCancelProbe.check,
+                        },
+                    },
+                ) catch |err| switch (err) {
+                    error.Canceled => return try http_route_helpers.textResponse(ctx.alloc, 409, "repair cancelled"),
+                    error.InvalidArgument => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid artifact repair request"),
+                    error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+                    error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+                    error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+                    else => return err,
+                }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+                defer result.deinit(ctx.alloc);
+                return try http_route_helpers.jsonResponseWithStatus(ctx.alloc, 202, result);
+            } else {
+                const store = ctx.repair_job_store orelse return try http_route_helpers.textResponse(ctx.alloc, 503, "repair cancel unavailable");
+                var probe = RepairJobCancelProbe{
+                    .alloc = ctx.alloc,
+                    .store = store,
+                    .job_id = job_id,
+                    .attempt_id = attempt_id,
+                };
+                var result = (writes.repairArtifactIssuesGroupLocalControlled(
+                    ctx.alloc,
+                    repair_route.group_id,
+                    repair_route.table_name,
+                    parsed.value,
+                    .{
+                        .cancel_check = .{
+                            .ptr = &probe,
+                            .is_requested = RepairJobCancelProbe.check,
+                        },
+                    },
+                ) catch |err| switch (err) {
+                    error.Canceled => return try http_route_helpers.textResponse(ctx.alloc, 409, "repair cancelled"),
+                    error.InvalidArgument => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid artifact repair request"),
+                    error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+                    error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+                    error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+                    else => return err,
+                }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+                defer result.deinit(ctx.alloc);
+                return try http_route_helpers.jsonResponseWithStatus(ctx.alloc, 202, result);
+            }
+        }
+        var result = (writes.repairArtifactIssuesGroupLocalControlled(
+            ctx.alloc,
+            repair_route.group_id,
+            repair_route.table_name,
+            parsed.value,
+            .{},
+        ) catch |err| switch (err) {
+            error.Canceled => return try http_route_helpers.textResponse(ctx.alloc, 409, "repair cancelled"),
+            error.InvalidArgument => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid artifact repair request"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        defer result.deinit(ctx.alloc);
+        return try http_route_helpers.jsonResponseWithStatus(ctx.alloc, 202, result);
+    }
+    if (routes.Routes.matchGroupDocumentArtifactPlacementUpdate(path)) |artifact_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(ctx.alloc, artifact_route.key);
+        defer ctx.alloc.free(decoded_key);
+        const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(ctx.alloc, artifact_route.artifact_name);
+        defer ctx.alloc.free(decoded_artifact_name);
+        var parsed = std.json.parseFromSlice(db_mod.types.DocumentArtifactChildRangePlacementUpdate, ctx.alloc, req.body, .{}) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid document artifact placement request");
+        };
+        defer parsed.deinit();
+        const handled = (writes.updateDocumentArtifactChildRangePlacementGroupLocal(
+            ctx.alloc,
+            artifact_route.group_id,
+            artifact_route.table_name,
+            decoded_key,
+            decoded_artifact_name,
+            parsed.value,
+        ) catch |err| switch (err) {
+            error.InvalidBatchRequest, error.InvalidArgument => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid document artifact placement request"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        if (!handled) return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        return try http_route_helpers.jsonResponse(ctx.alloc, .{ .placement = "updated" });
+    }
+    if (routes.Routes.matchGroupDocumentArtifactChildRangeBatch(path)) |artifact_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(ctx.alloc, artifact_route.key);
+        defer ctx.alloc.free(decoded_key);
+        const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(ctx.alloc, artifact_route.artifact_name);
+        defer ctx.alloc.free(decoded_artifact_name);
+        var parsed = std.json.parseFromSlice(db_mod.DocumentArtifactChildRangeApplyBatch, ctx.alloc, req.body, .{}) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid document artifact child range batch request");
+        };
+        defer parsed.deinit();
+        validateDocumentArtifactChildRangeBatchScope(ctx.alloc, decoded_key, decoded_artifact_name, parsed.value) catch |err| switch (err) {
+            error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid document artifact child range batch request"),
+            else => return err,
+        };
+        const sequence = (writes.applyDocumentArtifactChildRangeBatchGroupLocal(
+            ctx.alloc,
+            artifact_route.group_id,
+            artifact_route.table_name,
+            decoded_key,
+            decoded_artifact_name,
+            parsed.value,
+        ) catch |err| switch (err) {
+            error.InvalidBatchRequest, error.InvalidArgument => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid document artifact child range batch request"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        return try http_route_helpers.jsonResponse(ctx.alloc, .{ .sequence = sequence });
     }
     if (routes.Routes.matchGroupForeignKeyIntegrity(path)) |fk_route| {
         const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
@@ -1306,6 +1620,57 @@ test "internal group write routes validate transaction status requests" {
     try std.testing.expectEqualStrings("invalid transaction request", resp.body);
 }
 
+test "internal group write routes update document artifact child range placement" {
+    const alloc = std.testing.allocator;
+
+    var resp = (try handle(.{
+        .alloc = alloc,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:placement",
+        .body = "{\"range_id\":\"range:000000\",\"placement\":\"remote\",\"owner_group_id\":7002,\"placement_generation\":3,\"route_status\":\"remote_committed\",\"split_eligible\":true}",
+    }, "/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:placement")).?;
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"placement\":\"updated\"") != null);
+}
+
+test "internal group write routes apply document artifact child range batch" {
+    const alloc = std.testing.allocator;
+    const artifact_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc/a", "document_units_v1", "page:000001");
+    defer alloc.free(artifact_key);
+    const writes = [_]db_mod.types.BatchWrite{.{
+        .key = artifact_key,
+        .value = "{\"_parent_doc_key\":\"doc/a\",\"_artifact_name\":\"document_units_v1\",\"unit_id\":\"page:000001\",\"text\":\"alpha\"}",
+    }};
+    const body = try std.json.Stringify.valueAlloc(alloc, db_mod.DocumentArtifactChildRangeApplyBatch{
+        .artifact_writes = writes[0..],
+        .sync_level = .write,
+    }, .{});
+    defer alloc.free(body);
+
+    var resp = (try handle(.{
+        .alloc = alloc,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:child-range-batch",
+        .body = body,
+    }, "/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:child-range-batch")).?;
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"sequence\":44") != null);
+}
+
 test "internal group write routes expose foreign key integrity" {
     const alloc = std.testing.allocator;
 
@@ -2214,6 +2579,26 @@ test "internal group write routes stage rows mutation source envelopes" {
     }
 }
 
+pub fn expectRejectsCallbackTokenWithoutCancelExecutorForTest() !void {
+    const alloc = std.testing.allocator;
+
+    var resp = (try handle(.{
+        .alloc = alloc,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/repair/run",
+        .body = "{\"target\":\"index\",\"index_name\":\"semantic\",\"repair_job_id\":42,\"repair_attempt_id\":3,\"repair_cancel_base_uri\":\"http://node-a\"}",
+    }, "/internal/v1/groups/7/tables/docs/repair/run")).?;
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqualStrings("repair cancel unavailable", resp.body);
+}
+
 test "internal group write routes reject mismatched shard execute requests" {
     const alloc = std.testing.allocator;
 
@@ -2383,6 +2768,8 @@ const TestWriteSource = struct {
                 .unique_constraint_integrity_group_local = uniqueConstraintIntegrityGroupLocal,
                 .relational_column_backed_index_repair_group_local = relationalColumnBackedIndexRepairGroupLocal,
                 .table_emptying_group_local = tableEmptyingGroupLocal,
+                .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
+                .apply_document_artifact_child_range_batch_group_local = applyDocumentArtifactChildRangeBatchGroupLocal,
             },
         };
     }
@@ -2427,6 +2814,47 @@ const TestWriteSource = struct {
 
     fn txnStatusGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !?db_mod.types.TxnStatus {
         return .pending;
+    }
+
+    fn updateDocumentArtifactChildRangePlacementGroupLocal(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+    ) !?bool {
+        if (group_id != 7) return null;
+        if (!std.mem.eql(u8, table_name, "docs")) return null;
+        if (!std.mem.eql(u8, doc_key, "doc/a")) return false;
+        if (!std.mem.eql(u8, artifact_name, "document_units_v1")) return false;
+        if (!std.mem.eql(u8, update.range_id, "range:000000")) return false;
+        if (!std.mem.eql(u8, update.placement, "remote")) return false;
+        if (update.owner_group_id != 7002) return false;
+        if (update.placement_generation != 3) return false;
+        if (update.route_status == null or !std.mem.eql(u8, update.route_status.?, "remote_committed")) return false;
+        if (update.split_eligible != true) return false;
+        return true;
+    }
+
+    fn applyDocumentArtifactChildRangeBatchGroupLocal(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+    ) !?u64 {
+        if (group_id != 7) return null;
+        if (!std.mem.eql(u8, table_name, "docs")) return null;
+        if (!std.mem.eql(u8, doc_key, "doc/a")) return null;
+        if (!std.mem.eql(u8, artifact_name, "document_units_v1")) return null;
+        if (child_batch.artifact_writes.len != 1) return error.InvalidBatchRequest;
+        if (child_batch.artifact_delete_keys.len != 0) return error.InvalidBatchRequest;
+        if (child_batch.sync_level != .write) return error.InvalidBatchRequest;
+        return 44;
     }
 
     fn foreignKeyIntegrityGroupLocal(

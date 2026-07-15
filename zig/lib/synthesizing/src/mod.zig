@@ -136,7 +136,9 @@ pub const Registry = struct {
 
         var it = value.object.iterator();
         while (it.next()) |entry| {
-            var parsed = try std.json.parseFromValue(Config, alloc, entry.value_ptr.*, .{
+            const encoded = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.*, .{});
+            defer alloc.free(encoded);
+            var parsed = try std.json.parseFromSlice(Config, alloc, encoded, .{
                 .allocate = .alloc_always,
                 .ignore_unknown_fields = true,
             });

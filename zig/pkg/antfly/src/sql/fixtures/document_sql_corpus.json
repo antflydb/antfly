@@ -4235,7 +4235,7 @@
       "expected": {
         "producer": "indexed_filter",
         "filter_query_json": "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}",
-        "residual_filter_json": "{\"numeric_unary_range\":{\"path\":\"/metrics/score\",\"function\":\"sqrt\",\"min\":2,\"inclusive_min\":true}}",
+        "residual_filter_json": "{\"numeric_unary_range\":{\"path\":\"/metrics/score\",\"operator\":\"sqrt\",\"min\":2,\"inclusive_min\":true}}",
         "max_candidate_rows": 25
       }
     },
@@ -4589,12 +4589,25 @@
       }
     },
     {
-      "name": "hybrid search with scalar residual requires bounded candidate policy",
+      "name": "hybrid search with scalar residual uses catalog default bounded candidate policy",
       "schema": "vector_with_status",
       "indexes_json": "{\"docs_hybrid\":{\"type\":\"hybrid\",\"index_generation\":13,\"expected_index_generation\":13}}",
       "sql": "SELECT _id FROM docs WHERE antfly.hybrid_search(table_name => 'docs', full_text_index => 'docs_body_fts', semantic_index => 'docs_body_semantic', field => 'body', query => 'alpha', fusion => 'rrf', limit => 5) AND status = 'active'",
       "expected": {
-        "expected_error": "DocumentSqlBoundedScanPolicyRequired"
+        "producer": "native_query",
+        "native_query_json": "{\"semantic_search\":\"alpha\",\"indexes\":[\"docs_body_semantic\"],\"full_text_search\":{\"match\":\"alpha\",\"field\":\"body\"},\"merge_config\":{\"strategy\":\"rrf\"},\"limit\":5}",
+        "native_query_contains": [
+          "\"semantic_search\":\"alpha\"",
+          "\"full_text_search\"",
+          "\"merge_config\"",
+          "\"limit\":5"
+        ],
+        "residual_filter_contains": [
+          "\"/status\"",
+          "\"active\""
+        ],
+        "residual_filter_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "max_candidate_rows": 10000
       }
     },
     {
@@ -4698,12 +4711,24 @@
       }
     },
     {
-      "name": "graph traversal with scalar residual requires bounded candidate policy",
+      "name": "graph traversal with scalar residual uses catalog default bounded candidate policy",
       "schema": "vector_with_status",
       "indexes_json": "{\"docs_edge_graph\":{\"type\":\"graph\",\"index_generation\":14,\"expected_index_generation\":14}}",
       "sql": "SELECT _id FROM docs WHERE antfly.graph_traverse(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', max_depth => 2, limit => 5) AND status = 'active'",
       "expected": {
-        "expected_error": "DocumentSqlBoundedScanPolicyRequired"
+        "producer": "native_query",
+        "native_query_json": "{\"graph_searches\":{\"traverse\":{\"type\":\"traverse\",\"index_name\":\"docs_edge_graph\",\"start_nodes\":{\"keys\":[\"doc:a\"]},\"params\":{\"max_depth\":2}}},\"limit\":5}",
+        "native_query_contains": [
+          "\"graph_searches\"",
+          "\"type\":\"traverse\"",
+          "\"limit\":5"
+        ],
+        "residual_filter_contains": [
+          "\"/status\"",
+          "\"active\""
+        ],
+        "residual_filter_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "max_candidate_rows": 10000
       }
     },
     {
@@ -4797,12 +4822,24 @@
       }
     },
     {
-      "name": "graph metric with scalar residual requires bounded candidate policy",
+      "name": "graph metric with scalar residual uses catalog default bounded candidate policy",
       "schema": "vector_with_status",
       "indexes_json": "{\"docs_pagerank\":{\"type\":\"graph_metric\",\"index_generation\":15,\"expected_index_generation\":15}}",
       "sql": "SELECT _id FROM docs WHERE antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 10, limit => 5) AND status = 'active'",
       "expected": {
-        "expected_error": "DocumentSqlBoundedScanPolicyRequired"
+        "producer": "native_query",
+        "native_query_json": "{\"graph_metric\":{\"index\":\"docs_edge_graph\",\"metric\":\"pagerank\",\"top_k\":10},\"limit\":5}",
+        "native_query_contains": [
+          "\"graph_metric\"",
+          "\"metric\":\"pagerank\"",
+          "\"limit\":5"
+        ],
+        "residual_filter_contains": [
+          "\"/status\"",
+          "\"active\""
+        ],
+        "residual_filter_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "max_candidate_rows": 10000
       }
     },
     {
@@ -4889,12 +4926,25 @@
       }
     },
     {
-      "name": "graph metric rerank with scalar residual requires bounded candidate policy",
+      "name": "graph metric rerank with scalar residual uses catalog default bounded candidate policy",
       "schema": "vector_with_status",
       "indexes_json": "{\"docs_pagerank\":{\"type\":\"graph_metric\",\"index_generation\":16,\"expected_index_generation\":16}}",
       "sql": "SELECT _id FROM docs WHERE antfly.graph_metric_rerank(table_name => 'docs', full_text_index => 'docs_body_fts', field => 'body', query => 'alpha', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', limit => 5) AND status = 'active'",
       "expected": {
-        "expected_error": "DocumentSqlBoundedScanPolicyRequired"
+        "producer": "native_query",
+        "native_query_json": "{\"full_text_search\":{\"match\":\"alpha\",\"field\":\"body\"},\"graph_metric_rerank\":{\"index\":\"docs_edge_graph\",\"metric\":\"pagerank\"},\"limit\":5}",
+        "native_query_contains": [
+          "\"full_text_search\"",
+          "\"graph_metric_rerank\"",
+          "\"metric\":\"pagerank\"",
+          "\"limit\":5"
+        ],
+        "residual_filter_contains": [
+          "\"/status\"",
+          "\"active\""
+        ],
+        "residual_filter_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "max_candidate_rows": 10000
       }
     },
     {
@@ -4960,8 +5010,7 @@
         "filter_query_contains": [
           "\"/status\"",
           "\"active\""
-        ],
-        "max_candidate_rows": 25
+        ]
       }
     },
     {
@@ -5004,16 +5053,15 @@
         "filter_query_contains": [
           "\"/status\"",
           "\"active\""
-        ],
-        "max_candidate_rows": 25
+        ]
       }
     },
     {
-      "name": "aggregate unbounded scan rejects without bounded policy",
+      "name": "aggregate count without candidate lowers without bounded policy",
       "schema": "aggregate_ready",
       "sql": "SELECT count(*) AS row_count FROM docs",
       "expected": {
-        "expected_error": "DocumentSqlBoundedScanMissingExactProducer"
+        "aggregate_op": "count"
       }
     },
     {

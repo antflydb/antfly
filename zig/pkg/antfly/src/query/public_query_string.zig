@@ -294,6 +294,17 @@ fn freeFilter(alloc: std.mem.Allocator, filter: search_filter_mod.Filter) void {
             alloc.free(wildcard.field);
             alloc.free(wildcard.pattern);
         },
+        .range => |range| {
+            alloc.free(range.field);
+        },
+        .date_range => |range| {
+            alloc.free(range.field);
+        },
+        .term_range => |range| {
+            alloc.free(range.field);
+            if (range.min) |min| alloc.free(min);
+            if (range.max) |max| alloc.free(max);
+        },
         .bool_filter => |bool_filter| {
             freeFilterSlice(alloc, bool_filter.must);
             freeFilterSlice(alloc, bool_filter.should);
@@ -335,6 +346,17 @@ fn freeTextQuery(alloc: std.mem.Allocator, query: db_types.TextQuery) void {
         .fuzzy => |fuzzy| {
             alloc.free(fuzzy.field);
             alloc.free(fuzzy.term);
+        },
+        .numeric_range => |range| {
+            alloc.free(range.field);
+        },
+        .date_range => |range| {
+            alloc.free(range.field);
+        },
+        .term_range => |range| {
+            alloc.free(range.field);
+            if (range.min) |min| alloc.free(min);
+            if (range.max) |max| alloc.free(max);
         },
         .bool_query => |bool_query| {
             freeTextQuerySlice(alloc, bool_query.must);

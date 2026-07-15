@@ -20,6 +20,8 @@ const max_db_module_zig_bytes = 64 * 1024 * 1024;
 const db_source_root = "pkg/antfly/src/storage/db";
 const db_test_root_path = "pkg/antfly/src/db_test_root.zig";
 
+pub var selected_test_filter: ?[]const u8 = null;
+
 pub const no_default_filters = [_][]const u8{};
 
 pub const DBTestStep = struct {
@@ -788,6 +790,10 @@ pub const DBTestFilters = struct {
         "storage.db.lifecycle.test.",
     };
 
+    pub const artifact_repair = [_][]const u8{
+        "storage.db.artifact_repair.test.",
+    };
+
     pub const reopen = [_][]const u8{
         "storage.db.search_runtime.test.db search runtime reopen ",
     };
@@ -813,11 +819,13 @@ pub const APITestFilters = struct {
         "mcp table tools expose catalog fields and route supported catalog lifecycle targets",
         "internal group write routes expose unique integrity",
         "internal group write routes expose foreign key action job requeue",
+        "batch parser rejects removed aknn sync level",
         "batch parser accepts Go transform op spelling",
         "batch parser and encoder preserve relational identity rewrites",
         "public table contract exposes migration metadata",
         "table contract accepts public field scoped full text create index",
         "api http client round-trips public table management routes",
+        "api http client encodes table name for repair cancel callback",
         "api http server serves status",
         "api http server returns json eval and query builder validation errors",
         "api http server returns json not found for missing query builder table",
@@ -830,16 +838,21 @@ pub const APITestFilters = struct {
         "api http server lists secrets status without a local secret store",
         "api http server rejects secret writes without a local secret store",
         "api http server serves table lookup with version header",
+        "artifact repair query params decode percent encoded values",
+        "generated client query params decode for metadata parsers",
         "api http server serves table scan as ndjson",
+        "scan line key uses reserved _id document identity",
         "api http server routes table query through read schema full text index",
         "api http server serves table query response envelope",
+        "api http server passes rows total mode through public query route",
         "api http server serves retrieval agent response envelope",
         "api http server serves table batch writes",
-        "api http server exposes relational foreign key integrity repair",
-        "api http server exposes relational unique integrity repair",
-        "auto bulk max-window session rolls without a following write",
+        "api http server exposes relational ",
+        "relational repair route declares admin table permission",
+        "api http server marks table repair job ",
+        "auto bulk max-window request waits for idle finish",
         "auto bulk group writes release leases so idle finish can publish",
-        "auto bulk max-window rolls publish all threshold aligned docs",
+        "auto bulk background finish skips entries with active foreground leases",
         "provisioned table write source seeds doc identity namespace from table range",
         "provisioned table write source cached runtime status does not fetch catalog coverage",
         "managed startup catch-up uses provided indexes json without catalog fetch",
@@ -854,13 +867,12 @@ pub const APITestFilters = struct {
         "api http server serves table metadata list and detail",
         "api http server serves runtime schema debug on table and index detail",
         "api http server serves table index metadata routes",
-        "api index status prefers best-effort write runtime status",
-        "api index status prefers cached read runtime status before write status",
-        "api index status does not fall through to write runtime status when read cache is empty",
-        "api index status uses propagated remote store runtime status",
-        "api index status ignores propagated runtime status from removed owner",
-        "api index status reports missing remote shard as not ready",
+        "api index status ",
         "single embeddings index encoder keeps backfill active while enrichment replay lags",
+        "single embeddings index encoder treats stale enrichment tail as ready when coverage is complete",
+        "partial coverage embeddings readiness counts skipped source units",
+        "partial coverage embeddings readiness does not mask pending enrichment",
+        "empty embeddings index status is ready without dense artifact visibility",
         "api http server serves local index runtime backfill status",
         "api http server graph metric action endpoint returns updated status",
         "api http server serves provisioned index runtime backfill status across shards",
@@ -873,12 +885,35 @@ pub const APITestFilters = struct {
         "api http server serves table create and drop",
         "api http server serves table metadata routes against real metadata service",
         "api http server create table with replication sources returns encoded table detail",
-        "api http server exposes relational foreign key integrity repair",
-        "api http server exposes relational unique integrity repair",
         "api http server lists cluster backups through public route",
+        "api http server forwards cluster backup mutations to metadata leader",
+        "api http server returns retryable not leader for local public metadata mutation",
+        "api http server returns retryable not leader when metadata proposal is dropped",
+        "api http server returns retryable not leader through public table adapter mutation",
+        "api http server returns retryable not leader through public cluster adapter mutation",
         "api http server backs up and restores a table through public routes",
+        "api http server table restore is triggered when read path is still empty",
         "api http server prefers metadata-owned restore over inline write-source restore",
+        "api http server retries stale metadata table-exists restore race",
         "public API request body limit matches Go linear merge contract",
+        "public openapi documents stable exact sort diagnostics",
+        "public openapi row query contract includes total mode semantics",
+        "api http invalid query with sort diagnostic returns exact sort response",
+        "api http plain public query preserves outer absolute request deadline",
+        "api http public sort capability gate fails closed for uncovered observed dynamic fields",
+        "api http public sort capability gate validates mapped sortable fields",
+        "api http public sort capability gate validates score-bearing source",
+        "api http public table dispatch preserves unsupported sorted query as exact sort",
+        "api http query budget rejection response exposes stable sort reason",
+        "api http retry sleep is bounded by request deadline",
+        "api http server retries transient query EndOfStream before returning 500",
+        "api http server serves document lookup through mcp tool",
+        "api http server storage status prefers direct lsm stats over runtime cache",
+        "api http transient read retry honors expired request deadline before source query",
+        "api http unsupported count ordered page response exposes stable sort reason",
+        "api http unsupported sorted query response exposes stable sort reason",
+        "api http unsupported sorted query response surfaces exact sort diagnostics",
+        "api http unsupported unsorted query response remains generic",
         "public api smoke e2e creates table inserts and queries documents",
         "public api e2e supports graph queries",
         "public api e2e recreates managed embeddings index after corrupt artifact",
@@ -978,11 +1013,23 @@ pub const APITestFilters = struct {
     };
 
     pub const logic = [_][]const u8{
-        // api/tables.zig: status/detail/debug encoders, parsers, schema
-        // update, and query-routing logic.
+        // metadata/catalog/table_ddl.zig and api/table_contract.zig:
+        // status/detail/debug encoders, parsers, schema update, and
+        // query-routing logic.
         "metadata.table status encoder",
+        "metadata.table generated field capabilities",
+        "metadata.table status exposes",
+        "metadata.table status includes observed",
+        "metadata.table status promotes",
+        "metadata.table status does not",
+        "metadata.table status merges",
         "metadata.table detail encoder",
         "metadata.table debug encoder",
+        "table contract parses create table via generated openapi type",
+        "table contract rejects malformed schema payloads",
+        "table contract rejects artifact-backed public full text create index",
+        "table contract normalizes public artifact enrichment request",
+        "table contract schema update error message explains public sortable replacement for doc values",
         "create table parser",
         "schema-derived algebraic indexes",
         "single schema-derived algebraic index",
@@ -992,13 +1039,46 @@ pub const APITestFilters = struct {
         "schema update parser",
         "validated table schema parses",
         "table schema write validation",
+        "runtime schema derives internal doc values from sortable scalar mappings",
+        "schema rejects sortable non-scalar dynamic mappings",
+        "runtime schema lowers document field mappings to exact declared fields",
+        "schema rejects sortable non-scalar document field mappings",
+        "runtime schema derives and validates index sort metadata",
+        "parse document field mapping contract",
+        "parse accepts sortable without public doc values and rejects unsupported sortable mappings",
         "metadata.schema update",
         "metadata.query routing",
         "api query contract parses typed row claim request",
         "api query contract parses typed json filters",
+        "api query contract serializes sort profile diagnostics",
+        "api query contract maps public exact sort rejection diagnostics",
+        "api query contract serializes ordered hit sort tuple",
+        "api query contract serializes cursor-only id sort tuple",
+        "api query contract validates cursor-only implicit id sort tuple",
+        "api query contract rejects ordered hits without complete sort tuple",
+        "api query contract rejects ordered hits with non replayable sort tuple",
+        "api query contract keeps ambiguous direct text operators score-bearing",
+        "api query contract rejects malformed scoring clauses before filter fallback",
+        "api query contract treats canonical string path term as structured filter",
+        "api query contract rejects count with stored sort",
+        "api query contract rejects count with search_after cursor",
+        "api query contract rejects count with search_before cursor",
+        "api query contract defaults cursor pagination without sort to id order",
+        "api query contract preflight rejects cursor pagination without sort when cursor is not id arity",
+        "api query contract preflight rejects cursor pagination over approximate vector source",
+        "api query contract preflight rejects search_before pagination over approximate vector source",
+        "api query contract preflight rejects score sort over approximate vector source",
+        "api query contract preflight rejects score sort without score-bearing source",
+        "api query contract appends stable id sort tiebreaker for cursors",
+        "api query contract rejects cursor width that omits stable id tiebreaker",
+        "api query contract records cursor arity diagnostic without sort",
+        "api query contract rejects non replayable search_after cursor values",
+        "api query contract rejects score sort without score-bearing text source",
+        "api query contract rejects non replayable search_before cursor values",
+        "api query contract rejects ambiguous explicit id sort tiebreaker",
         "sql adapter parsed sql exposes raw statement source spans",
         "sql adapter parsed sql owns typed statement variants",
-        "sql adapter binder resolves catalog prebind table names from shared tokens",
+        "sql adapter binder resolves runtime schema from catalog table name",
         "sql adapter binder validates relational catalog lookups",
         "sql adapter binder resolves join projection bindings",
         "sql adapter lowering context classifies read sql into typed plan families",
@@ -1037,7 +1117,7 @@ pub const APITestFilters = struct {
         "sql adapter lower dml rejects stale generated conflict update assignment rhs metadata",
         "sql adapter lower dml rejects stale generated conflict literal assignment rhs expression kind metadata",
         "sql adapter lower dml rejects stale generated conflict default assignment rhs metadata",
-        "sql adapter lower dml rejects stale generated conflict boolean assignment operator metadata",
+        "sql adapter lower dml lowers retained generated conflict boolean assignment rhs chain",
         "sql adapter lower dml rejects stale generated conflict boolean assignment rhs child metadata",
         "sql adapter lower dml rejects stale generated conflict expression assignment rhs child metadata",
         "sql adapter lower dml rejects stale generated conflict action where predicate child metadata",
@@ -1059,7 +1139,7 @@ pub const APITestFilters = struct {
         "sql adapter lower dml rejects stale generated returning boolean field expression metadata",
         "sql adapter lower dml rejects stale generated returning boolean field expression child metadata",
         "sql adapter lower dml rejects stale generated returning function argument metadata",
-        "sql adapter lower dml rejects stale generated returning extract field metadata",
+        "sql adapter lower dml rejects generated returning extract metadata before legacy parsing",
         "sql adapter lower dml lowers generated targetless conflict do nothing",
         "sql adapter lower dml rejects stale generated conflict target helper payload metadata",
         "sql adapter lower dml rejects stale generated conflict target expression argument metadata",
@@ -1134,7 +1214,7 @@ pub const APITestFilters = struct {
         "sql adapter lower expr lowers pipe concat operator expressions",
         "sql adapter lower expr lowers concat projections",
         "sql adapter lower expr lowers boolean projection operators",
-        "sql adapter lower expr peeks simple returning fields",
+        "sql expr projection peeks simple returning fields",
         "sql adapter lower expr lowers nullif projections",
         "sql adapter lower expr lowers numeric function projections",
         "sql adapter lower expr lowers unary minus projections",
@@ -1157,7 +1237,7 @@ pub const APITestFilters = struct {
         "sql adapter lower expr lowers global aggregate queries",
         "sql adapter lower expr lowers pagination limit all and fetch forms",
         "sql adapter lower expr validates retained generated read body payloads",
-        "sql adapter lower expr rejects unsupported generated subquery predicates",
+        "sql adapter lower expr lowers generated subquery predicates",
         "sql adapter lower expr lowers row claim query plans",
         "sql adapter lower expr treats direct graph table functions as relation sources",
         "sql adapter lower expr lowers select all with named extra projections",
@@ -1194,22 +1274,22 @@ pub const APITestFilters = struct {
         "sql adapter lower expr lowers direct select set operation query plans",
         "sql adapter lower expr reconciles set operation output shape",
         "sql adapter lower expr assembles boolean predicate groups",
-        "sql adapter lower expr names every row expression kind",
-        "sql adapter lower expr compares row expressions",
-        "sql adapter lower expr compares aggregate specs",
-        "sql adapter lower expr detects catalog expression references",
-        "sql adapter lower expr compares query projection and set operation surfaces",
-        "sql adapter lower expr proves simple predicate disjointness",
-        "sql adapter lower expr validates catalog check expression types",
-        "sql adapter lower expr validates DDL expression catalog constraints",
+        "sql expr_type names every row expression kind",
+        "sql expr_equal compares row expressions",
+        "sql expr_equal compares aggregate specs",
+        "sql expr_type detects catalog expression references",
+        "sql select_set compares query projection and set operation surfaces",
+        "sql expr_disjoint proves simple predicate disjointness",
+        "sql expr_type validates catalog check expression types",
+        "sql expr_type validates DDL expression catalog constraints",
         "sql adapter lower expr lowers non recursive cte query plans",
         "sql adapter lower expr lowers equality join queries",
         "sql adapter lower expr lowers bounded left join lateral queries",
         "sql adapter lower expr lowers non recursive cte aggregate plans",
         "sql adapter lower expr lowers non recursive cte join and lateral plans",
         "sql adapter lower expr lowers row_number window query plans",
-        "sql adapter lower expr detects deterministic row expressions",
-        "sql adapter lower expr validates unique expression lists",
+        "sql expr_type detects deterministic row expressions",
+        "sql expr_type validates unique expression lists",
         "sql adapter plan clones and frees row expressions",
         "sql adapter plan frees predicate and window ownership containers",
         "sql adapter plan counts merge arm surfaces",
@@ -1253,8 +1333,7 @@ pub const APITestFilters = struct {
         "document SQL rejects algebraic group by without indexed facts",
         "document SQL lowers json path projection",
         "document SQL lowers full text producer",
-        "document SQL lowers qualified full text producer",
-        "document SQL rejects ranked antfly functions as scalar predicates",
+        "document SQL rejects antfly query functions as scalar predicates",
         "document SQL capability-aware lowering requires full text producer",
         "document SQL capability-aware lowering keeps full text candidate with scalar residual",
         "document SQL lowers scalar equality to indexed filter producer",
@@ -1276,8 +1355,8 @@ pub const APITestFilters = struct {
         "document SQL lowers between predicate to bounded residual scan",
         "document SQL lowers scalar inequality to policy bounded residual scan",
         "document SQL lowers scalar null predicate to policy bounded residual scan",
-        "document SQL lowers null equality comparisons to policy bounded residual scan",
-        "document SQL lowers null range and pattern predicates to policy bounded residual scan",
+        "document SQL lowers null equality comparisons to indexed match none without scan",
+        "document SQL lowers null range and pattern predicates to indexed match none under bounded policy",
         "document SQL keeps indexed scalar producer when bounded scan policy is present",
         "document SQL requires explicit limit for policy-backed indexed reads",
         "document SQL capability-aware lowering scans when scalar index capability is absent",
@@ -1297,9 +1376,6 @@ pub const APITestFilters = struct {
         "document SQL case-fold text predicate rejects unsupported types and non-ASCII literals",
         "document SQL requires bounded scan without id predicate",
         "source binding classifies relational document and lake schemas",
-        "sql adapter lowering context derives document scalar capabilities from catalog indexes",
-        "sql runtime rejects document joins with document diagnostic",
-        "sql runtime non catalog document reads use conservative capabilities",
         "sql adapter ddl plan lowers create index ddl",
         "sql adapter query function dispatch uses token keyword metadata",
         "sql adapter query function lowers antfly query functions into native search requests",
@@ -1319,6 +1395,7 @@ pub const APITestFilters = struct {
         "sql adapter ddl plan lowers type system catalog ddl plans",
         "sql adapter ddl plan lowers maintenance job ddl plans",
         "sql adapter ddl plan lowers bulk io ddl plans",
+        "sql adapter generated copy unsupported AST lowers to bulk io plan",
         "sql adapter ddl plan lowers session catalog ddl plans",
         "sql adapter generated session AST lowers to session catalog plans",
         "sql adapter ddl plan lowers transaction control and protocol ddl plans",
@@ -1332,7 +1409,6 @@ pub const APITestFilters = struct {
         "sql adapter ddl plan lowers application inline foreign key ddl",
         "sql adapter ddl plan preserves named inline create table constraints",
         "sql adapter ddl plan lowers computed check constraints into native expression checks",
-        "SQL adapter DDL syntax conversions map grammar enums to plan enums",
         "catalog jobs schedules typed schema rewrite jobs from applied SQL DDL work",
         "catalog jobs schedules durable schema validation jobs from applied SQL DDL work",
         "catalog jobs schedules row-plan schema rewrite jobs from applied SQL DDL work",
@@ -1347,7 +1423,7 @@ pub const APITestFilters = struct {
         "catalog jobs repairs table emptying barrier jobs after range topology changes",
         "catalog jobs promotes completed table emptying barrier by removing durable jobs",
         "catalog jobs rejects restart identity promotion without allocator reset owner",
-        "catalog jobs promotes restart identity barrier through catalog source reset hook",
+        "catalog jobs promotes restart identity barrier through catalog source promotion hook",
         "catalog jobs promotes one completed table emptying barrier per metadata mutation",
         "catalog jobs promotes completed table emptying barrier by table id",
         "catalog jobs snapshot scheduler does not require HTTP service surface",
@@ -1355,28 +1431,7 @@ pub const APITestFilters = struct {
         "sql adapter value parses scalar json literals",
         "sql adapter value validates json values and defaults",
         "sql adapter value parses interval literals",
-        "sql adapter grammar parses row security catalog tails",
-        "sql adapter grammar parses update policy trigger catalog tails",
-        "sql adapter grammar parses relation population syntax",
-        "sql adapter grammar parses authorization catalog tails",
-        "sql adapter grammar parses logical replication catalog tails",
-        "sql adapter grammar parses type system catalog tails",
-        "sql adapter grammar parses relation lifetime prefixes",
-        "sql adapter grammar parses routine catalog tails",
-        "sql adapter grammar parses sequence catalog tails",
-        "sql adapter grammar parses enum type catalog tails",
-        "sql adapter grammar parses domain catalog tails",
-        "sql adapter grammar parses comment metadata catalog tails",
-        "sql adapter grammar parses drop table and index catalog tails",
-        "sql adapter grammar parses create index headers",
         "sql adapter grammar validates identifier lists",
-        "sql adapter grammar parses alter table headers",
-        "sql adapter grammar parses identity allocator table headers",
-        "sql adapter grammar parses create table definition headers",
-        "sql adapter grammar parses table clone catalog tails",
-        "sql adapter grammar parses table partition catalog tails",
-        "sql adapter grammar parses view catalog tails",
-        "sql adapter grammar parses truncate mutation-source syntax",
         "sql adapter bulk io lowers COPY execution routes",
         "sql adapter bulk io imports COPY rows into row batches",
         "sql adapter bulk io imports and exports COPY text csv and binary codecs",
@@ -1411,11 +1466,6 @@ pub const APITestFilters = struct {
         "document sql native filter rewrite only maps field identifiers",
         "document sql native filter rewrite canonicalizes row filter conjunctions",
         "document SQL bounded aggregate scan admits only lookup-backed document keys",
-        "document SQL residual text case terms match ASCII semantics",
-        "document SQL residual filter supports bool must not",
-        "document SQL residual filter supports null and existence predicates",
-        "document SQL residual filter supports match all and match none",
-        "document SQL residual filter supports native conjuncts and disjuncts",
         "api http server executes Antfly SQL query functions through native query path",
         "api public SQL endpoint executes SQL point writes through typed row batch ingress",
         "api public SQL endpoint applies SQL row triggers to public SQL writes",
@@ -1457,7 +1507,6 @@ pub const APITestFilters = struct {
         "distributed table reads reject stale doc identity before multigroup fanout",
         "api public table query rejects only top-level internal fields",
         "single embeddings index encoder scopes isolated enrichment failure to one index",
-        "api query contract rejects doc identity control fields when with relaxes schema",
         "api query contract public parser rejects internal shard doc identity controls",
         "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
         "distributed graph metric status merge validates metadata compatibility",
@@ -1541,9 +1590,7 @@ pub const APITestFilters = struct {
         "storage.db.doc_filter_wire.test.doc filter wire ",
         "dense vector id ignores ordinal metadata for a different doc",
         "dense metadata prefetch includes legacy ordinal vector ids",
-        "db dense artifact rebuild preserves stable vector ids distinct from ordinals",
-        "db sparse index keeps physical doc nums distinct from doc identity ordinals",
-        "native dense constraints fail closed without ordinal vector mapping",
+        "db query result shape native dense constraints fail closed without ordinal vector mapping",
         "native constraints fail closed when resolved ordinals cannot be represented",
         "native sparse constraints fail closed without ordinal doc num mapper",
         "native sparse constraints map resolved ordinals to physical doc nums",
@@ -1558,7 +1605,7 @@ pub const APITestFilters = struct {
         "text native constraints fail closed when resolved ordinals cannot be projected",
         "text native constraints treat resolved all-doc exclusion as empty candidates",
         "segment doc ordinal sidecar roundtrip and merge preserve live order",
-        "db text compaction preserves ordinal filters across reopen",
+        "db search runtime text schema text compaction preserves ordinal filters across reopen",
         "structured filter doc set cache returns owned clones",
         "structured filter doc set cache separates shared namespace generation keys",
         "cache invalidates ownership move prefix without reviving pinned generations",
@@ -1689,6 +1736,12 @@ pub const APITestFilters = struct {
         "public table query view handler maps doc identity unavailable errors",
         "public table query view handler maps HA read gate errors",
         "public document artifact manifest handlers map HA read gate errors",
+        "public table query handler maps invalid exact sort diagnostics",
+        "public table query handler rejects unknown sort tuple properties before dispatch",
+        "public table query handler maps candidate budget exhaustion",
+        "public table query handler maps unsupported exact sort",
+        "public table query handler exposes stable count-only sort rejection reason",
+        "public table query handler surfaces exact sort rejection diagnostics",
     };
 
     pub const rows = [_][]const u8{
@@ -1843,17 +1896,17 @@ pub const APITestFilters = struct {
         "sql adapter lower dml lowers partial unique point selectors",
         "relational rows query only uses partial secondary index when predicates imply it",
         "relational rows query ignores building secondary indexes and scans base rows",
-        "relational rows query ignores ordered secondary indexes and scans base rows",
+        "relational rows query does not maintain scalar entries for ordered secondary indexes",
         "relational rows query only uses partial unique owner when predicates imply it",
         "relational rows expression partial predicate implication honors source column collation",
-        "relational rows unique owner lookup honors case-insensitive collation",
+        "relational unique owner lookup requires one active owner range",
         "relational rows query uses generated expression columns as non-unique expression indexes",
         "relational unique constraints honor case-insensitive column collation",
         "relational partial unique predicates honor case-insensitive column collation",
         "relational partial unique is-not-null implication parses json null literals",
         "relational expression partial unique predicates honor case-insensitive column collation",
         "relational unique ast field expressions honor source column collation and null distinctness",
-        "relational expression partial predicates maintain indexes and unique owners",
+        "relational expression partial predicates maintain indexes and ordered unique tuples",
         "postgres sql adapter insert source unique conflict executes through relational storage",
         "postgres sql adapter insert source temporal unique conflict executes through relational storage",
         "relational rows insert source contract parses typed source assignments",
@@ -1919,7 +1972,7 @@ pub const APITestFilters = struct {
         "db relational temporal foreign key delete actions respect remaining parent coverage",
         "db foreign key action job applies set-null children in durable pages",
         "db foreign key action job applies cascade children in durable pages",
-        "db foreign key repair rebuilds missing refs and prunes stale refs",
+        "relational foreign key repair rebuilds missing refs and prunes stale refs",
         "db foreign key modeled relational identity workload covers repair and actions",
         "unique integrity owner topology inspection reports active and transitional ranges",
         "relational rows lake bridge",
@@ -2104,17 +2157,17 @@ pub const APITestFilters = struct {
         "sql adapter lower dml lowers partial unique point selectors",
         "relational rows query only uses partial secondary index when predicates imply it",
         "relational rows query ignores building secondary indexes and scans base rows",
-        "relational rows query ignores ordered secondary indexes and scans base rows",
+        "relational rows query does not maintain scalar entries for ordered secondary indexes",
         "relational rows query only uses partial unique owner when predicates imply it",
         "relational rows expression partial predicate implication honors source column collation",
-        "relational rows unique owner lookup honors case-insensitive collation",
+        "relational unique owner lookup requires one active owner range",
         "relational rows query uses generated expression columns as non-unique expression indexes",
         "relational unique constraints honor case-insensitive column collation",
         "relational partial unique predicates honor case-insensitive column collation",
         "relational partial unique is-not-null implication parses json null literals",
         "relational expression partial unique predicates honor case-insensitive column collation",
         "relational unique ast field expressions honor source column collation and null distinctness",
-        "relational expression partial predicates maintain indexes and unique owners",
+        "relational expression partial predicates maintain indexes and ordered unique tuples",
         "postgres sql adapter insert source unique conflict executes through relational storage",
         "postgres sql adapter insert source temporal unique conflict executes through relational storage",
         "relational rows insert source contract parses typed source assignments",
@@ -2178,7 +2231,7 @@ pub const APITestFilters = struct {
         "db relational temporal foreign key delete actions respect remaining parent coverage",
         "db foreign key action job applies set-null children in durable pages",
         "db foreign key action job applies cascade children in durable pages",
-        "db foreign key repair rebuilds missing refs and prunes stale refs",
+        "relational foreign key repair rebuilds missing refs and prunes stale refs",
         "db foreign key modeled relational identity workload covers repair and actions",
         "unique integrity owner topology inspection reports active and transitional ranges",
         "relational rows joined mutation source contract parses lockable join plans",
@@ -2244,7 +2297,7 @@ pub const APITestFilters = struct {
         "explicit text stats requests reject stale identity generation",
         "structured filter doc set cache separates shared namespace generation keys",
         "cache invalidates ownership move prefix without reviving pinned generations",
-        "db text compaction preserves ordinal filters across reopen",
+        "db search runtime text schema text compaction preserves ordinal filters across reopen",
         "storage.db.lifecycle.test.db lifecycle doc identity ",
         "storage.db.write_path.test.db write path doc identity ",
         "identity namespace reassignment preserves snapshot generations and rejects stale writers",
@@ -2519,6 +2572,7 @@ pub const DataTestFilters = struct {
         "data runtime startup catch-up clears no-debt busy writer groups",
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
+        "cached repair telemetry is runtime facts",
         "data runtime local split fallback preserves source identity namespace",
         "data runtime local merge fallback derives receiver identity namespace from catalog",
         "data runtime resolves extension package store env before local default",
@@ -2751,9 +2805,49 @@ pub const StorageTestFilters = struct {
 
 pub const ArtifactReprocessJobTestFilters = struct {
     pub const store = [_][]const u8{
+        "api http client maps remote repair cancel unavailable",
+        "api http client encodes table name for repair cancel callback",
+        "internal group artifact repair rejects callback token without cancel executor",
         "artifact reprocess job store starts and updates a job",
+        "artifact reprocess job store applies running cancellation at pass boundary",
+        "artifact reprocess job store records cancel requested across stale queued token",
+        "artifact reprocess job store guards duplicate advances and stale pass records",
         "artifact reprocess job store recovers durable jobs and reseeds ids",
+        "artifact reprocess job store persists monotonic next id across stale durable writes",
         "artifact reprocess job cleanup removes recovered durable expired jobs",
+        "repair job store starts and records a pass",
+        "repair job store applies running cancellation at pass boundary",
+        "repair job store records cancel requested across stale queued token",
+        "repair job store does not expire future live running heartbeat",
+        "table repair job records bounded pass and continuation",
+        "table repair job store persists monotonic next id across stale durable writes",
+        "table repair job cleanup pages durable expired jobs",
+    };
+};
+
+pub const APIQueryTestFilters = struct {
+    pub const core = [_][]const u8{
+        "query encoder supports count-only and profile responses",
+        "query parser records approximate source diagnostic for semantic exact sort",
+        "query parser rejects semantic cursor-only pagination as approximate source",
+        "query parser rejects semantic search_before pagination as approximate source",
+        "query parser rejects semantic score sort as approximate source",
+        "query merge rejects score ordered hits without finite scores",
+        "query merge orders non score bearing hits by id without requiring scores",
+        "query merge rejects explicit score sort without score-bearing source",
+        "query merge applies distributed typed sort ordering and cursor paging",
+        "query merge applies default id cursor ordering without explicit order_by",
+        "query merge sort profile does not inherit stale rejection diagnostic",
+        "query merge rejects distributed field sort without runtime schema",
+        "query merge applies runtime schema to distributed date cursors",
+        "query merge rejects sorted shards without complete sort tuples",
+        "query merge rejects sorted shards whose id tiebreaker mismatches hit id",
+        "query merge rejects sorted shards with mixed sort value domains",
+        "query merge preserves lower-bound total relation",
+        "api query contract serializes fused index scores",
+        "api query contract serializes lower-bound total relation",
+        "api query contract maps timeout_ms to execution deadline",
+        "api query contract rejects invalid timeout_ms",
     };
 };
 
@@ -3120,6 +3214,11 @@ const db_storage_module_steps = [_]DBTestStep{
         .filters = &DBTestFilters.lifecycle,
     },
     .{
+        .name = "db-artifact-repair-test",
+        .description = "Run focused storage/db artifact repair tests",
+        .filters = &DBTestFilters.artifact_repair,
+    },
+    .{
         .name = "lib-db-reopen-test",
         .description = "Run root-module DB reopen/compaction tests",
         .filters = &DBTestFilters.reopen,
@@ -3386,24 +3485,19 @@ pub fn chainLabeledRun(
     return &run.step;
 }
 
-fn singleTestFilter(b: *std.Build, filter: []const u8) []const []const u8 {
-    const filters = b.allocator.alloc([]const u8, 1) catch @panic("OOM");
-    filters[0] = filter;
-    return filters;
-}
-
-fn chainLabeledFilteredTest(
+fn chainLabeledFilteredRun(
     b: *std.Build,
-    root_module: *std.Build.Module,
+    artifact: *std.Build.Step.Compile,
     phase: []const u8,
     filter: []const u8,
     previous: ?*std.Build.Step,
 ) *std.Build.Step {
-    const tests = b.addTest(.{
-        .root_module = root_module,
-        .filters = singleTestFilter(b, filter),
-    });
-    return chainLabeledRun(b, tests, b.fmt("{s}: {s}", .{ phase, filter }), previous);
+    const banner = addProgressBanner(b, b.fmt("{s}: {s}", .{ phase, filter }));
+    if (previous) |step| banner.step.dependOn(step);
+    const run = b.addRunArtifact(artifact);
+    run.addArgs(&.{ "--test-filter", filter });
+    run.step.dependOn(&banner.step);
+    return &run.step;
 }
 
 pub fn chainLabeledFilteredTests(
@@ -3413,9 +3507,17 @@ pub fn chainLabeledFilteredTests(
     filters: []const []const u8,
     previous: ?*std.Build.Step,
 ) *std.Build.Step {
+    const tests = b.addTest(.{
+        .root_module = root_module,
+        .filters = filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
     var tail = previous;
     for (filters) |filter| {
-        tail = chainLabeledFilteredTest(b, root_module, phase, filter, tail);
+        tail = chainLabeledFilteredRun(b, tests, phase, filter, tail);
     }
     return tail.?;
 }
@@ -3426,16 +3528,17 @@ fn addTestArtifact(
     default_filters: []const []const u8,
     simple_runner: bool,
 ) *std.Build.Step.Compile {
+    const filters = resolveTestFilters(b, default_filters, true, simple_runner);
     return if (simple_runner) b.addTest(.{
         .root_module = root_module,
-        .filters = selectTestFilters(b, default_filters),
+        .filters = filters,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     }) else b.addTest(.{
         .root_module = root_module,
-        .filters = selectTestFilters(b, default_filters),
+        .filters = filters,
     });
 }
 
@@ -3447,7 +3550,7 @@ pub fn addModuleTestStep(
     options: ModuleTestOptions,
 ) ModuleTestRun {
     const filters: []const []const u8 = if (options.filters) |default_filters|
-        if (options.select_filters) selectTestFilters(b, default_filters) else default_filters
+        resolveTestFilters(b, default_filters, options.select_filters, options.simple_runner)
     else
         &.{};
     const tests = if (options.simple_runner) b.addTest(.{
@@ -3462,6 +3565,7 @@ pub fn addModuleTestStep(
         .filters = filters,
     });
     const run = b.addRunArtifact(tests);
+    if (options.simple_runner) addSelectedRunTestFilter(b, run);
     const step = b.step(step_name, description);
     step.dependOn(&run.step);
     return .{
@@ -3617,7 +3721,7 @@ fn addSimpleAPITestRun(
     default_filters: []const []const u8,
     select_filters: bool,
 ) *std.Build.Step.Run {
-    const filters = if (select_filters) selectTestFilters(b, default_filters) else default_filters;
+    const filters = resolveTestFilters(b, default_filters, select_filters, true);
     const tests = b.addTest(.{
         .root_module = root_module,
         .filters = filters,
@@ -3626,7 +3730,9 @@ fn addSimpleAPITestRun(
             .mode = .simple,
         },
     });
-    return b.addRunArtifact(tests);
+    const run = b.addRunArtifact(tests);
+    addSelectedRunTestFilter(b, run);
+    return run;
 }
 
 fn addFocusedAPITestStep(
@@ -3649,7 +3755,7 @@ fn addAPIFocusedTestRun(
     select_filters: bool,
     dependency: ?*std.Build.Step,
 ) APIFocusedTestRun {
-    const filters = if (select_filters) selectTestFilters(b, default_filters) else default_filters;
+    const filters = resolveTestFilters(b, default_filters, select_filters, simple_runner);
     const tests = if (simple_runner) b.addTest(.{
         .root_module = root_module,
         .filters = filters,
@@ -3662,6 +3768,7 @@ fn addAPIFocusedTestRun(
         .filters = filters,
     });
     const run = b.addRunArtifact(tests);
+    if (simple_runner) addSelectedRunTestFilter(b, run);
     if (dependency) |dep| run.step.dependOn(dep);
     const step = if (name) |step_name| blk: {
         const focused_step = b.step(step_name, description);
@@ -3706,6 +3813,7 @@ fn addSimpleSelectedTestRun(
         },
     });
     const run = b.addRunArtifact(tests);
+    addSelectedRunTestFilter(b, run);
     for (skip_filters) |filter| {
         run.addArgs(&.{ "--skip-test-filter", filter });
     }
@@ -3743,7 +3851,7 @@ fn addMetadataTestRunArtifact(
     default_filters: []const []const u8,
     select_filters: bool,
 ) MetadataTestRun {
-    const filters = if (select_filters) selectTestFilters(b, default_filters) else default_filters;
+    const filters = resolveTestFilters(b, default_filters, select_filters, true);
     const tests = b.addTest(.{
         .root_module = root_module,
         .filters = filters,
@@ -3753,6 +3861,7 @@ fn addMetadataTestRunArtifact(
         },
     });
     const run = b.addRunArtifact(tests);
+    addSelectedRunTestFilter(b, run);
     return .{
         .tests = tests,
         .run = run,
@@ -3850,7 +3959,7 @@ fn addStorageTestRun(
     select_filters: bool,
     skip_filters: []const []const u8,
 ) StorageTestRun {
-    const filters = if (select_filters) selectTestFilters(b, default_filters) else default_filters;
+    const filters = resolveTestFilters(b, default_filters, select_filters, true);
     const tests = b.addTest(.{
         .root_module = root_module,
         .filters = filters,
@@ -3860,6 +3969,7 @@ fn addStorageTestRun(
         },
     });
     const run = b.addRunArtifact(tests);
+    addSelectedRunTestFilter(b, run);
     for (skip_filters) |filter| {
         run.addArgs(&.{ "--skip-test-filter", filter });
     }
@@ -3902,6 +4012,7 @@ pub fn addRootTestStep(
         },
     });
     const run = b.addRunArtifact(tests);
+    addSelectedRunTestFilter(b, run);
     for (RootTestFilters.skip) |filter| {
         run.addArgs(&.{ "--skip-test-filter", filter });
     }
@@ -4154,6 +4265,7 @@ pub fn addDBRootTestStep(
 ) DBRootTestStep {
     const tests = addTestArtifact(b, root_module, &DBTestFilters.root, true);
     const run = b.addRunArtifact(tests);
+    addSelectedRunTestFilter(b, run);
     const step = b.step(db_root_step_name, "Run root-module DB tests only");
     step.dependOn(&run.step);
     return .{
@@ -4190,7 +4302,9 @@ fn addDBStorageTestStep(
             .mode = .simple,
         },
     });
+    tests.stack_size = 64 * 1024 * 1024;
     const run = b.addRunArtifact(tests);
+    addSelectedRunTestFilter(b, run);
     const step = b.step(db_storage_step_name, "Run storage/db unit tests");
     step.dependOn(&run.step);
     return run;
@@ -4223,6 +4337,7 @@ pub fn addDBFilteredTestStep(
 ) *std.Build.Step.Run {
     const tests = addTestArtifact(b, root_module, db_step.filters, db_step.simple_runner);
     const run = b.addRunArtifact(tests);
+    if (db_step.simple_runner) addSelectedRunTestFilter(b, run);
     const step = b.step(db_step.name, db_step.description);
     step.dependOn(&run.step);
     return run;
@@ -4242,10 +4357,62 @@ pub fn selectTestFilters(
 ) []const []const u8 {
     const args = b.args orelse return default_filters;
     if (args.len == 0) return default_filters;
-
-    if (std.mem.eql(u8, args[0], "--test-filter")) {
-        if (args.len <= 1) return default_filters;
-        return args[1..];
-    }
+    if (argsSelectRunTestFilter(args)) return default_filters;
     return args;
+}
+
+fn resolveTestFilters(
+    b: *std.Build,
+    default_filters: []const []const u8,
+    select_filters: bool,
+    supports_runtime_filter: bool,
+) []const []const u8 {
+    if (!supports_runtime_filter) {
+        if (explicitTestFilterOverride(b)) |filters| return filters;
+    }
+    if (select_filters) return selectTestFilters(b, default_filters);
+    return default_filters;
+}
+
+fn addSelectedRunTestFilter(b: *std.Build, run: *std.Build.Step.Run) void {
+    if (selectedRunTestFilter(b)) |filter| {
+        run.addArgs(&.{ "--test-filter", filter });
+    }
+}
+
+fn selectedRunTestFilter(b: *std.Build) ?[]const u8 {
+    return selectedTestFilter(b);
+}
+
+fn selectedTestFilter(b: *std.Build) ?[]const u8 {
+    if (selected_test_filter) |filter| {
+        if (filter.len != 0) return filter;
+    }
+
+    const args = b.args orelse return null;
+    if (args.len == 0) return null;
+    if (std.mem.eql(u8, args[0], "--test-filter")) {
+        if (args.len <= 1) return null;
+        if (args[1].len == 0) return null;
+        return args[1];
+    }
+    if (std.mem.startsWith(u8, args[0], "--test-filter=")) {
+        const filter = args[0]["--test-filter=".len..];
+        if (filter.len == 0) return null;
+        return filter;
+    }
+    return null;
+}
+
+fn explicitTestFilterOverride(b: *std.Build) ?[]const []const u8 {
+    const filter = selectedTestFilter(b) orelse return null;
+    const filters = b.allocator.alloc([]const u8, 1) catch @panic("out of memory");
+    filters[0] = filter;
+    return filters;
+}
+
+fn argsSelectRunTestFilter(args: []const []const u8) bool {
+    if (args.len == 0) return false;
+    return std.mem.eql(u8, args[0], "--test-filter") or
+        std.mem.startsWith(u8, args[0], "--test-filter=");
 }

@@ -104,14 +104,14 @@ func formatTable(w io.Writer, res *antfly.QueryResponses) error {
 			continue
 		}
 
-		total := resp.Hits.Total
+		total := formatHitsTotal(resp.Hits.Total)
 		count := len(resp.Hits.Hits)
 		if count == 0 {
 			_, _ = fmt.Fprintln(w, "No results found.")
 			continue
 		}
 
-		_, _ = fmt.Fprintf(w, "Found %d hit(s) (total: %d)\n\n", count, total)
+		_, _ = fmt.Fprintf(w, "Found %d hit(s) (total: %s)\n\n", count, total)
 
 		// Collect source field names across all hits (preserving order of first appearance).
 		fieldOrder, fieldSet := collectSourceFields(resp.Hits.Hits)
@@ -187,6 +187,17 @@ func formatTable(w io.Writer, res *antfly.QueryResponses) error {
 		}
 	}
 	return nil
+}
+
+func formatHitsTotal(total antfly.QueryHitsTotal) string {
+	switch total.Relation {
+	case "", antfly.QueryHitsTotalRelationExact:
+		return fmt.Sprintf("%d", total.Value)
+	case antfly.QueryHitsTotalRelationGte:
+		return fmt.Sprintf(">= %d", total.Value)
+	default:
+		return fmt.Sprintf("%d (%s)", total.Value, total.Relation)
+	}
 }
 
 type col struct {

@@ -73,6 +73,7 @@ pub const TableSchema = struct {
     enforce_types: bool = false,
     document_schemas: []DocumentSchema = &.{},
     dynamic_templates: []DynamicTemplate = &.{},
+    index_sort: []IndexSortField = &.{},
     primary_key: ?PrimaryKey = null,
     periods: []RelationalPeriod = &.{},
     foreign_keys: []ForeignKey = &.{},
@@ -89,6 +90,8 @@ pub const TableSchema = struct {
         if (self.document_schemas.len > 0) alloc.free(self.document_schemas);
         for (self.dynamic_templates) |*dynamic_template| dynamic_template.deinit(alloc);
         if (self.dynamic_templates.len > 0) alloc.free(self.dynamic_templates);
+        for (self.index_sort) |*field| field.deinit(alloc);
+        if (self.index_sort.len > 0) alloc.free(self.index_sort);
         if (self.primary_key) |*primary_key| primary_key.deinit(alloc);
         for (self.periods) |*period| period.deinit(alloc);
         if (self.periods.len > 0) alloc.free(self.periods);
@@ -101,6 +104,16 @@ pub const TableSchema = struct {
         for (self.checks) |*check| check.deinit(alloc);
         if (self.checks.len > 0) alloc.free(self.checks);
         if (self.external_base_source) |source| storage_schema.freeExternalBaseSource(alloc, source);
+        self.* = undefined;
+    }
+};
+
+pub const IndexSortField = struct {
+    field: []const u8,
+    desc: bool = false,
+
+    pub fn deinit(self: *IndexSortField, alloc: std.mem.Allocator) void {
+        alloc.free(self.field);
         self.* = undefined;
     }
 };
@@ -681,6 +694,7 @@ pub const DocumentProperty = struct {
     field_type: ?[]const u8 = null,
     antfly_types: [][]const u8 = &.{},
     sql_column_name: ?[]const u8 = null,
+    antfly_field: ?DynamicTemplate = null,
     analyzer: ?[]const u8 = null,
     collation: ?[]const u8 = null,
     antfly_index: ?bool = null,
@@ -751,6 +765,7 @@ pub const DocumentProperty = struct {
         for (self.antfly_types) |antfly_type| alloc.free(antfly_type);
         if (self.antfly_types.len > 0) alloc.free(self.antfly_types);
         if (self.sql_column_name) |column_name| alloc.free(column_name);
+        if (self.antfly_field) |*field| field.deinit(alloc);
         if (self.analyzer) |analyzer| alloc.free(analyzer);
         if (self.collation) |collation| alloc.free(collation);
         if (self.index_name) |index_name| alloc.free(index_name);
@@ -900,7 +915,10 @@ pub const DynamicTemplate = struct {
     do_index: ?bool = null,
     store: ?bool = null,
     doc_values: ?bool = null,
+    sortable: ?bool = null,
+    missing_null_policy: ?[]const u8 = null,
     include_in_all: ?bool = null,
+    fields: []DynamicTemplate = &.{},
 
     pub fn deinit(self: *DynamicTemplate, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
@@ -911,6 +929,9 @@ pub const DynamicTemplate = struct {
         if (self.match_mapping_type) |match_mapping_type| alloc.free(match_mapping_type);
         if (self.field_type) |field_type| alloc.free(field_type);
         if (self.analyzer) |analyzer| alloc.free(analyzer);
+        if (self.missing_null_policy) |policy| alloc.free(policy);
+        for (self.fields) |*field| field.deinit(alloc);
+        if (self.fields.len > 0) alloc.free(self.fields);
         self.* = undefined;
     }
 };
@@ -1223,6 +1244,7 @@ fn validateSchemaValue(value: std.json.Value) !void {
     if (root.get("enforce_types")) |enforce_types| if (enforce_types != .null and enforce_types != .bool) return error.InvalidSchemaUpdateRequest;
     if (root.get("document_schemas")) |document_schemas| if (document_schemas != .null) try validateDocumentSchemas(document_schemas);
     if (root.get("dynamic_templates")) |dynamic_templates| if (dynamic_templates != .null) try validateDynamicTemplates(dynamic_templates);
+    if (root.get("index_sort")) |index_sort| if (index_sort != .null) try validateIndexSort(index_sort);
     if (root.get("primary_key")) |primary_key| if (primary_key != .null) try validatePrimaryKey(primary_key);
     if (root.get("periods")) |periods| if (periods != .null) try validateRelationalPeriodsValue(periods);
     if (root.get("foreign_keys")) |foreign_keys| if (foreign_keys != .null) try validateForeignKeys(foreign_keys);
@@ -2088,6 +2110,9 @@ fn validateDocumentSchemaKeywords(context: SchemaContext, object: std.json.Objec
     if (object.get("x-antfly-include-in-all")) |include_in_all| {
         if (include_in_all != .null) try validateAntflyIncludeInAllDefinition(include_in_all);
     }
+    if (object.get("x-antfly-field")) |antfly_field| {
+        if (antfly_field != .null) try validateFieldMappingObject(antfly_field, true);
+    }
     if (object.get("schema")) |embedded_schema| {
         if (embedded_schema != .null) try validateDocumentSchemaDefinition(embedded_schema);
     }
@@ -2101,7 +2126,10 @@ fn validateDocumentSchemaKeywords(context: SchemaContext, object: std.json.Objec
         if (properties != .null) {
             if (properties != .object) return error.InvalidSchemaUpdateRequest;
             var it = properties.object.iterator();
-            while (it.next()) |entry| try validatePropertySchemaDefinitionWithContext(context, entry.value_ptr.*);
+            while (it.next()) |entry| {
+                if (isReservedDocumentFieldName(entry.key_ptr.*)) return error.InvalidSchemaUpdateRequest;
+                try validatePropertySchemaDefinitionWithContext(context, entry.value_ptr.*);
+            }
         }
     }
     if (object.get("required")) |required| {
@@ -2690,7 +2718,18 @@ fn validateDefinitionsDefinition(context: SchemaContext, value: std.json.Value) 
     var it = object.iterator();
     while (it.next()) |entry| {
         try validatePropertySchemaDefinitionWithContext(context, entry.value_ptr.*);
+        if (try patternPropertyMayMatchReservedDocumentField(entry.key_ptr.*)) {
+            if (documentPropertySchemaValueContainsSortableMapping(entry.value_ptr.*)) return error.InvalidSchemaUpdateRequest;
+        }
     }
+}
+
+fn patternPropertyMayMatchReservedDocumentField(pattern: []const u8) !bool {
+    if (std.mem.eql(u8, pattern, "_id") or std.mem.eql(u8, pattern, "^_id$")) return true;
+    if (std.mem.indexOf(u8, pattern, "_id") != null) return true;
+    if (std.mem.startsWith(u8, pattern, "^_") or std.mem.startsWith(u8, pattern, "_")) return true;
+    if (std.mem.eql(u8, pattern, ".*") or std.mem.eql(u8, pattern, "^.*$") or std.mem.eql(u8, pattern, ".+")) return true;
+    return try regexMatch(pattern, "_id");
 }
 
 fn validateDependentSchemasDefinition(context: SchemaContext, value: std.json.Value) anyerror!void {
@@ -2785,6 +2824,12 @@ fn validateDynamicTemplate(value: std.json.Value) !void {
         else => return error.InvalidSchemaUpdateRequest,
     };
 
+    var keys = object.iterator();
+    while (keys.next()) |entry| {
+        if (!isKnownDynamicTemplateKey(entry.key_ptr.*)) return error.InvalidSchemaUpdateRequest;
+    }
+
+    if (object.get("name")) |name| if (name != .null and name != .string) return error.InvalidSchemaUpdateRequest;
     if (object.get("match")) |match| if (match != .null and match != .string) return error.InvalidSchemaUpdateRequest;
     if (object.get("match_pattern")) |match_pattern| if (match_pattern != .null and match_pattern != .string) return error.InvalidSchemaUpdateRequest;
     if (object.get("unmatch")) |unmatch| if (unmatch != .null and unmatch != .string) return error.InvalidSchemaUpdateRequest;
@@ -2804,14 +2849,246 @@ fn validateDynamicTemplate(value: std.json.Value) !void {
     }
 
     const mapping = object.get("mapping") orelse return error.InvalidSchemaUpdateRequest;
+    try validateDynamicTemplateMappingObject(mapping);
+    if (object.get("match_pattern") != null and fieldMappingValueContainsSortable(mapping)) return error.InvalidSchemaUpdateRequest;
+    if (dynamicTemplateTargetsReservedId(object, mapping)) return error.InvalidSchemaUpdateRequest;
+}
+
+fn isKnownDynamicTemplateKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "name") or
+        std.mem.eql(u8, key, "match") or
+        std.mem.eql(u8, key, "match_pattern") or
+        std.mem.eql(u8, key, "unmatch") or
+        std.mem.eql(u8, key, "path_match") or
+        std.mem.eql(u8, key, "path_unmatch") or
+        std.mem.eql(u8, key, "match_mapping_type") or
+        std.mem.eql(u8, key, "mapping");
+}
+
+fn isReservedDocumentFieldName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "_id");
+}
+
+fn dynamicTemplateTargetsReservedId(object: std.json.ObjectMap, mapping: std.json.Value) bool {
+    const exact_target =
+        optionalStringEquals(object.get("path_match"), "_id") or
+        optionalStringEquals(object.get("match"), "_id") or
+        optionalStringEquals(object.get("match_pattern"), "_id");
+    if (exact_target) return true;
+    if (!fieldMappingValueContainsSortable(mapping)) return false;
+    if (!dynamicTemplateMayMatchReservedId(object)) return false;
+    return true;
+}
+
+fn optionalStringEquals(value: ?std.json.Value, expected: []const u8) bool {
+    const resolved = value orelse return false;
+    return resolved == .string and std.mem.eql(u8, resolved.string, expected);
+}
+
+fn dynamicTemplateMayMatchReservedId(object: std.json.ObjectMap) bool {
+    const reserved = "_id";
+    if (object.get("match")) |match| {
+        if (match == .string and !globMatch(match.string, reserved)) return false;
+    }
+    if (object.get("match_pattern")) |match_pattern| {
+        if (match_pattern == .string and !globMatch(match_pattern.string, reserved)) return false;
+    }
+    if (object.get("unmatch")) |unmatch| {
+        if (unmatch == .string and globMatch(unmatch.string, reserved)) return false;
+    }
+    if (object.get("path_match")) |path_match| {
+        if (path_match == .string and !pathGlobMayMatchReservedId(path_match.string)) return false;
+    }
+    if (object.get("path_unmatch")) |path_unmatch| {
+        if (path_unmatch == .string and globMatch(path_unmatch.string, reserved)) return false;
+    }
+    return true;
+}
+
+fn pathGlobMayMatchReservedId(pattern: []const u8) bool {
+    if (globMatch(pattern, "_id")) return true;
+
+    var rest = pattern;
+    while (true) {
+        const dot = std.mem.indexOfScalar(u8, rest, '.');
+        const segment = if (dot) |idx| rest[0..idx] else rest;
+        if (globMatch(segment, "_id")) return true;
+        if (dot) |idx| {
+            rest = rest[idx + 1 ..];
+        } else {
+            return false;
+        }
+    }
+}
+
+fn fieldMappingValueContainsSortable(mapping: std.json.Value) bool {
+    if (mapping != .object) return false;
+    if (mapping.object.get("sortable")) |sortable| {
+        if (sortable == .bool and sortable.bool) return true;
+    }
+    if (mapping.object.get("fields")) |fields| {
+        if (fields == .object) {
+            var it = fields.object.iterator();
+            while (it.next()) |entry| {
+                if (fieldMappingValueContainsSortable(entry.value_ptr.*)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn documentPropertySchemaValueContainsSortableMapping(value: std.json.Value) bool {
+    switch (value) {
+        .object => |object| {
+            if (object.get("x-antfly-field")) |mapping| {
+                if (fieldMappingValueContainsSortable(mapping)) return true;
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "x-antfly-field")) continue;
+                if (documentPropertySchemaValueContainsSortableMapping(entry.value_ptr.*)) return true;
+            }
+            return false;
+        },
+        .array => |array| {
+            for (array.items) |item| {
+                if (documentPropertySchemaValueContainsSortableMapping(item)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+fn validateDynamicTemplateMappingObject(mapping: std.json.Value) !void {
     if (mapping == .null) return error.InvalidSchemaUpdateRequest;
     if (mapping != .object) return error.InvalidSchemaUpdateRequest;
+    var keys = mapping.object.iterator();
+    while (keys.next()) |entry| {
+        if (!isKnownDynamicTemplateMappingKey(entry.key_ptr.*)) return error.InvalidSchemaUpdateRequest;
+    }
     if (mapping.object.get("type")) |mapping_type| if (mapping_type != .null and mapping_type != .string) return error.InvalidSchemaUpdateRequest;
     if (mapping.object.get("analyzer")) |analyzer| if (analyzer != .null and analyzer != .string) return error.InvalidSchemaUpdateRequest;
     if (mapping.object.get("index")) |index| if (index != .null and index != .bool) return error.InvalidSchemaUpdateRequest;
     if (mapping.object.get("store")) |store| if (store != .null and store != .bool) return error.InvalidSchemaUpdateRequest;
     if (mapping.object.get("doc_values")) |doc_values| if (doc_values != .null and doc_values != .bool) return error.InvalidSchemaUpdateRequest;
+    if (mapping.object.get("sortable")) |sortable| if (sortable != .null and sortable != .bool) return error.InvalidSchemaUpdateRequest;
+    if (mapping.object.get("missing_null_policy")) |policy| {
+        if (policy != .null and policy != .string) return error.InvalidSchemaUpdateRequest;
+        if (policy == .string and storage_schema.parseMissingNullPolicy(policy.string) == null) return error.InvalidSchemaUpdateRequest;
+    }
     if (mapping.object.get("include_in_all")) |include_in_all| if (include_in_all != .null and include_in_all != .bool) return error.InvalidSchemaUpdateRequest;
+    if (mapping.object.get("sortable")) |sortable| {
+        if (sortable == .bool and sortable.bool) {
+            const mapping_type = mapping.object.get("type") orelse return error.InvalidSchemaUpdateRequest;
+            if (mapping_type != .string or !mappingTypeCanSort(mapping_type.string)) return error.InvalidSchemaUpdateRequest;
+            if (mapping.object.get("doc_values")) |doc_values| {
+                if (doc_values == .bool and !doc_values.bool) return error.InvalidSchemaUpdateRequest;
+            }
+        }
+    }
+}
+
+fn isKnownDynamicTemplateMappingKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "type") or
+        std.mem.eql(u8, key, "analyzer") or
+        std.mem.eql(u8, key, "index") or
+        std.mem.eql(u8, key, "store") or
+        std.mem.eql(u8, key, "doc_values") or
+        std.mem.eql(u8, key, "sortable") or
+        std.mem.eql(u8, key, "missing_null_policy") or
+        std.mem.eql(u8, key, "include_in_all");
+}
+
+fn validateFieldMappingObject(mapping: std.json.Value, allow_fields: bool) !void {
+    if (mapping == .null) return error.InvalidSchemaUpdateRequest;
+    if (mapping != .object) return error.InvalidSchemaUpdateRequest;
+    var keys = mapping.object.iterator();
+    while (keys.next()) |entry| {
+        if (!isKnownFieldMappingKey(entry.key_ptr.*, allow_fields)) return error.InvalidSchemaUpdateRequest;
+    }
+    if (mapping.object.get("type")) |mapping_type| if (mapping_type != .null and mapping_type != .string) return error.InvalidSchemaUpdateRequest;
+    if (mapping.object.get("analyzer")) |analyzer| if (analyzer != .null and analyzer != .string) return error.InvalidSchemaUpdateRequest;
+    if (mapping.object.get("index")) |index| if (index != .null and index != .bool) return error.InvalidSchemaUpdateRequest;
+    if (mapping.object.get("store")) |store| if (store != .null and store != .bool) return error.InvalidSchemaUpdateRequest;
+    if (mapping.object.get("doc_values") != null) return error.InvalidSchemaUpdateRequest;
+    if (mapping.object.get("sortable")) |sortable| if (sortable != .null and sortable != .bool) return error.InvalidSchemaUpdateRequest;
+    if (mapping.object.get("missing_null_policy")) |policy| {
+        if (policy != .null and policy != .string) return error.InvalidSchemaUpdateRequest;
+        if (policy == .string and storage_schema.parseMissingNullPolicy(policy.string) == null) return error.InvalidSchemaUpdateRequest;
+    }
+    if (mapping.object.get("include_in_all")) |include_in_all| if (include_in_all != .null and include_in_all != .bool) return error.InvalidSchemaUpdateRequest;
+    if (mapping.object.get("fields")) |fields| {
+        if (!allow_fields) return error.InvalidSchemaUpdateRequest;
+        if (fields != .object) return error.InvalidSchemaUpdateRequest;
+        var it = fields.object.iterator();
+        while (it.next()) |entry| {
+            if (!isValidMappingSubfieldName(entry.key_ptr.*)) return error.InvalidSchemaUpdateRequest;
+            try validateFieldMappingObject(entry.value_ptr.*, false);
+        }
+    }
+    if (mapping.object.get("sortable")) |sortable| {
+        if (sortable == .bool and sortable.bool) {
+            const mapping_type = mapping.object.get("type") orelse return error.InvalidSchemaUpdateRequest;
+            if (mapping_type != .string or !mappingTypeCanSort(mapping_type.string)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+}
+
+fn isKnownFieldMappingKey(key: []const u8, allow_fields: bool) bool {
+    return std.mem.eql(u8, key, "type") or
+        std.mem.eql(u8, key, "analyzer") or
+        std.mem.eql(u8, key, "index") or
+        std.mem.eql(u8, key, "store") or
+        std.mem.eql(u8, key, "sortable") or
+        std.mem.eql(u8, key, "missing_null_policy") or
+        std.mem.eql(u8, key, "include_in_all") or
+        (allow_fields and std.mem.eql(u8, key, "fields")) or
+        std.mem.eql(u8, key, "doc_values");
+}
+
+fn isValidMappingSubfieldName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    return std.mem.indexOfScalar(u8, name, '.') == null;
+}
+
+fn validateIndexSort(value: std.json.Value) !void {
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    if (array.items.len == 0) return error.InvalidSchemaUpdateRequest;
+    for (array.items) |entry| {
+        const object = switch (entry) {
+            .object => |object| object,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        const field = object.get("field") orelse return error.InvalidSchemaUpdateRequest;
+        if (field != .string or field.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (object.get("order")) |order| {
+            if (order != .string) return error.InvalidSchemaUpdateRequest;
+            if (!std.mem.eql(u8, order.string, "asc") and !std.mem.eql(u8, order.string, "desc")) {
+                return error.InvalidSchemaUpdateRequest;
+            }
+        }
+        if (object.get("desc")) |desc| {
+            if (desc != .bool) return error.InvalidSchemaUpdateRequest;
+            if (object.get("order") != null) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+}
+
+fn mappingTypeCanSort(mapping_type: []const u8) bool {
+    return std.mem.eql(u8, mapping_type, "keyword") or
+        std.mem.eql(u8, mapping_type, "numeric") or
+        std.mem.eql(u8, mapping_type, "number") or
+        std.mem.eql(u8, mapping_type, "integer") or
+        std.mem.eql(u8, mapping_type, "boolean") or
+        std.mem.eql(u8, mapping_type, "bool") or
+        std.mem.eql(u8, mapping_type, "datetime") or
+        std.mem.eql(u8, mapping_type, "date") or
+        std.mem.eql(u8, mapping_type, "timestamp") or
+        std.mem.eql(u8, mapping_type, "link");
 }
 
 fn validateNonNegativeInteger(value: std.json.Value) !void {
@@ -2865,6 +3142,9 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     if (root.get("dynamic_templates")) |dynamic_templates| {
         if (dynamic_templates != .null) parsed.dynamic_templates = try parseDynamicTemplates(alloc, dynamic_templates);
     }
+    if (root.get("index_sort")) |index_sort| {
+        if (index_sort != .null) parsed.index_sort = try parseIndexSort(alloc, index_sort);
+    }
     if (root.get("primary_key")) |primary_key| {
         if (primary_key != .null) parsed.primary_key = try parsePrimaryKey(alloc, primary_key);
     }
@@ -2898,6 +3178,36 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
         parsed.enforce_types = true;
     }
     return parsed;
+}
+
+fn parseIndexSort(alloc: std.mem.Allocator, value: std.json.Value) ![]IndexSortField {
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    const fields = try alloc.alloc(IndexSortField, array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (fields[0..initialized]) |*field| field.deinit(alloc);
+        alloc.free(fields);
+    }
+
+    for (array.items) |entry| {
+        const object = entry.object;
+        const field = object.get("field").?.string;
+        const desc = if (object.get("order")) |order|
+            std.mem.eql(u8, order.string, "desc")
+        else if (object.get("desc")) |desc_value|
+            desc_value.bool
+        else
+            false;
+        fields[initialized] = .{
+            .field = try alloc.dupe(u8, field),
+            .desc = desc,
+        };
+        initialized += 1;
+    }
+    return fields;
 }
 
 fn validateParsedTtlSchema(schema: TableSchema) !void {
@@ -4412,6 +4722,15 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         for (antfly_types) |type_name| alloc.free(type_name);
         if (antfly_types.len > 0) alloc.free(antfly_types);
     }
+    const antfly_field: ?DynamicTemplate = if (object.get("x-antfly-field")) |field_value| blk: {
+        if (field_value != .object) break :blk null;
+        try validateFieldMappingObject(field_value, true);
+        break :blk try parseFieldMappingSpec(alloc, "", field_value.object, true);
+    } else null;
+    errdefer if (antfly_field) |*field| {
+        var owned = field.*;
+        owned.deinit(alloc);
+    };
     const sql_column_name = if (object.get("x-antfly-column-name")) |column_name_value|
         switch (column_name_value) {
             .string => |name| if (isSqlColumnAliasIdentifier(name)) try alloc.dupe(u8, name) else return error.InvalidSchemaUpdateRequest,
@@ -4808,12 +5127,40 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         alloc.destroy(owned);
     };
 
+    if (schemaShapeIsArrayLike(
+        field_type,
+        min_items,
+        max_items,
+        prefix_items.len,
+        additional_items_allowed != null,
+        item != null,
+        unevaluated_items_allowed != null,
+        unevaluated_items_schema != null,
+        contains_schema != null,
+        min_contains,
+        max_contains,
+        unique_items,
+    )) {
+        if (fieldMappingContainsSortable(antfly_field)) return error.InvalidSchemaUpdateRequest;
+        if (documentPropertiesContainSortableMapping(prefix_items)) return error.InvalidSchemaUpdateRequest;
+        if (item) |array_item| {
+            if (documentPropertyContainsSortableMapping(array_item.*)) return error.InvalidSchemaUpdateRequest;
+        }
+        if (contains_schema) |contains_item| {
+            if (documentPropertyContainsSortableMapping(contains_item.*)) return error.InvalidSchemaUpdateRequest;
+        }
+        if (unevaluated_items_schema) |unevaluated_item| {
+            if (documentPropertyContainsSortableMapping(unevaluated_item.*)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+
     property.* = .{
         .name = try alloc.dupe(u8, ""),
         .root_ref = false,
         .field_type = field_type,
         .antfly_types = antfly_types,
         .sql_column_name = sql_column_name,
+        .antfly_field = antfly_field,
         .analyzer = analyzer,
         .collation = collation,
         .antfly_index = antfly_index,
@@ -5047,6 +5394,102 @@ fn mergeDependentSchemaSlices(
     return merged;
 }
 
+fn schemaShapeIsArrayLike(
+    field_type: ?[]const u8,
+    min_items: ?u64,
+    max_items: ?u64,
+    prefix_items_len: usize,
+    has_additional_items: bool,
+    has_item: bool,
+    has_unevaluated_items: bool,
+    has_unevaluated_items_schema: bool,
+    has_contains_schema: bool,
+    min_contains: ?u64,
+    max_contains: ?u64,
+    unique_items: bool,
+) bool {
+    if (field_type) |name| {
+        if (std.mem.eql(u8, name, "array")) return true;
+    }
+    return min_items != null or
+        max_items != null or
+        prefix_items_len > 0 or
+        has_additional_items or
+        has_item or
+        has_unevaluated_items or
+        has_unevaluated_items_schema or
+        has_contains_schema or
+        min_contains != null or
+        max_contains != null or
+        unique_items;
+}
+
+fn fieldMappingContainsSortable(mapping: ?DynamicTemplate) bool {
+    const resolved = mapping orelse return false;
+    if (resolved.sortable orelse false) return true;
+    return dynamicTemplatesContainSortableMapping(resolved.fields);
+}
+
+fn dynamicTemplatesContainSortableMapping(templates: []const DynamicTemplate) bool {
+    for (templates) |template| {
+        if (fieldMappingContainsSortable(template)) return true;
+    }
+    return false;
+}
+
+fn documentPropertiesContainSortableMapping(properties: []const DocumentProperty) bool {
+    for (properties) |property| {
+        if (documentPropertyContainsSortableMapping(property)) return true;
+    }
+    return false;
+}
+
+fn documentPropertyContainsSortableMapping(property: DocumentProperty) bool {
+    if (fieldMappingContainsSortable(property.antfly_field)) return true;
+    if (documentPropertiesContainSortableMapping(property.prefix_items)) return true;
+    if (documentPropertiesContainSortableMapping(property.properties)) return true;
+    for (property.pattern_properties) |pattern_property| {
+        if (documentPropertyContainsSortableMapping(pattern_property.property.*)) return true;
+    }
+    if (property.additional_properties_schema) |child| {
+        if (documentPropertyContainsSortableMapping(child.*)) return true;
+    }
+    if (property.unevaluated_properties_schema) |child| {
+        if (documentPropertyContainsSortableMapping(child.*)) return true;
+    }
+    if (property.property_names) |child| {
+        if (documentPropertyContainsSortableMapping(child.*)) return true;
+    }
+    for (property.dependent_schemas) |dependent_schema| {
+        if (documentPropertyContainsSortableMapping(dependent_schema.schema.*)) return true;
+    }
+    if (documentPropertiesContainSortableMapping(property.any_of)) return true;
+    if (documentPropertiesContainSortableMapping(property.one_of)) return true;
+    if (documentPropertiesContainSortableMapping(property.all_of)) return true;
+    if (property.not_schema) |child| {
+        if (documentPropertyContainsSortableMapping(child.*)) return true;
+    }
+    if (property.if_schema) |child| {
+        if (documentPropertyContainsSortableMapping(child.*)) return true;
+    }
+    if (property.then_schema) |child| {
+        if (documentPropertyContainsSortableMapping(child.*)) return true;
+    }
+    if (property.else_schema) |child| {
+        if (documentPropertyContainsSortableMapping(child.*)) return true;
+    }
+    if (property.contains_schema) |child| {
+        if (documentPropertyContainsSortableMapping(child.*)) return true;
+    }
+    if (property.item) |child| {
+        if (documentPropertyContainsSortableMapping(child.*)) return true;
+    }
+    if (property.unevaluated_items_schema) |child| {
+        if (documentPropertyContainsSortableMapping(child.*)) return true;
+    }
+    return false;
+}
+
 fn parseTypeSpec(alloc: std.mem.Allocator, value: std.json.Value, require_object_only: bool) !ParsedTypeSpec {
     const validated = try validateTypeSpecDefinition(value, require_object_only);
     return .{
@@ -5081,6 +5524,9 @@ fn parsePatternProperties(alloc: std.mem.Allocator, context: SchemaContext, obje
             .object => |property_object| property_object,
             else => return error.InvalidSchemaUpdateRequest,
         };
+        if (try patternPropertyMayMatchReservedDocumentField(entry.key_ptr.*)) {
+            if (documentPropertySchemaValueContainsSortableMapping(entry.value_ptr.*)) return error.InvalidSchemaUpdateRequest;
+        }
         properties[initialized] = .{
             .pattern = try alloc.dupe(u8, entry.key_ptr.*),
             .property = try parseAnonymousProperty(alloc, context, property_object),
@@ -5247,11 +5693,94 @@ fn parseDynamicTemplate(alloc: std.mem.Allocator, default_name: []const u8, valu
             .bool => |enabled| enabled,
             else => null,
         } else null,
+        .sortable = if (mapping.get("sortable")) |sortable| switch (sortable) {
+            .bool => |enabled| enabled,
+            else => null,
+        } else null,
+        .missing_null_policy = if (mapping.get("missing_null_policy")) |policy| switch (policy) {
+            .string => |policy_value| try alloc.dupe(u8, policy_value),
+            else => null,
+        } else null,
         .include_in_all = if (mapping.get("include_in_all")) |include_in_all| switch (include_in_all) {
             .bool => |enabled| enabled,
             else => null,
         } else null,
     };
+}
+
+fn parseFieldMappingSpec(alloc: std.mem.Allocator, default_name: []const u8, mapping: std.json.ObjectMap, allow_fields: bool) anyerror!DynamicTemplate {
+    const field_type = if (mapping.get("type")) |mapping_type|
+        switch (mapping_type) {
+            .string => |name| try alloc.dupe(u8, name),
+            .null => null,
+            else => null,
+        }
+    else
+        null;
+    errdefer if (field_type) |owned| alloc.free(owned);
+    const analyzer = if (mapping.get("analyzer")) |analyzer_value|
+        switch (analyzer_value) {
+            .string => |name| try alloc.dupe(u8, name),
+            .null => null,
+            else => null,
+        }
+    else
+        null;
+    errdefer if (analyzer) |owned| alloc.free(owned);
+    var fields: []DynamicTemplate = &.{};
+    if (allow_fields) {
+        fields = try parseFieldMappingSubfields(alloc, mapping);
+    }
+    errdefer freeFieldMappingSubfields(alloc, fields);
+    return .{
+        .name = try alloc.dupe(u8, default_name),
+        .field_type = field_type,
+        .analyzer = analyzer,
+        .do_index = if (mapping.get("index")) |index| switch (index) {
+            .bool => |enabled| enabled,
+            else => null,
+        } else null,
+        .store = if (mapping.get("store")) |store| switch (store) {
+            .bool => |enabled| enabled,
+            else => null,
+        } else null,
+        .sortable = if (mapping.get("sortable")) |sortable| switch (sortable) {
+            .bool => |enabled| enabled,
+            else => null,
+        } else null,
+        .missing_null_policy = if (mapping.get("missing_null_policy")) |policy| switch (policy) {
+            .string => |policy_value| try alloc.dupe(u8, policy_value),
+            else => null,
+        } else null,
+        .include_in_all = if (mapping.get("include_in_all")) |include_in_all| switch (include_in_all) {
+            .bool => |enabled| enabled,
+            else => null,
+        } else null,
+        .fields = fields,
+    };
+}
+
+fn parseFieldMappingSubfields(alloc: std.mem.Allocator, mapping: std.json.ObjectMap) anyerror![]DynamicTemplate {
+    const fields_value = mapping.get("fields") orelse return &[_]DynamicTemplate{};
+    const fields_object = fields_value.object;
+    if (fields_object.count() == 0) return &[_]DynamicTemplate{};
+    var fields = try alloc.alloc(DynamicTemplate, fields_object.count());
+    var initialized: usize = 0;
+    errdefer {
+        for (fields[0..initialized]) |*field| field.deinit(alloc);
+        alloc.free(fields);
+    }
+    var it = fields_object.iterator();
+    while (it.next()) |entry| {
+        fields[initialized] = try parseFieldMappingSpec(alloc, entry.key_ptr.*, entry.value_ptr.object, false);
+        initialized += 1;
+    }
+    return fields;
+}
+
+fn freeFieldMappingSubfields(alloc: std.mem.Allocator, fields: []DynamicTemplate) void {
+    for (fields) |*field| field.deinit(alloc);
+    if (fields.len > 0) alloc.free(fields);
 }
 
 fn parseForeignKeys(alloc: std.mem.Allocator, value: std.json.Value) ![]ForeignKey {
@@ -8180,6 +8709,104 @@ test "parse dynamic template contract and validate selectors" {
         error.InvalidBatchRequest,
         validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"title\":\"alpha\",\"meta.created_at\":\"not-a-date\"}" }}),
     );
+}
+
+test "parse document field mapping contract" {
+    var parsed = try parseSchema(std.testing.allocator,
+        \\{
+        \\  "default_type": "doc",
+        \\  "document_schemas": {
+        \\    "doc": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "properties": {
+        \\          "created_at": {"type": "string","format": "date-time","x-antfly-field": {"type":"date","sortable":true,"missing_null_policy":"missing_rejected"}},
+        \\          "rank": {"type": "number","x-antfly-field": {"type":"number","sortable":true}},
+        \\          "title": {"type": "string","x-antfly-field": {"type":"text","fields": {"keyword": {"type":"keyword","sortable":true}}}}
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    const created_at = findDocumentProperty(parsed.document_schemas[0].properties, "created_at") orelse return error.TestExpectedEqual;
+    const created_mapping = created_at.antfly_field orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("date", created_mapping.field_type.?);
+    try std.testing.expectEqual(true, created_mapping.sortable.?);
+    try std.testing.expectEqualStrings("missing_rejected", created_mapping.missing_null_policy.?);
+
+    const rank = findDocumentProperty(parsed.document_schemas[0].properties, "rank") orelse return error.TestExpectedEqual;
+    const rank_mapping = rank.antfly_field orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("number", rank_mapping.field_type.?);
+    try std.testing.expectEqual(true, rank_mapping.sortable.?);
+
+    const title = findDocumentProperty(parsed.document_schemas[0].properties, "title") orelse return error.TestExpectedEqual;
+    const title_mapping = title.antfly_field orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("text", title_mapping.field_type.?);
+    try std.testing.expectEqual(@as(usize, 1), title_mapping.fields.len);
+    try std.testing.expectEqualStrings("keyword", title_mapping.fields[0].name);
+    try std.testing.expectEqualStrings("keyword", title_mapping.fields[0].field_type.?);
+    try std.testing.expectEqual(true, title_mapping.fields[0].sortable.?);
+}
+
+test "parse accepts sortable without public doc values and rejects unsupported sortable mappings" {
+    var sortable = try parseSchema(
+        std.testing.allocator,
+        "{\"dynamic_templates\":[{\"name\":\"rank\",\"path_match\":\"rank\",\"mapping\":{\"type\":\"numeric\",\"sortable\":true}}]}",
+    );
+    defer sortable.deinit(std.testing.allocator);
+    try std.testing.expectEqual(true, sortable.dynamic_templates[0].sortable.?);
+
+    var sortable_document_field = try parseSchema(
+        std.testing.allocator,
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"rank\":{\"type\":\"number\",\"x-antfly-field\":{\"type\":\"number\",\"sortable\":true}}}}}}}",
+    );
+    defer sortable_document_field.deinit(std.testing.allocator);
+    const rank = sortable_document_field.document_schemas[0].properties[0].antfly_field orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(true, rank.sortable.?);
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"dynamic_templates\":[{\"name\":\"body\",\"path_match\":\"body\",\"mapping\":{\"type\":\"text\",\"sortable\":true}}]}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"dynamic_templates\":[{\"name\":\"rank\",\"path_match\":\"rank\",\"mapping\":{\"type\":\"numeric\",\"doc_values\":false,\"sortable\":true}}]}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"dynamic_templates\":[{\"name\":\"rank\",\"path_match\":\"rank\",\"unknown\":true,\"mapping\":{\"type\":\"numeric\",\"sortable\":true}}]}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"dynamic_templates\":[{\"name\":\"rank\",\"match_pattern\":\"rank_*\",\"mapping\":{\"type\":\"numeric\",\"sortable\":true}}]}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"dynamic_templates\":[{\"name\":\"rank\",\"path_match\":\"rank\",\"mapping\":{\"type\":\"numeric\",\"sortable\":true,\"unknown\":true}}]}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"dynamic_templates\":[{\"name\":\"rank\",\"path_match\":\"rank\",\"mapping\":{\"type\":\"numeric\",\"sortable\":true,\"missing_null_policy\":\"missing_last\"}}]}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"text\",\"sortable\":true}}}}}}}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"rank\":{\"type\":\"number\",\"x-antfly-field\":{\"type\":\"number\",\"doc_values\":false,\"sortable\":true}}}}}}}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"dynamic_templates\":[{\"name\":\"title\",\"path_match\":\"title\",\"mapping\":{\"type\":\"text\",\"fields\":{\"keyword\":{\"type\":\"keyword\",\"sortable\":true}}}}]}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"text\",\"fields\":{\"bad.name\":{\"type\":\"keyword\",\"sortable\":true}}}}}}}}}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"x-antfly-field\":{\"type\":\"keyword\",\"sortable\":true}}}}}}}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"keyword\",\"sortable\":true}}}}}}}}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"events\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"created_at\":{\"type\":\"string\",\"format\":\"date-time\",\"x-antfly-field\":{\"type\":\"date\",\"sortable\":true}}}}}}}}}}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"_id\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"keyword\",\"sortable\":true}}}}}}}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"dynamic_templates\":[{\"name\":\"id\",\"path_match\":\"_id\",\"mapping\":{\"type\":\"keyword\",\"sortable\":true}}]}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"dynamic_templates\":[{\"name\":\"id\",\"match\":\"_id\",\"mapping\":{\"type\":\"keyword\",\"sortable\":true}}]}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"dynamic_templates\":[{\"name\":\"all_keywords\",\"match\":\"*\",\"mapping\":{\"type\":\"keyword\",\"sortable\":true}}]}"));
+
+    var wildcard_excluding_reserved_id = try parseSchema(
+        std.testing.allocator,
+        "{\"dynamic_templates\":[{\"name\":\"all_keywords\",\"match\":\"*\",\"unmatch\":\"_id\",\"mapping\":{\"type\":\"keyword\",\"sortable\":true}}]}",
+    );
+    defer wildcard_excluding_reserved_id.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("all_keywords", wildcard_excluding_reserved_id.dynamic_templates[0].name);
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"dynamic_templates\":[{\"name\":\"meta_keywords\",\"path_match\":\"meta.*\",\"mapping\":{\"type\":\"keyword\",\"sortable\":true}}]}"));
+    var nested_wildcard_excluding_reserved_id = try parseSchema(
+        std.testing.allocator,
+        "{\"dynamic_templates\":[{\"name\":\"meta_keywords\",\"match\":\"*\",\"unmatch\":\"_id\",\"path_match\":\"meta.*\",\"mapping\":{\"type\":\"keyword\",\"sortable\":true}}]}",
+    );
+    defer nested_wildcard_excluding_reserved_id.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("meta_keywords", nested_wildcard_excluding_reserved_id.dynamic_templates[0].name);
+    var nested_non_reserved_wildcard = try parseSchema(
+        std.testing.allocator,
+        "{\"dynamic_templates\":[{\"name\":\"timestamps\",\"path_match\":\"meta.*_at\",\"mapping\":{\"type\":\"datetime\",\"sortable\":true}}]}",
+    );
+    defer nested_non_reserved_wildcard.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("timestamps", nested_non_reserved_wildcard.dynamic_templates[0].name);
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"patternProperties\":{\"^_id$\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"keyword\",\"sortable\":true}}}}}}}"));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator, "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"patternProperties\":{\"^_.*$\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"text\",\"fields\":{\"keyword\":{\"type\":\"keyword\",\"sortable\":true}}}}}}}}}"));
 }
 
 test "parse explicit field analyzer override" {

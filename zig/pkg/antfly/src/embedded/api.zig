@@ -213,7 +213,9 @@ pub const Api = struct {
     pub fn listIndexesJson(self: *Api, alloc: Allocator) ![]u8 {
         const configs = try self.db.listIndexes(alloc);
         defer embedded_db.types.freeIndexConfigs(alloc, configs);
-        return try std.json.Stringify.valueAlloc(alloc, configs, .{});
+        const public_configs = try embedded_db.types.publicIndexConfigsAlloc(alloc, configs);
+        defer alloc.free(public_configs);
+        return try std.json.Stringify.valueAlloc(alloc, public_configs, .{});
     }
 
     pub fn addIndexJson(self: *Api, alloc: Allocator, body: []const u8) ![]u8 {
@@ -222,6 +224,7 @@ pub const Api = struct {
         });
         defer parsed.deinit();
 
+        parsed.value.coverage_generation = 0;
         try self.db.addIndex(parsed.value);
         return try namedMutationJson(alloc, "created", parsed.value.name);
     }
@@ -763,7 +766,7 @@ test "embedded api openLite manages index and enrichment definitions over aflite
 
         const created_index = try api.addIndexJson(
             alloc,
-            "{\"name\":\"full_text_index_v0\",\"kind\":\"full_text\",\"config_json\":\"{}\"}",
+            "{\"name\":\"full_text_index_v0\",\"kind\":\"full_text\",\"config_json\":\"{}\",\"coverage_generation\":12345}",
         );
         defer alloc.free(created_index);
         try std.testing.expect(std.mem.indexOf(u8, created_index, "\"created\":true") != null);
@@ -788,6 +791,7 @@ test "embedded api openLite manages index and enrichment definitions over aflite
         const indexes = try reopened.listIndexesJson(alloc);
         defer alloc.free(indexes);
         try std.testing.expect(std.mem.indexOf(u8, indexes, "\"full_text_index_v0\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, indexes, "coverage_generation") == null);
 
         const enrichments = try reopened.listEnrichmentsJson(alloc);
         defer alloc.free(enrichments);

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
+from ..models.rows_query_request_total_mode import RowsQueryRequestTotalMode
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -61,6 +62,11 @@ class RowsQueryRequest:
             order_by (list[RowsQueryOrderExpression | RowsQueryOrderField] | Unset):
             limit (int | Unset):
             offset (int | Unset):
+            total_mode (RowsQueryRequestTotalMode | Unset): Controls total counting for paged reads. `exact` scans all
+                matches
+                and returns an exact total. `bounded` may stop after the requested
+                page and report a lower-bound total. `none` may omit work needed
+                only for totals.
             row_claim (RowsRowClaim | Unset): Lockable base-row claim metadata. Public row-plan endpoints reject this
                 field; it is only accepted by `rows/mutation-source` lockable base-row
                 sources and internal/coordinator execution paths. `transaction_id` is
@@ -87,6 +93,7 @@ class RowsQueryRequest:
     order_by: list[RowsQueryOrderExpression | RowsQueryOrderField] | Unset = UNSET
     limit: int | Unset = UNSET
     offset: int | Unset = UNSET
+    total_mode: RowsQueryRequestTotalMode | Unset = UNSET
     row_claim: RowsRowClaim | Unset = UNSET
     doc_key_range: Any | Unset = UNSET
 
@@ -207,6 +214,10 @@ class RowsQueryRequest:
 
         offset = self.offset
 
+        total_mode: str | Unset = UNSET
+        if not isinstance(self.total_mode, Unset):
+            total_mode = self.total_mode.value
+
         row_claim: dict[str, Any] | Unset = UNSET
         if not isinstance(self.row_claim, Unset):
             row_claim = self.row_claim.to_dict()
@@ -254,6 +265,8 @@ class RowsQueryRequest:
             field_dict["limit"] = limit
         if offset is not UNSET:
             field_dict["offset"] = offset
+        if total_mode is not UNSET:
+            field_dict["total_mode"] = total_mode
         if row_claim is not UNSET:
             field_dict["row_claim"] = row_claim
         if doc_key_range is not UNSET:
@@ -450,6 +463,13 @@ class RowsQueryRequest:
 
         offset = d.pop("offset", UNSET)
 
+        _total_mode = d.pop("total_mode", UNSET)
+        total_mode: RowsQueryRequestTotalMode | Unset
+        if isinstance(_total_mode, Unset):
+            total_mode = UNSET
+        else:
+            total_mode = RowsQueryRequestTotalMode(_total_mode)
+
         _row_claim = d.pop("row_claim", UNSET)
         row_claim: RowsRowClaim | Unset
         if isinstance(_row_claim, Unset):
@@ -482,6 +502,7 @@ class RowsQueryRequest:
             order_by=order_by,
             limit=limit,
             offset=offset,
+            total_mode=total_mode,
             row_claim=row_claim,
             doc_key_range=doc_key_range,
         )

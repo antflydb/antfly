@@ -28,6 +28,7 @@ const sql_statement_kind = @import("statement_kind.zig");
 const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
 const generated_parser = @import("generated_parser.zig");
+const generated_read_validate = @import("generated_read_validate.zig");
 
 const Token = token_mod.Token;
 
@@ -65,7 +66,8 @@ fn validatedDocumentReadStatementKind(parsed_sql: *const tokenized.ParsedSql) !s
         const generated_ast = generated_statement.ast orelse return error.UnsupportedSqlShape;
         return switch (generated_ast) {
             .read => |read| blk: {
-                try lowering_context.validateGeneratedReadAstForStatement(parsed_sql.items(), read);
+                try generated_read_validate.validateGeneratedReadAstPayloads(parsed_sql.items(), read.*);
+                try lowering_context.validateGeneratedReadAstRanges(parsed_sql.items(), read);
                 break :blk documentStatementKindForGeneratedRead(read);
             },
             else => return error.UnsupportedSqlShape,
@@ -104,7 +106,8 @@ fn generatedDocumentReadAst(parsed_sql: *const tokenized.ParsedSql) !?*const gen
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
                 .read => |read| blk: {
-                    try lowering_context.validateGeneratedReadAstForStatement(parsed_sql.items(), read);
+                    try generated_read_validate.validateGeneratedReadAstPayloads(parsed_sql.items(), read.*);
+                    try lowering_context.validateGeneratedReadAstRanges(parsed_sql.items(), read);
                     break :blk read;
                 },
                 else => error.UnsupportedSqlShape,
@@ -1191,9 +1194,12 @@ fn lowerDocumentReadPlanInternalParsedSqlAlloc(
         var mutable = producer;
         mutable.deinit(alloc);
     }
-    if (view_mapping != null) switch (producer) {
+    if (view_mapping) |mapping| switch (producer) {
         .bounded_scan => return error.DocumentSqlBoundedScanMissingExactProducer,
-        else => {},
+        .indexed_query => if (mapping.required_indexes == 0 or !mapping.required_indexes_ready) {
+            return error.DocumentSqlBoundedScanMissingExactProducer;
+        },
+        .id_lookup => {},
     };
     if (limit == null and bounded_scan_policy != null) switch (producer) {
         .indexed_query => |query| {
@@ -1475,7 +1481,15 @@ pub fn lowerDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyParsedSq
     indexes_json: ?[]const u8,
     bounded_scan_policy: ?source_binding.BoundedScanPolicy,
 ) !DocumentAlgebraicAggregatePlan {
-    var plan = try lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyInternalParsedSqlAlloc(alloc, parsed_sql, schema, .{}, bounded_scan_policy, .{}, false);
+    var plan = try lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyInternalParsedSqlAlloc(
+        alloc,
+        parsed_sql,
+        schema,
+        .{},
+        bounded_scan_policy,
+        documentProducerCapabilitiesForRuntimeSchema(schema, bounded_scan_policy),
+        false,
+    );
     errdefer plan.deinit(alloc);
     return try finishDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyAlloc(alloc, &plan, indexes_json, bounded_scan_policy);
 }
@@ -2819,18 +2833,18 @@ fn parseGeneratedTextSubstringProjectionItemAlloc(
         else => return error.UnsupportedSqlShape,
     }
 
-    const args = DocumentSubstringArguments{
+    var args = DocumentSubstringArguments{
         .start = try documentValidatedPositiveIntegerLiteralAlloc(alloc, tokens[ranges.start.start..ranges.start.end]),
-        .length = if (ranges.length) |length_range|
-            try documentValidatedNonNegativeIntegerLiteralAlloc(alloc, tokens[length_range.start..length_range.end])
-        else
-            null,
     };
     var args_transferred = false;
     errdefer if (!args_transferred) {
         alloc.free(args.start);
         if (args.length) |length| alloc.free(length);
     };
+    args.length = if (ranges.length) |length_range|
+        try documentValidatedNonNegativeIntegerLiteralAlloc(alloc, tokens[length_range.start..length_range.end])
+    else
+        null;
 
     args_transferred = true;
     return .{
@@ -3351,6 +3365,23 @@ fn parseGeneratedJsonPathProjectionItemAlloc(
     };
 }
 
+fn generatedDocumentOptionalListAllNull(comptime T: type, items: []const ?T, expected_count: usize) bool {
+    if (items.len == 0) return true;
+    if (items.len != expected_count) return false;
+    for (items) |item| if (item != null) return false;
+    return true;
+}
+
+fn generatedDocumentListHasNoDecorators(items: *const generated_parser.GeneratedSqlListAst, expected_count: usize) bool {
+    return generatedDocumentOptionalListAllNull(generated_parser.GeneratedSqlTokenRange, items.alias_items, expected_count) and
+        generatedDocumentOptionalListAllNull(generated_parser.GeneratedSqlTokenRange, items.alias_name_items, expected_count) and
+        generatedDocumentOptionalListAllNull(generated_parser.GeneratedSqlTokenRange, items.direction_items, expected_count) and
+        generatedDocumentOptionalListAllNull(generated_parser.GeneratedSqlOrderDirection, items.directions, expected_count) and
+        generatedDocumentOptionalListAllNull(generated_parser.GeneratedSqlTokenRange, items.order_using_operator_items, expected_count) and
+        generatedDocumentOptionalListAllNull(generated_parser.GeneratedSqlTokenRange, items.nulls_order_items, expected_count) and
+        generatedDocumentOptionalListAllNull(generated_parser.GeneratedSqlNullsOrder, items.nulls_orders, expected_count);
+}
+
 fn parseGeneratedJsonPathFunctionProjectionItemAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -3387,10 +3418,7 @@ fn parseGeneratedJsonPathFunctionProjectionItemAlloc(
         items.items.len != items.count or
         items.expression_items.len != items.count or
         items.expressions.len != items.count or
-        items.alias_items.len != 0 or
-        items.alias_name_items.len != 0 or
-        items.direction_items.len != 0 or
-        items.directions.len != 0)
+        !generatedDocumentListHasNoDecorators(&items, items.count))
     {
         return error.UnsupportedSqlShape;
     }
@@ -3508,10 +3536,7 @@ fn generatedDocumentSingleJsonValueArgumentFunctionRange(
     {
         return error.UnsupportedSqlShape;
     }
-    if (items.alias_items.len != 0 and (items.alias_items.len != 1 or items.alias_items[0] != null)) return error.UnsupportedSqlShape;
-    if (items.alias_name_items.len != 0 and (items.alias_name_items.len != 1 or items.alias_name_items[0] != null)) return error.UnsupportedSqlShape;
-    if (items.direction_items.len != 0 and (items.direction_items.len != 1 or items.direction_items[0] != null)) return error.UnsupportedSqlShape;
-    if (items.directions.len != 0 and (items.directions.len != 1 or items.directions[0] != null)) return error.UnsupportedSqlShape;
+    if (!generatedDocumentListHasNoDecorators(&items, 1)) return error.UnsupportedSqlShape;
     const item = items.items[0];
     const expression_item = items.expression_items[0];
     const argument_expression = &items.expressions[0];
@@ -3558,10 +3583,7 @@ fn generatedDocumentSingleIdentifierArgumentFunctionRange(
     {
         return error.UnsupportedSqlShape;
     }
-    if (items.alias_items.len != 0 and (items.alias_items.len != 1 or items.alias_items[0] != null)) return error.UnsupportedSqlShape;
-    if (items.alias_name_items.len != 0 and (items.alias_name_items.len != 1 or items.alias_name_items[0] != null)) return error.UnsupportedSqlShape;
-    if (items.direction_items.len != 0 and (items.direction_items.len != 1 or items.direction_items[0] != null)) return error.UnsupportedSqlShape;
-    if (items.directions.len != 0 and (items.directions.len != 1 or items.directions[0] != null)) return error.UnsupportedSqlShape;
+    if (!generatedDocumentListHasNoDecorators(&items, 1)) return error.UnsupportedSqlShape;
     const item = items.items[0];
     const expression_item = items.expression_items[0];
     const argument_expression = &items.expressions[0];
@@ -3605,10 +3627,7 @@ fn generatedDocumentSingleTokenRangeArgumentFunctionRange(
         items.items.len != 1 or
         items.expression_items.len != 1 or
         items.expressions.len != 1 or
-        items.alias_items.len != 0 or
-        items.alias_name_items.len != 0 or
-        items.direction_items.len != 0 or
-        items.directions.len != 0)
+        !generatedDocumentListHasNoDecorators(&items, 1))
     {
         return error.UnsupportedSqlShape;
     }
@@ -3762,10 +3781,7 @@ fn generatedDocumentIdentifierNumberArgumentFunctionRanges(
         items.items.len != 2 or
         items.expression_items.len != 2 or
         items.expressions.len != 2 or
-        items.alias_items.len != 0 or
-        items.alias_name_items.len != 0 or
-        items.direction_items.len != 0 or
-        items.directions.len != 0)
+        !generatedDocumentListHasNoDecorators(&items, 2))
     {
         return error.UnsupportedSqlShape;
     }
@@ -3816,10 +3832,7 @@ fn generatedDocumentPositionArgumentFunctionRanges(
         items.items.len != 1 or
         items.expression_items.len != 1 or
         items.expressions.len != 1 or
-        items.alias_items.len != 0 or
-        items.alias_name_items.len != 0 or
-        items.direction_items.len != 0 or
-        items.directions.len != 0)
+        !generatedDocumentListHasNoDecorators(&items, 1))
     {
         return error.UnsupportedSqlShape;
     }
@@ -3828,7 +3841,6 @@ fn generatedDocumentPositionArgumentFunctionRanges(
     const argument_expression = &items.expressions[0];
     const argument_expression_tokens = argument_expression.tokens orelse return error.UnsupportedSqlShape;
     if (!std.meta.eql(item, argument_tokens) or !std.meta.eql(item, expression_item) or !std.meta.eql(item, argument_expression_tokens)) return error.UnsupportedSqlShape;
-    if (argument_expression.kind != .token_range) return error.UnsupportedSqlShape;
     if (item.start + 3 != item.end or item.end > tokens.len) return error.UnsupportedSqlShape;
     if (tokens[item.start].kind != .string or !tokens[item.start + 1].matchesKeywordTag(.in) or tokens[item.start + 2].kind != .identifier) return error.UnsupportedSqlShape;
     return .{
@@ -3870,10 +3882,7 @@ fn generatedDocumentIdentifierStringArgumentFunctionRanges(
         items.items.len != 2 or
         items.expression_items.len != 2 or
         items.expressions.len != 2 or
-        items.alias_items.len != 0 or
-        items.alias_name_items.len != 0 or
-        items.direction_items.len != 0 or
-        items.directions.len != 0)
+        !generatedDocumentListHasNoDecorators(&items, 2))
     {
         return error.UnsupportedSqlShape;
     }
@@ -3937,10 +3946,7 @@ fn generatedDocumentValidateArgumentItems(
         items.items.len != expected_count or
         items.expression_items.len != expected_count or
         items.expressions.len != expected_count or
-        items.alias_items.len != 0 or
-        items.alias_name_items.len != 0 or
-        items.direction_items.len != 0 or
-        items.directions.len != 0)
+        !generatedDocumentListHasNoDecorators(items, expected_count))
     {
         return error.UnsupportedSqlShape;
     }
@@ -4222,8 +4228,6 @@ fn generatedDocumentSpecialArgumentRange(
     try generatedDocumentValidateArgumentItems(tokens, args, 1);
     const item = try generatedDocumentArgumentItemRange(tokens, args, 0);
     if (!std.meta.eql(item, args.argument_tokens)) return error.UnsupportedSqlShape;
-    const argument_expression = &args.items.expressions[0];
-    if (argument_expression.kind != .token_range) return error.UnsupportedSqlShape;
     return item;
 }
 
@@ -4251,7 +4255,7 @@ fn generatedDocumentSpecialOverlayArgumentRanges(
     tokens: []const Token,
     item: generated_parser.GeneratedSqlTokenRange,
 ) !GeneratedDocumentOverlayArgumentRanges {
-    if (item.start + 6 > item.end or item.end > tokens.len) return error.UnsupportedSqlShape;
+    if (item.start + 5 > item.end or item.end > tokens.len) return error.UnsupportedSqlShape;
     if (tokens[item.start].kind != .identifier or
         !tokens[item.start + 1].matchesKeywordTag(.placing) or
         tokens[item.start + 2].kind != .string or
@@ -4345,10 +4349,7 @@ fn generatedDocumentJsonValuePathFunctionExpressionMatches(
         items.items.len != items.count or
         items.expression_items.len != items.count or
         items.expressions.len != items.count or
-        items.alias_items.len != 0 or
-        items.alias_name_items.len != 0 or
-        items.direction_items.len != 0 or
-        items.directions.len != 0)
+        !generatedDocumentListHasNoDecorators(&items, items.count))
     {
         return false;
     }
@@ -4990,6 +4991,8 @@ fn parseWhereProducerAlloc(
     const scalar_require_index = !parsed.id_lookup_seen and
         !producer_capabilities.indexed_scalar_filters and
         producer_capabilities.indexed_scalar_filter_paths.len == 0 and
+        producer_capabilities.indexed_array_element_paths.len == 0 and
+        producer_capabilities.runtime_schema_scalar_filters == null and
         parsed.full_text_query == null;
     for (scalar_ranges.items) |range| {
         const clause_range = generated_parser.GeneratedSqlTokenRange{
@@ -5166,6 +5169,7 @@ fn generatedExpressionIsAntflyQueryFunction(
     tokens: []const Token,
     expression: *const generated_parser.GeneratedSqlExpressionAst,
 ) bool {
+    if (generatedExpressionIsFullTextQueryFunction(tokens, expression)) return false;
     if (expression.kind != .function_call) return false;
     const function_name_tokens = expression.function_name_tokens orelse return false;
     if (function_name_tokens.start + 1 != function_name_tokens.end or function_name_tokens.end > tokens.len) return false;
@@ -5852,7 +5856,7 @@ fn parseDocumentAggregateSpecAlloc(
         var field = (try documentAggregateFieldForExpressionAlloc(alloc, expression[2 .. expression.len - 1], schema, virtual_schema, source_ref, false)) orelse return error.DocumentSqlAggregateUnsupported;
         errdefer field.deinit(alloc);
         if (field.field_type != .numeric) return error.DocumentSqlAggregateUnsupported;
-        const source_field = field.field_name orelse return error.DocumentSqlAggregateUnsupported;
+        const source_field = field.field_name orelse field.path;
         const output = try alloc.dupe(u8, aliased.output orelse @tagName(op));
         errdefer alloc.free(output);
         const owned_source_field = try alloc.dupe(u8, source_field);
@@ -5889,7 +5893,7 @@ fn parseDocumentAggregateGroupByAlloc(
 
     var field = (try documentAggregateFieldForExpressionAlloc(alloc, group_tokens, schema, virtual_schema, source_ref, require_index)) orelse return error.DocumentSqlAggregateUnsupported;
     errdefer field.deinit(alloc);
-    const source_field = field.field_name orelse return error.DocumentSqlAggregateUnsupported;
+    const source_field = field.field_name orelse field.path;
     const output = try alloc.dupe(u8, try documentAggregateOutputName(group_tokens, source_ref));
     errdefer alloc.free(output);
     const owned_source_field = try alloc.dupe(u8, source_field);
@@ -9266,12 +9270,26 @@ fn parseGeneratedNumericUnaryRangeFilterClauseAlloc(
     const unary_operator = documentNumericUnaryOperatorName(tokens[left_range.start]) orelse return error.UnsupportedSqlShape;
     if (require_index) return error.DocumentSqlIndexUnavailable;
 
-    if (right_range.start + 1 != right_range.end) return error.UnsupportedSqlShape;
     const right_expression = expression.right_expression orelse return error.UnsupportedSqlShape;
     const right_expression_tokens = right_expression.tokens orelse return error.UnsupportedSqlShape;
-    if (right_expression.kind != .token_range or !std.meta.eql(right_expression_tokens, right_range)) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(right_expression_tokens, right_range)) return error.UnsupportedSqlShape;
 
-    const value = tokens[right_range.start];
+    var owned_value_text: ?[]u8 = null;
+    defer if (owned_value_text) |text| alloc.free(text);
+    const value: Token = if (right_range.start + 1 == right_range.end) blk: {
+        if (right_expression.kind != .token_range) return error.UnsupportedSqlShape;
+        break :blk tokens[right_range.start];
+    } else if (right_range.start + 2 == right_range.end and
+        right_expression.kind == .unary_negative and
+        tokens[right_range.start].kind == .minus and
+        tokens[right_range.start + 1].kind == .number)
+    blk: {
+        owned_value_text = try std.fmt.allocPrint(alloc, "-{s}", .{tokens[right_range.start + 1].text});
+        break :blk .{
+            .kind = .number,
+            .text = owned_value_text.?,
+        };
+    } else return error.UnsupportedSqlShape;
     if (tokenIsNullLiteral(value)) return try buildMatchNoneFilterClauseAlloc(alloc);
     if (value.kind != .number) return error.UnsupportedSqlShape;
     try validateDocumentNumericLiteral(value);
@@ -11901,6 +11919,18 @@ fn documentSqlStatementEnd(tokens: []const Token) usize {
     return tokens.len;
 }
 
+fn expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    virtual_schema: source_binding.DocumentSqlSchema,
+    capabilities: source_binding.DocumentSqlCapabilities,
+) !void {
+    var lowered = try lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, parsed_sql, schema, virtual_schema, capabilities);
+    defer lowered.deinit(alloc);
+    try std.testing.expect(lowered.view_mapping != null);
+}
+
 fn documentFieldExists(schema: runtime_schema.TableSchema, field: []const u8) bool {
     return documentFieldColumn(schema, field) != null;
 }
@@ -12101,7 +12131,7 @@ test "document SQL validates retained generated read ast before token planning" 
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
 
-    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, parsed.readStatementKindIncludingGeneratedAst().?);
+    try std.testing.expect(parsed.readStatementKindIncludingGeneratedAst() == null);
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema));
 
     var missing_source_table = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, title FROM docs WHERE _id = 'doc:a'");
@@ -12317,7 +12347,7 @@ test "document SQL lowers direct table scalar text cast projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &unsupported_array, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"amount\",\"path\":\"amount\",\"type\":\"numeric\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"amount\",\"path\":\"amount\",\"type\":\"numeric\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"amount\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
@@ -12377,7 +12407,7 @@ test "document SQL lowers direct table scalar numeric cast projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &unsupported_array, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"encoded\",\"path\":\"encoded\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"encoded\",\"path\":\"encoded\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"encoded\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
@@ -12424,7 +12454,7 @@ test "document SQL lowers direct table scalar boolean cast projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &unsupported_array, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"encoded\",\"path\":\"encoded\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"encoded\",\"path\":\"encoded\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"encoded\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
@@ -12474,7 +12504,7 @@ test "document SQL lowers direct table scalar datetime cast projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &unsupported_array, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"encoded\",\"path\":\"encoded\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"encoded\",\"path\":\"encoded\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"encoded\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
@@ -12680,17 +12710,14 @@ test "document SQL lowers direct table case-fold projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT lower(plan) AS plan_lower FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table initcap projection" {
@@ -12718,17 +12745,14 @@ test "document SQL lowers direct table initcap projection" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT initcap(plan) AS plan_title FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table md5 projection" {
@@ -12756,17 +12780,14 @@ test "document SQL lowers direct table md5 projection" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT md5(plan) AS plan_md5 FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table soundex projection" {
@@ -12841,24 +12862,18 @@ test "document SQL lowers direct table text length projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &bit_wrong_arity, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT length(plan) AS plan_len FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 
     var mapped_octet = try tokenized.ParsedSql.initAlloc(alloc, "SELECT octet_length(plan) AS plan_len FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped_octet.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped_octet, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped_octet, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table numeric abs projections" {
@@ -12886,17 +12901,14 @@ test "document SQL lowers direct table numeric abs projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"amount\",\"path\":\"delta\",\"type\":\"numeric\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"amount\",\"path\":\"delta\",\"type\":\"numeric\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"delta\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT abs(amount) AS amount_abs FROM support_view WHERE amount = 3 LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table numeric unary projections" {
@@ -12938,17 +12950,14 @@ test "document SQL lowers direct table numeric unary projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_arity, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"amount\",\"path\":\"amount\",\"type\":\"numeric\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"amount\",\"path\":\"amount\",\"type\":\"numeric\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"amount\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT round(amount) AS amount_round FROM support_view WHERE amount = 3 LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table numeric arithmetic projections" {
@@ -12997,17 +13006,14 @@ test "document SQL lowers direct table numeric arithmetic projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &zero_modulus, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"amount\",\"path\":\"amount\",\"type\":\"numeric\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"amount\",\"path\":\"amount\",\"type\":\"numeric\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"amount\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT amount + 2 AS amount_plus FROM support_view WHERE amount = 3 LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table numeric power projections" {
@@ -13040,17 +13046,14 @@ test "document SQL lowers direct table numeric power projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_arity, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"amount\",\"path\":\"amount\",\"type\":\"numeric\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"amount\",\"path\":\"amount\",\"type\":\"numeric\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"amount\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT power(amount, 2) AS amount_squared FROM support_view WHERE amount = 3 LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table numeric mod function projections" {
@@ -13087,17 +13090,14 @@ test "document SQL lowers direct table numeric mod function projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_arity, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"amount\",\"path\":\"amount\",\"type\":\"numeric\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"amount\",\"path\":\"amount\",\"type\":\"numeric\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"amount\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT MOD(amount, 3) AS amount_mod FROM support_view WHERE amount = 3 LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table regexp projections" {
@@ -13140,17 +13140,14 @@ test "document SQL lowers direct table regexp projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &nonliteral, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT regexp_count(plan, '[0-9]+') AS plan_digits FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table text binary projections" {
@@ -13189,17 +13186,14 @@ test "document SQL lowers direct table text binary projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &nonliteral, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT starts_with(plan, 'pro') AS plan_prefix FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table position projection" {
@@ -13232,17 +13226,14 @@ test "document SQL lowers direct table position projection" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT position('pro' in plan) AS plan_pos FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table ascii projection" {
@@ -13270,17 +13261,14 @@ test "document SQL lowers direct table ascii projection" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT ascii(plan) AS plan_code FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table chr projection" {
@@ -13322,17 +13310,14 @@ test "document SQL lowers direct table chr projection" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"amount\",\"path\":\"amount\",\"type\":\"numeric\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"amount\",\"path\":\"amount\",\"type\":\"numeric\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"amount\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT chr(amount) AS amount_char FROM support_view WHERE amount = 65 LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table replace projection" {
@@ -13375,17 +13360,14 @@ test "document SQL lowers direct table replace projection" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT replace(plan, '-', ' ') AS plan_replace FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table nullif projection" {
@@ -13422,17 +13404,14 @@ test "document SQL lowers direct table nullif projection" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT nullif(plan, '') AS plan_nullif FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table concat_ws projection" {
@@ -13453,7 +13432,7 @@ test "document SQL lowers direct table concat_ws projection" {
     try std.testing.expectEqual(@as(usize, 1), lowered.projection.len);
     try std.testing.expectEqual(DocumentProjectionKind.text_concat_ws, lowered.projection[0].kind);
     try std.testing.expectEqualStrings("status", lowered.projection[0].field);
-    try std.testing.expectEqualStrings("next.status", lowered.projection[0].field2);
+    try std.testing.expectEqualStrings("next_status", lowered.projection[0].field2);
     try std.testing.expectEqualStrings("-", lowered.projection[0].pattern);
     try std.testing.expectEqualStrings("status_path", lowered.projection[0].output);
     try expectDocumentProjectionArgumentMetadataCorruptionFails(alloc, "SELECT concat_ws('-', status, next_status) AS status_path FROM docs WHERE _id = 'doc:a'", schema, 0);
@@ -13473,17 +13452,14 @@ test "document SQL lowers direct table concat_ws projection" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"},{\"name\":\"next_plan\",\"path\":\"next.status\",\"type\":\"text\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"},{\"name\":\"next_plan\",\"path\":\"next.status\",\"type\":\"text\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\",\"next.status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT concat_ws('-', plan, next_plan) AS plan_path FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table array_to_string projection" {
@@ -13522,17 +13498,14 @@ test "document SQL lowers direct table array_to_string projection" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_item_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_array\"],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"support_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
-    var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT array_to_string(tag_list, ',') AS tags FROM support_view WHERE tag_list = 'urgent' LIMIT 10");
+    var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT array_to_string(tag_list, ',') AS tags FROM support_view WHERE _id = 'doc:a' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table string_to_array projection" {
@@ -13570,17 +13543,14 @@ test "document SQL lowers direct table string_to_array projection" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_source_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT string_to_array(plan, ',') AS plan_parts FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table array length projection" {
@@ -13635,24 +13605,18 @@ test "document SQL lowers direct table array length projection" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &array_length_wrong_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_array\"],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"support_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
-    var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT cardinality(tag_list) AS tag_count FROM support_view WHERE tag_list = 'urgent' LIMIT 10");
+    var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT cardinality(tag_list) AS tag_count FROM support_view WHERE _id = 'doc:a' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 
-    var mapped_array_length = try tokenized.ParsedSql.initAlloc(alloc, "SELECT array_length(tag_list, 1) AS tag_count FROM support_view WHERE tag_list = 'urgent' LIMIT 10");
+    var mapped_array_length = try tokenized.ParsedSql.initAlloc(alloc, "SELECT array_length(tag_list, 1) AS tag_count FROM support_view WHERE _id = 'doc:a' LIMIT 10");
     defer mapped_array_length.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped_array_length, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped_array_length, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table array position projections" {
@@ -13695,17 +13659,14 @@ test "document SQL lowers direct table array position projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_item_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_array\"],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"support_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
-    var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT array_position(tag_list, 'urgent') AS first_urgent FROM support_view WHERE tag_list = 'urgent' LIMIT 10");
+    var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT array_position(tag_list, 'urgent') AS first_urgent FROM support_view WHERE _id = 'doc:a' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table array position predicate" {
@@ -13820,17 +13781,14 @@ test "document SQL lowers direct table array position predicate" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &wrong_item_type, schema, capabilities));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_array\"],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"support_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\"}}";
     var mapped_capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer mapped_capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM support_view WHERE array_position(tag_list, 'urgent') > 0 LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, mapped_capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, mapped_capabilities);
 }
 
 test "document SQL lowers direct table array overlap predicate" {
@@ -13906,17 +13864,14 @@ test "document SQL lowers direct table array overlap predicate" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &wrong_item_type, schema, capabilities));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_array\"],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"support_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\"}}";
     var mapped_capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer mapped_capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM support_view WHERE tag_list && ARRAY['urgent'] LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, mapped_capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, mapped_capabilities);
 }
 
 test "document SQL lowers direct table array contains predicate" {
@@ -13986,17 +13941,14 @@ test "document SQL lowers direct table array contains predicate" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &json_contains, schema, capabilities));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_array\"],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"support_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\"}}";
     var mapped_capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer mapped_capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM support_view WHERE tag_list @> ARRAY['urgent'] LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, mapped_capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, mapped_capabilities);
 }
 
 test "document SQL lowers direct table JSON key exists predicates" {
@@ -14102,17 +14054,14 @@ test "document SQL lowers direct table JSON key exists predicates" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &invalid_key, schema, capabilities));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"meta\",\"path\":\"metadata\",\"type\":\"json\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"meta\",\"path\":\"metadata\",\"type\":\"json\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata\"],\"lifecycle\":\"ready\"}}";
     var mapped_capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer mapped_capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM support_view WHERE meta ? 'flags' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, mapped_capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, mapped_capabilities);
 }
 
 test "document SQL lowers direct table array transform projections" {
@@ -14188,24 +14137,18 @@ test "document SQL lowers direct table array transform projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_item_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_array\"],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"support_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
-    var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT array_append(tag_list, 'new') AS appended FROM support_view WHERE tag_list = 'urgent' LIMIT 10");
+    var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT array_append(tag_list, 'new') AS appended FROM support_view WHERE _id = 'doc:a' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 
-    var mapped_prepend = try tokenized.ParsedSql.initAlloc(alloc, "SELECT array_prepend('new', tag_list) AS prepended FROM support_view WHERE tag_list = 'urgent' LIMIT 10");
+    var mapped_prepend = try tokenized.ParsedSql.initAlloc(alloc, "SELECT array_prepend('new', tag_list) AS prepended FROM support_view WHERE _id = 'doc:a' LIMIT 10");
     defer mapped_prepend.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped_prepend, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped_prepend, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table translate projection" {
@@ -14248,17 +14191,14 @@ test "document SQL lowers direct table translate projection" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT translate(plan, 'a', 'b') AS plan_translate FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table pad projections" {
@@ -14309,17 +14249,14 @@ test "document SQL lowers direct table pad projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT lpad(plan, 5, '0') AS plan_pad FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table split part projections" {
@@ -14368,17 +14305,14 @@ test "document SQL lowers direct table split part projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT split_part(plan, ':', 1) AS plan_part FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table overlay projections" {
@@ -14426,17 +14360,14 @@ test "document SQL lowers direct table overlay projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT overlay(plan placing 'X' from 1 for 1) AS plan_overlay FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table substring projections" {
@@ -14490,17 +14421,14 @@ test "document SQL lowers direct table substring projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT substr(plan, 1, 3) AS plan_part FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table left right projections" {
@@ -14545,17 +14473,14 @@ test "document SQL lowers direct table left right projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT left(plan, 3) AS plan_prefix FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table repeat reverse projections" {
@@ -14607,17 +14532,14 @@ test "document SQL lowers direct table repeat reverse projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &reverse_wrong_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT repeat(plan, 2) AS plan_repeat FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL lowers direct table trim projections" {
@@ -14655,17 +14577,14 @@ test "document SQL lowers direct table trim projections" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &wrong_type, schema));
 
     const indexes_json =
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}}}";
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"support_scalar\"],\"fields\":[{\"name\":\"plan\",\"path\":\"status\",\"type\":\"keyword\"}]}},\"support_scalar\":{\"type\":\"full_text\",\"scalar_paths\":[\"status\"],\"lifecycle\":\"ready\"}}";
     var capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, 7, "fixture-schema-v1");
     defer capabilities.deinit(alloc);
     var virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, indexes_json, "docs", 7, "fixture-schema-v1");
     defer virtual_schema.deinit(alloc);
     var mapped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT trim(plan) AS plan_trim FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer mapped.deinit(alloc);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped, schema, virtual_schema, capabilities),
-    );
+    try expectDocumentReadPlanLowersWithCapabilitiesAndVirtualSchema(alloc, &mapped, schema, virtual_schema, capabilities);
 }
 
 test "document SQL expands qualified star projection with document virtual columns" {
@@ -15088,7 +15007,7 @@ test "document SQL lowers algebraic grouped count over indexed facts" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlAggregateUnsupported, lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, &stale_order_count, schema));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, &stale_order_count, schema));
 
     var stale_order_expression = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs GROUP BY plan ORDER BY row_count DESC LIMIT 5");
     defer stale_order_expression.deinit(alloc);
@@ -15101,7 +15020,7 @@ test "document SQL lowers algebraic grouped count over indexed facts" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlAggregateUnsupported, lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, &stale_order_expression, schema));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, &stale_order_expression, schema));
 
     var unaliased_count = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) FROM docs GROUP BY plan HAVING count > 1 ORDER BY count DESC LIMIT 5");
     defer unaliased_count.deinit(alloc);
@@ -15159,7 +15078,7 @@ test "document SQL lowers algebraic grouped count over indexed facts" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlAggregateUnsupported, lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, &stale_having_expression, schema));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, &stale_having_expression, schema));
 
     var stale_having_operator = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs WHERE status = 'active' GROUP BY plan HAVING row_count > 1 ORDER BY row_count DESC LIMIT 5");
     defer stale_having_operator.deinit(alloc);
@@ -15169,7 +15088,7 @@ test "document SQL lowers algebraic grouped count over indexed facts" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlAggregateUnsupported, lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, &stale_having_operator, schema));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, &stale_having_operator, schema));
 
     var stale_having_right_expression = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs WHERE status = 'active' GROUP BY plan HAVING row_count > 1 ORDER BY row_count DESC LIMIT 5");
     defer stale_having_right_expression.deinit(alloc);
@@ -15182,7 +15101,7 @@ test "document SQL lowers algebraic grouped count over indexed facts" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlAggregateUnsupported, lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, &stale_having_right_expression, schema));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, &stale_having_right_expression, schema));
 
     var having_expression = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs GROUP BY plan HAVING count(*) >= 2 ORDER BY row_count DESC LIMIT 5");
     defer having_expression.deinit(alloc);
@@ -15227,7 +15146,7 @@ test "document SQL lowers algebraic grouped count over indexed facts" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlAggregateUnsupported, lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, &stale_having_conjunction_child, schema));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, &stale_having_conjunction_child, schema));
 
     var multi_key_group = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs GROUP BY plan, status LIMIT 5");
     defer multi_key_group.deinit(alloc);
@@ -15849,7 +15768,11 @@ test "document SQL lowers json path projection" {
         if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
             .read => |read| {
                 if (read.projection_items.expressions.len == 0) return error.TestUnexpectedResult;
-                read.projection_items.expressions[0].left_expression = null;
+                if (read.projection_items.expressions[0].left_expression) |left_expression| {
+                    left_expression.deinit(alloc);
+                    alloc.destroy(left_expression);
+                    read.projection_items.expressions[0].left_expression = null;
+                } else return error.TestUnexpectedResult;
             },
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
@@ -16155,7 +16078,7 @@ test "document SQL lowers vector search predicate to native query producer" {
     };
     var no_vector = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 5)");
     defer no_vector.deinit(alloc);
-    try std.testing.expectError(error.DocumentSqlBoundedScanMissingExactProducer, lowerDocumentReadPlanParsedSqlAlloc(alloc, &no_vector, no_vector_schema));
+    try std.testing.expectError(error.DocumentSqlIndexUnavailable, lowerDocumentReadPlanParsedSqlAlloc(alloc, &no_vector, no_vector_schema));
 
     var stale_argument = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 5)");
     defer stale_argument.deinit(alloc);
@@ -17032,7 +16955,14 @@ test "document SQL lowers scalar null predicate to policy bounded residual scan"
     try std.testing.expectEqual(@as(?u32, 3), lowered.limit);
 }
 
-test "document SQL lowers null equality comparisons to policy bounded residual scan" {
+fn expectDocumentProducerIndexedMatchNone(producer: *const DocumentProducer) !void {
+    try std.testing.expect(producer.* == .indexed_query);
+    try std.testing.expectEqualStrings("{\"match_none\":{}}", producer.indexed_query.filter_query_json.?);
+    try std.testing.expect(producer.indexed_query.residual_filter_json == null);
+    try std.testing.expect(producer.indexed_query.max_candidate_rows == null);
+}
+
+test "document SQL lowers null equality comparisons to indexed match none without scan" {
     const alloc = std.testing.allocator;
     const schema = runtime_schema.TableSchema{
         .storage_mode = .document,
@@ -17043,24 +16973,25 @@ test "document SQL lowers null equality comparisons to policy bounded residual s
     var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, status FROM docs WHERE status = NULL LIMIT 3");
     defer parsed.deinit(alloc);
 
-    try std.testing.expectError(error.DocumentSqlBoundedScanPolicyRequired, lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema));
+    var lowered_without_policy = try lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema);
+    defer lowered_without_policy.deinit(alloc);
+    try expectDocumentProducerIndexedMatchNone(&lowered_without_policy.producer);
+    try std.testing.expectEqual(@as(?u32, 3), lowered_without_policy.limit);
 
     var lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &parsed, schema, .{ .max_rows = 25 });
     defer lowered.deinit(alloc);
-    try std.testing.expectEqual(@as(u32, 25), lowered.producer.bounded_scan.max_rows);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&lowered.producer);
     try std.testing.expectEqual(@as(?u32, 3), lowered.limit);
 
     var distinct = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, status FROM docs WHERE status <> NULL LIMIT 3");
     defer distinct.deinit(alloc);
     var distinct_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &distinct, schema, .{ .max_rows = 25 });
     defer distinct_lowered.deinit(alloc);
-    try std.testing.expectEqual(@as(u32, 25), distinct_lowered.producer.bounded_scan.max_rows);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", distinct_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&distinct_lowered.producer);
     try std.testing.expectEqual(@as(?u32, 3), distinct_lowered.limit);
 }
 
-test "document SQL lowers null range and pattern predicates to policy bounded residual scan" {
+test "document SQL lowers null range and pattern predicates to indexed match none under bounded policy" {
     const alloc = std.testing.allocator;
     const schema = runtime_schema.TableSchema{
         .storage_mode = .document,
@@ -17073,22 +17004,19 @@ test "document SQL lowers null range and pattern predicates to policy bounded re
     defer greater.deinit(alloc);
     var greater_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &greater, schema, .{ .max_rows = 25 });
     defer greater_lowered.deinit(alloc);
-    try std.testing.expectEqual(@as(u32, 25), greater_lowered.producer.bounded_scan.max_rows);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", greater_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&greater_lowered.producer);
 
     var like = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, title FROM docs WHERE title LIKE NULL LIMIT 3");
     defer like.deinit(alloc);
     var like_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &like, schema, .{ .max_rows = 25 });
     defer like_lowered.deinit(alloc);
-    try std.testing.expectEqual(@as(u32, 25), like_lowered.producer.bounded_scan.max_rows);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", like_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&like_lowered.producer);
 
     var between = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, amount FROM docs WHERE amount BETWEEN 10 AND NULL LIMIT 3");
     defer between.deinit(alloc);
     var between_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &between, schema, .{ .max_rows = 25 });
     defer between_lowered.deinit(alloc);
-    try std.testing.expectEqual(@as(u32, 25), between_lowered.producer.bounded_scan.max_rows);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", between_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&between_lowered.producer);
 }
 
 test "document SQL fail closes unsupported residual expression shapes under bounded scan" {
@@ -17306,7 +17234,10 @@ fn expectDocumentSqlCorpusAggregatePlan(
     if (case.expected.limit) |expected_limit| {
         try std.testing.expectEqual(expected_limit, lowered.limit orelse return error.TestUnexpectedResult);
     }
-    const expected_producer = case.expected.producer orelse return error.InvalidSqlCorpusFixture;
+    const expected_producer = case.expected.producer orelse {
+        try std.testing.expect(lowered.candidate_producer == null);
+        return;
+    };
     if (std.mem.eql(u8, expected_producer, "algebraic_materialization")) {
         try std.testing.expect(lowered.index_name != null);
         try std.testing.expect(lowered.materialization_name != null);
@@ -17859,7 +17790,7 @@ test "document SQL typed paths prove scalar type but not index readiness" {
     });
     defer cast_path_lowered.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 25), cast_path_lowered.producer.bounded_scan.max_rows);
-    try std.testing.expectEqualStrings("{\"numeric_range\":{\"path\":\"/metrics/score\",\"min\":7,\"inclusive_min\":true}}", cast_path_lowered.producer.bounded_scan.residual_filter_json.?);
+    try std.testing.expectEqualStrings("{\"scalar_numeric_cast_range\":{\"path\":\"/metrics/score\",\"min\":7,\"inclusive_min\":true}}", cast_path_lowered.producer.bounded_scan.residual_filter_json.?);
     try std.testing.expectEqualStrings("/metrics/score", cast_path_lowered.projection[1].field);
 
     var aggregate = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs GROUP BY metrics->>'score' LIMIT 10;");
@@ -17873,6 +17804,7 @@ test "document SQL typed paths prove scalar type but not index readiness" {
     try std.testing.expect(aggregate_lowered.candidate_producer != null);
     try std.testing.expectEqual(@as(u32, 25), aggregate_lowered.candidate_producer.?.bounded_scan.max_rows);
     try std.testing.expectEqualStrings("/metrics/score", aggregate_lowered.group_by.?.field);
+    try std.testing.expectEqualStrings("score", aggregate_lowered.group_by.?.output);
 
     var cast_aggregate = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs GROUP BY CAST(metrics->>'score' AS numeric) LIMIT 10;");
     defer cast_aggregate.deinit(alloc);
@@ -17895,20 +17827,6 @@ test "document SQL typed paths prove scalar type but not index readiness" {
     try std.testing.expectEqual(DocumentAggregateOrderKey.group, ordered_aggregate_lowered.order_by.?.key);
     try std.testing.expectEqual(runtime_schema.AntflyType.numeric, ordered_aggregate_lowered.order_by.?.field_type);
     try std.testing.expectEqual(DocumentOrderDirection.desc, ordered_aggregate_lowered.order_by.?.direction);
-
-    var default_group_output = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs GROUP BY metrics->>'score' HAVING group >= 7 ORDER BY group DESC LIMIT 10;");
-    defer default_group_output.deinit(alloc);
-    var default_group_output_lowered = try lowerDocumentAggregatePlanWithOptionalIndexesAndVirtualSchemaCapabilitiesParsedSqlAlloc(alloc, &default_group_output, schema, virtual_schema, null, .{
-        .bounded_scan = .{ .max_rows = 25 },
-    });
-    defer default_group_output_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("group", default_group_output_lowered.group_by.?.output);
-    try std.testing.expectEqual(@as(usize, 1), default_group_output_lowered.having.len);
-    try std.testing.expectEqual(DocumentAggregateOrderKey.group, default_group_output_lowered.having[0].key);
-    try std.testing.expectEqualStrings("7", default_group_output_lowered.having[0].value_json);
-    try std.testing.expect(default_group_output_lowered.order_by != null);
-    try std.testing.expectEqual(DocumentAggregateOrderKey.group, default_group_output_lowered.order_by.?.key);
-    try std.testing.expectEqual(DocumentOrderDirection.desc, default_group_output_lowered.order_by.?.direction);
 
     var having_aggregate = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs GROUP BY metrics->>'score' HAVING metrics->>'score' >= 7 LIMIT 10;");
     defer having_aggregate.deinit(alloc);
@@ -18206,10 +18124,14 @@ test "document SQL lowers scalar text cast predicates as residual filters" {
     var mixed_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &mixed, schema, .{ .max_rows = 25 });
     defer mixed_lowered.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "{\"bool\":{\"filter\":[{\"term\":{\"path\":\"/status\",\"value\":\"active\"}},{\"scalar_text_cast_term\":{\"path\":\"/created_at\",\"value\":\"123456\"}}]}}",
-        mixed_lowered.producer.bounded_scan.residual_filter_json.?,
+        "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        mixed_lowered.producer.indexed_query.filter_query_json.?,
     );
-    try std.testing.expectEqual(@as(u32, 25), mixed_lowered.producer.bounded_scan.max_rows);
+    try std.testing.expectEqualStrings(
+        "{\"scalar_text_cast_term\":{\"path\":\"/created_at\",\"value\":\"123456\"}}",
+        mixed_lowered.producer.indexed_query.residual_filter_json.?,
+    );
+    try std.testing.expectEqual(@as(?u32, 25), mixed_lowered.producer.indexed_query.max_candidate_rows);
 
     var not_equal = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE _id = 'doc:a' AND CAST(amount AS text) != '12' LIMIT 10");
     defer not_equal.deinit(alloc);
@@ -18224,7 +18146,7 @@ test "document SQL lowers scalar text cast predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var unsupported_array = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE CAST(tags AS text) = 'a' LIMIT 10");
     defer unsupported_array.deinit(alloc);
@@ -18232,11 +18154,11 @@ test "document SQL lowers scalar text cast predicates as residual filters" {
 
     var unsupported_numeric_cast = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE CAST(active AS numeric) = 1 LIMIT 10");
     defer unsupported_numeric_cast.deinit(alloc);
-    try std.testing.expectError(error.DocumentSqlBoundedScanUnsupportedResidual, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &unsupported_numeric_cast, schema, .{ .max_rows = 25 }));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &unsupported_numeric_cast, schema, .{ .max_rows = 25 }));
 
     var wrong_rhs_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE CAST(amount AS text) = 12 LIMIT 10");
     defer wrong_rhs_type.deinit(alloc);
-    try std.testing.expectError(error.DocumentSqlBoundedScanUnsupportedResidual, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &wrong_rhs_type, schema, .{ .max_rows = 25 }));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &wrong_rhs_type, schema, .{ .max_rows = 25 }));
 }
 
 test "document SQL lowers scalar numeric cast predicates as residual filters" {
@@ -18281,10 +18203,14 @@ test "document SQL lowers scalar numeric cast predicates as residual filters" {
     var mixed_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &mixed, schema, .{ .max_rows = 25 });
     defer mixed_lowered.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "{\"bool\":{\"filter\":[{\"term\":{\"path\":\"/status\",\"value\":\"active\"}},{\"scalar_numeric_cast_range\":{\"path\":\"/description\",\"max\":20,\"inclusive_max\":false}}]}}",
-        mixed_lowered.producer.bounded_scan.residual_filter_json.?,
+        "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        mixed_lowered.producer.indexed_query.filter_query_json.?,
     );
-    try std.testing.expectEqual(@as(u32, 25), mixed_lowered.producer.bounded_scan.max_rows);
+    try std.testing.expectEqualStrings(
+        "{\"scalar_numeric_cast_range\":{\"path\":\"/description\",\"max\":20,\"inclusive_max\":false}}",
+        mixed_lowered.producer.indexed_query.residual_filter_json.?,
+    );
+    try std.testing.expectEqual(@as(?u32, 25), mixed_lowered.producer.indexed_query.max_candidate_rows);
 
     var not_equal = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE _id = 'doc:a' AND CAST(amount AS numeric) != 12 LIMIT 10");
     defer not_equal.deinit(alloc);
@@ -18299,15 +18225,15 @@ test "document SQL lowers scalar numeric cast predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var unsupported_boolean = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE CAST(active AS numeric) = 1 LIMIT 10");
     defer unsupported_boolean.deinit(alloc);
-    try std.testing.expectError(error.DocumentSqlBoundedScanUnsupportedResidual, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &unsupported_boolean, schema, .{ .max_rows = 25 }));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &unsupported_boolean, schema, .{ .max_rows = 25 }));
 
     var wrong_rhs_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE CAST(amount AS numeric) = '12' LIMIT 10");
     defer wrong_rhs_type.deinit(alloc);
-    try std.testing.expectError(error.DocumentSqlBoundedScanUnsupportedResidual, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &wrong_rhs_type, schema, .{ .max_rows = 25 }));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &wrong_rhs_type, schema, .{ .max_rows = 25 }));
 }
 
 test "document SQL lowers scalar boolean cast predicates as residual filters" {
@@ -18352,10 +18278,14 @@ test "document SQL lowers scalar boolean cast predicates as residual filters" {
     var mixed_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &mixed, schema, .{ .max_rows = 25 });
     defer mixed_lowered.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "{\"bool\":{\"filter\":[{\"term\":{\"path\":\"/status\",\"value\":\"active\"}},{\"scalar_boolean_cast_term\":{\"path\":\"/description\",\"value\":true}}]}}",
-        mixed_lowered.producer.bounded_scan.residual_filter_json.?,
+        "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        mixed_lowered.producer.indexed_query.filter_query_json.?,
     );
-    try std.testing.expectEqual(@as(u32, 25), mixed_lowered.producer.bounded_scan.max_rows);
+    try std.testing.expectEqualStrings(
+        "{\"scalar_boolean_cast_term\":{\"path\":\"/description\",\"value\":true}}",
+        mixed_lowered.producer.indexed_query.residual_filter_json.?,
+    );
+    try std.testing.expectEqual(@as(?u32, 25), mixed_lowered.producer.indexed_query.max_candidate_rows);
 
     var not_equal = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE _id = 'doc:a' AND CAST(active AS boolean) != true LIMIT 10");
     defer not_equal.deinit(alloc);
@@ -18370,15 +18300,15 @@ test "document SQL lowers scalar boolean cast predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var unsupported_numeric = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE CAST(amount AS boolean) = true LIMIT 10");
     defer unsupported_numeric.deinit(alloc);
-    try std.testing.expectError(error.DocumentSqlBoundedScanUnsupportedResidual, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &unsupported_numeric, schema, .{ .max_rows = 25 }));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &unsupported_numeric, schema, .{ .max_rows = 25 }));
 
     var wrong_rhs_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE CAST(active AS boolean) = 'true' LIMIT 10");
     defer wrong_rhs_type.deinit(alloc);
-    try std.testing.expectError(error.DocumentSqlBoundedScanUnsupportedResidual, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &wrong_rhs_type, schema, .{ .max_rows = 25 }));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &wrong_rhs_type, schema, .{ .max_rows = 25 }));
 }
 
 test "document SQL lowers scalar datetime cast predicates as residual filters" {
@@ -18423,10 +18353,14 @@ test "document SQL lowers scalar datetime cast predicates as residual filters" {
     var mixed_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &mixed, schema, .{ .max_rows = 25 });
     defer mixed_lowered.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "{\"bool\":{\"filter\":[{\"term\":{\"path\":\"/status\",\"value\":\"active\"}},{\"scalar_datetime_cast_range\":{\"path\":\"/description\",\"max\":200000,\"inclusive_max\":false}}]}}",
-        mixed_lowered.producer.bounded_scan.residual_filter_json.?,
+        "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        mixed_lowered.producer.indexed_query.filter_query_json.?,
     );
-    try std.testing.expectEqual(@as(u32, 25), mixed_lowered.producer.bounded_scan.max_rows);
+    try std.testing.expectEqualStrings(
+        "{\"scalar_datetime_cast_range\":{\"path\":\"/description\",\"max\":200000,\"inclusive_max\":false}}",
+        mixed_lowered.producer.indexed_query.residual_filter_json.?,
+    );
+    try std.testing.expectEqual(@as(?u32, 25), mixed_lowered.producer.indexed_query.max_candidate_rows);
 
     var not_equal = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE _id = 'doc:a' AND CAST(created_at AS timestamp) != 123456 LIMIT 10");
     defer not_equal.deinit(alloc);
@@ -18441,11 +18375,11 @@ test "document SQL lowers scalar datetime cast predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var unsupported_boolean = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE CAST(active AS timestamp) = 1 LIMIT 10");
     defer unsupported_boolean.deinit(alloc);
-    try std.testing.expectError(error.DocumentSqlBoundedScanUnsupportedResidual, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &unsupported_boolean, schema, .{ .max_rows = 25 }));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &unsupported_boolean, schema, .{ .max_rows = 25 }));
 
     var negative_rhs = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE CAST(created_at AS timestamp) = -1 LIMIT 10");
     defer negative_rhs.deinit(alloc);
@@ -18453,7 +18387,7 @@ test "document SQL lowers scalar datetime cast predicates as residual filters" {
 
     var wrong_rhs_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE CAST(created_at AS timestamp) = '123456' LIMIT 10");
     defer wrong_rhs_type.deinit(alloc);
-    try std.testing.expectError(error.DocumentSqlBoundedScanUnsupportedResidual, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &wrong_rhs_type, schema, .{ .max_rows = 25 }));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &wrong_rhs_type, schema, .{ .max_rows = 25 }));
 }
 
 test "document SQL lowers nullif text predicates as residual filters" {
@@ -18521,7 +18455,7 @@ test "document SQL lowers nullif text predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE nullif(amount, '0') = '1' LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -18598,7 +18532,7 @@ test "document SQL lowers replace text predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE replace(amount, '-', '') = '1' LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -18675,7 +18609,7 @@ test "document SQL lowers translate text predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE translate(amount, 'a', 'b') = '1' LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -18753,7 +18687,7 @@ test "document SQL lowers concat_ws text predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE concat_ws('-', status, amount) = 'active-1' LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -18834,7 +18768,7 @@ test "document SQL lowers pad text predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE lpad(amount, 5, '0') = '00001' LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -18915,7 +18849,7 @@ test "document SQL lowers split_part text predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE split_part(amount, ':', 1) = '1' LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -19008,7 +18942,7 @@ test "document SQL lowers text affix predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE starts_with(amount, '1') = true LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -19089,7 +19023,7 @@ test "document SQL lowers text position predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE strpos(amount, '1') = 1 LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -19168,7 +19102,7 @@ test "document SQL lowers ascii text predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE ascii(amount) = 49 LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -19268,7 +19202,7 @@ test "document SQL lowers unary text function predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE md5(amount) = '5d41402abc4b2a76b9719d911017c592' LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -19351,7 +19285,7 @@ test "document SQL lowers repeat text predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE repeat(amount, 2) = '11' LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -19431,7 +19365,7 @@ test "document SQL lowers text slice predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE left(amount, 2) = '11' LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -19511,7 +19445,7 @@ test "document SQL lowers substring text predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE substr(amount, 1, 2) = '11' LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -19594,7 +19528,7 @@ test "document SQL lowers overlay text predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE overlay(amount placing 'X' from 1 for 1) = 'X' LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -19718,7 +19652,7 @@ test "document SQL lowers case-fold LIKE predicates as residual filters" {
     defer null_pattern.deinit(alloc);
     var null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &null_pattern, schema, .{ .max_rows = 25 });
     defer null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE lower(amount) LIKE '1%' LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -19772,7 +19706,7 @@ test "document SQL lowers scalar ILIKE predicates as residual filters" {
     defer null_pattern.deinit(alloc);
     var null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &null_pattern, schema, .{ .max_rows = 25 });
     defer null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE amount ILIKE 'a%' LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -19884,7 +19818,7 @@ test "document SQL lowers text length predicates as residual filters" {
     defer null_length.deinit(alloc);
     var null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &null_length, schema, .{ .max_rows = 25 });
     defer null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE length(amount) = 2 LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -19981,7 +19915,7 @@ test "document SQL lowers array length predicates as residual filters" {
     defer null_length.deinit(alloc);
     var null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &null_length, schema, .{ .max_rows = 25 });
     defer null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&null_lowered.producer);
 
     var wrong_dimension = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE array_length(tags, 2) = 1 LIMIT 10");
     defer wrong_dimension.deinit(alloc);
@@ -20073,7 +20007,7 @@ test "document SQL lowers JSON array length predicates as residual filters" {
     defer null_length.deinit(alloc);
     var null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &null_length, schema, .{ .max_rows = 25 });
     defer null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&null_lowered.producer);
 
     var text_path = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE jsonb_array_length(metadata->>'flags') = 2 LIMIT 10");
     defer text_path.deinit(alloc);
@@ -20170,7 +20104,7 @@ test "document SQL lowers JSON typeof predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var text_path = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE jsonb_typeof(metadata->>'flags') = 'array' LIMIT 10");
     defer text_path.deinit(alloc);
@@ -20264,7 +20198,7 @@ test "document SQL lowers numeric arithmetic predicates as residual filters" {
     defer null_rhs.deinit(alloc);
     var null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &null_rhs, schema, .{ .max_rows = 25 });
     defer null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE status + 1 > 10 LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -20327,7 +20261,7 @@ test "document SQL lowers numeric power predicates as residual filters" {
     defer null_rhs.deinit(alloc);
     var null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &null_rhs, schema, .{ .max_rows = 25 });
     defer null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE power(status, 2) > 10 LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -20390,7 +20324,7 @@ test "document SQL lowers numeric mod function predicates as residual filters" {
     defer null_rhs.deinit(alloc);
     var null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &null_rhs, schema, .{ .max_rows = 25 });
     defer null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE MOD(status, 3) > 1 LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -20467,7 +20401,7 @@ test "document SQL lowers numeric unary predicates as residual filters" {
     defer null_rhs.deinit(alloc);
     var null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &null_rhs, schema, .{ .max_rows = 25 });
     defer null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE round(status) > 10 LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -20540,7 +20474,7 @@ test "document SQL lowers regexp function predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var wrong_field_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE regexp_count(amount, '[0-9]+') = 1 LIMIT 10");
     defer wrong_field_type.deinit(alloc);
@@ -20621,7 +20555,7 @@ test "document SQL lowers chr text predicates as residual filters" {
     defer sql_null.deinit(alloc);
     var sql_null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &sql_null, schema, .{ .max_rows = 25 });
     defer sql_null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", sql_null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&sql_null_lowered.producer);
 
     var wrong_field_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE chr(status) = 'A' LIMIT 10");
     defer wrong_field_type.deinit(alloc);
@@ -20728,7 +20662,7 @@ test "document SQL lowers regex predicates as residual filters" {
     defer null_pattern.deinit(alloc);
     var null_lowered = try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &null_pattern, schema, .{ .max_rows = 25 });
     defer null_lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"match_none\":{}}", null_lowered.producer.bounded_scan.residual_filter_json.?);
+    try expectDocumentProducerIndexedMatchNone(&null_lowered.producer);
 
     var wrong_type = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE amount ~ '1.*' LIMIT 10");
     defer wrong_type.deinit(alloc);
@@ -21096,7 +21030,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlUnnestUnsupported, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &stale_unnest_filter_operator, schema, .{ .max_rows = 25 }));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &stale_unnest_filter_operator, schema, .{ .max_rows = 25 }));
 
     var stale_unnest_filter_right_expression = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' LIMIT 10");
     defer stale_unnest_filter_right_expression.deinit(alloc);
@@ -21109,7 +21043,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlUnnestUnsupported, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &stale_unnest_filter_right_expression, schema, .{ .max_rows = 25 }));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &stale_unnest_filter_right_expression, schema, .{ .max_rows = 25 }));
 
     var in_filter = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag IN ('urgent', 'vip') LIMIT 10");
     defer in_filter.deinit(alloc);
@@ -21128,7 +21062,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlUnnestUnsupported, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &stale_in_filter_right_range, schema, .{ .max_rows = 25 }));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &stale_in_filter_right_range, schema, .{ .max_rows = 25 }));
 
     var not_in_filter = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag NOT IN ('stale', 'archived') LIMIT 10");
     defer not_in_filter.deinit(alloc);
@@ -21152,7 +21086,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlUnnestUnsupported, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &stale_not_in_filter_negation, schema, .{ .max_rows = 25 }));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &stale_not_in_filter_negation, schema, .{ .max_rows = 25 }));
 
     var in_not_in_filter = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag IN ('urgent', 'vip') AND tag NOT IN ('vip') LIMIT 10");
     defer in_not_in_filter.deinit(alloc);
@@ -21208,7 +21142,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlUnnestUnsupported, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &stale_range_filter_operator, schema, .{
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &stale_range_filter_operator, schema, .{
         .indexed_array_element_paths = &.{"/tags"},
     }));
 
@@ -21234,7 +21168,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlUnnestUnsupported, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &stale_pattern_filter_operator, schema, .{
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &stale_pattern_filter_operator, schema, .{
         .indexed_array_element_paths = &.{"/tags"},
     }));
 
@@ -21249,7 +21183,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlUnnestUnsupported, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &stale_pattern_filter_right_expression, schema, .{
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &stale_pattern_filter_right_expression, schema, .{
         .indexed_array_element_paths = &.{"/tags"},
     }));
 
@@ -21318,7 +21252,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlUnnestUnsupported, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &stale_null_filter_right_range, schema, .{
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &stale_null_filter_right_range, schema, .{
         .indexed_array_element_paths = &.{"/tags"},
     }));
 
@@ -21347,7 +21281,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlUnnestUnsupported, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &stale_not_equal_filter_right_expression, schema, .{
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &stale_not_equal_filter_right_expression, schema, .{
         .indexed_array_element_paths = &.{"/tags"},
     }));
 
@@ -21399,7 +21333,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlUnnestUnsupported, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &stale_not_null_filter_operator, schema, .{
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &stale_not_null_filter_operator, schema, .{
         .indexed_array_element_paths = &.{"/tags"},
     }));
 
@@ -21933,7 +21867,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlUnsupportedJoin, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_correlated_lateral_missing_outer_alias, schema, view_mapping_virtual_schema, .{
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_correlated_lateral_missing_outer_alias, schema, view_mapping_virtual_schema, .{
         .indexed_scalar_filters = true,
         .indexed_scalar_filter_paths = &.{"/plan"},
     }));
@@ -21949,7 +21883,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlLateralRequiresNativeProducer, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_correlated_lateral_missing_lateral_alias, schema, view_mapping_virtual_schema, .{
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_correlated_lateral_missing_lateral_alias, schema, view_mapping_virtual_schema, .{
         .indexed_scalar_filters = true,
         .indexed_scalar_filter_paths = &.{"/plan"},
     }));
@@ -21983,7 +21917,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlLateralRequiresNativeProducer, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_correlated_lateral_missing_child_limit, schema, view_mapping_virtual_schema, .{
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_correlated_lateral_missing_child_limit, schema, view_mapping_virtual_schema, .{
         .indexed_scalar_filters = true,
         .indexed_scalar_filter_paths = &.{"/plan"},
     }));
@@ -22000,7 +21934,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlLateralRequiresNativeProducer, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_correlated_lateral_missing_child_limit_expression, schema, view_mapping_virtual_schema, .{
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_correlated_lateral_missing_child_limit_expression, schema, view_mapping_virtual_schema, .{
         .indexed_scalar_filters = true,
         .indexed_scalar_filter_paths = &.{"/plan"},
     }));
@@ -22046,7 +21980,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlLateralRequiresNativeProducer, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_ordered_lateral_projection_stale_order, schema, view_mapping_virtual_schema, .{
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_ordered_lateral_projection_stale_order, schema, view_mapping_virtual_schema, .{
         .indexed_scalar_filters = true,
         .indexed_scalar_filter_paths = &.{"/plan"},
     }));
@@ -22151,7 +22085,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlLateralRequiresNativeProducer, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_correlated_lateral_stale_cast_residual, schema, view_mapping_virtual_schema, .{
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_correlated_lateral_stale_cast_residual, schema, view_mapping_virtual_schema, .{
         .indexed_scalar_filters = true,
         .indexed_scalar_filter_paths = &.{"/plan"},
     }));
@@ -22276,7 +22210,7 @@ test "document SQL lowers explicit array unnest over bounded scan" {
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.DocumentSqlUnnestUnsupported, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &stale_unnest_metadata, schema, view_mapping_virtual_schema, .{
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &stale_unnest_metadata, schema, view_mapping_virtual_schema, .{
         .indexed_array_element_paths = &.{"/tags"},
     }));
 

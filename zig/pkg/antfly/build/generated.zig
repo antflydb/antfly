@@ -66,6 +66,7 @@ const openapi_join_input_paths = [_][]const u8{
     "../specs/openapi/antfly/metadata.yaml",
     "../specs/openapi/antfly/query.yaml",
     "../specs/openapi/antfly/reranking.yaml",
+    "../specs/openapi/antfly/sort.yaml",
     "../specs/openapi/antfly/websearch.yaml",
     "../specs/openapi/auth/api.yaml",
     "../specs/openapi/extensions/api.yaml",
@@ -89,6 +90,7 @@ pub const OpenApiModules = struct {
     client: *std.Build.Module,
     schema: *std.Build.Module,
     indexes: *std.Build.Module,
+    sort: *std.Build.Module,
     websearch: *std.Build.Module,
     eval: *std.Build.Module,
     query: *std.Build.Module,
@@ -123,6 +125,7 @@ pub fn addCommittedOpenApiModules(ctx: anytype) OpenApiModules {
     const client_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_client_openapi", antfly_openapi_generated_root ++ "/antfly_client_openapi", httpx_mod);
     const schema_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_schema_openapi", antfly_openapi_generated_root ++ "/antfly_schema_openapi");
     const indexes_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_indexes_openapi", antfly_openapi_generated_root ++ "/antfly_indexes_openapi");
+    const sort_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_sort_openapi", antfly_openapi_generated_root ++ "/antfly_sort_openapi");
     const websearch_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_websearch_openapi", antfly_openapi_generated_root ++ "/antfly_websearch_openapi");
     const eval_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_eval_openapi", antfly_openapi_generated_root ++ "/antfly_eval_openapi");
     const query_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_query_openapi", antfly_openapi_generated_root ++ "/antfly_query_openapi");
@@ -156,6 +159,7 @@ pub fn addCommittedOpenApiModules(ctx: anytype) OpenApiModules {
     generating_api_openapi_mod.addImport("antfly_websearch_openapi", websearch_openapi_mod);
     public_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     public_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
+    public_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
     public_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
     public_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
     public_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
@@ -163,6 +167,7 @@ pub fn addCommittedOpenApiModules(ctx: anytype) OpenApiModules {
     public_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
     client_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     client_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
+    client_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
     client_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
     client_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
     client_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
@@ -171,6 +176,7 @@ pub fn addCommittedOpenApiModules(ctx: anytype) OpenApiModules {
     metadata_openapi_mod.addImport("antfly_usermgr_openapi", usermgr_openapi_mod);
     metadata_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
     metadata_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
+    metadata_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
     metadata_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
     metadata_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
     metadata_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
@@ -199,6 +205,7 @@ pub fn addCommittedOpenApiModules(ctx: anytype) OpenApiModules {
         .client = client_openapi_mod,
         .schema = schema_openapi_mod,
         .indexes = indexes_openapi_mod,
+        .sort = sort_openapi_mod,
         .websearch = websearch_openapi_mod,
         .eval = eval_openapi_mod,
         .query = query_openapi_mod,
@@ -829,6 +836,7 @@ fn addOpenApiGeneratedPackages(
     addOpenApiGeneratedPackage(b, openapi_codegen, addJoinedPublicOpenApiSpec(b), "antfly_public_openapi", antfly_openapi_generated_root ++ "/antfly_public_openapi", "types,extractors", &.{
         .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
         .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
+        .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
         .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
         .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
         .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
@@ -838,6 +846,7 @@ fn addOpenApiGeneratedPackages(
     addOpenApiGeneratedPackage(b, openapi_codegen, addPrefixedPublicOpenApiSpec(b), "antfly_client_openapi", antfly_openapi_generated_root ++ "/antfly_client_openapi", "types,client", &.{
         .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
         .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
+        .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
         .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
         .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
         .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
@@ -851,6 +860,7 @@ fn addOpenApiGeneratedPackages(
         .{ "../shared/generating.yaml", "antfly_generating_openapi" },
         .{ "chunking.yaml", "antfly_chunking_openapi" },
     }, mode);
+    addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/antfly/sort.yaml"), "antfly_sort_openapi", antfly_openapi_generated_root ++ "/antfly_sort_openapi", "types", &.{}, mode);
     addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/antfly/websearch.yaml"), "antfly_websearch_openapi", antfly_openapi_generated_root ++ "/antfly_websearch_openapi", "types", &.{
         .{ "../shared/s3.yaml", "antfly_s3_openapi" },
     }, mode);
@@ -865,6 +875,7 @@ fn addOpenApiGeneratedPackages(
         .{ "../auth/api.yaml", "antfly_usermgr_openapi" },
         .{ "indexes.yaml", "antfly_indexes_openapi" },
         .{ "schema.yaml", "antfly_schema_openapi" },
+        .{ "sort.yaml", "antfly_sort_openapi" },
         .{ "generating.yaml", "antfly_generating_api_openapi" },
         .{ "eval.yaml", "antfly_eval_openapi" },
         .{ "../shared/generating.yaml", "antfly_generating_openapi" },
@@ -914,6 +925,7 @@ fn addOpenApiGeneratedPackages(
     addOpenApiGeneratedPackage(b, openapi_codegen, b.path("../specs/openapi/inference/api.yaml"), "inference_api", inference_openapi_generated_root ++ "/inference_api", "types,server", &.{
         .{ "../shared/generating.yaml", "antfly_generating_openapi" },
         .{ "../ai/extraction.yaml", "antfly_extraction_openapi" },
+        .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
     }, mode);
     addOpenApiGeneratedPackage(b, openapi_codegen, b.path("specs/openai-openapi.yaml"), "openai_api", antfly_openapi_generated_root ++ "/openai_api", "types", &.{}, mode);
 }

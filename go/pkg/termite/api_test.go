@@ -15,10 +15,17 @@
 package termite
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/antflydb/antfly/go/pkg/libaf/ai"
+	"github.com/antflydb/antfly/go/pkg/libaf/chunking"
 	"github.com/antflydb/antfly/go/pkg/libaf/embeddings"
+	"github.com/antflydb/antfly/go/pkg/termite/lib/modelregistry"
+	"go.uber.org/zap"
 )
 
 func TestConvertChatMessagePreservesMediaImageParts(t *testing.T) {
@@ -84,13 +91,89 @@ func TestConvertChatMessagePreservesMediaImageParts(t *testing.T) {
 	}
 }
 
+func TestHandleApiChunkRejectsInvalidInput(t *testing.T) {
+	node := &TermiteNode{
+		logger:       zap.NewNop(),
+		requestQueue: NewRequestQueue(RequestQueueConfig{}, zap.NewNop()),
+		chunker:      testChunker{},
+	}
+
+	tests := []struct {
+		name        string
+		body        string
+		wantMessage string
+	}{
+		{
+			name:        "missing input",
+			body:        `{"config":{"model":"fixed"}}`,
+			wantMessage: "input is required",
+		},
+		{
+			name:        "media missing data",
+			body:        `{"input":{"type":"media","mime_type":"audio/wav"},"config":{"model":"fixed"}}`,
+			wantMessage: "media content part missing 'data' field",
+		},
+		{
+			name:        "media missing mime type",
+			body:        `{"input":{"type":"media","data":"AA=="},"config":{"model":"fixed"}}`,
+			wantMessage: "media content part missing 'mime_type' field",
+		},
+		{
+			name:        "text part missing text",
+			body:        `{"input":{"type":"text"},"config":{"model":"fixed"}}`,
+			wantMessage: "text content part missing 'text' field",
+		},
+		{
+			name:        "unsupported image url part",
+			body:        `{"input":{"type":"image_url","image_url":{"url":"https://example.test/a.png"}},"config":{"model":"fixed"}}`,
+			wantMessage: "input content part type must be 'text' or 'media'",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/ai/v1/chunk", strings.NewReader(tt.body))
+			rec := httptest.NewRecorder()
+
+			node.handleApiChunk(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%q", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), tt.wantMessage) {
+				t.Fatalf("body = %q, want substring %q", rec.Body.String(), tt.wantMessage)
+			}
+		})
+	}
+}
+
+type testChunker struct{}
+
+func (testChunker) Chunk(context.Context, string, chunkConfig) ([]chunking.Chunk, bool, error) {
+	return []chunking.Chunk{{Id: 0, MimeType: "text/plain"}}, false, nil
+}
+
+func (testChunker) ChunkMedia(context.Context, []byte, string, string, chunking.ChunkOptions) ([]chunking.Chunk, error) {
+	return []chunking.Chunk{{Id: 0, MimeType: "text/plain"}}, nil
+}
+
+func (testChunker) ListModels() []string { return nil }
+
+func (testChunker) ListWithCapabilities() map[string][]string { return nil }
+
+func (testChunker) HasCapability(string, modelregistry.Capability) bool { return false }
+
+func (testChunker) Close() error { return nil }
+
 func TestValidateContentTypes(t *testing.T) {
 	caps := embeddings.EmbedderCapabilities{
 		SupportedMIMETypes: []embeddings.MIMETypeSupport{
 			{MIMEType: "text/plain"},
 			{MIMEType: "image/jpeg"},
 			{MIMEType: "image/png"},
-			{MIMEType: "image/*"},
+			{MIMEType: "image/gif"},
+			{MIMEType: "image/bmp"},
+			{MIMEType: "image/webp"},
 		},
 	}
 
@@ -118,21 +201,21 @@ func TestValidateContentTypes(t *testing.T) {
 			},
 		},
 		{
-			name: "image/gif accepted via wildcard",
+			name: "image/gif accepted (exact)",
 			contents: [][]ai.ContentPart{
 				{ai.BinaryContent{MIMEType: "image/gif", Data: []byte{0x47}}},
 			},
 		},
 		{
-			name: "image/webp accepted via wildcard",
+			name: "image/bmp accepted (exact)",
 			contents: [][]ai.ContentPart{
-				{ai.BinaryContent{MIMEType: "image/webp", Data: []byte{0x52}}},
+				{ai.BinaryContent{MIMEType: "image/bmp", Data: []byte{0x42}}},
 			},
 		},
 		{
-			name: "image/bmp accepted via wildcard",
+			name: "image/webp accepted (exact)",
 			contents: [][]ai.ContentPart{
-				{ai.BinaryContent{MIMEType: "image/bmp", Data: []byte{0x42}}},
+				{ai.BinaryContent{MIMEType: "image/webp", Data: []byte{0x52}}},
 			},
 		},
 		{
@@ -154,6 +237,40 @@ func TestValidateContentTypes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := validateContentTypes(tt.contents, caps)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateContentTypes() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateContentTypes_ImageWildcard(t *testing.T) {
+	caps := embeddings.EmbedderCapabilities{
+		SupportedMIMETypes: []embeddings.MIMETypeSupport{
+			{MIMEType: "text/plain"},
+			{MIMEType: "image/jpeg"},
+			{MIMEType: "image/png"},
+			{MIMEType: "image/*"},
+		},
+	}
+
+	tests := []struct {
+		name     string
+		mimeType string
+		wantErr  bool
+	}{
+		{"image/gif via wildcard", "image/gif", false},
+		{"image/webp via wildcard", "image/webp", false},
+		{"image/bmp via wildcard", "image/bmp", false},
+		{"audio/wav rejected", "audio/wav", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			contents := [][]ai.ContentPart{
+				{ai.BinaryContent{MIMEType: tt.mimeType, Data: []byte{0x00}}},
+			}
+			err := validateContentTypes(contents, caps)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validateContentTypes() error = %v, wantErr %v", err, tt.wantErr)
 			}

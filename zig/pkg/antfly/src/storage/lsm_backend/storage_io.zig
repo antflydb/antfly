@@ -331,6 +331,7 @@ pub const Storage = struct {
         write_file_absolute: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         append_file_absolute: ?*const fn (*anyopaque, []const u8, []const u8, bool) anyerror!void = null,
         begin_atomic_write: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!AtomicWriteSink = null,
+        sync_file_absolute: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
         rename_absolute: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         delete_file_absolute: *const fn (*anyopaque, []const u8) anyerror!void,
         delete_tree: *const fn (*anyopaque, []const u8) anyerror!void,
@@ -433,6 +434,12 @@ pub const Storage = struct {
             return try begin_atomic_write(self.ptr, allocator, path);
         }
         return try BufferedAtomicWriteSink.create(allocator, self, path);
+    }
+
+    pub fn syncFileAbsolute(self: Storage, path: []const u8) !void {
+        if (self.vtable.sync_file_absolute) |sync_file_absolute| {
+            return try sync_file_absolute(self.ptr, path);
+        }
     }
 
     pub fn renameAbsolute(self: Storage, old_path: []const u8, new_path: []const u8) !void {
@@ -1143,6 +1150,7 @@ else blk: {
                 .write_file_absolute = writeFileAbsolute,
                 .append_file_absolute = appendFileAbsolute,
                 .begin_atomic_write = beginAtomicWrite,
+                .sync_file_absolute = syncFileAbsolute,
                 .rename_absolute = renameAbsolute,
                 .delete_file_absolute = deleteFileAbsolute,
                 .delete_tree = deleteTree,
@@ -1303,6 +1311,14 @@ else blk: {
                 return try NativeAtomicWriteSink.create(allocator, path, self.state);
             }
 
+            fn syncFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+                switch (self.runtime) {
+                    .threaded => |*threaded| try syncFilePathWithIo(threaded.io(), path),
+                    .evented => |*evented| try syncFilePathWithIo(evented.io(), path),
+                }
+            }
+
             fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
                 const self: *NativeStorage = @ptrCast(@alignCast(ptr));
                 self.state.invalidateRename(old_path, new_path);
@@ -1361,6 +1377,7 @@ else blk: {
             .write_file_absolute = writeFileAbsolute,
             .append_file_absolute = appendFileAbsolute,
             .begin_atomic_write = beginAtomicWrite,
+            .sync_file_absolute = syncFileAbsolute,
             .rename_absolute = renameAbsolute,
             .delete_file_absolute = deleteFileAbsolute,
             .delete_tree = deleteTree,
@@ -1483,6 +1500,13 @@ else blk: {
             return try NativeAtomicWriteSink.create(allocator, path, state);
         }
 
+        fn syncFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            const retained = try state.retain();
+            defer retained.release();
+            try syncFilePathWithIo(retained.threaded.io(), path);
+        }
+
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
             const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
             const retained = try state.retain();
@@ -1567,6 +1591,10 @@ fn appendFileAbsoluteWithIo(io: anytype, path: []const u8, contents: []const u8,
         std.log.err("lsm appendFileAbsolute sync failed path={s} bytes={} err={s}", .{ path, contents.len, @errorName(err) });
         return err;
     };
+}
+
+fn syncFilePathWithIo(io: anytype, path: []const u8) !void {
+    try fs_paths.syncFileAndParentPortable(io, path);
 }
 
 fn openFilePathForWriteWithIo(io: anytype, path: []const u8, flags: std.Io.Dir.CreateFileOptions) !std.Io.File {
@@ -2118,6 +2146,7 @@ const NativeAtomicWriteSink = struct {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
 
+        try fs_paths.syncFdPortable(self.fd);
         closeFd(self.fd);
         self.fd = -1;
 
@@ -2190,6 +2219,7 @@ const memory_vtable: Storage.VTable = .{
     .read_file_trailer_alloc = memoryReadFileTrailerAlloc,
     .write_file_absolute = memoryWriteFileAbsolute,
     .append_file_absolute = memoryAppendFileAbsolute,
+    .sync_file_absolute = memorySyncFileAbsolute,
     .rename_absolute = memoryRenameAbsolute,
     .delete_file_absolute = memoryDeleteFileAbsolute,
     .delete_tree = memoryDeleteTree,
@@ -2281,6 +2311,8 @@ fn memoryAppendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const
     errdefer self.allocator.free(owned_contents);
     try self.files.putNoClobber(self.allocator, owned_path, owned_contents);
 }
+
+fn memorySyncFileAbsolute(_: *anyopaque, _: []const u8) !void {}
 
 fn memoryRenameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
     const self: *MemoryStorage = @ptrCast(@alignCast(ptr));

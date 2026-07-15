@@ -15,7 +15,14 @@
 const std = @import("std");
 
 pub const meta_key = "hbc:meta";
-pub const hbc_index_version: u32 = 1;
+pub const hbc_index_version: u32 = 2;
+
+pub const ProjectionCheckpointMetadata = struct {
+    applied_sequence: u64 = 0,
+    status: u8 = 1,
+    generation: u64 = 0,
+    config_hash: u64 = 0,
+};
 
 pub const IndexMetadata = struct {
     version: u32 = hbc_index_version,
@@ -28,6 +35,10 @@ pub const IndexMetadata = struct {
     use_quantization: bool = true,
     quantizer_seed: u64 = 42,
     metric: u8 = 0,
+    projection_applied_sequence: u64 = 0,
+    projection_status: u8 = 1,
+    projection_generation: u64 = 0,
+    projection_config_hash: u64 = 0,
 
     pub fn encode(self: *const IndexMetadata, buf: []u8) []u8 {
         var pos: usize = 0;
@@ -43,6 +54,11 @@ pub const IndexMetadata = struct {
         writeU64LE(buf, &pos, self.quantizer_seed);
         buf[pos] = self.metric;
         pos += 1;
+        writeU64LE(buf, &pos, self.projection_applied_sequence);
+        buf[pos] = self.projection_status;
+        pos += 1;
+        writeU64LE(buf, &pos, self.projection_generation);
+        writeU64LE(buf, &pos, self.projection_config_hash);
         return buf[0..pos];
     }
 
@@ -59,6 +75,12 @@ pub const IndexMetadata = struct {
         pos += 1;
         const seed = readU64LE(data, &pos);
         const metric = data[pos];
+        pos += 1;
+        const projection_applied_sequence = readU64LE(data, &pos);
+        const projection_status = data[pos];
+        pos += 1;
+        const projection_generation = readU64LE(data, &pos);
+        const projection_config_hash = readU64LE(data, &pos);
         return .{
             .version = version,
             .dims = dims,
@@ -70,10 +92,30 @@ pub const IndexMetadata = struct {
             .use_quantization = use_quant,
             .quantizer_seed = seed,
             .metric = metric,
+            .projection_applied_sequence = projection_applied_sequence,
+            .projection_status = projection_status,
+            .projection_generation = projection_generation,
+            .projection_config_hash = projection_config_hash,
         };
     }
 
-    pub const encoded_size = 4 + 4 + 4 + 4 + 8 + 8 + 8 + 1 + 8 + 1;
+    pub fn projectionCheckpoint(self: *const IndexMetadata) ProjectionCheckpointMetadata {
+        return .{
+            .applied_sequence = self.projection_applied_sequence,
+            .status = self.projection_status,
+            .generation = self.projection_generation,
+            .config_hash = self.projection_config_hash,
+        };
+    }
+
+    pub fn setProjectionCheckpoint(self: *IndexMetadata, checkpoint: ProjectionCheckpointMetadata) void {
+        self.projection_applied_sequence = checkpoint.applied_sequence;
+        self.projection_status = checkpoint.status;
+        self.projection_generation = checkpoint.generation;
+        self.projection_config_hash = checkpoint.config_hash;
+    }
+
+    pub const encoded_size = 4 + 4 + 4 + 4 + 8 + 8 + 8 + 1 + 8 + 1 + 8 + 1 + 8 + 8;
 };
 
 pub const Suffix = enum(u8) {

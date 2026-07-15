@@ -21,7 +21,8 @@ GO_SUBMODULES := \
 	./go/pkg/evalaf/plugins/antfly \
 	./go/pkg/genkit/antfly \
 	./go/pkg/genkit/openrouter \
-	./go/pkg/memoryaf
+	./go/pkg/memoryaf \
+	./go/pkg/termite
 
 GO_GENERATED_CHECK_PATHS := \
 	openapi.yaml \
@@ -409,7 +410,7 @@ endif
 # TLA+ Verification Commands
 # ====================================================================================
 
-GOMODCACHE := $(shell go env GOMODCACHE)
+GOMODCACHE := $(shell $(GO) env GOMODCACHE 2>/dev/null)
 RAFT_TLA := $(GOMODCACHE)/go.etcd.io/raft/v3@v3.6.0/tla
 
 .PHONY: tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-trace-raft tla-trace-txn

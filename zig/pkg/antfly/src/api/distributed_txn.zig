@@ -111,6 +111,15 @@ pub const CommitConflict = struct {
     message: []const u8,
     group_id: ?u64 = null,
     phase: ?ParticipantPhase = null,
+    owns_table_name: bool = false,
+    owns_key: bool = false,
+    owns_message: bool = false,
+
+    pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        if (self.owns_table_name) alloc.free(@constCast(self.table_name));
+        if (self.owns_key) alloc.free(@constCast(self.key));
+        if (self.owns_message) alloc.free(@constCast(self.message));
+    }
 };
 
 pub const ParticipantPhase = enum {
@@ -122,6 +131,13 @@ pub const ParticipantPhase = enum {
 pub const CommitOutcome = union(enum) {
     committed: ExecuteResult,
     conflict: CommitConflict,
+
+    pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        switch (self) {
+            .committed => {},
+            .conflict => |conflict| conflict.deinit(alloc),
+        }
+    }
 };
 
 pub const ParticipantWorker = struct {
@@ -1137,7 +1153,7 @@ fn executeMultiTableCommitOnce(
                     tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
                 }
                 try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
-                return .{ .conflict = participantConflict(participant) };
+                return .{ .conflict = try participantConflict(alloc, participant) };
             },
             error.UnknownGroup => {
                 if (surface_unavailable_conflict) {
@@ -1169,7 +1185,7 @@ fn executeMultiTableCommitOnce(
                         .reason = "participant decision conflict",
                     });
                 }
-                return .{ .conflict = participantDecisionConflict(participant, .resolve) };
+                return .{ .conflict = try participantDecisionConflict(alloc, participant, .resolve) };
             },
             error.TxnNotFound, error.InvalidTxnRecord => {
                 if (trace_writer) |tw| {
@@ -1181,7 +1197,7 @@ fn executeMultiTableCommitOnce(
                         .reason = "participant transaction state missing",
                     });
                 }
-                return .{ .conflict = participantTornStateConflict(participant, .resolve) };
+                return .{ .conflict = try participantTornStateConflict(alloc, participant, .resolve) };
             },
             error.UnknownGroup => {
                 if (surface_unavailable_conflict) {
@@ -6150,72 +6166,51 @@ fn abortBegunRefs(
     }
 }
 
-fn participantConflict(participant: ParticipantTxn) CommitConflict {
+fn ownedParticipantConflict(
+    alloc: std.mem.Allocator,
+    participant: ParticipantTxn,
+    key: []const u8,
+    message: []const u8,
+    phase: ParticipantPhase,
+) !CommitConflict {
+    const table_name = try alloc.dupe(u8, participant.table_name);
+    errdefer alloc.free(table_name);
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    return .{
+        .table_name = table_name,
+        .key = owned_key,
+        .message = message,
+        .group_id = participant.group_id,
+        .phase = phase,
+        .owns_table_name = true,
+        .owns_key = true,
+    };
+}
+
+fn participantConflict(alloc: std.mem.Allocator, participant: ParticipantTxn) !CommitConflict {
     if (participant.predicates.items.len > 0) {
-        return .{
-            .table_name = participant.table_name,
-            .key = participant.predicates.items[0].key,
-            .message = "version conflict",
-            .group_id = participant.group_id,
-            .phase = .prepare,
-        };
+        return try ownedParticipantConflict(alloc, participant, participant.predicates.items[0].key, "version conflict", .prepare);
     }
     if (participant.writes.items.len > 0) {
-        return .{
-            .table_name = participant.table_name,
-            .key = participant.writes.items[0].key,
-            .message = "intent conflict",
-            .group_id = participant.group_id,
-            .phase = .prepare,
-        };
+        return try ownedParticipantConflict(alloc, participant, participant.writes.items[0].key, "intent conflict", .prepare);
     }
     if (participant.deletes.items.len > 0) {
-        return .{
-            .table_name = participant.table_name,
-            .key = participant.deletes.items[0],
-            .message = "intent conflict",
-            .group_id = participant.group_id,
-            .phase = .prepare,
-        };
+        return try ownedParticipantConflict(alloc, participant, participant.deletes.items[0], "intent conflict", .prepare);
     }
-    return .{
-        .table_name = participant.table_name,
-        .key = "",
-        .message = "transaction conflict",
-        .group_id = participant.group_id,
-        .phase = .prepare,
-    };
+    return try ownedParticipantConflict(alloc, participant, "", "transaction conflict", .prepare);
 }
 
 fn participantUnavailableConflict(alloc: std.mem.Allocator, participant: ParticipantTxn, phase: ParticipantPhase) !CommitConflict {
-    _ = alloc;
-    return .{
-        .table_name = participant.table_name,
-        .key = "",
-        .message = "participant unavailable",
-        .group_id = participant.group_id,
-        .phase = phase,
-    };
+    return try ownedParticipantConflict(alloc, participant, "", "participant unavailable", phase);
 }
 
-fn participantDecisionConflict(participant: ParticipantTxn, phase: ParticipantPhase) CommitConflict {
-    return .{
-        .table_name = participant.table_name,
-        .key = "",
-        .message = "decision conflict",
-        .group_id = participant.group_id,
-        .phase = phase,
-    };
+fn participantDecisionConflict(alloc: std.mem.Allocator, participant: ParticipantTxn, phase: ParticipantPhase) !CommitConflict {
+    return try ownedParticipantConflict(alloc, participant, "", "decision conflict", phase);
 }
 
-fn participantTornStateConflict(participant: ParticipantTxn, phase: ParticipantPhase) CommitConflict {
-    return .{
-        .table_name = participant.table_name,
-        .key = "",
-        .message = "transaction state missing",
-        .group_id = participant.group_id,
-        .phase = phase,
-    };
+fn participantTornStateConflict(alloc: std.mem.Allocator, participant: ParticipantTxn, phase: ParticipantPhase) !CommitConflict {
+    return try ownedParticipantConflict(alloc, participant, "", "transaction state missing", phase);
 }
 
 test "distributed txn coordinator groups by range and commits all participants" {
@@ -6276,7 +6271,7 @@ test "distributed txn coordinator groups by range and commits all participants" 
 
         fn begin(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnBeginRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(@as(usize, 3), req.participants.len);
+            try std.testing.expectEqual(@as(usize, 2), req.participants.len);
             try self.begins.append(std.testing.allocator, group_id);
         }
 
@@ -13199,6 +13194,7 @@ test "distributed txn coordinator surfaces participant group on repeated unknown
         }},
         null,
     );
+    defer outcome.deinit(std.testing.allocator);
     try std.testing.expect(outcome == .conflict);
     try std.testing.expectEqualStrings("participant unavailable", outcome.conflict.message);
     try std.testing.expectEqualStrings("docs", outcome.conflict.table_name);
@@ -13295,6 +13291,7 @@ test "distributed txn coordinator surfaces resolve decision conflicts determinis
         }},
         null,
     );
+    defer outcome.deinit(std.testing.allocator);
     try std.testing.expect(outcome == .conflict);
     try std.testing.expectEqualStrings("decision conflict", outcome.conflict.message);
     try std.testing.expectEqualStrings("docs", outcome.conflict.table_name);

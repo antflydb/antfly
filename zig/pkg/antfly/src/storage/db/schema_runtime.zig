@@ -42,6 +42,25 @@ pub const ApplyTableSchemaOptions = struct {
     reload_algebraic_schema_configs: bool = true,
 };
 
+fn deleteKeysWithPrefixFromStore(alloc: Allocator, store: *docstore_mod.DocStore, prefix: []const u8) !void {
+    const keys = try store.scanPrefix(alloc, prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, keys);
+    if (keys.len == 0) return;
+
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    for (keys) |item| {
+        try deletes.append(alloc, item.key);
+    }
+    try store.putBatch(&.{}, deletes.items);
+}
+
+fn deleteDerivedCoverageForIndex(alloc: Allocator, store: *docstore_mod.DocStore, index_name: []const u8) !void {
+    const prefix = try internal_keys.derivedCoverageOutcomePrefixAlloc(alloc, index_name);
+    defer alloc.free(prefix);
+    try deleteKeysWithPrefixFromStore(alloc, store, prefix);
+}
+
 pub const SchemaRewriteJobExecutionResult = struct {
     report: relational_store_mod.RowRewriteReport,
     progress_row_key: []u8,
@@ -473,45 +492,169 @@ pub fn Impl(comptime DB: type) type {
             return try out.toOwnedSlice(alloc);
         }
 
+        const StoredGeneratedReplayBatch = struct {
+            writes: []types.BatchWrite = &.{},
+            extracted: []mapper.ExtractedWrite = &.{},
+            next_lower: ?[]u8 = null,
+
+            fn deinit(self: *@This(), alloc: Allocator) void {
+                for (self.writes) |write| {
+                    alloc.free(@constCast(write.key));
+                    alloc.free(@constCast(write.value));
+                }
+                if (self.writes.len > 0) alloc.free(self.writes);
+                for (self.extracted) |*item| item.deinit(alloc);
+                if (self.extracted.len > 0) alloc.free(self.extracted);
+                if (self.next_lower) |buf| alloc.free(buf);
+                self.* = .{};
+            }
+        };
+
+        fn collectStoredGeneratedReplayBatch(
+            self: *DB,
+            alloc: Allocator,
+            lower: []const u8,
+            lower_exclusive: bool,
+            limit: usize,
+        ) !StoredGeneratedReplayBatch {
+            const ScanState = struct {
+                alloc: Allocator,
+                relational_base_rows: bool,
+                limit: usize,
+                writes: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
+                extracted: std.ArrayListUnmanaged(mapper.ExtractedWrite) = .empty,
+                last_store_key: ?[]u8 = null,
+
+                fn deinitPartial(state: *@This()) void {
+                    for (state.writes.items) |write| {
+                        state.alloc.free(@constCast(write.key));
+                        state.alloc.free(@constCast(write.value));
+                    }
+                    state.writes.deinit(state.alloc);
+                    for (state.extracted.items) |*item| item.deinit(state.alloc);
+                    state.extracted.deinit(state.alloc);
+                    if (state.last_store_key) |key| state.alloc.free(key);
+                }
+
+                fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                    const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                    if (!db_internal.isBaseDocumentStoreKeyForMode(state.relational_base_rows, key)) return .@"continue";
+                    const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.alloc, key)) orelse return .@"continue";
+                    errdefer state.alloc.free(raw_key);
+                    const doc_json = if (state.relational_base_rows)
+                        try mapper.materializeRelationalRowValueAlloc(state.alloc, value)
+                    else
+                        try mapper.materializeDocumentValueAlloc(state.alloc, value);
+                    errdefer state.alloc.free(doc_json);
+                    try state.writes.append(state.alloc, .{
+                        .key = raw_key,
+                        .value = doc_json,
+                    });
+                    var extracted = try mapper.extractWrite(state.alloc, raw_key, doc_json);
+                    errdefer extracted.deinit(state.alloc);
+                    const next_last_store_key = try state.alloc.dupe(u8, key);
+                    errdefer state.alloc.free(next_last_store_key);
+                    try state.extracted.append(state.alloc, extracted);
+                    if (state.last_store_key) |last| state.alloc.free(last);
+                    state.last_store_key = next_last_store_key;
+                    if (state.writes.items.len >= state.limit) return .stop;
+                    return .@"continue";
+                }
+            };
+
+            var state = ScanState{
+                .alloc = alloc,
+                .relational_base_rows = self.relationalColumnsForStore() != null,
+                .limit = limit,
+            };
+            errdefer state.deinitPartial();
+            try self.core.store.scanWithContext(lower, "", .{ .lower_exclusive = lower_exclusive }, &state, ScanState.scanEntry);
+
+            var next_lower: ?[]u8 = null;
+            if (state.last_store_key) |last| {
+                next_lower = try alloc.dupe(u8, last);
+                alloc.free(last);
+                state.last_store_key = null;
+            }
+
+            return .{
+                .writes = try state.writes.toOwnedSlice(alloc),
+                .extracted = try state.extracted.toOwnedSlice(alloc),
+                .next_lower = next_lower,
+            };
+        }
+
         pub fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: Allocator) !usize {
+            if (self.enrichment_runtime == null) return 0;
+
+            const chunk_size: usize = 128;
+            const initial_lower = try self.core.documentRangeLowerAlloc("");
+            defer self.core.alloc.free(initial_lower);
+            var lower = try alloc.dupe(u8, initial_lower);
+            defer alloc.free(lower);
+            var lower_exclusive = false;
+
+            var generated_ref_count: usize = 0;
+            var latest_sequence: u64 = 0;
+            while (true) {
+                var replay_batch = try Self.collectStoredGeneratedReplayBatch(self, alloc, lower, lower_exclusive, chunk_size);
+                defer replay_batch.deinit(alloc);
+                if (replay_batch.writes.len == 0) break;
+
+                var pending_batch = derived_types.DerivedBatch{};
+                defer derived_types.deinitDerivedBatch(alloc, &pending_batch);
+                try DB.SchemaRuntimeCallbacks.append_generated_enrichments(self, &pending_batch, .{
+                    .writes = replay_batch.writes,
+                    .sync_level = .write,
+                }, replay_batch.extracted);
+                if (pending_batch.generated_enrichment_refs.len != 0) {
+                    generated_ref_count += pending_batch.generated_enrichment_refs.len;
+                    const sequence = try DB.SchemaRuntimeCallbacks.append_derived_batch_record(self, pending_batch);
+                    latest_sequence = @max(latest_sequence, sequence);
+                }
+
+                const next_lower = replay_batch.next_lower orelse break;
+                replay_batch.next_lower = null;
+                alloc.free(lower);
+                lower = next_lower;
+                lower_exclusive = true;
+            }
+            if (latest_sequence != 0) {
+                self.executor.notifySequence(latest_sequence);
+                if (self.enrichment_runtime) |runtime| runtime.notifySequence(latest_sequence);
+                DB.SchemaRuntimeCallbacks.notify_resolver_replay_runtimes(self, latest_sequence);
+            }
+            return generated_ref_count;
+        }
+
+        pub fn reprocessGeneratedEnrichmentFromStoredDocs(
+            self: *DB,
+            alloc: Allocator,
+            artifact_name: ?[]const u8,
+        ) !usize {
+            const name = artifact_name orelse return try Self.replayGeneratedEnrichmentsFromStoredDocs(self, alloc);
             if (self.enrichment_runtime == null) return 0;
 
             const lower = try self.core.documentRangeLowerAlloc("");
             defer self.core.alloc.free(lower);
             const docs = try self.core.scanStoreRange(alloc, lower, "");
             defer docstore_mod.DocStore.freeResults(alloc, docs);
-            var materialized_values = std.ArrayListUnmanaged([]u8).empty;
-            defer {
-                for (materialized_values.items) |value| alloc.free(value);
-                materialized_values.deinit(alloc);
-            }
+
             const chunk_size: usize = 128;
-            var index: usize = 0;
-            var generated_ref_count: usize = 0;
             const relational_base_rows = self.relationalColumnsForStore() != null;
+            const force_artifacts = [_][]const u8{name};
+            var index: usize = 0;
+            var reprocessed: usize = 0;
             while (index < docs.len) {
-                var write_count: usize = 0;
-                var probe = index;
-                while (probe < docs.len and write_count < chunk_size) : (probe += 1) {
-                    if (db_internal.isBaseDocumentStoreKeyForMode(relational_base_rows, docs[probe].key)) write_count += 1;
-                }
-                if (write_count == 0) break;
-
-                var writes = try alloc.alloc(types.BatchWrite, write_count);
+                var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
                 defer {
-                    for (writes) |write| alloc.free(@constCast(write.key));
-                    alloc.free(writes);
+                    for (writes.items) |write| {
+                        alloc.free(@constCast(write.key));
+                        alloc.free(@constCast(write.value));
+                    }
+                    writes.deinit(alloc);
                 }
-
-                var extracted = try alloc.alloc(mapper.ExtractedWrite, write_count);
-                var extracted_initialized: usize = 0;
-                defer {
-                    for (extracted[0..extracted_initialized]) |*item| item.deinit(alloc);
-                    alloc.free(extracted);
-                }
-
-                var filled: usize = 0;
-                while (index < docs.len and filled < write_count) : (index += 1) {
+                while (index < docs.len and writes.items.len < chunk_size) : (index += 1) {
                     const doc = docs[index];
                     if (!db_internal.isBaseDocumentStoreKeyForMode(relational_base_rows, doc.key)) continue;
                     const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, doc.key)) orelse continue;
@@ -521,30 +664,32 @@ pub fn Impl(comptime DB: type) type {
                     else
                         try mapper.materializeDocumentValueAlloc(alloc, doc.value);
                     errdefer alloc.free(doc_json);
-                    try materialized_values.append(alloc, doc_json);
-                    writes[filled] = .{
+                    try writes.append(alloc, .{
                         .key = raw_key,
                         .value = doc_json,
-                    };
-                    extracted[filled] = try mapper.extractWrite(alloc, raw_key, doc_json);
-                    extracted_initialized += 1;
-                    filled += 1;
+                    });
                 }
-
-                var pending_batch = derived_types.DerivedBatch{};
-                defer derived_types.deinitDerivedBatch(alloc, &pending_batch);
-                try DB.SchemaRuntimeCallbacks.append_generated_enrichments(self, &pending_batch, .{
-                    .writes = writes[0..filled],
+                if (writes.items.len == 0) continue;
+                try DB.WritePathCallbacks.batch_internal(self, .{
+                    .writes = writes.items,
                     .sync_level = .write,
-                }, extracted[0..filled]);
-                if (pending_batch.generated_enrichment_refs.len == 0) continue;
-                generated_ref_count += pending_batch.generated_enrichment_refs.len;
-                const sequence = try DB.SchemaRuntimeCallbacks.append_derived_batch_record(self, pending_batch);
-                self.executor.notifySequence(sequence);
-                if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
-                DB.SchemaRuntimeCallbacks.notify_resolver_replay_runtimes(self, sequence);
+                }, null, .{
+                    .force_generated_artifact_names = &force_artifacts,
+                    .admission_prechecked = true,
+                });
+                reprocessed += writes.items.len;
             }
-            return generated_ref_count;
+            return reprocessed;
+        }
+
+        fn markEnrichmentAppliedIfNoPendingThrough(self: *DB, sequence: u64) !void {
+            if (sequence == 0) return;
+            const runtime = self.enrichment_runtime orelse return;
+            const runtime_stats = runtime.stats();
+            if (runtime_stats.applied_sequence >= sequence) return;
+            if (try DB.SchemaRuntimeCallbacks.no_pending_enrichment_replay_through(self, runtime_stats.applied_sequence, sequence)) {
+                try runtime.markAppliedThrough(sequence);
+            }
         }
 
         pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
@@ -566,7 +711,11 @@ pub fn Impl(comptime DB: type) type {
             if (needs_enrichment_replay) {
                 if (self.enrichment_runtime != null) {
                     const refs = try DB.SchemaRuntimeCallbacks.replay_generated_enrichments_from_stored_docs(self, self.alloc);
-                    if (refs == 0) try self.core.saveAppliedSequence(cfg.name, self.core.nextDerivedSequence());
+                    if (refs == 0) {
+                        const target_sequence = self.core.nextDerivedSequence();
+                        try self.core.saveAppliedSequence(cfg.name, target_sequence);
+                        try Self.markEnrichmentAppliedIfNoPendingThrough(self, target_sequence);
+                    }
                 }
             }
         }
@@ -608,7 +757,9 @@ pub fn Impl(comptime DB: type) type {
             self.executor.removeWorker(name);
             self.core.lockApply();
             defer self.core.unlockApply();
-            return try self.core.deleteIndex(name);
+            const removed = try self.core.deleteIndex(name);
+            if (removed) try deleteDerivedCoverageForIndex(self.core.alloc, self.core.store, name);
+            return removed;
         }
 
         pub fn deleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8) !bool {
@@ -3470,4 +3621,49 @@ test "db schema runtime index inspection lists graph indexes" {
     try std.testing.expectEqual(@as(usize, 1), indexes.len);
     try std.testing.expectEqualStrings("graph_v1", indexes[0].name);
     try std.testing.expectEqual(types.IndexKind.graph, indexes[0].kind);
+}
+
+test "db schema runtime delete index clears derived coverage rows" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_delete",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+    });
+    try db.addIndex(.{
+        .name = "dv_keep",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+    });
+
+    const delete_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, "dv_delete", 7, "doc:a", "skipped");
+    defer alloc.free(delete_key);
+    const delete_counter_key = try internal_keys.derivedCoverageSkippedCountKeyAlloc(alloc, "dv_delete", 7);
+    defer alloc.free(delete_counter_key);
+    const keep_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, "dv_keep", 7, "doc:a", "skipped");
+    defer alloc.free(keep_key);
+
+    var counter_value: [8]u8 = undefined;
+    try db.core.store.putBatch(&.{
+        .{ .key = delete_key, .value = "skipped" },
+        .{ .key = delete_counter_key, .value = internal_keys.encodeDerivedCoverageSkippedCount(&counter_value, 1) },
+        .{ .key = keep_key, .value = "skipped" },
+    }, &.{});
+
+    try std.testing.expect(try db.deleteIndex("dv_delete"));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, delete_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, delete_counter_key));
+
+    const kept = try db.core.store.get(alloc, keep_key);
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("skipped", kept);
 }

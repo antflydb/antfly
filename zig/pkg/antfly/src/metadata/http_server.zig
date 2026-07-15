@@ -2163,7 +2163,10 @@ pub const MetadataHttpServer = struct {
 
     fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.handle(req);
+        return self.handle(req) catch |err| switch (err) {
+            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => try notLeaderResponse(self.alloc),
+            else => return err,
+        };
     }
 };
 
@@ -4215,11 +4218,27 @@ fn validateSplitDocIdentityCompatibility(
     snapshot: *const metadata_api.AdminSnapshot,
     source_group_id: u64,
 ) !void {
-    const source = findMergedGroupStatus(snapshot.merged_group_statuses, source_group_id) orelse return error.DocIdentityNamespaceMismatch;
+    const source = findMergedGroupStatus(snapshot.merged_group_statuses, source_group_id) orelse {
+        if (!snapshotHasDocIdentityTelemetry(snapshot)) return;
+        return error.DocIdentityNamespaceMismatch;
+    };
+    if (!runtimeDocIdentityHasFacts(source.doc_identity)) return;
     if (source.doc_identity_reassignment_active) return error.DocIdentityNamespaceMismatch;
     if (source.doc_identity_namespace_conflict) return error.DocIdentityNamespaceMismatch;
     if (source.doc_identity.rebuild_required) return error.DocIdentityNamespaceMismatch;
     if (source.doc_identity.ordinal_capacity_exhausted) return error.DocIdentityNamespaceMismatch;
+}
+
+fn snapshotHasDocIdentityTelemetry(snapshot: *const metadata_api.AdminSnapshot) bool {
+    for (snapshot.merged_group_statuses) |status| {
+        if (runtimeDocIdentityHasFacts(status.doc_identity)) return true;
+    }
+    for (snapshot.stores) |store| {
+        for (store.runtime_statuses) |status| {
+            if (runtimeDocIdentityHasFacts(status.doc_identity)) return true;
+        }
+    }
+    return false;
 }
 
 fn validateSplitRequestDocIdentity(source: AdminSource, table_name: []const u8, req: SplitRequest) !void {
@@ -4235,6 +4254,29 @@ fn findMergedGroupStatus(statuses: []const metadata_reconciler.MergedGroupStatus
         if (status.group_id == group_id) return status;
     }
     return null;
+}
+
+fn runtimeDocIdentityHasFacts(stats: metadata_table_manager.RuntimeDocIdentityStatusReport) bool {
+    return stats.namespace_table_id != 0 or
+        stats.namespace_shard_id != 0 or
+        stats.namespace_range_id != 0 or
+        stats.next_ordinal != 1 or
+        stats.allocated_ordinals != 0 or
+        stats.ordinal_capacity_remaining != 0 or
+        stats.ordinal_capacity_exhausted or
+        stats.rebuild_required or
+        stats.state_rows != 0 or
+        stats.live_ordinals != 0 or
+        stats.tombstone_ordinals != 0 or
+        stats.min_created_generation != 0 or
+        stats.max_created_generation != 0 or
+        stats.min_deleted_generation != 0 or
+        stats.max_deleted_generation != 0 or
+        stats.scanned_primary_docs != 0 or
+        stats.primary_docs_missing_ordinals != 0 or
+        stats.primary_docs_missing_identity_state != 0 or
+        stats.primary_docs_with_tombstone_ordinals != 0 or
+        stats.complete;
 }
 
 fn runtimeDocIdentityHasOrdinalRows(stats: metadata_table_manager.RuntimeDocIdentityStatusReport) bool {
@@ -4353,6 +4395,44 @@ fn textResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_c
         .status = status,
         .content_type = try alloc.dupe(u8, "text/plain"),
         .body = try alloc.dupe(u8, body),
+    };
+}
+
+fn notLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+    const headers = try alloc.alloc(http_common.Header, 2);
+    var initialized_headers: usize = 0;
+    errdefer {
+        for (headers[0..initialized_headers]) |*header| header.deinit(alloc);
+        alloc.free(headers);
+    }
+
+    var retry_after_name: ?[]u8 = try alloc.dupe(u8, "Retry-After");
+    errdefer if (retry_after_name) |value| alloc.free(value);
+    var retry_after_value: ?[]u8 = try alloc.dupe(u8, "1");
+    errdefer if (retry_after_value) |value| alloc.free(value);
+    headers[0] = .{ .name = retry_after_name.?, .value = retry_after_value.? };
+    retry_after_name = null;
+    retry_after_value = null;
+    initialized_headers += 1;
+
+    var not_leader_name: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_header);
+    errdefer if (not_leader_name) |value| alloc.free(value);
+    var not_leader_value: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_value);
+    errdefer if (not_leader_value) |value| alloc.free(value);
+    headers[1] = .{ .name = not_leader_name.?, .value = not_leader_value.? };
+    not_leader_name = null;
+    not_leader_value = null;
+    initialized_headers += 1;
+
+    const content_type = try alloc.dupe(u8, "text/plain");
+    errdefer alloc.free(content_type);
+    const body = try alloc.dupe(u8, "metadata leader unavailable");
+    errdefer alloc.free(body);
+    return .{
+        .status = 503,
+        .content_type = content_type,
+        .headers = headers,
+        .body = body,
     };
 }
 

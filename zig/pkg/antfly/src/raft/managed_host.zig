@@ -598,6 +598,7 @@ fn prepareHostDeps(
     read_state_observer: ?state_machine.ReadStateObserver,
 ) !PreparedHostDeps {
     var prepared = PreparedHostDeps{ .host = base };
+    errdefer prepared.deinit(alloc);
     var effective_metadata_builder = metadata_snapshot_builder;
     var effective_data_builder = data_snapshot_builder;
     var applied_sink: ?state_machine.AppliedIndexSink = null;

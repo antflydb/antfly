@@ -1047,6 +1047,7 @@ pub fn Impl(comptime DB: type) type {
             });
             if (pending_identity_visibility_summary) |summary| {
                 self.identity_visibility_summary_cache = summary;
+                self.clearLiveDocSetCache();
             }
         }
 

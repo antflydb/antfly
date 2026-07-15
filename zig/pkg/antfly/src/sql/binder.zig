@@ -3599,6 +3599,10 @@ fn readSourceTableNamesFromGeneratedCteReadAstAlloc(
                 cte.body_set_operation,
             ) orelse return error.UnsupportedSqlShape;
             defer body_tables.deinit(alloc);
+            if (body_tables.source) |source| {
+                if (!std.mem.eql(u8, body_tables.left, source)) return error.UnsupportedSqlShape;
+            }
+            if (body_tables.extra_sources.len != 0) return error.UnsupportedSqlShape;
             break :blk try alloc.dupe(u8, body_tables.left);
         };
         errdefer alloc.free(cte_source);
@@ -4170,9 +4174,8 @@ test "sql adapter binder source table helpers validate parsed statement family" 
         joinedWriteSourceTableNamesFromGeneratedDmlCteAstAlloc(alloc, data_cte_merge.items(), &data_cte_merge_ast, missing_data_cte_first_body),
     );
 
-    const mismatched_data_cte_last_body = data_cte_prefix;
-    const last_body_dml = mismatched_data_cte_last_body.last_body_dml orelse return error.TestUnexpectedResult;
-    last_body_dml.command_span = data_cte_merge_ast.command_span;
+    var mismatched_data_cte_last_body = data_cte_prefix;
+    mismatched_data_cte_last_body.last_body_tokens = data_cte_merge_ast.target_table_tokens orelse return error.TestUnexpectedResult;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         joinedWriteSourceTableNamesFromGeneratedDmlCteAstAlloc(alloc, data_cte_merge.items(), &data_cte_merge_ast, mismatched_data_cte_last_body),
@@ -4514,7 +4517,7 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     var bound_write = try bindWritePlanCatalogStatementAlloc(alloc, &parsed_write, .{}, catalog.iface());
     defer bound_write.deinit(alloc);
     switch (bound_write.statement) {
-        .write => |statement| try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert, statement.kind),
+        .write => |statement| try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert_source, statement.kind),
         else => return error.TestUnexpectedResult,
     }
     const write = try bound_write.writeCatalog();
@@ -4534,7 +4537,7 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     switch (logical_write) {
         .catalog_write => |logical| {
             switch (logical.statement) {
-                .write => |statement| try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert, statement.kind),
+                .write => |statement| try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.insert_source, statement.kind),
                 else => return error.TestUnexpectedResult,
             }
             try std.testing.expect(logical.options.insert_source_schema != null);

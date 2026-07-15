@@ -321,6 +321,7 @@ pub const DecoderRuntimeApplyRmsNormLinearArgmaxRequest = struct {
     hidden_size: usize,
     eps: f32,
     out_dim: usize,
+    suppress_token_ids: []const i32 = &.{},
 };
 
 pub const DecoderRuntimeApplyRmsNormLinearRequest = struct {
@@ -356,6 +357,23 @@ pub const DecoderRuntimeApplyRmsNormLinearSampleRequest = struct {
     hidden_size: usize,
     eps: f32,
     out_dim: usize,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    min_p: f32,
+    repetition_penalty: f32,
+    frequency_penalty: f32,
+    presence_penalty: f32,
+    token_history: []const i64,
+};
+
+/// Sample from the full logits left resident in the backend's sample-logits
+/// buffer by the most recent decode frame's fused lm-head tail.
+pub const DecoderRuntimeSampleResidentLogitsRequest = struct {
+    out_dim: usize,
+    /// Gemma-style final-logit softcap applied on-device before sampling
+    /// (0 = disabled).
+    final_logit_softcap: f32 = 0,
     temperature: f32,
     top_k: usize,
     top_p: f32,
@@ -823,9 +841,30 @@ pub const DecoderRuntimeDecodeItem = struct {
     attention: AttentionContext,
 };
 
+pub const DecoderRuntimeDecodePhase = enum {
+    /// Encode, submit, wait, and read the token in one call (default).
+    full,
+    /// Encode this request's frame from the host token id and submit it
+    /// without waiting. Arms the pipelined decode sequence.
+    submit_only,
+    /// Encode this request's frame using the device-resident token id
+    /// (previous frame's argmax output), then wait the previously submitted
+    /// frame and write ITS token to output_token_ids[0]. The new frame stays
+    /// active and unsubmitted.
+    step,
+    /// Submit the active frame encoded by a previous `.step` call.
+    submit_pending,
+    /// Cancel the active frame encoded by a previous `.step` call.
+    cancel_pending,
+    /// Wait the previously submitted frame and write its token to
+    /// output_token_ids[0] without encoding a new frame.
+    await_only,
+};
+
 pub const DecoderRuntimeDecodeRequest = struct {
     contract: DecoderRuntimeDecodeContract,
     mode: DecoderRuntimeDecodeMode = .greedy_argmax,
+    phase: DecoderRuntimeDecodePhase = .full,
     configured_layer_count: usize,
     layer_count: usize,
     hidden_size: usize,
@@ -846,6 +885,10 @@ pub const DecoderRuntimeDecodeRequest = struct {
     items: []const DecoderRuntimeDecodeItem,
     token_embedding_weight: ?CT = null,
     ple_token_embedding_weight: ?CT = null,
+    /// Token ids excluded from greedy argmax. This is part of the greedy
+    /// decode contract because the backend-owned path commits KV before the
+    /// token id is handed back to the caller.
+    suppress_token_ids: []const i32 = &.{},
     /// Optional backend tensor containing one token id per item. When null,
     /// `items[*].token_id` is authoritative.
     input_token_ids: ?CT = null,
@@ -855,6 +898,13 @@ pub const DecoderRuntimeDecodeRequest = struct {
     /// Optional backend-owned token-id output tensor for the next decode step.
     /// Backends may leave this null and use host writeback only.
     output_token_ids_tensor: ?*CT = null,
+    /// Optional backend-owned final hidden output for single-token decode.
+    /// When set, successful calls populate it with the row after final norm.
+    output_hidden: ?*?CT = null,
+    /// When true, `output_hidden` receives the backbone row BEFORE the final
+    /// norm instead — for tails that apply the final norm themselves (fused
+    /// norm+lm-head sampling).
+    output_hidden_pre_norm: bool = false,
     /// Host-visible token writeback for each item. Backends may keep token ids
     /// device-owned internally, but successful calls must populate this slice.
     output_token_ids: []i64,

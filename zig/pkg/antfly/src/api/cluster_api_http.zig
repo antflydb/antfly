@@ -28,11 +28,13 @@ pub const ClusterApi = struct {
     };
 
     pub const ExecuteBackupError = error{
+        NotLeader,
         MethodNotAllowed,
         InternalFailure,
     };
 
     pub const ExecuteRestoreError = error{
+        NotLeader,
         InvalidRequest,
         TableAlreadyExists,
         MethodNotAllowed,
@@ -133,6 +135,7 @@ pub fn handleClusterBackup(
     defer location.deinit(alloc);
 
     const response_body = api.executeClusterBackup(alloc, req, &location) catch |err| switch (err) {
+        error.NotLeader => return err,
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "backup failed") },
     };
@@ -163,6 +166,7 @@ pub fn handleClusterRestore(
     };
 
     const response_body = api.executeClusterRestore(alloc, req, &location, restore_mode) catch |err| switch (err) {
+        error.NotLeader => return err,
         error.InvalidRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") },
         error.TableAlreadyExists => return .{ .status = 400, .body = try alloc.dupe(u8, "table already exists") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },

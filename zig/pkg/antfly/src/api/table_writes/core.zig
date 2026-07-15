@@ -81,11 +81,15 @@ pub fn freeRelationalIndexRepairJobRecord(alloc: std.mem.Allocator, record: Rela
     if (record.database_name.len > 0) alloc.free(record.database_name);
     if (record.namespace_name.len > 0) alloc.free(record.namespace_name);
     if (record.table_name.len > 0) alloc.free(record.table_name);
+    if (record.access_method.len > 0) alloc.free(record.access_method);
+    if (record.index_name.len > 0) alloc.free(record.index_name);
     if (record.worker_id.len > 0) alloc.free(record.worker_id);
     if (record.lower_doc_key.len > 0) alloc.free(record.lower_doc_key);
     if (record.upper_doc_key.len > 0) alloc.free(record.upper_doc_key);
     if (record.status.len > 0) alloc.free(record.status);
     if (record.next_lower_doc_key.len > 0) alloc.free(record.next_lower_doc_key);
+    if (record.cursor.len > 0) alloc.free(record.cursor);
+    if (record.failure_reason) |value| alloc.free(value);
     if (record.last_error) |value| alloc.free(value);
 }
 
@@ -213,6 +217,19 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             index_name: []const u8,
             index_json: []const u8,
+        ) anyerror!?void = null,
+        put_artifact_enrichment: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            artifact_name: []const u8,
+            enrichment_json: []const u8,
+        ) anyerror!?void = null,
+        delete_artifact_enrichment: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            artifact_name: []const u8,
         ) anyerror!?void = null,
         create_catalog_index: ?*const fn (
             ptr: *anyopaque,
@@ -556,6 +573,17 @@ pub const TableWriteSource = struct {
             alloc: std.mem.Allocator,
             target: catalog_resources.TableTarget,
         ) anyerror!?runtime_status.LocalTableRuntimeStatuses = null,
+        request_table_structural_reconcile: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+        ) anyerror!?void = null,
+        request_table_index_structural_reconcile: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+        ) anyerror!?void = null,
         foreign_key_integrity: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -792,6 +820,47 @@ pub const TableWriteSource = struct {
             worker_id: []const u8,
             lease_ms: u64,
         ) anyerror!?SecondaryIndexRebuildWorkerResult = null,
+        list_artifact_repair_issues: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.ArtifactRepairListRequest,
+        ) anyerror!?db_mod.types.ArtifactRepairListResult = null,
+        repair_artifact_issues: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.ArtifactRepairRunRequest,
+        ) anyerror!?db_mod.types.ArtifactRepairResult = null,
+        repair_artifact_issues_controlled: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.ArtifactRepairRunRequest,
+            options: db_mod.types.ArtifactRepairRunOptions,
+        ) anyerror!?db_mod.types.ArtifactRepairResult = null,
+        list_artifact_repair_issues_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.ArtifactRepairListRequest,
+        ) anyerror!?db_mod.types.ArtifactRepairListResult = null,
+        repair_artifact_issues_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.ArtifactRepairRunRequest,
+        ) anyerror!?db_mod.types.ArtifactRepairResult = null,
+        repair_artifact_issues_group_local_controlled: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.ArtifactRepairRunRequest,
+            options: db_mod.types.ArtifactRepairRunOptions,
+        ) anyerror!?db_mod.types.ArtifactRepairResult = null,
         relational_column_backed_index_repair_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1198,6 +1267,27 @@ pub const TableWriteSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, index_name, index_json);
     }
 
+    pub fn putArtifactEnrichment(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        enrichment_json: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.put_artifact_enrichment orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, artifact_name, enrichment_json);
+    }
+
+    pub fn deleteArtifactEnrichment(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.delete_artifact_enrichment orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, artifact_name);
+    }
+
     pub fn createCatalogIndex(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -1535,6 +1625,25 @@ pub const TableWriteSource = struct {
         return error.UnsupportedOperation;
     }
 
+    pub fn requestTableStructuralReconcile(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.request_table_structural_reconcile orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name);
+    }
+
+    pub fn requestTableIndexStructuralReconcile(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.request_table_index_structural_reconcile orelse return try self.requestTableStructuralReconcile(alloc, table_name);
+        return try fn_ptr(self.ptr, alloc, table_name, index_name);
+    }
+
     pub fn foreignKeyIntegrity(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -1861,6 +1970,75 @@ pub const TableWriteSource = struct {
     ) !?SecondaryIndexRebuildWorkerResult {
         const fn_ptr = self.vtable.secondary_index_rebuild_group_local orelse return null;
         return try fn_ptr(self.ptr, alloc, group_id, table_name, record, worker_id, lease_ms);
+    }
+
+    pub fn listArtifactRepairIssues(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairListRequest,
+    ) !?db_mod.types.ArtifactRepairListResult {
+        const fn_ptr = self.vtable.list_artifact_repair_issues orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, req);
+    }
+
+    pub fn repairArtifactIssues(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+    ) !?db_mod.types.ArtifactRepairResult {
+        const fn_ptr = self.vtable.repair_artifact_issues orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, req);
+    }
+
+    pub fn repairArtifactIssuesControlled(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+        options: db_mod.types.ArtifactRepairRunOptions,
+    ) !?db_mod.types.ArtifactRepairResult {
+        const fn_ptr = self.vtable.repair_artifact_issues_controlled orelse {
+            return try self.repairArtifactIssues(alloc, table_name, req);
+        };
+        return try fn_ptr(self.ptr, alloc, table_name, req, options);
+    }
+
+    pub fn listArtifactRepairIssuesGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairListRequest,
+    ) !?db_mod.types.ArtifactRepairListResult {
+        const fn_ptr = self.vtable.list_artifact_repair_issues_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, req);
+    }
+
+    pub fn repairArtifactIssuesGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+    ) !?db_mod.types.ArtifactRepairResult {
+        const fn_ptr = self.vtable.repair_artifact_issues_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, req);
+    }
+
+    pub fn repairArtifactIssuesGroupLocalControlled(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+        options: db_mod.types.ArtifactRepairRunOptions,
+    ) !?db_mod.types.ArtifactRepairResult {
+        const fn_ptr = self.vtable.repair_artifact_issues_group_local_controlled orelse {
+            return try self.repairArtifactIssuesGroupLocal(alloc, group_id, table_name, req);
+        };
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, options);
     }
 
     pub fn relationalColumnBackedIndexRepairGroupLocal(

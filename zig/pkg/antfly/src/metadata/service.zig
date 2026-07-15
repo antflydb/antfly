@@ -123,9 +123,12 @@ fn logMetadataRaftRoundDiagnostics(round: raft_engine.runtime.multi_raft.HostRou
     );
     const persist = ready.persist_ready_detail;
     std.log.warn(
-        "metadata raft ready persist detail group_id={d} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
+        "metadata raft ready persist detail group_id={d} skipped_no_durable_state={} used_batch={} used_group_storage={} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
         .{
             ready.group_id,
+            persist.skipped_no_durable_state,
+            persist.used_batch,
+            persist.used_group_storage,
             @divTrunc(persist.storage_apply_elapsed_ns, std.time.ns_per_ms),
             @divTrunc(persist.encode_elapsed_ns, std.time.ns_per_ms),
             @divTrunc(persist.wal_append_elapsed_ns, std.time.ns_per_ms),
@@ -1220,6 +1223,53 @@ fn groupIdsFingerprint(group_ids: []const u64) u64 {
     return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(group_ids));
 }
 
+fn localMaintenanceGroupIds(
+    alloc: std.mem.Allocator,
+    replica_root_dir: ?[]const u8,
+    raft_group_ids: []const u64,
+    tables: []const metadata_table_manager.TableRecord,
+    ranges: []const metadata_table_manager.RangeRecord,
+) ![]u64 {
+    var out = try std.ArrayListUnmanaged(u64).initCapacity(alloc, raft_group_ids.len);
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, raft_group_ids);
+
+    const root = replica_root_dir orelse return try out.toOwnedSlice(alloc);
+    for (ranges) |range| {
+        if (containsGroupId(out.items, range.group_id)) continue;
+        if (!rangeHasLocalRestoreWork(range, tables) and !try localGroupDbExists(alloc, root, range.group_id)) continue;
+        try out.append(alloc, range.group_id);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn rangeHasLocalRestoreWork(range: metadata_table_manager.RangeRecord, tables: []const metadata_table_manager.TableRecord) bool {
+    if (range.restore_backup_id.len > 0) return true;
+    for (tables) |table| {
+        if (table.table_id == range.table_id) return table.restore_backup_id.len > 0;
+    }
+    return false;
+}
+
+fn localGroupDbExists(alloc: std.mem.Allocator, replica_root_dir: []const u8, group_id: u64) !bool {
+    const path = try metadata_table_provisioner.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+    defer alloc.free(path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn containsGroupId(group_ids: []const u64, group_id: u64) bool {
+    for (group_ids) |candidate| {
+        if (candidate == group_id) return true;
+    }
+    return false;
+}
+
 const LocalProjectionInputs = struct {
     group_ids: []u64,
     group_ids_fingerprint: u64,
@@ -1484,8 +1534,8 @@ const LocalTransitionInputs = struct {
 };
 
 fn captureLocalProjectionInputs(self: *MetadataHttpService) !LocalProjectionInputs {
-    const group_ids = try self.raft.host.http_host.host.listGroupIds(self.alloc);
-    errdefer self.alloc.free(group_ids);
+    const raft_group_ids = try self.raft.host.http_host.host.listGroupIds(self.alloc);
+    defer self.alloc.free(raft_group_ids);
     self.lockRuntime();
     defer self.unlockRuntime();
     const snapshot = try self.projectedCoreSnapshotLocked();
@@ -1493,6 +1543,8 @@ fn captureLocalProjectionInputs(self: *MetadataHttpService) !LocalProjectionInpu
     errdefer self.freeProjectedTables(self.alloc, tables);
     const ranges = try cloneProjectedRangesOwned(self.alloc, snapshot.ranges);
     errdefer self.freeProjectedRanges(self.alloc, ranges);
+    const group_ids = try localMaintenanceGroupIds(self.alloc, self.replica_root_dir, raft_group_ids, tables, ranges);
+    errdefer self.alloc.free(group_ids);
     const stores = try cloneProjectedStoresOwned(self.alloc, snapshot.stores);
     errdefer self.freeProjectedStores(self.alloc, stores);
     const schema_progresses = try cloneProjectedSchemaProgressOwned(self.alloc, snapshot.schema_progresses);
@@ -2627,9 +2679,10 @@ pub const MetadataService = struct {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
             else => return err,
         };
+        try self.refreshLocalTransitions();
+        _ = try self.raft.stepTransitions();
         if (!try runReplicationBackfillIfLeaseHeld(self)) return;
         try self.refreshLocalPlacementIntents();
-        try self.refreshLocalTransitions();
         _ = self.refreshLocalTableProvisioning() catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => .{},
             else => return err,
@@ -2677,9 +2730,10 @@ pub const MetadataService = struct {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
             else => return err,
         };
+        try self.refreshLocalTransitions();
+        _ = try self.raft.stepTransitions();
         if (!try runReplicationBackfillIfLeaseHeld(self)) return;
         try self.refreshLocalPlacementIntents();
-        try self.refreshLocalTransitions();
         _ = self.refreshLocalTableProvisioning() catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => .{},
             else => return err,
@@ -3196,7 +3250,13 @@ pub const MetadataService = struct {
     fn refreshLocalTableProvisioning(self: *MetadataService) !metadata_table_provisioner.ProvisionSummary {
         const replica_root_dir = self.replica_root_dir orelse return .{};
         const current_epoch = self.projection_epoch.load(.monotonic);
-        const group_ids = try self.raft.host.host.listGroupIds(self.alloc);
+        const raft_group_ids = try self.raft.host.host.listGroupIds(self.alloc);
+        defer self.alloc.free(raft_group_ids);
+        const tables = try self.listProjectedTables(self.alloc);
+        defer self.freeProjectedTables(self.alloc, tables);
+        const ranges = try self.listProjectedRanges(self.alloc);
+        defer self.freeProjectedRanges(self.alloc, ranges);
+        const group_ids = try localMaintenanceGroupIds(self.alloc, replica_root_dir, raft_group_ids, tables, ranges);
         defer self.alloc.free(group_ids);
         const group_ids_fingerprint = groupIdsFingerprint(group_ids);
         if (!shouldRefreshLocalProjection(
@@ -3208,10 +3268,6 @@ pub const MetadataService = struct {
             local_table_provisioning_refresh_interval_ms,
         )) return .{};
 
-        const tables = try self.listProjectedTables(self.alloc);
-        defer self.freeProjectedTables(self.alloc, tables);
-        const ranges = try self.listProjectedRanges(self.alloc);
-        defer self.freeProjectedRanges(self.alloc, ranges);
         const fingerprint = metadata_table_provisioner.provisioningFingerprint(
             self.metadata_group_id,
             group_ids,
@@ -3279,7 +3335,13 @@ pub const MetadataService = struct {
         const replica_root_dir = self.replica_root_dir orelse return;
         const local_node_id = self.raft.host.host.cfg.local_node_id;
         const current_epoch = self.projection_epoch.load(.monotonic);
-        const group_ids = try self.raft.host.host.listGroupIds(self.alloc);
+        const raft_group_ids = try self.raft.host.host.listGroupIds(self.alloc);
+        defer self.alloc.free(raft_group_ids);
+        const tables = try self.listProjectedTables(self.alloc);
+        defer self.freeProjectedTables(self.alloc, tables);
+        const ranges = try self.listProjectedRanges(self.alloc);
+        defer self.freeProjectedRanges(self.alloc, ranges);
+        const group_ids = try localMaintenanceGroupIds(self.alloc, replica_root_dir, raft_group_ids, tables, ranges);
         defer self.alloc.free(group_ids);
         const group_ids_fingerprint = groupIdsFingerprint(group_ids);
         if (!shouldRefreshLocalProjection(
@@ -3291,10 +3353,6 @@ pub const MetadataService = struct {
             local_schema_progress_refresh_interval_ms,
         )) return;
 
-        const tables = try self.listProjectedTables(self.alloc);
-        defer self.freeProjectedTables(self.alloc, tables);
-        const ranges = try self.listProjectedRanges(self.alloc);
-        defer self.freeProjectedRanges(self.alloc, ranges);
         const backend_runtime = try self.ensureBackendRuntime();
         var fallback_shard_db = metadata_mod.FallbackLocalShardDbAdapter{
             .replica_root_dir = replica_root_dir,
@@ -4392,6 +4450,21 @@ pub const MetadataHttpService = struct {
         if (!self.observe_local_replica_root) return;
 
         phase_start_ns = platform_time.monotonicNs();
+        var local_transition_inputs = try captureLocalTransitionInputs(self);
+        defer {
+            const cleanup_phase_start_ns = platform_time.monotonicNs();
+            freeLocalTransitionInputs(self, &local_transition_inputs);
+            run_round_trace.recordSince("free_transition_inputs", cleanup_phase_start_ns);
+        }
+        run_round_trace.recordSince("capture_transition_inputs", phase_start_ns);
+        phase_start_ns = platform_time.monotonicNs();
+        try self.refreshLocalTransitions(&local_transition_inputs);
+        run_round_trace.recordSince("refresh_local_transitions", phase_start_ns);
+        phase_start_ns = platform_time.monotonicNs();
+        _ = try self.raft.stepTransitions();
+        run_round_trace.recordSince("step_committed_transitions", phase_start_ns);
+
+        phase_start_ns = platform_time.monotonicNs();
         const has_reconcile_lease = try self.ensureReconcileLease();
         run_round_trace.recordSince("ensure_reconcile_lease", phase_start_ns);
         if (!has_reconcile_lease) return;
@@ -4432,22 +4505,8 @@ pub const MetadataHttpService = struct {
         }
         run_round_trace.recordSince("capture_placement_inputs", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
-        var local_transition_inputs = try captureLocalTransitionInputs(self);
-        defer {
-            const cleanup_phase_start_ns = platform_time.monotonicNs();
-            freeLocalTransitionInputs(self, &local_transition_inputs);
-            run_round_trace.recordSince("free_transition_inputs", cleanup_phase_start_ns);
-        }
-        run_round_trace.recordSince("capture_transition_inputs", phase_start_ns);
-        phase_start_ns = platform_time.monotonicNs();
         try self.refreshLocalPlacementIntents(&local_placement_inputs);
         run_round_trace.recordSince("refresh_local_placement_intents", phase_start_ns);
-        phase_start_ns = platform_time.monotonicNs();
-        try self.refreshLocalTransitions(&local_transition_inputs);
-        run_round_trace.recordSince("refresh_local_transitions", phase_start_ns);
-        phase_start_ns = platform_time.monotonicNs();
-        _ = try self.raft.stepTransitions();
-        run_round_trace.recordSince("step_transitions", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         _ = self.refreshLocalTableProvisioning(&local_projection_inputs) catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => .{},
@@ -4491,7 +4550,7 @@ pub const MetadataHttpService = struct {
         run_round_trace.recordSince("run_lifecycle_reconcile_hook", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         _ = try self.raft.stepTransitions();
-        run_round_trace.recordSince("step_transitions", phase_start_ns);
+        run_round_trace.recordSince("step_post_reconcile_transitions", phase_start_ns);
     }
 
     pub fn probeReady(self: *const MetadataHttpService) bool {
@@ -4524,6 +4583,11 @@ pub const MetadataHttpService = struct {
         if (raft_diagnostics_snapshot.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
         if (!self.observe_local_replica_root) return;
 
+        var local_transition_inputs = try captureLocalTransitionInputs(self);
+        defer freeLocalTransitionInputs(self, &local_transition_inputs);
+        try self.refreshLocalTransitions(&local_transition_inputs);
+        _ = try self.raft.stepTransitions();
+
         const has_reconcile_lease = try self.ensureReconcileLease();
         if (!has_reconcile_lease) return;
 
@@ -4543,10 +4607,7 @@ pub const MetadataHttpService = struct {
         };
         var local_placement_inputs = try captureLocalPlacementInputs(self);
         defer freeLocalPlacementInputs(self, &local_placement_inputs);
-        var local_transition_inputs = try captureLocalTransitionInputs(self);
-        defer freeLocalTransitionInputs(self, &local_transition_inputs);
         try self.refreshLocalPlacementIntents(&local_placement_inputs);
-        try self.refreshLocalTransitions(&local_transition_inputs);
         _ = self.refreshLocalTableProvisioning(&local_projection_inputs) catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => .{},
             else => return err,
@@ -4874,10 +4935,13 @@ pub const MetadataHttpService = struct {
         );
         const persist = ready.persist_ready_detail;
         std.log.warn(
-            "metadata linearizable read timeout persist detail request_id={d} group_id={d} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
+            "metadata linearizable read timeout persist detail request_id={d} group_id={d} skipped_no_durable_state={} used_batch={} used_group_storage={} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
             .{
                 request_id,
                 ready.group_id,
+                persist.skipped_no_durable_state,
+                persist.used_batch,
+                persist.used_group_storage,
                 @divTrunc(persist.storage_apply_elapsed_ns, std.time.ns_per_ms),
                 @divTrunc(persist.encode_elapsed_ns, std.time.ns_per_ms),
                 @divTrunc(persist.wal_append_elapsed_ns, std.time.ns_per_ms),

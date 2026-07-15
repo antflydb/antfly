@@ -124,7 +124,9 @@ pub fn buildEffectiveFilterQueryJsonAlloc(
         var root = std.json.ObjectMap.empty;
         errdefer root.deinit(alloc);
         try root.put(alloc, try alloc.dupe(u8, "conjuncts"), .{ .array = conjuncts });
-        return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = root }, .{});
+        var root_value = std.json.Value{ .object = root };
+        defer json_helpers.deinitJsonValue(alloc, &root_value);
+        return try std.json.Stringify.valueAlloc(alloc, root_value, .{});
     }
 
     defer json_helpers.deinitJsonValue(alloc, &prefix_value);

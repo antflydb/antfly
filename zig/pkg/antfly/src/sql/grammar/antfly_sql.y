@@ -24,7 +24,7 @@
 %reference postgres_scan_l https://github.com/postgres/postgres/blob/4cc02b80774ecdc4cf2a2d5df09c07df36d68ca5/src/backend/parser/scan.l
 %reference cockroach_sql_y https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y
 
-%expect 10721
+%expect 10832
 
 %start statement
 
@@ -330,7 +330,25 @@ policy_tail_opt:
   ;
 
 policy_tail:
-    policy_to_opt policy_using_opt policy_with_check_opt
+    policy_mode_opt policy_command_opt policy_to_opt policy_using_opt policy_with_check_opt
+  ;
+
+policy_mode_opt:
+    /* empty */
+  | AS identifier_name
+  ;
+
+policy_command_opt:
+    /* empty */
+  | FOR policy_command
+  ;
+
+policy_command:
+    ALL
+  | SELECT
+  | INSERT
+  | UPDATE
+  | DELETE
   ;
 
 policy_to_opt:
@@ -457,24 +475,44 @@ index_target_relation_prefix_opt:
   ;
 
 create_extension_statement:
-    CREATE EXTENSION if_not_exists_opt qualified_name extension_schema_opt extension_version_opt
-  ;
-
-extension_schema_opt:
-    /* empty */
-  | WITH SCHEMA qualified_name
-  | SCHEMA qualified_name
+    CREATE EXTENSION if_not_exists_opt qualified_name
+  | CREATE EXTENSION if_not_exists_opt qualified_name WITH SCHEMA qualified_name extension_version_opt
+  | CREATE EXTENSION if_not_exists_opt qualified_name SCHEMA qualified_name extension_version_opt
+  | CREATE EXTENSION if_not_exists_opt qualified_name extension_version
+  | CREATE EXTENSION if_not_exists_opt qualified_name WITH extension_version
   ;
 
 extension_version_opt:
     /* empty */
-  | identifier_name STRING
+  | extension_version
+  ;
+
+extension_version:
+    identifier_name STRING
   ;
 
 alter_table_statement:
     ALTER TABLE alter_table_relation_prefix_opt qualified_name alter_table_partition_action
-  | ALTER TABLE alter_table_relation_prefix_opt qualified_name ADD table_constraint table_constraint_attribute_list_opt
+  | ALTER TABLE alter_table_relation_prefix_opt qualified_name alter_table_action_list
   | ALTER TABLE alter_table_relation_prefix_opt qualified_name diagnostic_tail_opt
+  ;
+
+alter_table_action_list:
+    alter_table_action
+  | alter_table_action_list COMMA alter_table_action
+  ;
+
+alter_table_action:
+    ADD IDENT if_not_exists_opt column_definition
+  | ADD table_constraint table_constraint_attribute_list_opt
+  | ADD period_table_constraint
+  | DROP IDENT if_exists_opt identifier_name alter_table_drop_behavior_opt
+  ;
+
+alter_table_drop_behavior_opt:
+    /* empty */
+  | RESTRICT
+  | CASCADE
   ;
 
 alter_table_partition_action:
@@ -827,6 +865,7 @@ unsupported_statement:
   | CREATE IDENT TRIGGER diagnostic_tail_opt
   | CREATE IDENT diagnostic_tail_opt
   | CREATE IDENT IDENT diagnostic_tail_opt
+  | CREATE OR REPLACE IDENT IDENT IDENT diagnostic_tail_opt
   | CREATE OPERATOR IDENT diagnostic_tail_opt
   | CREATE RULE diagnostic_tail_opt
   | CREATE SERVER diagnostic_tail_opt
@@ -991,6 +1030,7 @@ graph_match_token:
   | AND
   | AS
   | ASC
+  | BACKUP
   | BY
   | CASCADE
   | CALL
@@ -1067,6 +1107,7 @@ graph_match_token:
   | RENAME
   | RESET
   | RESTRICT
+  | RESTORE
   | REVOKE
   | ROLE
   | ROUTINE
@@ -1191,7 +1232,17 @@ table_constraint:
   | UNIQUE index_nulls_distinct_opt LPAREN constraint_key_list RPAREN index_include_opt
   | FOREIGN KEY LPAREN referential_key_list RPAREN IDENT qualified_name LPAREN referential_key_list RPAREN foreign_key_match_opt foreign_key_action_list_opt
   | CHECK LPAREN expression RPAREN
+  | IDENT LPAREN exclusion_constraint_element_list RPAREN
   | CONSTRAINT identifier_name table_constraint
+  ;
+
+exclusion_constraint_element_list:
+    exclusion_constraint_element
+  | exclusion_constraint_element_list COMMA exclusion_constraint_element
+  ;
+
+exclusion_constraint_element:
+    identifier_name WITH operator_symbol
   ;
 
 table_constraint_attribute_list_opt:
@@ -1285,9 +1336,15 @@ column_constraint:
   | INCLUDE LPAREN identifier_list RPAREN
   | table_constraint_attribute
   | NOT NULL
+  | NULL
+  | DEFAULT STRING NOT NULL
   | DEFAULT expression
   | CHECK LPAREN expression RPAREN
-  | IDENT qualified_name LPAREN identifier_list RPAREN foreign_key_match_opt foreign_key_action_list_opt
+  | MATCH FULL
+  | MATCH IDENT
+  | IDENT qualified_name LPAREN identifier_list RPAREN foreign_key_action_list_opt table_constraint_attribute_list_opt
+  | IDENT qualified_name LPAREN identifier_list RPAREN MATCH FULL foreign_key_action_list_opt table_constraint_attribute_list_opt
+  | IDENT qualified_name LPAREN identifier_list RPAREN MATCH IDENT foreign_key_action_list_opt table_constraint_attribute_list_opt
   | CONSTRAINT identifier_name column_constraint
   | IDENT identifier_name
   | generated_column_constraint
@@ -2015,6 +2072,7 @@ identifier_name:
     IDENT
   | ACCESS
   | AGGREGATE
+  | BACKUP
   | BASE_WEIGHT
   | CALL
   | CHECKPOINT
@@ -2056,6 +2114,7 @@ identifier_name:
   | REPLACE
   | RESET
   | RESTART
+  | RESTORE
   | REVOKE
   | SAVEPOINT
   | SECURITY
@@ -2173,6 +2232,7 @@ diagnostic_token:
   | ALL
   | ALTER
   | ANALYZE
+  | ARRAY
   | AS
   | BY
   | CASCADE

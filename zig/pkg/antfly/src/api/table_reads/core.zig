@@ -41,7 +41,7 @@ pub fn appendScanLine(
     const escaped_key = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(key, .{})});
     defer alloc.free(escaped_key);
 
-    try out.appendSlice(alloc, "{\"key\":");
+    try out.appendSlice(alloc, "{\"_id\":");
     try out.appendSlice(alloc, escaped_key);
     if (version) |value| {
         const version_json = try std.fmt.allocPrint(alloc, ",\"version\":{d}", .{value});
@@ -49,17 +49,59 @@ pub fn appendScanLine(
         try out.appendSlice(alloc, version_json);
     }
     if (projected_json) |json| {
-        if (json.len < 2 or json[0] != '{' or json[json.len - 1] != '}') return error.InvalidProjectedDocumentJson;
-        if (json.len > 2) {
-            try out.append(alloc, ',');
-            try out.appendSlice(alloc, json[1..]);
-        } else {
-            try out.append(alloc, '}');
-        }
+        try appendScanProjectedFields(alloc, out, json);
     } else {
         try out.append(alloc, '}');
     }
     try out.append(alloc, '\n');
+}
+
+fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
+}
+
+fn appendScanProjectedFields(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    projected_json: []const u8,
+) !void {
+    if (projected_json.len < 2 or projected_json[0] != '{' or projected_json[projected_json.len - 1] != '}') return error.InvalidProjectedDocumentJson;
+    if (projected_json.len == 2) {
+        try out.append(alloc, '}');
+        return;
+    }
+    if (std.mem.indexOf(u8, projected_json, "\"_id\"") == null) {
+        try out.append(alloc, ',');
+        try out.appendSlice(alloc, projected_json[1..]);
+        return;
+    }
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, projected_json, .{}) catch return error.InvalidProjectedDocumentJson;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidProjectedDocumentJson;
+
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "_id")) continue;
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, out, entry.key_ptr.*);
+        try out.append(alloc, ':');
+        const encoded_value = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.*, .{});
+        defer alloc.free(encoded_value);
+        try out.appendSlice(alloc, encoded_value);
+    }
+    try out.append(alloc, '}');
+}
+
+test "scan ndjson keeps _id reserved for server document identity" {
+    const alloc = std.testing.allocator;
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+
+    try appendScanLine(alloc, &out, "doc:server", "{\"_id\":\"doc:stored\",\"title\":\"alpha\"}", null);
+    try std.testing.expectEqualStrings("{\"_id\":\"doc:server\",\"title\":\"alpha\"}\n", out.items);
 }
 
 pub const TextStatsResponse = struct {
@@ -81,6 +123,7 @@ pub const BackgroundTextStatsResponse = struct {
 };
 
 pub const LsmStorageStats = runtime_status.LsmStorageStats;
+pub const ObservedDynamicFieldCapabilitySet = db_mod.IndexManager.ObservedDynamicFieldCapabilitySet;
 
 pub const ParsedTextStatsHttpResponse = union(enum) {
     fields: TextStatsResponse,
@@ -675,6 +718,11 @@ pub const TableReadSource = struct {
             ptr: *anyopaque,
             table_name: []const u8,
         ) anyerror!?LsmStorageStats = null,
+        observed_dynamic_field_capability_sets: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+        ) anyerror!?[]ObservedDynamicFieldCapabilitySet = null,
         document_artifact_manifest: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1329,5 +1377,14 @@ pub const TableReadSource = struct {
     ) !?LsmStorageStats {
         const fn_ptr = self.vtable.lsm_storage_stats orelse return null;
         return try fn_ptr(self.ptr, table_name);
+    }
+
+    pub fn observedDynamicFieldCapabilitySets(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?[]ObservedDynamicFieldCapabilitySet {
+        const fn_ptr = self.vtable.observed_dynamic_field_capability_sets orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name);
     }
 };

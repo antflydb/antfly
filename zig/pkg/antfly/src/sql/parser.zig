@@ -15,6 +15,7 @@
 const std = @import("std");
 
 const ast = @import("ast.zig");
+const lexer = @import("lexer.zig");
 const token_mod = @import("token.zig");
 
 pub const Token = token_mod.Token;
@@ -464,14 +465,9 @@ pub fn findTopLevelTailIndexToken(
 
 test "sql adapter parser cursor tracks shared token position" {
     var pos: usize = 0;
-    const tokens = [_]Token{
-        .{ .kind = .identifier, .text = "select", .source_start = 0, .source_end = 6 },
-        .{ .kind = .star, .text = "*", .source_start = 7, .source_end = 8 },
-        .{ .kind = .identifier, .text = "from", .source_start = 9, .source_end = 13 },
-        .{ .kind = .identifier, .text = "lower", .source_start = 14, .source_end = 19 },
-        .{ .kind = .lparen, .text = "(", .source_start = 19, .source_end = 20 },
-    };
-    const cursor = Cursor.init(tokens[0..], &pos);
+    var tokens = try lexer.tokenizeAlloc(std.testing.allocator, "select * from lower(");
+    defer lexer.freeTokens(std.testing.allocator, &tokens);
+    const cursor = Cursor.init(tokens.items, &pos);
 
     try cursor.expectKeyword("select");
     try std.testing.expectEqual(@as(usize, 1), pos);

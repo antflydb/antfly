@@ -12,6 +12,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+pub const storage_backend_erased = @import("storage/backend_erased.zig");
+pub const lsm_backend = @import("storage/lsm_backend.zig");
+
 test {
     _ = @import("storage/db/catalog/index_manager.zig");
 }

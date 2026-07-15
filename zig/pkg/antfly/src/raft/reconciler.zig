@@ -22,7 +22,49 @@ pub const PlacementIntent = struct {
     record: catalog.ReplicaRecord,
     store_id: u64 = 0,
     peer_node_ids: []const u64 = &.{},
+    serving_state: PlacementServingState = .serving,
+    relocation_generation: u64 = 0,
+    relocation_source_node_id: u64 = 0,
+    relocation_source_store_id: u64 = 0,
+    relocation_doc_count_watermark: u64 = 0,
+    relocation_disk_bytes_watermark: u64 = 0,
+    relocation_target_sequence: u64 = 0,
+    relocation_applied_sequence: u64 = 0,
 };
+
+pub const PlacementServingState = enum(u8) {
+    planned,
+    bootstrapping,
+    replaying,
+    cutover_ready,
+    serving,
+    draining,
+};
+
+pub fn placementMayServeClientReads(intent: PlacementIntent) bool {
+    return switch (intent.serving_state) {
+        .serving, .draining => true,
+        .planned, .bootstrapping, .replaying, .cutover_ready => false,
+    };
+}
+
+pub fn placementReadableWithPeers(intents: []const PlacementIntent, intent: PlacementIntent) bool {
+    switch (intent.serving_state) {
+        .serving => return true,
+        .draining => {
+            for (intents) |peer| {
+                if (peer.record.group_id == intent.record.group_id and
+                    peer.record.local_node_id != intent.record.local_node_id and
+                    peer.serving_state == .serving)
+                {
+                    return false;
+                }
+            }
+            return true;
+        },
+        .planned, .bootstrapping, .replaying, .cutover_ready => return false,
+    }
+}
 
 pub const PlacementProvider = struct {
     ptr: *anyopaque,
@@ -247,6 +289,14 @@ fn hashIntent(intent: PlacementIntent) u64 {
     hashU64(&hasher, @as(u64, @intFromEnum(intent.record.bootstrap_mode)));
     hashU64(&hasher, intent.record.metadata_version);
     hashU64(&hasher, intent.store_id);
+    hashU64(&hasher, @intFromEnum(intent.serving_state));
+    hashU64(&hasher, intent.relocation_generation);
+    hashU64(&hasher, intent.relocation_source_node_id);
+    hashU64(&hasher, intent.relocation_source_store_id);
+    hashU64(&hasher, intent.relocation_doc_count_watermark);
+    hashU64(&hasher, intent.relocation_disk_bytes_watermark);
+    hashU64(&hasher, intent.relocation_target_sequence);
+    hashU64(&hasher, intent.relocation_applied_sequence);
     hashU64(&hasher, @intCast(intent.peer_node_ids.len));
     for (intent.peer_node_ids) |node_id| hashU64(&hasher, node_id);
     if (intent.record.snapshot_bootstrap) |snapshot| {
@@ -281,6 +331,14 @@ fn cloneIntent(alloc: std.mem.Allocator, intent: PlacementIntent) !PlacementInte
         .record = cloned_record,
         .store_id = intent.store_id,
         .peer_node_ids = if (intent.peer_node_ids.len == 0) &.{} else try alloc.dupe(u64, intent.peer_node_ids),
+        .serving_state = intent.serving_state,
+        .relocation_generation = intent.relocation_generation,
+        .relocation_source_node_id = intent.relocation_source_node_id,
+        .relocation_source_store_id = intent.relocation_source_store_id,
+        .relocation_doc_count_watermark = intent.relocation_doc_count_watermark,
+        .relocation_disk_bytes_watermark = intent.relocation_disk_bytes_watermark,
+        .relocation_target_sequence = intent.relocation_target_sequence,
+        .relocation_applied_sequence = intent.relocation_applied_sequence,
     };
 }
 

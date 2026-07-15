@@ -27,7 +27,9 @@ const http_client = @import("../http_client.zig");
 const http_common = @import("../../raft/transport/http_common.zig");
 const query_api = @import("../query.zig");
 const query_contract = @import("../query_contract.zig");
+const fusion_mod = @import("../../search/fusion.zig");
 const storage_schema = @import("../../storage/schema.zig");
+const platform_time = @import("../../platform/time.zig");
 const table_read_core = @import("core.zig");
 const table_read_relational_rows = @import("relational_rows.zig");
 
@@ -38,6 +40,19 @@ const relationalUniqueOwnerKeyAlloc = table_read_relational_rows.relationalUniqu
 const algebraic_ir = db_mod.algebraic.ir;
 const algebraic_law = db_mod.algebraic.law;
 const algebraic_planner = db_mod.algebraic.planner;
+
+fn timeoutMsFromExecutionDeadlineNs(deadline_ns: ?u64) ?u64 {
+    const deadline = deadline_ns orelse return null;
+    const now = platform_time.monotonicNs();
+    if (deadline <= now) return 0;
+    const remaining_ns = deadline - now;
+    return ((remaining_ns - 1) / std.time.ns_per_ms) + 1;
+}
+
+fn executionDeadlineNsFromTimeoutMs(timeout_ms: ?u64) ?u64 {
+    const timeout = timeout_ms orelse return null;
+    return platform_time.monotonicNs() +| timeout *| std.time.ns_per_ms;
+}
 
 const TextStatsRequestMode = enum {
     query_request,
@@ -69,6 +84,7 @@ pub fn searchRequestFromVectorWorkerEnvelope(envelope: *const query_contract.Own
             .return_mode = envelope.options.return_mode,
             .max_chunks_per_parent = envelope.options.max_chunks_per_parent,
             .identity_read_generation = envelope.options.identity_read_generation,
+            .execution_deadline_ns = executionDeadlineNsFromTimeoutMs(envelope.options.timeout_ms),
             .resolved_doc_filter = envelope.resolved_doc_filter,
             .resolved_doc_filter_wire_context = envelope.resolved_doc_filter_wire_context,
             .query = .{ .dense_knn = dense },
@@ -95,6 +111,7 @@ pub fn searchRequestFromVectorWorkerEnvelope(envelope: *const query_contract.Own
             .return_mode = envelope.options.return_mode,
             .max_chunks_per_parent = envelope.options.max_chunks_per_parent,
             .identity_read_generation = envelope.options.identity_read_generation,
+            .execution_deadline_ns = executionDeadlineNsFromTimeoutMs(envelope.options.timeout_ms),
             .resolved_doc_filter = envelope.resolved_doc_filter,
             .resolved_doc_filter_wire_context = envelope.resolved_doc_filter_wire_context,
             .query = .{ .sparse_knn = sparse },
@@ -316,6 +333,8 @@ fn algebraicVectorWorkerCandidateForSearchRequest(
         req.dense_queries.len != 0 or
         req.sparse_queries.len != 0 or
         req.graph_queries.len != 0 or
+        req.graph_metric_queries.len != 0 or
+        req.graph_metric_rerank != null or
         req.merge_config != null or
         req.reranker != null or
         req.pruner != null or
@@ -429,6 +448,7 @@ pub fn encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(
             .return_mode = req.return_mode,
             .max_chunks_per_parent = req.max_chunks_per_parent,
             .identity_read_generation = req.identity_read_generation,
+            .timeout_ms = timeoutMsFromExecutionDeadlineNs(req.execution_deadline_ns),
         },
         constraints,
         req.resolved_doc_filter,
@@ -2117,6 +2137,9 @@ pub fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequ
     if (req.identity_read_generation) |generation| {
         try appendJsonFieldU64(alloc, &out, &first, "_identity_read_generation", generation);
     }
+    if (timeoutMsFromExecutionDeadlineNs(req.execution_deadline_ns)) |timeout_ms| {
+        try appendJsonFieldU64(alloc, &out, &first, "timeout_ms", timeout_ms);
+    }
     if (req.resolved_doc_filter != null) {
         try db_mod.doc_filter_wire.appendSearchRequestFieldAlloc(alloc, &out, &first, req);
     }
@@ -2795,6 +2818,7 @@ pub fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_m
     if (responses.len == 0) return error.InvalidQueryRequest;
     const response = responses[0];
     const hits_obj = response.hits orelse return error.InvalidQueryRequest;
+    const total_obj = hits_obj.total orelse return error.InvalidQueryRequest;
     const hits_value = hits_obj.hits orelse return error.InvalidQueryRequest;
 
     const hits = try alloc.alloc(db_mod.types.SearchHit, hits_value.len);
@@ -2807,6 +2831,7 @@ pub fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_m
         hits[i] = .{
             .id = try alloc.dupe(u8, item._id),
             .score = item._score,
+            .index_scores = try parseRemoteIndexScoresAlloc(alloc, item._index_scores),
             .stored_data = if (item._source) |value| try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})}) else null,
         };
         initialized += 1;
@@ -2832,10 +2857,54 @@ pub fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_m
     return .{
         .alloc = alloc,
         .hits = hits,
-        .total_hits = @intCast(hits_obj.total orelse 0),
+        .total_hits = try query_contract.queryHitsTotalValueToU32(total_obj),
+        .total_hits_relation = switch (total_obj.relation) {
+            .exact => .exact,
+            .gte => .gte,
+        },
         .graph_results = graph_results,
         .graph_metric_results = graph_metric_results,
     };
+}
+
+fn parseRemoteIndexScoresAlloc(
+    alloc: std.mem.Allocator,
+    maybe_value: ?std.json.Value,
+) ![]fusion_mod.IndexScore {
+    const value = maybe_value orelse return &.{};
+    if (value != .object) return &.{};
+    const object = value.object;
+    if (object.count() == 0) return &.{};
+
+    var scores = try alloc.alloc(fusion_mod.IndexScore, object.count());
+    var initialized: usize = 0;
+    errdefer {
+        for (scores[0..initialized]) |score| alloc.free(score.index_name);
+        alloc.free(scores);
+    }
+
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        const score: f64 = switch (entry.value_ptr.*) {
+            .float => |v| v,
+            .integer => |v| @floatFromInt(v),
+            .number_string, .string => |v| std.fmt.parseFloat(f64, v) catch continue,
+            else => continue,
+        };
+        scores[initialized] = .{
+            .index_name = try alloc.dupe(u8, entry.key_ptr.*),
+            .score = score,
+        };
+        initialized += 1;
+    }
+
+    if (initialized == 0) {
+        alloc.free(scores);
+        return &.{};
+    }
+    if (initialized == scores.len) return scores;
+    const trimmed = try alloc.realloc(scores, initialized);
+    return trimmed;
 }
 
 fn parseRemoteGraphMetricResults(
@@ -3531,7 +3600,7 @@ fn parseJsonTestBody(comptime T: type, alloc: std.mem.Allocator, body: []const u
 test "remote query parser preserves graph metric results" {
     const alloc = std.testing.allocator;
     var parsed = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":0,"hits":[]},"graph_metric_results":{"central":{"index_name":"graph_idx","metric":"pagerank","scores":[{"node":"doc:b","score":0.8},{"node":"doc:a","score":0.9}],"status":{"state":"fresh","phase":"complete","maintenance_paused":false,"build_queued":false,"published_generation":7,"edge_generation":7,"target_edge_generation":7,"queued_generation":0,"building_generation":0,"build_job_id":12345,"build_started_at_ms":1780000000123,"build_lease_expires_at_ms":0,"progress":1.0,"converged":true,"iterations_completed":12,"delta":0.0,"computed_at_ms":1780000000000}}},"took":0,"status":200}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_metric_results":{"central":{"index_name":"graph_idx","metric":"pagerank","scores":[{"node":"doc:b","score":0.8},{"node":"doc:a","score":0.9}],"status":{"state":"fresh","phase":"complete","maintenance_paused":false,"build_queued":false,"published_generation":7,"edge_generation":7,"target_edge_generation":7,"queued_generation":0,"building_generation":0,"build_job_id":12345,"build_started_at_ms":1780000000123,"build_lease_expires_at_ms":0,"progress":1.0,"converged":true,"iterations_completed":12,"delta":0.0,"computed_at_ms":1780000000000}}},"took":0,"status":200}]}
     );
     defer parsed.deinit();
 
@@ -3548,6 +3617,24 @@ test "remote query parser preserves graph metric results" {
     try std.testing.expectEqual(@as(u64, 7), result.status.published_generation);
     try std.testing.expectEqual(@as(u64, 12345), result.status.build_job_id);
     try std.testing.expectEqual(@as(u64, 1780000000123), result.status.build_started_at_ms);
+}
+
+test "remote query parser preserves total relation and fused index scores" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseRemoteSearchResult(alloc,
+        \\{"responses":[{"hits":{"total":{"value":12,"relation":"gte"},"hits":[{"_id":"doc:a","_score":1.25,"_index_scores":{"dense":0.75,"sparse":"0.5"},"_source":{"title":"A"}}]},"took":0,"status":200}]}
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u32, 12), parsed.total_hits);
+    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, parsed.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 1), parsed.hits.len);
+    try std.testing.expectEqualStrings("doc:a", parsed.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 2), parsed.hits[0].index_scores.len);
+    try std.testing.expectEqualStrings("dense", parsed.hits[0].index_scores[0].index_name);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), parsed.hits[0].index_scores[0].score, 0.001);
+    try std.testing.expectEqualStrings("sparse", parsed.hits[0].index_scores[1].index_name);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), parsed.hits[0].index_scores[1].score, 0.001);
 }
 
 test "encode query request round-trips composed bleve full_text queries" {
@@ -3576,6 +3663,7 @@ test "encode query request round-trips composed bleve full_text queries" {
         },
         .limit = 5,
         .identity_read_generation = 77,
+        .execution_deadline_ns = platform_time.monotonicNs() + 60_000 * std.time.ns_per_ms,
     });
     defer alloc.free(encoded);
 
@@ -3583,6 +3671,9 @@ test "encode query request round-trips composed bleve full_text queries" {
     defer parsed.deinit();
     const full_text = parsed.value.object.get("full_text_search").?.object;
     try std.testing.expectEqual(@as(i64, 77), parsed.value.object.get("_identity_read_generation").?.integer);
+    const timeout_ms = parsed.value.object.get("timeout_ms").?.integer;
+    try std.testing.expect(timeout_ms > 0);
+    try std.testing.expect(timeout_ms <= 60_000);
     const must = full_text.get("must").?.object.get("conjuncts").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), must.len);
     try std.testing.expectEqual(true, must[1].object.get("inclusive_max").?.bool);
@@ -3896,6 +3987,7 @@ test "vector worker request lowers search request to envelope" {
         .return_mode = .parent_with_chunks,
         .max_chunks_per_parent = 2,
         .identity_read_generation = 54321,
+        .execution_deadline_ns = platform_time.monotonicNs() + 60_000 * std.time.ns_per_ms,
         .query = .{ .dense_knn = .{ .vector = &.{ 0.25, 0.5 }, .k = 7 } },
         .filter_doc_ids_positive = true,
         .filter_doc_ids = &.{ "doc:b", "doc:a" },
@@ -3931,6 +4023,9 @@ test "vector worker request lowers search request to envelope" {
     try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, envelope.options.return_mode);
     try std.testing.expectEqual(@as(u32, 2), envelope.options.max_chunks_per_parent);
     try std.testing.expectEqual(@as(?u64, 54321), envelope.options.identity_read_generation);
+    const timeout_ms = envelope.options.timeout_ms orelse return error.TestUnexpectedResult;
+    try std.testing.expect(timeout_ms > 0);
+    try std.testing.expect(timeout_ms <= 60_000);
     try std.testing.expect(envelope.native_doc_id_constraints.constraints.positive_filter);
     try std.testing.expectEqualStrings("doc:a", envelope.native_doc_id_constraints.constraints.include_doc_ids[0]);
     try std.testing.expectEqualStrings("doc:b", envelope.native_doc_id_constraints.constraints.include_doc_ids[1]);
@@ -4124,6 +4219,7 @@ test "vector worker envelope converts to constrained search request" {
             .return_mode = .parent_with_chunks,
             .max_chunks_per_parent = 2,
             .identity_read_generation = 12345,
+            .timeout_ms = 250,
         },
         .{
             .positive_filter = true,
@@ -4139,7 +4235,9 @@ test "vector worker envelope converts to constrained search request" {
 
     var envelope = try query_contract.parseAlgebraicVectorWorkerRequestEnvelopeAlloc(alloc, encoded);
     defer envelope.deinit(alloc);
+    const before_deadline_decode_ns = platform_time.monotonicNs();
     const req = searchRequestFromVectorWorkerEnvelope(&envelope);
+    const after_deadline_decode_ns = platform_time.monotonicNs();
 
     try std.testing.expectEqualStrings("dense_idx", req.index_name.?);
     try std.testing.expectEqual(@as(u32, 8), req.limit);
@@ -4165,6 +4263,9 @@ test "vector worker envelope converts to constrained search request" {
     try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, req.return_mode);
     try std.testing.expectEqual(@as(u32, 2), req.max_chunks_per_parent);
     try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
+    const execution_deadline_ns = req.execution_deadline_ns orelse return error.TestUnexpectedResult;
+    try std.testing.expect(execution_deadline_ns >= before_deadline_decode_ns + 250 * std.time.ns_per_ms);
+    try std.testing.expect(execution_deadline_ns <= after_deadline_decode_ns + 250 * std.time.ns_per_ms);
     try std.testing.expect(req.filter_doc_ids_positive);
     try std.testing.expectEqual(@as(usize, 2), req.filter_doc_ids.len);
     try std.testing.expectEqualStrings("doc:a", req.filter_doc_ids[0]);

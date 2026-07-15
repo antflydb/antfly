@@ -137,10 +137,10 @@ fn prefixUpperBoundAlloc(allocator: std.mem.Allocator, prefix: []const u8) !?[]u
     return out;
 }
 
-/// A scan ndjson row is the entity document object with an extra `"key"` field
-/// (see `table_reads.appendScanLine`). Pull the key out and hand the row to the
-/// worker as the candidate value; the spurious `"key"` field is harmless because
-/// the matcher only reads the fields its comparisons name.
+/// A scan ndjson row is the entity document object with a server-owned `_id`
+/// field (see `table_reads.appendScanLine`). Pull the key out and hand the row
+/// to the worker as the candidate value; the spurious `_id` field is harmless
+/// because the matcher only reads the fields its comparisons name.
 fn consumeScanLine(
     allocator: std.mem.Allocator,
     line: []const u8,
@@ -150,7 +150,7 @@ fn consumeScanLine(
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return;
     defer parsed.deinit();
     if (parsed.value != .object) return;
-    const key = switch (parsed.value.object.get("key") orelse return) {
+    const key = switch (parsed.value.object.get("_id") orelse return) {
         .string => |s| s,
         else => return,
     };
@@ -258,17 +258,7 @@ const FakeTableReadSource = struct {
             const key = e.key_ptr.*;
             if (std.mem.order(u8, key, from_key) == .lt) continue;
             if (std.mem.order(u8, key, to_key) != .lt) continue;
-            // Emit {"key":"<key>", <doc fields>} like the real scan encoder.
-            const doc = e.value_ptr.*;
-            const escaped_key = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(key, .{})});
-            defer alloc.free(escaped_key);
-            try out.appendSlice(alloc, "{\"key\":");
-            try out.appendSlice(alloc, escaped_key);
-            if (doc.len > 2) {
-                try out.append(alloc, ',');
-                try out.appendSlice(alloc, doc[1..]);
-            } else try out.append(alloc, '}');
-            try out.append(alloc, '\n');
+            try table_reads.appendScanLine(alloc, &out, key, e.value_ptr.*, null);
         }
         return .{ .ndjson = try out.toOwnedSlice(alloc) };
     }
@@ -379,7 +369,7 @@ test "DistributedCandidateSource nearest parses query hits into candidates" {
     var fake = FakeTableReadSource{ .alloc = alloc, .table = "entities" };
     defer fake.docs.deinit(alloc);
     fake.query_body =
-        \\{"responses":[{"hits":{"total":1,"hits":[
+        \\{"responses":[{"hits":{"total":{"value":1,"relation":"exact"},"hits":[
         \\  {"_id":"person/ada_lovelace","_score":0.98,"_source":{"canonical_name":"Ada Lovelace","label":"person"}}
         \\]}}]}
     ;

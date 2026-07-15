@@ -1399,21 +1399,23 @@ test "db split sync coordinator tracks explicit split transition phases" {
     const dst_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-phase-dst", .{tmp.sub_path});
     defer std.testing.allocator.free(dst_root);
 
-    var source = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root });
-    defer source.deinit();
+    {
+        var source = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root });
+        defer source.deinit();
 
-    const prepare = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
-        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
-        .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
-    });
-    defer std.testing.allocator.free(prepare);
-    try source.snapshotBuilder().applyBatch(.{
-        .group_id = 131,
-        .commit_index = 4,
-        .entries_bytes = prepare,
-    });
+        const prepare = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+            .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
+            .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
+            .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+        });
+        defer std.testing.allocator.free(prepare);
+        try source.snapshotBuilder().applyBatch(.{
+            .group_id = 131,
+            .commit_index = 4,
+            .entries_bytes = prepare,
+        });
+    }
 
     var coord = try SyncCoordinator.init(std.testing.allocator, .{
         .source_root_dir = src_root,
@@ -1493,19 +1495,21 @@ test "db split sync coordinator can start source split from prepare" {
     const dst_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-start-dst", .{tmp.sub_path});
     defer std.testing.allocator.free(dst_root);
 
-    var source = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root });
-    defer source.deinit();
+    {
+        var source = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root });
+        defer source.deinit();
 
-    const prepare = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
-        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
-    });
-    defer std.testing.allocator.free(prepare);
-    try source.snapshotBuilder().applyBatch(.{
-        .group_id = 133,
-        .commit_index = 2,
-        .entries_bytes = prepare,
-    });
+        const prepare = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+            .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
+            .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+        });
+        defer std.testing.allocator.free(prepare);
+        try source.snapshotBuilder().applyBatch(.{
+            .group_id = 133,
+            .commit_index = 2,
+            .entries_bytes = prepare,
+        });
+    }
 
     var coord = try SyncCoordinator.init(std.testing.allocator, .{
         .source_root_dir = src_root,

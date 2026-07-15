@@ -418,7 +418,7 @@ Current serverless mapping:
 - `full_text`
   - ingest the write, synchronously publish a new `PublishedGeneration`, and
     return only after the published head covers the admitted WAL range
-- `aknn` / `full_index`
+- `full_index`
   - use the same synchronous publish path when vector/index visibility is
     satisfiable from the current table definition
   - reject explicitly when the table is configured for background

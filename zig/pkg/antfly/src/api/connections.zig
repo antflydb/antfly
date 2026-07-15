@@ -1066,7 +1066,7 @@ test "build response reports configured web search connections" {
         \\        "region": "us",
         \\        "include_content": true,
         \\        "include_highlights": true,
-        \\        "api_key": "${secret:exa.api_key}",
+        \\        "api_key": "test-exa-api-key",
         \\        "include_domains": ["docs.example.com"]
         \\      }
         \\    }

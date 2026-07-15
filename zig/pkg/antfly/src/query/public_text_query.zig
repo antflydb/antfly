@@ -408,22 +408,34 @@ fn directRangeQueryAlloc(alloc: std.mem.Allocator, query: std.json.Value, boost:
     if (numeric_like and string_like) return error.UnsupportedQueryRequest;
 
     if (numeric_like) {
+        const min_value = if (min) |item| try directNumber(item) else null;
+        const max_value = if (max) |item| try directNumber(item) else null;
+        const inclusive_min = try directOptionalBool(query.object, "inclusive_min", true);
+        const inclusive_max = try directOptionalBool(query.object, "inclusive_max", false);
         return .{ .numeric_range = .{
             .field = try alloc.dupe(u8, field.string),
-            .min = if (min) |item| try directNumber(item) else null,
-            .max = if (max) |item| try directNumber(item) else null,
-            .inclusive_min = try directOptionalBool(query.object, "inclusive_min", true),
-            .inclusive_max = try directOptionalBool(query.object, "inclusive_max", false),
+            .min = min_value,
+            .max = max_value,
+            .inclusive_min = inclusive_min,
+            .inclusive_max = inclusive_max,
             .boost = boost,
         } };
     }
     if (string_like) {
+        const inclusive_min = try directOptionalBool(query.object, "inclusive_min", true);
+        const inclusive_max = try directOptionalBool(query.object, "inclusive_max", false);
+        const field_owned = try alloc.dupe(u8, field.string);
+        errdefer alloc.free(field_owned);
+        const min_value = if (min) |item| try directStringAlloc(alloc, item) else null;
+        errdefer if (min_value) |item| alloc.free(item);
+        const max_value = if (max) |item| try directStringAlloc(alloc, item) else null;
+        errdefer if (max_value) |item| alloc.free(item);
         return .{ .term_range = .{
-            .field = try alloc.dupe(u8, field.string),
-            .min = if (min) |item| try directStringAlloc(alloc, item) else null,
-            .max = if (max) |item| try directStringAlloc(alloc, item) else null,
-            .inclusive_min = try directOptionalBool(query.object, "inclusive_min", true),
-            .inclusive_max = try directOptionalBool(query.object, "inclusive_max", false),
+            .field = field_owned,
+            .min = min_value,
+            .max = max_value,
+            .inclusive_min = inclusive_min,
+            .inclusive_max = inclusive_max,
             .boost = boost,
         } };
     }
@@ -473,13 +485,12 @@ fn jsonString(value: std.json.Value) ?[]const u8 {
 
 test "public full text subset accepts supported query strings" {
     const alloc = std.testing.allocator;
-    var spec = try parseTextSpecAlloc(alloc, .{
-        .object = blk: {
-            var obj = std.json.ObjectMap.empty;
-            try obj.put(alloc, "query", .{ .string = "body:alpha OR body:bravo" });
-            break :blk obj;
-        },
-    });
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"query":"body:alpha OR body:bravo"}
+    , .{});
+    defer parsed.deinit();
+
+    var spec = try parseTextSpecAlloc(alloc, parsed.value);
     defer spec.deinit(alloc);
 
     try std.testing.expectEqual(TextOperator.any_terms, spec.operator);
@@ -488,25 +499,22 @@ test "public full text subset accepts supported query strings" {
 
 test "public full text subset rejects unsupported fields" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseTextSpecAlloc(alloc, .{
-        .object = blk: {
-            var obj = std.json.ObjectMap.empty;
-            try obj.put(alloc, "query", .{ .string = "title:alpha" });
-            break :blk obj;
-        },
-    }));
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"query":"title:alpha"}
+    , .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseTextSpecAlloc(alloc, parsed.value));
 }
 
 test "public direct text parser accepts query dsl fields" {
     const alloc = std.testing.allocator;
-    const maybe_direct = try parseStatefulDirectTextQueryAlloc(alloc, .{
-        .object = blk: {
-            var obj = std.json.ObjectMap.empty;
-            try obj.put(alloc, "field", .{ .string = "title" });
-            try obj.put(alloc, "match", .{ .string = "hello" });
-            break :blk obj;
-        },
-    }, 1.0);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"field":"title","match":"hello"}
+    , .{});
+    defer parsed.deinit();
+
+    const maybe_direct = try parseStatefulDirectTextQueryAlloc(alloc, parsed.value, 1.0);
     try std.testing.expect(maybe_direct != null);
     var query = maybe_direct.?;
     defer query.deinit(alloc);
@@ -536,20 +544,12 @@ test "public direct text parser lowers multi_match bool_prefix" {
 
 test "public direct text parser emits stateful match phrase" {
     const alloc = std.testing.allocator;
-    const maybe_direct = try parseStatefulDirectTextQueryAlloc(alloc, .{
-        .object = blk: {
-            var obj = std.json.ObjectMap.empty;
-            try obj.put(alloc, "match_phrase", .{
-                .object = blk2: {
-                    var inner = std.json.ObjectMap.empty;
-                    try inner.put(alloc, "field", .{ .string = "body" });
-                    try inner.put(alloc, "text", .{ .string = "hello world" });
-                    break :blk2 inner;
-                },
-            });
-            break :blk obj;
-        },
-    }, 1.0);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"match_phrase":{"field":"body","text":"hello world"}}
+    , .{});
+    defer parsed.deinit();
+
+    const maybe_direct = try parseStatefulDirectTextQueryAlloc(alloc, parsed.value, 1.0);
     try std.testing.expect(maybe_direct != null);
     var query = maybe_direct.?;
     defer query.deinit(alloc);
@@ -612,10 +612,12 @@ fn directOperatorTestValue(
     operand: std.json.Value,
 ) !std.json.Value {
     var inner = std.json.ObjectMap.empty;
+    errdefer inner.deinit(alloc);
     try inner.put(alloc, "field", .{ .string = "body" });
     try inner.put(alloc, value_key, operand);
 
     var outer = std.json.ObjectMap.empty;
+    errdefer outer.deinit(alloc);
     try outer.put(alloc, operator, .{ .object = inner });
     return .{ .object = outer };
 }

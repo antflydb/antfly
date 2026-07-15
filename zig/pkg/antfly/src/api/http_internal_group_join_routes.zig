@@ -105,7 +105,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
 
 fn joinRouteErrorResponse(alloc: std.mem.Allocator, err: anyerror, invalid_message: []const u8) !http_common.HttpResponse {
     return switch (err) {
-        error.InvalidQueryRequest, error.UnsupportedQueryRequest => try http_route_helpers.textResponse(alloc, 400, invalid_message),
+        error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.MissingField, error.UnknownField, error.SyntaxError, error.UnexpectedEndOfInput => try http_route_helpers.textResponse(alloc, 400, invalid_message),
         error.TableNotFound, error.UnknownGroup => try http_route_helpers.textResponse(alloc, 404, "not found"),
         error.TopologyChanged => try http_route_helpers.textResponse(alloc, 409, "topology changed"),
         error.DocIdentityNamespaceMismatch => try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),

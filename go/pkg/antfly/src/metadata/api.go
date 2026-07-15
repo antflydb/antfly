@@ -364,6 +364,14 @@ func (w wrapper) CreateNamespaceTableIndex(rw http.ResponseWriter, r *http.Reque
 	w.TableApi.CreateIndex(rw, r, tableName, indexName)
 }
 
+func (w wrapper) RepairNamespaceTableRelationalColumnBackedIndex(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string, tableName string) {
+	w.TableApi.RepairRelationalColumnBackedIndex(rw, r, tableName)
+}
+
+func (w wrapper) GetNamespaceTableRelationalIndexRepairJob(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string, tableName string, jobId string) {
+	w.TableApi.GetRelationalIndexRepairJob(rw, r, tableName, jobId)
+}
+
 func (w wrapper) QueryNamespaceTable(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string, tableName string) {
 	w.TableApi.QueryTable(rw, r, tableName)
 }
@@ -1059,7 +1067,7 @@ func (t *TableApi) docMatchesRowFilter(ctx context.Context, tableName, key strin
 		Count:       true,
 	}
 	result := t.runQuery(ctx, qr)
-	return result.Status == http.StatusOK && result.Hits.Total > 0
+	return result.Status == http.StatusOK && queryHitsTotalValue(result.Hits.Total) > 0
 }
 
 // hasSpecialFieldsOnly returns true if all fields are special fields (_embeddings, _summaries, _chunks)
@@ -1754,6 +1762,62 @@ func (t *TableApi) UpdateSchema(w http.ResponseWriter, r *http.Request, tableNam
 		t.logger.Warn("Error encoding response", zap.Error(err))
 		errorResponse(w, "Failed to encode response", http.StatusInternalServerError)
 	}
+}
+
+func (t *TableApi) RepairRelationalColumnBackedIndex(w http.ResponseWriter, r *http.Request, tableName string) {
+	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
+		return
+	}
+	errorResponse(w, "relational index repair is only available in the Zig runtime", http.StatusMethodNotAllowed)
+}
+
+func (t *TableApi) GetRelationalIndexRepairJob(w http.ResponseWriter, r *http.Request, tableName string, jobId string) {
+	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
+		return
+	}
+	errorResponse(w, "relational index repair jobs are only available in the Zig runtime", http.StatusMethodNotAllowed)
+}
+
+func (t *TableApi) ListTableRepairIssues(w http.ResponseWriter, r *http.Request, tableName string) {
+	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
+		return
+	}
+	errorResponse(w, "table repair is only available in the Zig runtime", http.StatusMethodNotAllowed)
+}
+
+func (t *TableApi) RunTableRepair(w http.ResponseWriter, r *http.Request, tableName string) {
+	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
+		return
+	}
+	errorResponse(w, "table repair is only available in the Zig runtime", http.StatusMethodNotAllowed)
+}
+
+func (t *TableApi) StartTableRepairJob(w http.ResponseWriter, r *http.Request, tableName string) {
+	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
+		return
+	}
+	errorResponse(w, "table repair jobs are only available in the Zig runtime", http.StatusMethodNotAllowed)
+}
+
+func (t *TableApi) GetTableRepairJob(w http.ResponseWriter, r *http.Request, tableName string, jobId string) {
+	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
+		return
+	}
+	errorResponse(w, "table repair jobs are only available in the Zig runtime", http.StatusMethodNotAllowed)
+}
+
+func (t *TableApi) AdvanceTableRepairJob(w http.ResponseWriter, r *http.Request, tableName string, jobId string) {
+	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
+		return
+	}
+	errorResponse(w, "table repair jobs are only available in the Zig runtime", http.StatusMethodNotAllowed)
+}
+
+func (t *TableApi) CancelTableRepairJob(w http.ResponseWriter, r *http.Request, tableName string, jobId string) {
+	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
+		return
+	}
+	errorResponse(w, "table repair jobs are only available in the Zig runtime", http.StatusMethodNotAllowed)
 }
 
 // authApiRoutes configures the public authentication API.

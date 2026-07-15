@@ -695,6 +695,8 @@ pub fn fuseNamedSets(
     }
     defer for (ranked_results) |result| alloc.free(result.hits);
 
+    if (req.merge_config) |config| try validateFusionWeights(config.weights, ranked_results);
+
     const merge_config = if (req.merge_config) |config|
         fusion_mod.FusionConfig{
             .strategy = config.strategy,
@@ -1278,6 +1280,23 @@ fn fusionWeightName(name: []const u8) []const u8 {
     if (std.mem.startsWith(u8, name, "$full_text_results.")) return name["$full_text_results.".len..];
     if (std.mem.startsWith(u8, name, "$aknn_results.")) return name["$aknn_results.".len..];
     return name;
+}
+
+fn validateFusionWeights(weights: []const fusion_mod.NamedWeight, results: []const fusion_mod.RankedResult) !void {
+    for (weights, 0..) |weight, i| {
+        const canonical_name = fusionWeightName(weight.name);
+        for (weights[0..i]) |previous| {
+            if (std.mem.eql(u8, fusionWeightName(previous.name), canonical_name)) return error.InvalidQueryRequest;
+        }
+        var found = false;
+        for (results) |result| {
+            if (std.mem.eql(u8, result.index_name, canonical_name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return error.InvalidQueryRequest;
+    }
 }
 
 fn fusionUsesDistanceScore(req: types.SearchRequest, name: []const u8) bool {
@@ -2502,10 +2521,14 @@ fn jsonValuesContainDateRange(values: []const std.json.Value, range_query: std.j
     if (range_query != .object) return error.InvalidArgument;
     const start_ns = if (range_query.object.get("start_ns")) |value|
         try jsonI64FromValue(value)
+    else if (range_query.object.get("start")) |value|
+        try jsonDateNsFromValue(value)
     else
         null;
     const end_ns = if (range_query.object.get("end_ns")) |value|
         try jsonI64FromValue(value)
+    else if (range_query.object.get("end")) |value|
+        try jsonDateNsFromValue(value)
     else
         null;
     if (start_ns == null and end_ns == null) return error.InvalidArgument;
@@ -2700,12 +2723,39 @@ fn jsonI64FromValue(value: std.json.Value) !i64 {
 fn jsonDateNsFromValue(value: std.json.Value) !i64 {
     return switch (value) {
         .string => |text| blk: {
-            const ts = (try parsePatternRfc3339ToNs(text)) orelse return error.InvalidArgument;
+            const ts = (try parsePatternTimestampToNs(text)) orelse return error.InvalidArgument;
             break :blk @as(i64, @intCast(ts));
         },
         .integer, .float => try jsonI64FromValue(value),
         else => error.InvalidArgument,
     };
+}
+
+fn parsePatternTimestampToNs(text: []const u8) !?u64 {
+    if (try parsePatternRfc3339ToNs(text)) |ts| return ts;
+    return parsePatternDateOnlyToNs(text);
+}
+
+fn parsePatternDateOnlyToNs(text: []const u8) ?u64 {
+    if (text.len != 10 or text[4] != '-' or text[7] != '-') return null;
+    const year = std.fmt.parseInt(i64, text[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(i64, text[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(i64, text[8..10], 10) catch return null;
+    if (month < 1 or month > 12 or day < 1 or day > 31) return null;
+    const days = patternDaysFromCivil(year, month, day);
+    if (days < 0) return null;
+    return @as(u64, @intCast(days)) * 86_400 * std.time.ns_per_s;
+}
+
+fn patternDaysFromCivil(year: i64, month: i64, day: i64) i64 {
+    var y = year;
+    y -= if (month <= 2) @as(i64, 1) else @as(i64, 0);
+    const era = @divFloor(if (y >= 0) y else y - 399, 400);
+    const yoe = y - era * 400;
+    const mp = month + (if (month > 2) @as(i64, -3) else @as(i64, 9));
+    const doy = @divFloor(153 * mp + 2, 5) + day - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146_097 + doe - 719_468;
 }
 
 fn jsonScalarTermSlice(value: std.json.Value, buf: []u8) ![]const u8 {
@@ -2834,7 +2884,9 @@ fn freePatternGeoPolygons(alloc: Allocator, polygons: []const []const geo_mod.Ge
     alloc.free(polygons);
 }
 
-pub const parsePatternRfc3339ToNs = db_internal.parseRfc3339ToNs;
+pub fn parsePatternRfc3339ToNs(text: []const u8) !?u64 {
+    return try db_internal.parseRfc3339ToNs(text);
+}
 
 fn wildcardMatch(pattern: []const u8, text: []const u8) bool {
     var pi: usize = 0;
@@ -3752,6 +3804,43 @@ test "fuseNamedSets preserves fused per-index scores" {
     try std.testing.expectEqual(@as(usize, 2), result.hits[0].index_scores.len);
     try std.testing.expectEqualStrings("dense", result.hits[0].index_scores[0].index_name);
     try std.testing.expectEqualStrings("sparse", result.hits[0].index_scores[1].index_name);
+}
+
+test "fuseNamedSets rejects unknown merge weights" {
+    const alloc = std.testing.allocator;
+
+    const id_a = try alloc.dupe(u8, "doc:a");
+    defer alloc.free(id_a);
+    const id_b = try alloc.dupe(u8, "doc:b");
+    defer alloc.free(id_b);
+    const left_hits = [_]types.SearchHit{.{ .id = id_a, .score = 1.0 }};
+    const right_hits = [_]types.SearchHit{.{ .id = id_b, .score = 0.5 }};
+    const named_sets = [_]NamedResultSet{
+        .{ .name = "$full_text_results", .hits = &left_hits, .total_hits = left_hits.len },
+        .{ .name = "dense_idx", .hits = &right_hits, .total_hits = right_hits.len },
+    };
+
+    const Harness = struct {
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror!?[]u8 {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    try std.testing.expectError(error.InvalidQueryRequest, fuseNamedSets(alloc, .{
+        .limit = 2,
+        .include_stored = false,
+        .merge_config = .{
+            .weights = &.{.{ .name = "missing_idx", .weight = 2.0 }},
+        },
+    }, &named_sets, .{
+        .ctx = null,
+        .load_projected_document = Harness.loadProjectedDocument,
+    }));
 }
 
 test "executeGraphQueries projects base hits to resolved doc-set for unbounded selectors" {

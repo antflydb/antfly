@@ -70,7 +70,7 @@
       "durable_document": "read_only",
       "durable_row": "none",
       "evidence_file": "zig/pkg/antfly/src/sql/fixtures/document_sql_corpus.json",
-      "evidence_symbol": "document SQL view mapping read, boolean, pattern, JSON, and array residual, expression, lateral, and UNNEST corpus fixtures",
+      "evidence_symbol": "document SQL view mapping read, boolean residual, pattern residual, JSON residual, array residual, expression, lateral, and UNNEST corpus fixtures",
       "release_gate": "relational-release-gate"
     }
   ]

@@ -36,13 +36,15 @@ pub const TypeGenerator = struct {
         return .{ .arena = arena, .w = w, .resolver = resolver };
     }
 
-    /// Generate all types from components/schemas in topological order.
+    /// Generate all component schemas in stable lexical order.
     pub fn generateAll(self: *TypeGenerator, doc: *const types.OpenApiDoc) !void {
         const components = doc.components orelse return;
         const schemas = components.schemas;
 
-        // Build dependency graph and emit in topological order
-        const order = try self.topologicalSort(schemas);
+        // Zig named declarations can reference later declarations, so schema
+        // emission does not need dependency ordering. Keeping this lexical makes
+        // checked-in generated files stable across runs and parser map layouts.
+        const order = try sortedStringKeys(self.arena, schemas.keys());
 
         for (order) |name| {
             const sor = schemas.get(name) orelse continue;
@@ -62,94 +64,14 @@ pub const TypeGenerator = struct {
         }
     }
 
-    /// Topological sort of schemas by dependency order.
-    /// Schemas with no dependencies come first. Cycles are broken arbitrarily
-    /// (Zig handles forward references to named types).
-    fn topologicalSort(self: *TypeGenerator, schemas: std.StringArrayHashMapUnmanaged(types.SchemaOrRef)) ![]const []const u8 {
-        const names = schemas.keys();
-
-        // Build name → index map
-        var name_index = std.StringArrayHashMapUnmanaged(usize){};
-        for (names, 0..) |name, i| {
-            try name_index.put(self.arena, name, i);
-        }
-
-        // Build in-degree counts
-        var in_degree = try self.arena.alloc(usize, names.len);
-        @memset(in_degree, 0);
-
-        // For each schema, find which other schemas it references
-        var reverse_deps = try self.arena.alloc(std.ArrayListUnmanaged(usize), names.len);
-        for (0..names.len) |i| {
-            reverse_deps[i] = .empty;
-        }
-
-        var refs = std.ArrayListUnmanaged([]const u8).empty;
-        for (names, schemas.values(), 0..) |_, sor, i| {
-            refs.clearRetainingCapacity();
-            try collectRefs(sor, &refs, self.arena);
-            for (refs.items) |ref_str| {
-                // Skip external refs — they're imported, not defined locally
-                if (naming.isExternalRef(ref_str)) continue;
-                const ref_name = naming.refToName(ref_str) orelse continue;
-                if (name_index.get(ref_name)) |dep_idx| {
-                    if (dep_idx != i) {
-                        in_degree[i] += 1;
-                        try reverse_deps[dep_idx].append(self.arena, i);
-                    }
-                }
-            }
-        }
-
-        // Kahn's algorithm with pre-allocated queue
-        var queue = std.ArrayListUnmanaged(usize).empty;
-        try queue.ensureTotalCapacity(self.arena, names.len);
-        for (0..names.len) |i| {
-            if (in_degree[i] == 0) queue.appendAssumeCapacity(i);
-        }
-
-        var order = std.ArrayListUnmanaged([]const u8).empty;
-        try order.ensureTotalCapacity(self.arena, names.len);
-        var head: usize = 0;
-        while (head < queue.items.len) {
-            const idx = queue.items[head];
-            head += 1;
-            try order.append(self.arena, names[idx]);
-            for (reverse_deps[idx].items) |dependent| {
-                in_degree[dependent] -= 1;
-                if (in_degree[dependent] == 0) try queue.append(self.arena, dependent);
-            }
-        }
-
-        // Append any remaining schemas (cycles) in original order.
-        // Nodes still with in_degree > 0 are in cycles.
-        if (order.items.len < names.len) {
-            for (in_degree, 0..) |deg, i| {
-                if (deg > 0) try order.append(self.arena, names[i]);
-            }
-        }
-
-        return order.items;
+    fn sortedStringKeys(arena: Allocator, keys: []const []const u8) ![]const []const u8 {
+        const sorted = try arena.dupe([]const u8, keys);
+        std.sort.pdq([]const u8, sorted, {}, stringLessThan);
+        return sorted;
     }
 
-    /// Collect all $ref strings from a SchemaOrRef tree.
-    fn collectRefs(sor: types.SchemaOrRef, refs: *std.ArrayListUnmanaged([]const u8), arena: Allocator) !void {
-        switch (sor) {
-            .ref => |ref| try refs.append(arena, ref.ref_string),
-            .schema => |schema| {
-                for (schema.properties.values()) |prop| try collectRefs(prop, refs, arena);
-                if (schema.items) |items| try collectRefs(items.*, refs, arena);
-                for (schema.all_of) |member| try collectRefs(member, refs, arena);
-                for (schema.one_of) |member| try collectRefs(member, refs, arena);
-                for (schema.any_of) |member| try collectRefs(member, refs, arena);
-                if (schema.additional_properties) |ap| {
-                    switch (ap) {
-                        .schema => |s| try collectRefs(s.*, refs, arena),
-                        .boolean => {},
-                    }
-                }
-            },
-        }
+    fn stringLessThan(_: void, left: []const u8, right: []const u8) bool {
+        return std.mem.order(u8, left, right) == .lt;
     }
 
     /// Generate a named type from a schema.
@@ -1004,6 +926,52 @@ test "required + nullable field codegen" {
     try std.testing.expect(std.mem.indexOf(u8, output, "old_tag: ?[]const u8 = null") == null);
     // Doc comment from nullable field description
     try std.testing.expect(std.mem.indexOf(u8, output, "/// A nullable required tag") != null);
+}
+
+test "component schema emission order is lexical" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var zeta_props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try zeta_props.put(arena, "name", .{
+        .schema = .{ .schema_type = .{ .single = "string" } },
+    });
+
+    var alpha_props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try alpha_props.put(arena, "zeta", .{
+        .ref = .{ .ref_string = "#/components/schemas/Zeta" },
+    });
+
+    var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "Zeta", .{
+        .schema = .{
+            .schema_type = .{ .single = "object" },
+            .properties = zeta_props,
+        },
+    });
+    try schemas.put(arena, "Alpha", .{
+        .schema = .{
+            .schema_type = .{ .single = "object" },
+            .properties = alpha_props,
+        },
+    });
+
+    const doc = types.OpenApiDoc{
+        .openapi = "3.1.0",
+        .info = .{ .title = "Test", .version = "1.0" },
+        .components = .{ .schemas = schemas },
+    };
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var gen = TypeGenerator.init(arena, &w, &resolver);
+    try gen.generateAll(&doc);
+    const output = w.toSlice();
+
+    const alpha_pos = std.mem.indexOf(u8, output, "pub const Alpha = struct {").?;
+    const zeta_pos = std.mem.indexOf(u8, output, "pub const Zeta = struct {").?;
+    try std.testing.expect(alpha_pos < zeta_pos);
 }
 
 test "inline index_type discriminator struct fields generate named enum types" {

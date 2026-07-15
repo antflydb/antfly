@@ -569,6 +569,7 @@ fn applySplitGraphArtifacts(
             dest_store,
             artifact_keys,
             entry.config.name,
+            .{},
         );
         defer graph_mutations.deinit();
         try dest_indexes.applyGraphMutationsByName(entry.config.name, graph_mutations.writes, graph_mutations.deletes);
@@ -1651,6 +1652,7 @@ pub fn Impl(comptime DB: type) type {
             try self.core.store.ensureReplayNextSequenceAtLeast(replay_floor);
             try self.core.pruneSplitRangeFromPrimaryIndexes(split_state.split_key, split_state.original_range_end);
             try Self.rebaseManagedIndexAppliedSequencesIfNeeded(self);
+            try Self.markSplitOffDocumentArtifactChildRangesLocked(self, split_state, split_lower);
 
             if (split_state.phase == .prepare) {
                 try self.core.completeSplitTransition(split_state.new_shard_id, split_state.split_key);
@@ -1828,6 +1830,27 @@ pub fn Impl(comptime DB: type) type {
             try deleteFileIfExists(io, import_marker_path);
         }
 
+        pub fn markRestoreCompleteForPath(
+            alloc: Allocator,
+            path: []const u8,
+            backup_id: []const u8,
+            location: []const u8,
+            snapshot_path: []const u8,
+            group_id: u64,
+        ) !void {
+            var state = try restoreStateAlloc(alloc, backup_id, location, snapshot_path, group_id, "complete", true, true, "");
+            defer state.deinit(alloc);
+            try writeRestoreStateForPath(alloc, path, state);
+            const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
+            defer alloc.free(repair_marker_path);
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+                .sub_path = repair_marker_path,
+                .data = "done\n",
+            });
+        }
+
         pub fn restoreRuntimeRepairNeededForPath(alloc: Allocator, path: []const u8) !bool {
             var state = (try readRestoreStateForPathAlloc(alloc, path)) orelse return false;
             defer state.deinit(alloc);
@@ -1915,6 +1938,8 @@ pub fn Impl(comptime DB: type) type {
             if (std.mem.eql(u8, phase, "rebuild_artifacts")) {
                 std.log.info("restore runtime repair rebuild stored embedding artifacts path={s}", .{self.core.path});
                 _ = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+                _ = try self.rebuildSparseIndexesForTargetCoverage(alloc);
+                _ = try Self.rebuildSparseIndexesFromPrimaryDocsForRestore(self, alloc);
                 try Self.updateRestoreRuntimeRepairPhase(self, alloc, "replay_enrichments", false);
                 return true;
             }
@@ -1929,7 +1954,13 @@ pub fn Impl(comptime DB: type) type {
             }
             if (std.mem.eql(u8, phase, "drain_async")) {
                 std.log.info("restore runtime repair drain async work path={s}", .{self.core.path});
-                try self.runUntilIdle();
+                // Earlier repair phases synchronously rebuild restored runtime state.
+                // At this point only persisted applied-sequence watermarks need to
+                // be flushed before the final index sync/complete marker. Do not
+                // call runUntilIdle here: large portable restores can leave
+                // substantial replay, posting-maintenance, or LSM maintenance debt,
+                // and queries remain correct while that background debt is paid down.
+                try DB.LifecycleCallbacks.flush_applied_sequences_for_idle(self);
                 try Self.updateRestoreRuntimeRepairPhase(self, alloc, "sync_indexes", false);
                 return true;
             }
@@ -1941,6 +1972,39 @@ pub fn Impl(comptime DB: type) type {
                 return true;
             }
             return error.InvalidRestoreState;
+        }
+
+        fn rebuildSparseIndexesFromPrimaryDocsForRestore(self: *DB, alloc: Allocator) !usize {
+            if (self.core.index_manager.sparse_indexes.items.len == 0) return 0;
+
+            const lower = try self.core.documentRangeLowerAlloc(self.getRange().start);
+            defer self.core.alloc.free(lower);
+            const upper = if (self.getRange().end.len > 0) try self.core.documentRangeUpperAlloc(self.getRange().end) else null;
+            defer if (upper) |buf| self.core.alloc.free(buf);
+
+            const pairs = try self.core.store.scanRange(alloc, lower, if (upper) |buf| buf else "");
+            defer docstore_mod.DocStore.freeResults(alloc, pairs);
+
+            var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+            defer writes.deinit(alloc);
+            const relational_base_rows = self.relationalColumnsForStore() != null;
+            for (pairs) |kv| {
+                if (!db_internal.isBaseDocumentStoreKeyForMode(relational_base_rows, kv.key)) continue;
+                try writes.append(alloc, .{
+                    .key = kv.key,
+                    .value = kv.value,
+                });
+            }
+            if (writes.items.len == 0) return 0;
+
+            var rebuilt: usize = 0;
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            for (self.core.index_manager.sparse_indexes.items) |*entry| {
+                try self.core.index_manager.indexSparseBatchByName(self.core.store, entry.config.name, writes.items);
+                rebuilt += writes.items.len;
+            }
+            return rebuilt;
         }
 
         pub fn repairRestoreRuntimeStateIfNeeded(self: *DB, alloc: Allocator) !bool {
@@ -1955,6 +2019,13 @@ pub fn Impl(comptime DB: type) type {
         pub fn rebuildGraphDerivedState(self: *DB) !usize {
             self.core.lockApply();
             defer self.core.unlockApply();
+            try applySplitGraphArtifactsInRange(
+                self.alloc,
+                self.getRange().start,
+                self.getRange().end,
+                self.core.store,
+                self.core.index_manager,
+            );
             return try self.core.index_manager.rebuildGraphSplitDestination(
                 self.getRange().start,
                 self.getRange().end,

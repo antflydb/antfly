@@ -326,7 +326,8 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 	// Preload specified models at startup (Ollama-compatible)
 	// Note: This preloads models that aren't already pinned
 	if len(config.Preload) > 0 {
-		if err := embedderRegistry.Preload(config.Preload); err != nil {
+		preloadModels := embedderPreloadNames(config.Preload, zl)
+		if err := embedderRegistry.Preload(preloadModels); err != nil {
 			zl.Warn("Some models failed to preload", zap.Error(err))
 		}
 	}
@@ -627,6 +628,23 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 	}
 
 	return node
+}
+
+func embedderPreloadNames(refs []ModelRef, zl *zap.Logger) []string {
+	names := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		if ref.Name == "" {
+			continue
+		}
+		if ref.Kind != "" && ref.Kind != ModelKindEmbedder {
+			zl.Warn("Skipping non-embedder preload entry",
+				zap.String("kind", string(ref.Kind)),
+				zap.String("model", ref.Name))
+			continue
+		}
+		names = append(names, ref.Name)
+	}
+	return names
 }
 
 // APIHandler returns the full HTTP handler serving /ai/v1/*, /openai/v1/*,

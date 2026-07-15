@@ -113,11 +113,20 @@ func translateTemplateFieldMapping(m TemplateFieldMapping) *mapping.FieldMapping
 	if m.IncludeInAll {
 		fieldMapping.IncludeInAll = true
 	}
-	if m.DocValues {
+	if m.Sortable && templateFieldMappingTypeCanSort(m.Type) {
 		fieldMapping.DocValues = true
 	}
 
 	return fieldMapping
+}
+
+func templateFieldMappingTypeCanSort(t AntflyType) bool {
+	switch t {
+	case AntflyTypeKeyword, AntflyTypeLink, AntflyTypeNumeric, AntflyTypeBoolean, AntflyTypeDatetime:
+		return true
+	default:
+		return false
+	}
 }
 
 const (

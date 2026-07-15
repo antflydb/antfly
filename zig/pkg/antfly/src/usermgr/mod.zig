@@ -12,8 +12,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const build_options = @import("build_options");
 const user_manager = @import("user_manager.zig");
-const storage_adapter = @import("storage_adapter.zig");
+const storage_adapter = if (build_options.usermgr_storage_adapter) @import("storage_adapter.zig") else struct {};
 
 pub const MemoryStore = user_manager.MemoryStore;
 pub const AuthSubjectEntry = user_manager.AuthSubjectEntry;
@@ -37,9 +38,9 @@ pub const validateRoleSettingName = user_manager.validateRoleSettingName;
 pub const validateRoleSettingValue = user_manager.validateRoleSettingValue;
 pub const UserManager = user_manager.UserManager;
 pub const UserStore = user_manager.UserStore;
-pub const StorageCasbinAdapter = storage_adapter.StorageCasbinAdapter;
-pub const StorageUserStore = storage_adapter.StorageUserStore;
+pub const StorageCasbinAdapter = if (build_options.usermgr_storage_adapter) storage_adapter.StorageCasbinAdapter else void;
+pub const StorageUserStore = if (build_options.usermgr_storage_adapter) storage_adapter.StorageUserStore else void;
 
 test {
-    _ = storage_adapter;
+    if (build_options.usermgr_storage_adapter) _ = storage_adapter;
 }

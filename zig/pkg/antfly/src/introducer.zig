@@ -256,6 +256,7 @@ pub const TypedFieldValue = struct {
     field_name: []const u8,
     value_type: typed_dv.ValueType,
     value: typed_dv.TypedValue,
+    conflicted: bool = false,
 };
 
 /// A document with raw text fields that will be analyzed before indexing.
@@ -279,6 +280,7 @@ pub const TextField = struct {
 pub const BuildTextOptions = struct {
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
+    index_sort: []const segment_mod.SegmentIndexSortField = &.{},
     profile: ?*BuildTextProfile = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     build_memory_target_bytes: usize = default_build_memory_target_bytes,
@@ -623,7 +625,17 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
     var scratch = TextBuildScratch{};
     defer scratch.deinit(alloc);
 
-    for (docs, 0..) |text_doc, doc_idx| {
+    var empty_doc_order: [0]TextIndexSortEntry = .{};
+    const doc_order: []TextIndexSortEntry = if (options.index_sort.len > 0)
+        try buildTextDocumentOrderAlloc(alloc, docs, text_analysis, options.index_sort)
+    else
+        empty_doc_order[0..];
+    errdefer freeTextDocumentOrder(alloc, doc_order);
+    defer freeTextDocumentOrder(alloc, doc_order);
+
+    for (0..docs.len) |doc_idx| {
+        const source_doc_idx = if (options.index_sort.len > 0) doc_order[doc_idx].doc_index else doc_idx;
+        const text_doc = docs[source_doc_idx];
         _ = doc_arena_state.reset(.{ .retain_with_limit = options.doc_scratch_retained_bytes });
         scratch.reset(alloc, options.doc_scratch_retained_bytes);
         const doc_alloc = doc_arena_state.allocator();
@@ -736,6 +748,10 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
         const typed_collect_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
         if (text_doc.typed_fields) |projected_typed_fields| {
             for (projected_typed_fields) |field| {
+                if (field.conflicted) {
+                    try markTypedFieldConflict(alloc, &typed_fields, field.field_name);
+                    continue;
+                }
                 try appendTypedFieldValue(alloc, &typed_fields, field.field_name, @intCast(doc_idx), .{
                     .value_type = field.value_type,
                     .value = field.value,
@@ -796,6 +812,15 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
 
     const segment_encode_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
     if (has_doc_ordinal) try seg_writer.addDocOrdinals(doc_ordinals.items);
+    if (options.index_sort.len > 0) {
+        if (doc_order.len > 0) {
+            var bounds = try textIndexSortBoundsAlloc(alloc, doc_order[0].keys, doc_order[doc_order.len - 1].keys);
+            defer bounds.deinit(alloc);
+            try seg_writer.addIndexSortMetadataWithBounds(options.index_sort, bounds);
+        } else {
+            try seg_writer.addIndexSortMetadata(options.index_sort);
+        }
+    }
 
     var fit = field_builders.iterator();
     while (fit.next()) |entry| {
@@ -906,6 +931,234 @@ fn hasDuplicateTextFieldNames(fields: []const TextField) bool {
         }
     }
     return false;
+}
+
+const TextIndexSortEntry = struct {
+    doc_index: usize,
+    keys: []TextIndexSortValue,
+
+    fn deinit(self: *TextIndexSortEntry, alloc: Allocator) void {
+        for (self.keys) |*key| key.deinit(alloc);
+        alloc.free(self.keys);
+        self.* = undefined;
+    }
+};
+
+const TextIndexSortValue = union(enum) {
+    u64_val: u64,
+    i64_val: i64,
+    f64_val: f64,
+    bool_val: bool,
+    bytes_val: []u8,
+    id: []const u8,
+
+    fn deinit(self: *TextIndexSortValue, alloc: Allocator) void {
+        switch (self.*) {
+            .bytes_val => |bytes| alloc.free(bytes),
+            else => {},
+        }
+        self.* = undefined;
+    }
+};
+
+const TextIndexSortValueTag = std.meta.Tag(TextIndexSortValue);
+
+fn textIndexSortEntryLessThan(index_sort: []const segment_mod.SegmentIndexSortField, a: TextIndexSortEntry, b: TextIndexSortEntry) bool {
+    for (index_sort, 0..) |field, i| {
+        const order = compareTextIndexSortValues(a.keys[i], b.keys[i]);
+        if (order == .eq) continue;
+        return if (field.desc) order == .gt else order == .lt;
+    }
+    return a.doc_index < b.doc_index;
+}
+
+fn buildTextDocumentOrderAlloc(
+    alloc: Allocator,
+    docs: []const TextDocument,
+    text_analysis: TextAnalysisConfig,
+    index_sort: []const segment_mod.SegmentIndexSortField,
+) ![]TextIndexSortEntry {
+    const order = try alloc.alloc(TextIndexSortEntry, docs.len);
+    var initialized: usize = 0;
+    const expected_key_tags = try alloc.alloc(?TextIndexSortValueTag, index_sort.len);
+    defer alloc.free(expected_key_tags);
+    @memset(expected_key_tags, null);
+    errdefer {
+        for (order[0..initialized]) |*entry| entry.deinit(alloc);
+        alloc.free(order);
+    }
+    for (order, 0..) |*entry, i| {
+        entry.* = .{
+            .doc_index = i,
+            .keys = try alloc.alloc(TextIndexSortValue, index_sort.len),
+        };
+        var keys_initialized: usize = 0;
+        errdefer {
+            for (entry.keys[0..keys_initialized]) |*key| key.deinit(alloc);
+            alloc.free(entry.keys);
+        }
+        for (index_sort) |field| {
+            var key = try textDocumentSortValueAlloc(alloc, docs[i], field.field, text_analysis);
+            errdefer key.deinit(alloc);
+            const key_tag = std.meta.activeTag(key);
+            if (expected_key_tags[keys_initialized]) |expected| {
+                if (expected != key_tag) return error.InvalidSegment;
+            } else {
+                expected_key_tags[keys_initialized] = key_tag;
+            }
+            entry.keys[keys_initialized] = key;
+            keys_initialized += 1;
+        }
+        initialized += 1;
+    }
+    std.sort.pdq(TextIndexSortEntry, order, index_sort, textIndexSortEntryLessThan);
+    return order;
+}
+
+fn freeTextDocumentOrder(alloc: Allocator, order: []TextIndexSortEntry) void {
+    for (order) |*entry| entry.deinit(alloc);
+    if (order.len > 0) alloc.free(order);
+}
+
+fn textIndexSortBoundsAlloc(
+    alloc: Allocator,
+    first: []const TextIndexSortValue,
+    last: []const TextIndexSortValue,
+) !segment_mod.SegmentIndexSortBounds {
+    if (first.len == 0 or first.len != last.len) return error.InvalidSegment;
+    const first_bounds = try textIndexSortBoundValuesAlloc(alloc, first);
+    errdefer {
+        for (first_bounds) |*value| value.deinit(alloc);
+        alloc.free(first_bounds);
+    }
+    return .{
+        .first = first_bounds,
+        .last = try textIndexSortBoundValuesAlloc(alloc, last),
+    };
+}
+
+fn textIndexSortBoundValuesAlloc(
+    alloc: Allocator,
+    values: []const TextIndexSortValue,
+) ![]segment_mod.SegmentIndexSortBoundValue {
+    const out = try alloc.alloc(segment_mod.SegmentIndexSortBoundValue, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*value| value.deinit(alloc);
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        out[i] = try textIndexSortBoundValueAlloc(alloc, value);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn textIndexSortBoundValueAlloc(alloc: Allocator, value: TextIndexSortValue) !segment_mod.SegmentIndexSortBoundValue {
+    return switch (value) {
+        .u64_val => |v| .{ .u64_val = v },
+        .i64_val => |v| .{ .i64_val = v },
+        .f64_val => |v| if (std.math.isFinite(v)) .{ .f64_val = v } else error.InvalidSegment,
+        .bool_val => |v| .{ .bool_val = v },
+        .bytes_val => |v| .{ .bytes_val = try alloc.dupe(u8, v) },
+        .id => |v| .{ .id = try alloc.dupe(u8, v) },
+    };
+}
+
+fn textDocumentSortValueAlloc(
+    alloc: Allocator,
+    doc: TextDocument,
+    field: []const u8,
+    text_analysis: TextAnalysisConfig,
+) !TextIndexSortValue {
+    if (std.mem.eql(u8, field, "_id")) return .{ .id = doc.id };
+    if (doc.typed_fields) |typed_fields| {
+        var found: ?typed_dv.TypedValue = null;
+        for (typed_fields) |typed_field| {
+            if (!std.mem.eql(u8, typed_field.field_name, field)) continue;
+            if (found != null) return error.InvalidSegment;
+            found = typed_field.value;
+        }
+        if (found) |value| return try textIndexSortValueFromTypedValueAlloc(alloc, value);
+    }
+    if (doc.typed_source) |source| {
+        if (jsonPathValue(source, field)) |value| {
+            return try textIndexSortValueFromJsonAlloc(alloc, field, value, text_analysis);
+        }
+    }
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc.stored_data, .{});
+    defer parsed.deinit();
+    const value = jsonPathValue(parsed.value, field) orelse return error.InvalidSegment;
+    return try textIndexSortValueFromJsonAlloc(alloc, field, value, text_analysis);
+}
+
+fn textIndexSortValueFromJsonAlloc(
+    alloc: Allocator,
+    field: []const u8,
+    value: std.json.Value,
+    text_analysis: TextAnalysisConfig,
+) !TextIndexSortValue {
+    const detected = detectTypedValue(field, value, text_analysis) orelse return error.InvalidSegment;
+    return try textIndexSortValueFromTypedValueAlloc(alloc, detected.value);
+}
+
+fn textIndexSortValueFromTypedValueAlloc(alloc: Allocator, value: typed_dv.TypedValue) !TextIndexSortValue {
+    return switch (value) {
+        .u64_val => |v| .{ .u64_val = v },
+        .i64_val => |v| .{ .i64_val = v },
+        .f64_val => |v| if (std.math.isFinite(v)) .{ .f64_val = v } else error.InvalidSegment,
+        .bool_val => |v| .{ .bool_val = v },
+        .bytes_val => |v| .{ .bytes_val = try alloc.dupe(u8, v) },
+        .geo_point => error.UnsupportedTypedDocValues,
+    };
+}
+
+fn jsonPathValue(value: std.json.Value, path: []const u8) ?std.json.Value {
+    var current = value;
+    var parts = std.mem.splitScalar(u8, path, '.');
+    while (parts.next()) |part| {
+        if (current != .object) return null;
+        current = current.object.get(part) orelse return null;
+    }
+    return current;
+}
+
+fn compareTextIndexSortValues(a: TextIndexSortValue, b: TextIndexSortValue) std.math.Order {
+    return switch (a) {
+        .u64_val => |av| switch (b) {
+            .u64_val => |bv| std.math.order(av, bv),
+            else => .lt,
+        },
+        .i64_val => |av| switch (b) {
+            .i64_val => |bv| std.math.order(av, bv),
+            else => .lt,
+        },
+        .f64_val => |av| switch (b) {
+            .f64_val => |bv| compareSortF64(av, bv),
+            else => .lt,
+        },
+        .bool_val => |av| switch (b) {
+            .bool_val => |bv| std.math.order(@intFromBool(av), @intFromBool(bv)),
+            else => .lt,
+        },
+        .bytes_val => |av| switch (b) {
+            .bytes_val => |bv| std.mem.order(u8, av, bv),
+            else => .lt,
+        },
+        .id => |av| switch (b) {
+            .id => |bv| std.mem.order(u8, av, bv),
+            else => .lt,
+        },
+    };
+}
+
+fn compareSortF64(a: f64, b: f64) std.math.Order {
+    const a_nan = std.math.isNan(a);
+    const b_nan = std.math.isNan(b);
+    if (a_nan and b_nan) return .eq;
+    if (a_nan) return .gt;
+    if (b_nan) return .lt;
+    return std.math.order(a, b);
 }
 
 fn cachedFieldAnalyzer(
@@ -1046,6 +1299,7 @@ const TypedFieldCollector = struct {
     value_type: ?typed_dv.ValueType = null,
     writer: ?typed_dv.TypedDocValuesWriter = null,
     conflicted: bool = false,
+    last_doc_id: ?u32 = null,
 };
 
 const DetectedTypedValue = struct {
@@ -1229,6 +1483,7 @@ fn cloneTypedValue(alloc: Allocator, value: typed_dv.TypedValue) !typed_dv.Typed
     return switch (value) {
         .bytes_val => |bytes| .{ .bytes_val = try alloc.dupe(u8, bytes) },
         .u64_val => |number| .{ .u64_val = number },
+        .i64_val => |number| .{ .i64_val = number },
         .f64_val => |number| .{ .f64_val = number },
         .geo_point => |point| .{ .geo_point = point },
         .bool_val => |boolean| .{ .bool_val = boolean },
@@ -1336,19 +1591,41 @@ fn appendTypedFieldValue(
         gop.value_ptr.* = .{};
     }
     if (gop.value_ptr.conflicted) return;
+    if (gop.value_ptr.last_doc_id != null and gop.value_ptr.last_doc_id.? == doc_id) {
+        markTypedFieldCollectorConflicted(gop.value_ptr);
+        return;
+    }
 
     if (gop.value_ptr.value_type == null) {
         gop.value_ptr.value_type = detected.value_type;
         gop.value_ptr.writer = typed_dv.TypedDocValuesWriter.init(alloc, detected.value_type, typed_dv.default_chunk_size);
     } else if (gop.value_ptr.value_type.? != detected.value_type) {
-        if (gop.value_ptr.writer) |*writer| writer.deinit();
-        gop.value_ptr.writer = null;
-        gop.value_ptr.conflicted = true;
+        markTypedFieldCollectorConflicted(gop.value_ptr);
         return;
     }
 
     try gop.value_ptr.writer.?.add(doc_id, detected.value);
+    gop.value_ptr.last_doc_id = doc_id;
     if (profile) |p| p.typed_value_count +|= 1;
+}
+
+fn markTypedFieldConflict(
+    alloc: Allocator,
+    typed_fields: *std.StringHashMapUnmanaged(TypedFieldCollector),
+    field_name: []const u8,
+) !void {
+    const gop = try typed_fields.getOrPut(alloc, field_name);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = try alloc.dupe(u8, field_name);
+        gop.value_ptr.* = .{};
+    }
+    markTypedFieldCollectorConflicted(gop.value_ptr);
+}
+
+fn markTypedFieldCollectorConflicted(collector: *TypedFieldCollector) void {
+    if (collector.writer) |*writer| writer.deinit();
+    collector.writer = null;
+    collector.conflicted = true;
 }
 
 const FieldDateTimeParser = struct {
@@ -2603,6 +2880,94 @@ test "buildSegmentFromText indexes caller-supplied relational typed columns and 
     // would otherwise be detected (object -> geo attempt, number -> f64).
     try std.testing.expect(reader.getSection("meta", .typed_doc_values) == null);
     try std.testing.expect(reader.getSection("score", .typed_doc_values) == null);
+}
+
+test "buildSegmentFromText omits multi-valued typed doc values" {
+    const alloc = std.testing.allocator;
+
+    const seg_bytes = try buildSegmentFromTextWithAnalysisOptions(alloc, &.{
+        .{
+            .id = "doc1",
+            .stored_data = "{\"title\":\"alpha\",\"price\":10,\"scores\":[3,5]}",
+            .text_fields = &.{.{ .field_name = "title", .text = "alpha" }},
+        },
+        .{
+            .id = "doc2",
+            .stored_data = "{\"title\":\"beta\",\"price\":20,\"scores\":[7]}",
+            .text_fields = &.{.{ .field_name = "title", .text = "beta" }},
+        },
+    }, &analysis_mod.default_analyzer, .{}, .{
+        .recursive_typed_fields = true,
+    });
+    defer alloc.free(seg_bytes);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
+    defer reader.deinit();
+
+    const price_section = reader.getSection("price", .typed_doc_values) orelse return error.TestExpectedEqual;
+    var price_reader = try typed_dv.TypedDocValuesReader.init(alloc, price_section);
+    try std.testing.expectEqual(typed_dv.ValueType.f64_val, price_reader.value_type);
+    try std.testing.expectEqual(@as(?f64, 10.0), try price_reader.getF64(0));
+    try std.testing.expectEqual(@as(?f64, 20.0), try price_reader.getF64(1));
+
+    try std.testing.expect(reader.getSection("scores", .typed_doc_values) == null);
+}
+
+test "buildSegmentFromText rejects multi-valued projected index sort field" {
+    const alloc = std.testing.allocator;
+
+    const typed_fields = [_]TypedFieldValue{
+        .{
+            .field_name = "price",
+            .value_type = .f64_val,
+            .value = .{ .f64_val = 10.0 },
+        },
+        .{
+            .field_name = "price",
+            .value_type = .f64_val,
+            .value = .{ .f64_val = 12.0 },
+        },
+    };
+    const index_sort = [_]segment_mod.SegmentIndexSortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+
+    try std.testing.expectError(error.InvalidSegment, buildSegmentFromTextWithAnalysisOptions(alloc, &.{
+        .{
+            .id = "doc1",
+            .stored_data = "{\"price\":10}",
+            .text_fields = &.{.{ .field_name = "title", .text = "alpha" }},
+            .typed_fields = &typed_fields,
+        },
+    }, &analysis_mod.default_analyzer, .{}, .{
+        .index_sort = &index_sort,
+    }));
+}
+
+test "buildSegmentFromText rejects non-finite projected index sort field" {
+    const alloc = std.testing.allocator;
+
+    const typed_fields = [_]TypedFieldValue{.{
+        .field_name = "price",
+        .value_type = .f64_val,
+        .value = .{ .f64_val = std.math.nan(f64) },
+    }};
+    const index_sort = [_]segment_mod.SegmentIndexSortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+
+    try std.testing.expectError(error.InvalidSegment, buildSegmentFromTextWithAnalysisOptions(alloc, &.{
+        .{
+            .id = "doc1",
+            .stored_data = "{\"price\":10}",
+            .text_fields = &.{.{ .field_name = "title", .text = "alpha" }},
+            .typed_fields = &typed_fields,
+        },
+    }, &analysis_mod.default_analyzer, .{}, .{
+        .index_sort = &index_sort,
+    }));
 }
 
 test "buildSegmentFromText uses configured custom datetime parsers for typed doc values" {

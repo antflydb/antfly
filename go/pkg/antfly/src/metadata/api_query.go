@@ -1254,7 +1254,7 @@ func (t *TableApi) fusionResultToQueryResult(
 	queryResult.Hits.Hits = resp
 	queryResult.Hits.MaxScore = fusionResult.MaxScore
 	queryResult.Took = fusionResult.Took
-	queryResult.Hits.Total = fusionResult.Total
+	queryResult.Hits.Total = exactQueryHitsTotal(fusionResult.Total)
 	queryResult.Profile = profile
 
 	queryResult.GraphResults = t.runGraphSearches(ctx, table, graphSearches,
@@ -1355,14 +1355,14 @@ func (t *TableApi) bleveResultToQueryResult(
 			ID:     r.ID,
 		}
 		if len(r.Sort) > 0 {
-			resp[i].Sort = r.Sort
+			resp[i].Sort = stringSliceAsAny(r.Sort)
 		}
 	}
 
 	if len(resp) > 0 && (len(q.Fields) != 0 || queryReq.FullTextSearch != nil || !q.Count) {
 		queryResult.Hits.Hits = resp
 	}
-	queryResult.Hits.Total = searchResult.Total
+	queryResult.Hits.Total = exactQueryHitsTotal(searchResult.Total)
 	queryResult.Hits.MaxScore = searchResult.MaxScore
 	queryResult.Took = searchResult.Took
 
@@ -1375,6 +1375,17 @@ func (t *TableApi) bleveResultToQueryResult(
 	}
 
 	return queryResult
+}
+
+func stringSliceAsAny(values []string) []any {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]any, len(values))
+	for i, value := range values {
+		out[i] = value
+	}
+	return out
 }
 
 // buildShardsProfile creates a QueryProfile with shard statistics from the search status.

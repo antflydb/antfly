@@ -1169,6 +1169,10 @@ pub const ColumnIndexPolicy = struct {
         return .{};
     }
 
+    fn maintainsLegacyScalarIndexes(self: ColumnIndexPolicy) bool {
+        return self.columns.len == 0 and self.indexes.len == 0 and self.target_index_name == null;
+    }
+
     pub fn fromSchemaParts(columns: []const schema_mod.RelationalColumn, indexes: []const schema_mod.RelationalIndex) ColumnIndexPolicy {
         return .{
             .columns = columns,
@@ -1214,6 +1218,7 @@ pub const ColumnIndexPolicy = struct {
     }
 
     pub fn mayIndexAnyRow(self: ColumnIndexPolicy) bool {
+        if (self.maintainsLegacyScalarIndexes()) return true;
         for (self.columns) |column| {
             if (!self.shouldMaintainIndexColumn(column)) continue;
             if (self.catalogIndexForMaintainedColumn(column)) |_| return true;
@@ -1243,6 +1248,7 @@ pub const ColumnIndexPolicy = struct {
     }
 
     pub fn shouldIndex(self: ColumnIndexPolicy, path: []const u8) bool {
+        if (self.maintainsLegacyScalarIndexes()) return true;
         for (self.columns) |column| {
             if (std.mem.eql(u8, column.path, path) or std.mem.eql(u8, column.name, path)) {
                 return self.catalogIndexForColumn(column, null) != null;
@@ -1252,6 +1258,7 @@ pub const ColumnIndexPolicy = struct {
     }
 
     pub fn shouldMaintainScalarIndexRow(self: ColumnIndexPolicy, alloc: Allocator, path: []const u8, row_value: []const u8) !bool {
+        if (self.maintainsLegacyScalarIndexes()) return true;
         for (self.columns) |column| {
             if (!std.mem.eql(u8, column.path, path) and !std.mem.eql(u8, column.name, path)) continue;
             if (!self.shouldMaintainIndexColumn(column)) return false;
@@ -1262,6 +1269,7 @@ pub const ColumnIndexPolicy = struct {
     }
 
     pub fn shouldIndexRow(self: ColumnIndexPolicy, alloc: Allocator, path: []const u8, row_value: []const u8) !bool {
+        if (self.maintainsLegacyScalarIndexes()) return true;
         for (self.columns) |column| {
             if (!std.mem.eql(u8, column.path, path) and !std.mem.eql(u8, column.name, path)) continue;
             if (!self.shouldMaintainIndexColumn(column)) return false;
@@ -1286,6 +1294,7 @@ pub const ColumnIndexPolicy = struct {
     }
 
     pub fn readyForQuery(self: ColumnIndexPolicy, path: []const u8) bool {
+        if (self.maintainsLegacyScalarIndexes()) return true;
         for (self.columns) |column| {
             if (!std.mem.eql(u8, column.path, path) and !std.mem.eql(u8, column.name, path)) continue;
             if (self.catalogIndexForColumn(column, .scalar_column)) |index| {
@@ -1882,6 +1891,12 @@ fn appendOrderedScalarBytes(
             const start = out.items.len;
             try out.resize(alloc, start + @sizeOf(u64));
             std.mem.writeInt(u64, out.items[start..][0..@sizeOf(u64)], cell.value.u64_val, .big);
+        },
+        .i64_val => {
+            const start = out.items.len;
+            try out.resize(alloc, start + @sizeOf(u64));
+            const sortable_bits: u64 = @as(u64, @bitCast(cell.value.i64_val)) ^ 0x8000_0000_0000_0000;
+            std.mem.writeInt(u64, out.items[start..][0..@sizeOf(u64)], sortable_bits, .big);
         },
         .f64_val => {
             const start = out.items.len;
@@ -4773,6 +4788,16 @@ fn foreignKeyParentKeyComponentCellAlloc(
                 .value = .{ .u64_val = std.mem.readInt(u64, payload[0..8], .big) },
             };
         },
+        .i64_val => blk: {
+            if (payload.len != 8) return error.InvalidColumnValue;
+            const sortable_bits = std.mem.readInt(u64, payload[0..8], .big);
+            break :blk .{
+                .path = child_column,
+                .value_type = .i64_val,
+                .is_json = false,
+                .value = .{ .i64_val = @bitCast(sortable_bits ^ 0x8000_0000_0000_0000) },
+            };
+        },
         .f64_val => blk: {
             if (payload.len != 8) return error.InvalidColumnValue;
             break :blk .{
@@ -7167,6 +7192,7 @@ fn cellJsonValueAlloc(alloc: Allocator, cell: relational_row_codec.Cell) ![]u8 {
             try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = bytes }, .{}),
         .bool_val => |value| try alloc.dupe(u8, if (value) "true" else "false"),
         .u64_val => |value| try std.fmt.allocPrint(alloc, "{d}", .{value}),
+        .i64_val => |value| try std.fmt.allocPrint(alloc, "{d}", .{value}),
         .f64_val => |value| try std.fmt.allocPrint(alloc, "{d}", .{value}),
         .geo_point => return error.InvalidColumnValue,
     };
@@ -7248,6 +7274,10 @@ fn cellEqualsJsonLiteralWithCollation(alloc: Allocator, cell: relational_row_cod
         .bool_val => |value| return parsed.value == .bool and value == parsed.value.bool,
         .u64_val => |value| switch (parsed.value) {
             .integer => |parsed_int| return parsed_int >= 0 and value == @as(u64, @intCast(parsed_int)),
+            else => return false,
+        },
+        .i64_val => |value| switch (parsed.value) {
+            .integer => |parsed_int| return value == parsed_int,
             else => return false,
         },
         .f64_val => |value| switch (parsed.value) {
@@ -7455,6 +7485,12 @@ fn decodeUniqueConstraintDisplayValueAlloc(alloc: Allocator, component: []const 
             const value = std.mem.readInt(u64, payload[0..8], .big);
             break :blk try std.fmt.allocPrint(alloc, "{d}", .{value});
         },
+        .i64_val => blk: {
+            if (payload.len != 8) return error.InvalidColumnValue;
+            const sortable_bits = std.mem.readInt(u64, payload[0..8], .big);
+            const value: i64 = @bitCast(sortable_bits ^ 0x8000_0000_0000_0000);
+            break :blk try std.fmt.allocPrint(alloc, "{d}", .{value});
+        },
         .f64_val => blk: {
             if (payload.len != 8) return error.InvalidColumnValue;
             const value: f64 = @bitCast(std.mem.readInt(u64, payload[0..8], .big));
@@ -7477,6 +7513,7 @@ fn decodeUniqueConstraintDisplayValueAlloc(alloc: Allocator, component: []const 
 fn typedValueTypeFromByte(tag: u8) ?typed_dv.ValueType {
     return switch (tag) {
         @intFromEnum(typed_dv.ValueType.u64_val) => .u64_val,
+        @intFromEnum(typed_dv.ValueType.i64_val) => .i64_val,
         @intFromEnum(typed_dv.ValueType.f64_val) => .f64_val,
         @intFromEnum(typed_dv.ValueType.bytes_val) => .bytes_val,
         @intFromEnum(typed_dv.ValueType.geo_point) => .geo_point,
@@ -7730,6 +7767,12 @@ fn uniqueConstraintCellValueWithCollationAlloc(
         .u64_val => |value| {
             var buf: [8]u8 = undefined;
             std.mem.writeInt(u64, &buf, value, .big);
+            try out.appendSlice(alloc, &buf);
+        },
+        .i64_val => |value| {
+            var buf: [8]u8 = undefined;
+            const sortable_bits: u64 = @as(u64, @bitCast(value)) ^ 0x8000_0000_0000_0000;
+            std.mem.writeInt(u64, &buf, sortable_bits, .big);
             try out.appendSlice(alloc, &buf);
         },
         .f64_val => |value| {
@@ -9368,6 +9411,10 @@ fn rowRewriteCellIsValid(cell: relational_row_codec.Cell) bool {
     return switch (cell.value_type) {
         .u64_val => switch (cell.value) {
             .u64_val => true,
+            else => false,
+        },
+        .i64_val => switch (cell.value) {
+            .i64_val => true,
             else => false,
         },
         .f64_val => switch (cell.value) {
@@ -11280,12 +11327,15 @@ fn insertIndexReserveCounts(
     column_index_policy: ColumnIndexPolicy,
     cells: []const relational_row_codec.Cell,
 ) InsertIndexReserveCounts {
-    var scalar_cells: usize = 0;
-    for (cells) |cell| {
-        for (column_index_policy.columns) |column| {
-            if (!std.mem.eql(u8, column.path, cell.path) and !std.mem.eql(u8, column.name, cell.path)) continue;
-            if (column_index_policy.columnHasScalarIndex(column)) scalar_cells += 1;
-            break;
+    var scalar_cells: usize = cells.len;
+    if (!column_index_policy.maintainsLegacyScalarIndexes()) {
+        scalar_cells = 0;
+        for (cells) |cell| {
+            for (column_index_policy.columns) |column| {
+                if (!std.mem.eql(u8, column.path, cell.path) and !std.mem.eql(u8, column.name, cell.path)) continue;
+                if (column_index_policy.columnHasScalarIndex(column)) scalar_cells += 1;
+                break;
+            }
         }
     }
 
@@ -11338,6 +11388,7 @@ fn scalarIndexCellCount(
 }
 
 fn catalogCellHasScalarIndex(column_index_policy: ColumnIndexPolicy, path: []const u8) bool {
+    if (column_index_policy.maintainsLegacyScalarIndexes()) return true;
     for (column_index_policy.columns) |column| {
         if (!std.mem.eql(u8, column.path, path) and !std.mem.eql(u8, column.name, path)) continue;
         return column_index_policy.columnHasScalarIndex(column);
@@ -11689,6 +11740,7 @@ fn relationalCellsEqual(lhs: relational_row_codec.Cell, rhs: relational_row_code
     if (lhs.value_type != rhs.value_type or lhs.is_json != rhs.is_json) return false;
     return switch (lhs.value) {
         .u64_val => |value| rhs.value == .u64_val and rhs.value.u64_val == value,
+        .i64_val => |value| rhs.value == .i64_val and rhs.value.i64_val == value,
         .f64_val => |value| rhs.value == .f64_val and rhs.value.f64_val == value,
         .bool_val => |value| rhs.value == .bool_val and rhs.value.bool_val == value,
         .geo_point => |value| rhs.value == .geo_point and rhs.value.geo_point.lat == value.lat and rhs.value.geo_point.lon == value.lon,
@@ -12214,6 +12266,7 @@ fn appendExistingColumnDeletesForRow(
 fn cloneTypedValue(alloc: Allocator, value_type: typed_dv.ValueType, value: typed_dv.TypedValue) !typed_dv.TypedValue {
     return switch (value_type) {
         .u64_val => .{ .u64_val = value.u64_val },
+        .i64_val => .{ .i64_val = value.i64_val },
         .f64_val => .{ .f64_val = value.f64_val },
         .bool_val => .{ .bool_val = value.bool_val },
         .geo_point => .{ .geo_point = value.geo_point },

@@ -21,6 +21,7 @@ const connection = @import("connection.zig");
 const db_mod = @import("../db/mod.zig");
 const db_types = @import("../db/types.zig");
 const group_ids = @import("../../common/group_ids.zig");
+const internal_keys = @import("../internal_keys.zig");
 const portable_backup = @import("../portable_backup.zig");
 const query_api = @import("../../api/query.zig");
 const tables_api = @import("../../metadata/catalog/table_ddl.zig");
@@ -334,7 +335,7 @@ fn appendBinaryIndexCatalogFields(
 
     var pos: usize = 4;
     const version = try readCatalogU32(data, &pos);
-    if (version != 1) return error.InvalidBackupRequest;
+    if (version != 1 and version != 2) return error.InvalidBackupRequest;
     const count = try readCatalogU32(data, &pos);
 
     for (0..count) |_| {
@@ -344,6 +345,10 @@ fn appendBinaryIndexCatalogFields(
         pos += 1;
         const kind = indexKindFromCatalogByte(kind_value) orelse return error.InvalidBackupRequest;
         const config_json = try readCatalogString(data, &pos);
+        const coverage_generation = if (version >= 2)
+            try readCatalogU64(data, &pos)
+        else
+            internal_keys.derivedCoverageGeneration(config_json);
 
         if (!first.*) try out.append(allocator, ',');
         first.* = false;
@@ -354,6 +359,8 @@ fn appendBinaryIndexCatalogFields(
         try appendJsonString(allocator, out, @tagName(kind));
         try out.appendSlice(allocator, ",\"config_json\":");
         try appendJsonString(allocator, out, config_json);
+        try out.appendSlice(allocator, ",\"coverage_generation\":");
+        try appendJsonU64(allocator, out, coverage_generation);
         try out.append(allocator, '}');
     }
 }
@@ -373,6 +380,13 @@ fn readCatalogU32(data: []const u8, pos: *usize) !u32 {
     if (pos.* + 4 > data.len) return error.InvalidBackupRequest;
     const value = std.mem.readInt(u32, data[pos.*..][0..4], .little);
     pos.* += 4;
+    return value;
+}
+
+fn readCatalogU64(data: []const u8, pos: *usize) !u64 {
+    if (pos.* + 8 > data.len) return error.InvalidBackupRequest;
+    const value = std.mem.readInt(u64, data[pos.*..][0..8], .little);
+    pos.* += 8;
     return value;
 }
 
@@ -476,6 +490,16 @@ fn appendJsonString(
     const escaped = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(value, .{})});
     defer allocator.free(escaped);
     try out.appendSlice(allocator, escaped);
+}
+
+fn appendJsonU64(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: u64,
+) !void {
+    const encoded = try std.fmt.allocPrint(allocator, "{d}", .{value});
+    defer allocator.free(encoded);
+    try out.appendSlice(allocator, encoded);
 }
 
 fn readFileAlloc(allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
@@ -639,7 +663,9 @@ test "lite restore staging preserves portable afb schema index and enrichment me
     var parsed_indexes = try std.json.parseFromSlice(std.json.Value, allocator, manifest.indexes_json, .{});
     defer parsed_indexes.deinit();
     try std.testing.expect(parsed_indexes.value == .object);
-    try std.testing.expect(parsed_indexes.value.object.get("ft_body") != null);
+    const ft_body = parsed_indexes.value.object.get("ft_body") orelse return error.TestExpectedEqual;
+    try std.testing.expect(ft_body == .object);
+    try std.testing.expect(ft_body.object.get("coverage_generation") != null);
     const enrichments = parsed_indexes.value.object.get("enrichments") orelse return error.TestExpectedEqual;
     try std.testing.expect(enrichments == .array);
     try std.testing.expectEqual(@as(usize, 1), enrichments.array.items.len);

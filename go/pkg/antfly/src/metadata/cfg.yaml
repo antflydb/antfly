@@ -22,4 +22,5 @@ import-mapping:
   reranking.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/reranking
   schema.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/schema
   indexes.yaml: github.com/antflydb/antfly/go/pkg/antfly/src/store/db/indexes
+  sort.yaml: github.com/antflydb/antfly/go/pkg/antfly/src/store/db/sorttypes
   query.yaml: github.com/antflydb/antfly/go/pkg/antfly/src/store/db/indexes

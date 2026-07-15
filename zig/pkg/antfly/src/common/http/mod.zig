@@ -29,6 +29,8 @@ pub const StdHttpExecutor = std_http_executor.StdHttpExecutor;
 pub const StdHttpExecutorConfig = std_http_executor.StdHttpExecutorConfig;
 pub const StdHttpListener = std_http_listener.StdHttpListener;
 pub const StdHttpListenerConfig = std_http_listener.StdHttpListenerConfig;
+pub const default_body_read_timeout_ms = std_http_listener.default_body_read_timeout_ms;
+pub const default_header_read_timeout_ms = std_http_listener.default_header_read_timeout_ms;
 pub const default_max_request_bytes = std_http_listener.default_max_request_bytes;
 
 test "common http module compiles" {
@@ -44,5 +46,7 @@ test "common http module compiles" {
     _ = StdHttpExecutorConfig;
     _ = StdHttpListener;
     _ = StdHttpListenerConfig;
+    _ = default_body_read_timeout_ms;
+    _ = default_header_read_timeout_ms;
     _ = default_max_request_bytes;
 }

@@ -3,6 +3,7 @@ SHELL := /bin/bash
 ZIG ?= zig
 ZIG_BUILD_FLAGS ?=
 UV ?= uv
+GIT ?= git
 SCRIPTS_PY := $(UV) run --project ../scripts --locked python
 INFERENCE_BIN ?= ./zig-out/bin/antfly
 SNOWBALL_REQUIRED_SOURCES := deps/snowball/zig/env.zig deps/snowball/compiler/analyser.c
@@ -14,6 +15,10 @@ else
 SNOWBALL_GENERATED_TARGETS :=
 SNOWBALL_CHECK_TARGETS :=
 endif
+OPENAPI_CODEGEN_SOURCES = build.zig build.zig.zon $(wildcard lib/openapi/src/*.zig)
+OPENAPI_CODEGEN_CACHE_KEY = $(strip $(shell $(GIT) hash-object $(OPENAPI_CODEGEN_SOURCES) 2>/dev/null | $(GIT) hash-object --stdin 2>/dev/null))
+OPENAPI_CODEGEN_CACHE_DIR ?= .zig-cache/openapi-generate-$(OPENAPI_CODEGEN_CACHE_KEY)
+OPENAPI_ZIG_BUILD = $(if $(OPENAPI_CODEGEN_CACHE_KEY),$(ZIG) build --cache-dir $(OPENAPI_CODEGEN_CACHE_DIR),$(error failed to compute OPENAPI_CODEGEN_CACHE_KEY; ensure git is available))
 
 # ====================================================================================
 # Build
@@ -75,10 +80,12 @@ generated-check: openapi-check snowball-check cabi-header-check sql-api-parity-f
 
 openapi-generate:
 	$(SCRIPTS_PY) ../scripts/join_public_openapi.py openapi.yaml
-	$(ZIG) build regen-openapi
+	$(OPENAPI_ZIG_BUILD) regen-openapi
 
 openapi-check:
-	$(ZIG) build openapi-check
+	$(SCRIPTS_PY) ../scripts/join_public_openapi.py --compare openapi.yaml
+	$(OPENAPI_ZIG_BUILD) regen-openapi
+	test -z "$$(git status --porcelain -- ../openapi.yaml pkg/antfly/src/openapi/generated pkg/inference/src/api/generated)"
 
 snowball-generate:
 	$(ZIG) build regen-snowball

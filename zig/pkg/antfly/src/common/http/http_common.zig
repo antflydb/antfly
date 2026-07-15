@@ -14,6 +14,9 @@
 
 const std = @import("std");
 
+pub const metadata_not_leader_header = "X-Antfly-Metadata-Not-Leader";
+pub const metadata_not_leader_value = "true";
+
 pub const Method = enum {
     GET,
     POST,

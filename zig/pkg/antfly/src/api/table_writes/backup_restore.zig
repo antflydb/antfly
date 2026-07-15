@@ -21,6 +21,7 @@ const db_mod = @import("../../storage/db/mod.zig");
 const doc_identity = @import("../../storage/db/doc_identity.zig");
 const portable_backup = @import("../../storage/portable_backup.zig");
 
+const restore_trash_dir_name = ".antfly-restore-trash";
 const dropped_table_trash_dir_name = ".antfly-drop-trash";
 
 pub const DroppedTableDeleteHook = struct {
@@ -125,11 +126,87 @@ pub fn prepareLocalTablePathForRestore(alloc: std.mem.Allocator, path: []const u
 
     const indexes_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{path});
     defer alloc.free(indexes_path);
-    std.Io.Dir.cwd().deleteTree(io, indexes_path) catch {};
+    try moveRestorePathToTrashIfPresent(alloc, io, path, indexes_path, "indexes");
 
     const snapshots_path = try std.fmt.allocPrint(alloc, "{s}.snapshots", .{path});
     defer alloc.free(snapshots_path);
     std.Io.Dir.cwd().deleteTree(io, snapshots_path) catch {};
+}
+
+fn moveRestorePathToTrashIfPresent(
+    alloc: std.mem.Allocator,
+    io: anytype,
+    table_path: []const u8,
+    source_path: []const u8,
+    name: []const u8,
+) !void {
+    const trash_dir_path = try std.fmt.allocPrint(alloc, "{s}/../{s}", .{ table_path, restore_trash_dir_name });
+    defer alloc.free(trash_dir_path);
+    try fs_paths.createDirPathPortable(io, trash_dir_path);
+
+    const trash_path = try std.fmt.allocPrint(alloc, "{s}/{s}-{d}", .{
+        trash_dir_path,
+        name,
+        platform_time.monotonicNs(),
+    });
+    defer alloc.free(trash_path);
+    std.Io.Dir.rename(std.Io.Dir.cwd(), source_path, std.Io.Dir.cwd(), trash_path, io) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+test "prepare restore moves existing indexes to restore trash" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root_path);
+    const table_path = try std.fmt.allocPrint(alloc, "{s}/restore-table", .{root_path});
+    defer alloc.free(table_path);
+    const indexes_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{table_path});
+    defer alloc.free(indexes_path);
+    const marker_path = try std.fmt.allocPrint(alloc, "{s}/marker.txt", .{indexes_path});
+    defer alloc.free(marker_path);
+    const snapshots_path = try std.fmt.allocPrint(alloc, "{s}.snapshots", .{table_path});
+    defer alloc.free(snapshots_path);
+    const snapshot_marker_path = try std.fmt.allocPrint(alloc, "{s}/marker.txt", .{snapshots_path});
+    defer alloc.free(snapshot_marker_path);
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    try fs_paths.createDirPathPortable(io, indexes_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = marker_path, .data = "index-marker" });
+    try fs_paths.createDirPathPortable(io, snapshots_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = snapshot_marker_path, .data = "snapshot-marker" });
+
+    try prepareLocalTablePathForRestore(alloc, table_path);
+
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, indexes_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, snapshots_path, .{}));
+
+    const trash_dir_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root_path, restore_trash_dir_name });
+    defer alloc.free(trash_dir_path);
+    var trash_dir = try std.Io.Dir.cwd().openDir(io, trash_dir_path, .{ .iterate = true });
+    defer trash_dir.close(io);
+
+    var found_indexes_trash = false;
+    var iter = trash_dir.iterateAssumeFirstIteration();
+    while (try iter.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        if (!std.mem.startsWith(u8, entry.name, "indexes-")) continue;
+        const moved_marker_path = try std.fmt.allocPrint(alloc, "{s}/{s}/marker.txt", .{ trash_dir_path, entry.name });
+        defer alloc.free(moved_marker_path);
+        const body = try std.Io.Dir.cwd().readFileAlloc(io, moved_marker_path, alloc, .limited(64));
+        defer alloc.free(body);
+        try std.testing.expectEqualStrings("index-marker", body);
+        found_indexes_trash = true;
+    }
+    try std.testing.expect(found_indexes_trash);
 }
 
 pub fn portableBackupShardRelPath(alloc: std.mem.Allocator, backup_id: []const u8) ![]u8 {

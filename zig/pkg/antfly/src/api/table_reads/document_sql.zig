@@ -25,6 +25,7 @@ const raft_mod = @import("../../raft/mod.zig");
 const core = @import("core.zig");
 const cache = @import("cache.zig");
 const remote_wire = @import("remote_wire.zig");
+const platform_time = @import("../../platform/time.zig");
 
 pub const RuntimeSourceAdapter = struct {
     source: core.TableReadSource,
@@ -260,13 +261,37 @@ pub fn requestWithResultIdentityGeneration(
     return out;
 }
 
+pub const default_aggregation_full_result_budget: u32 = 100_000;
+
+pub fn aggregationFullResultBudgetFromRaw(raw: ?[*:0]u8) u32 {
+    const value = raw orelse return default_aggregation_full_result_budget;
+    const slice = std.mem.span(value);
+    if (slice.len == 0) return default_aggregation_full_result_budget;
+    const parsed = std.fmt.parseUnsigned(u32, slice, 10) catch return default_aggregation_full_result_budget;
+    return if (parsed == 0) std.math.maxInt(u32) else parsed;
+}
+
+pub fn aggregationFullResultBudget() u32 {
+    return aggregationFullResultBudgetFromRaw(std.c.getenv("ANTFLY_AGGREGATION_FULL_RESULT_BUDGET\x00"));
+}
+
+pub fn checkQueryDeadline(req: db_mod.types.SearchRequest) !void {
+    const deadline_ns = req.execution_deadline_ns orelse return;
+    if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+}
+
 pub fn identityGenerationForAggregationFullResultRerun(
     req: db_mod.types.SearchRequest,
     result: db_mod.types.SearchResult,
 ) !?u64 {
-    if (!req.count_only and result.hits.len == result.total_hits) return req.identity_read_generation orelse result.identity_read_generation;
-    if (result.total_hits == 0) return req.identity_read_generation orelse result.identity_read_generation;
+    if (aggregationCanUseCurrentResult(req, result)) return req.identity_read_generation orelse result.identity_read_generation;
     return req.identity_read_generation orelse result.identity_read_generation orelse error.UnsupportedQueryRequest;
+}
+
+pub fn aggregationCanUseCurrentResult(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult) bool {
+    if (result.total_hits_relation != .exact) return false;
+    if (result.total_hits == 0) return true;
+    return !req.count_only and result.hits.len == result.total_hits;
 }
 
 /// True when the first-pass search already materialized every matching document,
@@ -281,12 +306,40 @@ pub fn aggregationFirstPassIsComplete(
     req: db_mod.types.SearchRequest,
     result: db_mod.types.SearchResult,
 ) bool {
+    if (result.total_hits_relation != .exact) return false;
     if (!req.include_stored) return false;
     if (req.limit == 0) return false;
     if (result.hits.len != result.total_hits) return false;
     // hits == total_hits but the page was filled to the limit: there may be more
     // matches the limit hid, so a full scan is still required.
     return result.hits.len < req.limit;
+}
+
+pub fn aggregationFullResultLimit(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult, operation: []const u8) !u32 {
+    try checkQueryDeadline(req);
+    if (result.total_hits_relation != .exact) return error.UnsupportedQueryRequest;
+    const budget = aggregationFullResultBudget();
+    if (result.total_hits > budget) {
+        std.log.warn("query aggregation full-result rerun budget exceeded operation={s} total_hits={d} budget={d}", .{
+            operation,
+            result.total_hits,
+            budget,
+        });
+        return error.QueryCandidateBudgetExceeded;
+    }
+    return result.total_hits;
+}
+
+pub fn aggregationFullResultRequest(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult, operation: []const u8) !db_mod.types.SearchRequest {
+    const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result);
+    const full_limit = try aggregationFullResultLimit(req, result, operation);
+    var full_req = req;
+    full_req.identity_read_generation = identity_read_generation;
+    full_req.offset = 0;
+    full_req.limit = full_limit;
+    full_req.include_stored = true;
+    full_req.count_only = false;
+    return full_req;
 }
 
 /// Limit to use when re-fetching all matching documents for scan-based
@@ -335,6 +388,42 @@ test "aggregation context rejects non-current identity generation" {
     }, &db));
 }
 
+test "aggregation completeness requires exact total relation" {
+    const req = db_mod.types.SearchRequest{};
+    try std.testing.expect(aggregationCanUseCurrentResult(req, .{
+        .alloc = std.testing.allocator,
+        .hits = &.{},
+        .total_hits = 0,
+        .total_hits_relation = .exact,
+    }));
+    try std.testing.expect(!aggregationCanUseCurrentResult(req, .{
+        .alloc = std.testing.allocator,
+        .hits = &.{},
+        .total_hits = 0,
+        .total_hits_relation = .gte,
+    }));
+
+    const hits = [_]db_mod.types.SearchHit{.{ .id = @constCast("doc:a") }};
+    try std.testing.expect(aggregationCanUseCurrentResult(req, .{
+        .alloc = std.testing.allocator,
+        .hits = @constCast(hits[0..]),
+        .total_hits = 1,
+        .total_hits_relation = .exact,
+    }));
+    try std.testing.expect(!aggregationCanUseCurrentResult(req, .{
+        .alloc = std.testing.allocator,
+        .hits = @constCast(hits[0..]),
+        .total_hits = 1,
+        .total_hits_relation = .gte,
+    }));
+    try std.testing.expectError(error.UnsupportedQueryRequest, aggregationFullResultLimit(.{}, .{
+        .alloc = std.testing.allocator,
+        .hits = @constCast(hits[0..]),
+        .total_hits = 1,
+        .total_hits_relation = .gte,
+    }, "test"));
+}
+
 test "aggregation full-result rerun can reuse snapped result identity generation" {
     const alloc = std.testing.allocator;
 
@@ -361,11 +450,40 @@ test "aggregation full-result rerun can reuse snapped result identity generation
         .total_hits = 0,
     };
     try std.testing.expectEqual(@as(?u64, null), try identityGenerationForAggregationFullResultRerun(.{}, complete));
+    try std.testing.expect(aggregationCanUseCurrentResult(.{}, complete));
 
     try std.testing.expect(!aggregationFirstPassIsComplete(.{ .include_stored = false, .limit = 10 }, result));
     try std.testing.expect(!aggregationFirstPassIsComplete(.{ .include_stored = true, .limit = 1 }, result));
     result.total_hits = 1;
     try std.testing.expect(aggregationFirstPassIsComplete(.{ .include_stored = true, .limit = 10 }, result));
+    try std.testing.expect(aggregationCanUseCurrentResult(.{}, result));
+    result.total_hits_relation = .gte;
+    try std.testing.expect(!aggregationFirstPassIsComplete(.{ .include_stored = true, .limit = 10 }, result));
+    try std.testing.expect(!aggregationCanUseCurrentResult(.{}, result));
+    try std.testing.expectError(error.UnsupportedQueryRequest, aggregationFullResultLimit(.{}, result, "test"));
+
+    result.total_hits_relation = .exact;
+    result.total_hits = default_aggregation_full_result_budget + 1;
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, aggregationFullResultLimit(.{}, result, "test"));
+
+    result.total_hits = 1;
+    const full_req = try aggregationFullResultRequest(.{
+        .offset = 10,
+        .limit = 5,
+        .count_only = true,
+        .include_stored = false,
+    }, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+        .total_hits_relation = .exact,
+        .identity_read_generation = 99,
+    }, "test");
+    try std.testing.expectEqual(@as(u32, 0), full_req.offset);
+    try std.testing.expectEqual(@as(u32, 1), full_req.limit);
+    try std.testing.expect(!full_req.count_only);
+    try std.testing.expect(full_req.include_stored);
+    try std.testing.expectEqual(@as(?u64, 99), full_req.identity_read_generation);
 }
 
 test "aggregation full-scan limit uses primary count and distributed fallback is unbounded" {

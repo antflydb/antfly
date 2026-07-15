@@ -180,8 +180,10 @@ pub const Provider = struct {
     }
 
     pub fn embedParts(self: *Provider, alloc: std.mem.Allocator, model: []const u8, parts: []const template_mod.ContentPart) !inference.EmbedResult {
-        var values = std.json.Array.init(alloc);
-        defer values.deinit();
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const json_alloc = arena_state.allocator();
+        var values = std.json.Array.init(json_alloc);
         var encoded_buffers = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (encoded_buffers.items) |buf| alloc.free(buf);
@@ -192,20 +194,17 @@ pub const Provider = struct {
             switch (part) {
                 .text => |text| {
                     var obj = std.json.ObjectMap.empty;
-                    errdefer obj.deinit(alloc);
-                    try obj.put(alloc, "type", .{ .string = "text" });
-                    try obj.put(alloc, "text", .{ .string = text });
+                    try obj.put(json_alloc, "type", .{ .string = "text" });
+                    try obj.put(json_alloc, "text", .{ .string = text });
                     try values.append(.{ .object = obj });
                 },
                 .media_url => |url| {
                     var image_url = std.json.ObjectMap.empty;
-                    errdefer image_url.deinit(alloc);
-                    try image_url.put(alloc, "url", .{ .string = url });
+                    try image_url.put(json_alloc, "url", .{ .string = url });
 
                     var obj = std.json.ObjectMap.empty;
-                    errdefer obj.deinit(alloc);
-                    try obj.put(alloc, "type", .{ .string = "image_url" });
-                    try obj.put(alloc, "image_url", .{ .object = image_url });
+                    try obj.put(json_alloc, "type", .{ .string = "image_url" });
+                    try obj.put(json_alloc, "image_url", .{ .object = image_url });
                     try values.append(.{ .object = obj });
                 },
                 .binary => |binary_part| {
@@ -217,13 +216,12 @@ pub const Provider = struct {
 
                     var obj = std.json.ObjectMap.empty;
                     errdefer {
-                        obj.deinit(alloc);
                         _ = encoded_buffers.pop();
                         alloc.free(encoded);
                     }
-                    try obj.put(alloc, "type", .{ .string = "media" });
-                    try obj.put(alloc, "data", .{ .string = encoded });
-                    try obj.put(alloc, "mime_type", .{ .string = binary_part.mime_type });
+                    try obj.put(json_alloc, "type", .{ .string = "media" });
+                    try obj.put(json_alloc, "data", .{ .string = encoded });
+                    try obj.put(json_alloc, "mime_type", .{ .string = binary_part.mime_type });
                     try values.append(.{ .object = obj });
                 },
             }
@@ -845,5 +843,5 @@ test "antfly embed fails on non-200 response" {
     try ts.handleOne();
     group.await(io) catch {};
 
-    try std.testing.expectEqual(error.EmbedRequestFailed, result_err);
+    try std.testing.expectEqual(error.EmbedTransientFailure, result_err);
 }

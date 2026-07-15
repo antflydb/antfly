@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const metadata_openapi = @import("antfly_metadata_openapi");
+const query_contract = @import("query_contract.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 
 pub fn jsonResponse(alloc: std.mem.Allocator, value: anytype) !http_common.HttpResponse {
@@ -90,6 +91,7 @@ pub const OwnedScanKeysRequest = struct {
     from: []const u8 = "",
     to: []const u8 = "",
     fields: [][]const u8 = &.{},
+    filter_query_json: []const u8 = "",
     opts: @import("../storage/db/types.zig").ScanOptions = .{},
 
     pub fn deinit(self: *OwnedScanKeysRequest, alloc: std.mem.Allocator) void {
@@ -97,6 +99,7 @@ pub const OwnedScanKeysRequest = struct {
         if (self.to.len > 0) alloc.free(self.to);
         for (self.fields) |field| alloc.free(field);
         if (self.fields.len > 0) alloc.free(self.fields);
+        if (self.filter_query_json.len > 0) alloc.free(@constCast(self.filter_query_json));
         self.* = undefined;
     }
 };
@@ -108,8 +111,10 @@ pub fn parseLookupOptions(alloc: std.mem.Allocator, query: []const u8) !OwnedLoo
         if (!std.mem.startsWith(u8, part, "fields=")) continue;
         const raw_fields = part["fields=".len..];
         if (raw_fields.len == 0) return .{};
+        const decoded_fields = try decodePercentEncodedPathComponentAlloc(alloc, raw_fields);
+        defer alloc.free(decoded_fields);
         var field_count: usize = 1;
-        for (raw_fields) |ch| {
+        for (decoded_fields) |ch| {
             if (ch == ',') field_count += 1;
         }
         const fields = try alloc.alloc([]const u8, field_count);
@@ -118,7 +123,7 @@ pub fn parseLookupOptions(alloc: std.mem.Allocator, query: []const u8) !OwnedLoo
             for (fields[0..field_index]) |field| alloc.free(field);
             alloc.free(fields);
         }
-        var field_it = std.mem.splitScalar(u8, raw_fields, ',');
+        var field_it = std.mem.splitScalar(u8, decoded_fields, ',');
         while (field_it.next()) |field| {
             fields[field_index] = try alloc.dupe(u8, field);
             field_index += 1;
@@ -162,6 +167,16 @@ pub fn decodePercentEncodedPathComponentAlloc(alloc: std.mem.Allocator, raw: []c
     return try alloc.realloc(out, out_index);
 }
 
+test "lookup options decode generated SDK query values before splitting fields" {
+    const alloc = std.testing.allocator;
+    var opts = try parseLookupOptions(alloc, "fields=title%2Cbody%2Cauthor");
+    defer opts.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), opts.fields.len);
+    try std.testing.expectEqualStrings("title", opts.fields[0]);
+    try std.testing.expectEqualStrings("body", opts.fields[1]);
+    try std.testing.expectEqualStrings("author", opts.fields[2]);
+}
+
 pub fn parseScanKeysRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedScanKeysRequest {
     if (body.len == 0) return .{};
 
@@ -178,11 +193,17 @@ pub fn parseScanKeysRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedSc
     errdefer if (from.len > 0) alloc.free(from);
     const to = if (parsed.value.to) |value| try alloc.dupe(u8, value) else "";
     errdefer if (to.len > 0) alloc.free(to);
+    const filter_query_json = if (parsed.value.filter_query) |filter_query|
+        try query_contract.normalizePublicFilterQueryAlloc(alloc, filter_query)
+    else
+        "";
+    errdefer if (filter_query_json.len > 0) alloc.free(filter_query_json);
 
     return .{
         .from = from,
         .to = to,
         .fields = fields,
+        .filter_query_json = filter_query_json,
         .opts = .{
             .inclusive_from = parsed.value.inclusive_from orelse false,
             .exclusive_to = parsed.value.exclusive_to orelse false,
@@ -193,6 +214,7 @@ pub fn parseScanKeysRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedSc
                 0,
             .fields = fields,
             .include_all_fields = false,
+            .filter_query_json = filter_query_json,
         },
     };
 }
@@ -214,4 +236,20 @@ fn cloneFieldList(alloc: std.mem.Allocator, raw_fields: []const []const u8) ![][
 fn freeFieldList(alloc: std.mem.Allocator, fields: [][]const u8) void {
     for (fields) |field| alloc.free(field);
     if (fields.len > 0) alloc.free(fields);
+}
+
+test "parse scan request normalizes filter query" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "filter_query": {"term": {"tenant": "t1"}}
+        \\}
+    ;
+
+    var parsed = try parseScanKeysRequest(alloc, body);
+    defer parsed.deinit(alloc);
+
+    try std.testing.expect(!parsed.opts.include_documents);
+    try std.testing.expectEqualStrings(parsed.filter_query_json, parsed.opts.filter_query_json);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.filter_query_json, "\"tenant\"") != null);
 }

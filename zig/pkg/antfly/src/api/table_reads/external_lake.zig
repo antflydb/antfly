@@ -42,6 +42,7 @@ const TableReadSource = table_read_core.TableReadSource;
 const LookupResponse = table_read_core.LookupResponse;
 const ScanResponse = table_read_core.ScanResponse;
 const LsmStorageStats = table_read_core.LsmStorageStats;
+const ObservedDynamicFieldCapabilitySet = table_read_core.ObservedDynamicFieldCapabilitySet;
 const table_read_relational_rows = @import("relational_rows.zig");
 
 pub const PinnedExternalLakeRowsScanner = struct {
@@ -1091,6 +1092,10 @@ pub const ExternalLakeRoutingTableReadSource = struct {
                 .relational_temporal_unique_overlap_owner_lookup_group_local = relationalTemporalUniqueOverlapOwnerLookupGroupLocal,
                 .rows_query_plan = rowsQueryPlan,
                 .rows_query_plan_catalog = rowsQueryPlanCatalog,
+                .rows_query_plan_system_time_as_of_sequence = rowsQueryPlanSystemTimeAsOfSequence,
+                .rows_query_plan_catalog_system_time_as_of_sequence = rowsQueryPlanCatalogSystemTimeAsOfSequence,
+                .rows_query_plan_system_time_as_of_timestamp_ns = rowsQueryPlanSystemTimeAsOfTimestampNs,
+                .rows_query_plan_catalog_system_time_as_of_timestamp_ns = rowsQueryPlanCatalogSystemTimeAsOfTimestampNs,
                 .rows_set_operation_plan = rowsSetOperationPlan,
                 .rows_set_operation_plan_catalog = rowsSetOperationPlanCatalog,
                 .rows_aggregate_plan = rowsAggregatePlan,
@@ -1114,7 +1119,9 @@ pub const ExternalLakeRoutingTableReadSource = struct {
                 .graph_hydrate_group_local = graphHydrateGroupLocal,
                 .graph_edges_group_local = graphEdgesGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
+                .local_runtime_statuses_catalog = localRuntimeStatusesCatalog,
                 .lsm_storage_stats = lsmStorageStats,
+                .observed_dynamic_field_capability_sets = observedDynamicFieldCapabilitySets,
                 .document_artifact_manifest = documentArtifactManifest,
                 .document_artifact_manifests = documentArtifactManifests,
                 .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
@@ -1240,6 +1247,30 @@ pub const ExternalLakeRoutingTableReadSource = struct {
         var lake_source = try self.openedLakeSourceAlloc(alloc, runtime_schema);
         defer lake_source.deinit();
         return try lake_source.source().rowsQueryPlan(alloc, target.table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsQueryPlanSystemTimeAsOfSequence(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, runtime_schema: storage_schema.TableSchema, commit_sequence: u64, plan: db_mod.types.RelationalRowsQueryPlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (runtime_schema.external_base_source != null) return error.UnsupportedOperation;
+        return try self.base.rowsQueryPlanSystemTimeAsOfSequence(alloc, table_name, runtime_schema, commit_sequence, plan, consistency);
+    }
+
+    fn rowsQueryPlanCatalogSystemTimeAsOfSequence(ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget, runtime_schema: storage_schema.TableSchema, commit_sequence: u64, plan: db_mod.types.RelationalRowsQueryPlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (runtime_schema.external_base_source != null) return error.UnsupportedOperation;
+        return try self.base.rowsQueryPlanCatalogSystemTimeAsOfSequence(alloc, target, runtime_schema, commit_sequence, plan, consistency);
+    }
+
+    fn rowsQueryPlanSystemTimeAsOfTimestampNs(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, runtime_schema: storage_schema.TableSchema, timestamp_ns: u64, plan: db_mod.types.RelationalRowsQueryPlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (runtime_schema.external_base_source != null) return error.UnsupportedOperation;
+        return try self.base.rowsQueryPlanSystemTimeAsOfTimestampNs(alloc, table_name, runtime_schema, timestamp_ns, plan, consistency);
+    }
+
+    fn rowsQueryPlanCatalogSystemTimeAsOfTimestampNs(ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget, runtime_schema: storage_schema.TableSchema, timestamp_ns: u64, plan: db_mod.types.RelationalRowsQueryPlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (runtime_schema.external_base_source != null) return error.UnsupportedOperation;
+        return try self.base.rowsQueryPlanCatalogSystemTimeAsOfTimestampNs(alloc, target, runtime_schema, timestamp_ns, plan, consistency);
     }
 
     fn rowsSetOperationPlan(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, runtime_schema: storage_schema.TableSchema, plan: db_mod.types.RelationalRowsSetOperationPlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
@@ -1381,9 +1412,19 @@ pub const ExternalLakeRoutingTableReadSource = struct {
         return try self.base.localRuntimeStatuses(alloc, table_name);
     }
 
+    fn localRuntimeStatusesCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget) !?runtime_status.LocalTableRuntimeStatuses {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.localRuntimeStatusesCatalog(alloc, target);
+    }
+
     fn lsmStorageStats(ptr: *anyopaque, table_name: []const u8) !?LsmStorageStats {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return try self.base.lsmStorageStats(table_name);
+    }
+
+    fn observedDynamicFieldCapabilitySets(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !?[]ObservedDynamicFieldCapabilitySet {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.observedDynamicFieldCapabilitySets(alloc, table_name);
     }
 
     fn documentArtifactManifest(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, doc_key: []const u8, artifact_name: []const u8, consistency: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
@@ -3496,7 +3537,10 @@ test "external lake routing source resolves object store for external row plans"
 
     const FakeBase = struct {
         rows_query_count: u32 = 0,
+        rows_query_system_time_count: u32 = 0,
         document_algebraic_aggregate_count: u32 = 0,
+        local_runtime_statuses_catalog_count: u32 = 0,
+        observed_dynamic_capability_sets_count: u32 = 0,
 
         fn source(self: *@This()) TableReadSource {
             return .{
@@ -3507,6 +3551,9 @@ test "external lake routing source resolves object store for external row plans"
                     .query = query,
                     .document_algebraic_aggregate = documentAlgebraicAggregate,
                     .rows_query_plan = rowsQueryPlan,
+                    .rows_query_plan_system_time_as_of_sequence = rowsQueryPlanSystemTimeAsOfSequence,
+                    .local_runtime_statuses_catalog = localRuntimeStatusesCatalog,
+                    .observed_dynamic_field_capability_sets = observedDynamicFieldCapabilitySets,
                 },
             };
         }
@@ -3527,6 +3574,24 @@ test "external lake routing source resolves object store for external row plans"
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.rows_query_count += 1;
             return error.BaseRowsQueryReached;
+        }
+
+        fn rowsQueryPlanSystemTimeAsOfSequence(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: storage_schema.TableSchema, _: u64, _: db_mod.types.RelationalRowsQueryPlan, _: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.rows_query_system_time_count += 1;
+            return error.BaseRowsSystemTimeReached;
+        }
+
+        fn localRuntimeStatusesCatalog(ptr: *anyopaque, _: std.mem.Allocator, _: catalog_resources.TableTarget) !?runtime_status.LocalTableRuntimeStatuses {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.local_runtime_statuses_catalog_count += 1;
+            return error.BaseCatalogRuntimeStatusReached;
+        }
+
+        fn observedDynamicFieldCapabilitySets(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8) !?[]ObservedDynamicFieldCapabilitySet {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.observed_dynamic_capability_sets_count += 1;
+            return error.BaseObservedDynamicCapabilitiesReached;
         }
 
         fn documentAlgebraicAggregate(
@@ -3610,6 +3675,22 @@ test "external lake routing source resolves object store for external row plans"
     try std.testing.expectError(error.BaseRowsQueryReached, source.rowsQueryPlan(alloc, "events", local_schema, plan, .read_index));
     try std.testing.expectEqual(@as(u32, 1), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 1), base.rows_query_count);
+
+    try std.testing.expectError(error.UnsupportedOperation, source.rowsQueryPlanSystemTimeAsOfSequence(alloc, "events", external_schema, 11, plan, .read_index));
+    try std.testing.expectEqual(@as(u32, 0), base.rows_query_system_time_count);
+
+    try std.testing.expectError(error.BaseRowsSystemTimeReached, source.rowsQueryPlanSystemTimeAsOfSequence(alloc, "events", local_schema, 11, plan, .read_index));
+    try std.testing.expectEqual(@as(u32, 1), base.rows_query_system_time_count);
+
+    try std.testing.expectError(error.BaseCatalogRuntimeStatusReached, source.localRuntimeStatusesCatalog(alloc, .{
+        .database_name = "main",
+        .namespace_name = "public",
+        .table_name = "events",
+    }));
+    try std.testing.expectEqual(@as(u32, 1), base.local_runtime_statuses_catalog_count);
+
+    try std.testing.expectError(error.BaseObservedDynamicCapabilitiesReached, source.observedDynamicFieldCapabilitySets(alloc, "events"));
+    try std.testing.expectEqual(@as(u32, 1), base.observed_dynamic_capability_sets_count);
 
     var aggregate = (try source.documentAlgebraicAggregate(alloc, "docs", .{
         .index_name = "amount_alg",

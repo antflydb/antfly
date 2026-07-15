@@ -159,7 +159,14 @@ pub fn applyJoinResponseMetadata(
     hits_obj: *std.json.ObjectMap,
     metadata: JoinResponseMetadata,
 ) !void {
-    try setObjectFieldOwned(alloc, hits_obj, "total", .{ .integer = @intCast(metadata.total_hits) });
+    var total_obj = std.json.ObjectMap.empty;
+    errdefer {
+        var total_value = std.json.Value{ .object = total_obj };
+        json_helpers.deinitJsonValue(alloc, &total_value);
+    }
+    try setObjectFieldOwned(alloc, &total_obj, "value", .{ .integer = @intCast(metadata.total_hits) });
+    try setObjectFieldOwned(alloc, &total_obj, "relation", .{ .string = try alloc.dupe(u8, "exact") });
+    try setObjectFieldOwned(alloc, hits_obj, "total", .{ .object = total_obj });
     try setObjectFieldOwned(alloc, hits_obj, "max_score", .{ .float = metadata.max_score });
 }
 
@@ -809,7 +816,9 @@ test "join model applies shell to response and refreshes hit metadata" {
     const hits_ptr = try queryHitsArrayPtr(&root);
 
     try std.testing.expectEqual(@as(usize, 2), hits_ptr.items.len);
-    try std.testing.expectEqual(@as(i64, 2), hits_obj.get("total").?.integer);
+    const total = hits_obj.get("total").?.object;
+    try std.testing.expectEqual(@as(i64, 2), total.get("value").?.integer);
+    try std.testing.expectEqualStrings("exact", total.get("relation").?.string);
     try std.testing.expectApproxEqAbs(@as(f64, 2.25), hits_obj.get("max_score").?.float, 0.000001);
     try std.testing.expectEqualStrings("doc:1", hits_ptr.items[0].object.get("_id").?.string);
     try std.testing.expect(hits_ptr.items[0].object.get(internal_doc_identity_key_field) == null);

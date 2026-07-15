@@ -860,7 +860,7 @@ pub const SessionRegistry = struct {
         };
         self.mutex.lock();
         defer self.mutex.unlock();
-        try self.renewLeaseLocked(txn_id, owner_node_id);
+        try self.forceRenewLeaseLockedAt(txn_id, owner_node_id, now);
         try self.sessions.put(alloc, txn_id, session);
         try self.persistLocked(session);
         return session.info();

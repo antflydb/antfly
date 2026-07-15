@@ -24,17 +24,67 @@ const backend_types = @import("../backend_types.zig");
 const change_journal_mod = @import("../db/derived/change_journal.zig");
 const internal_keys = @import("../internal_keys.zig");
 const native = @import("native.zig");
+const resource_manager_mod = @import("../resource_manager.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const OpenOptions = struct {
     read_only: bool = false,
     no_sync: bool = false,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
 
 pub const CreateOptions = struct {
     exclusive: bool = false,
     no_sync: bool = false,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
+};
+
+/// Immutable, refcounted materialized view of the document store at one
+/// checkpoint. The store caches the latest snapshot so transactions can share
+/// it instead of re-walking the document page chain per transaction; open
+/// transactions keep their snapshot alive after newer ones are published,
+/// preserving the existing pinned-snapshot semantics.
+const SharedSnapshot = struct {
+    allocator: Allocator,
+    refs: std.atomic.Value(usize),
+    commit_sequence: u64,
+    document_root_page: u64,
+    docs: []native.OwnedDocument,
+    resource_reservation: ?resource_manager_mod.Reservation = null,
+
+    fn create(
+        allocator: Allocator,
+        docs: []native.OwnedDocument,
+        commit_sequence: u64,
+        document_root_page: u64,
+        initial_refs: usize,
+        resource_reservation: ?resource_manager_mod.Reservation,
+    ) !*SharedSnapshot {
+        const snap = try allocator.create(SharedSnapshot);
+        snap.* = .{
+            .allocator = allocator,
+            .refs = .init(initial_refs),
+            .commit_sequence = commit_sequence,
+            .document_root_page = document_root_page,
+            .docs = docs,
+            .resource_reservation = resource_reservation,
+        };
+        return snap;
+    }
+
+    fn retain(self: *SharedSnapshot) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    fn release(self: *SharedSnapshot) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) {
+            const allocator = self.allocator;
+            if (self.resource_reservation) |*reservation| reservation.release();
+            native.NativeFile.freeSnapshotDocuments(allocator, self.docs);
+            allocator.destroy(self);
+        }
+    }
 };
 
 pub const Store = struct {
@@ -43,6 +93,8 @@ pub const Store = struct {
     read_only: bool = false,
     mutex: std.atomic.Mutex = .unlocked,
     writer_active: bool = false,
+    cached_snapshot: ?*SharedSnapshot = null,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
 
     pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !Store {
         return try openWithOptions(allocator, path, .{ .read_only = read_only });
@@ -52,11 +104,13 @@ pub const Store = struct {
         const file = try native.NativeFile.openWithOptions(allocator, path, .{
             .read_only = opts.read_only,
             .no_sync = opts.no_sync,
+            .resource_manager = opts.resource_manager,
         });
         return .{
             .allocator = allocator,
             .file = file,
             .read_only = opts.read_only,
+            .resource_manager = opts.resource_manager,
         };
     }
 
@@ -68,15 +122,18 @@ pub const Store = struct {
         const file = try native.NativeFile.createWithOptions(allocator, path, .{
             .exclusive = opts.exclusive,
             .no_sync = opts.no_sync,
+            .resource_manager = opts.resource_manager,
         });
         return .{
             .allocator = allocator,
             .file = file,
             .read_only = false,
+            .resource_manager = opts.resource_manager,
         };
     }
 
     pub fn close(self: *Store) void {
+        if (self.cached_snapshot) |snap| snap.release();
         self.file.close();
         self.* = undefined;
     }
@@ -95,7 +152,9 @@ pub const Store = struct {
 
         lockStore(self);
         defer self.mutex.unlock();
-        return try self.file.vacuum();
+        const report = try self.file.vacuum();
+        clearCachedSnapshotLocked(self);
+        return report;
     }
 
     pub fn reserveWriterSlot(self: *Store) !void {
@@ -389,9 +448,152 @@ const PendingMutation = struct {
     value: ?[]u8 = null,
 };
 
+fn clearCachedSnapshotLocked(store: *Store) void {
+    if (store.cached_snapshot) |old| old.release();
+    store.cached_snapshot = null;
+}
+
+fn snapshotByteCost(docs: []const native.OwnedDocument) u64 {
+    var total: u64 = @sizeOf(SharedSnapshot) + @as(u64, @intCast(docs.len)) * @as(u64, @sizeOf(native.OwnedDocument));
+    for (docs) |doc| {
+        total +|= @intCast(doc.key.len);
+        total +|= @intCast(doc.value.len);
+    }
+    return total;
+}
+
+fn createCachedSnapshotLocked(
+    store: *Store,
+    docs: []native.OwnedDocument,
+    commit_sequence: u64,
+    document_root_page: u64,
+    initial_refs: usize,
+) !?*SharedSnapshot {
+    var reservation: ?resource_manager_mod.Reservation = null;
+    if (store.resource_manager) |manager| {
+        reservation = manager.reserve(.lite_docstore_snapshot_cache, snapshotByteCost(docs)) catch return null;
+    }
+    errdefer if (reservation) |*reserved| reserved.release();
+    return try SharedSnapshot.create(store.allocator, docs, commit_sequence, document_root_page, initial_refs, reservation);
+}
+
+fn createUncachedSnapshot(
+    store: *Store,
+    docs: []native.OwnedDocument,
+    commit_sequence: u64,
+    document_root_page: u64,
+) !*SharedSnapshot {
+    return try SharedSnapshot.create(store.allocator, docs, commit_sequence, document_root_page, 1, null);
+}
+
+/// Returns a retained snapshot for the store's active checkpoint, reusing the
+/// cached one when it is still current. Must be called with `store.mutex`
+/// held.
+fn acquireSnapshotLocked(store: *Store) !*SharedSnapshot {
+    const checkpoint = store.file.activeCheckpoint();
+    if (store.cached_snapshot) |snap| {
+        if (snap.commit_sequence == checkpoint.commit_sequence and
+            snap.document_root_page == checkpoint.document_root_page)
+        {
+            snap.retain();
+            return snap;
+        }
+    }
+
+    const docs = try store.file.snapshotDocumentsAlloc(store.allocator);
+    errdefer native.NativeFile.freeSnapshotDocuments(store.allocator, docs);
+    if (store.cached_snapshot) |_| clearCachedSnapshotLocked(store);
+    // Two refs: one owned by the store cache, one handed to the caller.
+    if (try createCachedSnapshotLocked(store, docs, checkpoint.commit_sequence, checkpoint.document_root_page, 2)) |snap| {
+        store.cached_snapshot = snap;
+        return snap;
+    }
+    return try createUncachedSnapshot(store, docs, checkpoint.commit_sequence, checkpoint.document_root_page);
+}
+
+/// After a successful `putDocumentBatch`, publish the committing
+/// transaction's mutations applied to its base snapshot as the store's cached
+/// snapshot for the new checkpoint. The document chain cannot have moved
+/// between the base snapshot and this commit because the committer held the
+/// writer slot throughout. Failure just drops the cache; the next transaction
+/// rebuilds from disk. Must be called with `store.mutex` held.
+fn publishAppliedSnapshotLocked(store: *Store, base: []const native.OwnedDocument, pending: []const PendingMutation) void {
+    const applied = buildAppliedSnapshotDocs(store.allocator, base, pending) catch return clearCachedSnapshotLocked(store);
+    const checkpoint = store.file.activeCheckpoint();
+    clearCachedSnapshotLocked(store);
+    const maybe_snap = createCachedSnapshotLocked(
+        store,
+        applied,
+        checkpoint.commit_sequence,
+        checkpoint.document_root_page,
+        1,
+    ) catch {
+        native.NativeFile.freeSnapshotDocuments(store.allocator, applied);
+        return clearCachedSnapshotLocked(store);
+    };
+    if (maybe_snap) |snap| {
+        store.cached_snapshot = snap;
+    } else {
+        native.NativeFile.freeSnapshotDocuments(store.allocator, applied);
+    }
+}
+
+/// Builds the sorted post-commit document set from a base snapshot plus the
+/// commit's pending mutations. Later mutations win over earlier ones for the
+/// same key and deletes drop the key, matching both `Txn.get` overlay
+/// semantics and what a fresh chain walk would materialize after
+/// `putDocumentBatch` appended the same mutations in order.
+fn buildAppliedSnapshotDocs(
+    allocator: Allocator,
+    base: []const native.OwnedDocument,
+    pending: []const PendingMutation,
+) ![]native.OwnedDocument {
+    var updates = std.StringHashMapUnmanaged(?[]const u8).empty;
+    defer updates.deinit(allocator);
+    for (pending) |mutation| {
+        try updates.put(allocator, mutation.key, mutation.value);
+    }
+
+    var docs = std.ArrayListUnmanaged(native.OwnedDocument).empty;
+    errdefer {
+        for (docs.items) |doc| {
+            allocator.free(doc.key);
+            allocator.free(doc.value);
+        }
+        docs.deinit(allocator);
+    }
+    try docs.ensureTotalCapacity(allocator, base.len + updates.count());
+
+    for (base) |doc| {
+        if (updates.contains(doc.key)) continue;
+        const key = try allocator.dupe(u8, doc.key);
+        errdefer allocator.free(key);
+        const value = try allocator.dupe(u8, doc.value);
+        docs.appendAssumeCapacity(.{ .key = key, .value = value });
+    }
+
+    var it = updates.iterator();
+    while (it.next()) |entry| {
+        const value_src = entry.value_ptr.* orelse continue;
+        const key = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(key);
+        const value = try allocator.dupe(u8, value_src);
+        docs.appendAssumeCapacity(.{ .key = key, .value = value });
+    }
+
+    const owned = try docs.toOwnedSlice(allocator);
+    std.mem.sort(native.OwnedDocument, owned, {}, struct {
+        fn lessThan(_: void, lhs: native.OwnedDocument, rhs: native.OwnedDocument) bool {
+            return std.mem.order(u8, lhs.key, rhs.key) == .lt;
+        }
+    }.lessThan);
+    return owned;
+}
+
 pub const Txn = struct {
     allocator: Allocator,
     store: ?*Store = null,
+    snapshot: ?*SharedSnapshot = null,
     docs: []native.OwnedDocument = &.{},
     pending: std.ArrayListUnmanaged(PendingMutation) = .empty,
     read_only: bool = true,
@@ -400,9 +602,11 @@ pub const Txn = struct {
     pub fn openRead(store: *Store) !Txn {
         lockStore(store);
         defer store.mutex.unlock();
+        const snapshot = try acquireSnapshotLocked(store);
         return .{
             .allocator = store.allocator,
-            .docs = try store.file.snapshotDocumentsAlloc(store.allocator),
+            .snapshot = snapshot,
+            .docs = snapshot.docs,
             .read_only = true,
         };
     }
@@ -414,10 +618,12 @@ pub const Txn = struct {
         lockStore(store);
         defer store.mutex.unlock();
 
+        const snapshot = try acquireSnapshotLocked(store);
         return .{
             .allocator = store.allocator,
             .store = store,
-            .docs = try store.file.snapshotDocumentsAlloc(store.allocator),
+            .snapshot = snapshot,
+            .docs = snapshot.docs,
             .read_only = false,
             .writer_reserved = true,
         };
@@ -430,10 +636,12 @@ pub const Txn = struct {
         lockStore(store);
         defer store.mutex.unlock();
 
+        const snapshot = try acquireSnapshotLocked(store);
         return .{
             .allocator = store.allocator,
             .store = store,
-            .docs = try store.file.snapshotDocumentsAlloc(store.allocator),
+            .snapshot = snapshot,
+            .docs = snapshot.docs,
             .read_only = false,
             .writer_reserved = true,
         };
@@ -441,7 +649,7 @@ pub const Txn = struct {
 
     pub fn abort(self: *Txn) void {
         self.freePending();
-        native.NativeFile.freeSnapshotDocuments(self.allocator, self.docs);
+        if (self.snapshot) |snap| snap.release();
         self.releaseWriterSlot();
         self.* = undefined;
     }
@@ -468,13 +676,18 @@ pub const Txn = struct {
             }
         }
         try store.file.putDocumentBatch(mutations);
+        // An empty batch publishes no new checkpoint, so the existing cached
+        // snapshot is still current.
+        if (self.pending.items.len > 0) {
+            publishAppliedSnapshotLocked(store, self.docs, self.pending.items);
+        }
         if (self.writer_reserved) {
             store.writer_active = false;
             self.writer_reserved = false;
         }
 
         self.freePending();
-        native.NativeFile.freeSnapshotDocuments(self.allocator, self.docs);
+        if (self.snapshot) |snap| snap.release();
         self.* = undefined;
     }
 
@@ -977,4 +1190,255 @@ test "lite native docstore reserves one writer until abort or commit" {
     var next_writer = try store.beginWrite();
     defer next_writer.abort();
     try std.testing.expectEqualStrings("committed", try next_writer.get("doc:a"));
+}
+
+fn expectCachedSnapshotMatchesDiskRebuild(store: *Store) !void {
+    const allocator = std.testing.allocator;
+    const cached = store.cached_snapshot orelse return error.TestUnexpectedResult;
+
+    const checkpoint = store.file.activeCheckpoint();
+    try std.testing.expectEqual(checkpoint.commit_sequence, cached.commit_sequence);
+    try std.testing.expectEqual(checkpoint.document_root_page, cached.document_root_page);
+
+    const rebuilt = try store.file.snapshotDocumentsAlloc(allocator);
+    defer native.NativeFile.freeSnapshotDocuments(allocator, rebuilt);
+
+    try std.testing.expectEqual(rebuilt.len, cached.docs.len);
+    for (rebuilt, cached.docs) |expected, actual| {
+        try std.testing.expectEqualStrings(expected.key, actual.key);
+        try std.testing.expectEqualStrings(expected.value, actual.value);
+    }
+}
+
+test "lite native docstore applied snapshot matches disk rebuild across mixed commits" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-docstore-applied-snapshot.aflite");
+    defer allocator.free(path);
+
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+
+    {
+        var batch = try store.beginWrite();
+        try batch.put("doc:b", "b1");
+        try batch.put("doc:a", "a1");
+        try batch.put("doc:c", "c1");
+        try batch.put("doc:b", "b2-last-wins");
+        try batch.commit();
+    }
+    try expectCachedSnapshotMatchesDiskRebuild(&store);
+
+    {
+        var batch = try store.beginWrite();
+        try batch.delete("doc:c");
+        try batch.delete("doc:never-existed");
+        try batch.put("doc:d", "d1");
+        try batch.put("doc:a", "a2");
+        try batch.commit();
+    }
+    try expectCachedSnapshotMatchesDiskRebuild(&store);
+
+    {
+        // Put-then-delete and delete-then-put of the same key in one batch.
+        var batch = try store.beginWrite();
+        try batch.put("doc:e", "e1");
+        try batch.delete("doc:e");
+        try batch.delete("doc:d");
+        try batch.put("doc:d", "d2-resurrected");
+        try batch.commit();
+    }
+    try expectCachedSnapshotMatchesDiskRebuild(&store);
+
+    // A large value that spills to external value pages.
+    {
+        const big = try allocator.alloc(u8, 3 * native.default_page_size);
+        defer allocator.free(big);
+        @memset(big, 'x');
+        var batch = try store.beginWrite();
+        try batch.put("doc:big", big);
+        try batch.commit();
+    }
+    try expectCachedSnapshotMatchesDiskRebuild(&store);
+
+    // Empty commit publishes nothing and keeps the cache current.
+    {
+        var batch = try store.beginWrite();
+        try batch.commit();
+    }
+    try expectCachedSnapshotMatchesDiskRebuild(&store);
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("a2", try read.get("doc:a"));
+    try std.testing.expectEqualStrings("b2-last-wins", try read.get("doc:b"));
+    try std.testing.expectError(error.NotFound, read.get("doc:c"));
+    try std.testing.expectEqualStrings("d2-resurrected", try read.get("doc:d"));
+    try std.testing.expectError(error.NotFound, read.get("doc:e"));
+}
+
+test "lite native docstore read transactions pin their snapshot across commits" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-docstore-pinned-snapshot.aflite");
+    defer allocator.free(path);
+
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+
+    {
+        var batch = try store.beginWrite();
+        try batch.put("doc:pin", "v1");
+        try batch.commit();
+    }
+
+    var pinned = try store.beginRead();
+    defer pinned.abort();
+    try std.testing.expectEqualStrings("v1", try pinned.get("doc:pin"));
+
+    {
+        var batch = try store.beginWrite();
+        try batch.put("doc:pin", "v2");
+        try batch.put("doc:new", "n1");
+        try batch.commit();
+    }
+
+    // The pinned reader still sees its snapshot; a fresh reader sees the
+    // committed state.
+    try std.testing.expectEqualStrings("v1", try pinned.get("doc:pin"));
+    try std.testing.expectError(error.NotFound, pinned.get("doc:new"));
+
+    var fresh = try store.beginRead();
+    defer fresh.abort();
+    try std.testing.expectEqualStrings("v2", try fresh.get("doc:pin"));
+    try std.testing.expectEqualStrings("n1", try fresh.get("doc:new"));
+}
+
+test "lite native docstore snapshot cache survives out-of-band catalog commits and vacuum" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-docstore-cache-oob.aflite");
+    defer allocator.free(path);
+
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+
+    {
+        var batch = try store.beginWrite();
+        try batch.put("doc:oob", "v1");
+        try batch.commit();
+    }
+
+    // A catalog commit bumps the checkpoint without touching documents; the
+    // next read must key-miss, rebuild, and still see identical content.
+    try store.file.putCatalogRecord("catalog:key", "catalog-value");
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("v1", try read.get("doc:oob"));
+    }
+    try expectCachedSnapshotMatchesDiskRebuild(&store);
+
+    // Update churn then vacuum: the file is rewritten in place and the cache
+    // key changes with the vacuum checkpoint.
+    var round: usize = 0;
+    while (round < 10) : (round += 1) {
+        var value_buf: [32]u8 = undefined;
+        const value = try std.fmt.bufPrint(&value_buf, "churn-{d}", .{round});
+        var batch = try store.beginWrite();
+        try batch.put("doc:oob", value);
+        try batch.commit();
+    }
+    _ = try store.vacuum();
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("churn-9", try read.get("doc:oob"));
+    }
+    try expectCachedSnapshotMatchesDiskRebuild(&store);
+}
+
+test "lite native docstore snapshot cache reports usage to resource manager" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-docstore-snapshot-resource.aflite");
+    defer allocator.free(path);
+
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    var store = try Store.createWithOptions(allocator, path, .{
+        .no_sync = true,
+        .resource_manager = &manager,
+    });
+
+    {
+        var batch = try store.beginWrite();
+        try batch.put("doc:resource", "tracked");
+        try batch.commit();
+    }
+    try std.testing.expect(manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes > 0);
+
+    _ = try store.vacuum();
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes);
+
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("tracked", try read.get("doc:resource"));
+        try std.testing.expect(manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes > 0);
+    }
+
+    store.close();
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes);
+}
+
+test "lite native docstore snapshot cache budget rejection does not fail transactions" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-docstore-snapshot-budget.aflite");
+    defer allocator.free(path);
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.lite_docstore_snapshot_cache)] = .{
+        .soft_limit_bytes = 1,
+        .hard_limit_bytes = 1,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var store = try Store.createWithOptions(allocator, path, .{
+        .no_sync = true,
+        .resource_manager = &manager,
+    });
+    defer store.close();
+
+    {
+        var batch = try store.beginWrite();
+        try batch.put("doc:budget", "uncached");
+        try batch.commit();
+    }
+    try std.testing.expect(store.cached_snapshot == null);
+
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("uncached", try read.get("doc:budget"));
+    }
+    try std.testing.expect(store.cached_snapshot == null);
+
+    const stats = manager.sliceStats(.lite_docstore_snapshot_cache);
+    try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);
+    try std.testing.expect(stats.hard_limit_rejections > 0);
 }

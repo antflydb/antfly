@@ -23,6 +23,10 @@ const raft_routes = @import("../raft/transport/routes.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const routes = @import("http_routes.zig");
 
+const max_transport_retries: usize = 1;
+const max_metadata_not_leader_retries: usize = 2;
+const default_request_timeout_ms: u32 = 5_000;
+
 fn isUriUnreserved(ch: u8) bool {
     return (ch >= 'A' and ch <= 'Z') or
         (ch >= 'a' and ch <= 'z') or
@@ -449,6 +453,7 @@ pub const MetadataHttpClient = struct {
         var resp = try self.executeWithRetry(.{
             .method = .GET,
             .uri = uri,
+            .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
         try mapStatus(resp.status, null, null, null);
@@ -462,6 +467,7 @@ pub const MetadataHttpClient = struct {
         var resp = try self.executeWithRetry(.{
             .method = .GET,
             .uri = uri,
+            .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
         try mapStatus(resp.status, null, null, null);
@@ -490,6 +496,7 @@ pub const MetadataHttpClient = struct {
             .uri = uri,
             .body = body,
             .content_type = "application/json",
+            .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
         try mapStatus(resp.status, bad_request_err, not_found_err, conflict_err);
@@ -514,6 +521,7 @@ pub const MetadataHttpClient = struct {
             .uri = uri,
             .body = body,
             .content_type = "application/json",
+            .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
         try mapStatus(resp.status, bad_request_err, not_found_err, conflict_err);
@@ -534,28 +542,50 @@ pub const MetadataHttpClient = struct {
         var resp = try self.executeWithRetry(.{
             .method = method,
             .uri = uri,
+            .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
         try mapStatus(resp.status, bad_request_err, not_found_err, null);
     }
 
     fn executeWithRetry(self: *MetadataHttpClient, req: http_common.HttpRequest) !http_common.HttpResponse {
-        var attempt: usize = 0;
+        var transport_attempt: usize = 0;
+        var not_leader_attempt: usize = 0;
         while (true) {
-            return self.executor.execute(self.alloc, req) catch |err| switch (err) {
+            var resp = self.executor.execute(self.alloc, req) catch |err| switch (err) {
                 error.HttpConnectionClosing,
                 error.ConnectionResetByPeer,
                 error.ConnectionRefused,
                 error.BrokenPipe,
                 error.EndOfStream,
+                error.Timeout,
                 => {
-                    if (attempt >= 1) return err;
-                    attempt += 1;
+                    if (transport_attempt >= max_transport_retries) return err;
+                    transport_attempt += 1;
                     continue;
                 },
                 else => return err,
             };
+            if (!isMetadataNotLeaderResponse(resp)) return resp;
+            if (not_leader_attempt >= max_metadata_not_leader_retries) {
+                resp.deinit(self.alloc);
+                return error.NotLeader;
+            }
+            not_leader_attempt += 1;
+            resp.deinit(self.alloc);
         }
+    }
+
+    fn isMetadataNotLeaderResponse(resp: http_common.HttpResponse) bool {
+        if (resp.status != 503) return false;
+        for (resp.headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, http_common.metadata_not_leader_header) and
+                std.ascii.eqlIgnoreCase(std.mem.trim(u8, header.value, " \t\r\n"), http_common.metadata_not_leader_value))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     fn mapStatus(status: u16, bad_request_err: ?anyerror, not_found_err: ?anyerror, conflict_err: ?anyerror) !void {
@@ -606,6 +636,7 @@ test "metadata http client retries transient connection close on fetch status" {
         fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(http_common.Method.GET, req.method);
+            try std.testing.expectEqual(@as(?u32, default_request_timeout_ms), req.timeout_ms);
             self.attempts += 1;
             if (self.attempts == 1) return error.HttpConnectionClosing;
             return .{
@@ -652,6 +683,100 @@ test "metadata http client preserves service unavailable as leader unavailable" 
     try std.testing.expectError(error.LeaderUnavailable, client.fetchStatus("http://127.0.0.1:9000"));
     try std.testing.expectError(error.LeaderUnavailable, client.triggerReallocate("http://127.0.0.1:9000"));
     try std.testing.expectEqual(@as(usize, 2), executor.calls);
+}
+
+test "metadata http client retries bounded timeout on fetch status" {
+    const TimeoutExecutor = struct {
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.GET, req.method);
+            try std.testing.expectEqual(@as(?u32, default_request_timeout_ms), req.timeout_ms);
+            self.attempts += 1;
+            if (self.attempts == 1) return error.Timeout;
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8,
+                    \\{"metadata_group_id":88,"metrics":{"rounds":0,"repairs":0,"rebalances":0,"splits":0,"merges":0},"projected_tables":0,"projected_ranges":0,"projected_placement_intents":0,"projected_split_transitions":0,"projected_merge_transitions":0,"projected_split_observations":0,"projected_merge_observations":0,"projected_schema_progress":0,"projected_restore_progress":0,"projected_snapshot_bootstrap_intents":0,"projected_backup_restore_bootstrap_intents":0,"projected_shuffle_join_leases":0,"projected_replication_source_statuses":0}
+                ),
+            };
+        }
+    };
+
+    var timeout_executor = TimeoutExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, timeout_executor.executor());
+    const status = try client.fetchStatus("http://127.0.0.1:9000");
+    try std.testing.expectEqual(@as(u64, 88), status.metadata_group_id);
+    try std.testing.expectEqual(@as(usize, 2), timeout_executor.attempts);
+}
+
+test "metadata http client retries explicit metadata not leader response" {
+    const NotLeaderExecutor = struct {
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn notLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+            const headers = try alloc.alloc(http_common.Header, 1);
+            var initialized_headers: usize = 0;
+            errdefer {
+                for (headers[0..initialized_headers]) |*header| header.deinit(alloc);
+                alloc.free(headers);
+            }
+            var header_name: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_header);
+            errdefer if (header_name) |value| alloc.free(value);
+            var header_value: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_value);
+            errdefer if (header_value) |value| alloc.free(value);
+            headers[0] = .{
+                .name = header_name.?,
+                .value = header_value.?,
+            };
+            header_name = null;
+            header_value = null;
+            initialized_headers += 1;
+            const body = try alloc.dupe(u8, "metadata leader unavailable");
+            errdefer alloc.free(body);
+            return .{
+                .status = 503,
+                .headers = headers,
+                .body = body,
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.GET, req.method);
+            self.attempts += 1;
+            if (self.attempts <= 2) return try notLeaderResponse(alloc);
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8,
+                    \\{"metadata_group_id":88,"metrics":{"rounds":0,"repairs":0,"rebalances":0,"splits":0,"merges":0},"projected_tables":0,"projected_ranges":0,"projected_placement_intents":0,"projected_split_transitions":0,"projected_merge_transitions":0,"projected_split_observations":0,"projected_merge_observations":0,"projected_schema_progress":0,"projected_restore_progress":0,"projected_snapshot_bootstrap_intents":0,"projected_backup_restore_bootstrap_intents":0,"projected_shuffle_join_leases":0,"projected_replication_source_statuses":0}
+                ),
+            };
+        }
+    };
+
+    var executor = NotLeaderExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    const status = try client.fetchStatus("http://127.0.0.1:9000");
+    try std.testing.expectEqual(@as(u64, 88), status.metadata_group_id);
+    try std.testing.expectEqual(@as(usize, 3), executor.attempts);
 }
 
 test "metadata http client preserves split merge doc identity conflicts" {

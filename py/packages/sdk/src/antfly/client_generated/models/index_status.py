@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from ..models.graph_index_config import GraphIndexConfig
     from ..models.graph_index_stats import GraphIndexStats
     from ..models.index_status_shard_status import IndexStatusShardStatus
+    from ..models.relational_index_stats import RelationalIndexStats
 
 
 T = TypeVar("T", bound="IndexStatus")
@@ -28,16 +29,17 @@ class IndexStatus:
         shard_status (IndexStatusShardStatus):
         config (AlgebraicIndexConfig | EmbeddingsIndexConfig | FullTextIndexConfig | GraphIndexConfig): Configuration
             for an index
-        status (AlgebraicIndexStats | EmbeddingsIndexStats | FullTextIndexStats | GraphIndexStats): Statistics for an
-            index
+        status (AlgebraicIndexStats | EmbeddingsIndexStats | FullTextIndexStats | GraphIndexStats |
+            RelationalIndexStats): Statistics for an index
     """
 
     shard_status: IndexStatusShardStatus
     config: AlgebraicIndexConfig | EmbeddingsIndexConfig | FullTextIndexConfig | GraphIndexConfig
-    status: AlgebraicIndexStats | EmbeddingsIndexStats | FullTextIndexStats | GraphIndexStats
+    status: AlgebraicIndexStats | EmbeddingsIndexStats | FullTextIndexStats | GraphIndexStats | RelationalIndexStats
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.algebraic_index_stats import AlgebraicIndexStats
         from ..models.embeddings_index_config import EmbeddingsIndexConfig
         from ..models.embeddings_index_stats import EmbeddingsIndexStats
         from ..models.full_text_index_config import FullTextIndexConfig
@@ -63,6 +65,8 @@ class IndexStatus:
         elif isinstance(self.status, EmbeddingsIndexStats):
             status = self.status.to_dict()
         elif isinstance(self.status, GraphIndexStats):
+            status = self.status.to_dict()
+        elif isinstance(self.status, AlgebraicIndexStats):
             status = self.status.to_dict()
         else:
             status = self.status.to_dict()
@@ -90,6 +94,7 @@ class IndexStatus:
         from ..models.graph_index_config import GraphIndexConfig
         from ..models.graph_index_stats import GraphIndexStats
         from ..models.index_status_shard_status import IndexStatusShardStatus
+        from ..models.relational_index_stats import RelationalIndexStats
 
         d = dict(src_dict)
         shard_status = IndexStatusShardStatus.from_dict(d.pop("shard_status"))
@@ -131,7 +136,7 @@ class IndexStatus:
 
         def _parse_status(
             data: object,
-        ) -> AlgebraicIndexStats | EmbeddingsIndexStats | FullTextIndexStats | GraphIndexStats:
+        ) -> AlgebraicIndexStats | EmbeddingsIndexStats | FullTextIndexStats | GraphIndexStats | RelationalIndexStats:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
@@ -156,11 +161,19 @@ class IndexStatus:
                 return componentsschemas_index_stats_type_2
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_index_stats_type_3 = AlgebraicIndexStats.from_dict(data)
+
+                return componentsschemas_index_stats_type_3
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            componentsschemas_index_stats_type_3 = AlgebraicIndexStats.from_dict(data)
+            componentsschemas_index_stats_type_4 = RelationalIndexStats.from_dict(data)
 
-            return componentsschemas_index_stats_type_3
+            return componentsschemas_index_stats_type_4
 
         status = _parse_status(d.pop("status"))
 

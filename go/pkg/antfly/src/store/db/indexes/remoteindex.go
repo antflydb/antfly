@@ -520,8 +520,8 @@ type FullTextPagingOptions struct {
 	OrderBy      []SortField
 	Limit        int
 	Offset       int
-	SearchAfter  []string
-	SearchBefore []string
+	SearchAfter  []any
+	SearchBefore []any
 }
 
 // applyFullTextPaging applies sort order and cursor-based pagination to a bleve
@@ -534,13 +534,31 @@ func applyFullTextPaging(req *bleve.SearchRequest, opts FullTextPagingOptions) {
 		req.Sort = append(req.Sort, &search.SortField{Field: sf.Field, Desc: desc})
 	}
 	if len(opts.SearchAfter) > 0 {
-		req.SearchAfter = opts.SearchAfter
+		req.SearchAfter = bleveCursorStrings(opts.SearchAfter)
 		req.From = 0
 	}
 	if len(opts.SearchBefore) > 0 {
-		req.SearchBefore = opts.SearchBefore
+		req.SearchBefore = bleveCursorStrings(opts.SearchBefore)
 		req.From = 0
 	}
+}
+
+func bleveCursorStrings(values []any) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, len(values))
+	for i, value := range values {
+		switch v := value.(type) {
+		case string:
+			out[i] = v
+		case fmt.Stringer:
+			out[i] = v.String()
+		default:
+			out[i] = fmt.Sprint(v)
+		}
+	}
+	return out
 }
 
 type VectorPagingOptions struct {
@@ -1461,8 +1479,8 @@ type Query struct {
 	// Full text search
 	OrderBy             []SortField         `json:"order_by,omitempty"`
 	Offset              int                 `json:"offset,omitempty,omitzero"`
-	SearchAfter         []string            `json:"search_after,omitempty"`
-	SearchBefore        []string            `json:"search_before,omitempty"`
+	SearchAfter         []any               `json:"search_after,omitempty"`
+	SearchBefore        []any               `json:"search_before,omitempty"`
 	FullTextSearch      query.Query         `json:"full_text_search,omitempty"`
 	AggregationRequests AggregationRequests `json:"aggregations,omitempty"`
 	HybridFullTextMode  HybridFullTextMode  `json:"-"`

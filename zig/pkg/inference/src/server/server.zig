@@ -148,8 +148,8 @@ const GenerateBackendSelection = struct {
 
 fn parseGenerateBackendSelection(
     backend_value: ?api.ModelBackend,
-    mode_value: ?[]const u8,
-    compiled_target_value: ?[]const u8,
+    mode_value: ?api.GenerateRequestMode,
+    compiled_target_value: ?api.GenerateRequestCompiledTarget,
 ) !GenerateBackendSelection {
     const choice = if (backend_value) |value|
         modelBackendToNativeChoice(value)
@@ -157,20 +157,18 @@ fn parseGenerateBackendSelection(
         native_backend_choice.Choice.auto;
     try native_backend_choice.validate(choice);
 
-    const compiled_mode_requested = if (mode_value) |value| blk: {
-        if (std.mem.eql(u8, value, "eager")) break :blk false;
-        if (std.mem.eql(u8, value, "compiled")) break :blk true;
-        return error.InvalidGenerateMode;
+    const compiled_mode_requested = if (mode_value) |value| switch (value) {
+        .eager => false,
+        .compiled => true,
     } else false;
 
     const explicit_partition_backend = native_backend_choice.compiledPartitionBackendForMode(
         choice,
         compiled_mode_requested,
     );
-    const compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = if (compiled_target_value) |value| blk: {
-        if (std.mem.eql(u8, value, "partitioned")) break :blk graph_mod.compiled_backend.AttachmentTarget.partitioned;
-        if (std.mem.eql(u8, value, "whole-model")) break :blk graph_mod.compiled_backend.AttachmentTarget.whole_model;
-        return error.InvalidCompiledTarget;
+    const compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = if (compiled_target_value) |value| switch (value) {
+        .partitioned => .partitioned,
+        .whole_model => .whole_model,
     } else blk: {
         if (compiled_mode_requested and explicit_partition_backend == .metal) break :blk graph_mod.compiled_backend.AttachmentTarget.whole_model;
         break :blk graph_mod.compiled_backend.AttachmentTarget.partitioned;
@@ -181,6 +179,16 @@ fn parseGenerateBackendSelection(
         .compiled_partition_backend = explicit_partition_backend,
         .compiled_attachment_target = compiled_attachment_target,
         .graph_mode_requested = compiled_mode_requested,
+    };
+}
+
+fn generateRequestCacheDtypeName(value: ?api.GenerateRequestCacheDtype) ?[]const u8 {
+    return switch (value orelse return null) {
+        .f16 => "f16",
+        .f32 => "f32",
+        .int8 => "int8",
+        .fp8 => "fp8",
+        .int4 => "int4",
     };
 }
 
@@ -530,7 +538,7 @@ pub const Node = struct {
     pub const DirectSparseEmbedding = sparse_embedding_mod.SparseVector;
 
     pub fn init(allocator: std.mem.Allocator, config: NodeConfig) !Node {
-        return .{
+        var node: Node = .{
             .config = config,
             .allocator = allocator,
             .session_manager = backends_mod.SessionManager.init(allocator),
@@ -541,6 +549,8 @@ pub const Node = struct {
             .metrics = metrics_mod.Metrics.default,
             .request_queue = request_queue_mod.RequestQueue.init(config.max_concurrent_requests),
         };
+        node.updateQueueMetrics();
+        return node;
     }
 
     pub fn deinit(self: *Node) void {
@@ -558,6 +568,7 @@ pub const Node = struct {
     ) ![][]f32 {
         if (texts.len == 0) return try allocator.alloc([]f32, 0);
         try self.request_queue.acquire();
+        self.updateQueueMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
@@ -582,6 +593,7 @@ pub const Node = struct {
     ) ![]DirectSparseEmbedding {
         if (texts.len == 0) return try allocator.alloc(DirectSparseEmbedding, 0);
         try self.request_queue.acquire();
+        self.updateQueueMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("embed_sparse.local");
         defer self.metrics.decActive();
@@ -610,6 +622,7 @@ pub const Node = struct {
     ) ![]f32 {
         if (documents.len == 0) return try allocator.alloc(f32, 0);
         try self.request_queue.acquire();
+        self.updateQueueMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("rerank.local");
         defer self.metrics.decActive();
@@ -703,6 +716,7 @@ pub const Node = struct {
 
         const queue_units = self.estimateGenerateQueueUnits(messages, max_tokens);
         try self.request_queue.acquireUnits(queue_units);
+        self.updateQueueMetrics();
         defer self.releaseSlotUnits(queue_units);
         self.metrics.incRequest("generate.local");
         defer self.metrics.decActive();
@@ -787,7 +801,19 @@ pub const Node = struct {
             .head_dim = gpt_config.maxHeadDim(),
             .sliding_window_size = sliding_window_size,
         });
+        var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+            .backend = backend_kind,
+            .dtype = kv_dtype,
+            .page_size_tokens = 16,
+            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
+            .num_kv_heads = gpt_config.maxKvHeads(),
+            .head_dim = gpt_config.maxHeadDim(),
+            .sliding_window_size = sliding_window_size,
+        });
+        defer kv_storage.deinit();
+        try cb.provisionKvDeviceWriteHook(&kv_storage);
         var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
+        decode_state.kv_storage = &kv_storage;
         defer decode_state.deinit();
 
         const use_metal_whole_model = build_options.enable_metal and
@@ -971,6 +997,7 @@ pub const Node = struct {
         input: std.json.Value,
     ) ![][]f32 {
         try self.request_queue.acquire();
+        self.updateQueueMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
@@ -999,6 +1026,7 @@ pub const Node = struct {
     ) ![]readers_api.Result {
         if (request.images.len == 0) return try allocator.alloc(readers_api.Result, 0);
         try self.request_queue.acquire();
+        self.updateQueueMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("read.local");
         defer self.metrics.decActive();
@@ -1042,6 +1070,7 @@ pub const Node = struct {
         request: transcribing_api.Request,
     ) !transcribing_api.Response {
         try self.request_queue.acquire();
+        self.updateQueueMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("transcribe.local");
         defer self.metrics.decActive();
@@ -1082,6 +1111,7 @@ pub const Node = struct {
         request: extracting_api.Request,
     ) !extracting_api.Response {
         try self.request_queue.acquire();
+        self.updateQueueMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("extract.local");
         defer self.metrics.decActive();
@@ -1323,15 +1353,18 @@ pub const Node = struct {
     }
 
     fn acquireSlotUnits(self: *Node, ctx: *httpx.Context, units: usize) !?httpx.Response {
+        const requested_units = self.request_queue.capacityUnits(units);
         self.request_queue.acquireUnits(units) catch {
             self.metrics.incError();
+            self.metrics.recordQueueRejection(requested_units);
+            self.updateQueueMetrics();
             const resp = try ctx.status(503).json(.{
                 .@"error" = "SERVICE_UNAVAILABLE",
                 .message = "server at capacity, try again later",
             });
             return resp;
         };
-        self.metrics.setQueueDepth(self.request_queue.depth());
+        self.updateQueueMetrics();
         return null;
     }
 
@@ -1341,7 +1374,15 @@ pub const Node = struct {
 
     fn releaseSlotUnits(self: *Node, units: usize) void {
         self.request_queue.releaseUnits(units);
-        self.metrics.setQueueDepth(self.request_queue.depth());
+        self.updateQueueMetrics();
+    }
+
+    fn updateQueueMetrics(self: *Node) void {
+        self.metrics.setQueueState(
+            self.request_queue.depth(),
+            self.request_queue.max_concurrent,
+            self.request_queue.requests(),
+        );
     }
 
     fn estimateHttpRequestQueueUnits(self: *Node, ctx: *httpx.Context) usize {
@@ -1665,8 +1706,13 @@ pub const Node = struct {
             });
         };
         const pipeline_start = embedTimingStart();
-        const embeddings = embedDenseInputs(ctx.allocator, &pipeline, &inputs) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+        const embeddings = embedDenseInputs(ctx.allocator, &pipeline, &inputs) catch |err| {
+            const failure = embedDenseInputFailure(err);
+            return ctx.status(failure.status).json(.{
+                .@"error" = failure.code,
+                .message = failure.message,
+            });
+        };
         logEmbedTiming("embed.pipeline", inputs.total_count, pipeline_start);
         defer {
             for (embeddings) |e| ctx.allocator.free(e);
@@ -1696,7 +1742,8 @@ pub const Node = struct {
     }
 
     pub fn chunkText(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        var parsed = (try ctx.parseJson(api.ChunkRequest)) orelse
+        var parsed = (ctx.parseJson(api.ChunkRequest) catch |err|
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = chunkRequestParseErrorMessage(err) })) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
@@ -1706,71 +1753,9 @@ pub const Node = struct {
         self.metrics.incRequest("chunk");
         defer self.metrics.decActive();
 
-        const input: lib_chunker.Input = blk: {
-            if (body.input) |input_val| {
-                switch (input_val) {
-                    .string => |s| break :blk .{ .text = s },
-                    .object => |obj| {
-                        if (obj.get("type")) |type_val| {
-                            if (type_val != .string) return ctx.status(400).json(.{
-                                .@"error" = "INVALID_REQUEST",
-                                .message = "content part 'type' must be a string",
-                            });
-                            if (std.mem.eql(u8, type_val.string, "text")) {
-                                const text_val = obj.get("text") orelse return ctx.status(400).json(.{
-                                    .@"error" = "INVALID_REQUEST",
-                                    .message = "text content part missing 'text' field",
-                                });
-                                if (text_val != .string) return ctx.status(400).json(.{
-                                    .@"error" = "INVALID_REQUEST",
-                                    .message = "text content part 'text' must be a string",
-                                });
-                                break :blk .{ .text = text_val.string };
-                            }
-                        }
-
-                        const data_val = obj.get("data") orelse return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "media content part missing 'data' field",
-                        });
-                        if (data_val != .string) return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "media 'data' must be a base64 string",
-                        });
-                        const mime_val = obj.get("mime_type") orelse return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "media content part missing 'mime_type' field",
-                        });
-                        if (mime_val != .string) return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "media 'mime_type' must be a string",
-                        });
-                        const decoded_payload = decodeMediaData(ctx.allocator, data_val.string) catch
-                            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid base64 data" });
-                        const decoded = decoded_payload.data;
-                        errdefer ctx.allocator.free(decoded);
-                        if (!mediaMimeMatches(mime_val.string, decoded_payload.mime_type)) {
-                            ctx.allocator.free(decoded);
-                            return ctx.status(400).json(.{
-                                .@"error" = "INVALID_REQUEST",
-                                .message = "media data URI mime_type does not match content part mime_type",
-                            });
-                        }
-                        break :blk .{ .binary = .{
-                            .mime_type = mime_val.string,
-                            .data = decoded,
-                        } };
-                    },
-                    else => return ctx.status(400).json(.{
-                        .@"error" = "INVALID_REQUEST",
-                        .message = "'input' must be a string or content part object",
-                    }),
-                }
-            }
-            // Fall back to deprecated 'text' field
-            if (body.text) |t| break :blk .{ .text = t };
-            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "missing 'input' or 'text' field" });
-        };
+        const input = parseChunkRequestInput(ctx.allocator, body.input) catch |err|
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = chunkInputParseErrorMessage(err) });
+        defer deinitChunkRequestInput(ctx.allocator, input);
 
         var config = lib_chunker.FixedChunkConfig{};
         if (body.config) |cfg| {
@@ -1814,7 +1799,7 @@ pub const Node = struct {
             }
 
             api_chunks[i] = .{
-                .object = "chunk",
+                .object = .chunk,
                 .index = @intCast(i),
                 .id = @intCast(chunk.id),
                 .mime_type = chunk.mime_type,
@@ -1835,7 +1820,7 @@ pub const Node = struct {
         };
 
         return ctx.json(api.ChunkResponse{
-            .object = "list",
+            .object = .list,
             .data = api_chunks,
             .model = if (config.model.len > 0) config.model else "fixed-bert-tokenizer",
             .usage = tokenUsage(prompt_tokens, 0),
@@ -2164,7 +2149,7 @@ pub const Node = struct {
 
                 const forced_function = tool_parser_mod.forcedFunctionName(parsed_tool_choice);
                 for (tools) |tool| {
-                    if (!std.mem.eql(u8, tool.type, "function")) {
+                    if (tool.type != .function) {
                         return ctx.status(400).json(.{
                             .@"error" = "INVALID_REQUEST",
                             .message = "only function tools are supported",
@@ -2174,7 +2159,7 @@ pub const Node = struct {
                         if (!std.mem.eql(u8, tool.function.name, forced)) continue;
                     }
                     try selected_tools.append(ctx.allocator, .{
-                        .type = tool.type,
+                        .type = "function",
                         .function = .{
                             .name = tool.function.name,
                             .description = tool.function.description orelse "",
@@ -2234,15 +2219,13 @@ pub const Node = struct {
                 4,
             .speculation_requested = effective_draft_model_name != null,
             .prefill_chunk_size = 256,
-            .cache_dtype = body.cache_dtype,
+            .cache_dtype = generateRequestCacheDtypeName(body.cache_dtype),
             .cache_compaction_ratio = body.cache_compaction_ratio,
         };
         const backend_selection = parseGenerateBackendSelection(body.backend, body.mode, body.compiled_target) catch |err| {
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = switch (err) {
-                    error.InvalidGenerateMode => "unsupported generation mode",
-                    error.InvalidCompiledTarget => "unsupported compiled_target",
                     else => "unsupported backend",
                 },
             });
@@ -2252,9 +2235,9 @@ pub const Node = struct {
             (body.backend == null or backend_selection.native_choice == .onnx);
 
         if (body.response_format) |rf| {
-            if (std.mem.eql(u8, rf.type, "json_object")) {
+            if (rf.type == .json_object) {
                 config.grammar = "json";
-            } else if (std.mem.eql(u8, rf.type, "json_schema")) {
+            } else if (rf.type == .json_schema) {
                 const schema_cfg = rf.json_schema orelse {
                     return ctx.status(400).json(.{
                         .@"error" = "INVALID_REQUEST",
@@ -2273,7 +2256,7 @@ pub const Node = struct {
                         .message = @errorName(err),
                     });
                 };
-            } else if (!std.mem.eql(u8, rf.type, "text")) {
+            } else if (rf.type != .text) {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
                     .message = "unsupported response_format.type",
@@ -2664,7 +2647,21 @@ pub const Node = struct {
             .sliding_window_size = sliding_window_size,
         }) catch |err|
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+        var kv_storage = runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, .{
+            .backend = backend_kind,
+            .dtype = kv_dtype,
+            .page_size_tokens = 16,
+            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
+            .num_kv_heads = gpt_config.maxKvHeads(),
+            .head_dim = gpt_config.maxHeadDim(),
+            .sliding_window_size = sliding_window_size,
+        }) catch |err|
+            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+        defer kv_storage.deinit();
+        cb.provisionKvDeviceWriteHook(&kv_storage) catch |err|
+            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         var decode_state = generation.NativeDecodeState.initPaged(ctx.allocator, &kv_manager, pool_id, model.shared_moe_cache);
+        decode_state.kv_storage = &kv_storage;
         defer decode_state.deinit();
         var draft_decode_state: ?generation.NativeDecodeState = null;
         defer if (draft_decode_state) |*state| state.deinit();
@@ -2906,13 +2903,13 @@ pub const Node = struct {
         defer ctx.allocator.free(data);
         for (scores, 0..) |score, i| {
             data[i] = .{
-                .object = "rerank.score",
+                .object = .rerank_score,
                 .index = @intCast(i),
                 .score = score,
             };
         }
         return ctx.json(api.RerankResponse{
-            .object = "list",
+            .object = .list,
             .data = data,
             .model = model_name,
             .usage = tokenUsage(prompt_tokens, 0),
@@ -3010,7 +3007,7 @@ pub const Node = struct {
                 for (calls, 0..) |call, i| {
                     api_calls[i] = .{
                         .id = call.id,
-                        .type = call.type,
+                        .type = .function,
                         .function = .{ .name = call.function.name, .arguments = call.function.arguments },
                     };
                 }
@@ -3027,7 +3024,7 @@ pub const Node = struct {
         }};
         return ctx.json(api.GenerateResponse{
             .id = completion_id,
-            .object = "chat.completion",
+            .object = .chat_completion,
             .created = created,
             .model = model_name,
             .choices = &choices,
@@ -3223,7 +3220,7 @@ pub const Node = struct {
                 for (calls, 0..) |call, idx| try emitToolCallDeltaUpdate(writer, allocator, stream_id, stream_created, model_name, .{
                     .index = idx,
                     .id = call.id,
-                    .type = call.type,
+                    .type = .function,
                     .name = call.function.name,
                     .arguments = call.function.arguments,
                 });
@@ -3289,7 +3286,7 @@ pub const Node = struct {
         }};
         try writeGenerateChunkEvent(writer, allocator, .{
             .id = stream_id,
-            .object = "chat.completion.chunk",
+            .object = .chat_completion_chunk,
             .created = stream_created,
             .model = model_name,
             .choices = &choices,
@@ -3310,7 +3307,7 @@ pub const Node = struct {
         }};
         try writeGenerateChunkEvent(writer, allocator, .{
             .id = stream_id,
-            .object = "chat.completion.chunk",
+            .object = .chat_completion_chunk,
             .created = stream_created,
             .model = model_name,
             .choices = &choices,
@@ -3332,7 +3329,7 @@ pub const Node = struct {
         const tool_calls = [_]api.ToolCallDelta{.{
             .index = @intCast(delta.index),
             .id = delta.id,
-            .type = delta.type,
+            .type = if (delta.type != null) .function else null,
             .function = function_delta,
         }};
         const choices = [_]api.GenerateChunkChoice{.{
@@ -3341,7 +3338,7 @@ pub const Node = struct {
         }};
         try writeGenerateChunkEvent(writer, allocator, .{
             .id = stream_id,
-            .object = "chat.completion.chunk",
+            .object = .chat_completion_chunk,
             .created = stream_created,
             .model = model_name,
             .choices = &choices,
@@ -3360,7 +3357,7 @@ pub const Node = struct {
         try emitToolCallDeltaUpdate(writer, allocator, stream_id, stream_created, model_name, .{
             .index = index,
             .id = call.id,
-            .type = call.type,
+            .type = "function",
             .name = call.function.name,
             .arguments = call.function.arguments,
         });
@@ -3381,7 +3378,7 @@ pub const Node = struct {
         }};
         try writeGenerateChunkEvent(writer, allocator, .{
             .id = stream_id,
-            .object = "chat.completion.chunk",
+            .object = .chat_completion_chunk,
             .created = stream_created,
             .model = model_name,
             .choices = &choices,
@@ -3653,7 +3650,7 @@ pub const Node = struct {
         }
 
         return ctx.json(api.RecognizeResponse{
-            .object = "list",
+            .object = .list,
             .data = data,
             .model = model_name,
             .usage = tokenUsage(estimateTextsTokens(input_texts), 0),
@@ -3840,7 +3837,7 @@ pub const Node = struct {
         }};
 
         return ctx.json(api.DocumentClassificationResponse{
-            .object = "list",
+            .object = .list,
             .data = &data,
             .model = body.model,
             .usage = tokenUsage(@intCast(num_tokens), 0),
@@ -3982,7 +3979,7 @@ pub const Node = struct {
         }};
 
         return ctx.json(api.DocumentTokenClassificationResponse{
-            .object = "list",
+            .object = .list,
             .data = &data,
             .model = body.model,
             .usage = tokenUsage(body.tokens.len, 0),
@@ -4087,7 +4084,7 @@ pub const Node = struct {
             inner[0] = try ctx.allocator.dupe(u8, result.text);
             completion_tokens += countTokenizerTokens(ctx.allocator, hf_tok.tokenizer(), result.text) catch estimateTextTokens(result.text);
             data[i] = .{
-                .object = "rewrite",
+                .object = .rewrite,
                 .index = @intCast(i),
                 .texts = inner,
             };
@@ -4096,7 +4093,7 @@ pub const Node = struct {
 
         const prompt_tokens = countTokenizerTexts(ctx.allocator, hf_tok.tokenizer(), body.inputs) catch estimateTextsTokens(body.inputs);
         return ctx.json(api.RewriteResponse{
-            .object = "list",
+            .object = .list,
             .data = data,
             .model = body.model,
             .usage = tokenUsage(prompt_tokens, completion_tokens),
@@ -4180,7 +4177,7 @@ pub const Node = struct {
 
         const prompt_tokens = if (body.prompt) |prompt| estimateTextTokens(prompt) * body.images.len else 0;
         return ctx.json(api.ReadResponse{
-            .object = "list",
+            .object = .list,
             .data = results_out,
             .model = body.model,
             .usage = tokenUsage(prompt_tokens, completion_tokens),
@@ -4222,7 +4219,7 @@ pub const Node = struct {
             .text = text_copy,
             .fields = fields_map,
             .regions = regions,
-            .object = "read",
+            .object = .read,
             .index = @intCast(index),
         };
     }
@@ -4350,13 +4347,13 @@ pub const Node = struct {
 
         const model_str = body.model orelse "default";
         const data = [_]api.TranscribeObject{.{
-            .object = "transcription",
+            .object = .transcription,
             .index = 0,
             .text = result.text,
             .language = result.language,
         }};
         return ctx.json(api.TranscribeResponse{
-            .object = "list",
+            .object = .list,
             .data = &data,
             .model = model_str,
             .usage = tokenUsage(0, countTokenizerTokens(ctx.allocator, tokenizer, result.text) catch estimateTextTokens(result.text)),
@@ -4646,7 +4643,7 @@ pub const Node = struct {
         }
 
         return ctx.json(api.PredictorsResponse{
-            .object = "list",
+            .object = .list,
             .predictors = predictors,
         });
     }
@@ -4852,7 +4849,7 @@ fn buildClassificationResponse(
     }
 
     return ctx.json(api.ClassifyResponse{
-        .object = "list",
+        .object = .list,
         .data = data,
         .model = model_name,
         .usage = tokenUsage(prompt_tokens, 0),
@@ -4886,14 +4883,14 @@ fn buildExtractionResponse(
             structures_map.map.putAssumeCapacity(structure.name, instances);
         }
         data[result_index] = .{
-            .object = "extraction",
+            .object = .extraction,
             .index = @intCast(result_index),
             .results = structures_map,
         };
     }
 
     return ctx.json(api.ExtractResponse{
-        .object = "list",
+        .object = .list,
         .data = data,
         .model = model_name,
         .usage = tokenUsage(prompt_tokens, 0),
@@ -4926,14 +4923,14 @@ fn extractionResponseJsonAlloc(
             structures_map.map.putAssumeCapacity(structure.name, instances);
         }
         data[result_index] = .{
-            .object = "extraction",
+            .object = .extraction,
             .index = @intCast(result_index),
             .results = structures_map,
         };
     }
 
     return try std.json.Stringify.valueAlloc(allocator, api.ExtractResponse{
-        .object = "list",
+        .object = .list,
         .data = data,
         .model = model_name,
         .usage = tokenUsage(0, 0),
@@ -5879,7 +5876,7 @@ test "generate backend selection keeps compiled mode explicit" {
         try std.testing.expectEqual(@as(?ops.BackendKind, null), eager.compiled_partition_backend);
         try std.testing.expect(!eager.graph_mode_requested);
 
-        const compiled = try parseGenerateBackendSelection(.webgpu, "compiled", null);
+        const compiled = try parseGenerateBackendSelection(.webgpu, .compiled, null);
         try std.testing.expectEqual(native_backend_choice.Choice.webgpu, compiled.native_choice);
         try std.testing.expectEqual(@as(?ops.BackendKind, .webgpu), compiled.compiled_partition_backend);
         try std.testing.expectEqual(graph_mod.compiled_backend.AttachmentTarget.partitioned, compiled.compiled_attachment_target);
@@ -5888,12 +5885,10 @@ test "generate backend selection keeps compiled mode explicit" {
         try std.testing.expectError(error.BackendUnavailable, eager_webgpu);
     }
 
-    const auto_compiled = try parseGenerateBackendSelection(null, "compiled", null);
+    const auto_compiled = try parseGenerateBackendSelection(null, .compiled, null);
     try std.testing.expectEqual(native_backend_choice.Choice.auto, auto_compiled.native_choice);
     try std.testing.expectEqual(@as(?ops.BackendKind, null), auto_compiled.compiled_partition_backend);
     try std.testing.expect(auto_compiled.graph_mode_requested);
-    try std.testing.expectError(error.InvalidGenerateMode, parseGenerateBackendSelection(null, "graph", null));
-    try std.testing.expectError(error.InvalidCompiledTarget, parseGenerateBackendSelection(null, "compiled", "full"));
 }
 
 test "singleBackendPreference is strict" {
@@ -5950,6 +5945,106 @@ test "download remote content blocks hosts outside allowlist" {
         .request_queue = undefined,
     };
     try std.testing.expectError(error.HostNotAllowed, downloadRemoteContent(&node, alloc, "https://example.com/a.png"));
+}
+
+test "chunk request requires input in generated schema" {
+    try std.testing.expectError(
+        error.MissingField,
+        std.json.parseFromSlice(api.ChunkRequest, std.testing.allocator, "{}", .{ .ignore_unknown_fields = true }),
+    );
+}
+
+test "chunk request input parser rejects invalid content parts" {
+    const cases = [_]struct {
+        name: []const u8,
+        input_json: []const u8,
+        expected_error: anyerror,
+        expected_message: []const u8,
+    }{
+        .{
+            .name = "empty text input",
+            .input_json = "\"\"",
+            .expected_error = error.ChunkInputRequired,
+            .expected_message = "missing 'input' field",
+        },
+        .{
+            .name = "missing content part type",
+            .input_json = "{\"text\":\"hello\"}",
+            .expected_error = error.UnsupportedChunkInputContentPartType,
+            .expected_message = "input content part type must be 'text' or 'media'",
+        },
+        .{
+            .name = "unsupported content part type",
+            .input_json = "{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.test/a.png\"}}",
+            .expected_error = error.UnsupportedChunkInputContentPartType,
+            .expected_message = "input content part type must be 'text' or 'media'",
+        },
+        .{
+            .name = "missing text",
+            .input_json = "{\"type\":\"text\"}",
+            .expected_error = error.ChunkTextContentPartMissingText,
+            .expected_message = "text content part missing 'text' field",
+        },
+        .{
+            .name = "empty text",
+            .input_json = "{\"type\":\"text\",\"text\":\"\"}",
+            .expected_error = error.ChunkTextContentPartMissingText,
+            .expected_message = "text content part missing 'text' field",
+        },
+        .{
+            .name = "missing media data",
+            .input_json = "{\"type\":\"media\",\"mime_type\":\"audio/wav\"}",
+            .expected_error = error.ChunkMediaContentPartMissingData,
+            .expected_message = "media content part missing 'data' field",
+        },
+        .{
+            .name = "empty media data",
+            .input_json = "{\"type\":\"media\",\"data\":\"\",\"mime_type\":\"audio/wav\"}",
+            .expected_error = error.ChunkMediaContentPartMissingData,
+            .expected_message = "media content part missing 'data' field",
+        },
+        .{
+            .name = "empty media data uri payload",
+            .input_json = "{\"type\":\"media\",\"data\":\"data:audio/wav;base64,\",\"mime_type\":\"audio/wav\"}",
+            .expected_error = error.ChunkMediaContentPartMissingData,
+            .expected_message = "media content part missing 'data' field",
+        },
+        .{
+            .name = "missing media mime",
+            .input_json = "{\"type\":\"media\",\"data\":\"AA==\"}",
+            .expected_error = error.ChunkMediaContentPartMissingMimeType,
+            .expected_message = "media content part missing 'mime_type' field",
+        },
+        .{
+            .name = "blank media mime",
+            .input_json = "{\"type\":\"media\",\"data\":\"AA==\",\"mime_type\":\"  \"}",
+            .expected_error = error.ChunkMediaContentPartMissingMimeType,
+            .expected_message = "media content part missing 'mime_type' field",
+        },
+    };
+
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.input_json, .{});
+        defer parsed.deinit();
+
+        try std.testing.expectError(case.expected_error, parseChunkRequestInput(std.testing.allocator, parsed.value));
+        try std.testing.expectEqualStrings(case.expected_message, chunkInputParseErrorMessage(case.expected_error));
+    }
+}
+
+test "chunk request input parser accepts valid text and media" {
+    var text_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"type\":\"text\",\"text\":\"hello\"}", .{});
+    defer text_parsed.deinit();
+    const text_input = try parseChunkRequestInput(std.testing.allocator, text_parsed.value);
+    defer deinitChunkRequestInput(std.testing.allocator, text_input);
+    try std.testing.expectEqualStrings("hello", text_input.text);
+
+    var media_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"type\":\"media\",\"data\":\"aGVsbG8=\",\"mime_type\":\"audio/wav\"}", .{});
+    defer media_parsed.deinit();
+    const media_input = try parseChunkRequestInput(std.testing.allocator, media_parsed.value);
+    defer deinitChunkRequestInput(std.testing.allocator, media_input);
+    try std.testing.expectEqualStrings("audio/wav", media_input.binary.mime_type);
+    try std.testing.expectEqualStrings("hello", media_input.binary.data);
 }
 
 fn dirContainsModel(path: []const u8) bool {
@@ -6024,6 +6119,76 @@ fn jsonBytesResponse(ctx: *httpx.Context, body: []const u8) !httpx.Response {
     try ctx.setHeader("Content-Type", "application/json");
     _ = ctx.response.body(body);
     return ctx.response.build();
+}
+
+fn parseChunkRequestInput(allocator: std.mem.Allocator, input: std.json.Value) !lib_chunker.Input {
+    return switch (input) {
+        .string => |s| blk: {
+            if (s.len == 0) return error.ChunkInputRequired;
+            break :blk .{ .text = s };
+        },
+        .object => |obj| blk: {
+            const type_val = obj.get("type") orelse return error.UnsupportedChunkInputContentPartType;
+            if (type_val != .string) return error.ChunkContentPartTypeMustBeString;
+            if (std.mem.eql(u8, type_val.string, "text")) {
+                const text_val = obj.get("text") orelse return error.ChunkTextContentPartMissingText;
+                if (text_val != .string or text_val.string.len == 0) return error.ChunkTextContentPartMissingText;
+                break :blk .{ .text = text_val.string };
+            }
+            if (!std.mem.eql(u8, type_val.string, "media")) return error.UnsupportedChunkInputContentPartType;
+
+            const data_val = obj.get("data") orelse return error.ChunkMediaContentPartMissingData;
+            if (data_val != .string) return error.ChunkMediaDataMustBeBase64String;
+            if (data_val.string.len == 0) return error.ChunkMediaContentPartMissingData;
+            const mime_val = obj.get("mime_type") orelse return error.ChunkMediaContentPartMissingMimeType;
+            if (mime_val != .string) return error.ChunkMediaMimeTypeMustBeString;
+            if (std.mem.trim(u8, mime_val.string, &std.ascii.whitespace).len == 0) return error.ChunkMediaContentPartMissingMimeType;
+
+            const decoded_payload = decodeMediaData(allocator, data_val.string) catch return error.ChunkInvalidBase64Data;
+            const decoded = decoded_payload.data;
+            errdefer allocator.free(decoded);
+            if (decoded.len == 0) return error.ChunkMediaContentPartMissingData;
+            if (!mediaMimeMatches(mime_val.string, decoded_payload.mime_type)) return error.ChunkMediaDataMimeTypeMismatch;
+            break :blk .{ .binary = .{
+                .mime_type = mime_val.string,
+                .data = decoded,
+            } };
+        },
+        else => error.ChunkInputMustBeStringOrContentPartObject,
+    };
+}
+
+fn deinitChunkRequestInput(allocator: std.mem.Allocator, input: lib_chunker.Input) void {
+    switch (input) {
+        .binary => |binary| allocator.free(binary.data),
+        .text => {},
+    }
+}
+
+fn chunkInputParseErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.ChunkInputRequired => "missing 'input' field",
+        error.UnsupportedChunkInputContentPartType => "input content part type must be 'text' or 'media'",
+        error.ChunkContentPartTypeMustBeString => "content part 'type' must be a string",
+        error.ChunkTextContentPartMissingText => "text content part missing 'text' field",
+        error.ChunkMediaContentPartMissingData => "media content part missing 'data' field",
+        error.ChunkMediaDataMustBeBase64String => "media 'data' must be a base64 string",
+        error.ChunkMediaContentPartMissingMimeType => "media content part missing 'mime_type' field",
+        error.ChunkMediaMimeTypeMustBeString => "media 'mime_type' must be a string",
+        error.ChunkInvalidBase64Data => "invalid base64 data",
+        error.ChunkMediaDataMimeTypeMismatch => "media data URI mime_type does not match content part mime_type",
+        error.ChunkInputMustBeStringOrContentPartObject => "'input' must be a string or content part object",
+        else => "invalid chunk input",
+    };
+}
+
+fn chunkRequestParseErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.MissingField => "missing required 'input' field",
+        error.SyntaxError => "request body must be valid JSON",
+        error.UnexpectedToken => "request body does not match chunk request schema",
+        else => "invalid chunk request",
+    };
 }
 
 fn validateEmbeddingEncodingFormat(encoding_format: ?[]const u8) !void {
@@ -6363,6 +6528,27 @@ fn embedInputParseErrorMessage(err: anyerror) []const u8 {
     };
 }
 
+const EmbedDenseInputFailure = struct {
+    status: u16,
+    code: []const u8,
+    message: []const u8,
+};
+
+fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
+    return switch (err) {
+        error.ImageDecodeFailed => .{
+            .status = 400,
+            .code = "INVALID_IMAGE",
+            .message = "unsupported or corrupt image input",
+        },
+        else => .{
+            .status = 500,
+            .code = "INFERENCE_FAILED",
+            .message = @errorName(err),
+        },
+    };
+}
+
 fn embedDenseInputs(
     allocator: std.mem.Allocator,
     pipeline: *embedding_mod.EmbeddingPipeline,
@@ -6448,13 +6634,13 @@ fn buildEmbedDenseResponse(
         try arr.ensureTotalCapacity(dimensions);
         for (emb[0..dimensions]) |val| arr.appendAssumeCapacity(.{ .float = val });
         data[i] = .{
-            .object = "embedding",
+            .object = .embedding,
             .index = @intCast(i),
             .embedding = .{ .array = arr },
         };
     }
     return .{
-        .object = "list",
+        .object = .list,
         .data = data,
         .model = model_name,
         .usage = .{
@@ -6485,13 +6671,13 @@ fn buildEmbedSparseResponse(
         try obj.put(arena, "values", .{ .array = values });
 
         data[i] = .{
-            .object = "embedding",
+            .object = .embedding,
             .index = @intCast(i),
             .embedding = .{ .object = obj },
         };
     }
     return .{
-        .object = "list",
+        .object = .list,
         .data = data,
         .model = model_name,
         .usage = .{
@@ -6801,6 +6987,17 @@ test "Antfly inference embed media-only usage does not require text tokens" {
     try std.testing.expectEqual(@as(usize, 0), estimateParsedDenseEmbedPromptTokens(&inputs));
 }
 
+test "embedding image decode failures are permanent client input errors" {
+    const failure = embedDenseInputFailure(error.ImageDecodeFailed);
+    try std.testing.expectEqual(@as(u16, 400), failure.status);
+    try std.testing.expectEqualStrings("INVALID_IMAGE", failure.code);
+    try std.testing.expectEqualStrings("unsupported or corrupt image input", failure.message);
+
+    const runtime_failure = embedDenseInputFailure(error.OutOfMemory);
+    try std.testing.expectEqual(@as(u16, 500), runtime_failure.status);
+    try std.testing.expectEqualStrings("INFERENCE_FAILED", runtime_failure.code);
+}
+
 test "Antfly inference embed parser accepts data uri media payloads" {
     const alloc = std.testing.allocator;
     const body =
@@ -7043,14 +7240,14 @@ fn coerceGenerateResponseFormat(
     json_text: []const u8,
 ) !?[]u8 {
     const rf = response_format orelse return null;
-    if (std.mem.eql(u8, rf.type, "json_object")) {
+    if (rf.type == .json_object) {
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch
             return try allocator.dupe(u8, "{}");
         defer parsed.deinit();
         if (parsed.value == .object) return null;
         return try allocator.dupe(u8, "{}");
     }
-    if (!std.mem.eql(u8, rf.type, "json_schema")) return null;
+    if (rf.type != .json_schema) return null;
 
     const schema_cfg = rf.json_schema orelse return error.MissingJsonSchema;
     validateGeneratedJsonSchema(allocator, json_text, schema_cfg) catch {

@@ -2627,8 +2627,12 @@ test "sql adapter ddl fingerprint owns partition and row security catalog ddl su
             .fingerprint = "ddl:create_row_policy:policy=usage_records_targeted_policy:table=usage_records:kind=current_setting_eq:field=tenant_id:setting=app.tenant_id:roles=2:role=app_reader:role=app_writer",
         },
         .{
-            .sql = "CREATE POLICY usage_records_select_policy ON usage_records AS RESTRICTIVE FOR SELECT TO app_reader USING (tenant_id = current_setting('app.tenant_id'));",
-            .fingerprint = "ddl:create_row_policy:policy=usage_records_select_policy:table=usage_records:kind=current_setting_eq:field=tenant_id:setting=app.tenant_id:mode=restrictive:command=select:roles=1:role=app_reader",
+            .sql = "CREATE POLICY usage_records_restrictive_policy ON usage_records AS RESTRICTIVE USING (tenant_id = 'tenant-a');",
+            .fingerprint = "ddl:create_row_policy:policy=usage_records_restrictive_policy:table=usage_records:kind=literal_eq:field=tenant_id:value_json_hex=2274656e616e742d6122:mode=restrictive",
+        },
+        .{
+            .sql = "CREATE POLICY usage_records_select_policy ON usage_records AS RESTRICTIVE FOR SELECT TO app_reader, app_writer USING (tenant_id = current_setting('app.tenant_id')) WITH CHECK (status = 'active');",
+            .fingerprint = "ddl:create_row_policy:policy=usage_records_select_policy:table=usage_records:kind=current_setting_eq:field=tenant_id:setting=app.tenant_id:check=kind=literal_eq:field=status:value_json_hex=2261637469766522:mode=restrictive:command=select:roles=2:role=app_reader:role=app_writer",
         },
         .{
             .sql = "CREATE POLICY usage_records_active_policy ON usage_records USING (status = 'active');",

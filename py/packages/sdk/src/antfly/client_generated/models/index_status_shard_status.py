@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from ..models.embeddings_index_stats import EmbeddingsIndexStats
     from ..models.full_text_index_stats import FullTextIndexStats
     from ..models.graph_index_stats import GraphIndexStats
+    from ..models.relational_index_stats import RelationalIndexStats
 
 
 T = TypeVar("T", bound="IndexStatusShardStatus")
@@ -21,10 +22,11 @@ class IndexStatusShardStatus:
     """ """
 
     additional_properties: dict[
-        str, AlgebraicIndexStats | EmbeddingsIndexStats | FullTextIndexStats | GraphIndexStats
+        str, AlgebraicIndexStats | EmbeddingsIndexStats | FullTextIndexStats | GraphIndexStats | RelationalIndexStats
     ] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.algebraic_index_stats import AlgebraicIndexStats
         from ..models.embeddings_index_stats import EmbeddingsIndexStats
         from ..models.full_text_index_stats import FullTextIndexStats
         from ..models.graph_index_stats import GraphIndexStats
@@ -37,6 +39,8 @@ class IndexStatusShardStatus:
                 field_dict[prop_name] = prop.to_dict()
             elif isinstance(prop, GraphIndexStats):
                 field_dict[prop_name] = prop.to_dict()
+            elif isinstance(prop, AlgebraicIndexStats):
+                field_dict[prop_name] = prop.to_dict()
             else:
                 field_dict[prop_name] = prop.to_dict()
 
@@ -48,6 +52,7 @@ class IndexStatusShardStatus:
         from ..models.embeddings_index_stats import EmbeddingsIndexStats
         from ..models.full_text_index_stats import FullTextIndexStats
         from ..models.graph_index_stats import GraphIndexStats
+        from ..models.relational_index_stats import RelationalIndexStats
 
         d = dict(src_dict)
         index_status_shard_status = cls()
@@ -57,7 +62,9 @@ class IndexStatusShardStatus:
 
             def _parse_additional_property(
                 data: object,
-            ) -> AlgebraicIndexStats | EmbeddingsIndexStats | FullTextIndexStats | GraphIndexStats:
+            ) -> (
+                AlgebraicIndexStats | EmbeddingsIndexStats | FullTextIndexStats | GraphIndexStats | RelationalIndexStats
+            ):
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
@@ -82,11 +89,19 @@ class IndexStatusShardStatus:
                     return componentsschemas_index_stats_type_2
                 except (TypeError, ValueError, AttributeError, KeyError):
                     pass
+                try:
+                    if not isinstance(data, dict):
+                        raise TypeError()
+                    componentsschemas_index_stats_type_3 = AlgebraicIndexStats.from_dict(data)
+
+                    return componentsschemas_index_stats_type_3
+                except (TypeError, ValueError, AttributeError, KeyError):
+                    pass
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_index_stats_type_3 = AlgebraicIndexStats.from_dict(data)
+                componentsschemas_index_stats_type_4 = RelationalIndexStats.from_dict(data)
 
-                return componentsschemas_index_stats_type_3
+                return componentsschemas_index_stats_type_4
 
             additional_property = _parse_additional_property(prop_dict)
 
@@ -101,11 +116,13 @@ class IndexStatusShardStatus:
 
     def __getitem__(
         self, key: str
-    ) -> AlgebraicIndexStats | EmbeddingsIndexStats | FullTextIndexStats | GraphIndexStats:
+    ) -> AlgebraicIndexStats | EmbeddingsIndexStats | FullTextIndexStats | GraphIndexStats | RelationalIndexStats:
         return self.additional_properties[key]
 
     def __setitem__(
-        self, key: str, value: AlgebraicIndexStats | EmbeddingsIndexStats | FullTextIndexStats | GraphIndexStats
+        self,
+        key: str,
+        value: AlgebraicIndexStats | EmbeddingsIndexStats | FullTextIndexStats | GraphIndexStats | RelationalIndexStats,
     ) -> None:
         self.additional_properties[key] = value
 

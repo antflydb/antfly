@@ -47,6 +47,31 @@ pub const Policy = struct {
     not_found_is_recoverable: bool = false,
 };
 
+fn scaleCeilNs(max_ns: u64, numerator: u64, denominator: u64) u64 {
+    if (max_ns == 0 or numerator == 0) return 0;
+    if (denominator == 0) return max_ns;
+    const product = @as(u128, max_ns) * @as(u128, numerator);
+    const divisor = @as(u128, denominator);
+    var scaled = product / divisor;
+    if (product % divisor != 0) scaled += 1;
+    return @intCast(@min(scaled, @as(u128, std.math.maxInt(u64))));
+}
+
+pub fn replayWindowMaxWaitNs(policy: Policy, pending_records: u64) u64 {
+    if (pending_records == 0) return 0;
+    if (policy.coalesce_min_records == 0 or policy.coalesce_delay_ns == 0 or policy.coalesce_max_wait_ns == 0) return 0;
+    if (pending_records >= policy.coalesce_min_records) return 0;
+    return scaleCeilNs(policy.coalesce_max_wait_ns, pending_records, policy.coalesce_min_records);
+}
+
+pub fn sessionIdleMaxWaitNs(policy: Policy, recent_tail_records: u64) u64 {
+    if (recent_tail_records == 0) return 0;
+    if (policy.session_idle_ns == 0) return 0;
+    if (policy.coalesce_min_records == 0) return policy.session_idle_ns;
+    if (recent_tail_records >= policy.coalesce_min_records) return policy.session_idle_ns;
+    return scaleCeilNs(policy.session_idle_ns, recent_tail_records, policy.coalesce_min_records);
+}
+
 pub fn forIndex(index_ref: index_manager_mod.ManagedIndexRef, resource_manager: ?*resource_manager_mod.ResourceManager) Policy {
     return switch (index_ref.kind) {
         .dense_vector => .{

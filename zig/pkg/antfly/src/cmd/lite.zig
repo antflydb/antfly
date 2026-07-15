@@ -258,7 +258,9 @@ fn indexList(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator)
 
     const configs = try lite.db.listIndexes(allocator);
     defer db_types.freeIndexConfigs(allocator, configs);
-    const json = try std.json.Stringify.valueAlloc(allocator, configs, .{});
+    const public_configs = try db_types.publicIndexConfigsAlloc(allocator, configs);
+    defer allocator.free(public_configs);
+    const json = try std.json.Stringify.valueAlloc(allocator, public_configs, .{});
     defer allocator.free(json);
     writeJsonLine(io, json);
 }
@@ -275,6 +277,7 @@ fn indexCreate(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterato
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
+    parsed.value.coverage_generation = 0;
 
     var lite = try LiteDb.open(allocator, path, .writer);
     defer lite.close();
@@ -746,7 +749,7 @@ fn promoteWithRestore(
     try restore_fn(restore_ctx, opts.table, .{
         .backup_id = staged.backup_id,
         .location = staged.location,
-        .format = "portable",
+        .format = .portable,
     });
 
     return staged;
@@ -1102,7 +1105,9 @@ fn liteHttpIndexList(ctx: *httpx.Context) anyerror!httpx.Response {
     defer state.mutex.unlock();
     const configs = state.lite.db.listIndexes(ctx.allocator) catch |err| return liteHttpError(ctx, err);
     defer db_types.freeIndexConfigs(ctx.allocator, configs);
-    const json = std.json.Stringify.valueAlloc(ctx.allocator, configs, .{}) catch |err| return liteHttpError(ctx, err);
+    const public_configs = db_types.publicIndexConfigsAlloc(ctx.allocator, configs) catch |err| return liteHttpError(ctx, err);
+    defer ctx.allocator.free(public_configs);
+    const json = std.json.Stringify.valueAlloc(ctx.allocator, public_configs, .{}) catch |err| return liteHttpError(ctx, err);
     defer ctx.allocator.free(json);
     return liteHttpJson(ctx, 200, json);
 }
@@ -1113,6 +1118,7 @@ fn liteHttpIndexCreate(ctx: *httpx.Context) anyerror!httpx.Response {
         .ignore_unknown_fields = true,
     }) catch |err| return liteHttpError(ctx, err);
     defer parsed.deinit();
+    parsed.value.coverage_generation = 0;
     const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
     lockLiteHttpState(state);
     defer state.mutex.unlock();
@@ -3275,7 +3281,7 @@ test "lite promote helper stages backup then submits normal restore request" {
         table: []const u8 = "",
         backup_id: []const u8 = "",
         location: []const u8 = "",
-        format: []const u8 = "",
+        format: ?antfly_client.types.RestoreRequestFormat = null,
 
         fn restore(ctx: *anyopaque, table: []const u8, request: antfly_client.types.RestoreRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -3283,7 +3289,7 @@ test "lite promote helper stages backup then submits normal restore request" {
             self.table = table;
             self.backup_id = request.backup_id;
             self.location = request.location;
-            self.format = request.format orelse "";
+            self.format = request.format;
         }
     };
 
@@ -3295,7 +3301,7 @@ test "lite promote helper stages backup then submits normal restore request" {
     try std.testing.expectEqualStrings("docs", capture.table);
     try std.testing.expectEqualStrings(staged.backup_id, capture.backup_id);
     try std.testing.expectEqualStrings(staged.location, capture.location);
-    try std.testing.expectEqualStrings("portable", capture.format);
+    try std.testing.expectEqual(antfly_client.types.RestoreRequestFormat.portable, capture.format.?);
     try std.testing.expectEqualStrings("lite-promote-command.afb", staged.snapshot_path);
 
     var backup_location = try antfly.public_api.backups.openBackupLocation(allocator, location);

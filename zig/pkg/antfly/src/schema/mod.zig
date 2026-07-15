@@ -44,25 +44,21 @@ pub fn validateWritesAgainstTableSchema(
 }
 
 pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSchema) !storage_schema.TableSchema {
+    const document_field_templates = try deriveRuntimeDocumentFieldTemplates(alloc, schema);
+    var document_field_templates_owned = true;
+    errdefer if (document_field_templates_owned) freeRuntimeDynamicTemplates(alloc, document_field_templates);
+
     const embedded_dynamic_template_count = countEmbeddedDynamicTemplates(schema);
-    const dynamic_template_count = schema.dynamic_templates.len + embedded_dynamic_template_count;
+    const dynamic_template_count = schema.dynamic_templates.len + embedded_dynamic_template_count + document_field_templates.len;
     var dynamic_templates: []storage_schema.DynamicTemplate = if (dynamic_template_count == 0)
         &[_]storage_schema.DynamicTemplate{}
     else
         try alloc.alloc(storage_schema.DynamicTemplate, dynamic_template_count);
     var initialized: usize = 0;
-    errdefer if (dynamic_template_count > 0) {
-        for (dynamic_templates[0..initialized]) |template| {
-            alloc.free(template.name);
-            if (template.match_pattern) |value| alloc.free(value);
-            if (template.unmatch_pattern) |value| alloc.free(value);
-            if (template.path_match) |value| alloc.free(value);
-            if (template.path_unmatch) |value| alloc.free(value);
-            if (template.match_mapping_type) |value| alloc.free(value);
-            alloc.free(template.mapping.analyzer);
-        }
-        alloc.free(dynamic_templates);
-    };
+    errdefer {
+        freeRuntimeDynamicTemplateItems(alloc, dynamic_templates[0..initialized]);
+        if (dynamic_templates.len > 0) alloc.free(dynamic_templates);
+    }
     const full_text_documents = try deriveRuntimeFullTextDocuments(alloc, schema);
     errdefer freeRuntimeFullTextDocuments(alloc, full_text_documents);
 
@@ -96,6 +92,15 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
             try appendEmbeddedRuntimeDynamicTemplates(alloc, &dynamic_templates, &initialized, property.name, property);
         }
     }
+    for (document_field_templates) |template| {
+        dynamic_templates[initialized] = template;
+        initialized += 1;
+    }
+    document_field_templates_owned = false;
+    if (document_field_templates.len > 0) alloc.free(document_field_templates);
+
+    const index_sort = try deriveRuntimeIndexSort(alloc, schema.index_sort, dynamic_templates);
+    errdefer freeRuntimeIndexSort(alloc, index_sort);
 
     return .{
         .version = schema.version,
@@ -115,7 +120,25 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .checks = checks,
         .external_base_source = external_base_source,
         .system_versioned = schema.system_versioned,
+        .index_sort = index_sort,
     };
+}
+
+fn freeRuntimeDynamicTemplates(alloc: std.mem.Allocator, templates: []storage_schema.DynamicTemplate) void {
+    freeRuntimeDynamicTemplateItems(alloc, templates);
+    if (templates.len > 0) alloc.free(templates);
+}
+
+fn freeRuntimeDynamicTemplateItems(alloc: std.mem.Allocator, templates: []storage_schema.DynamicTemplate) void {
+    for (templates) |template| {
+        alloc.free(template.name);
+        if (template.match_pattern) |value| alloc.free(value);
+        if (template.unmatch_pattern) |value| alloc.free(value);
+        if (template.path_match) |value| alloc.free(value);
+        if (template.path_unmatch) |value| alloc.free(value);
+        if (template.match_mapping_type) |value| alloc.free(value);
+        alloc.free(template.mapping.analyzer);
+    }
 }
 
 fn cloneRuntimeExternalBaseSource(
@@ -206,6 +229,9 @@ fn runtimeDynamicTemplateFromParsed(
     scope_path: ?[]const u8,
 ) !storage_schema.DynamicTemplate {
     const field_type = parseRuntimeFieldType(template.field_type orelse "text");
+    const sortable = template.sortable orelse false;
+    const do_index = template.do_index orelse true;
+    try validateRuntimeSortableMapping(field_type, sortable);
     return .{
         .name = if (scope_path) |scope| try std.fmt.allocPrint(alloc, "{s}.{s}", .{ scope, template.name }) else try alloc.dupe(u8, template.name),
         .match_pattern = if (template.match_pattern) |value| try alloc.dupe(u8, value) else null,
@@ -215,11 +241,108 @@ fn runtimeDynamicTemplateFromParsed(
         .match_mapping_type = if (template.match_mapping_type) |value| try alloc.dupe(u8, value) else null,
         .mapping = .{
             .field_type = field_type,
-            .do_index = template.do_index orelse true,
+            .do_index = do_index,
             .store = template.store orelse false,
-            .doc_values = template.doc_values orelse false,
+            .doc_values = template.doc_values orelse runtimeMappingUsesDocValues(field_type, sortable, do_index),
+            .sortable = sortable,
+            .missing_null_policy = if (template.missing_null_policy) |policy|
+                storage_schema.parseMissingNullPolicy(policy) orelse return error.InvalidSchemaUpdateRequest
+            else
+                .missing_rejected,
             .include_in_all = template.include_in_all orelse false,
             .analyzer = try alloc.dupe(u8, template.analyzer orelse defaultDynamicTemplateAnalyzer(field_type)),
+        },
+    };
+}
+
+fn deriveRuntimeDocumentFieldTemplates(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]storage_schema.DynamicTemplate {
+    var out = std.ArrayListUnmanaged(storage_schema.DynamicTemplate).empty;
+    errdefer {
+        freeRuntimeDynamicTemplateItems(alloc, out.items);
+        out.deinit(alloc);
+    }
+    for (schema.document_schemas) |document_schema| {
+        for (document_schema.properties) |property| {
+            try appendRuntimeDocumentFieldTemplates(alloc, &out, property.name, property);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendRuntimeDocumentFieldTemplates(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(storage_schema.DynamicTemplate),
+    path: []const u8,
+    property: impl.DocumentProperty,
+) !void {
+    if (property.antfly_index != null and !property.antfly_index.?) return;
+
+    if (property.embedded_schema) |embedded_schema| {
+        try appendRuntimeDocumentFieldTemplates(alloc, out, path, embedded_schema.*);
+    }
+    if (property.item) |item| {
+        if (item.antfly_index != null and !item.antfly_index.?) return;
+        if (item.properties.len > 0) {
+            for (item.properties) |child| {
+                const child_path = try appendPath(alloc, path, child.name);
+                defer alloc.free(child_path);
+                try appendRuntimeDocumentFieldTemplates(alloc, out, child_path, child);
+            }
+        }
+        return;
+    }
+
+    if (property.properties.len > 0) {
+        for (property.properties) |child| {
+            const child_path = try appendPath(alloc, path, child.name);
+            defer alloc.free(child_path);
+            try appendRuntimeDocumentFieldTemplates(alloc, out, child_path, child);
+        }
+        return;
+    }
+
+    const mapping = property.antfly_field orelse return;
+    try appendRuntimeDocumentFieldMappingTemplates(alloc, out, path, mapping);
+}
+
+fn appendRuntimeDocumentFieldMappingTemplates(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(storage_schema.DynamicTemplate),
+    path: []const u8,
+    mapping: impl.DynamicTemplate,
+) !void {
+    try out.append(alloc, try runtimeDocumentFieldTemplateFromParsed(alloc, path, mapping));
+    for (mapping.fields) |subfield| {
+        const subfield_path = try appendPath(alloc, path, subfield.name);
+        defer alloc.free(subfield_path);
+        try out.append(alloc, try runtimeDocumentFieldTemplateFromParsed(alloc, subfield_path, subfield));
+    }
+}
+
+fn runtimeDocumentFieldTemplateFromParsed(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    mapping: impl.DynamicTemplate,
+) !storage_schema.DynamicTemplate {
+    const field_type = parseRuntimeFieldType(mapping.field_type orelse "text");
+    const sortable = mapping.sortable orelse false;
+    const do_index = mapping.do_index orelse true;
+    try validateRuntimeSortableMapping(field_type, sortable);
+    return .{
+        .name = try alloc.dupe(u8, path),
+        .path_match = try alloc.dupe(u8, path),
+        .mapping = .{
+            .field_type = field_type,
+            .do_index = do_index,
+            .store = mapping.store orelse false,
+            .doc_values = runtimeMappingUsesDocValues(field_type, sortable, do_index),
+            .sortable = sortable,
+            .missing_null_policy = if (mapping.missing_null_policy) |policy|
+                storage_schema.parseMissingNullPolicy(policy) orelse return error.InvalidSchemaUpdateRequest
+            else
+                .missing_rejected,
+            .include_in_all = mapping.include_in_all orelse false,
+            .analyzer = try alloc.dupe(u8, mapping.analyzer orelse defaultDynamicTemplateAnalyzer(field_type)),
         },
     };
 }
@@ -234,6 +357,24 @@ fn scopedPatternAlloc(
     if (pattern) |value| return try std.fmt.allocPrint(alloc, "{s}.{s}", .{ scope, value });
     if (default_to_scope) return try std.fmt.allocPrint(alloc, "{s}.*", .{scope});
     return null;
+}
+
+fn validateRuntimeSortableMapping(field_type: storage_schema.AntflyType, sortable: bool) !void {
+    if (sortable and !storage_schema.fieldTypeIsSortableScalar(field_type)) {
+        return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn runtimeMappingUsesDocValues(
+    field_type: storage_schema.AntflyType,
+    sortable: bool,
+    do_index: bool,
+) bool {
+    if (sortable) return true;
+    return switch (field_type) {
+        .geopoint => do_index,
+        else => false,
+    };
 }
 
 /// Derive the relational typed-column catalog from a parsed table schema. One
@@ -1402,16 +1543,24 @@ fn requiredFieldsContain(required_fields: []const []const u8, name: []const u8) 
 fn parseRuntimeFieldType(field_type: []const u8) storage_schema.AntflyType {
     if (std.mem.eql(u8, field_type, "text")) return .text;
     if (std.mem.eql(u8, field_type, "keyword")) return .keyword;
-    if (std.mem.eql(u8, field_type, "numeric")) return .numeric;
+    if (std.mem.eql(u8, field_type, "numeric") or
+        std.mem.eql(u8, field_type, "number") or
+        std.mem.eql(u8, field_type, "integer"))
+        return .numeric;
     if (std.mem.eql(u8, field_type, "embedding")) return .embedding;
     if (std.mem.eql(u8, field_type, "link")) return .link;
-    if (std.mem.eql(u8, field_type, "boolean")) return .boolean;
-    if (std.mem.eql(u8, field_type, "datetime")) return .datetime;
-    if (std.mem.eql(u8, field_type, "geopoint")) return .geopoint;
-    if (std.mem.eql(u8, field_type, "geoshape")) return .geoshape;
+    if (std.mem.eql(u8, field_type, "boolean") or std.mem.eql(u8, field_type, "bool")) return .boolean;
+    if (std.mem.eql(u8, field_type, "datetime") or
+        std.mem.eql(u8, field_type, "date") or
+        std.mem.eql(u8, field_type, "timestamp"))
+        return .datetime;
+    if (std.mem.eql(u8, field_type, "geopoint") or std.mem.eql(u8, field_type, "geo_point")) return .geopoint;
+    if (std.mem.eql(u8, field_type, "geoshape") or std.mem.eql(u8, field_type, "geo_shape")) return .geoshape;
     if (std.mem.eql(u8, field_type, "blob")) return .blob;
     if (std.mem.eql(u8, field_type, "html")) return .html;
     if (std.mem.eql(u8, field_type, "search_as_you_type")) return .search_as_you_type;
+    if (std.mem.eql(u8, field_type, "json") or std.mem.eql(u8, field_type, "object")) return .json;
+    if (std.mem.eql(u8, field_type, "array")) return .array;
     return .text;
 }
 
@@ -1450,6 +1599,64 @@ fn freeRuntimeFullTextDocuments(alloc: std.mem.Allocator, docs: []storage_schema
         if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
     }
     if (docs.len > 0) alloc.free(docs);
+}
+
+fn freeRuntimeIndexSort(alloc: std.mem.Allocator, fields: []const storage_schema.IndexSortField) void {
+    for (fields) |field| alloc.free(field.field);
+    if (fields.len > 0) alloc.free(fields);
+}
+
+fn deriveRuntimeIndexSort(
+    alloc: std.mem.Allocator,
+    parsed_fields: []const impl.IndexSortField,
+    dynamic_templates: []const storage_schema.DynamicTemplate,
+) ![]const storage_schema.IndexSortField {
+    if (parsed_fields.len == 0) return &.{};
+
+    var saw_id = false;
+    for (parsed_fields, 0..) |field, i| {
+        if (std.mem.eql(u8, field.field, "_id")) {
+            if (field.desc or i != parsed_fields.len - 1) return error.InvalidSchemaUpdateRequest;
+            saw_id = true;
+        }
+        for (parsed_fields[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.field, field.field)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+
+    const count = parsed_fields.len + @as(usize, if (saw_id) 0 else 1);
+    const fields = try alloc.alloc(storage_schema.IndexSortField, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (fields[0..initialized]) |field| alloc.free(field.field);
+        alloc.free(fields);
+    }
+
+    const validation_schema = storage_schema.TableSchema{
+        .dynamic_templates = dynamic_templates,
+    };
+    for (parsed_fields) |field| {
+        if (!std.mem.eql(u8, field.field, "_id")) {
+            const mapping = storage_schema.resolveDeclaredFieldType(validation_schema, field.field) orelse return error.InvalidSchemaUpdateRequest;
+            if (!mapping.sortable or !mapping.doc_values or !storage_schema.fieldTypeIsSortableScalar(mapping.field_type)) {
+                return error.InvalidSchemaUpdateRequest;
+            }
+        }
+        fields[initialized] = .{
+            .field = try alloc.dupe(u8, field.field),
+            .desc = field.desc,
+        };
+        initialized += 1;
+    }
+
+    if (!saw_id) {
+        fields[initialized] = .{
+            .field = try alloc.dupe(u8, "_id"),
+            .desc = false,
+        };
+        initialized += 1;
+    }
+    return fields;
 }
 
 fn deriveRuntimeFullTextDocuments(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]storage_schema.FullTextDocument {
@@ -1931,8 +2138,18 @@ fn appendFullTextField(
 
 fn effectiveAntflyTypes(property: impl.DocumentProperty, item: ?impl.DocumentProperty) []const []const u8 {
     if (property.antfly_types.len > 0) return property.antfly_types;
+    if (property.antfly_field) |mapping| {
+        if (mapping.field_type) |field_type| {
+            if (inferAntflyType(field_type)) |inferred| return inferred;
+        }
+    }
     if (item) |item_property| {
         if (item_property.antfly_types.len > 0) return item_property.antfly_types;
+        if (item_property.antfly_field) |mapping| {
+            if (mapping.field_type) |field_type| {
+                if (inferAntflyType(field_type)) |inferred| return inferred;
+            }
+        }
         if (item_property.field_type) |field_type| {
             if (inferAntflyType(field_type)) |inferred| return inferred;
         }
@@ -2061,9 +2278,11 @@ test "deriveRuntimeTableSchema rejects invalid document join cardinality proofs"
         try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc, schema_json));
     }
 
-    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
+    var valid_relational_scalar_index = try parseValidatedTableSchema(alloc,
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_status_idx","owner_kind":"relational_column","owner_name":"tenant_id","access_method":"scalar_column","columns":["tenant_id"]}]}
-    ));
+    );
+    defer valid_relational_scalar_index.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), valid_relational_scalar_index.relational_indexes.len);
     const invalid_relational_embedded_index_schemas = [_][]const u8{
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index":false}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
         ,
@@ -2087,11 +2306,11 @@ test "deriveRuntimeTableSchema rejects invalid or duplicate document SQL column 
     const alloc = std.testing.allocator;
 
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
-        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"metadata":{"type":"object","properties":{"plan":{"type":"keyword","x-antfly-column-name":"metadata-plan"}}}}}}}
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"metadata":{"type":"object","properties":{"plan":{"type":"keyword","x-antfly-column-name":"metadata-plan"}}}}}}}}
     ));
 
     var duplicate = try parseValidatedTableSchema(alloc,
-        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"metadata":{"type":"object","properties":{"plan":{"type":"keyword","x-antfly-column-name":"title"}}}}}}}
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"metadata":{"type":"object","properties":{"plan":{"type":"keyword","x-antfly-column-name":"title"}}}}}}}}
     );
     defer duplicate.deinit(alloc);
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, duplicate));
@@ -2160,7 +2379,7 @@ test "deriveRuntimeTableSchema carries relational storage mode and column catalo
     try std.testing.expectEqualStrings("id", id.path);
     try std.testing.expectEqualStrings("C", id.collation.?);
     try std.testing.expect(!id.nullable); // required
-    try std.testing.expect(id.indexed);
+    try std.testing.expect(!id.indexed);
     const customer_id = findRuntimeColumn(runtime, "customer_id").?;
     try std.testing.expect(customer_id.index_name == null);
     const customer_idx = findRuntimeRelationalIndex(runtime, "customer_idx") orelse return error.TestExpectedEqual;
@@ -2199,7 +2418,7 @@ test "deriveRuntimeTableSchema carries relational storage mode and column catalo
     try std.testing.expectEqualStrings("customer_id", runtime.primary_key.?.include_columns[1]);
     try std.testing.expectEqual(storage_schema.AntflyType.numeric, findRuntimeColumn(runtime, "amount").?.field_type);
     try std.testing.expect(findRuntimeColumn(runtime, "amount").?.nullable);
-    try std.testing.expect(findRuntimeColumn(runtime, "amount").?.indexed);
+    try std.testing.expect(!findRuntimeColumn(runtime, "amount").?.indexed);
     try std.testing.expectEqual(storage_schema.AntflyType.datetime, findRuntimeColumn(runtime, "created_at").?.field_type);
     try std.testing.expect(findRuntimeColumn(runtime, "created_at").?.on_update_value != null);
     try std.testing.expectEqual(storage_schema.RelationalDefaultKind.now_ns, findRuntimeColumn(runtime, "created_at").?.on_update_value.?.kind);
@@ -2445,6 +2664,250 @@ test "deriveRuntimeTableSchema carries scalar subquery relational defaults" {
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
         \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-default":{"op":"scalar_subquery","query":"SELECT status FROM usage_records"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ));
+}
+
+fn findFieldCapability(capabilities: []const storage_schema.FieldCapability, field: []const u8) ?storage_schema.FieldCapability {
+    for (capabilities) |capability| {
+        if (capability.field) |capability_field| {
+            if (std.mem.eql(u8, capability_field, field)) return capability;
+        }
+    }
+    return null;
+}
+
+test "runtime schema derives internal doc values from sortable scalar mappings" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "dynamic_templates": [
+        \\    {"name":"dates","path_match":"created_at","mapping":{"type":"datetime","sortable":true,"missing_null_policy":"missing_rejected"}},
+        \\    {"name":"body","path_match":"body","mapping":{"type":"text"}},
+        \\    {"name":"rank","path_match":"rank","mapping":{"type":"numeric","sortable":false}},
+        \\    {"name":"points","path_match":"location","mapping":{"type":"geo_point","index":true}},
+        \\    {"name":"unindexed_points","path_match":"hidden_location","mapping":{"type":"geopoint","index":false}}
+        \\  ]
+        \\}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    try std.testing.expectEqual(@as(usize, 5), runtime.dynamic_templates.len);
+    try std.testing.expect(runtime.dynamic_templates[0].mapping.doc_values);
+    try std.testing.expect(runtime.dynamic_templates[0].mapping.sortable);
+    try std.testing.expectEqual(storage_schema.MissingNullPolicy.missing_rejected, runtime.dynamic_templates[0].mapping.missing_null_policy);
+    try std.testing.expect(!runtime.dynamic_templates[1].mapping.doc_values);
+    try std.testing.expect(!runtime.dynamic_templates[1].mapping.sortable);
+    try std.testing.expect(!runtime.dynamic_templates[2].mapping.doc_values);
+    try std.testing.expect(!runtime.dynamic_templates[2].mapping.sortable);
+    try std.testing.expectEqual(storage_schema.AntflyType.geopoint, runtime.dynamic_templates[3].mapping.field_type);
+    try std.testing.expect(runtime.dynamic_templates[3].mapping.doc_values);
+    try std.testing.expect(!runtime.dynamic_templates[3].mapping.sortable);
+    try std.testing.expectEqual(storage_schema.AntflyType.geopoint, runtime.dynamic_templates[4].mapping.field_type);
+    try std.testing.expect(!runtime.dynamic_templates[4].mapping.doc_values);
+    try std.testing.expect(!runtime.dynamic_templates[4].mapping.sortable);
+}
+
+test "schema rejects sortable non-scalar dynamic mappings" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
+        \\{
+        \\  "dynamic_templates": [
+        \\    {"name":"body","path_match":"body","mapping":{"type":"text","sortable":true}}
+        \\  ]
+        \\}
+    ));
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
+        \\{
+        \\  "dynamic_templates": [
+        \\    {"name":"location","path_match":"location","mapping":{"type":"geo_point","sortable":true}}
+        \\  ]
+        \\}
+    ));
+}
+
+test "runtime schema lowers document field mappings to exact declared fields" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "document_schemas": {
+        \\    "doc": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "properties": {
+        \\          "created_at": {"type": "string","format": "date-time","x-antfly-field": {"type":"date","sortable":true}},
+        \\          "meta": {"type": "object","properties": {"rank": {"type":"number","x-antfly-field":{"type":"number","sortable":true}}}},
+        \\          "title": {"type": "string","x-antfly-field": {"type":"text","fields": {"keyword": {"type":"keyword","sortable":true}}}},
+        \\          "status": {"type": "string","x-antfly-field": {"type":"keyword","sortable":true}},
+        \\          "location": {"type": "object","x-antfly-field": {"type":"geo_point"}}
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    try std.testing.expectEqual(@as(usize, 6), runtime.dynamic_templates.len);
+    try std.testing.expectEqualStrings("created_at", runtime.dynamic_templates[0].name);
+    try std.testing.expectEqualStrings("created_at", runtime.dynamic_templates[0].path_match.?);
+    try std.testing.expectEqual(storage_schema.AntflyType.datetime, runtime.dynamic_templates[0].mapping.field_type);
+    try std.testing.expect(runtime.dynamic_templates[0].mapping.doc_values);
+    try std.testing.expect(runtime.dynamic_templates[0].mapping.sortable);
+
+    const created_mapping = storage_schema.resolveDeclaredFieldType(runtime, "created_at") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.AntflyType.datetime, created_mapping.field_type);
+    try std.testing.expect(created_mapping.doc_values);
+    try std.testing.expect(created_mapping.sortable);
+
+    const rank_mapping = storage_schema.resolveDeclaredFieldType(runtime, "meta.rank") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.AntflyType.numeric, rank_mapping.field_type);
+    try std.testing.expect(rank_mapping.doc_values);
+    try std.testing.expect(rank_mapping.sortable);
+
+    const title_mapping = storage_schema.resolveDeclaredFieldType(runtime, "title") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.AntflyType.text, title_mapping.field_type);
+    try std.testing.expect(!title_mapping.doc_values);
+    try std.testing.expect(!title_mapping.sortable);
+
+    const keyword_mapping = storage_schema.resolveDeclaredFieldType(runtime, "title.keyword") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.AntflyType.keyword, keyword_mapping.field_type);
+    try std.testing.expect(keyword_mapping.doc_values);
+    try std.testing.expect(keyword_mapping.sortable);
+
+    const status_mapping = storage_schema.resolveDeclaredFieldType(runtime, "status") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.AntflyType.keyword, status_mapping.field_type);
+    try std.testing.expect(status_mapping.doc_values);
+    try std.testing.expect(status_mapping.sortable);
+
+    const location_mapping = storage_schema.resolveDeclaredFieldType(runtime, "location") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.AntflyType.geopoint, location_mapping.field_type);
+    try std.testing.expect(location_mapping.doc_values);
+    try std.testing.expect(!location_mapping.sortable);
+    const status_field = findRuntimeFullTextField(runtime.full_text_documents[0], "status") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("status", status_field.path);
+    try std.testing.expectEqualStrings("keyword", status_field.analyzer);
+
+    const capabilities = try storage_schema.fieldCapabilitiesAlloc(alloc, runtime);
+    defer storage_schema.freeFieldCapabilities(alloc, capabilities);
+    const created_capability = findFieldCapability(capabilities, "created_at") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.AntflyType.datetime, created_capability.field_type);
+    try std.testing.expect(created_capability.doc_values);
+    try std.testing.expect(created_capability.sortable);
+    try std.testing.expectEqualStrings("schema_declared", created_capability.doc_value_coverage);
+    try std.testing.expectEqualStrings("dynamic_template", created_capability.provenance);
+    try std.testing.expectEqualStrings("declared", created_capability.queryability_state);
+
+    const keyword_capability = findFieldCapability(capabilities, "title.keyword") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.AntflyType.keyword, keyword_capability.field_type);
+    try std.testing.expect(keyword_capability.doc_values);
+    try std.testing.expect(keyword_capability.sortable);
+    try std.testing.expectEqualStrings("schema_declared", keyword_capability.doc_value_coverage);
+
+    const location_capability = findFieldCapability(capabilities, "location") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.AntflyType.geopoint, location_capability.field_type);
+    try std.testing.expect(location_capability.searchable);
+    try std.testing.expect(location_capability.filterable);
+    try std.testing.expect(!location_capability.aggregatable);
+    try std.testing.expect(location_capability.doc_values);
+    try std.testing.expect(!location_capability.sortable);
+    try std.testing.expectEqualStrings("schema_declared", location_capability.doc_value_coverage);
+    try std.testing.expectEqualStrings("declared", location_capability.queryability_state);
+}
+
+test "schema rejects sortable non-scalar document field mappings" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
+        \\{"document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"string","x-antfly-field":{"type":"text","sortable":true}}}}}}}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
+        \\{"document_schemas":{"doc":{"schema":{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string"},"x-antfly-field":{"type":"keyword","sortable":true}}}}}}}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
+        \\{
+        \\  "document_schemas": {
+        \\    "doc": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "properties": {
+        \\          "events": {
+        \\            "type": "array",
+        \\            "items": {
+        \\              "type": "object",
+        \\              "properties": {
+        \\                "created_at": {
+        \\                  "type": "string",
+        \\                  "format": "date-time",
+        \\                  "x-antfly-field": {"type":"date","sortable":true}
+        \\                }
+        \\              }
+        \\            }
+        \\          }
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ));
+}
+
+test "runtime schema derives and validates index sort metadata" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "dynamic_templates": [
+        \\    {"name":"created","path_match":"created_at","mapping":{"type":"datetime","sortable":true}},
+        \\    {"name":"rank","path_match":"rank","mapping":{"type":"numeric","sortable":false}}
+        \\  ],
+        \\  "index_sort": [{"field":"created_at","order":"desc"}]
+        \\}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+    try std.testing.expectEqual(@as(usize, 2), runtime.index_sort.len);
+    try std.testing.expectEqualStrings("created_at", runtime.index_sort[0].field);
+    try std.testing.expect(runtime.index_sort[0].desc);
+    try std.testing.expectEqualStrings("_id", runtime.index_sort[1].field);
+    try std.testing.expect(!runtime.index_sort[1].desc);
+
+    var explicit_id = try parseValidatedTableSchema(alloc,
+        \\{"dynamic_templates":[{"name":"created","path_match":"created_at","mapping":{"type":"datetime","sortable":true}}],"index_sort":[{"field":"created_at","order":"asc"},{"field":"_id","order":"asc"}]}
+    );
+    defer explicit_id.deinit(alloc);
+    const explicit_runtime = try deriveRuntimeTableSchema(alloc, explicit_id);
+    defer storage_schema.freeSchema(alloc, explicit_runtime);
+    try std.testing.expectEqual(@as(usize, 2), explicit_runtime.index_sort.len);
+    try std.testing.expectEqualStrings("_id", explicit_runtime.index_sort[1].field);
+
+    var match_mapping_type = try parseValidatedTableSchema(alloc,
+        \\{"dynamic_templates":[{"name":"dates","path_match":"meta.*_at","match_mapping_type":"date","mapping":{"type":"datetime","sortable":true}}],"index_sort":[{"field":"meta.created_at","order":"desc"}]}
+    );
+    defer match_mapping_type.deinit(alloc);
+    const match_mapping_runtime = try deriveRuntimeTableSchema(alloc, match_mapping_type);
+    defer storage_schema.freeSchema(alloc, match_mapping_runtime);
+    try std.testing.expectEqual(@as(usize, 2), match_mapping_runtime.index_sort.len);
+    try std.testing.expectEqualStrings("meta.created_at", match_mapping_runtime.index_sort[0].field);
+    try std.testing.expect(match_mapping_runtime.index_sort[0].desc);
+    try std.testing.expectEqualStrings("_id", match_mapping_runtime.index_sort[1].field);
+
+    var unsortable = try parseValidatedTableSchema(alloc,
+        \\{"dynamic_templates":[{"name":"rank","path_match":"rank","mapping":{"type":"numeric","sortable":false}}],"index_sort":[{"field":"rank","order":"asc"}]}
+    );
+    defer unsortable.deinit(alloc);
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, unsortable));
+
+    var id_not_final = try parseValidatedTableSchema(alloc,
+        \\{"dynamic_templates":[{"name":"created","path_match":"created_at","mapping":{"type":"datetime","sortable":true}}],"index_sort":[{"field":"_id","order":"asc"},{"field":"created_at","order":"asc"}]}
+    );
+    defer id_not_final.deinit(alloc);
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, id_not_final));
 }
 
 test "deriveRuntimeTableSchema projects embedded json schema as prefixed document fields" {

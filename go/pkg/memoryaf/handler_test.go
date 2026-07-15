@@ -61,18 +61,8 @@ func (m *mockClient) QueryWithBody(_ context.Context, body []byte) ([]byte, erro
 		return m.queryFn(body)
 	}
 	return json.Marshal(queryResponse{
-		Responses: []struct {
-			Hits struct {
-				Hits  []rawHit `json:"hits"`
-				Total uint64   `json:"total"`
-			} `json:"hits"`
-			Aggregations map[string]aggregationResult `json:"aggregations"`
-			Error        string                       `json:"error"`
-		}{
-			{Hits: struct {
-				Hits  []rawHit `json:"hits"`
-				Total uint64   `json:"total"`
-			}{}},
+		Responses: []queryResult{
+			{Hits: queryHits{Total: exactQueryHitsTotal(0)}},
 		},
 	})
 }
@@ -116,20 +106,10 @@ func sessionUctx() UserContext {
 // mockQueryHit builds a query response with a single hit.
 func mockQueryHit(id string, source map[string]any) []byte {
 	resp := queryResponse{
-		Responses: []struct {
-			Hits struct {
-				Hits  []rawHit `json:"hits"`
-				Total uint64   `json:"total"`
-			} `json:"hits"`
-			Aggregations map[string]aggregationResult `json:"aggregations"`
-			Error        string                       `json:"error"`
-		}{
-			{Hits: struct {
-				Hits  []rawHit `json:"hits"`
-				Total uint64   `json:"total"`
-			}{
+		Responses: []queryResult{
+			{Hits: queryHits{
 				Hits:  []rawHit{{ID: id, Score: 1.0, Source: source}},
-				Total: 1,
+				Total: exactQueryHitsTotal(1),
 			}},
 		},
 	}
@@ -362,24 +342,14 @@ func TestSearchMemories(t *testing.T) {
 	mc := newMockClient()
 	mc.queryFn = func(body []byte) ([]byte, error) {
 		resp := queryResponse{
-			Responses: []struct {
-				Hits struct {
-					Hits  []rawHit `json:"hits"`
-					Total uint64   `json:"total"`
-				} `json:"hits"`
-				Aggregations map[string]aggregationResult `json:"aggregations"`
-				Error        string                       `json:"error"`
-			}{
-				{Hits: struct {
-					Hits  []rawHit `json:"hits"`
-					Total uint64   `json:"total"`
-				}{
+			Responses: []queryResult{
+				{Hits: queryHits{
 					Hits: []rawHit{
 						{ID: "mem:a", Score: 0.9, Source: map[string]any{"content": "first", "memory_type": "semantic", "visibility": "team"}},
 						{ID: "mem:b", Score: 0.7, Source: map[string]any{"content": "second", "memory_type": "semantic", "visibility": "team"}},
 						{ID: "ent:technology:go", Score: 0.5, Source: map[string]any{"entity_type": "entity"}},
 					},
-					Total: 3,
+					Total: exactQueryHitsTotal(3),
 				}},
 			},
 		}
@@ -915,23 +885,13 @@ func TestEndSession_DeletesOwnMemoriesOnly(t *testing.T) {
 			t.Fatalf("expected created_by filter for non-admin, got %s", filter)
 		}
 		resp := queryResponse{
-			Responses: []struct {
-				Hits struct {
-					Hits  []rawHit `json:"hits"`
-					Total uint64   `json:"total"`
-				} `json:"hits"`
-				Aggregations map[string]aggregationResult `json:"aggregations"`
-				Error        string                       `json:"error"`
-			}{
-				{Hits: struct {
-					Hits  []rawHit `json:"hits"`
-					Total uint64   `json:"total"`
-				}{
+			Responses: []queryResult{
+				{Hits: queryHits{
 					Hits: []rawHit{
 						{ID: "mem:a", Score: 1.0, Source: map[string]any{"session_id": "sess-1", "created_by": "user1"}},
 						{ID: "mem:b", Score: 1.0, Source: map[string]any{"session_id": "sess-1", "created_by": "user1"}},
 					},
-					Total: 2,
+					Total: exactQueryHitsTotal(2),
 				}},
 			},
 		}
@@ -990,20 +950,10 @@ func TestEndSession_AdminDeletesAcrossPages(t *testing.T) {
 			hits = nil
 		}
 		resp := queryResponse{
-			Responses: []struct {
-				Hits struct {
-					Hits  []rawHit `json:"hits"`
-					Total uint64   `json:"total"`
-				} `json:"hits"`
-				Aggregations map[string]aggregationResult `json:"aggregations"`
-				Error        string                       `json:"error"`
-			}{
-				{Hits: struct {
-					Hits  []rawHit `json:"hits"`
-					Total uint64   `json:"total"`
-				}{
+			Responses: []queryResult{
+				{Hits: queryHits{
 					Hits:  hits,
-					Total: uint64(len(hits)),
+					Total: exactQueryHitsTotal(uint64(len(hits))),
 				}},
 			},
 		}
@@ -1042,19 +992,9 @@ func TestListSessions(t *testing.T) {
 		json.Unmarshal(body, &req)
 		if req["table"] == "ephemeral_memories" && req["aggregations"] != nil {
 			resp := queryResponse{
-				Responses: []struct {
-					Hits struct {
-						Hits  []rawHit `json:"hits"`
-						Total uint64   `json:"total"`
-					} `json:"hits"`
-					Aggregations map[string]aggregationResult `json:"aggregations"`
-					Error        string                       `json:"error"`
-				}{
+				Responses: []queryResult{
 					{
-						Hits: struct {
-							Hits  []rawHit `json:"hits"`
-							Total uint64   `json:"total"`
-						}{Total: 5},
+						Hits: queryHits{Total: exactQueryHitsTotal(5)},
 						Aggregations: map[string]aggregationResult{
 							"by_session": {Buckets: []aggregationBucket{
 								{Key: "sess-1", DocCount: 3},

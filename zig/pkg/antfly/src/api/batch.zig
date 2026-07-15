@@ -225,7 +225,6 @@ fn syncLevelName(sync_level: db_mod.types.SyncLevel) []const u8 {
         .write => "write",
         .full_text => "query",
         .enrichments => "enrichments",
-        .aknn => "full_index",
         .full_index => "full_index",
     };
 }
@@ -480,6 +479,12 @@ test "batch parser accepts public sync levels" {
     );
     defer owned.deinit(std.testing.allocator);
     try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, owned.req.sync_level);
+}
+
+test "batch parser rejects removed aknn sync level" {
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(std.testing.allocator,
+        \\{"inserts":{"doc:a":{"title":"alpha"}},"sync_level":"aknn"}
+    ));
 }
 
 test "batch parser accepts transforms" {

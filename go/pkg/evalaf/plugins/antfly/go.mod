@@ -1,6 +1,6 @@
 module github.com/antflydb/antfly/go/pkg/evalaf/plugins/antfly
 
-go 1.26
+go 1.26.0
 
 require (
 	github.com/antflydb/antfly/go/pkg/evalaf v0.0.0
@@ -9,12 +9,13 @@ require (
 )
 
 require (
+	github.com/antflydb/antfly/go/pkg/generating v0.0.0 // indirect
 	github.com/antflydb/antfly/go/pkg/libaf v0.0.1 // indirect
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/buger/jsonparser v1.1.2 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/getkin/kin-openapi v0.133.0 // indirect
+	github.com/getkin/kin-openapi v0.134.0 // indirect
 	github.com/go-json-experiment/json v0.0.0-20260214004413-d219187c3433 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -33,8 +34,8 @@ require (
 	github.com/mbleigh/raymond v0.0.0-20250414171441-6b3a58ab9e0a // indirect
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826 // indirect
 	github.com/oapi-codegen/runtime v1.3.0 // indirect
-	github.com/oasdiff/yaml v0.0.0-20250309154309-f31be36b4037 // indirect
-	github.com/oasdiff/yaml3 v0.0.0-20250309153720-d2182401db90 // indirect
+	github.com/oasdiff/yaml v0.0.1 // indirect
+	github.com/oasdiff/yaml3 v0.0.1 // indirect
 	github.com/perimeterx/marshmallow v1.1.5 // indirect
 	github.com/wk8/go-ordered-map/v2 v2.1.8 // indirect
 	github.com/woodsbury/decimal128 v1.4.0 // indirect
@@ -55,6 +56,7 @@ require (
 
 replace (
 	github.com/antflydb/antfly/go/pkg/evalaf => ../..
+	github.com/antflydb/antfly/go/pkg/generating => ../../../generating
 	github.com/antflydb/antfly/go/pkg/libaf => ../../../libaf
 	github.com/antflydb/antfly/go/pkg/sdk => ../../../sdk
 )

@@ -813,6 +813,62 @@ pub fn parseAggregateOutputExpressionAlloc(
     );
 }
 
+fn parseAggregateGroupedExpressionOrderAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    type_context: expr_type.RowExpressionTypeContext,
+    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    options: OutputExpressionParserOptions,
+) !?db_mod.types.RelationalRowsQueryOrder {
+    if (group_expressions.len == 0) return null;
+    const start = pos.*;
+
+    const previous_context = options.context_hooks.get_context(options.context_hooks.ptr);
+    var context = previous_context;
+    context.schema = schema;
+    options.context_hooks.set_context(options.context_hooks.ptr, context);
+    defer options.context_hooks.set_context(options.context_hooks.ptr, previous_context);
+
+    const order = parseExpressionAlloc(
+        alloc,
+        tokens,
+        pos,
+        context.schema,
+        options.function_bindings,
+        context.field_expression_qualifiers,
+        context.returning_expression_qualifiers,
+        context.defer_row_expression_field_validation,
+        type_context,
+        options.order_expression_hooks,
+    ) catch |err| switch (err) {
+        error.InvalidSqlCatalog, error.UnsupportedSqlShape => {
+            pos.* = start;
+            return null;
+        },
+        else => return err,
+    };
+    var order_transferred = false;
+    errdefer if (!order_transferred) plan_mod.freeOrderBy(alloc, &.{order});
+
+    const expression = order.expression orelse {
+        plan_mod.freeOrderBy(alloc, &.{order});
+        pos.* = start;
+        return null;
+    };
+    for (group_expressions) |projection| {
+        if (expr_equal.relationalRowsExpressionEqual(expression, projection.expression)) {
+            order_transferred = true;
+            return order;
+        }
+    }
+
+    plan_mod.freeOrderBy(alloc, &.{order});
+    pos.* = start;
+    return null;
+}
+
 pub fn parseWindowOutputExpressionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -889,6 +945,9 @@ pub fn parseAggregateByAlloc(
             const ordinal = std.fmt.parseInt(u32, token.text, 10) catch return error.UnsupportedSqlShape;
             break :blk db_mod.types.RelationalRowsQueryOrder{ .field = try expr_aggregate.outputFieldByOrdinalAlloc(alloc, group_fields, group_expressions, aggregations, ordinal) };
         } else if (expr_aggregate.peekOutputOrderExpression(tokens, pos.*)) blk: {
+            if (try parseAggregateGroupedExpressionOrderAlloc(alloc, tokens, pos, schema, type_context, group_expressions, item_order_expression_options)) |grouped_order| {
+                break :blk grouped_order;
+            }
             break :blk try parseAggregateOutputExpressionAlloc(alloc, tokens, pos, schema, type_context, group_fields, group_expressions, aggregations, item_order_expression_options);
         } else blk: {
             try validateGeneratedSimpleOrderExpression(tokens, generated_expression);

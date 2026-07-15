@@ -7,7 +7,6 @@
     "document_sql_bounded_scan_incomplete_topk",
     "document_sql_bounded_scan_missing_exact_producer",
     "document_sql_bounded_scan_unbounded_source",
-    "document_sql_bounded_scan_unsupported_residual",
     "document_sql_unnest_unsupported",
     "document_sql_unsupported_join",
     "document_sql_view_mapping_catalog",
@@ -41,7 +40,6 @@
     "duplicate_update_target",
     "enforced_unique_conflict_target",
     "event_trigger_catalog_plan",
-    "extension",
     "foreign_data_catalog_plan",
     "graph_query_plan",
     "index_access_method_plan",
@@ -51,8 +49,8 @@
     "multi_output_subquery_delete_selector",
     "multi_output_subquery_update_selector",
     "operator_catalog_plan",
-    "row_rewrite_expression_plan",
     "row_lock_mode_plan",
+    "row_rewrite_expression_plan",
     "rule_catalog_plan",
     "session_setting",
     "set_operation_output_shape",
@@ -67,7 +65,6 @@
     "table_tablespace_plan",
     "table_trigger_state_plan",
     "text_search_catalog_plan",
-    "transaction_control",
     "transform_catalog_plan",
     "trigger_catalog_plan"
   ]

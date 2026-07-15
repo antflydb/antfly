@@ -353,6 +353,7 @@ pub fn build(b: *std.Build) void {
     const link_libc = b.option(bool, "link-libc", "Link Antfly runtime modules against libc") orelse true;
     const edition = b.option(BuildEdition, "edition", "Build edition: full or inference") orelse .full;
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
+    antfly_tests_build.selected_test_filter = b.option([]const u8, "test-filter", "Run selectable Zig test steps with a single test-name filter");
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
         @panic("-Dantfly-bin-name must be a non-empty filename, not a path");
     }
@@ -446,6 +447,7 @@ pub fn build(b: *std.Build) void {
     const client_openapi_mod = openapi_modules.client;
     const schema_openapi_mod = openapi_modules.schema;
     const indexes_openapi_mod = openapi_modules.indexes;
+    const sort_openapi_mod = openapi_modules.sort;
     const eval_openapi_mod = openapi_modules.eval;
     const query_openapi_mod = openapi_modules.query;
     const admin_openapi_mod = openapi_modules.admin;
@@ -554,21 +556,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const storage_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/storage_root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    storage_mod.addImport("bloom", bloom_mod);
-    storage_mod.addImport("antfly_platform", platform_mod);
+    const usermgr_build_options = b.addOptions();
+    usermgr_build_options.addOption(bool, "usermgr_storage_adapter", false);
     const usermgr_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
+    usermgr_mod.addOptions("build_options", usermgr_build_options);
     usermgr_mod.link_libc = link_libc;
     usermgr_mod.addImport("antfly_casbin", casbin_mod);
-    usermgr_mod.addImport("usermgr_storage", storage_mod);
     const wasm_bloom_mod = b.createModule(.{
         .root_source_file = b.path("lib/bloom/src/mod.zig"),
         .target = wasm_target,
@@ -715,6 +712,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    termite_ml_mod.addImport("antfly_platform", platform_mod);
     const ml_tabular_mod = b.addModule("ml_tabular", .{
         .root_source_file = b.path("lib/ml/tabular/src/root.zig"),
         .target = target,
@@ -790,6 +788,7 @@ pub fn build(b: *std.Build) void {
     const inference_api_mod = inference_graph.inference_api_mod;
     inference_api_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     inference_api_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
+    inference_api_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
     const inference_hf_tokenizer_mod = inference_graph.inference_hf_tokenizer_mod;
     const inference_fixed_tokenizer_data_mod = inference_graph.inference_fixed_tokenizer_data_mod;
     const inference_chunker_mod = inference_graph.inference_chunker_mod;
@@ -952,6 +951,7 @@ pub fn build(b: *std.Build) void {
         public_openapi_mod,
         query_openapi_mod,
         indexes_openapi_mod,
+        sort_openapi_mod,
         metadata_openapi_mod,
         reranking_mod,
         objectstore_mod,
@@ -1036,6 +1036,7 @@ pub fn build(b: *std.Build) void {
         public_openapi_mod,
         query_openapi_mod,
         indexes_openapi_mod,
+        sort_openapi_mod,
         metadata_openapi_mod,
         reranking_mod,
         wasm_objectstore_mod,
@@ -1165,6 +1166,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     antfly_imports.configure(b, api_artifact_reprocess_jobs_test_mod, true, true);
+    const run_api_query_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        api_query_test_mod,
+        "api-query-test",
+        "Run focused API query merge and response tests",
+        .{
+            .filters = &antfly_tests_build.APIQueryTestFilters.core,
+            .select_filters = false,
+            .simple_runner = true,
+        },
+    ).run;
     const run_api_artifact_reprocess_jobs_tests = antfly_tests_build.addModuleTestStep(
         b,
         api_artifact_reprocess_jobs_test_mod,
@@ -1687,6 +1699,7 @@ pub fn build(b: *std.Build) void {
     antfly_tests_build.dependOnAPITableUnitTestRuns(unit_test_step, api_table_tests);
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
     unit_test_step.dependOn(&run_lib_api_logic_tests.step);
+    unit_test_step.dependOn(&run_api_query_tests.step);
     unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
     unit_test_step.dependOn(&run_public_api_parity_tests.step);
     unit_test_step.dependOn(&standalone_module_tests.template.run.step);
@@ -1770,18 +1783,20 @@ pub fn build(b: *std.Build) void {
     persistent_soak_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
     persistent_soak_test_mod.addImport("antfly_reranking", reranking_mod);
 
-    const index_manager_test_mod = makeLmdbModule(b, "pkg/antfly/src/index_manager_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
-    addSnowballModule(b, index_manager_test_mod);
-    index_manager_test_mod.addImport("bloom", bloom_mod);
-    index_manager_test_mod.addImport("antfly_vellum", vellum_mod);
-    index_manager_test_mod.addImport("antfly_vector", vector_mod);
-    index_manager_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
-    index_manager_test_mod.addImport("antfly_matcher", matcher_mod);
-    index_manager_test_mod.addImport("antfly_resolver", resolver_mod);
-    index_manager_test_mod.addImport("antfly_chunking", chunking_mod);
-    index_manager_test_mod.addImport("antfly_reranking", reranking_mod);
-    index_manager_test_mod.addImport("antfly_regex", regex_mod);
-    index_manager_test_mod.addImport("structlog", structlog_mod);
+    const index_manager_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/index_manager_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, index_manager_test_mod, true, true);
+    const usermgr_storage_index_manager_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    usermgr_storage_index_manager_test_mod.addImport("antfly_root", index_manager_test_mod);
+    usermgr_storage_index_manager_test_mod.addImport("antfly_platform", platform_mod);
+    index_manager_test_mod.addImport("usermgr_storage", usermgr_storage_index_manager_test_mod);
 
     const db_test_mod = makeLmdbModule(b, "pkg/antfly/src/db_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     const transcribing_db_test_stub_mod = b.createModule(.{

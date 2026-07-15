@@ -56,6 +56,7 @@ pub const distributed_entity_sink = @import("distributed_entity_sink.zig");
 pub const distributed_join = @import("distributed_join.zig");
 pub const distributed_graph = @import("distributed_graph.zig");
 pub const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
+pub const repair_jobs = @import("repair_jobs.zig");
 pub const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
 pub const http_internal_group_join_routes = @import("http_internal_group_join_routes.zig");
 pub const http_internal_group_write_routes = @import("http_internal_group_write_routes.zig");
@@ -112,6 +113,34 @@ test {
     _ = protocol_adapters;
 }
 
+test "api query contract preserves filter-only query string filters" {
+    try query_contract.testing.expectFilterOnlyQueryStringFilterPreserved();
+}
+
+test "protocol adapters require extension runtime package digest identity" {
+    try protocol_adapters.testExtensionRuntimeBindingRequiresInstalledPackageDigestMatch();
+}
+
+test "protocol adapters carry matched extension runtime package digest" {
+    try protocol_adapters.testExtensionRuntimeBindingCarriesMatchedInstalledPackageDigest();
+}
+
+test "api table runtime schema debug emits sort capabilities" {
+    try tables.testRuntimeSchemaDebugEmitsSortCapabilities();
+}
+
+test "api table runtime schema debug emits observed dynamic capabilities" {
+    try tables.testRuntimeSchemaDebugEmitsObservedDynamicCapabilities();
+}
+
+test "api query builder preflight describes missing physical sort coverage with public sortable wording" {
+    try query_builder_agent.testPreflightDescribesMissingPhysicalSortCoverageWithPublicSortableWording();
+}
+
+test "api query builder prompt exposes native sort capabilities" {
+    try query_builder_agent.testQueryBuilderUsesGeneratedFullTextSpecialistWhenRunnerProvided();
+}
+
 test "linear merge request parser accepts raw payload value under public request cap" {
     const alloc = std.testing.allocator;
     const payload = try alloc.alloc(u8, 6 * 1024 * 1024);
@@ -161,6 +190,18 @@ test "public batch default schema accepts docsaf doc_type row and rejects reserv
     try std.testing.expect(extracted.cleaned_value != null);
     try std.testing.expect(std.mem.indexOf(u8, extracted.cleaned_value.?, "\"doc_type\":\"pdf_page\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, extracted.cleaned_value.?, "\"_type\"") == null);
+}
+
+test "artifact enrichment request permits asset full text routing" {
+    const config_json = try table_contract.parseArtifactEnrichmentRequest(
+        std.testing.allocator,
+        "image_caption_v1",
+        "{\"kind\":\"asset\",\"field\":\"caption_json\",\"full_text_index\":true}",
+    );
+    defer std.testing.allocator.free(config_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"kind\":\"asset\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"full_text_index\":true") != null);
 }
 
 test "join inequality: jsonValuesCompare all six operators on integers" {

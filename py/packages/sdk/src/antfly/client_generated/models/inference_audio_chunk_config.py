@@ -9,7 +9,7 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.inference_vad_options import InferenceVADOptions
+    from ..models.vad_options import VADOptions
 
 
 T = TypeVar("T", bound="InferenceAudioChunkConfig")
@@ -23,13 +23,12 @@ class InferenceAudioChunkConfig:
         window_duration_ms (int | Unset): Window duration in milliseconds for fixed-window audio chunking (default:
             30000).
         overlap_duration_ms (int | Unset): Overlap duration in milliseconds between audio chunks (default: 0).
-        vad (InferenceVADOptions | Unset): Options for Voice Activity Detection (VAD) based audio segmentation.
-            inference-specific.
+        vad (VADOptions | Unset): Options for Voice Activity Detection (VAD) based audio segmentation.
     """
 
     window_duration_ms: int | Unset = UNSET
     overlap_duration_ms: int | Unset = UNSET
-    vad: InferenceVADOptions | Unset = UNSET
+    vad: VADOptions | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -55,7 +54,7 @@ class InferenceAudioChunkConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.inference_vad_options import InferenceVADOptions
+        from ..models.vad_options import VADOptions
 
         d = dict(src_dict)
         window_duration_ms = d.pop("window_duration_ms", UNSET)
@@ -63,11 +62,11 @@ class InferenceAudioChunkConfig:
         overlap_duration_ms = d.pop("overlap_duration_ms", UNSET)
 
         _vad = d.pop("vad", UNSET)
-        vad: InferenceVADOptions | Unset
+        vad: VADOptions | Unset
         if isinstance(_vad, Unset):
             vad = UNSET
         else:
-            vad = InferenceVADOptions.from_dict(_vad)
+            vad = VADOptions.from_dict(_vad)
 
         inference_audio_chunk_config = cls(
             window_duration_ms=window_duration_ms,

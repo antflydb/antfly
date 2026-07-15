@@ -24,6 +24,7 @@ else
     @import("../../sparse/sparse.zig");
 const relational_store_mod = @import("relational_store.zig");
 const artifact_replay = @import("artifact_replay.zig");
+const artifact_repair = @import("artifact_repair.zig");
 const backfill_state_mod = @import("backfill_state.zig");
 const backend_types = @import("../backend_types.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
@@ -46,6 +47,7 @@ const internal_keys = @import("../internal_keys.zig");
 const mapper = @import("document_mapper.zig");
 const mem_backend_mod = @import("../mem_backend.zig");
 const promotion_runtime_mod = @import("promotion_runtime.zig");
+const replay_source_mod = @import("derived/replay_source.zig");
 const replay_stream_mod = @import("derived/replay_stream.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const resolution_runtime_mod = @import("resolution_runtime.zig");
@@ -68,6 +70,207 @@ const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct
 pub fn freeOwnedKeySlice(alloc: Allocator, keys: [][]u8) void {
     for (keys) |key| alloc.free(key);
     alloc.free(keys);
+}
+
+fn loadDerivedCoverageSkippedCounterFromStore(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_name: []const u8,
+    generation: u64,
+) !?u64 {
+    const counter_key = try internal_keys.derivedCoverageSkippedCountKeyAlloc(alloc, index_name, generation);
+    defer alloc.free(counter_key);
+    const raw = store.get(alloc, counter_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    return try internal_keys.decodeDerivedCoverageSkippedCount(raw);
+}
+
+fn scanDerivedCoverageSkippedFromStore(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_name: []const u8,
+    generation: u64,
+) !u64 {
+    const lower = try internal_keys.derivedCoverageOutcomeKindPrefixAlloc(alloc, index_name, generation, "skipped");
+    defer alloc.free(lower);
+    const upper = try internal_keys.nextPrefixAlloc(alloc, lower);
+    defer if (upper) |key| alloc.free(key);
+    const upper_bound = if (upper) |key| key else "";
+
+    var skipped: u64 = 0;
+    const CountState = struct {
+        skipped: *u64,
+
+        fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            _ = key;
+            _ = value;
+            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            state.skipped.* += 1;
+            return .@"continue";
+        }
+    };
+
+    var state = CountState{ .skipped = &skipped };
+    try store.scanWithContext(lower, upper_bound, .{}, &state, CountState.scanEntry);
+    return skipped;
+}
+
+fn derivedCoverageSkippedCounterValueForStore(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_name: []const u8,
+    generation: u64,
+) !u64 {
+    return (try loadDerivedCoverageSkippedCounterFromStore(alloc, store, index_name, generation)) orelse
+        try scanDerivedCoverageSkippedFromStore(alloc, store, index_name, generation);
+}
+
+fn deleteDerivedCoverageSkippedForDocKeys(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    index_name: []const u8,
+    doc_keys: []const []const u8,
+) !void {
+    if (doc_keys.len == 0) return;
+    const generation = index_manager.coverageGenerationForIndex(index_name) orelse return;
+
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (deletes.items) |key| alloc.free(@constCast(key));
+        deletes.deinit(alloc);
+    }
+
+    var removed_count: u64 = 0;
+    for (doc_keys) |doc_key| {
+        const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, doc_key, "skipped");
+        errdefer alloc.free(marker_key);
+        var duplicate_delete = false;
+        for (deletes.items) |existing| {
+            if (std.mem.eql(u8, existing, marker_key)) {
+                duplicate_delete = true;
+                break;
+            }
+        }
+        if (duplicate_delete) {
+            alloc.free(marker_key);
+            continue;
+        }
+        const had_marker = blk: {
+            const existing = store.get(alloc, marker_key) catch |err| switch (err) {
+                error.NotFound => break :blk false,
+                else => return err,
+            };
+            alloc.free(existing);
+            break :blk true;
+        };
+        if (had_marker) removed_count +|= 1;
+        try deletes.append(alloc, marker_key);
+    }
+
+    if (deletes.items.len == 0) return;
+    if (removed_count == 0) {
+        try store.putBatch(&.{}, deletes.items);
+        return;
+    }
+
+    const current_count = try derivedCoverageSkippedCounterValueForStore(alloc, store, index_name, generation);
+    const counter_key = try internal_keys.derivedCoverageSkippedCountKeyAlloc(alloc, index_name, generation);
+    defer alloc.free(counter_key);
+    var counter_value: [8]u8 = undefined;
+    const new_count = if (current_count > removed_count) current_count - removed_count else 0;
+    const write = docstore_mod.KVPair{
+        .key = counter_key,
+        .value = internal_keys.encodeDerivedCoverageSkippedCount(&counter_value, new_count),
+    };
+    try store.putBatch(&.{write}, deletes.items);
+}
+
+test "db derived async deletes skipped coverage markers for replay deletes once" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+    });
+    const generation = db.core.index_manager.coverageGenerationForIndex("dv_v1") orelse return error.TestUnexpectedResult;
+
+    const delete_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, "dv_v1", generation, "doc:a", "skipped");
+    defer alloc.free(delete_key);
+    const keep_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, "dv_v1", generation, "doc:b", "skipped");
+    defer alloc.free(keep_key);
+    const counter_key = try internal_keys.derivedCoverageSkippedCountKeyAlloc(alloc, "dv_v1", generation);
+    defer alloc.free(counter_key);
+
+    var counter_value: [8]u8 = undefined;
+    try db.core.store.putBatch(&.{
+        .{ .key = delete_key, .value = "skipped" },
+        .{ .key = keep_key, .value = "skipped" },
+        .{ .key = counter_key, .value = internal_keys.encodeDerivedCoverageSkippedCount(&counter_value, 2) },
+    }, &.{});
+
+    try deleteDerivedCoverageSkippedForDocKeys(alloc, db.core.store, db.core.index_manager, "dv_v1", &.{ "doc:a", "doc:a" });
+
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, delete_key));
+    const kept = try db.core.store.get(alloc, keep_key);
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("skipped", kept);
+
+    const raw_counter = try db.core.store.get(alloc, counter_key);
+    defer alloc.free(raw_counter);
+    try std.testing.expectEqual(@as(u64, 1), try internal_keys.decodeDerivedCoverageSkippedCount(raw_counter));
+}
+
+fn putDenseEmbeddingArtifactWithCounterForTest(db: anytype, alloc: Allocator, artifact_key: []const u8, source_hash: ?u64, vector: []const f32) !void {
+    const DB = @TypeOf(db.*);
+    const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, source_hash, vector);
+    defer alloc.free(payload);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    try writes.append(alloc, .{ .key = artifact_key, .value = payload });
+
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    try DB.appendDenseArtifactCounterMutations(
+        alloc,
+        db.core.store,
+        db.core.index_manager,
+        &writes,
+        &.{},
+        &owned_keys,
+        &owned_values,
+    );
+    try db.core.store.putBatch(writes.items, &.{});
+    try db.core.putArtifactPresenceMarker();
+}
+
+fn concatKeyViews(alloc: Allocator, left: []const []const u8, right: []const []const u8) ![][]const u8 {
+    const out = try alloc.alloc([]const u8, left.len + right.len);
+    @memcpy(out[0..left.len], left);
+    @memcpy(out[left.len..], right);
+    return out;
 }
 
 fn nsToMs(ns: u64) u64 {
@@ -1163,6 +1366,25 @@ test "dense catch-up maintenance cooldown skips light repeated maintenance" {
     try std.testing.expect(TestImpl.shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns + denseCatchUpMaintenanceCooldownNs()));
 }
 
+test "target advance repair cooldown skips repeated repair attempts" {
+    const TestDB = struct {};
+    const TestImpl = Impl(TestDB);
+    const TestAsyncContext = db_internal.AsyncContext(TestDB);
+    var ctx = TestAsyncContext{
+        .alloc = std.testing.allocator,
+        .store = undefined,
+        .index_manager = undefined,
+        .apply_mutex = undefined,
+    };
+    defer ctx.deinit(std.testing.allocator);
+
+    const now_ns = std.time.ns_per_s;
+    try std.testing.expect(TestImpl.shouldRunTargetAdvanceRepair(&ctx, "idx", now_ns));
+    try TestImpl.noteTargetAdvanceRepairRun(&ctx, "idx", now_ns);
+    try std.testing.expect(!TestImpl.shouldRunTargetAdvanceRepair(&ctx, "idx", now_ns + denseCatchUpMaintenanceCooldownNs() - 1));
+    try std.testing.expect(TestImpl.shouldRunTargetAdvanceRepair(&ctx, "idx", now_ns + denseCatchUpMaintenanceCooldownNs()));
+}
+
 test "db derived async runUntilIdle drains lazy dense posting maintenance" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
@@ -1246,6 +1468,55 @@ test "db derived async collectManagedSyncTargets includes graph index for graph 
 
     try std.testing.expectEqual(@as(usize, 1), sync_targets.all_indexes.len);
     try std.testing.expectEqualStrings("gr_v1", sync_targets.all_indexes[0]);
+}
+
+test "db derived async graph replay ignores document extraction parent asset but tracks units" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addIndex(.{
+        .name = "unit_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"document_units_v1","path":"$.relations[*]","format":"extraction_relation"}
+        \\}
+        ,
+    });
+
+    const graph_ref = index_manager_mod.ManagedIndexRef{ .name = "unit_graph", .kind = .graph };
+
+    const parent_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "document_units_v1");
+    defer alloc.free(parent_key);
+    const parent_batch = derived_types.DerivedBatch{
+        .changed_artifact_keys = &.{parent_key},
+    };
+
+    try std.testing.expect(!db.derivedAsyncBatchAffectsManagedIndex(parent_batch, graph_ref));
+    try std.testing.expect(!try db.derivedAsyncBatchAffectsManagedIndexForReplay(parent_batch, graph_ref));
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "document:000001");
+    defer alloc.free(unit_key);
+    const unit_batch = derived_types.DerivedBatch{
+        .changed_artifact_keys = &.{unit_key},
+    };
+
+    try std.testing.expect(db.derivedAsyncBatchAffectsManagedIndex(unit_batch, graph_ref));
+    try std.testing.expect(try db.derivedAsyncBatchAffectsManagedIndexForReplay(unit_batch, graph_ref));
 }
 
 test "db derived async filters relational text-search sync targets by generation record" {
@@ -1706,11 +1977,106 @@ pub fn Impl(comptime DB: type) type {
             }
         };
 
+        const dense_artifact_target_counter_prefix = "\x00\x00__metadata__:dense_artifact_target_count:";
+
+        fn storeHasReplayRecordForHintAfter(
+            store: *docstore_mod.DocStore,
+            hint: change_journal_mod.TargetHint,
+            from_sequence: u64,
+        ) !bool {
+            const Context = struct {
+                found: bool = false,
+
+                fn handle(self: *@This(), sequence: u64, payload: []const u8) !void {
+                    _ = sequence;
+                    _ = payload;
+                    self.found = true;
+                }
+            };
+
+            var scan_ctx = Context{};
+            const stats = store.forEachReplayLaneFrom(
+                @intCast(@intFromEnum(hint)),
+                from_sequence + 1,
+                1,
+                &scan_ctx,
+                Context.handle,
+            ) catch |err| switch (err) {
+                error.ReplayIndexUnavailable => return false,
+                else => return err,
+            };
+            return scan_ctx.found or stats.matched_entries != 0;
+        }
+
+        fn managedIndexReplayHint(kind: types.IndexKind) change_journal_mod.TargetHint {
+            return switch (kind) {
+                .full_text => .full_text,
+                .dense_vector => .dense_vector,
+                .sparse_vector => .sparse_vector,
+                .graph => .graph,
+                .algebraic => .algebraic,
+            };
+        }
+
+        fn replayRangeHasManagedIndexApplicableRecord(
+            ctx: *AsyncContext,
+            index_ref: index_manager_mod.ManagedIndexRef,
+            from_sequence: u64,
+            target_sequence: u64,
+        ) !bool {
+            const Context = struct {
+                alloc: Allocator,
+                index_manager: *index_manager_mod.IndexManager,
+                index_ref: index_manager_mod.ManagedIndexRef,
+                target_sequence: u64,
+                found: bool = false,
+
+                fn handle(self: *@This(), sequence: u64, payload: []const u8) !void {
+                    if (sequence > self.target_sequence) return replay_source_mod.StopReplayChunk.StopReplayChunk;
+                    var decoded = try change_journal_mod.decodeRecord(self.alloc, payload);
+                    defer decoded.deinit();
+                    switch (managedIndexRecordApplicability(self.index_manager, decoded.record, self.index_ref)) {
+                        .irrelevant => {},
+                        .relevant, .missing_dependency => {
+                            self.found = true;
+                            return replay_source_mod.StopReplayChunk.StopReplayChunk;
+                        },
+                    }
+                }
+            };
+
+            var scan_ctx = Context{
+                .alloc = ctx.alloc,
+                .index_manager = ctx.index_manager,
+                .index_ref = index_ref,
+                .target_sequence = target_sequence,
+            };
+            _ = ctx.store.forEachReplayLaneFrom(
+                @intCast(@intFromEnum(managedIndexReplayHint(index_ref.kind))),
+                from_sequence + 1,
+                0,
+                &scan_ctx,
+                Context.handle,
+            ) catch |err| switch (err) {
+                error.ReplayIndexUnavailable => return try storeHasReplayRecordForHintAfter(ctx.store, managedIndexReplayHint(index_ref.kind), from_sequence),
+                replay_source_mod.StopReplayChunk.StopReplayChunk => return scan_ctx.found,
+                else => return err,
+            };
+            return scan_ctx.found;
+        }
+
         pub fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) !bool {
-            _ = from_sequence;
             const ctx = asyncContextFromOpaque(ctx_ptr);
-            const persisted_applied = try apply_state.loadAppliedSequence(ctx.alloc, ctx.store, index_ref.name);
+            const persisted_applied = try apply_state.loadAppliedSequenceWithCheckpoint(
+                ctx.alloc,
+                ctx.store,
+                ctx.applied_sequence_checkpoint_path,
+                index_ref.name,
+            );
             if (persisted_applied >= target_sequence) return true;
+
+            if (try replayRangeHasManagedIndexApplicableRecord(ctx, index_ref, from_sequence, target_sequence)) return false;
+            if (!ctx.index_manager.indexLoadComplete(index_ref.name)) return false;
             if (index_ref.kind != .dense_vector) return true;
 
             ctx.apply_mutex.lockExclusive();
@@ -1718,9 +2084,20 @@ pub fn Impl(comptime DB: type) type {
 
             const entry = ctx.index_manager.denseIndex(index_ref.name) orelse return true;
             if (!denseIndexIsArtifactBacked(entry)) return true;
-            if (db_internal.asyncContextHasActiveDenseBulkWork(ctx)) return false;
+            if (ctx.active_external_dense_bulk_sessions.load(.acquire) != 0) return false;
+            if (ctx.active_dense_catch_up_sessions.load(.acquire) != 0) return true;
 
-            const expected_doc_count = try denseTargetCountForIndexContext(ctx, index_ref.name);
+            const now_ns = monotonicTimeNs();
+            if (!Self.shouldRunTargetAdvanceRepair(ctx, index_ref.name, now_ns)) return false;
+            try Self.noteTargetAdvanceRepairRun(ctx, index_ref.name, now_ns);
+
+            const expected_doc_count = (try denseTargetCountForIndexContext(ctx, index_ref.name)) orelse {
+                std.log.warn(
+                    "dense replay target advance deferred by missing durable artifact counter index={s}",
+                    .{index_ref.name},
+                );
+                return false;
+            };
             if (expected_doc_count == 0) return true;
             if (entry.index.stats().active_count >= expected_doc_count) return true;
 
@@ -1802,6 +2179,73 @@ pub fn Impl(comptime DB: type) type {
             return sequence;
         }
 
+        pub fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, artifact_delete_keys: []const []const u8) !u64 {
+            if (artifact_delete_keys.len == 0) return appendDerivedBatchFromEnrichment(ctx_ptr, batch);
+
+            const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
+            var batch_ctx = ctx.batchContext();
+            try DB.DerivedAsyncCallbacks.enforce_ha_write_gate_optional(batch_ctx.ha_write_gate);
+            const replay_deleted_keys = try concatKeyViews(batch_ctx.alloc, batch.deleted_keys, artifact_delete_keys);
+            defer batch_ctx.alloc.free(replay_deleted_keys);
+            var replay_batch = batch;
+            replay_batch.deleted_keys = replay_deleted_keys;
+
+            batch_ctx.apply_mutex.lockExclusive();
+            const sequence = blk: {
+                defer batch_ctx.apply_mutex.unlockExclusive();
+                const reserved_sequence = batch_ctx.store.reserveNextReplaySequence(1);
+                replay_batch.sequence = reserved_sequence;
+                const payload = try encodeChangeRecordPayload(&batch_ctx, replay_batch, reserved_sequence);
+                defer batch_ctx.alloc.free(payload);
+                var counter_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+                defer counter_writes.deinit(batch_ctx.alloc);
+                var owned_counter_keys = std.ArrayListUnmanaged([]u8).empty;
+                defer {
+                    for (owned_counter_keys.items) |key| batch_ctx.alloc.free(key);
+                    owned_counter_keys.deinit(batch_ctx.alloc);
+                }
+                var owned_counter_values = std.ArrayListUnmanaged([]u8).empty;
+                defer {
+                    for (owned_counter_values.items) |value| batch_ctx.alloc.free(value);
+                    owned_counter_values.deinit(batch_ctx.alloc);
+                }
+                try appendDenseArtifactCounterMutations(
+                    batch_ctx.alloc,
+                    batch_ctx.store,
+                    batch_ctx.index_manager,
+                    &counter_writes,
+                    artifact_delete_keys,
+                    &owned_counter_keys,
+                    &owned_counter_values,
+                );
+                try batch_ctx.store.putBatchWithReplay(batch_ctx.io, counter_writes.items, artifact_delete_keys, .{
+                    .sequence = reserved_sequence,
+                    .payload = payload,
+                });
+                const split_state = batch_ctx.shard_manager.getSplitState();
+                if (split_state != null and split_state.?.phase == .splitting) {
+                    batch_ctx.shard_manager.appendSplitDelta(DB.WritePathCallbacks.current_time_ns(), &.{}, artifact_delete_keys) catch |err| switch (err) {
+                        error.SplitInProgress => {},
+                        else => return err,
+                    };
+                }
+                DB.DerivedAsyncCallbacks.mirror_ha_replay_payload_best_effort_context(batch_ctx.log_mutex, batch_ctx.ha_async_effect_mirror, payload);
+                batch_ctx.executor.trackBacklogBytes(reserved_sequence, @intCast(payload.len)) catch {};
+                break :blk reserved_sequence;
+            };
+
+            notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
+            if (ctx.executor.hasWorkers()) {
+                ctx.executor.forceSequence(sequence);
+                return sequence;
+            }
+
+            var applied_batch = replay_batch;
+            applied_batch.sequence = sequence;
+            try applyDerivedBatchContext(&batch_ctx, applied_batch);
+            return sequence;
+        }
+
         pub fn notifyDerivedExecutorSequence(ctx_ptr: *anyopaque, sequence: u64) void {
             const executor: *derived_executor_mod.Executor = @ptrCast(@alignCast(ctx_ptr));
             executor.notifySequence(sequence);
@@ -1821,7 +2265,7 @@ pub fn Impl(comptime DB: type) type {
         pub fn applyDerivedBacklogPressureContext(ctx: *const BatchExecutionContext, sequence: u64, sync_level: types.SyncLevel, sync_targets: ManagedSyncTargets) !void {
             switch (sync_level) {
                 .propose, .write => return,
-                .enrichments, .full_text, .aknn, .full_index => {},
+                .enrichments, .full_text, .full_index => {},
             }
             if (!ctx.executor.shouldThrottleBacklog()) return;
             if (sync_level == .full_text) {
@@ -1859,7 +2303,7 @@ pub fn Impl(comptime DB: type) type {
                 .full_text => {
                     try runMaintenanceUntilTargetsContext(ctx, sequence, sync_targets.full_text_indexes);
                 },
-                .aknn, .full_index => try runMaintenanceUntilContext(ctx, sequence, sync_targets),
+                .full_index => try runMaintenanceUntilContext(ctx, sequence, sync_targets),
             }
         }
 
@@ -1871,7 +2315,7 @@ pub fn Impl(comptime DB: type) type {
         pub fn syncLevelRequiresDerivedVisibility(sync_level: types.SyncLevel) bool {
             return switch (sync_level) {
                 .propose, .write, .enrichments => false,
-                .full_text, .aknn, .full_index => true,
+                .full_text, .full_index => true,
             };
         }
 
@@ -1886,6 +2330,19 @@ pub fn Impl(comptime DB: type) type {
 
         pub fn noteDenseCatchUpMaintenanceRun(ctx: *AsyncContext, index_name: []const u8, now_ns: u64) !void {
             const gop = try ctx.dense_maintenance_last_ns.getOrPut(ctx.alloc, index_name);
+            if (!gop.found_existing) gop.key_ptr.* = try ctx.alloc.dupe(u8, index_name);
+            gop.value_ptr.* = now_ns;
+        }
+
+        pub fn shouldRunTargetAdvanceRepair(ctx: *AsyncContext, index_name: []const u8, now_ns: u64) bool {
+            const cooldown_ns = denseCatchUpMaintenanceCooldownNs();
+            if (cooldown_ns == 0) return true;
+            const last_ns = ctx.target_advance_repair_last_ns.get(index_name) orelse return true;
+            return now_ns -| last_ns >= cooldown_ns;
+        }
+
+        pub fn noteTargetAdvanceRepairRun(ctx: *AsyncContext, index_name: []const u8, now_ns: u64) !void {
+            const gop = try ctx.target_advance_repair_last_ns.getOrPut(ctx.alloc, index_name);
             if (!gop.found_existing) gop.key_ptr.* = try ctx.alloc.dupe(u8, index_name);
             gop.value_ptr.* = now_ns;
         }
@@ -2001,11 +2458,6 @@ pub fn Impl(comptime DB: type) type {
                     }
                     const before_hbc_profile = if (profile != null) ctx.index_manager.denseWriteProfileByName(index_ref.name) else null;
                     const batch_options: backend_types.BatchOptions = .{ .mode = .bulk_ingest };
-                    const dense_delete_start_ns = monotonicTimeNs();
-                    try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.deleted_keys, batch_options);
-                    try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.overwritten_doc_keys, batch_options);
-                    if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.dense_delete_ns, dense_delete_start_ns);
-
                     var dense_embeddings = try collectDenseEmbeddingWritesForBatch(
                         ctx.alloc,
                         ctx.index_manager,
@@ -2014,6 +2466,15 @@ pub fn Impl(comptime DB: type) type {
                         index_ref.name,
                     );
                     defer dense_embeddings.deinit();
+                    const dense_entry = ctx.index_manager.denseIndex(index_ref.name) orelse return error.IndexNotFound;
+                    try recordDenseEmbeddingArtifactRepairIssuesForReplay(ctx, index_ref.name, dense_entry.dims, dense_embeddings.writes, batch.sequence);
+
+                    const dense_delete_start_ns = monotonicTimeNs();
+                    try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.deleted_keys, batch_options);
+                    try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.overwritten_doc_keys, batch_options);
+                    try deleteDerivedCoverageSkippedForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
+                    try deleteDerivedCoverageSkippedForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
+                    if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.dense_delete_ns, dense_delete_start_ns);
 
                     var dense_embedding_doc_keys = try denseEmbeddingDocKeySet(ctx.alloc, dense_embeddings.writes);
                     defer dense_embedding_doc_keys.deinit(ctx.alloc);
@@ -2062,11 +2523,6 @@ pub fn Impl(comptime DB: type) type {
                     var sparse_doc_index_ns: u64 = 0;
                     var sparse_collect_embedding_ns: u64 = 0;
                     var sparse_embedding_apply_ns: u64 = 0;
-                    const sparse_delete_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
-                    try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.deleted_keys, batch_options);
-                    try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.overwritten_doc_keys, batch_options);
-                    if (emit_sparse_write_profile) sparse_delete_ns = monotonicTimeNs() - sparse_delete_start_ns;
-
                     const sparse_collect_embedding_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
                     var sparse_embeddings = try collectSparseEmbeddingWritesForBatch(
                         ctx.alloc,
@@ -2077,6 +2533,14 @@ pub fn Impl(comptime DB: type) type {
                     );
                     defer sparse_embeddings.deinit();
                     if (emit_sparse_write_profile) sparse_collect_embedding_ns = monotonicTimeNs() - sparse_collect_embedding_start_ns;
+                    try recordSparseEmbeddingArtifactRepairIssuesForReplay(ctx, index_ref.name, sparse_embeddings.writes, batch.sequence);
+
+                    const sparse_delete_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
+                    try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.deleted_keys, batch_options);
+                    try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.overwritten_doc_keys, batch_options);
+                    try deleteDerivedCoverageSkippedForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
+                    try deleteDerivedCoverageSkippedForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
+                    if (emit_sparse_write_profile) sparse_delete_ns = monotonicTimeNs() - sparse_delete_start_ns;
 
                     var sparse_embedding_doc_keys = try sparseEmbeddingDocKeySet(ctx.alloc, sparse_embeddings.writes);
                     defer sparse_embedding_doc_keys.deinit(ctx.alloc);
@@ -2156,6 +2620,10 @@ pub fn Impl(comptime DB: type) type {
                             .{
                                 .relational_base_rows = ctx.relational_base_rows,
                                 .require_resolution_contract = ctx.require_graph_resolution_contract,
+                                .repair = .{
+                                    .enabled = true,
+                                    .sequence = batch.sequence,
+                                },
                             },
                         )
                     else
@@ -2173,7 +2641,12 @@ pub fn Impl(comptime DB: type) type {
                     if (batch.changed_artifact_keys.len > 0 or materialized_artifact_keys.len > 0) {
                         const graph_artifact_keys = try concatArtifactKeyViews(ctx.alloc, batch.changed_artifact_keys, materialized_artifact_keys);
                         defer ctx.alloc.free(graph_artifact_keys);
-                        var graph_mutations = try artifact_replay.collectGraphMutationsForArtifacts(ctx.alloc, ctx.store, graph_artifact_keys, index_ref.name);
+                        var graph_mutations = try artifact_replay.collectGraphMutationsForArtifacts(ctx.alloc, ctx.store, graph_artifact_keys, index_ref.name, .{
+                            .repair = .{
+                                .enabled = true,
+                                .sequence = batch.sequence,
+                            },
+                        });
                         defer graph_mutations.deinit();
                         try ctx.index_manager.applyGraphMutationsByName(index_ref.name, graph_mutations.writes, graph_mutations.deletes);
                     }
@@ -2211,6 +2684,76 @@ pub fn Impl(comptime DB: type) type {
             index_ref: index_manager_mod.ManagedIndexRef,
         ) !bool {
             return try batchAffectsManagedIndexForReplay(self.core.index_manager, batch, index_ref);
+        }
+
+        fn graphArtifactSourceConsumesArtifactKey(
+            index_manager: *index_manager_mod.IndexManager,
+            source: index_manager_mod.GraphArtifactSource,
+            artifact_key: []const u8,
+        ) bool {
+            return artifact_replay.graphArtifactSourceConsumesArtifactKey(index_manager, source, artifact_key);
+        }
+
+        fn managedIndexRecordApplicability(
+            index_manager: *index_manager_mod.IndexManager,
+            record: change_journal_mod.Record,
+            index_ref: index_manager_mod.ManagedIndexRef,
+        ) ManagedIndexBatchApplicability {
+            switch (index_ref.kind) {
+                .full_text, .algebraic => {
+                    if (record.changed_doc_keys.len > 0 or
+                        record.deleted_doc_keys.len > 0 or
+                        record.overwritten_doc_keys.len > 0) return .relevant;
+                    return .irrelevant;
+                },
+                .dense_vector => {
+                    if (record.changed_doc_keys.len > 0 or
+                        record.deleted_doc_keys.len > 0 or
+                        record.overwritten_doc_keys.len > 0) return .relevant;
+                    if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, record.changed_artifact_keys)) return .relevant;
+                    return .irrelevant;
+                },
+                .sparse_vector => {
+                    if (record.changed_doc_keys.len > 0 or
+                        record.deleted_doc_keys.len > 0 or
+                        record.overwritten_doc_keys.len > 0) return .relevant;
+                    if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, record.changed_artifact_keys)) return .relevant;
+                    return .irrelevant;
+                },
+                .graph => {
+                    if (record.deleted_doc_keys.len > 0) return .relevant;
+                    for (record.changed_artifact_keys) |artifact_key| {
+                        if (!internal_keys.isResolutionArtifactKey(artifact_key) and !internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
+                            const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
+                            if (graphArtifactSourceConsumesArtifactKey(index_manager, source, artifact_key)) return .relevant;
+                            continue;
+                        }
+                        if (internal_keys.isResolutionArtifactKey(artifact_key)) {
+                            const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
+                            if (source.mention_edge_type.len == 0) continue;
+                            const parsed = (internal_keys.parseResolutionArtifactKeyAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
+                            defer {
+                                index_manager.alloc.free(parsed.doc_key);
+                                index_manager.alloc.free(parsed.artifact_name);
+                            }
+                            if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return .relevant;
+                            if (resolverConfigForResolutionArtifact(index_manager, parsed.artifact_name) != null) continue;
+                            return .missing_dependency;
+                        }
+                        if (internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
+                            const parsed = (internal_keys.parseGraphEdgeArtifactKeyAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
+                            defer {
+                                index_manager.alloc.free(parsed.doc_key);
+                                index_manager.alloc.free(parsed.index_name);
+                                index_manager.alloc.free(parsed.edge_type);
+                                index_manager.alloc.free(parsed.target_doc_key);
+                            }
+                            if (std.mem.eql(u8, parsed.index_name, index_ref.name)) return .relevant;
+                        }
+                    }
+                    return .irrelevant;
+                },
+            }
         }
 
         pub fn batchAdvancesManagedIndexApplyState(
@@ -2441,6 +2984,42 @@ pub fn Impl(comptime DB: type) type {
             }
             try saveAppliedSequencesBatchContext(ctx, updates.items);
             try truncateReplayJournalIfSafeContext(ctx);
+        }
+
+        pub fn catchUpManagedIndexWithBatchContext(
+            ctx: *const BatchExecutionContext,
+            index_ref: index_manager_mod.ManagedIndexRef,
+            applied: u64,
+            target_sequence: u64,
+        ) !derived_worker.CatchUpStats {
+            var replay_ctx = ReplayApplyContextBatch{
+                .batch = ctx,
+                .dense_bulk_session_scope = .external,
+            };
+            return try derived_worker.catchUpIndexWithOptions(
+                ctx.alloc,
+                ctx.replay_source,
+                index_ref,
+                applied,
+                &replay_ctx,
+                applyDerivedBatchToIndexReplayContext,
+                .{
+                    .resource_manager = ctx.index_manager.resource_manager,
+                    .window_ctx = &replay_ctx,
+                    .begin_window_fn = beginDerivedCatchUpWindowContext,
+                    .finish_window_fn = finishDerivedCatchUpWindowContext,
+                    .target_sequence = target_sequence,
+                },
+            );
+        }
+
+        pub fn canAdvanceDerivedReplayTargetForBatchContext(
+            ctx: *const BatchExecutionContext,
+            index_ref: index_manager_mod.ManagedIndexRef,
+            from_sequence: u64,
+            target_sequence: u64,
+        ) !bool {
+            return try canAdvanceDerivedReplayTargetContext(ctx, index_ref, from_sequence, target_sequence);
         }
 
         fn canAdvanceDerivedReplayTargetContext(
@@ -2844,7 +3423,7 @@ pub fn Impl(comptime DB: type) type {
         fn shouldDeferBacklogPressureForExternalDenseBulk(ctx: *const BatchExecutionContext, sync_level: types.SyncLevel) bool {
             switch (sync_level) {
                 .propose, .write, .enrichments => {},
-                .full_text, .aknn, .full_index => return false,
+                .full_text, .full_index => return false,
             }
             const async_context = ctx.async_context orelse return false;
             return async_context.active_external_dense_bulk_sessions.load(.acquire) != 0;
@@ -2905,10 +3484,9 @@ pub fn Impl(comptime DB: type) type {
                         if (std.mem.eql(u8, delete.index_name, index_ref.name)) return .relevant;
                     }
                     for (batch.changed_artifact_keys) |artifact_key| {
-                        if (internal_keys.isAssetArtifactKey(artifact_key)) {
-                            var artifact_ref = (artifact_ids.decodeArtifactRefAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
-                            defer artifact_ref.deinit(index_manager.alloc);
-                            if (artifact_ref.kind == .asset and index_manager.graphIndexConsumesAssetArtifact(index_ref.name, artifact_ref.name)) return .relevant;
+                        if (!internal_keys.isResolutionArtifactKey(artifact_key) and !internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
+                            const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
+                            if (graphArtifactSourceConsumesArtifactKey(index_manager, source, artifact_key)) return .relevant;
                             continue;
                         }
                         if (internal_keys.isResolutionArtifactKey(artifact_key)) {
@@ -2975,28 +3553,79 @@ pub fn Impl(comptime DB: type) type {
             updates: []const apply_state.AppliedSequenceUpdate,
         ) !void {
             if (updates.len == 0) return;
+            const enriched_updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, updates);
+            defer ctx.alloc.free(enriched_updates);
             if (ctx.async_context) |async_ctx| {
                 var seq_lock = lockAtomicWithBackoffProfiled(
                     &async_ctx.applied_sequence_mutex,
                     &async_ctx.stats.applied_sequence_mutex,
                 );
                 defer seq_lock.unlock();
+                try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+                try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
                 try apply_state.saveAppliedSequencesWithCheckpoint(
                     ctx.alloc,
                     ctx.store,
                     ctx.applied_sequence_checkpoint_path,
-                    updates,
+                    enriched_updates,
                 );
-                try DB.DerivedAsyncCallbacks.save_index_status_snapshots(ctx.alloc, ctx.store, ctx.index_manager, updates);
+                try DB.DerivedAsyncCallbacks.save_index_status_snapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
                 return;
             }
+            try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+            try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
             try apply_state.saveAppliedSequencesWithCheckpoint(
                 ctx.alloc,
                 ctx.store,
                 ctx.applied_sequence_checkpoint_path,
-                updates,
+                enriched_updates,
             );
-            try DB.DerivedAsyncCallbacks.save_index_status_snapshots(ctx.alloc, ctx.store, ctx.index_manager, updates);
+            try DB.DerivedAsyncCallbacks.save_index_status_snapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
+        }
+
+        fn appliedSequenceUpdatesWithConfigHashes(
+            alloc: Allocator,
+            index_manager: *const index_manager_mod.IndexManager,
+            updates: []const apply_state.AppliedSequenceUpdate,
+        ) ![]apply_state.AppliedSequenceUpdate {
+            const enriched = try alloc.alloc(apply_state.AppliedSequenceUpdate, updates.len);
+            for (updates, 0..) |update, i| {
+                enriched[i] = update;
+                if (enriched[i].config_hash == 0) {
+                    if (index_manager.get(update.index_name)) |cfg| {
+                        enriched[i].config_hash = types.indexConfigHash(cfg.*);
+                    }
+                }
+            }
+            return enriched;
+        }
+
+        fn saveDenseProjectionMetadataForAppliedSequenceUpdates(
+            index_manager: *index_manager_mod.IndexManager,
+            updates: []const apply_state.AppliedSequenceUpdate,
+        ) !void {
+            for (updates) |update| {
+                const current = index_manager.denseProjectionCheckpointMetadata(update.index_name) orelse continue;
+                try index_manager.saveDenseProjectionCheckpointMetadata(update.index_name, .{
+                    .applied_sequence = update.sequence,
+                    .status = current.status,
+                    .generation = if (update.generation != 0) update.generation else current.generation,
+                    .config_hash = if (update.config_hash != 0) update.config_hash else current.config_hash,
+                });
+            }
+        }
+
+        fn checkpointManagedProjectionEffectsForAppliedSequenceUpdates(
+            index_manager: *index_manager_mod.IndexManager,
+            updates: []const apply_state.AppliedSequenceUpdate,
+        ) !void {
+            for (updates) |update| {
+                const cfg = index_manager.get(update.index_name) orelse continue;
+                try index_manager.checkpointLsmWalForManagedIndex(.{
+                    .name = update.index_name,
+                    .kind = cfg.kind,
+                });
+            }
         }
 
         fn runDerivedUntilContext(ctx: *const BatchExecutionContext, sequence: u64) !void {
@@ -3156,16 +3785,11 @@ pub fn Impl(comptime DB: type) type {
             try ctx.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_ref.name, finish_options);
             const finalize_ns = elapsedSince(finalize_start_ns);
             setDenseCatchUpPhase(ctx, .applied_sequence_flush);
-            var published_visibility = false;
-            if (ctx.applied_sequence_mutex.tryLock()) {
-                defer ctx.applied_sequence_mutex.unlock();
-                published_visibility = try flushFinishedDenseAppliedSequenceLocked(ctx, index_ref.name);
-            } else {
-                _ = ctx.stats.applied_sequence.skipped_flush_calls.fetchAdd(1, .monotonic);
-            }
-            if (!published_visibility) {
-                if (ctx.query_visibility_hook) |hook| hook.notify(.publish_consistent);
-            }
+            const published_visibility = blk: {
+                var seq_lock = lockAtomicWithBackoffProfiled(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex);
+                defer seq_lock.unlock();
+                break :blk try flushFinishedDenseAppliedSequenceLocked(ctx, index_ref.name);
+            };
             try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
             db_internal.finishDenseCatchUpSessionTracked(ctx, index_ref.name);
             const after_lsm_stats = denseLsmWriteStatsSnapshot(ctx, index_ref.name);
@@ -3192,6 +3816,10 @@ pub fn Impl(comptime DB: type) type {
             };
             if (ctx.index_manager.resource_manager) |manager| {
                 manager.noteDenseReplayWindowResult(dense_window_result);
+            }
+            if (ctx.query_visibility_hook) |hook| {
+                if (!published_visibility) hook.notify(.publish_consistent);
+                hook.notify(.publish_blocking);
             }
         }
 
@@ -3361,6 +3989,179 @@ pub fn Impl(comptime DB: type) type {
             return try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ self.core.path, index_name });
         }
 
+        const DenseArtifactTargetKey = struct {
+            artifact_name: []const u8,
+            dims: u32,
+        };
+
+        const DenseArtifactTargetKeyContext = struct {
+            pub fn hash(_: @This(), key: DenseArtifactTargetKey) u64 {
+                var hasher = std.hash.Wyhash.init(0);
+                const artifact_name_len: u64 = @intCast(key.artifact_name.len);
+                hasher.update(std.mem.asBytes(&artifact_name_len));
+                hasher.update(key.artifact_name);
+                hasher.update(std.mem.asBytes(&key.dims));
+                return hasher.final();
+            }
+
+            pub fn eql(_: @This(), lhs: DenseArtifactTargetKey, rhs: DenseArtifactTargetKey) bool {
+                return lhs.dims == rhs.dims and std.mem.eql(u8, lhs.artifact_name, rhs.artifact_name);
+            }
+        };
+
+        const DenseArtifactTargetLookup = struct {
+            by_artifact: std.HashMapUnmanaged(DenseArtifactTargetKey, std.ArrayListUnmanaged(usize), DenseArtifactTargetKeyContext, 80) = .empty,
+
+            fn deinit(self: *@This(), alloc: Allocator) void {
+                var values = self.by_artifact.valueIterator();
+                while (values.next()) |indices| indices.deinit(alloc);
+                self.by_artifact.deinit(alloc);
+                self.* = .{};
+            }
+
+            fn add(self: *@This(), alloc: Allocator, artifact_name: []const u8, dims: u32, dense_index_idx: usize) !void {
+                const key: DenseArtifactTargetKey = .{
+                    .artifact_name = artifact_name,
+                    .dims = dims,
+                };
+                var entry = try self.by_artifact.getOrPut(alloc, key);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(alloc, dense_index_idx);
+            }
+        };
+
+        fn denseArtifactTargetCounterKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+            return try std.fmt.allocPrint(alloc, "{s}{s}", .{ dense_artifact_target_counter_prefix, index_name });
+        }
+
+        pub fn loadDenseArtifactTargetCounter(alloc: Allocator, store: *docstore_mod.DocStore, index_name: []const u8) !?u64 {
+            const key = try denseArtifactTargetCounterKeyAlloc(alloc, index_name);
+            defer alloc.free(key);
+            const raw = store.get(alloc, key) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            defer alloc.free(raw);
+            if (raw.len != 8) return error.InvalidDenseArtifactTargetCounter;
+            return std.mem.readInt(u64, raw[0..8], .little);
+        }
+
+        fn appendDenseArtifactTargetCounterWrite(
+            alloc: Allocator,
+            store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+            owned_keys: *std.ArrayListUnmanaged([]u8),
+            owned_values: *std.ArrayListUnmanaged([]u8),
+            index_name: []const u8,
+            count: u64,
+        ) !void {
+            const key = try denseArtifactTargetCounterKeyAlloc(alloc, index_name);
+            errdefer alloc.free(key);
+            const value = try alloc.alloc(u8, 8);
+            errdefer alloc.free(value);
+            std.mem.writeInt(u64, value[0..8], count, .little);
+            try owned_keys.append(alloc, key);
+            try owned_values.append(alloc, value);
+            try store_writes.append(alloc, .{
+                .key = key,
+                .value = value,
+            });
+        }
+
+        fn denseArtifactTargetsForArtifact(
+            index_manager: *const index_manager_mod.IndexManager,
+            artifact_name: []const u8,
+            dims: u32,
+            out: *std.ArrayListUnmanaged(usize),
+            alloc: Allocator,
+        ) !void {
+            for (index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
+                if (!denseIndexIsArtifactBacked(entry)) continue;
+                if (entry.dims != dims) continue;
+                if (std.mem.eql(u8, entry.config.name, artifact_name) or
+                    (entry.embedding_name != null and std.mem.eql(u8, entry.embedding_name.?, artifact_name)))
+                {
+                    try out.append(alloc, dense_index_idx);
+                }
+            }
+        }
+
+        fn applyDenseArtifactCounterDelta(
+            alloc: Allocator,
+            store: *docstore_mod.DocStore,
+            index_manager: *const index_manager_mod.IndexManager,
+            counts: *std.AutoHashMapUnmanaged(usize, u64),
+            artifact_key: []const u8,
+            artifact_value: ?[]const u8,
+            delta: i64,
+        ) !void {
+            if (delta == 0) return;
+            var identity = (artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key) catch |err| switch (err) {
+                error.InvalidInternalUserKey => return,
+                else => return err,
+            }) orelse return;
+            defer identity.deinit(alloc);
+            const value = artifact_value orelse return;
+            const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(value) catch return;
+            if (dims == 0) return;
+
+            var targets = std.ArrayListUnmanaged(usize).empty;
+            defer targets.deinit(alloc);
+            try denseArtifactTargetsForArtifact(index_manager, identity.embedding_name, dims, &targets, alloc);
+            for (targets.items) |dense_index_idx| {
+                const entry = &index_manager.dense_indexes.items[dense_index_idx];
+                const gop = try counts.getOrPut(alloc, dense_index_idx);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = (try loadDenseArtifactTargetCounter(alloc, store, entry.config.name)) orelse 0;
+                }
+                if (delta > 0) {
+                    gop.value_ptr.* +|= @as(u64, @intCast(delta));
+                } else {
+                    gop.value_ptr.* -|= @as(u64, @intCast(-delta));
+                }
+            }
+        }
+
+        pub fn appendDenseArtifactCounterMutations(
+            alloc: Allocator,
+            store: *docstore_mod.DocStore,
+            index_manager: *const index_manager_mod.IndexManager,
+            store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+            delete_keys: []const []const u8,
+            owned_keys: *std.ArrayListUnmanaged([]u8),
+            owned_values: *std.ArrayListUnmanaged([]u8),
+        ) !void {
+            if (index_manager.dense_indexes.items.len == 0) return;
+            var counts = std.AutoHashMapUnmanaged(usize, u64){};
+            defer counts.deinit(alloc);
+
+            for (delete_keys) |key| {
+                const old_value = store.get(alloc, key) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                defer alloc.free(old_value);
+                try applyDenseArtifactCounterDelta(alloc, store, index_manager, &counts, key, old_value, -1);
+            }
+
+            for (store_writes.items) |write| {
+                const old_value = store.get(alloc, write.key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                defer if (old_value) |value| alloc.free(value);
+                if (old_value) |value| {
+                    try applyDenseArtifactCounterDelta(alloc, store, index_manager, &counts, write.key, value, -1);
+                }
+                try applyDenseArtifactCounterDelta(alloc, store, index_manager, &counts, write.key, write.value, 1);
+            }
+
+            var it = counts.iterator();
+            while (it.next()) |entry| {
+                const dense_entry = &index_manager.dense_indexes.items[entry.key_ptr.*];
+                try appendDenseArtifactTargetCounterWrite(alloc, store_writes, owned_keys, owned_values, dense_entry.config.name, entry.value_ptr.*);
+            }
+        }
+
         fn collectDenseArtifactTargetCounts(
             self: *DB,
             alloc: Allocator,
@@ -3369,38 +4170,48 @@ pub fn Impl(comptime DB: type) type {
             var counts: DenseArtifactTargetCounts = .{};
             errdefer counts.deinit(alloc);
 
-            var tracked_indices = std.ArrayListUnmanaged(usize).empty;
-            defer tracked_indices.deinit(alloc);
+            var target_lookup: DenseArtifactTargetLookup = .{};
+            defer target_lookup.deinit(alloc);
 
             if (rebuild_targets) |targets| {
                 for (targets) |target| {
-                    try tracked_indices.append(alloc, target.dense_index_idx);
+                    const entry = &self.core.index_manager.dense_indexes.items[target.dense_index_idx];
                     try counts.per_target_index.put(alloc, target.dense_index_idx, 0);
+                    try target_lookup.add(alloc, entry.config.name, entry.dims, target.dense_index_idx);
+                    if (entry.embedding_name) |embedding_name| {
+                        if (!std.mem.eql(u8, embedding_name, entry.config.name)) {
+                            try target_lookup.add(alloc, embedding_name, entry.dims, target.dense_index_idx);
+                        }
+                    }
                 }
             } else {
                 for (self.core.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
                     if (!denseIndexIsArtifactBacked(entry)) continue;
-                    try tracked_indices.append(alloc, dense_index_idx);
                     try counts.per_target_index.put(alloc, dense_index_idx, 0);
+                    try target_lookup.add(alloc, entry.config.name, entry.dims, dense_index_idx);
+                    if (entry.embedding_name) |embedding_name| {
+                        if (!std.mem.eql(u8, embedding_name, entry.config.name)) {
+                            try target_lookup.add(alloc, embedding_name, entry.dims, dense_index_idx);
+                        }
+                    }
                 }
             }
 
-            if (tracked_indices.items.len == 0) return counts;
+            if (target_lookup.by_artifact.count() == 0) return counts;
 
             const lower = try self.core.documentRangeLowerAlloc("");
             defer self.core.alloc.free(lower);
 
             const ScanState = struct {
                 alloc: Allocator,
-                db: *DB,
                 counts: *DenseArtifactTargetCounts,
-                tracked_indices: []const usize,
+                target_lookup: *const DenseArtifactTargetLookup,
 
                 fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
                     const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
                     if (!internal_keys.isInternalUserKey(key)) return .@"continue";
 
-                    var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(state.alloc, key)) orelse return .@"continue";
+                    var artifact_ref = (try db_internal.decodeArtifactRefIfKnownAlloc(state.alloc, key)) orelse return .@"continue";
                     defer artifact_ref.deinit(state.alloc);
                     if (artifact_ref.kind != .embedding) return .@"continue";
 
@@ -3410,27 +4221,56 @@ pub fn Impl(comptime DB: type) type {
                     };
                     if (dims == 0) return .@"continue";
 
-                    var matched = false;
-                    for (state.tracked_indices) |dense_index_idx| {
-                        const entry = &state.db.core.index_manager.dense_indexes.items[dense_index_idx];
-                        if (!std.mem.eql(u8, denseArtifactNameForEntry(entry), artifact_ref.name)) continue;
-                        if (entry.dims != dims) continue;
+                    const lookup_key: DenseArtifactTargetKey = .{
+                        .artifact_name = artifact_ref.name,
+                        .dims = dims,
+                    };
+                    const indices = state.target_lookup.by_artifact.get(lookup_key) orelse return .@"continue";
+                    for (indices.items) |dense_index_idx| {
                         const count = state.counts.per_target_index.getPtr(dense_index_idx).?;
                         count.* += 1;
-                        matched = true;
                     }
-                    if (matched) state.counts.total_target_artifacts += 1;
+                    state.counts.total_target_artifacts += 1;
                     return .@"continue";
                 }
             };
 
             var state = ScanState{
                 .alloc = alloc,
-                .db = self,
                 .counts = &counts,
-                .tracked_indices = tracked_indices.items,
+                .target_lookup = &target_lookup,
             };
             try self.core.store.scanWithContext(lower, "", .{}, &state, ScanState.scanEntry);
+            return counts;
+        }
+
+        fn collectDenseArtifactTargetCountsFromCounters(
+            self: *DB,
+            alloc: Allocator,
+            rebuild_targets: []const DenseArtifactRebuildTarget,
+        ) !DenseArtifactTargetCounts {
+            var counts: DenseArtifactTargetCounts = .{};
+            errdefer counts.deinit(alloc);
+
+            var source_counts = std.HashMapUnmanaged(DenseArtifactTargetKey, u64, DenseArtifactTargetKeyContext, 80).empty;
+            defer source_counts.deinit(alloc);
+
+            for (rebuild_targets) |target| {
+                const entry = &self.core.index_manager.dense_indexes.items[target.dense_index_idx];
+                const count = (try loadDenseArtifactTargetCounter(alloc, self.core.store, entry.config.name)) orelse 0;
+                try counts.per_target_index.put(alloc, target.dense_index_idx, count);
+
+                const source_key: DenseArtifactTargetKey = .{
+                    .artifact_name = denseArtifactNameForEntry(entry),
+                    .dims = entry.dims,
+                };
+                const gop = try source_counts.getOrPut(alloc, source_key);
+                if (!gop.found_existing or count > gop.value_ptr.*) gop.value_ptr.* = count;
+            }
+
+            var source_it = source_counts.valueIterator();
+            while (source_it.next()) |count| counts.total_target_artifacts +|= count.*;
+
             return counts;
         }
 
@@ -3450,7 +4290,9 @@ pub fn Impl(comptime DB: type) type {
                 persisted_resume: ?[]u8 = null,
                 applied_sequence: u64,
                 target_sequence: u64,
+                watermark_count: u64 = 0,
                 force_reset: bool = false,
+                counterless_scan_allowed: bool = false,
 
                 fn deinit(candidate: *@This(), local_alloc: Allocator) void {
                     if (candidate.persisted_resume) |buf| local_alloc.free(buf);
@@ -3469,7 +4311,10 @@ pub fn Impl(comptime DB: type) type {
             };
 
             var targets = std.ArrayListUnmanaged(DenseArtifactRebuildTarget).empty;
-            errdefer targets.deinit(alloc);
+            errdefer {
+                for (targets.items) |*target| target.deinit(alloc);
+                targets.deinit(alloc);
+            }
 
             var candidates = std.ArrayListUnmanaged(Candidate).empty;
             defer {
@@ -3478,14 +4323,24 @@ pub fn Impl(comptime DB: type) type {
             }
 
             for (self.core.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
-                if (!denseIndexIsArtifactBacked(entry)) continue;
+                const status_snapshot = try db_internal.loadIndexStatusSnapshot(alloc, self.core.store, entry.config.name);
+                const watermark_count = if (status_snapshot) |status_value|
+                    if (status_value.kind == .dense_vector) status_value.doc_count else 0
+                else
+                    0;
+                const watermark_regressed = watermark_count > entry.index.stats().active_count;
+                if (!denseIndexIsArtifactBacked(entry) and !watermark_regressed) continue;
 
                 const rebuild_root_path = try denseIndexRebuildStatePathAlloc(self, alloc, entry.config.name);
                 defer alloc.free(rebuild_root_path);
                 const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
                 const persisted_resume = try rebuild_state.check(alloc);
                 errdefer if (persisted_resume) |buf| alloc.free(buf);
-                const applied_sequence = try self.core.loadAppliedSequence(alloc, entry.config.name);
+                const projection_checkpoint = try self.core.loadProjectionCheckpoint(alloc, entry.config.name);
+                const config_hash = types.indexConfigHash(entry.config);
+                const checkpoint_config_mismatch = projection_checkpoint.config_hash != config_hash;
+                const counterless_scan_allowed = projection_checkpoint.generation == 0 and entry.index.stats().active_count == 0;
+                const applied_sequence = projection_checkpoint.applied_sequence;
                 const target_sequence = try probeDerivedReplayTargetSequence(
                     self,
                     alloc,
@@ -3496,8 +4351,17 @@ pub fn Impl(comptime DB: type) type {
                     },
                     applied_sequence,
                 );
-                if (persisted_resume == null and applied_sequence < target_sequence) continue;
+                if (persisted_resume == null and
+                    !checkpoint_config_mismatch and
+                    applied_sequence < target_sequence and
+                    projection_checkpoint.status != .rebuilding and
+                    projection_checkpoint.status != .repair_required)
+                {
+                    continue;
+                }
                 const force_reset = blk: {
+                    if (checkpoint_config_mismatch) break :blk true;
+                    if (projection_checkpoint.status == .repair_required) break :blk true;
                     if (entry.index.stats().active_count == 0) break :blk false;
                     if (@hasDecl(@TypeOf(entry.index), "validateStoredStructure")) {
                         entry.index.validateStoredStructure(alloc) catch |err| {
@@ -3512,7 +4376,9 @@ pub fn Impl(comptime DB: type) type {
                     .persisted_resume = persisted_resume,
                     .applied_sequence = applied_sequence,
                     .target_sequence = target_sequence,
+                    .watermark_count = watermark_count,
                     .force_reset = force_reset,
+                    .counterless_scan_allowed = counterless_scan_allowed,
                 });
             }
 
@@ -3522,13 +4388,39 @@ pub fn Impl(comptime DB: type) type {
                 try candidate_targets.append(alloc, .{ .dense_index_idx = candidate.dense_index_idx });
             }
 
-            var target_counts = try collectDenseArtifactTargetCounts(self, alloc, candidate_targets.items);
+            var target_counts = try collectDenseArtifactTargetCountsFromCounters(self, alloc, candidate_targets.items);
             defer target_counts.deinit(alloc);
+
+            var needs_counterless_candidate_scan = false;
+            for (candidates.items) |candidate| {
+                const counter_count = target_counts.per_target_index.get(candidate.dense_index_idx) orelse 0;
+                if (counter_count != 0) continue;
+                if (candidate.persisted_resume != null or candidate.force_reset or candidate.watermark_count != 0 or candidate.counterless_scan_allowed) {
+                    needs_counterless_candidate_scan = true;
+                    break;
+                }
+            }
+            if (needs_counterless_candidate_scan) {
+                var scanned_counts = try collectDenseArtifactTargetCounts(self, alloc, candidate_targets.items);
+                defer scanned_counts.deinit(alloc);
+
+                var scanned_it = scanned_counts.per_target_index.iterator();
+                while (scanned_it.next()) |entry| {
+                    const existing = target_counts.per_target_index.get(entry.key_ptr.*) orelse 0;
+                    if (entry.value_ptr.* > existing) {
+                        try target_counts.per_target_index.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
+                    }
+                }
+                target_counts.total_target_artifacts = @max(target_counts.total_target_artifacts, scanned_counts.total_target_artifacts);
+            }
 
             for (candidates.items) |*candidate| {
                 const dense_index_idx = candidate.dense_index_idx;
                 const entry = &self.core.index_manager.dense_indexes.items[dense_index_idx];
-                const artifact_target_count = target_counts.per_target_index.get(dense_index_idx) orelse 0;
+                const artifact_target_count = @max(
+                    target_counts.per_target_index.get(dense_index_idx) orelse 0,
+                    candidate.watermark_count,
+                );
                 const rebuild_root_path = try denseIndexRebuildStatePathAlloc(self, alloc, entry.config.name);
                 defer alloc.free(rebuild_root_path);
                 const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
@@ -3573,6 +4465,13 @@ pub fn Impl(comptime DB: type) type {
         fn prepareDenseArtifactRebuildPlan(self: *DB, plan: DenseArtifactRebuildPlan) !void {
             for (plan.targets) |target| {
                 const entry = &self.core.index_manager.dense_indexes.items[target.dense_index_idx];
+                const checkpoint = try self.core.loadProjectionCheckpoint(self.alloc, entry.config.name);
+                try self.core.saveProjectionCheckpoint(entry.config.name, .{
+                    .applied_sequence = checkpoint.applied_sequence,
+                    .status = .rebuilding,
+                    .generation = checkpoint.generation,
+                    .config_hash = types.indexConfigHash(entry.config),
+                });
                 if (target.force_reset) {
                     try self.core.index_manager.resetDenseIndexForArtifactRebuild(entry.config.name);
                 }
@@ -3603,6 +4502,13 @@ pub fn Impl(comptime DB: type) type {
                 const repaired = entry.index.stats().active_count >= target.artifact_target_count and applied_sequence >= target_sequence;
                 if (repaired) {
                     try rebuild_state.clear();
+                    const checkpoint = try self.core.loadProjectionCheckpoint(alloc, entry.config.name);
+                    try self.core.saveProjectionCheckpoint(entry.config.name, .{
+                        .applied_sequence = applied_sequence,
+                        .status = .clean,
+                        .generation = checkpoint.generation +| 1,
+                        .config_hash = types.indexConfigHash(entry.config),
+                    });
                 }
             }
         }
@@ -3781,7 +4687,6 @@ pub fn Impl(comptime DB: type) type {
 
                     const vector = enrichment_artifact_codec.decodeDenseEmbeddingAlloc(state.alloc, value) catch |err| {
                         if (Self.isRecoverableEmbeddingArtifactError(err)) {
-                            try state.db.core.store.putBatch(&.{}, &.{key});
                             return .@"continue";
                         }
                         return err;
@@ -3939,6 +4844,7 @@ pub fn Impl(comptime DB: type) type {
             try prepareDenseArtifactRebuildPlan(self, plan);
             const ResumePersistCtx = struct {
                 db: *DB,
+                alloc: Allocator,
                 targets: []DenseArtifactRebuildTarget,
 
                 fn run(ctx: *anyopaque, last_key: []const u8) !void {
@@ -3948,19 +4854,20 @@ pub fn Impl(comptime DB: type) type {
                             if (std.mem.order(u8, last_key, resume_from) != .gt) continue;
                         }
                         const entry = &persist.db.core.index_manager.dense_indexes.items[target.dense_index_idx];
-                        const rebuild_root_path = try denseIndexRebuildStatePathAlloc(persist.db, persist.db.alloc, entry.config.name);
-                        defer persist.db.alloc.free(rebuild_root_path);
+                        const rebuild_root_path = try denseIndexRebuildStatePathAlloc(persist.db, persist.alloc, entry.config.name);
+                        defer persist.alloc.free(rebuild_root_path);
                         const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
                         try rebuild_state.update(last_key);
-                        const owned_key = try persist.db.alloc.dupe(u8, last_key);
-                        errdefer persist.db.alloc.free(owned_key);
-                        if (target.resume_from) |resume_from| persist.db.alloc.free(resume_from);
+                        const owned_key = try persist.alloc.dupe(u8, last_key);
+                        errdefer persist.alloc.free(owned_key);
+                        if (target.resume_from) |resume_from| persist.alloc.free(resume_from);
                         target.resume_from = owned_key;
                     }
                 }
             };
             var persist_ctx = ResumePersistCtx{
                 .db = self,
+                .alloc = alloc,
                 .targets = plan.targets,
             };
             const rebuilt = try rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
@@ -4121,14 +5028,16 @@ pub fn Impl(comptime DB: type) type {
 
             const flush_start_ns = monotonicTimeNs();
             const save_start_ns = monotonicTimeNs();
-            try apply_state.saveAppliedSequencesWithCheckpoint(ctx.alloc, ctx.store, ctx.applied_sequence_checkpoint_path, &[_]apply_state.AppliedSequenceUpdate{.{
+            const raw_update = apply_state.AppliedSequenceUpdate{
                 .index_name = pending.owned_name,
                 .sequence = pending.sequence,
-            }});
-            try DB.DerivedAsyncCallbacks.save_index_status_snapshots(ctx.alloc, ctx.store, ctx.index_manager, &[_]apply_state.AppliedSequenceUpdate{.{
-                .index_name = pending.owned_name,
-                .sequence = pending.sequence,
-            }});
+            };
+            const updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, &.{raw_update});
+            defer ctx.alloc.free(updates);
+            try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, updates);
+            try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, updates);
+            try apply_state.saveAppliedSequencesWithCheckpoint(ctx.alloc, ctx.store, ctx.applied_sequence_checkpoint_path, updates);
+            try DB.DerivedAsyncCallbacks.save_index_status_snapshots(ctx.alloc, ctx.store, ctx.index_manager, updates);
             const save_ns = elapsedSince(save_start_ns);
 
             ctx.applied_sequence_coalescer.last_flush_ns = monotonicTimeNs();
@@ -4138,7 +5047,7 @@ pub fn Impl(comptime DB: type) type {
             _ = ctx.stats.applied_sequence.save_ns.fetchAdd(save_ns, .monotonic);
             _ = ctx.stats.applied_sequence.flush_ns.fetchAdd(flush_ns, .monotonic);
             db_internal.atomicMaxU64(&ctx.stats.applied_sequence.max_flush_ns, flush_ns);
-            if (ctx.query_visibility_hook) |hook| hook.notify(.publish_consistent);
+            if (ctx.query_visibility_hook) |hook| hook.notify(.status);
             return true;
         }
 
@@ -4161,13 +5070,17 @@ pub fn Impl(comptime DB: type) type {
             const sync_ns: u64 = 0;
 
             const save_start_ns = monotonicTimeNs();
+            const enriched_updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, updates.items);
+            defer ctx.alloc.free(enriched_updates);
+            try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+            try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
             try apply_state.saveAppliedSequencesWithCheckpoint(
                 ctx.alloc,
                 ctx.store,
                 ctx.applied_sequence_checkpoint_path,
-                updates.items,
+                enriched_updates,
             );
-            try DB.DerivedAsyncCallbacks.save_index_status_snapshots(ctx.alloc, ctx.store, ctx.index_manager, updates.items);
+            try DB.DerivedAsyncCallbacks.save_index_status_snapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
             const save_ns = elapsedSince(save_start_ns);
             ctx.applied_sequence_coalescer.clearPending(ctx.alloc);
             ctx.applied_sequence_coalescer.last_flush_ns = monotonicTimeNs();
@@ -4178,7 +5091,7 @@ pub fn Impl(comptime DB: type) type {
             _ = ctx.stats.applied_sequence.save_ns.fetchAdd(save_ns, .monotonic);
             _ = ctx.stats.applied_sequence.flush_ns.fetchAdd(flush_ns, .monotonic);
             db_internal.atomicMaxU64(&ctx.stats.applied_sequence.max_flush_ns, flush_ns);
-            if (ctx.query_visibility_hook) |hook| hook.notify(.publish);
+            if (ctx.query_visibility_hook) |hook| hook.notify(.status);
             return true;
         }
 
@@ -4213,10 +5126,12 @@ pub fn Impl(comptime DB: type) type {
             return entry.external or entry.chunk_name != null or entry.embedding_name != null;
         }
 
-        fn denseTargetCountForIndexContext(ctx: anytype, index_name: []const u8) !u64 {
-            const artifact_count = try denseArtifactTargetCountForIndexContext(ctx, index_name);
-            const inline_count = try densePrimaryVectorTargetCountForIndexContext(ctx, index_name);
-            return @max(artifact_count, inline_count);
+        fn denseTargetCountForIndexContext(ctx: anytype, index_name: []const u8) !?u64 {
+            const entry = ctx.index_manager.denseIndex(index_name) orelse return 0;
+            if (denseIndexIsArtifactBacked(entry)) {
+                return try loadDenseArtifactTargetCounter(ctx.alloc, ctx.store, index_name);
+            }
+            return try densePrimaryVectorTargetCountForIndexContext(ctx, index_name);
         }
 
         fn denseArtifactTargetCountForIndexContext(ctx: anytype, index_name: []const u8) !u64 {
@@ -4463,12 +5378,9 @@ pub fn Impl(comptime DB: type) type {
                     const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
                     if (!internal_keys.isInternalUserKey(key)) return .@"continue";
 
-                    var identity = (artifact_ids.decodeEmbeddingArtifactIdentityAlloc(state.ctx.alloc, key) catch |err| switch (err) {
-                        error.InvalidInternalUserKey => return .@"continue",
-                        else => return err,
-                    }) orelse return .@"continue";
-                    defer identity.deinit(state.ctx.alloc);
-                    if (!std.mem.eql(u8, identity.embedding_name, state.expected_name)) return .@"continue";
+                    var identity = (try artifact_replay.decodeEmbeddingArtifactWriteIdentityAlloc(state.ctx.alloc, key, state.expected_name)) orelse return .@"continue";
+                    var identity_transferred = false;
+                    defer if (!identity_transferred) identity.deinit(state.ctx.alloc);
 
                     const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(value) catch |err| {
                         if (Self.isRecoverableEmbeddingArtifactError(err)) return .@"continue";
@@ -4478,10 +5390,12 @@ pub fn Impl(comptime DB: type) type {
 
                     try state.writes.append(state.ctx.alloc, .{
                         .index_name = try state.ctx.alloc.dupe(u8, state.index_name),
-                        .doc_key = try state.ctx.alloc.dupe(u8, identity.doc_key),
+                        .doc_key = identity.doc_key,
+                        .parent_doc_key = identity.parent_doc_key,
                         .artifact_key = try state.ctx.alloc.dupe(u8, key),
                         .vector = &.{},
                     });
+                    identity_transferred = true;
                     state.rebuilt += 1;
 
                     if (state.writes.items.len >= state.rebuild_chunk_size) try state.flush();
@@ -4540,6 +5454,106 @@ pub fn Impl(comptime DB: type) type {
                 => true,
                 else => false,
             };
+        }
+
+        fn denseEmbeddingArtifactRepairReason(
+            ctx: anytype,
+            dims: u32,
+            artifact_key: []const u8,
+        ) !?types.ArtifactRepairReason {
+            const raw = ctx.store.get(ctx.alloc, artifact_key) catch |err| switch (err) {
+                error.NotFound => return .missing_artifact,
+                else => return err,
+            };
+            defer ctx.alloc.free(raw);
+
+            const expected_dims: usize = @intCast(dims);
+            if (enrichment_artifact_codec.denseEmbeddingVectorView(raw)) |maybe_view| {
+                if (maybe_view) |view| {
+                    return if (view.len == expected_dims) null else .corrupt_artifact;
+                }
+            } else |err| {
+                if (Self.isRecoverableEmbeddingArtifactError(err)) return .corrupt_artifact;
+                return err;
+            }
+
+            const decoded = enrichment_artifact_codec.decodeDenseEmbeddingAlloc(ctx.alloc, raw) catch |err| {
+                if (Self.isRecoverableEmbeddingArtifactError(err)) return .corrupt_artifact;
+                return err;
+            };
+            defer ctx.alloc.free(decoded);
+            return if (decoded.len == expected_dims) null else .corrupt_artifact;
+        }
+
+        fn sparseEmbeddingArtifactRepairReason(ctx: anytype, artifact_key: []const u8) !?types.ArtifactRepairReason {
+            const raw = ctx.store.get(ctx.alloc, artifact_key) catch |err| switch (err) {
+                error.NotFound => return .missing_artifact,
+                else => return err,
+            };
+            defer ctx.alloc.free(raw);
+
+            if (enrichment_artifact_codec.sparseEmbeddingVectorView(raw)) |maybe_view| {
+                if (maybe_view != null) return null;
+            } else |err| {
+                if (Self.isRecoverableEmbeddingArtifactError(err)) return .corrupt_artifact;
+                return err;
+            }
+
+            var decoded = enrichment_artifact_codec.decodeSparseEmbeddingAlloc(ctx.alloc, raw) catch |err| {
+                if (Self.isRecoverableEmbeddingArtifactError(err)) return .corrupt_artifact;
+                return err;
+            };
+            decoded.deinit(ctx.alloc);
+            return null;
+        }
+
+        fn recordDenseEmbeddingArtifactRepairIssuesForReplay(
+            ctx: anytype,
+            index_name: []const u8,
+            dims: u32,
+            writes: []const mapper.DenseEmbeddingWrite,
+            sequence: u64,
+        ) !void {
+            var debt_recorded = false;
+            for (writes) |write| {
+                const artifact_key = write.artifact_key orelse continue;
+                if (try denseEmbeddingArtifactRepairReason(ctx, dims, artifact_key)) |reason| {
+                    try artifact_repair.recordEmbeddingArtifactRepairIssueForReplay(
+                        ctx.alloc,
+                        ctx.store,
+                        index_name,
+                        artifact_key,
+                        sequence,
+                        reason,
+                    );
+                    debt_recorded = true;
+                }
+            }
+            if (debt_recorded) return error.ArtifactRepairRequired;
+        }
+
+        fn recordSparseEmbeddingArtifactRepairIssuesForReplay(
+            ctx: anytype,
+            index_name: []const u8,
+            writes: []const mapper.SparseEmbeddingWrite,
+            sequence: u64,
+        ) !void {
+            var debt_recorded = false;
+            for (writes) |write| {
+                const artifact_key = write.artifact_key orelse continue;
+                if (try sparseEmbeddingArtifactRepairReason(ctx, artifact_key)) |reason| {
+                    try artifact_repair.recordEmbeddingArtifactRepairIssueForReplay(
+                        ctx.alloc,
+                        ctx.store,
+                        index_name,
+                        artifact_key,
+                        sequence,
+                        reason,
+                    );
+                    debt_recorded = true;
+                }
+            }
+            if (debt_recorded) return error.ArtifactRepairRequired;
         }
 
         pub fn freeDenseArtifactRebuildWrites(alloc: Allocator, writes: *std.ArrayListUnmanaged(mapper.DenseEmbeddingWrite)) void {
@@ -4784,7 +5798,7 @@ test "db derived async replay text replay delete keys include upserted derived d
     try std.testing.expectEqualStrings("overwritten:1", keys[2]);
 }
 
-test "db derived async replay skips dense embedding writes when artifact payload is missing" {
+test "db replay blocks dense embedding writes when artifact payload is missing" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
 
@@ -4824,8 +5838,26 @@ test "db derived async replay skips dense embedding writes when artifact payload
         appended_sequence = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
     }
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
     defer reopened.close();
+
+    const issues = try reopened.listEmbeddingArtifactRepairIssues(alloc, "dv_v1", 0);
+    defer types.freeEmbeddingArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expectEqual(.missing_embedding_artifact, issues[0].reason);
+    try std.testing.expectEqual(.embedding, issues[0].artifact_kind);
+    try std.testing.expectEqualStrings("doc:a", issues[0].doc_key);
+    try std.testing.expectEqualStrings("dv_v1", issues[0].artifact_name);
+
+    const degraded_stats = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, degraded_stats);
+    try std.testing.expect(degraded_stats.repair_degraded);
+    try std.testing.expectEqual(@as(u64, 1), degraded_stats.repair_issue_count);
+    try std.testing.expect(degraded_stats.indexes[0].repair_degraded);
+    try std.testing.expectEqual(@as(u64, 1), degraded_stats.indexes[0].repair_issue_count);
 
     var result = try reopened.search(alloc, .{
         .index_name = "dv_v1",
@@ -4840,10 +5872,11 @@ test "db derived async replay skips dense embedding writes when artifact payload
     try std.testing.expectEqual(@as(u32, 0), result.total_hits);
 
     const dense_applied = try reopened.core.loadAppliedSequence(alloc, "dv_v1");
-    try std.testing.expectEqual(appended_sequence, dense_applied);
+    try std.testing.expectEqual(@as(u64, 0), dense_applied);
+    try std.testing.expect(appended_sequence > dense_applied);
 }
 
-test "db derived async replay skips and deletes corrupt dense embedding artifacts" {
+test "db replay blocks and preserves corrupt dense embedding artifacts" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
 
@@ -4884,8 +5917,19 @@ test "db derived async replay skips and deletes corrupt dense embedding artifact
         appended_sequence = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
     }
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
     defer reopened.close();
+
+    const issues = try reopened.listEmbeddingArtifactRepairIssues(alloc, "dv_v1", 0);
+    defer types.freeEmbeddingArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expectEqual(.corrupt_embedding_artifact, issues[0].reason);
+    try std.testing.expectEqual(.embedding, issues[0].artifact_kind);
+    try std.testing.expectEqualStrings("doc:a", issues[0].doc_key);
+    try std.testing.expectEqualStrings("dv_v1", issues[0].artifact_name);
 
     var result = try reopened.search(alloc, .{
         .index_name = "dv_v1",
@@ -4901,13 +5945,102 @@ test "db derived async replay skips and deletes corrupt dense embedding artifact
 
     const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
     defer alloc.free(artifact_key);
-    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, artifact_key));
+    const artifact_value = try reopened.core.store.get(alloc, artifact_key);
+    defer alloc.free(artifact_value);
+    try std.testing.expectEqualStrings("bad-artifact", artifact_value);
 
     const dense_applied = try reopened.core.loadAppliedSequence(alloc, "dv_v1");
-    try std.testing.expectEqual(appended_sequence, dense_applied);
+    try std.testing.expectEqual(@as(u64, 0), dense_applied);
+    try std.testing.expect(appended_sequence > dense_applied);
+
+    reopened.runDerivedUntil(appended_sequence) catch |err| switch (err) {
+        error.ArtifactRepairRequired => {},
+        else => return err,
+    };
+    const issues_after_replay = try reopened.listEmbeddingArtifactRepairIssues(alloc, "dv_v1", 0);
+    defer types.freeEmbeddingArtifactRepairIssues(alloc, issues_after_replay);
+    try std.testing.expectEqual(@as(usize, 1), issues_after_replay.len);
+    try std.testing.expectEqual(issues[0].first_seen_ns, issues_after_replay[0].first_seen_ns);
+    try std.testing.expectEqual(issues[0].attempts, issues_after_replay[0].attempts);
+    try std.testing.expectEqualStrings(issues[0].last_error, issues_after_replay[0].last_error);
+
+    const repair = try reopened.repairEmbeddingArtifactIssues(alloc, 10);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 0), repair.repaired);
+    try std.testing.expectEqual(@as(u64, 1), repair.failed);
+    const issues_after_repair = try reopened.listEmbeddingArtifactRepairIssues(alloc, "dv_v1", 0);
+    defer types.freeEmbeddingArtifactRepairIssues(alloc, issues_after_repair);
+    try std.testing.expectEqual(@as(usize, 1), issues_after_repair.len);
+    try std.testing.expectEqual(@as(u64, 1), issues_after_repair[0].attempts);
+    try std.testing.expectEqualStrings("embedding_enrichment_unavailable", issues_after_repair[0].last_error);
 }
 
-test "db derived async dense artifact rebuild deletes corrupt stored embedding artifacts" {
+test "db replay records wrong-dimension dense embedding artifact as repair debt" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var appended_sequence: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.put(stored_key, "{\"title\":\"alpha\"}");
+
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
+        defer alloc.free(artifact_key);
+        try TestHelpers.putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0, 0 });
+
+        const derived_batch = derived_types.DerivedBatch{
+            .dense_embeddings = &.{
+                .{
+                    .index_name = "dv_v1",
+                    .doc_key = "doc:a",
+                    .artifact_key = artifact_key,
+                    .vector = &[_]f32{ 1, 0 },
+                },
+            },
+        };
+        appended_sequence = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const issues = try reopened.listEmbeddingArtifactRepairIssues(alloc, "dv_v1", 0);
+    defer types.freeEmbeddingArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expectEqual(.corrupt_embedding_artifact, issues[0].reason);
+    try std.testing.expectEqualStrings("doc:a", issues[0].doc_key);
+    try std.testing.expectEqualStrings("dv_v1", issues[0].artifact_name);
+
+    const degraded_stats = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, degraded_stats);
+    try std.testing.expect(degraded_stats.repair_degraded);
+    try std.testing.expectEqual(@as(u64, 1), degraded_stats.repair_issue_count);
+    try std.testing.expect(degraded_stats.indexes[0].repair_degraded);
+    try std.testing.expectEqual(@as(u64, 1), degraded_stats.indexes[0].repair_issue_count);
+
+    const dense_applied = try reopened.core.loadAppliedSequence(alloc, "dv_v1");
+    try std.testing.expectEqual(@as(u64, 0), dense_applied);
+    try std.testing.expect(appended_sequence > dense_applied);
+}
+
+test "db rebuild dense indexes preserves corrupt stored embedding artifacts" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
 
@@ -4930,7 +6063,9 @@ test "db derived async dense artifact rebuild deletes corrupt stored embedding a
 
     const rebuilt = try db.rebuildDenseIndexesFromStoredEmbeddingArtifacts(alloc);
     try std.testing.expectEqual(@as(usize, 0), rebuilt);
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, artifact_key));
+    const artifact_value = try db.core.store.get(alloc, artifact_key);
+    defer alloc.free(artifact_value);
+    try std.testing.expectEqualStrings("bad-artifact", artifact_value);
 }
 
 test "db derived async dense artifact rebuild write cleanup tolerates artifact-backed empty vectors" {
@@ -5000,7 +6135,7 @@ test "db derived async replay applies sparse embeddings from artifact payloads" 
     try std.testing.expectEqual(@as(u64, 1), stats.doc_count);
 }
 
-test "db derived async replay skips and deletes corrupt sparse embedding artifacts" {
+test "db replay blocks and preserves corrupt sparse embedding artifacts" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
 
@@ -5042,8 +6177,19 @@ test "db derived async replay skips and deletes corrupt sparse embedding artifac
         appended_sequence = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
     }
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
     defer reopened.close();
+
+    const issues = try reopened.listEmbeddingArtifactRepairIssues(alloc, "sp_v1", 0);
+    defer types.freeEmbeddingArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expectEqual(.corrupt_embedding_artifact, issues[0].reason);
+    try std.testing.expectEqual(.embedding, issues[0].artifact_kind);
+    try std.testing.expectEqualStrings("doc:a", issues[0].doc_key);
+    try std.testing.expectEqualStrings("sp_v1", issues[0].artifact_name);
 
     var sparse_index = reopened.core.index_manager.sparseIndex("sp_v1").?.index;
     const stats = sparse_index.stats();
@@ -5051,10 +6197,13 @@ test "db derived async replay skips and deletes corrupt sparse embedding artifac
 
     const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "sp_v1");
     defer alloc.free(artifact_key);
-    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, artifact_key));
+    const artifact_value = try reopened.core.store.get(alloc, artifact_key);
+    defer alloc.free(artifact_value);
+    try std.testing.expectEqualStrings("bad-artifact", artifact_value);
 
     const sparse_applied = try reopened.core.loadAppliedSequence(alloc, "sp_v1");
-    try std.testing.expectEqual(appended_sequence, sparse_applied);
+    try std.testing.expectEqual(@as(u64, 0), sparse_applied);
+    try std.testing.expect(appended_sequence > sparse_applied);
 }
 
 test "db derived async replay batch persists per-index applied sequence watermark" {
@@ -5582,6 +6731,422 @@ test "db derived async dense artifact rebuild dense artifact rebuild preserves s
     defer alloc.free(stable_metadata);
     try std.testing.expectEqualStrings("doc:b", stable_metadata);
     try std.testing.expectEqual(@as(?[]u8, null), try dense_entry.index.getMetadata(@as(u64, ordinal)));
+}
+
+test "db dense artifact counters include derived chunk embedding artifacts" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+
+    const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    defer alloc.free(chunk_key);
+    const artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "chunk_dense_v1");
+    defer alloc.free(artifact_key);
+    try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0, 0 });
+
+    try std.testing.expectEqual(
+        @as(?u64, 1),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "semantic_idx"),
+    );
+}
+
+test "db dense artifact rebuild trusts clean projection checkpoint without artifact recount" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    const dense_cfg: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(dense_cfg);
+        const stored_dense_cfg = &(db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult).config;
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" }},
+            .sync_level = .full_index,
+        });
+
+        const target_sequence = db.core.nextDerivedSequence() -| 1;
+        try db.core.saveProjectionCheckpoint("dense_idx", .{
+            .applied_sequence = target_sequence,
+            .status = .clean,
+            .generation = 3,
+            .config_hash = types.indexConfigHash(stored_dense_cfg.*),
+        });
+
+        const stale_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:stale", "dense_idx");
+        defer alloc.free(stale_artifact_key);
+        try TestHelpers.putDenseEmbeddingArtifactForTest(&db, alloc, stale_artifact_key, null, &[_]f32{ 0, 1, 0 });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
+}
+
+test "db dense artifact rebuild rejects clean checkpoint for stale config identity" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" }},
+            .sync_level = .full_index,
+        });
+
+        const target_sequence = db.core.nextDerivedSequence() -| 1;
+        try db.core.saveProjectionCheckpoint("dense_idx", .{
+            .applied_sequence = target_sequence,
+            .status = .clean,
+            .generation = 4,
+            .config_hash = types.indexConfigHash(.{
+                .name = "dense_idx",
+                .kind = .dense_vector,
+                .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"external\":true}",
+            }),
+        });
+
+        const stale_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:stale", "dense_idx");
+        defer alloc.free(stale_artifact_key);
+        try TestHelpers.putDenseEmbeddingArtifactForTest(&db, alloc, stale_artifact_key, null, &[_]f32{ 0, 1, 0 });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    try std.testing.expect(try reopened.hasPendingDenseArtifactRebuild(alloc));
+}
+
+test "db dense artifact rebuild checks artifact counters before clean checkpoint skip" {
+    const DB = @import("mod.zig").DB;
+    const threadedIo = db_internal.threadedIo;
+    const alloc = std.testing.allocator;
+    const dense_cfg: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(dense_cfg);
+        const stored_dense_cfg = &(db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult).config;
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.putBatch(&.{
+            .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
+        }, &.{});
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dense_idx");
+        defer alloc.free(artifact_key);
+        try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0, 0 });
+
+        const target_sequence = db.core.nextDerivedSequence() -| 1;
+        try db.core.saveProjectionCheckpoint("dense_idx", .{
+            .applied_sequence = target_sequence,
+            .status = .clean,
+            .generation = 7,
+            .config_hash = types.indexConfigHash(stored_dense_cfg.*),
+        });
+    }
+
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_index_path);
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    try std.testing.expect(try reopened.hasPendingDenseArtifactRebuild(alloc));
+    try std.testing.expectEqual(@as(usize, 1), try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+    try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
+}
+
+test "db dense artifact rebuild does not recount counterless artifacts during startup" {
+    const DB = @import("mod.zig").DB;
+    const threadedIo = db_internal.threadedIo;
+    const alloc = std.testing.allocator;
+    const dense_cfg: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(dense_cfg);
+        const stored_dense_cfg = &(db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult).config;
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.putBatch(&.{
+            .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
+        }, &.{});
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dense_idx");
+        defer alloc.free(artifact_key);
+        try TestHelpers.putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0, 0 });
+
+        const target_sequence = db.core.nextDerivedSequence() -| 1;
+        try db.core.saveProjectionCheckpoint("dense_idx", .{
+            .applied_sequence = target_sequence,
+            .status = .clean,
+            .generation = 9,
+            .config_hash = types.indexConfigHash(stored_dense_cfg.*),
+        });
+    }
+
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_index_path);
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
+    try std.testing.expectEqual(@as(usize, 0), try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+}
+
+test "db dense artifact rebuild uses durable artifact counters instead of recount" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    const dense_cfg: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(dense_cfg);
+        const stored_dense_cfg = &(db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult).config;
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" }},
+            .sync_level = .full_index,
+        });
+
+        const target_sequence = db.core.nextDerivedSequence() -| 1;
+        try db.core.saveProjectionCheckpoint("dense_idx", .{
+            .applied_sequence = target_sequence,
+            .status = .rebuilding,
+            .generation = 5,
+            .config_hash = types.indexConfigHash(stored_dense_cfg.*),
+        });
+
+        const stale_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:stale", "dense_idx");
+        defer alloc.free(stale_artifact_key);
+        try TestHelpers.putDenseEmbeddingArtifactForTest(&db, alloc, stale_artifact_key, null, &[_]f32{ 0, 1, 0 });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
+}
+
+test "db dense artifact rebuild resume keys are owned by plan allocator" {
+    const DB = @import("mod.zig").DB;
+    const threadedIo = db_internal.threadedIo;
+    const alloc = std.testing.allocator;
+    const db_alloc = std.heap.page_allocator;
+    const doc_count: usize = 3;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    {
+        var db = try DB.open(db_alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+
+        for (0..doc_count) |i| {
+            const doc_id = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{i});
+            defer alloc.free(doc_id);
+            const stored_key = try internal_keys.documentKeyAlloc(alloc, doc_id);
+            defer alloc.free(stored_key);
+            const stored_value = try std.fmt.allocPrint(alloc, "{{\"title\":\"doc-{d}\"}}", .{i});
+            defer alloc.free(stored_value);
+            try db.core.store.putBatch(&.{
+                .{ .key = stored_key, .value = stored_value },
+            }, &.{});
+
+            const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_id, "dense_idx");
+            defer alloc.free(artifact_key);
+            try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &[_]f32{
+                @floatFromInt(i + 1),
+                0,
+                0,
+            });
+        }
+    }
+
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_index_path);
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
+
+    var reopened = try DB.open(db_alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const rebuilt = try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+    try std.testing.expectEqual(doc_count, rebuilt);
+    try std.testing.expectEqual(@as(u64, doc_count), reopened.core.index_manager.denseIndex("dense_idx").?.index.metadata.active_count);
+}
+
+test "db dense artifact rebuild keeps resume keys owned by caller allocator" {
+    const DB = @import("mod.zig").DB;
+    const threadedIo = db_internal.threadedIo;
+    const alloc = std.testing.allocator;
+    const rebuild_alloc = std.heap.page_allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.putBatch(&.{
+            .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
+        }, &.{});
+
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dense_idx");
+        defer alloc.free(artifact_key);
+        try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0, 0 });
+    }
+
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_index_path);
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const rebuilt = try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(rebuild_alloc);
+    try std.testing.expectEqual(@as(usize, 1), rebuilt);
+    try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
 }
 
 test "db derived async dense artifact rebuild dense artifact rebuild force-resets corrupt external dense structure" {

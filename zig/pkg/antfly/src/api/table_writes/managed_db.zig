@@ -57,6 +57,75 @@ pub const ManagedDbOpenOptions = struct {
     ha_async_metadata_mirror: ?db_mod.HAAsyncMetadataMirror = null,
 };
 
+pub const ManagedDbEnrichmentSet = struct {
+    dense: ?db_embedder.DenseEmbedder = null,
+    sparse: ?db_embedder.SparseEmbedder = null,
+    asset_runtime: ?*asset_producer_runtime.Runtime = null,
+    generated: bool = false,
+
+    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+        if (self.dense) |owned| owned.deinit(allocator);
+        if (self.sparse) |owned| owned.deinit(allocator);
+        if (self.asset_runtime) |runtime| {
+            runtime.deinit();
+            allocator.destroy(runtime);
+        }
+    }
+
+    pub fn enabled(self: @This()) bool {
+        return self.dense != null or self.sparse != null or self.asset_runtime != null or self.generated;
+    }
+
+    pub fn config(self: @This()) db_mod.enrichment_runtime.Config {
+        return .{
+            .dense_embedder = self.dense,
+            .sparse_embedder = self.sparse,
+            .asset_producer = if (self.asset_runtime) |runtime| runtime.ownedProducer() else null,
+            .enable_without_producers = self.generated,
+        };
+    }
+
+    pub fn forgetTransferred(self: *@This()) void {
+        self.dense = null;
+        self.sparse = null;
+        self.asset_runtime = null;
+        self.generated = false;
+    }
+};
+
+pub fn createManagedDbEnrichments(
+    allocator: std.mem.Allocator,
+    raw_indexes_json: []const u8,
+    runtime: ?*db_mod.background_runtime.BackendRuntime,
+    local_provider: ?managed_embedder.AntflyProvider,
+    inference_api_url: ?[]const u8,
+    store: ?*common_secrets.FileStore,
+    remote: ?*const scraping.RemoteContentConfig,
+) !ManagedDbEnrichmentSet {
+    const asset_runtime = if (try indexesJsonNeedsAssetProducer(allocator, raw_indexes_json)) blk: {
+        const io = if (runtime) |backend| backend.io() orelse return error.MissingBackendRuntimeIo else return error.MissingBackendRuntimeIo;
+        break :blk try asset_producer_runtime.Runtime.createOwned(allocator, io, .{
+            .antfly_provider = local_provider,
+            .secret_store = store,
+        });
+    } else null;
+    errdefer if (asset_runtime) |owned| {
+        owned.deinit();
+        allocator.destroy(owned);
+    };
+    const dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url });
+    errdefer if (dense) |owned| owned.deinit(allocator);
+    const sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url });
+    errdefer if (sparse) |owned| owned.deinit(allocator);
+    const generated = try indexesJsonHasGeneratedEnrichment(allocator, raw_indexes_json);
+    return .{
+        .dense = dense,
+        .sparse = sparse,
+        .asset_runtime = asset_runtime,
+        .generated = generated,
+    };
+}
+
 pub const TableManagedMetadata = struct {
     indexes_json: ?[]u8,
     schema_json: ?[]u8,
@@ -183,9 +252,17 @@ pub fn catchUpManagedIndexCreate(
     db: *db_mod.DB,
     index_name: []const u8,
 ) !void {
-    if (try db.core.indexRequiresEnrichmentReplay(index_name)) {
+    if (db.core.index_manager.get(index_name)) |cfg| {
+        if (cfg.kind == .graph) {
+            try db.core.index_manager.syncAll(true);
+            return;
+        }
+    }
+
+    const requires_enrichment_replay = try db.core.indexRequiresEnrichmentReplay(index_name);
+    if (requires_enrichment_replay) {
         if (db.enrichment_runtime != null) {
-            _ = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+            _ = try db.reprocessGeneratedEnrichmentFromStoredDocs(alloc, managedIndexEmbeddingArtifactName(db, index_name));
         } else {
             _ = try seedManagedIndexReplayFromStoredDocsIfNeeded(alloc, db, index_name);
         }
@@ -201,7 +278,59 @@ pub fn catchUpManagedIndexCreate(
         try db.catchUpPendingDerivedReplay();
         try db.runUntilIdle();
     }
-    try db.core.index_manager.syncAll(false);
+    if (requires_enrichment_replay) {
+        const debt_remaining = try repairManagedEmbeddingArtifactsForIndex(alloc, db, index_name);
+        if (debt_remaining) try markManagedIndexRepairRequired(alloc, db, index_name);
+    }
+    try db.core.index_manager.syncAll(true);
+}
+
+fn managedIndexEmbeddingArtifactName(db: *db_mod.DB, index_name: []const u8) ?[]const u8 {
+    if (db.core.index_manager.denseEmbeddingName(index_name)) |name| return name;
+    if (db.core.index_manager.sparseEmbeddingName(index_name)) |name| return name;
+    return index_name;
+}
+
+fn repairManagedEmbeddingArtifactsForIndex(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    index_name: []const u8,
+) !bool {
+    const max_passes: usize = 4;
+    var pass: usize = 0;
+    while (pass < max_passes) : (pass += 1) {
+        var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+            .artifact_kind = .embedding,
+            .index_name = index_name,
+            .limit = 1024,
+        });
+        defer repair.deinit(alloc);
+
+        if (repair.reprocessed == 0 and repair.repaired == 0) return repair.has_more or repair.debt_remaining;
+        db.catchUpPendingDerivedReplay() catch |err| switch (err) {
+            error.ArtifactRepairRequired => {},
+            else => return err,
+        };
+        try db.runUntilIdle();
+        if (!repair.has_more and !repair.debt_remaining) return false;
+    }
+    var remaining = try db.listArtifactRepairIssuesPage(alloc, .{
+        .artifact_kind = .embedding,
+        .index_name = index_name,
+        .limit = 1,
+    });
+    defer remaining.deinit(alloc);
+    return remaining.issues.len != 0 or remaining.has_more;
+}
+
+fn markManagedIndexRepairRequired(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    index_name: []const u8,
+) !void {
+    var checkpoint = try db.core.loadProjectionCheckpoint(alloc, index_name);
+    checkpoint.status = .repair_required;
+    try db.core.saveProjectionCheckpoint(index_name, checkpoint);
 }
 
 fn managedIndexReplayDebtRequired(replay_debt: anytype, index_name: []const u8) bool {
@@ -1359,69 +1488,15 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
     identity_namespace: ?doc_identity.Namespace,
     options: ManagedDbOpenOptions,
 ) !db_mod.DB {
-    const EnrichmentSet = struct {
-        dense: ?db_embedder.DenseEmbedder = null,
-        sparse: ?db_embedder.SparseEmbedder = null,
-        asset_runtime: ?*asset_producer_runtime.Runtime = null,
-        generated: bool = false,
-
-        fn deinit(self: @This(), allocator: std.mem.Allocator) void {
-            if (self.dense) |owned| owned.deinit(allocator);
-            if (self.sparse) |owned| owned.deinit(allocator);
-            if (self.asset_runtime) |runtime| {
-                runtime.deinit();
-                allocator.destroy(runtime);
-            }
-        }
-
-        fn enabled(self: @This()) bool {
-            return self.dense != null or self.sparse != null or self.asset_runtime != null or self.generated;
-        }
-
-        fn config(self: @This()) db_mod.enrichment_runtime.Config {
-            return .{
-                .dense_embedder = self.dense,
-                .sparse_embedder = self.sparse,
-                .asset_producer = if (self.asset_runtime) |runtime| runtime.ownedProducer() else null,
-                .enable_without_producers = self.generated,
-            };
-        }
+    const mode_consumes_enrichments = switch (mode) {
+        .default, .default_async, .writer_no_replay, .restore_repair => true,
+        .startup_catch_up, .query_readonly, .status_only => false,
     };
 
-    const createEnrichments = struct {
-        fn run(
-            allocator: std.mem.Allocator,
-            raw_indexes_json: []const u8,
-            runtime: ?*db_mod.background_runtime.BackendRuntime,
-            local_provider: ?managed_embedder.AntflyProvider,
-            inference_api_url: ?[]const u8,
-            store: ?*common_secrets.FileStore,
-            remote: ?*const scraping.RemoteContentConfig,
-        ) !EnrichmentSet {
-            const asset_runtime = if (try indexesJsonNeedsAssetProducer(allocator, raw_indexes_json)) blk: {
-                const io = if (runtime) |backend| backend.io() orelse return error.MissingBackendRuntimeIo else return error.MissingBackendRuntimeIo;
-                break :blk try asset_producer_runtime.Runtime.createOwned(allocator, io, .{
-                    .antfly_provider = local_provider,
-                    .secret_store = store,
-                });
-            } else null;
-            errdefer if (asset_runtime) |owned| {
-                owned.deinit();
-                allocator.destroy(owned);
-            };
-            return .{
-                .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url }),
-                .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url }),
-                .asset_runtime = asset_runtime,
-                .generated = try indexesJsonHasGeneratedEnrichment(allocator, raw_indexes_json),
-            };
-        }
-    }.run;
-
-    var enrichments = if (mode == .startup_catch_up)
-        EnrichmentSet{}
+    var enrichments = if (mode_consumes_enrichments)
+        try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.inference_api_url, secret_store, remote_content)
     else
-        try createEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.inference_api_url, secret_store, remote_content);
+        ManagedDbEnrichmentSet{};
     errdefer enrichments.deinit(alloc);
 
     const openDb = struct {
@@ -1648,9 +1723,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
     var db = blk: {
         const enrichment_cfg = if (enrichments.enabled()) enrichments.config() else null;
         const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace, options);
-        enrichments.dense = null;
-        enrichments.sparse = null;
-        enrichments.asset_runtime = null;
+        enrichments.forgetTransferred();
         break :blk opened;
     };
     var db_open = true;
@@ -1665,16 +1738,14 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
     if (summary.indexManagerCatalogChanged()) {
         db.close();
         db_open = false;
-        enrichments = if (mode == .startup_catch_up)
-            EnrichmentSet{}
+        enrichments = if (mode_consumes_enrichments)
+            try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.inference_api_url, secret_store, remote_content)
         else
-            try createEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.inference_api_url, secret_store, remote_content);
+            ManagedDbEnrichmentSet{};
         db = blk: {
             const enrichment_cfg = if (enrichments.enabled()) enrichments.config() else null;
             const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace, options);
-            enrichments.dense = null;
-            enrichments.sparse = null;
-            enrichments.asset_runtime = null;
+            enrichments.forgetTransferred();
             break :blk opened;
         };
         db_open = true;
@@ -1709,6 +1780,7 @@ fn jsonValueHasGeneratedEnrichment(alloc: std.mem.Allocator, value: std.json.Val
             if (object.get("kind")) |kind| {
                 if (kind == .string and (std.mem.eql(u8, kind.string, "asset") or std.mem.eql(u8, kind.string, "chunk"))) return true;
             }
+            if (object.get("generator") != null or object.get("chunker") != null) return true;
             var it = object.iterator();
             while (it.next()) |entry| {
                 if (try jsonValueHasGeneratedEnrichment(alloc, entry.value_ptr.*)) return true;
@@ -1822,6 +1894,20 @@ test "provisioning does not require asset producer for copy graph shorthand asse
         \\  "name":"relations_graph",
         \\  "kind":"graph",
         \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"relations\"}}"
+        \\}]
+    ));
+}
+
+test "provisioning detects generated embedding chunkers inside index metadata" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try indexesJsonHasGeneratedEnrichment(alloc,
+        \\{"semantic_chunked_idx":{"type":"embeddings","field":"body","dimension":3,"chunker":{"provider":"antfly","model":"fixed-bert-tokenizer","store_chunks":false,"full_text_index":{},"text":{"target_tokens":4,"overlap_tokens":1,"separator":" "}}}}
+    ));
+    try std.testing.expect(try indexesJsonHasGeneratedEnrichment(alloc,
+        \\[{
+        \\  "name":"semantic_chunked_idx",
+        \\  "type":"embeddings",
+        \\  "config_json":"{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunker\":{\"provider\":\"antfly\",\"model\":\"fixed-bert-tokenizer\",\"store_chunks\":false}}}"
         \\}]
     ));
 }

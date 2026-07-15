@@ -69,6 +69,7 @@ const ParsedGlobalQueryTable = struct {
 };
 
 fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlobalQueryTable {
+    try query_contract.validatePublicQuerySortTupleContract(alloc, body);
     var parsed = metadata_openapi.server.parseGlobalQueryBody(alloc, body) catch return error.InvalidQueryRequest;
     errdefer parsed.deinit();
     return .{
@@ -186,17 +187,15 @@ pub const AntflyApiHandler = struct {
         var runtime_io = runtime.io() orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
         const job_alloc = std.heap.page_allocator;
         const owned_table_name = try job_alloc.dupe(u8, table_name);
-        errdefer job_alloc.free(owned_table_name);
+        defer job_alloc.free(owned_table_name);
         const owned_body_data = try job_alloc.dupe(u8, body_data);
-        errdefer job_alloc.free(owned_body_data);
+        defer job_alloc.free(owned_body_data);
         var job = OffloadedTableBatch{
             .alloc = job_alloc,
             .table_name = owned_table_name,
             .body_data = owned_body_data,
             .api = api,
         };
-        defer job_alloc.free(owned_table_name);
-        defer job_alloc.free(owned_body_data);
         var future = try runtime_io.concurrent(OffloadedTableBatch.run, .{&job});
         while (!job.done.load(.acquire)) {
             ctx.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
@@ -594,6 +593,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         };
+        defer outcome.deinit(alloc);
 
         switch (outcome) {
             .committed => {
@@ -1113,6 +1113,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         };
+        defer outcome.deinit(alloc);
 
         switch (outcome) {
             .committed => {
@@ -1735,8 +1736,11 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid create table request");
         };
-        var create_req = table_contract.parseCreateTableRequest(alloc, body_data) catch {
+        var create_req = table_contract.parseCreateTableRequest(alloc, body_data) catch |err| {
             _ = ctx.status(400);
+            if (err == error.InvalidCreateTableSchemaRequest) {
+                return ctx.text(table_contract.createTableRequestErrorMessage(body_data));
+            }
             return ctx.text("invalid create table request");
         };
         defer create_req.deinit(alloc);
@@ -2347,9 +2351,10 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid schema update request");
         };
+        const invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(body_data);
         const schema_json = table_contract.parseSchemaUpdateRequest(alloc, body_data) catch {
             _ = ctx.status(400);
-            return ctx.text("invalid schema update request");
+            return ctx.text(invalid_schema_message);
         };
         defer alloc.free(schema_json);
 
@@ -2358,7 +2363,7 @@ pub const AntflyApiHandler = struct {
             self.api_server.source.updateSchema(alloc, decoded_table_name, schema_json) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => {
                     _ = ctx.status(400);
-                    return ctx.text("invalid schema update request");
+                    return ctx.text(invalid_schema_message);
                 },
                 error.TableNotFound => {
                     _ = ctx.status(404);
@@ -2372,7 +2377,7 @@ pub const AntflyApiHandler = struct {
                     _ = table_writes_source.updateSchema(alloc, decoded_table_name, schema_json) catch |write_err| switch (write_err) {
                         error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
                             _ = ctx.status(400);
-                            return ctx.text("invalid schema update request");
+                            return ctx.text(invalid_schema_message);
                         },
                         else => return write_err,
                     } orelse {
@@ -2393,7 +2398,7 @@ pub const AntflyApiHandler = struct {
         self.api_server.source.updateSchema(alloc, decoded_table_name, schema_json) catch |err| switch (err) {
             error.InvalidSchemaUpdateRequest => {
                 _ = ctx.status(400);
-                return ctx.text("invalid schema update request");
+                return ctx.text(invalid_schema_message);
             },
             error.TableNotFound => {
                 _ = ctx.status(404);
@@ -2407,7 +2412,7 @@ pub const AntflyApiHandler = struct {
                 _ = table_writes_source.updateSchema(alloc, decoded_table_name, schema_json) catch |write_err| switch (write_err) {
                     error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
                         _ = ctx.status(400);
-                        return ctx.text("invalid schema update request");
+                        return ctx.text(invalid_schema_message);
                     },
                     else => return write_err,
                 };
@@ -2429,7 +2434,7 @@ pub const AntflyApiHandler = struct {
                 _ = table_writes_source.updateSchema(alloc, decoded_table_name, schema_json) catch |write_err| switch (write_err) {
                     error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
                         _ = ctx.status(400);
-                        return ctx.text("invalid schema update request");
+                        return ctx.text(invalid_schema_message);
                     },
                     else => return write_err,
                 };
@@ -2610,6 +2615,82 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(decoded_table_name);
         var resp = try public_table_http.handleListArtifactEnrichments(ctx.allocator, decoded_table_name, self.api_server.tableApi());
         return respondOwnedApiResponse(ctx, &resp);
+    }
+
+    pub fn listTableRepairIssues(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        if (ctx.request.uri.query) |query| {
+            if (query.len != 0) return textResponse(ctx, 400, "repair requests use json body");
+        }
+        const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_table_name);
+        const body_data = (try ctx.body()) orelse "";
+        var response = try self.api_server.handlePublicListArtifactRepairIssues(decoded_table_name, body_data);
+        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+    }
+
+    pub fn listArtifactRepairIssues(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return try self.listTableRepairIssues(ctx, table_name);
+    }
+
+    pub fn runTableRepair(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        if (ctx.request.uri.query) |query| {
+            if (query.len != 0) return textResponse(ctx, 400, "repair requests use json body");
+        }
+        const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_table_name);
+        const body_data = (try ctx.body()) orelse "";
+        var response = try self.api_server.handlePublicRunTableRepair(decoded_table_name, body_data);
+        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+    }
+
+    pub fn startTableRepairJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        if (ctx.request.uri.query) |query| {
+            if (query.len != 0) return textResponse(ctx, 400, "repair job requests use json body");
+        }
+        const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_table_name);
+        const body_data = (try ctx.body()) orelse "";
+        var response = try self.api_server.handlePublicStartTableRepairJob(decoded_table_name, body_data);
+        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+    }
+
+    pub fn getTableRepairJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_table_name);
+        var response = try self.api_server.handlePublicTableRepairJob(decoded_table_name, job_id);
+        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+    }
+
+    pub fn advanceTableRepairJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_table_name);
+        var response = try self.api_server.handlePublicAdvanceTableRepairJob(decoded_table_name, job_id);
+        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+    }
+
+    pub fn cancelTableRepairJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_table_name);
+        var response = try self.api_server.handlePublicCancelTableRepairJob(decoded_table_name, job_id);
+        return respondWithAllocator(ctx, &response, self.api_server.alloc);
     }
 
     pub fn reprocessDocumentArtifact(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response {

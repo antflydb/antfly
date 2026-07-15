@@ -266,7 +266,7 @@ fn parseScanLineKey(alloc: std.mem.Allocator, line: []const u8) ![]const u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidLinearMergeRequest;
-    const key_value = parsed.value.object.get("key") orelse return error.InvalidLinearMergeRequest;
+    const key_value = parsed.value.object.get("_id") orelse return error.InvalidLinearMergeRequest;
     if (key_value != .string) return error.InvalidLinearMergeRequest;
     return try alloc.dupe(u8, key_value.string);
 }
@@ -328,7 +328,7 @@ fn comparableObjectFieldCount(obj: std.json.ObjectMap) usize {
 }
 
 fn isIgnoredSystemField(field: []const u8) bool {
-    return std.mem.eql(u8, field, "_timestamp");
+    return std.mem.eql(u8, field, "_timestamp") or std.mem.eql(u8, field, "_id");
 }
 
 test "linear merge request parser sorts keys and accepts sync level aliases" {
@@ -383,11 +383,19 @@ test "linear merge equality ignores system timestamp" {
     try std.testing.expect(try jsonDocumentsEqualIgnoringTimestamp(std.testing.allocator,
         \\{"title":"alpha","content":"same"}
     ,
-        \\{"title":"alpha","content":"same","_timestamp":1234}
+        \\{"_id":"doc:a","title":"alpha","content":"same","_timestamp":1234}
     ));
     try std.testing.expect(!(try jsonDocumentsEqualIgnoringTimestamp(std.testing.allocator,
         \\{"title":"alpha","content":"same"}
     ,
         \\{"title":"alpha","content":"different","_timestamp":1234}
     )));
+}
+
+test "linear merge scan line key uses reserved document identity" {
+    const key = try parseScanLineKey(std.testing.allocator, "{\"_id\":\"doc:a\",\"title\":\"alpha\"}");
+    defer std.testing.allocator.free(key);
+    try std.testing.expectEqualStrings("doc:a", key);
+
+    try std.testing.expectError(error.InvalidLinearMergeRequest, parseScanLineKey(std.testing.allocator, "{\"key\":\"doc:legacy\"}"));
 }

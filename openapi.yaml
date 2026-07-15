@@ -3148,6 +3148,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '422':
+          $ref: '#/components/responses/UnsupportedExactSort'
         '500':
           description: Internal server error
           content:
@@ -4791,6 +4793,8 @@ paths:
                 $ref: '#/components/schemas/QueryResponses'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '422':
+          $ref: '#/components/responses/UnsupportedExactSort'
         '404':
           $ref: '#/components/responses/NotFound'
         '500':
@@ -5523,7 +5527,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /db/v1/tables/{tableName}/lookup:
+  /db/v1/tables/{tableName}/documents:
     parameters:
       - name: tableName
         in: path
@@ -5532,13 +5536,13 @@ paths:
         schema:
           type: string
     post:
-      summary: Scan keys in a table within a key range
+      summary: Scan documents in a table within a key range
       description: >
         Scans keys in a table within an optional key range and returns them as
 
         newline-delimited JSON (NDJSON). Each line contains a JSON object with
 
-        the key and optionally projected document fields. This is useful for
+        the `_id` document identifier and optionally projected document fields. This is useful for
 
         iterating through all keys in a table or a subset of keys within a range.
       tags:
@@ -5557,7 +5561,7 @@ paths:
             application/x-ndjson:
               schema:
                 type: string
-                description: Newline-delimited JSON, each line is a JSON object with a "key" field
+                description: Newline-delimited JSON, each line is a JSON object with an "_id" field
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -5747,6 +5751,299 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/tables/{tableName}/repair/issues:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+    post:
+      summary: List table repair issues
+      description: >
+        Lists durable repair debt for a table. This operator-facing endpoint
+
+        returns exact document keys, artifact keys, index names, and repair
+
+        errors, and therefore requires table admin permission when authentication
+
+        is enabled. Request filters are supplied in the JSON body. This release
+
+        supports `target=artifact` for durable artifact queue entries and
+
+        `target=index` for index repair candidates.
+      tags:
+        - data_operations
+      operationId: listTableRepairIssues
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RepairIssueListRequest'
+      responses:
+        '200':
+          description: Table repair issue page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableRepairIssueList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/repair/run:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+    post:
+      summary: Run a bounded table repair pass
+      description: >
+        Synchronously attempts to repair queued table issues. `target=artifact` reprocesses
+
+        supported artifact kinds and replays derived state; it is bounded by
+
+        `limit` and returns an opaque continuation cursor when another artifact
+
+        repair page is available. `target=index` repairs one named index by
+
+        building a shadow replacement, catching it up to the current derived
+
+        replay sequence, and atomically swapping it into service; healthy
+
+        indexes are skipped unless `force=true` is supplied, and any positive
+
+        `limit` permits that single named index repair. The response reports
+
+        unresolved debt separately, and the endpoint requires table admin
+
+        permission when authentication is enabled.
+      tags:
+        - data_operations
+      operationId: runTableRepair
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RepairRunRequest'
+      responses:
+        '200':
+          description: Bounded table repair pass completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableRepairRunResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/repair/jobs:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+    post:
+      summary: Start a durable table repair job
+      description: >
+        Creates a durable table repair job for large or long-running repair work.
+
+        The job stores progress and accumulated counters across bounded advance
+
+        calls. Use this endpoint instead of synchronous `runTableRepair` when
+
+        repairing large indexes or when clients need retryable progress.
+      tags:
+        - data_operations
+      operationId: startTableRepairJob
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TableRepairJobStartRequest'
+      responses:
+        '200':
+          description: Job completed during the initial advance.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableRepairJob'
+        '202':
+          description: Repair job accepted or advanced but not terminal.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableRepairJob'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/repair/jobs/{jobId}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: jobId
+        in: path
+        required: true
+        description: Repair job identifier.
+        schema:
+          type: string
+    get:
+      summary: Get a table repair job
+      tags:
+        - data_operations
+      operationId: getTableRepairJob
+      responses:
+        '200':
+          description: Repair job state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableRepairJob'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/repair/jobs/{jobId}/advance:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: jobId
+        in: path
+        required: true
+        description: Repair job identifier.
+        schema:
+          type: string
+    post:
+      summary: Advance a table repair job
+      description: Runs at most one bounded repair pass for the job. Concurrent advances use the job lease
+        and return the current running state.
+      tags:
+        - data_operations
+      operationId: advanceTableRepairJob
+      responses:
+        '200':
+          description: Repair job reached a terminal phase.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableRepairJob'
+        '202':
+          description: Repair job remains queued or running.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableRepairJob'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/repair/jobs/{jobId}/cancel:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: jobId
+        in: path
+        required: true
+        description: Repair job identifier.
+        schema:
+          type: string
+    post:
+      summary: Cancel a table repair job
+      description: >
+        Cancels a queued table repair job. If a repair pass is already running,
+
+        the response returns the current running state; cancellation is applied
+
+        only at pass boundaries so the API never reports a committed in-flight
+
+        pass as cancelled.
+      tags:
+        - data_operations
+      operationId: cancelTableRepairJob
+      responses:
+        '200':
+          description: Repair job cancelled or already terminal.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableRepairJob'
+        '202':
+          description: Cancellation requested; the current running pass has not yet reached a cancellation
+            boundary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableRepairJob'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess:
     parameters:
       - name: tableName
@@ -5824,9 +6121,9 @@ paths:
       description: >
         Registers a table-level generated artifact definition. Reusing the same
 
-        artifact name replaces the existing mapping. Chunk enrichments may set
+        artifact name replaces the existing mapping. Chunk or asset enrichments
 
-        `full_text_index: true` to map generated chunk text into the table's
+        may set `full_text_index: true` to map generated text into the table's
 
         default full-text index.
       tags:
@@ -6064,12 +6361,27 @@ paths:
           type: string
     post:
       summary: Cancel a derived document artifact reprocess job
+      description: >
+        Cancels a queued document artifact reprocess job. If a reprocess pass is
+
+        already running, the response returns the current running state;
+
+        cancellation is applied only at pass boundaries so the API never reports
+
+        a committed in-flight pass as cancelled.
       tags:
         - data_operations
       operationId: cancelDocumentArtifactReprocessJob
       responses:
         '200':
-          description: Reprocess job was cancelled or already terminal
+          description: Reprocess job cancelled or already terminal.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentArtifactReprocessJob'
+        '202':
+          description: Cancellation requested; the current running pass has not yet reached a cancellation
+            boundary.
           content:
             application/json:
               schema:
@@ -8448,12 +8760,96 @@ components:
       required:
         - kind
         - session_id
+    ExactSortError:
+      type: object
+      additionalProperties: false
+      required:
+        - error
+        - message
+        - reason
+        - sort_rejection_reason
+        - sort_rejection_detail
+        - sort_rejection_field
+        - status
+      properties:
+        error:
+          type: string
+          description: Stable error class.
+          example: unsupported_exact_sort
+        message:
+          type: string
+          description: Human-readable error summary.
+          example: exact sort is unsupported for this query
+        reason:
+          type: string
+          description: >
+            Stable machine-readable rejection reason. Known exact-sort
+
+            reasons include `unmapped_field`, `non_sortable_field`,
+
+            `unsupported_sort_field`, `mixed_field_type`,
+
+            `field_not_sort_ready`, `filter_not_queryable`,
+
+            `invalid_cursor_arity`, `invalid_cursor_type`,
+
+            `invalid_sort_tuple`, `approximate_candidate_source`,
+
+            `candidate_budget_exceeded`, `missing_null_policy`,
+
+            `non_score_bearing_source`, `invalid_score_value`,
+
+            `count_only_ordered_page`, `stored_json_sort_disabled`,
+
+            `unsupported_exact_sort`, and `distributed_merge_unsupported`.
+          example: field_not_sort_ready
+        sort_rejection_reason:
+          type: string
+          description: Stable exact-sort rejection reason; uses the same stable reason taxonomy as `reason`.
+          example: field_not_sort_ready
+        budget_rejection_reason:
+          type: string
+          description: >
+            Stable budget rejection reason when the rejection was
+
+            budget-driven. Known values include
+
+            `text_exact_late_visibility_totals`,
+
+            `text_field_sort_candidate_window`,
+
+            `match_all_candidate_collect_limit`,
+
+            `match_all_exact_candidate_window`,
+
+            `sorted_segment_scan_window`, and
+
+            `distributed_merge_shard_window`.
+          example: text_field_sort_candidate_window
+        sort_rejection_detail:
+          type: string
+          description: >
+            Stable user-facing exact-sort rejection detail. Internal storage
+
+            and planner details are reserved for logs, traces, and explicit
+
+            debug surfaces.
+          example: field_not_sort_ready
+        sort_rejection_field:
+          type: string
+          description: Sort field associated with the rejection when safe to expose.
+          example: created_at
+        status:
+          type: integer
+          format: int32
+          example: 422
     SortDirection:
       type: boolean
       description: Sort direction for a single field. true = descending, false = ascending.
     SortField:
       type: object
       description: A single sort field with direction.
+      additionalProperties: false
       required:
         - field
       properties:
@@ -9064,6 +9460,413 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/EnrichmentConfig'
+    ArtifactRepairKind:
+      type: string
+      description: Kind of stored artifact tracked by the repair queue.
+      enum:
+        - embedding
+        - asset
+        - chunk
+        - graph
+        - full_text
+        - algebraic
+    ArtifactRepairReason:
+      type: string
+      description: Reason an artifact was added to the repair queue.
+      enum:
+        - missing_artifact
+        - corrupt_artifact
+        - unreadable_artifact
+    RepairTarget:
+      type: string
+      description: Repair subsystem to inspect or run.
+      enum:
+        - artifact
+        - index
+    TableRepairIssue:
+      type: object
+      description: Durable table repair debt. Artifact targets include exact source and artifact identifiers;
+        index targets include the affected index and repair status.
+      required:
+        - artifact_kind
+        - index_name
+        - doc_key
+        - artifact_name
+        - repairable
+        - sequence
+        - reason
+        - attempts
+        - first_seen_ns
+        - last_seen_ns
+      properties:
+        artifact_kind:
+          $ref: '#/components/schemas/ArtifactRepairKind'
+        index_name:
+          type: string
+          description: Index whose replay or derived state observed the artifact problem.
+        doc_key:
+          type: string
+          description: Source or derived document key whose artifact is missing or unreadable.
+        parent_doc_key:
+          type: string
+          description: Parent source document key for chunk-derived artifacts.
+        unit_id:
+          type: string
+          description: Unit identifier for unit-scoped artifacts, when applicable.
+        source_artifact_name:
+          type: string
+          description: Source artifact stream used to produce this artifact, when applicable.
+        artifact_name:
+          type: string
+          description: Derived artifact name that must be reprocessed or made readable.
+        artifact_key:
+          type: string
+          description: Hex-encoded internal artifact storage key, when known.
+        chunk_id:
+          type: integer
+          format: uint32
+          nullable: true
+          description: Chunk ordinal for chunk-derived artifacts.
+        repairable:
+          type: boolean
+          description: Whether this artifact kind currently has an automated repair reprocessor.
+        unsupported_reason:
+          type: string
+          description: Stable reason code when repairable is false.
+        sequence:
+          type: integer
+          format: uint64
+          description: Derived replay sequence that observed the issue.
+        reason:
+          $ref: '#/components/schemas/ArtifactRepairReason'
+        attempts:
+          type: integer
+          format: uint64
+          description: Number of repair attempts made for this issue.
+        first_seen_ns:
+          type: integer
+          format: uint64
+          description: Monotonic timestamp when this issue was first recorded.
+        last_seen_ns:
+          type: integer
+          format: uint64
+          description: Monotonic timestamp when this issue was last observed or attempted.
+        last_error:
+          type: string
+          description: Last stable repair error code, when a repair attempt failed.
+    TableRepairIssueList:
+      type: object
+      description: Bounded page of table repair issues.
+      required:
+        - table
+        - target
+        - limit
+        - scanned
+        - groups_scanned
+        - has_more
+        - issues
+      properties:
+        table:
+          type: string
+          description: Table whose repair queue was listed.
+        target:
+          $ref: '#/components/schemas/RepairTarget'
+        limit:
+          type: integer
+          format: uint32
+          description: Effective page limit.
+        scanned:
+          type: integer
+          format: uint64
+          description: Number of repair records scanned while building this page.
+        groups_scanned:
+          type: integer
+          format: uint64
+          description: Number of table groups touched while building this page.
+        has_more:
+          type: boolean
+          description: Whether another page is available.
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor for the next page when has_more is true.
+        issues:
+          type: array
+          items:
+            $ref: '#/components/schemas/TableRepairIssue'
+    RepairIssueListRequest:
+      type: object
+      description: Bounded request to list table repair issues.
+      properties:
+        target:
+          $ref: '#/components/schemas/RepairTarget'
+          default: artifact
+          description: Repair subsystem to list. `artifact` lists durable artifact queue records; `index`
+            lists index repair candidates derived from index status and artifact debt.
+        kind:
+          $ref: '#/components/schemas/ArtifactRepairKind'
+        index:
+          type: string
+          description: Restrict results to one index name.
+        cursor:
+          type: string
+          description: Opaque cursor returned by a prior response.
+        limit:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 500
+          default: 50
+          description: Maximum repair records to return.
+    RepairRunRequest:
+      type: object
+      description: Bounded request to run a table repair pass.
+      properties:
+        target:
+          $ref: '#/components/schemas/RepairTarget'
+        kind:
+          $ref: '#/components/schemas/ArtifactRepairKind'
+        index:
+          type: string
+          description: Restrict repair attempts to one index name.
+        cursor:
+          type: string
+          description: Opaque cursor returned by a prior repair response.
+        force:
+          type: boolean
+          default: false
+          description: Force a named index rebuild even when no repair debt is currently recorded. Only
+            applies to target=index.
+        limit:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 1000
+          default: 100
+          description: Maximum artifact repair records to attempt. For target=index, any positive value
+            permits one named index repair.
+    TableRepairRunResult:
+      type: object
+      description: Result of one bounded table repair pass.
+      required:
+        - scanned
+        - groups_scanned
+        - reprocessed
+        - repaired
+        - missing_source_docs
+        - failed
+        - unsupported
+        - unresolved
+        - in_progress
+        - indexes_rebuilt
+        - indexes_degraded
+        - limit
+        - has_more
+        - debt_remaining
+      properties:
+        scanned:
+          type: integer
+          format: uint64
+          description: Number of repair records attempted by this pass.
+        groups_scanned:
+          type: integer
+          format: uint64
+          description: Number of table groups touched by this bounded repair pass.
+        reprocessed:
+          type: integer
+          format: uint64
+          description: Number of artifacts whose source was reprocessed.
+        repaired:
+          type: integer
+          format: uint64
+          description: Number of repair records cleared because the artifact became readable.
+        missing_source_docs:
+          type: integer
+          format: uint64
+          description: Number of repair records whose source document no longer exists.
+        failed:
+          type: integer
+          format: uint64
+          description: Number of supported repair attempts that failed.
+        unsupported:
+          type: integer
+          format: uint64
+          description: Number of repair records skipped because no automated repair exists for the selected
+            target.
+        unresolved:
+          type: integer
+          format: uint64
+          description: Number of attempted repair records that remained queued after this pass.
+        in_progress:
+          type: integer
+          format: uint64
+          description: Number of selected repair records or indexes skipped because another repair pass
+            already owns them.
+        indexes_rebuilt:
+          type: integer
+          format: uint64
+          description: Number of indexes rebuilt by this pass when target is index.
+        indexes_degraded:
+          type: integer
+          format: uint64
+          description: Number of selected indexes that were already degraded or quarantined before repair.
+        limit:
+          type: integer
+          format: uint32
+          description: Effective repair limit.
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor for the next artifact repair pass when has_more is true. Index repair
+            currently repairs one named index per request and does not return a continuation cursor.
+        has_more:
+          type: boolean
+          description: Whether another repair scan page is available via next_cursor.
+        debt_remaining:
+          type: boolean
+          description: Whether repair debt remains after this bounded pass. If true and next_cursor is
+            absent, rerun repair from the beginning after addressing failed or unsupported records.
+    TableRepairRunResponse:
+      type: object
+      description: Response for a bounded table repair pass.
+      required:
+        - table
+        - target
+        - limit
+        - result
+      properties:
+        table:
+          type: string
+          description: Table whose repair queue was processed.
+        target:
+          $ref: '#/components/schemas/RepairTarget'
+        limit:
+          type: integer
+          format: uint32
+          description: Effective repair limit.
+        result:
+          $ref: '#/components/schemas/TableRepairRunResult'
+    TableRepairJobStartRequest:
+      type: object
+      description: Starts a durable table repair job. The job advances in bounded passes using the same
+        repair request shape as runTableRepair.
+      properties:
+        target:
+          $ref: '#/components/schemas/RepairTarget'
+          default: artifact
+        kind:
+          $ref: '#/components/schemas/ArtifactRepairKind'
+        index:
+          type: string
+          description: Restrict repair attempts to one index name.
+        cursor:
+          type: string
+          description: Opaque cursor returned by a prior repair response.
+        force:
+          type: boolean
+          default: false
+          description: Force a named index rebuild even when no repair debt is currently recorded. Only
+            applies to target=index.
+        limit:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 1000
+          default: 100
+          description: Maximum artifact repair records to attempt per pass. For target=index, any positive
+            value permits one named index repair.
+        advance:
+          type: boolean
+          default: true
+          description: When true, the server immediately attempts the first bounded repair pass before
+            returning the job.
+    TableRepairJob:
+      type: object
+      description: Durable table repair job state.
+      required:
+        - job_id
+        - attempt_id
+        - table_name
+        - phase
+        - repair_status
+        - target
+        - limit
+        - force
+        - result
+        - cancel_requested
+        - created_at_millis
+        - last_updated_at_millis
+        - expires_at_millis
+      properties:
+        job_id:
+          type: integer
+          format: uint64
+          description: Server-assigned durable repair job identifier.
+        attempt_id:
+          type: integer
+          format: uint64
+          description: Monotonic execution attempt token for the current running pass.
+        table_name:
+          type: string
+          description: Table being repaired.
+        phase:
+          type: string
+          enum:
+            - queued
+            - running
+            - succeeded
+            - failed
+            - cancelled
+          description: Lifecycle phase of the repair job.
+        repair_status:
+          type: string
+          enum:
+            - in_progress
+            - complete
+            - debt_remaining
+            - stopped
+          description: User-facing repair progress state. `debt_remaining` means the bounded job stopped
+            because unsupported or failed debt still requires operator action.
+        target:
+          $ref: '#/components/schemas/RepairTarget'
+        kind:
+          $ref: '#/components/schemas/ArtifactRepairKind'
+        index:
+          type: string
+          description: Index name when the job is restricted to one index.
+        cursor:
+          type: string
+          nullable: true
+          description: Opaque continuation cursor for the next bounded repair pass.
+        limit:
+          type: integer
+          format: uint32
+          description: Effective per-pass repair limit.
+        force:
+          type: boolean
+          description: Whether the job forces a named index rebuild.
+        result:
+          $ref: '#/components/schemas/TableRepairRunResult'
+        last_error:
+          type: string
+          nullable: true
+          description: Last stable job-level error code.
+        cancel_requested:
+          type: boolean
+          description: Whether cancellation has been requested for a running pass. Running passes finish
+            at a bounded repair boundary before the job transitions to cancelled.
+        created_at_millis:
+          type: integer
+          format: uint64
+          description: Unix epoch milliseconds when the job was created.
+        last_updated_at_millis:
+          type: integer
+          format: uint64
+          description: Unix epoch milliseconds when the job state was last updated.
+        expires_at_millis:
+          type: integer
+          format: uint64
+          description: Unix epoch milliseconds when the job is eligible for cleanup.
     DocumentArtifactReprocessResponse:
       type: object
       required:
@@ -9235,6 +10038,7 @@ components:
       type: object
       required:
         - job_id
+        - attempt_id
         - table_name
         - artifact_name
         - phase
@@ -9249,6 +10053,7 @@ components:
         - pending_shards
         - failures
         - shard_cursors
+        - cancel_requested
         - created_at_millis
         - last_updated_at_millis
         - expires_at_millis
@@ -9257,6 +10062,10 @@ components:
           type: integer
           format: uint64
           description: Server-assigned durable repair job identifier.
+        attempt_id:
+          type: integer
+          format: uint64
+          description: Monotonic execution attempt token for the current running pass.
         table_name:
           type: string
           description: Table containing the source documents being repaired.
@@ -9322,18 +10131,22 @@ components:
           type: string
           nullable: true
           description: Last terminal or transient job error, when available.
+        cancel_requested:
+          type: boolean
+          description: Whether cancellation has been requested for a running pass. Running passes finish
+            at a bounded reprocess boundary before the job transitions to cancelled.
         created_at_millis:
           type: integer
           format: uint64
-          description: Monotonic server timestamp when the job was created.
+          description: Unix epoch milliseconds when the job was created.
         last_updated_at_millis:
           type: integer
           format: uint64
-          description: Monotonic server timestamp when the job was last updated.
+          description: Unix epoch milliseconds when the job was last updated.
         expires_at_millis:
           type: integer
           format: uint64
-          description: Monotonic server timestamp after which the retained job status may be removed.
+          description: Unix epoch milliseconds after which the retained job status may be removed.
     ClusterDataNodeStatus:
       type: object
       required:
@@ -9751,6 +10564,97 @@ components:
 
             cannot be dropped while the table references it.
           example: fastspace
+    FieldCapability:
+      type: object
+      description: Public field capability derived from Antfly schema mappings and observed dynamic field
+        metadata.
+      required:
+        - type
+        - query_modes
+        - sortable
+        - provenance
+        - missing_null_policy
+        - sort_lifecycle_state
+      properties:
+        name:
+          type: string
+          description: Mapping or dynamic-template name, when applicable.
+        field:
+          type: string
+          description: Concrete query field path when known. Pattern-only dynamic templates may omit this.
+        path_pattern:
+          type: string
+          description: Dynamic-template path_match pattern, when applicable.
+        field_pattern:
+          type: string
+          description: Dynamic-template match pattern, when applicable.
+        match_mapping_type:
+          type: string
+          description: Dynamic-template match_mapping_type, when applicable.
+        emitted_name:
+          type: string
+          description: Physical emitted field name for schema-derived text fields, when different from
+            the logical path.
+        document_schema:
+          type: string
+          description: Document schema that produced this capability, when applicable.
+        type:
+          $ref: '#/components/schemas/AntflyType'
+        query_modes:
+          type: array
+          items:
+            type: string
+            enum:
+              - full_text
+              - exact
+              - range
+              - geo
+              - autocomplete
+          description: >
+            Query modes supported by this concrete field variant. These modes are derived from
+
+            Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and
+
+            `search_as_you_type`; they are not separate schema toggles.
+        sortable:
+          type: boolean
+          description: >
+            Whether this concrete field is declared sortable in the effective
+
+            capability model. Public exact order_by accepts it only when
+
+            sort_lifecycle_state is queryable or accelerated.
+        provenance:
+          type: string
+          description: Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
+        missing_null_policy:
+          type: string
+          description: Current missing/null handling policy for this field.
+        sort_lifecycle_state:
+          type: string
+          enum:
+            - unsupported
+            - declared
+            - indexed
+            - covered
+            - queryable
+            - accelerated
+          description: Operational lifecycle state for exact sort use. Queryable fields are accepted by
+            public exact sort; accelerated fields are queryable and participate in the configured index_sort
+            tuple.
+        analyzer:
+          type: string
+          description: Analyzer name for text/searchable fields, when applicable.
+        index_sort_position:
+          type: integer
+          format: int64
+          description: Zero-based position in the table index_sort tuple when this field participates.
+        index_sort_order:
+          type: string
+          enum:
+            - asc
+            - desc
+          description: Sort direction in the table index_sort tuple when this field participates.
     AntflyType:
       type: string
       enum:
@@ -9804,6 +10708,18 @@ components:
             $ref: '#/components/schemas/ReplicationSource'
           description: >
             PostgreSQL CDC replication sources configured for this table.
+        field_capabilities:
+          type: array
+          description: >
+            Effective runtime field capabilities for this table. Clients can use this to discover
+
+            concrete field variants and their supported query modes, such as full_text, exact,
+
+            range, geo, and autocomplete. Public exact field sort is supported only for `_id`
+
+            or scalar fields marked sortable whose sort lifecycle is queryable or accelerated.
+          items:
+            $ref: '#/components/schemas/FieldCapability'
     DatabaseCatalogRecord:
       type: object
       required:
@@ -15207,6 +16123,13 @@ components:
             - Date ranges: `"created_at:>2023-01-01"`
 
             - Category filtering: `"+category:technology +language:en"`
+
+            - Geo bounding boxes: `{"geo_bbox":{"field":"location","min_lat":-1,"min_lon":179.5,"max_lat":1,"max_lon":-179.5}}`
+
+
+            For structured `geo_bbox`, `min_lon > max_lon` intentionally
+
+            represents a bounding box that crosses the antimeridian.
           example:
             query: +category:technology +year:>2020
             boost: 1.0
@@ -15335,10 +16258,24 @@ components:
         offset:
           type: integer
           description: >
-            Number of results to skip for pagination. Only available for full_text_search queries.
+            Number of results to skip for pagination. Supported for text-backed,
 
-            Not supported for semantic_search due to vector index limitations.
+            match_all, and filter-only requests. Not supported for semantic_search
+
+            due to vector index limitations.
           example: 0
+        timeout_ms:
+          type: integer
+          minimum: 0
+          description: >
+            Optional query execution deadline in milliseconds. The server applies this as a
+
+            cooperative deadline across query planning, search execution, aggregation reruns,
+
+            sorting, and response post-processing. If the deadline expires before the query
+
+            completes, the HTTP API returns 504.
+          example: 5000
         order_by:
           type: array
           items:
@@ -15346,8 +16283,27 @@ components:
           description: >
             Sort order for results. Array of sort fields with direction.
 
-            Only applicable for full_text_search queries. Semantic searches are always sorted by similarity
-            score.
+            Antfly appends `_id` ascending as a stable tie-breaker when it is omitted.
+
+            Supported for exact text-backed, match_all, and filter-only requests
+
+            when each non-`_id` field is a mapped exact scalar field with sortable
+
+            native doc-value coverage. Sortable mapping types are keyword,
+
+            numeric/number/integer, boolean/bool, datetime/date/timestamp, and
+
+            link. Analyzed `text` fields and `search_as_you_type`, geo, embedding,
+
+            blob, html, object, and array fields are not directly sortable; sort
+
+            on an exact scalar mapping such as `title.keyword` instead. Requests
+
+            that cannot be executed through an exact native sort path return 422
+
+            rather than falling back to stored JSON sorting. Semantic searches
+
+            are always sorted by similarity score. Not supported when `count` is true.
           example:
             - field: created_at
               desc: true
@@ -15355,24 +16311,54 @@ components:
               desc: true
         search_after:
           type: array
-          items:
-            type: string
+          items: {}
           description: >
             Cursor for forward pagination. Pass the `_sort` values from the last hit
 
-            of the previous page. Mutually exclusive with `offset`.
+            of the previous page exactly, including the appended `_id` tie-breaker.
 
-            Requires `order_by` to be set. Only supported for full_text_search queries.
+            Values preserve their JSON types; for example numbers remain numbers,
+
+            booleans remain booleans, and strings remain strings. Cursor values
+
+            must be replayable JSON scalars; nulls, arrays, objects, and non-finite
+
+            numbers are rejected.
+
+            Mutually exclusive with `offset`.
+
+            When `order_by` is omitted, Antfly uses `_id` ascending as the effective
+
+            order and the cursor tuple must contain exactly one `_id` string.
+
+            Supported for exact text-backed, match_all, and filter-only requests;
+
+            not supported for semantic_search or count-only requests.
         search_before:
           type: array
-          items:
-            type: string
+          items: {}
           description: >
             Cursor for backward pagination. Pass the `_sort` values from the first hit
 
-            of the current page. Mutually exclusive with `offset`.
+            of the current page exactly, including the appended `_id` tie-breaker.
 
-            Requires `order_by` to be set. Only supported for full_text_search queries.
+            Values preserve their JSON types; for example numbers remain numbers,
+
+            booleans remain booleans, and strings remain strings. Cursor values
+
+            must be replayable JSON scalars; nulls, arrays, objects, and non-finite
+
+            numbers are rejected.
+
+            Mutually exclusive with `offset`.
+
+            When `order_by` is omitted, Antfly uses `_id` ascending as the effective
+
+            order and the cursor tuple must contain exactly one `_id` string.
+
+            Supported for exact text-backed, match_all, and filter-only requests;
+
+            not supported for semantic_search or count-only requests.
         distance_under:
           x-go-type-skip-optional-pointer: false
           type: number
@@ -15409,7 +16395,11 @@ components:
             If true, returns only the total count of matching documents without retrieving the actual
             documents.
 
-            Useful for pagination and displaying result counts.
+            Useful for pagination and displaying result counts. Count-only requests
+
+            do not return an ordered result page, so `order_by`, `search_after`,
+
+            and `search_before` are not supported when this is true.
           example: false
         profile:
           type: boolean
@@ -15878,6 +16868,10 @@ components:
           items:
             $ref: '#/components/schemas/GraphMetricProfile'
           description: Graph metric freshness and generation details for metric-aware query work.
+        sort:
+          $ref: '#/components/schemas/SortProfile'
+          description: Sort execution statistics (present when the query used ordered page options and
+            profiling was enabled).
     GraphMetricProfile:
       type: object
       required:
@@ -15906,6 +16900,282 @@ components:
         status:
           $ref: '#/components/schemas/GraphMetricStatus'
           description: Published generation and freshness status observed by the query.
+    SortProfile:
+      type: object
+      additionalProperties: false
+      description: >
+        Sort execution profile. These fields are the stable public diagnostic
+
+        surface. Low-level implementation counters such as doc-value load
+
+        timings, stored-source loads, collector/window internals, cost-model
+
+        inputs, native-filter modes, and index-sort availability flags are kept
+
+        out of normal SDK-facing query responses and may appear only in
+
+        internal debug logs or explicit debug surfaces.
+      properties:
+        plan:
+          type: string
+          description: >
+            Stable physical sort plan name. Known values include `none`,
+
+            `id_only`, `id_seek`, `sorted_segment_seek`,
+
+            `native_doc_values_top_n`, `score_top_k`,
+
+            `distributed_k_way_merge`, `stored_json_debug`, and
+
+            `unsupported_exact_sort`. Public exact sort requests must not
+
+            silently move from native plans to `stored_json_debug`; missing
+
+            native coverage is reported through the rejection fields instead.
+        order_by:
+          type: array
+          description: Requested order fields, including the implicit _id tie-breaker when applicable.
+          items:
+            $ref: '#/components/schemas/SortField'
+        cursor:
+          type: string
+          description: Cursor mode for this request.
+        exactness:
+          type: string
+          description: >
+            Exactness class for the selected plan. Known values include
+
+            `none`, `exact`, `bounded_exact`, `approximate`, and
+
+            `unsupported`.
+        source:
+          type: string
+          description: >
+            Sort execution primitive used by the selected plan. Known values
+
+            include `none`, `candidate_collector`, `primary_key_scan`,
+
+            `sorted_segment_scan`, `score_top_k`, `doc_values_collector`,
+
+            `distributed_merge`, `stored_json_debug`, and `unsupported`.
+        candidate_source:
+          type: string
+          enum:
+            - none
+            - existing_hits
+            - match_all
+            - primary_key
+            - native_filter
+            - sorted_segment_membership
+            - text_postings
+            - distributed_shards
+            - vector_top_k
+            - composed
+          description: Exact candidate source consumed by the selected sort primitive.
+        cursor_support:
+          type: string
+          description: >
+            Cursor support level for the selected plan. Known values include
+
+            `none`, `comparator`, `segment_seek`, `distributed_seek`, and
+
+            `unsupported`.
+        source_load:
+          type: string
+          description: >
+            Stored source load strategy. Known values include `none`,
+
+            `source_free`, `projected_source_after_page`,
+
+            `stored_source_required`, and `unsupported`.
+        distributed_behavior:
+          type: string
+          description: >
+            Distributed sort behavior. Known values include `none`,
+
+            `shard_local_only`, `coordinator_merge`, and `unsupported`.
+        selection_reason:
+          type: string
+          description: >
+            Stable reason the planner selected this sort plan. Known values
+
+            include `none`, `unsupported_exact_sort`,
+
+            `distributed_k_way_merge`, `stored_json_debug`,
+
+            `id_candidate_order`, `id_primary_key_seek`, `score_top_k`,
+
+            `index_sort_sorted_segment_seek`, `sorted_segment_seek`,
+
+            `doc_values_collector`, `index_sort_unavailable_doc_values_collector`,
+
+            `caller_selected_doc_values_collector`, and
+
+            `selective_filter_doc_values_collector`.
+        require_native:
+          type: boolean
+          description: Whether exact execution required native typed sort values.
+        sort_lifecycle_state:
+          type: string
+          enum:
+            - unsupported
+            - declared
+            - indexed
+            - covered
+            - queryable
+            - accelerated
+          description: Conservative lifecycle state for the requested sort path. Queryable fields are
+            accepted by public exact sort; accelerated fields are queryable and have an index_sort-compatible
+            physical path.
+        index_sort_coverage:
+          type: string
+          description: >
+            Physical index_sort coverage status for the requested order. Known
+
+            values include `request_mismatch`, `no_live_segments`,
+
+            `missing_segment_index_sort`, `covered_without_bounds`, and
+
+            `covered_with_bounds`.
+        candidate_count:
+          type: integer
+          format: int64
+          description: Candidate documents considered by sort execution.
+        cursor_rejected_count:
+          type: integer
+          format: int64
+          description: Candidates rejected by cursor comparison.
+        selected_count:
+          type: integer
+          format: int64
+          description: Hits selected for the returned page.
+        total_us:
+          type: integer
+          format: int64
+          description: Total sort execution time in microseconds.
+        distributed_shard_count:
+          type: integer
+          format: int64
+          description: Shards participating in distributed sort execution.
+        budget_rejection_reason:
+          type: string
+          description: >
+            Stable budget rejection reason. Known values include
+
+            `text_exact_late_visibility_totals`,
+
+            `text_field_sort_candidate_window`,
+
+            `match_all_candidate_collect_limit`,
+
+            `match_all_exact_candidate_window`,
+
+            `sorted_segment_scan_window`, and
+
+            `distributed_merge_shard_window`.
+        sort_rejection_reason:
+          type: string
+          description: >
+            Stable public exact-sort rejection reason. Known values include
+
+            `unmapped_field`, `non_sortable_field`,
+
+            `unsupported_sort_field`, `mixed_field_type`,
+
+            `field_not_sort_ready`, `filter_not_queryable`,
+
+            `invalid_cursor_arity`, `invalid_cursor_type`,
+
+            `invalid_sort_tuple`, `approximate_candidate_source`,
+
+            `candidate_budget_exceeded`, `missing_null_policy`,
+
+            `non_score_bearing_source`, `invalid_score_value`,
+
+            `count_only_ordered_page`, `stored_json_sort_disabled`,
+
+            `unsupported_exact_sort`, and
+
+            `distributed_merge_unsupported`.
+        sort_rejection_detail:
+          type: string
+          description: >
+            Stable rejection detail. Known exact-sort details include
+
+            `unmapped_sort_field`, `unmapped_field`,
+
+            `non_sortable_sort_field`, `non_scalar_field`,
+
+            `non_sortable_field`, `mixed_field_type`,
+
+            `missing_doc_values_section`, `malformed_doc_values_section`,
+
+            `doc_values_kind_mismatch`, `sparse_live_doc_values`,
+
+            `invalid_doc_value_doc_id`, `duplicate_doc_value_doc_id`,
+
+            `unsupported_doc_values_type`, `missing_doc_values_coverage`,
+
+            `missing_doc_values_capability`, `schema_declared`,
+
+            `observed_declared`, `not_declared`, `missing_doc_values`,
+
+            `non_sortable`, `declared`, `text_search_only`, `mixed`,
+
+            `missing_native_filter_coverage`, `invalid_cursor_arity`,
+
+            `invalid_cursor_type`, `invalid_sort_tuple`,
+
+            `sort_tuple_arity`, `invalid_doc_value_type`,
+
+            `missing_runtime_mapping`, `incomplete_sort_tuple`,
+
+            `mixed_sort_value_domain`, `unsorted_shard_window`,
+
+            `unsorted_component_window`,
+
+            `non_numeric_score`, `missing_score`, `non_finite_score`,
+
+            `score_sort_tuple_mismatch`, `non_score_bearing_source`,
+
+            `id_tiebreaker_mismatch`, `approximate_candidate_source`,
+
+            `count_only_ordered_page`, `native_sort_loader_unavailable`,
+
+            `sorted_segment_executor_unavailable`,
+
+            `primary_key_stream_unavailable`,
+
+            `native_candidate_stream_unavailable`,
+
+            `candidate_stream_unavailable`, `incompatible_sort_plan`,
+
+            `sorted_segment_bounds_unavailable`,
+
+            `filter_query_json_unresolved`,
+
+            `exclusion_query_json_unresolved`,
+
+            `text_index_entry_unavailable`,
+
+            `doc_ordinal_projection_unavailable`,
+
+            `component_sort_profile_missing`,
+
+            `unsupported_composed_sort_source`,
+
+            `stored_json_sort_disabled`, `distributed_merge_unsupported`,
+
+            `distributed_merge_plan_required`,
+
+            `distributed_shard_window_incomplete`,
+
+            `distributed_shard_cursor_window_invalid`, and
+
+            `distributed_merge_shard_window`.
+        sort_rejection_field:
+          type: string
+          description: Sort field associated with the rejection when safe to expose.
     ShardsProfile:
       type: object
       description: Shard-level execution statistics.
@@ -16175,12 +17445,15 @@ components:
                 additionalProperties: true
         _sort:
           type: array
-          items:
-            type: string
+          items: {}
           description: >
             Sort key values for this hit. Pass as search_after or search_before
 
-            to paginate to the next/previous page. Only present when order_by is specified.
+            to paginate to the next/previous page. Values preserve their JSON
+
+            types. Present for ordered result pages, including cursor-only
+
+            requests whose effective order is `_id` ascending.
           x-go-name: sort
     QueryHits:
       x-omitempty: false
@@ -16189,9 +17462,8 @@ components:
       description: A list of query hits.
       properties:
         total:
-          type: integer
-          format: uint64
-          description: Total number of hits available.
+          $ref: '#/components/schemas/QueryHitsTotal'
+          description: Total number of hits available and whether it is exact.
           x-omitzero: false
         hits:
           x-omitempty: false
@@ -16204,6 +17476,26 @@ components:
           format: float
           x-go-type: float64
           description: Maximum score of the results.
+    QueryHitsTotal:
+      x-omitempty: false
+      x-omitzero: false
+      type: object
+      description: Total hit count metadata.
+      required:
+        - value
+        - relation
+      properties:
+        value:
+          type: integer
+          format: uint64
+          description: Hit count value.
+          x-omitzero: false
+        relation:
+          type: string
+          enum:
+            - exact
+            - gte
+          description: Whether value is exact or a lower bound.
     QueryResponses:
       type: object
       description: Responses from multiple query operations.
@@ -17359,8 +18651,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           default: false
-          description: When true on a chunk enrichment, route generated chunk text into the table's default
-            full-text index.
+          description: When true on a chunk or asset enrichment, route generated text into the table's
+            default full-text index.
         content_type:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -18826,6 +20118,7 @@ components:
         - json
     TemplateFieldMapping:
       type: object
+      additionalProperties: false
       description: Field mapping to apply when a dynamic template matches
       properties:
         type:
@@ -18848,12 +20141,39 @@ components:
           type: boolean
           default: false
           description: Whether to include in the _all field for cross-field search
-        doc_values:
+        sortable:
           type: boolean
           default: false
-          description: Whether to enable doc values for sorting/faceting
+          description: >
+            Whether this exact scalar field can be used in order_by. Supported
+
+            sortable mapping types are keyword, numeric/number/integer,
+
+            boolean/bool, datetime/date/timestamp, and link. Analyzed text,
+
+            search_as_you_type, geo, embedding, blob, html, object, and array
+
+            fields are not directly sortable; use an exact scalar subfield such
+
+            as title.keyword for sorted string pagination. When true, Antfly
+
+            derives the internal typed doc-value structures required for exact
+
+            sorting; users should not configure doc_values directly.
+        missing_null_policy:
+          type: string
+          enum:
+            - missing_rejected
+          default: missing_rejected
+          description: >
+            Missing/null sort policy for this mapped field. The current production
+
+            policy rejects missing or null native sort values so sorted cursors
+
+            remain replayable JSON scalar tuples.
     DynamicTemplate:
       type: object
+      additionalProperties: false
       description: >
         A rule for mapping dynamically detected fields. Templates are checked in order
 
@@ -19732,30 +21052,48 @@ components:
         - cidr
     GeoBoundingBoxQuery:
       type: object
+      description: >
+        Geographic bounding box filter. The public query shape uses scalar latitude and longitude bounds
+        to match structured filter_query.geo_bbox. Longitude ranges may cross the antimeridian by specifying
+        a western/min longitude that is greater than the eastern/max longitude; for example, min_lon 179.5
+        and max_lon -179.5 matches points near +/-180 degrees longitude. Latitude bounds must be ordered
+        with min_lat <= max_lat.
       properties:
-        top_left:
-          type: array
-          items:
-            type: number
-            format: double
-          minItems: 2
-          maxItems: 2
-          description: '[lon, lat]'
-        bottom_right:
-          type: array
-          items:
-            type: number
-            format: double
-          minItems: 2
-          maxItems: 2
-          description: '[lon, lat]'
         field:
           type: string
+          description: Field or path containing geo_point values.
+        min_lat:
+          type: number
+          format: double
+          minimum: -90
+          maximum: 90
+          description: Southern latitude bound.
+        min_lon:
+          type: number
+          format: double
+          minimum: -180
+          maximum: 180
+          description: Western longitude bound. If greater than max_lon, the box crosses the antimeridian.
+        max_lat:
+          type: number
+          format: double
+          minimum: -90
+          maximum: 90
+          description: Northern latitude bound. Must be greater than or equal to min_lat.
+        max_lon:
+          type: number
+          format: double
+          minimum: -180
+          maximum: 180
+          description: Eastern longitude bound. May be less than min_lon for antimeridian-wrapped boxes.
         boost:
           $ref: '#/components/schemas/Boost'
       required:
-        - top_left
-        - bottom_right
+        - field
+        - min_lat
+        - min_lon
+        - max_lat
+        - max_lon
     GeoDistanceQuery:
       type: object
       properties:
@@ -19892,6 +21230,10 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: Whether the index is currently rebuilding
+        backfill_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: Whether the index is actively rebuilding, replaying, or catching up.
         backfill_progress:
           x-go-type-skip-optional-pointer: true
           type: number
@@ -19902,6 +21244,154 @@ components:
           type: integer
           format: uint64
           description: Number of documents indexed during current rebuild
+        backfill_state:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Operational readiness state such as ready, running, retrying, or failed.
+        doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of documents visible to the index.
+        term_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of indexed terms when available.
+        replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Highest replay sequence applied to the index runtime.
+        replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Replay sequence the index runtime must reach to be current.
+        replay_catch_up_required:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: Whether replay must catch up before the index is fully current.
+        runtime_present:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_fresh:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        runtime_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        catch_up_phase:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        catch_up_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        text_merge:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Full-text merge runtime diagnostics.
+        async_indexing:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Asynchronous indexer runtime diagnostics.
+        projection_checkpoint_status:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: 'Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.'
+        projection_checkpoint_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Highest derived-log sequence covered by the durable projection checkpoint.
+        projection_checkpoint_generation:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Projection generation associated with the durable checkpoint.
+        projection_checkpoint_config_hash:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Projection configuration identity associated with the durable checkpoint.
+        checkpoint_replay_tail_sequence_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of derived-log sequences after the durable checkpoint that still need replay.
+        repair_scan_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Repair issues found by explicit repair-scan accounting for this projection.
+        edge_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact resolution replay diagnostics.
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact promotion replay diagnostics.
     EmbeddingsIndexStats:
       type: object
       description: Statistics for an embeddings index (dense or sparse)
@@ -19947,6 +21437,10 @@ components:
           type: integer
           format: uint64
           description: Number of documents pending enrichment in the WAL
+        backfill_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: Whether the index is actively rebuilding, replaying, enriching, or catching up.
         backfill_progress:
           x-go-type-skip-optional-pointer: true
           type: number
@@ -19957,6 +21451,227 @@ components:
           type: integer
           format: uint64
           description: Total items processed during backfill
+        backfill_state:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Operational readiness state such as ready, running, retrying, or failed.
+        doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of documents visible to the index.
+        query_visible_doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Documents currently visible to queries.
+        published_doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        published_node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        root_node:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        published_root_node:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        dense_replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        dense_replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        dense_publish_pending:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: Whether dense/vector artifacts still need publication before queries see the latest
+            data.
+        coverage:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: false
+          description: Source document coverage accounting for embeddings indexes.
+          properties:
+            policy:
+              type: string
+              description: Coverage policy used to decide readiness.
+            source_total:
+              type: integer
+              format: uint64
+              description: Total source documents expected for coverage.
+            produced:
+              type: integer
+              format: uint64
+              description: Source documents with produced embeddings.
+            skipped:
+              type: integer
+              format: uint64
+              description: Source documents intentionally skipped by coverage policy.
+            terminal_failed:
+              type: integer
+              format: uint64
+              description: Source documents that reached a terminal enrichment failure.
+            covered:
+              type: integer
+              format: uint64
+              description: Source documents counted as covered by the coverage policy.
+            complete:
+              type: boolean
+              description: Whether the coverage policy considers the index complete.
+        replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_catch_up_required:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_present:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_fresh:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        runtime_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        catch_up_phase:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        catch_up_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        enrichment_runtime:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          properties:
+            pending_sequence_count:
+              type: integer
+              format: uint64
+          description: Embedding enrichment worker runtime diagnostics.
+        hbc_cache:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+        hbc_posting:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+        async_indexing:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+        projection_checkpoint_status:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: 'Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.'
+        projection_checkpoint_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Highest derived-log sequence covered by the durable projection checkpoint.
+        projection_checkpoint_generation:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Projection generation associated with the durable checkpoint.
+        projection_checkpoint_config_hash:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Projection configuration identity associated with the durable checkpoint.
+        checkpoint_replay_tail_sequence_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of derived-log sequences after the durable checkpoint that still need replay.
+        repair_scan_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Repair issues found by explicit repair-scan accounting for this projection.
+        term_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        edge_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact resolution replay diagnostics.
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact promotion replay diagnostics.
     GraphMetricRuntimeStats:
       type: object
       description: Summarized graph metric maintenance runtime state. Identity fields are stable hashes,
@@ -20121,6 +21836,10 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: Whether the index is currently rebuilding
+        backfill_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: Whether the index is actively rebuilding, materializing, or catching up.
         backfill_progress:
           x-go-type-skip-optional-pointer: true
           type: number
@@ -20131,6 +21850,156 @@ components:
           type: integer
           format: uint64
           description: Number of edges indexed during current rebuild
+        backfill_state:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Operational readiness state such as ready, running, retrying, or failed.
+        doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of documents covered by the graph index.
+        edge_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of graph edges currently indexed.
+        node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of graph nodes currently indexed.
+        replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_catch_up_required:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_present:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_fresh:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        runtime_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        catch_up_phase:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        catch_up_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        source_artifact:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Graph source artifact materialization status.
+        resolver_replay:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Resolver replay diagnostics for graph materialization.
+        async_indexing:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+        projection_checkpoint_status:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: 'Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.'
+        projection_checkpoint_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Highest derived-log sequence covered by the durable projection checkpoint.
+        projection_checkpoint_generation:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Projection generation associated with the durable checkpoint.
+        projection_checkpoint_config_hash:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Projection configuration identity associated with the durable checkpoint.
+        checkpoint_replay_tail_sequence_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of derived-log sequences after the durable checkpoint that still need replay.
+        repair_scan_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Repair issues found by explicit repair-scan accounting for this projection.
+        term_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact resolution replay diagnostics.
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact promotion replay diagnostics.
         algebraic_graph:
           x-go-type-skip-optional-pointer: true
           type: object
@@ -20188,6 +22057,10 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: Whether the sidecar is currently rebuilding
+        backfill_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: Whether the sidecar is actively rebuilding, replaying, or catching up.
         backfill_progress:
           x-go-type-skip-optional-pointer: true
           type: number
@@ -20198,6 +22071,60 @@ components:
           type: integer
           format: uint64
           description: Number of documents processed during current backfill
+        backfill_state:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Operational readiness state such as ready, running, retrying, or failed.
+        doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of documents visible to the sidecar.
+        term_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_catch_up_required:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_present:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_fresh:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        runtime_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        catch_up_phase:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        catch_up_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        async_indexing:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
         healthy:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -20297,6 +22224,100 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: uint64
+        projection_checkpoint_status:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: 'Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.'
+        projection_checkpoint_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Highest derived-log sequence covered by the durable projection checkpoint.
+        projection_checkpoint_generation:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Projection generation associated with the durable checkpoint.
+        projection_checkpoint_config_hash:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Projection configuration identity associated with the durable checkpoint.
+        checkpoint_replay_tail_sequence_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of derived-log sequences after the durable checkpoint that still need replay.
+        repair_scan_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Repair issues found by explicit repair-scan accounting for this projection.
+        edge_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        source_artifact:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Source artifact stream used to materialize graph edges.
+        resolver_replay:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Graph resolver replay diagnostics.
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact resolution replay diagnostics.
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact promotion replay diagnostics.
     RelationalIndexRebuildStatus:
       type: object
       description: Aggregate secondary-index rebuild progress projected from authoritative metadata ranges.
@@ -22960,84 +24981,25 @@ components:
             mime_type:
               type: string
               description: 'MIME type: text/plain, audio/wav, image/png, etc.'
-    InferenceVADOptions:
-      type: object
-      description: Options for Voice Activity Detection (VAD) based audio segmentation. inference-specific.
-      properties:
-        min_silence_duration_ms:
-          type: integer
-          description: 'Minimum silence duration (ms) to split speech segments. Gaps shorter than this
-            are merged. Higher values produce longer, fewer segments. Default: 300.'
-        min_speech_duration_ms:
-          type: integer
-          description: 'Minimum speech duration (ms) for a segment to be kept. Shorter segments are discarded.
-            Default: 250.'
-        speech_pad_ms:
-          type: integer
-          description: 'Padding (ms) added before and after detected speech. Default: 30.'
-        max_segment_duration_ms:
-          type: integer
-          description: 'Maximum segment duration (ms). Segments longer than this are split. Useful for
-            Whisper-compatible chunking. Default: 30000.'
-    InferenceAudioChunkConfig:
-      type: object
-      description: Audio chunking configuration for inference, including VAD options.
-      properties:
-        window_duration_ms:
-          type: integer
-          description: 'Window duration in milliseconds for fixed-window audio chunking (default: 30000).'
-        overlap_duration_ms:
-          type: integer
-          description: 'Overlap duration in milliseconds between audio chunks (default: 0).'
-        vad:
-          $ref: '#/components/schemas/InferenceVADOptions'
-    InferenceChunkConfig:
-      type: object
-      description: >
-        Configuration for chunking requests to Inference API.
-
-        Combines shared text options with inference-specific audio/VAD options.
-      properties:
-        model:
-          type: string
-          description: The chunking model to use. Either 'fixed' for simple token-based chunking, or a
-            model name from models/chunkers/{name}/.
-          default: fixed
-          example: fixed
-        max_chunks:
-          type: integer
-          description: Maximum number of chunks to generate per document.
-        threshold:
-          type: number
-          format: float
-          description: Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models
-            and VAD audio models.
-        text:
-          $ref: '#/components/schemas/InferenceTextChunkOptions'
-        audio:
-          $ref: '#/components/schemas/InferenceAudioChunkConfig'
     InferenceChunkRequest:
       type: object
+      required:
+        - input
       properties:
         input:
           description: >
             Input content to chunk. Supports two formats:
 
-            - Text string: `"This is a long document..."` (backward compatible)
+            - Text string: `"This is a long document..."`
 
             - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}`
 
             - ContentPart: `{"type": "text", "text": "..."}`
           oneOf:
             - type: string
-              description: Text to chunk (backward compatible)
-            - $ref: '#/components/schemas/ContentPart'
+              description: Text to chunk
+            - $ref: '#/components/schemas/InferenceChunkContentPart'
               description: Content part (text or media)
-        text:
-          type: string
-          deprecated: true
-          description: 'DEPRECATED: Use ''input'' instead. Text to chunk.'
-          example: This is a long document that needs to be split into smaller chunks...
         config:
           $ref: '#/components/schemas/InferenceChunkConfig'
     InferenceChunkResponse:
@@ -24352,21 +26314,6 @@ components:
           type: boolean
           description: Whether the WASM backend is built into this runtime
           example: false
-    InferenceTextChunkOptions:
-      type: object
-      description: Options specific to text chunking.
-      properties:
-        target_tokens:
-          type: integer
-          description: Target number of tokens per chunk.
-        overlap_tokens:
-          type: integer
-          description: Number of tokens to overlap between consecutive chunks. Helps maintain context
-            across chunk boundaries. Only used by fixed-size chunkers.
-        separator:
-          type: string
-          description: Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size
-            chunkers.
     InferenceTextContent:
       type: object
       description: Text content with character offsets.
@@ -25168,6 +27115,67 @@ components:
         usage:
           type: object
           additionalProperties: true
+    InferenceChunkContentPart:
+      description: Content part supported by chunking requests.
+      oneOf:
+        - $ref: '#/components/schemas/TextContentPart'
+        - $ref: '#/components/schemas/MediaContentPart'
+    VADOptions:
+      type: object
+      description: Options for Voice Activity Detection (VAD) based audio segmentation.
+      properties:
+        min_silence_duration_ms:
+          type: integer
+          description: 'Minimum silence duration (ms) to split speech segments. Gaps shorter than this
+            are merged. Higher values produce longer, fewer segments. Default: 300.'
+        min_speech_duration_ms:
+          type: integer
+          description: 'Minimum speech duration (ms) for a segment to be kept. Shorter segments are discarded.
+            Default: 250.'
+        speech_pad_ms:
+          type: integer
+          description: 'Padding (ms) added before and after detected speech. Default: 30.'
+        max_segment_duration_ms:
+          type: integer
+          description: 'Maximum segment duration (ms). Segments longer than this are split. Useful for
+            Whisper-compatible chunking. Default: 30000.'
+    InferenceAudioChunkConfig:
+      type: object
+      description: Audio chunking configuration for inference, including VAD options.
+      properties:
+        window_duration_ms:
+          type: integer
+          description: 'Window duration in milliseconds for fixed-window audio chunking (default: 30000).'
+        overlap_duration_ms:
+          type: integer
+          description: 'Overlap duration in milliseconds between audio chunks (default: 0).'
+        vad:
+          $ref: '#/components/schemas/VADOptions'
+    InferenceChunkConfig:
+      type: object
+      description: >
+        Configuration for chunking requests to Antfly inference.
+
+        Combines shared text options with inference-specific audio/VAD options.
+      properties:
+        model:
+          type: string
+          description: The chunking model to use. Either 'fixed' for simple token-based chunking, or a
+            model name from models/chunkers/{name}/.
+          default: fixed
+          example: fixed
+        max_chunks:
+          type: integer
+          description: Maximum number of chunks to generate per document.
+        threshold:
+          type: number
+          format: float
+          description: Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models
+            and VAD audio models.
+        text:
+          $ref: '#/components/schemas/TextChunkOptions'
+        audio:
+          $ref: '#/components/schemas/InferenceAudioChunkConfig'
   responses:
     BadRequest:
       description: Bad request
@@ -25217,6 +27225,12 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    UnsupportedExactSort:
+      description: Exact sort cannot be executed through a supported native plan
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ExactSortError'
     InternalServerError:
       description: Internal server error
       content:

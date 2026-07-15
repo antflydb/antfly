@@ -415,6 +415,9 @@ func TestParseSyncLevelFlag(t *testing.T) {
 	if _, err := parseSyncLevelFlag("full_text"); err == nil {
 		t.Fatalf("parseSyncLevelFlag accepted old full_text value")
 	}
+	if _, err := parseSyncLevelFlag("embeddings"); err == nil {
+		t.Fatalf("parseSyncLevelFlag accepted old embeddings value")
+	}
 	if _, err := parseSyncLevelFlag("aknn"); err == nil {
 		t.Fatalf("parseSyncLevelFlag accepted old aknn value")
 	}
@@ -749,6 +752,7 @@ func TestExtractZipPDFs_Parallel(t *testing.T) {
 				entry.Name(), len(data), len(pdfData))
 		}
 	}
+
 }
 
 func TestIterateZipPDFs(t *testing.T) {

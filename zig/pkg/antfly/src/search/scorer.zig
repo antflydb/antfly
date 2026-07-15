@@ -122,6 +122,11 @@ pub const TopKCollector = struct {
         self.total_relation = .gte;
     }
 
+    pub fn markSkippedLowerBound(self: *TopKCollector) void {
+        self.total_relation = .gte;
+        self.total_count +|= 1;
+    }
+
     pub fn collect(self: *TopKCollector, hit: ScoredHit) !void {
         self.total_count += 1;
         try insertTopK(self.alloc, &self.hits, self.k, hit);
@@ -320,6 +325,7 @@ pub const WANDScorer = struct {
         defer self.alloc.free(sorted);
         for (sorted, 0..) |*s, i| s.* = i;
 
+        var counted_skipped_lower_bound = false;
         while (true) {
             // Count active terms and sort indices by current doc_id
             var active: usize = 0;
@@ -353,7 +359,13 @@ pub const WANDScorer = struct {
                 }
             }
 
-            if (pivot_pos == null) break;
+            if (pivot_pos == null) {
+                if (!counted_skipped_lower_bound and collector.topKLimit() > 0) {
+                    collector.markSkippedLowerBound();
+                    counted_skipped_lower_bound = true;
+                }
+                break;
+            }
 
             const pivot_doc = self.terms.items[sorted[pivot_pos.?]].current.?.doc_id;
 
@@ -402,6 +414,9 @@ pub const WANDScorer = struct {
                     }
                 }
             }
+        }
+        if (!counted_skipped_lower_bound and self.chunks_skipped > 0 and collector.topKLimit() > 0) {
+            collector.markSkippedLowerBound();
         }
     }
 
@@ -737,6 +752,7 @@ test "scorer executes into external top-k collector" {
     defer alloc.free(results.hits);
 
     try std.testing.expectEqual(TotalHitsRelation.gte, results.total_relation);
+    try std.testing.expect(results.total_count > results.hits.len);
     try std.testing.expectEqual(@as(usize, 3), results.hits.len);
     try std.testing.expectEqual(@as(u32, 7), results.hits[0].doc_id);
 }

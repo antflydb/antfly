@@ -179,13 +179,13 @@ pub fn lowerSelectParsedSqlAlloc(
         Parser.ContextAccessors.simpleSelectSetTailHooks(&parser),
     ) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        error.InvalidSqlCatalog => return error.UnsupportedSqlShape,
         else => return err,
     };
     errdefer lowered.deinit(alloc);
     relational_rows.validateRowsQueryPlanCteOutputAlloc(alloc, schema, lowered.plan) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        error.InvalidSqlCatalog => return error.UnsupportedSqlShape,
         else => return err,
     };
 
@@ -282,7 +282,7 @@ pub fn lowerQueryPlanWithOptionalSourceSchemaParsedSqlAlloc(
         Parser.ContextAccessors.simpleSelectSetTailHooks(&parser),
     ) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        error.InvalidSqlCatalog => return error.UnsupportedSqlShape,
         else => return err,
     };
     errdefer lowered.deinit(alloc);
@@ -1038,13 +1038,13 @@ pub fn lowerAggregatePlanParsedSqlAlloc(
         Parser.ContextAccessors.aggregatePlanParserHooks(&parser),
     ) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        error.InvalidSqlCatalog => return error.UnsupportedSqlShape,
         else => return err,
     };
     errdefer lowered.deinit(alloc);
     relational_rows.validateRowsAggregatePlanCteOutputAlloc(alloc, schema, lowered.plan) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        error.InvalidSqlCatalog => return error.UnsupportedSqlShape,
         else => return err,
     };
     return lowered;
@@ -1292,6 +1292,8 @@ test "select projection lowerer fails closed on malformed retained expression pa
             .read => |read| {
                 try std.testing.expectEqual(@as(usize, 1), read.projection_items.count);
                 try std.testing.expectEqual(read.projection_items.count, read.projection_items.expressions.len);
+                for (read.projection_items.expressions) |*expression| expression.deinit(alloc);
+                alloc.free(read.projection_items.expressions);
                 read.projection_items.expressions = &.{};
             },
             else => return error.TestUnexpectedResult,
@@ -1318,7 +1320,8 @@ test "select projection lowerer fails closed on malformed retained expression pa
                 try std.testing.expectEqual(@as(usize, 1), read.projection_items.count);
                 try std.testing.expectEqual(read.projection_items.count, read.projection_items.expressions.len);
                 _ = read.where_expression.tokens orelse return error.TestUnexpectedResult;
-                read.projection_items.expressions[0] = read.where_expression;
+                read.projection_items.expressions[0].deinit(alloc);
+                read.projection_items.expressions[0] = try generated_parser_mod.cloneGeneratedExpressionAlloc(alloc, read.where_expression);
             },
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
@@ -1355,6 +1358,7 @@ test "where predicate lowerer fails closed on malformed retained expression payl
             .read => |read| {
                 _ = read.where_tokens orelse return error.TestUnexpectedResult;
                 _ = read.where_expression.tokens orelse return error.TestUnexpectedResult;
+                read.where_expression.deinit(alloc);
                 read.where_expression = .{};
             },
             else => return error.TestUnexpectedResult,
@@ -1382,7 +1386,8 @@ test "where predicate lowerer fails closed on malformed retained expression payl
                 _ = read.where_expression.tokens orelse return error.TestUnexpectedResult;
                 try std.testing.expectEqual(@as(usize, 1), read.projection_items.count);
                 try std.testing.expectEqual(read.projection_items.count, read.projection_items.expressions.len);
-                read.where_expression = read.projection_items.expressions[0];
+                read.where_expression.deinit(alloc);
+                read.where_expression = try generated_parser_mod.cloneGeneratedExpressionAlloc(alloc, read.projection_items.expressions[0]);
             },
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
@@ -1420,6 +1425,8 @@ test "order by lowerer fails closed on malformed retained expression payloads" {
                 _ = read.order_tokens orelse return error.TestUnexpectedResult;
                 try std.testing.expectEqual(@as(usize, 1), read.order_items.count);
                 try std.testing.expectEqual(read.order_items.count, read.order_items.expressions.len);
+                for (read.order_items.expressions) |*expression| expression.deinit(alloc);
+                alloc.free(read.order_items.expressions);
                 read.order_items.expressions = &.{};
             },
             else => return error.TestUnexpectedResult,
@@ -1448,7 +1455,8 @@ test "order by lowerer fails closed on malformed retained expression payloads" {
                 try std.testing.expectEqual(read.order_items.count, read.order_items.expressions.len);
                 try std.testing.expectEqual(@as(usize, 1), read.projection_items.count);
                 try std.testing.expectEqual(read.projection_items.count, read.projection_items.expressions.len);
-                read.order_items.expressions[0] = read.projection_items.expressions[0];
+                read.order_items.expressions[0].deinit(alloc);
+                read.order_items.expressions[0] = try generated_parser_mod.cloneGeneratedExpressionAlloc(alloc, read.projection_items.expressions[0]);
             },
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
@@ -1487,6 +1495,8 @@ test "aggregate group having and order lowerers fail closed on malformed retaine
                 _ = read.group_tokens orelse return error.TestUnexpectedResult;
                 try std.testing.expectEqual(@as(usize, 1), read.group_items.count);
                 try std.testing.expectEqual(read.group_items.count, read.group_items.expressions.len);
+                for (read.group_items.expressions) |*expression| expression.deinit(alloc);
+                alloc.free(read.group_items.expressions);
                 read.group_items.expressions = &.{};
             },
             else => return error.TestUnexpectedResult,
@@ -1514,7 +1524,8 @@ test "aggregate group having and order lowerers fail closed on malformed retaine
                 try std.testing.expectEqual(@as(usize, 1), read.group_items.count);
                 try std.testing.expectEqual(read.group_items.count, read.group_items.expressions.len);
                 try std.testing.expect(read.projection_items.expressions.len >= 1);
-                read.group_items.expressions[0] = read.projection_items.expressions[0];
+                read.group_items.expressions[0].deinit(alloc);
+                read.group_items.expressions[0] = try generated_parser_mod.cloneGeneratedExpressionAlloc(alloc, read.projection_items.expressions[0]);
             },
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
@@ -1539,6 +1550,7 @@ test "aggregate group having and order lowerers fail closed on malformed retaine
             .read => |read| {
                 _ = read.having_tokens orelse return error.TestUnexpectedResult;
                 _ = read.having_expression.tokens orelse return error.TestUnexpectedResult;
+                read.having_expression.deinit(alloc);
                 read.having_expression = .{};
             },
             else => return error.TestUnexpectedResult,
@@ -1565,7 +1577,8 @@ test "aggregate group having and order lowerers fail closed on malformed retaine
                 _ = read.having_tokens orelse return error.TestUnexpectedResult;
                 _ = read.having_expression.tokens orelse return error.TestUnexpectedResult;
                 try std.testing.expect(read.group_items.expressions.len >= 1);
-                read.having_expression = read.group_items.expressions[0];
+                read.having_expression.deinit(alloc);
+                read.having_expression = try generated_parser_mod.cloneGeneratedExpressionAlloc(alloc, read.group_items.expressions[0]);
             },
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
@@ -1591,6 +1604,8 @@ test "aggregate group having and order lowerers fail closed on malformed retaine
                 _ = read.order_tokens orelse return error.TestUnexpectedResult;
                 try std.testing.expectEqual(@as(usize, 1), read.order_items.count);
                 try std.testing.expectEqual(read.order_items.count, read.order_items.expressions.len);
+                for (read.order_items.expressions) |*expression| expression.deinit(alloc);
+                alloc.free(read.order_items.expressions);
                 read.order_items.expressions = &.{};
             },
             else => return error.TestUnexpectedResult,
@@ -1618,7 +1633,8 @@ test "aggregate group having and order lowerers fail closed on malformed retaine
                 try std.testing.expectEqual(@as(usize, 1), read.order_items.count);
                 try std.testing.expectEqual(read.order_items.count, read.order_items.expressions.len);
                 try std.testing.expect(read.projection_items.expressions.len >= 1);
-                read.order_items.expressions[0] = read.projection_items.expressions[0];
+                read.order_items.expressions[0].deinit(alloc);
+                read.order_items.expressions[0] = try generated_parser_mod.cloneGeneratedExpressionAlloc(alloc, read.projection_items.expressions[0]);
             },
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
 const image = @import("image.zig");
 const crop = @import("crop.zig");
@@ -460,6 +461,7 @@ pub const MultiStageOCRPipeline = struct {
 
         const heatmap = try extractDetectionHeatmap(self.allocator, &outputs[0], self.detection_preprocess.width, self.detection_preprocess.height);
         defer self.allocator.free(heatmap.values);
+        traceDetectionHeatmap(&outputs[0], heatmap.values, heatmap.width, heatmap.height, self.post_processor);
         return self.post_processor.process(self.allocator, heatmap.values, heatmap.width, heatmap.height, img.width, img.height);
     }
 
@@ -765,6 +767,31 @@ fn extractDetectionHeatmap(
             .height = fallback_height,
         },
     }
+}
+
+fn traceDetectionHeatmap(output: *const backends.Tensor, values: []const f32, width: usize, height: usize, processor: DetectionPostProcessor) void {
+    if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_TRACE_OCR_DETECTION", false)) return;
+
+    var min_value: f32 = std.math.inf(f32);
+    var max_value: f32 = -std.math.inf(f32);
+    var sum: f64 = 0;
+    var above_threshold: usize = 0;
+    const threshold = switch (processor) {
+        .db => |db| db.threshold,
+        .heatmap => |heatmap| heatmap.threshold,
+    };
+
+    for (values) |value| {
+        min_value = @min(min_value, value);
+        max_value = @max(max_value, value);
+        sum += value;
+        if (value > threshold) above_threshold += 1;
+    }
+    const mean = if (values.len > 0) sum / @as(f64, @floatFromInt(values.len)) else 0;
+    std.log.info(
+        "ocr detection output shape={any} heatmap={}x{} values={} min={d:.6} max={d:.6} mean={d:.6} above_threshold={} threshold={d:.6}",
+        .{ output.shape, width, height, values.len, min_value, max_value, mean, above_threshold, threshold },
+    );
 }
 
 fn computeBoxScore(prob_map: []const f32, comp: connected_components.ComponentRect, width: usize) f64 {

@@ -1242,7 +1242,7 @@ func TestE2E_OnlineSplit_PreBuiltIndexes(t *testing.T) {
 	require.NotNil(t, preSplitResults)
 	var preSplitCount uint64
 	if len(preSplitResults.Responses) > 0 {
-		preSplitCount = preSplitResults.Responses[0].Hits.Total
+		preSplitCount = antfly.QueryHitsTotalValue(preSplitResults.Responses[0].Hits.Total)
 	}
 	t.Logf("Pre-split search for 'quantum' returned %d results", preSplitCount)
 	require.Positive(t, preSplitCount, "Search should find documents before split")
@@ -1300,7 +1300,7 @@ func TestE2E_OnlineSplit_PreBuiltIndexes(t *testing.T) {
 		searchDuration := time.Since(searchStart)
 		var resultCount uint64
 		if len(results.Responses) > 0 {
-			resultCount = results.Responses[0].Hits.Total
+			resultCount = antfly.QueryHitsTotalValue(results.Responses[0].Hits.Total)
 		}
 
 		t.Logf("Search for '%s': %d results in %v", term, resultCount, searchDuration)
@@ -1326,7 +1326,7 @@ func TestE2E_OnlineSplit_PreBuiltIndexes(t *testing.T) {
 
 	var totalFound uint64
 	if len(allResults.Responses) > 0 {
-		totalFound = allResults.Responses[0].Hits.Total
+		totalFound = antfly.QueryHitsTotalValue(allResults.Responses[0].Hits.Total)
 	}
 	t.Logf("Total documents found searching for 'document': %d", totalFound)
 
@@ -1686,7 +1686,7 @@ func TestE2E_SplitAvailabilityIndexQueries(t *testing.T) {
 		})
 		require.NoError(t, err)
 		if len(results.Responses) > 0 {
-			t.Logf("Pre-split search for '%s': %d results", term, results.Responses[0].Hits.Total)
+			t.Logf("Pre-split search for '%s': %d results", term, antfly.QueryHitsTotalValue(results.Responses[0].Hits.Total))
 		}
 	}
 
@@ -1820,7 +1820,7 @@ func TestE2E_SplitAvailabilityIndexQueries(t *testing.T) {
 		})
 		require.NoError(t, err, "Search for '%s' should work after split", term)
 		if len(results.Responses) > 0 {
-			require.Positive(t, results.Responses[0].Hits.Total,
+			require.Positive(t, antfly.QueryHitsTotalValue(results.Responses[0].Hits.Total),
 				"Search for '%s' should find results after split", term)
 		}
 	}

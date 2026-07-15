@@ -1713,7 +1713,10 @@ test "postgres libpq live logical poll returns inserted row" {
     const dsn = try testPgDsnAlloc(alloc);
     defer alloc.free(dsn);
 
-    var executor = try Executor.init(alloc);
+    var executor = Executor.init(alloc) catch |err| switch (err) {
+        error.LibpqUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
     defer executor.deinit();
 
     const conn = executor.connect(dsn) catch return error.SkipZigTest;
@@ -1801,7 +1804,10 @@ test "postgres libpq live logical poll can auto-create publication and slot befo
     const dsn = try testPgDsnAlloc(alloc);
     defer alloc.free(dsn);
 
-    var executor = try Executor.init(alloc);
+    var executor = Executor.init(alloc) catch |err| switch (err) {
+        error.LibpqUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
     defer executor.deinit();
 
     const conn = executor.connect(dsn) catch return error.SkipZigTest;
@@ -1876,7 +1882,10 @@ test "postgres libpq live prepare replication returns slot checkpoint" {
     const dsn = try testPgDsnAlloc(alloc);
     defer alloc.free(dsn);
 
-    var executor = try Executor.init(alloc);
+    var executor = Executor.init(alloc) catch |err| switch (err) {
+        error.LibpqUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
     defer executor.deinit();
 
     const conn = executor.connect(dsn) catch return error.SkipZigTest;
@@ -1941,7 +1950,10 @@ test "postgres libpq live logical poll works after snapshot query on same connec
     const dsn = try testPgDsnAlloc(alloc);
     defer alloc.free(dsn);
 
-    var executor = try Executor.init(alloc);
+    var executor = Executor.init(alloc) catch |err| switch (err) {
+        error.LibpqUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
     defer executor.deinit();
 
     const conn = executor.connect(dsn) catch return error.SkipZigTest;
@@ -2023,7 +2035,10 @@ test "postgres libpq consistent snapshot query holds repeatable read view" {
     const dsn = try testPgDsnAlloc(alloc);
     defer alloc.free(dsn);
 
-    var executor = try Executor.init(alloc);
+    var executor = Executor.init(alloc) catch |err| switch (err) {
+        error.LibpqUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
     defer executor.deinit();
 
     const conn = executor.connect(dsn) catch return error.SkipZigTest;
@@ -2080,7 +2095,10 @@ test "postgres libpq prepared replication snapshot bridges initial cutover" {
     const dsn = try testPgDsnAlloc(alloc);
     defer alloc.free(dsn);
 
-    var executor = try Executor.init(alloc);
+    var executor = Executor.init(alloc) catch |err| switch (err) {
+        error.LibpqUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
     defer executor.deinit();
 
     const conn = executor.connect(dsn) catch return error.SkipZigTest;
@@ -2163,7 +2181,10 @@ test "postgres libpq poll resumes from durable checkpoint across multiple transa
     const dsn = try testPgDsnAlloc(alloc);
     defer alloc.free(dsn);
 
-    var executor = try Executor.init(alloc);
+    var executor = Executor.init(alloc) catch |err| switch (err) {
+        error.LibpqUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
     defer executor.deinit();
 
     const conn = executor.connect(dsn) catch return error.SkipZigTest;

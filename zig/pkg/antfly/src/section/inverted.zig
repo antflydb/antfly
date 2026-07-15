@@ -2619,6 +2619,7 @@ pub fn mergeInvertedSectionSlotsWithDeletes(
                 const h = termBloomHashes(merged_term);
                 try bloom_hashes.append(alloc, .{ .h1 = h.h1, .h2 = h.h2 });
             }
+            try sortPostingAccumulatorByDocId(alloc, &acc);
             const dict_value = try appendMergedTerm(alloc, &postings_data, &serialize_scratch, &acc, config, running_offset);
             try dict_entries.append(alloc, .{
                 .term = merged_term,
@@ -2633,6 +2634,150 @@ pub fn mergeInvertedSectionSlotsWithDeletes(
     const norms_data = try encodeNormTable(alloc, merged_norms);
     defer alloc.free(norms_data);
     return assembleMergedSection(alloc, running_offset, total_field_len, config.chunk_size, postings_data.items, norms_data, term_dict_data, config, bloom_hashes.items);
+}
+
+pub fn mergeInvertedSectionSlotsWithDocMaps(
+    alloc: Allocator,
+    sections: []const ?[]const u8,
+    doc_counts: []const u32,
+    doc_maps: []const []const u32,
+    merged_doc_count: u32,
+    config: IndexConfig,
+) ![]u8 {
+    if (sections.len != doc_counts.len or sections.len != doc_maps.len) return error.InvalidData;
+
+    var readers = try alloc.alloc(InvertedIndexReader, sections.len);
+    defer alloc.free(readers);
+    var reader_present = try alloc.alloc(bool, sections.len);
+    defer alloc.free(reader_present);
+    for (sections, 0..) |section_opt, i| {
+        if (doc_maps[i].len != doc_counts[i]) return error.InvalidData;
+        reader_present[i] = false;
+        const section = section_opt orelse continue;
+        const reader = try InvertedIndexReader.init(alloc, section);
+        if (reader.doc_count > doc_counts[i]) return error.InvalidData;
+        readers[i] = reader;
+        reader_present[i] = true;
+    }
+
+    var term_iters = try alloc.alloc(TermIterator, sections.len);
+    defer {
+        for (term_iters, 0..) |*iter, i| {
+            if (reader_present[i]) iter.deinit();
+        }
+        alloc.free(term_iters);
+    }
+
+    var current_entries = try alloc.alloc(?TermIterator.Entry, sections.len);
+    defer alloc.free(current_entries);
+    @memset(current_entries, null);
+
+    for (readers, 0..) |*reader, seg_idx| {
+        if (!reader_present[seg_idx]) continue;
+        term_iters[seg_idx] = try reader.termIterator();
+        current_entries[seg_idx] = try nextTermIteratorEntry(term_iters, seg_idx);
+    }
+
+    var postings_data = std.ArrayListUnmanaged(u8).empty;
+    defer postings_data.deinit(alloc);
+
+    var total_field_len: u64 = 0;
+    const merged_norms = try alloc.alloc(u32, merged_doc_count);
+    defer alloc.free(merged_norms);
+    @memset(merged_norms, 0);
+    var serialize_scratch = PostingSerializeScratch{};
+    defer serialize_scratch.deinit(alloc);
+    var bloom_hashes = std.ArrayListUnmanaged(TermBloomHash).empty;
+    defer bloom_hashes.deinit(alloc);
+    const collect_bloom_hashes = config.enable_bloom;
+    var dict_entries = std.ArrayListUnmanaged(TermDictEntry).empty;
+    defer {
+        for (dict_entries.items) |entry| alloc.free(entry.term);
+        dict_entries.deinit(alloc);
+    }
+
+    while (true) {
+        const min_term = findMinCurrentTerm(current_entries) orelse break;
+
+        {
+            const merged_term = try alloc.dupe(u8, min_term);
+            var keep_merged_term = false;
+            defer if (!keep_merged_term) alloc.free(merged_term);
+
+            var acc = PostingAccumulator.init();
+            defer acc.deinit(alloc);
+
+            for (current_entries, 0..) |entry_opt, seg_idx| {
+                const entry = entry_opt orelse continue;
+                if (!std.mem.eql(u8, entry.term, merged_term)) continue;
+
+                try appendLookupResultToAccumulator(alloc, &acc, entry.result, doc_maps[seg_idx], merged_norms, &total_field_len);
+                current_entries[seg_idx] = try nextTermIteratorEntry(term_iters, seg_idx);
+            }
+
+            if (acc.doc_ids.items.len == 0) continue;
+            if (collect_bloom_hashes) {
+                const h = termBloomHashes(merged_term);
+                try bloom_hashes.append(alloc, .{ .h1 = h.h1, .h2 = h.h2 });
+            }
+            try sortPostingAccumulatorByDocId(alloc, &acc);
+            const dict_value = try appendMergedTerm(alloc, &postings_data, &serialize_scratch, &acc, config, merged_doc_count);
+            try dict_entries.append(alloc, .{
+                .term = merged_term,
+                .value = dict_value,
+            });
+            keep_merged_term = true;
+        }
+    }
+
+    const term_dict_data = try encodeBlockedTermDictionary(alloc, dict_entries.items);
+    defer alloc.free(term_dict_data);
+    const norms_data = try encodeNormTable(alloc, merged_norms);
+    defer alloc.free(norms_data);
+    return assembleMergedSection(alloc, merged_doc_count, total_field_len, config.chunk_size, postings_data.items, norms_data, term_dict_data, config, bloom_hashes.items);
+}
+
+const PostingSortEntry = struct {
+    doc_id: u32,
+    meta: PostingMeta,
+    positions_start: usize,
+};
+
+fn postingSortEntryLessThan(_: void, a: PostingSortEntry, b: PostingSortEntry) bool {
+    return a.doc_id < b.doc_id;
+}
+
+fn sortPostingAccumulatorByDocId(alloc: Allocator, acc: *PostingAccumulator) !void {
+    if (acc.doc_ids.items.len <= 1) return;
+
+    const entries = try alloc.alloc(PostingSortEntry, acc.doc_ids.items.len);
+    defer alloc.free(entries);
+    var positions_start: usize = 0;
+    for (entries, 0..) |*entry, i| {
+        entry.* = .{
+            .doc_id = acc.doc_ids.items[i],
+            .meta = acc.metas.items[i],
+            .positions_start = positions_start,
+        };
+        positions_start += acc.metas.items[i].position_count;
+    }
+
+    std.mem.sort(PostingSortEntry, entries, {}, postingSortEntryLessThan);
+
+    const sorted_positions = try alloc.alloc(u32, acc.all_positions.items.len);
+    defer alloc.free(sorted_positions);
+    var sorted_positions_len: usize = 0;
+    for (entries, 0..) |entry, i| {
+        acc.doc_ids.items[i] = entry.doc_id;
+        acc.metas.items[i] = entry.meta;
+        const position_count: usize = @intCast(entry.meta.position_count);
+        if (position_count == 0) continue;
+        const positions = acc.all_positions.items[entry.positions_start..][0..position_count];
+        @memcpy(sorted_positions[sorted_positions_len..][0..position_count], positions);
+        sorted_positions_len += position_count;
+    }
+    if (sorted_positions_len != acc.all_positions.items.len) return error.InvalidData;
+    @memcpy(acc.all_positions.items, sorted_positions);
 }
 
 fn nextTermIteratorEntry(term_iters: []TermIterator, idx: usize) !?TermIterator.Entry {

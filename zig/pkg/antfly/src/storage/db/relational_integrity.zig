@@ -3082,7 +3082,7 @@ pub fn Impl(comptime DB: type) type {
             status: []const u8,
             now_ns: u64,
         ) !RelationalIndexRepairJobRecord {
-            if (job_id.len == 0 or database_name.len == 0 or namespace_name.len == 0 or table_name.len == 0 or access_method.len == 0 or index_name.len == 0 or generation == 0 or worker_id.len == 0 or lease_ms == 0 or max_work_units == 0 or status.len == 0) return error.InvalidRelationalIndexRepairJob;
+            if (job_id.len == 0 or database_name.len == 0 or namespace_name.len == 0 or table_name.len == 0 or access_method.len == 0 or index_name.len == 0 or generation == 0 or worker_id.len == 0 or lease_ms == 0 or status.len == 0) return error.InvalidRelationalIndexRepairJob;
             self.core.lockApply();
             defer self.core.unlockApply();
 

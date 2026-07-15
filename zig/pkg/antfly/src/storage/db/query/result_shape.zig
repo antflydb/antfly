@@ -178,9 +178,29 @@ pub fn externalizeSearchResultArtifactIds(alloc: Allocator, result: *types.Searc
     }
 }
 
+fn resultCoversCompleteCandidateSet(result: types.SearchResult, original_hits_len: usize) bool {
+    return result.total_hits_relation == .exact and @as(usize, result.total_hits) == original_hits_len;
+}
+
+fn relationForRewrittenLocalTotal(source: types.SearchResult, original_hits_len: usize) types.TotalHitsRelation {
+    return if (resultCoversCompleteCandidateSet(source, original_hits_len)) .exact else .gte;
+}
+
+fn rewriteLocalTotal(result: *types.SearchResult, source: types.SearchResult, original_hits_len: usize, local_total: usize) void {
+    result.total_hits = @intCast(local_total);
+    result.total_hits_relation = relationForRewrittenLocalTotal(source, original_hits_len);
+}
+
+fn rewriteLocalTotalAfterObservedDrop(result: *types.SearchResult, source: types.SearchResult, original_hits_len: usize, local_total: usize) void {
+    if (local_total == original_hits_len) return;
+    rewriteLocalTotal(result, source, original_hits_len, local_total);
+}
+
 pub fn dedupeSearchHitsById(alloc: Allocator, result: *types.SearchResult) !void {
     if (allHitsHaveDocOrdinals(result.hits)) return try dedupeSearchHitsByOrdinal(alloc, result);
 
+    const source = result.*;
+    const original_hits_len = result.hits.len;
     var seen = std.StringHashMapUnmanaged(void).empty;
     defer seen.deinit(alloc);
 
@@ -202,10 +222,12 @@ pub fn dedupeSearchHitsById(alloc: Allocator, result: *types.SearchResult) !void
     for (result.hits) |*hit| hit.deinit(alloc);
     if (result.hits.len > 0) alloc.free(result.hits);
     result.hits = owned_hits;
-    result.total_hits = @intCast(result.hits.len);
+    rewriteLocalTotalAfterObservedDrop(result, source, original_hits_len, result.hits.len);
 }
 
 fn dedupeSearchHitsByOrdinal(alloc: Allocator, result: *types.SearchResult) !void {
+    const source = result.*;
+    const original_hits_len = result.hits.len;
     var seen = std.AutoHashMapUnmanaged(doc_set.DocOrdinal, void).empty;
     defer seen.deinit(alloc);
 
@@ -227,7 +249,7 @@ fn dedupeSearchHitsByOrdinal(alloc: Allocator, result: *types.SearchResult) !voi
     for (result.hits) |*hit| hit.deinit(alloc);
     if (result.hits.len > 0) alloc.free(result.hits);
     result.hits = owned_hits;
-    result.total_hits = @intCast(result.hits.len);
+    rewriteLocalTotalAfterObservedDrop(result, source, original_hits_len, result.hits.len);
 }
 
 pub fn filterVisibleSearchResult(
@@ -241,6 +263,8 @@ pub fn filterVisibleSearchResult(
         kept.deinit(alloc);
     }
 
+    const source = raw;
+    const original_hits_len = raw.hits.len;
     var owned = raw;
     errdefer owned.deinit();
 
@@ -264,7 +288,7 @@ pub fn filterVisibleSearchResult(
 
     alloc.free(owned.hits);
     owned.hits = try kept.toOwnedSlice(alloc);
-    owned.total_hits = @intCast(owned.hits.len);
+    rewriteLocalTotalAfterObservedDrop(&owned, source, original_hits_len, owned.hits.len);
     return owned;
 }
 
@@ -350,6 +374,8 @@ pub fn reshapeChunkBackedResult(
     }
     try normalizeGroupedParentHitOrder(alloc, &parents);
 
+    const source = raw;
+    const original_hits_len = raw.hits.len;
     var out = raw;
     defer out.deinit();
     const parent_count: u32 = @intCast(parents.items.len);
@@ -358,7 +384,7 @@ pub fn reshapeChunkBackedResult(
         .alloc = alloc,
         .hits = owned_hits,
         .total_hits = parent_count,
-        .total_hits_relation = raw.total_hits_relation,
+        .total_hits_relation = relationForRewrittenLocalTotal(source, original_hits_len),
         .graph_results = &.{},
     };
 }
@@ -417,7 +443,8 @@ fn hydrateDirectChunkAncestors(
     raw: types.SearchResult,
     shaper: ChunkParentResultShaper,
 ) !types.SearchResult {
-    if ((!req.hierarchy_include_source and !req.hierarchy_include_unit) or raw.hits.len == 0) return raw;
+    const needs_chunk_payloads = req.include_stored or req.hierarchy_include_source or req.hierarchy_include_unit;
+    if (!needs_chunk_payloads or raw.hits.len == 0) return raw;
     if (shaper.load_stored == null and shaper.load_many_stored == null) return raw;
 
     var owned = raw;
@@ -434,6 +461,18 @@ fn hydrateDirectChunkAncestors(
 
     const chunk_payloads = try loadDirectChunkPayloads(alloc, owned.hits, shaper);
     defer freeOptionalOwnedBytes(alloc, chunk_payloads);
+
+    if (req.include_stored) {
+        for (owned.hits, 0..) |*hit, i| {
+            if (hit.stored_data != null) continue;
+            if (chunk_payloads[i]) |payload| {
+                hit.stored_data = payload;
+                chunk_payloads[i] = null;
+            }
+        }
+    }
+
+    if (!req.hierarchy_include_source and !req.hierarchy_include_unit) return owned;
 
     var source_count: usize = 0;
     var unit_count: usize = 0;
@@ -898,6 +937,8 @@ pub fn applyStoredSearchPatternFilters(
     const exclusion_needs_stored = if (compiled_exclusion) |compiled| compiled.needsStoredDoc() else false;
     const needs_stored = filter_needs_stored or exclusion_needs_stored;
 
+    const source = result;
+    const original_hits_len = result.hits.len;
     var owned = result;
 
     var missing_indices = std.ArrayListUnmanaged(usize).empty;
@@ -988,7 +1029,7 @@ pub fn applyStoredSearchPatternFilters(
     } else if (kept_len != owned.hits.len) {
         owned.hits = try alloc.realloc(owned.hits, kept_len);
     }
-    owned.total_hits = @intCast(kept_len);
+    rewriteLocalTotal(&owned, source, original_hits_len, kept_len);
     return owned;
 }
 
@@ -1022,6 +1063,7 @@ pub fn postprocessTextSearchResult(
     filtered = try applyStoredSearchPatternFilters(alloc, req, filtered, .{
         .ctx = processor.ctx,
         .load_stored = processor.load_stored,
+        .load_many_stored = processor.load_many_stored,
         .resolve_doc_set_doc_ids = processor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = processor.resolve_doc_ids_to_doc_set,
     });
@@ -1078,8 +1120,25 @@ pub fn resolveChunkParentId(
     hit: types.SearchHit,
     resolver: ChunkParentResolver,
 ) ![]u8 {
-    if (internal_keys.isChunkArtifactRecordKey(hit.id)) {
+    if (hit.artifact_ref) |artifact_ref| {
+        if (artifact_ref.kind == .chunk or artifact_ref.kind == .asset) {
+            return try alloc.dupe(u8, artifact_ref.document_id);
+        }
+    }
+
+    if (internal_keys.isChunkArtifactRecordKey(hit.id) or internal_keys.isAssetArtifactKey(hit.id)) {
         return (try internal_keys.decodeDocumentComponentAlloc(alloc, hit.id)) orelse error.InvalidChunkArtifact;
+    }
+
+    if (artifact_ids.decodeArtifactPublicIdAlloc(alloc, hit.id) catch |err| switch (err) {
+        error.InvalidInternalUserKey => null,
+        else => return err,
+    }) |artifact_ref_value| {
+        var artifact_ref = artifact_ref_value;
+        defer artifact_ref.deinit(alloc);
+        if (artifact_ref.kind == .chunk or artifact_ref.kind == .asset) {
+            return try alloc.dupe(u8, artifact_ref.document_id);
+        }
     }
 
     const stored = if (hit.stored_data) |stored_data|
@@ -1090,8 +1149,8 @@ pub fn resolveChunkParentId(
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidChunkArtifact;
-    const parent = parsed.value.object.get("_parent_doc_key") orelse parsed.value.object.get("parent_doc_key") orelse return error.InvalidChunkArtifact;
+    if (parsed.value != .object) return try alloc.dupe(u8, hit.id);
+    const parent = parsed.value.object.get("_parent_doc_key") orelse parsed.value.object.get("parent_doc_key") orelse return try alloc.dupe(u8, hit.id);
     if (parent != .string) return error.InvalidChunkArtifact;
     return try alloc.dupe(u8, parent.string);
 }
@@ -1550,6 +1609,108 @@ test "applyStoredSearchPatternFilters batch-loads only missing stored docs" {
     try std.testing.expectEqual(@as(usize, 0), loader.single_calls);
     try std.testing.expectEqual(@as(usize, 1), loader.many_calls);
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
+test "applyStoredSearchPatternFilters reports lower-bound total for filtered page window" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
+    };
+    hits[1] = .{
+        .id = try alloc.dupe(u8, "doc:b"),
+        .stored_data = try alloc.dupe(u8, "{\"title\":\"beta\"}"),
+    };
+
+    var loader = TestStoredLoader{};
+    var result = try applyStoredSearchPatternFilters(alloc, .{
+        .filter_query_json = "{\"term\":{\"title\":\"beta\"}}",
+    }, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 10,
+        .total_hits_relation = .exact,
+    }, .{
+        .ctx = &loader,
+        .load_stored = TestStoredLoader.loadStored,
+        .load_many_stored = TestStoredLoader.loadManyStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, result.total_hits_relation);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
+const TestPostprocessor = struct {
+    fn isVisible(_: ?*anyopaque, _: Allocator, _: types.SearchHit) !bool {
+        return true;
+    }
+};
+
+test "postprocessTextSearchResult preserves exact upstream total when page is unchanged" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a") };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b") };
+
+    var loader = TestStoredLoader{};
+    var result = try postprocessTextSearchResult(alloc, .{}, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 100,
+        .total_hits_relation = .exact,
+    }, false, .{
+        .ctx = &loader,
+        .is_visible = TestPostprocessor.isVisible,
+        .resolve_parent_id = TestChunkParentShaper.resolveParentId,
+        .load_parent_stored = TestChunkParentShaper.loadParentStored,
+        .load_stored = TestStoredLoader.loadStored,
+        .load_many_stored = TestStoredLoader.loadManyStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 100), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+}
+
+test "postprocessTextSearchResult forwards batch stored loader to pattern filters" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
+    };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b") };
+
+    var loader = TestStoredLoader{};
+    var result = try postprocessTextSearchResult(alloc, .{
+        .filter_query_json = "{\"term\":{\"title\":\"beta\"}}",
+    }, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+    }, false, .{
+        .ctx = &loader,
+        .is_visible = TestPostprocessor.isVisible,
+        .resolve_parent_id = TestChunkParentShaper.resolveParentId,
+        .load_parent_stored = TestChunkParentShaper.loadParentStored,
+        .load_stored = TestStoredLoader.loadStored,
+        .load_many_stored = TestStoredLoader.loadManyStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), loader.single_calls);
+    try std.testing.expectEqual(@as(usize, 1), loader.many_calls);
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
     try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
 }
 

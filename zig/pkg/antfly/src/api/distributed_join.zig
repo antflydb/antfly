@@ -1732,10 +1732,17 @@ const DistributedRightJoinGroups = struct {
     ) !?DistributedRightJoinGroups {
         var snapshot = (try ctx.adminSnapshot()) orelse return null;
         errdefer ctx.freeAdminSnapshot(&snapshot);
-        const right_table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+        const right_table = tables_api.findTableByName(&snapshot, table_name) orelse {
+            ctx.freeAdminSnapshot(&snapshot);
+            return null;
+        };
         const group_ids = try rightJoinGroupIdsFromSnapshot(alloc, &snapshot, right_table.table_id);
         errdefer alloc.free(group_ids);
-        if (group_ids.len < min_group_count) return null;
+        if (group_ids.len < min_group_count) {
+            alloc.free(group_ids);
+            ctx.freeAdminSnapshot(&snapshot);
+            return null;
+        }
         try validateDistributedJoinDocIdentityReady(&snapshot, right_table.table_id);
         return .{
             .ctx = ctx,
@@ -1986,7 +1993,10 @@ const StatefulDistributedShuffleEngine = struct {
         const right_table = tables_api.findTableByName(&snapshot, self.join.right_table) orelse return error.TableNotFound;
         const worker_group_ids = try rightJoinGroupIdsFromSnapshot(self.alloc, &snapshot, right_table.table_id);
         errdefer self.alloc.free(worker_group_ids);
-        if (worker_group_ids.len <= 1) return null;
+        if (worker_group_ids.len <= 1) {
+            self.alloc.free(worker_group_ids);
+            return null;
+        }
         try validateDistributedJoinDocIdentityReady(&snapshot, right_table.table_id);
         return worker_group_ids;
     }
@@ -2696,7 +2706,7 @@ fn executeJoinRowsLocal(
     defer owned_req.deinit(alloc);
 
     var hits = std.json.Array.init(alloc);
-    errdefer {
+    defer {
         for (hits.items) |*item| deinitJsonValue(alloc, item);
         hits.deinit();
     }
@@ -2839,16 +2849,17 @@ pub fn executeJoinPartitionWorkerLocal(
         for (owned) |*hit| deinitJsonValue(alloc, hit);
         alloc.free(owned);
     };
-    const right_hits = if (req.right_group_ids.len > 0 and req.join.nested_join == null)
-        collectJoinPartitionRightRows(ctx, job_store, alloc, source, worker_group_id, req) catch |err| {
+    const right_hits = if (req.right_group_ids.len > 0 and req.join.nested_join == null) blk: {
+        right_hits_owned = collectJoinPartitionRightRows(ctx, job_store, alloc, source, worker_group_id, req) catch |err| {
             std.log.warn("join partition right-row collection failed worker_group_id={d} partition_index={d} err={}", .{
                 worker_group_id,
                 req.partition_index,
                 err,
             });
             return err;
-        }
-    else blk: {
+        };
+        break :blk right_hits_owned.?;
+    } else blk: {
         var right_result = try executeRightJoinBroadcastQueryLocal(ctx, job_store, alloc, source, req.join, req.left_hits, .{});
         defer right_result.deinit(alloc);
         right_hits_owned = try alloc.alloc(std.json.Value, right_result.hits.len);
@@ -2856,7 +2867,9 @@ pub fn executeJoinPartitionWorkerLocal(
         break :blk right_hits_owned.?;
     };
 
-    var merged = mergeJoinedRightHitsAlloc(alloc, req.left_hits, req.join, right_hits, &.{}, req.appended_left_field) catch |err| {
+    var merge_join = req.join;
+    if (merge_join.join_type == .right) merge_join.join_type = .inner;
+    var merged = mergeJoinedRightHitsAlloc(alloc, req.left_hits, merge_join, right_hits, &.{}, req.appended_left_field) catch |err| {
         std.log.err("join partition merge failed worker_group_id={d} partition_index={d} err={}", .{
             worker_group_id,
             req.partition_index,
@@ -3137,7 +3150,7 @@ fn appendGroupLocalUnmatchedRightJoinHits(
             if (query_req.identity_read_generation == null) {
                 query_req.identity_read_generation = search_result.identity_read_generation;
             }
-            if (total_hits == null) total_hits = search_result.total_hits;
+            if (total_hits == null or search_result.total_hits > total_hits.?) total_hits = search_result.total_hits;
             if (search_result.hits.len == 0) break;
 
             _ = try join_model.appendUnmatchedRightJoinSearchHitsAlloc(
@@ -3151,7 +3164,7 @@ fn appendGroupLocalUnmatchedRightJoinHits(
             );
 
             scanned_hits += search_result.hits.len;
-            if (scanned_hits >= search_result.total_hits) break;
+            if (search_result.total_hits_relation == .exact and scanned_hits >= search_result.total_hits) break;
             try requireStampedJoinFollowupRequest(query_req);
             query_req.offset = @intCast(scanned_hits);
             continue;
@@ -3162,8 +3175,8 @@ fn appendGroupLocalUnmatchedRightJoinHits(
 
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, response.json, .{}) catch return error.InternalFailure;
         defer parsed.deinit();
-        const page_total_hits = try queryTotalHits(parsed.value);
-        if (total_hits == null) total_hits = page_total_hits;
+        const page_total_hits = try queryHitsTotal(parsed.value);
+        if (total_hits == null or page_total_hits.value > total_hits.?) total_hits = page_total_hits.value;
         const hits_ptr = try queryHitsArrayPtr(&parsed.value);
         if (hits_ptr.items.len == 0) break;
 
@@ -3178,7 +3191,7 @@ fn appendGroupLocalUnmatchedRightJoinHits(
         );
 
         scanned_hits += hits_ptr.items.len;
-        if (scanned_hits >= page_total_hits) break;
+        if (page_total_hits.relation == .exact and scanned_hits >= page_total_hits.value) break;
         try requireStampedJoinFollowupRequest(query_req);
         query_req.offset = @intCast(scanned_hits);
     }
@@ -3723,7 +3736,7 @@ fn loadRightJoinQueryAlloc(
 ) !LoadedRightJoinQuery {
     var parsed = try executeRightJoinQueryParsedAlloc(ctx, alloc, source, join, query_value.*, nested_foreign_leaf_join);
     errdefer parsed.deinit();
-    const total_hits = try queryTotalHits(parsed.value);
+    const total_hits = try queryExactTotalHits(parsed.value);
     var hits_ptr = try queryHitsArrayPtr(&parsed.value);
     const explicit_right_limit = join.right_filters != null and join.right_filters.?.limit != null;
 
@@ -4355,7 +4368,18 @@ pub fn queryHitsArrayPtr(root: *std.json.Value) !*std.json.Array {
     return try join_model.queryHitsArrayPtr(root);
 }
 
-fn queryTotalHits(root: std.json.Value) !usize {
+const QueryHitsTotal = struct {
+    value: usize,
+    relation: db_mod.types.TotalHitsRelation,
+};
+
+fn queryExactTotalHits(root: std.json.Value) !usize {
+    const total = try queryHitsTotal(root);
+    if (total.relation != .exact) return error.UnsupportedQueryRequest;
+    return total.value;
+}
+
+fn queryHitsTotal(root: std.json.Value) !QueryHitsTotal {
     if (root != .object) return error.InvalidQueryRequest;
     const responses = root.object.get("responses") orelse return error.InvalidQueryRequest;
     if (responses != .array or responses.array.items.len == 0) return error.InvalidQueryRequest;
@@ -4364,9 +4388,21 @@ fn queryTotalHits(root: std.json.Value) !usize {
     const hits = response.object.get("hits") orelse return error.InvalidQueryRequest;
     if (hits != .object) return error.InvalidQueryRequest;
     const total = hits.object.get("total") orelse return error.InvalidQueryRequest;
-    return switch (total) {
-        .integer => |value| @intCast(value),
-        else => error.InvalidQueryRequest,
+    if (total == .integer) {
+        if (total.integer < 0) return error.InvalidQueryRequest;
+        return .{
+            .value = @intCast(total.integer),
+            .relation = .exact,
+        };
+    }
+    if (total != .object) return error.InvalidQueryRequest;
+    const value = total.object.get("value") orelse return error.InvalidQueryRequest;
+    const relation = total.object.get("relation") orelse return error.InvalidQueryRequest;
+    if (value != .integer or value.integer < 0) return error.InvalidQueryRequest;
+    if (relation != .string) return error.InvalidQueryRequest;
+    return .{
+        .value = @intCast(value.integer),
+        .relation = try query_contract.parseTotalHitsRelation(relation.string),
     };
 }
 
@@ -4428,19 +4464,26 @@ pub fn mergeJoinedRightHitsAlloc(
 
     for (left_hits) |hit_value| {
         var joined_hit = try cloneJsonValue(alloc, hit_value);
-        errdefer deinitJsonValue(alloc, &joined_hit);
+        var joined_hit_owned = true;
+        defer if (joined_hit_owned) deinitJsonValue(alloc, &joined_hit);
         const source_value = joined_hit.object.getPtr("_source") orelse return error.InvalidQueryRequest;
         if (source_value.* != .object) return error.InvalidQueryRequest;
         if (appended_left_field) removeFieldFromSourceObject(alloc, source_value, join.left_field);
 
         const left_value = extractJoinValueFromHit(hit_value, join.left_field) orelse {
             stats.rows_unmatched_left += 1;
-            if (join.join_type == .left) try joined_hits.append(joined_hit);
+            if (join.join_type == .left) {
+                try joined_hits.append(joined_hit);
+                joined_hit_owned = false;
+            }
             continue;
         };
         const matched_right = findFirstMatchingRightHit(join, left_value, right_hits) orelse {
             stats.rows_unmatched_left += 1;
-            if (join.join_type == .left) try joined_hits.append(joined_hit);
+            if (join.join_type == .left) {
+                try joined_hits.append(joined_hit);
+                joined_hit_owned = false;
+            }
             continue;
         };
 
@@ -4449,6 +4492,7 @@ pub fn mergeJoinedRightHitsAlloc(
             try matched_right_ids.put(alloc, matched_id, {});
         }
         try joined_hits.append(joined_hit);
+        joined_hit_owned = false;
         stats.rows_matched += 1;
     }
 
@@ -5102,6 +5146,10 @@ fn scalarJsonValueStringAlloc(alloc: std.mem.Allocator, value: std.json.Value) !
     return try json_helpers.scalarJsonValueStringAlloc(alloc, value);
 }
 
+fn finiteScoreOrZero(score: f32) f64 {
+    return if (std.math.isFinite(score)) score else 0;
+}
+
 fn appendSearchHitAsJsonHit(
     alloc: std.mem.Allocator,
     hits: *std.json.Array,
@@ -5121,7 +5169,7 @@ fn appendSearchHitAsJsonHit(
     if (hit.doc_ordinal) |ordinal| {
         try hit_obj.put(alloc, try alloc.dupe(u8, join_model.internal_doc_identity_key_field), .{ .string = try std.fmt.allocPrint(alloc, "o:{d}", .{ordinal}) });
     }
-    try hit_obj.put(alloc, try alloc.dupe(u8, "_score"), if (hit.score) |score| .{ .float = score } else .{ .float = 0 });
+    try hit_obj.put(alloc, try alloc.dupe(u8, "_score"), .{ .float = if (hit.score) |score| finiteScoreOrZero(score) else 0 });
     const source_value = if (hit.stored_data) |stored_data| blk: {
         var parsed = try json_helpers.parseJsonValueAlloc(alloc, stored_data);
         defer parsed.deinit();
@@ -5138,6 +5186,45 @@ fn appendSearchHitsAsJsonHits(
 ) !void {
     for (search_hits) |hit| {
         try appendSearchHitAsJsonHit(alloc, hits, hit);
+    }
+}
+
+test "distributed join search hit JSON normalizes non-finite scores" {
+    const alloc = std.testing.allocator;
+    var hits = std.json.Array.init(alloc);
+    defer {
+        for (hits.items) |*hit| deinitJsonValue(alloc, hit);
+        hits.deinit();
+    }
+
+    const id = try alloc.dupe(u8, "doc:score");
+    defer alloc.free(id);
+    const stored_data = try alloc.dupe(u8, "{\"customer_id\":\"cust:a\"}");
+    defer alloc.free(stored_data);
+
+    try appendSearchHitAsJsonHit(alloc, &hits, .{
+        .id = id,
+        .score = std.math.nan(f32),
+        .stored_data = stored_data,
+    });
+
+    var root = std.json.Value{ .object = std.json.ObjectMap.empty };
+    defer deinitJsonValue(alloc, &root);
+    try putOwnedJsonField(alloc, &root.object, "hits", .{ .array = hits });
+    hits = std.json.Array.init(alloc);
+
+    const encoded = try stringifyJsonValueAlloc(alloc, root);
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "nan") == null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer parsed.deinit();
+    const parsed_hits = parsed.value.object.get("hits").?.array.items;
+    const parsed_score = parsed_hits[0].object.get("_score").?;
+    switch (parsed_score) {
+        .integer => |value| try std.testing.expectEqual(@as(i64, 0), value),
+        .float => |value| try std.testing.expectEqual(@as(f64, 0), value),
+        else => return error.TestUnexpectedResult,
     }
 }
 
@@ -5183,6 +5270,7 @@ fn appendGroupLocalJoinHits(
         if (query_req.identity_read_generation == null) {
             query_req.identity_read_generation = search_result.identity_read_generation;
         }
+        if (!explicit_limit and search_result.total_hits_relation != .exact) return error.UnsupportedQueryRequest;
         if (!explicit_limit and search_result.hits.len < search_result.total_hits) {
             try requireStampedJoinFollowupRequest(query_req);
             query_req.limit = search_result.total_hits;
@@ -5199,7 +5287,7 @@ fn appendGroupLocalJoinHits(
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, response.json, .{}) catch return error.InternalFailure;
     defer parsed.deinit();
     var hits_ptr = try queryHitsArrayPtr(&parsed.value);
-    const total_hits = try queryTotalHits(parsed.value);
+    const total_hits = try queryExactTotalHits(parsed.value);
 
     if (!explicit_limit and hits_ptr.items.len < total_hits) {
         try requireStampedJoinFollowupRequest(query_req);

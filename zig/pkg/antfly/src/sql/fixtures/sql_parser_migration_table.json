@@ -111,7 +111,7 @@
         "lowering_fixtures": ["query function semantic search request", "query function graph traverse request"],
         "runtime_fixtures": ["query function semantic search request", "query function graph metric request"],
         "api_native_parity_fixtures": ["query function semantic search request", "query function hybrid search request"],
-        "unsupported_shape_fixtures": ["unsupported document sql native semantic search missing producer"],
+        "unsupported_shape_fixtures": ["unsupported document sql native semantic search missing exact producer"],
         "stale_metadata_tests": ["sql adapter parsed sql rejects malformed generated graph and antfly source metadata"]
       }
     },
@@ -148,7 +148,7 @@
           "analyze maintenance job",
           "declare cursor portal protocol plan",
           "prepare statement protocol plan",
-          "adapter-only start transaction control syntax",
+          "start transaction boundary syntax",
           "prepare transaction durable recovery intent"
         ],
         "lowering_fixtures": [
@@ -156,7 +156,7 @@
           "reindex maintenance job",
           "cluster maintenance job",
           "execute prepared statement protocol plan",
-          "adapter-only commit transaction control syntax",
+          "commit transaction boundary syntax",
           "commit prepared transaction durable recovery intent"
         ],
         "runtime_fixtures": [
@@ -165,7 +165,7 @@
           "cluster maintenance job",
           "fetch cursor portal protocol plan",
           "deallocate prepared statement protocol plan",
-          "adapter-only rollback transaction control syntax",
+          "rollback transaction boundary syntax",
           "rollback prepared transaction durable recovery intent"
         ],
         "api_native_parity_fixtures": [
@@ -282,7 +282,7 @@
           "grant table privilege catalog ddl",
           "row security create policy catalog ddl",
           "create schema namespace catalog ddl",
-          "adapter-only session setting syntax"
+          "unsupported local client messages session setting syntax"
         ],
         "lowering_fixtures": [
           "alter role catalog ddl",
@@ -290,7 +290,7 @@
           "revoke table privilege catalog ddl",
           "row security alter policy catalog ddl",
           "drop schema namespace catalog ddl",
-          "adapter-only reset session setting syntax"
+          "unsupported reset client messages session setting syntax"
         ],
         "runtime_fixtures": [
           "create role catalog ddl",
@@ -298,7 +298,7 @@
           "row security drop policy catalog ddl",
           "drop role catalog ddl",
           "drop schema namespace cascade catalog ddl",
-          "adapter-only client encoding session setting syntax"
+          "unsupported client encoding session setting syntax"
         ],
         "api_native_parity_fixtures": [
           "create role catalog ddl",
@@ -306,7 +306,7 @@
           "alter default privileges grant catalog ddl",
           "create schema namespace catalog ddl",
           "row security create policy catalog ddl",
-          "adapter-only session setting syntax"
+          "unsupported local client messages session setting syntax"
         ],
         "unsupported_shape_fixtures": ["unsupported document table ddl invalid antfly extension"],
         "stale_metadata_tests": ["sql adapter generated utility unsupported AST rejects stale role privilege and policy metadata"]

@@ -2170,6 +2170,7 @@ test "relational storage columns persist and reconstruct the document" {
         const reader = try typed_doc_values.TypedDocValuesReader.init(alloc, section);
         const value: ColumnValue = switch (field.value_type) {
             .u64_val => .{ .u64_val = (try reader.getU64(0)).? },
+            .i64_val => .{ .f64_val = @floatFromInt((try reader.getI64(0)).?) },
             .f64_val => .{ .f64_val = (try reader.getF64(0)).? },
             .bool_val => .{ .bool_val = (try reader.getBool(0)).? },
             .geo_point => blk: {

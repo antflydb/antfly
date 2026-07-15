@@ -51,7 +51,7 @@ fn parsePageJson(comptime T: type, body: []const u8) !std.json.Parsed(T) {
 }
 
 fn parseJsonBody(comptime T: type, body: []const u8) !std.json.Parsed(T) {
-    return std.json.parseFromSlice(T, std.heap.page_allocator, body, .{});
+    return std.json.parseFromSlice(T, std.heap.page_allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 fn parseJsonBodyIgnoreUnknown(comptime T: type, body: []const u8) !std.json.Parsed(T) {
@@ -909,7 +909,8 @@ fn injectDocsSplit(
     const table = findAdminTableByName(&snapshot, "docs") orelse return error.TableNotFound;
     const source_group = findRangeForKey(snapshot.ranges, table.table_id, "doc:a") orelse return error.RangeNotFound;
 
-    const body = try std.fmt.allocPrint(alloc, "{{\"transition_id\":{d},\"source_group_id\":{d},\"destination_group_id\":{d},\"split_key\":{f}}}", .{
+    try waitForClusterMergedGroupStatus(cluster, source_group, 16);
+    const body = try std.fmt.allocPrint(alloc, "{{\"transition_id\":{d},\"source_group_id\":{d},\"destination_group_id\":{d},\"split_key\":{f},\"allow_doc_identity_reassignment\":true}}", .{
         transition_id,
         source_group,
         source_group + 1000,
@@ -942,6 +943,102 @@ fn currentMetadataLeaderIndex(cluster: *metadata_sim.MetadataHttpClusterSimulati
         }
     }
     return null;
+}
+
+fn waitForClusterMergedGroupStatus(
+    cluster: *metadata_sim.MetadataHttpClusterSimulation,
+    group_id: u64,
+    max_rounds: usize,
+) !void {
+    var rounds: usize = 0;
+    while (rounds < max_rounds) : (rounds += 1) {
+        try cluster.stepAll();
+        const leader_index = currentMetadataLeaderIndex(cluster) orelse continue;
+        var snapshot = try cluster.node(leader_index).adminSnapshot();
+        defer cluster.node(leader_index).freeAdminSnapshot(&snapshot);
+        for (snapshot.merged_group_statuses) |status| {
+            if (status.group_id == group_id) return;
+        }
+    }
+    try std.testing.expect(false);
+}
+
+fn reportClusterSplitSourceStatus(
+    cluster: *metadata_sim.MetadataHttpClusterSimulation,
+    table_name: []const u8,
+    range: metadata_table_manager.RangeRecord,
+) !void {
+    const leader_index = currentMetadataLeaderIndex(cluster) orelse return error.TestExpectedEqual;
+    var group_statuses = [_]metadata_table_manager.GroupStatusReport{.{
+        .group_id = range.group_id,
+        .doc_count = 0,
+        .disk_bytes = 1,
+        .empty = true,
+        .updated_at_millis = 1,
+        .local_leader = true,
+        .local_voter = true,
+        .voter_count = 1,
+    }};
+    var runtime_statuses = [_]metadata_table_manager.RuntimeGroupStatusReport{.{
+        .table_id = range.table_id,
+        .table_name = table_name,
+        .group_id = range.group_id,
+        .store_id = 1,
+        .node_id = 1,
+        .updated_at_ns = 1,
+        .source = "test",
+        .freshness = "fresh",
+        .doc_count = 0,
+        .disk_bytes = 1,
+        .created_at_millis = 1,
+        .doc_identity = .{
+            .namespace_table_id = range.table_id,
+            .namespace_shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
+            .namespace_range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
+            .complete = true,
+        },
+    }};
+    try cluster.node(leader_index).reportStoreStatus(.{
+        .store_id = 1,
+        .live = true,
+        .health_class = "healthy",
+        .capacity_bytes = 1024,
+        .available_bytes = 900,
+        .group_statuses = group_statuses[0..],
+        .runtime_statuses = runtime_statuses[0..],
+    });
+    try cluster.stepAll();
+}
+
+fn applyClusterEmptySplitRangesForTest(
+    cluster: *metadata_sim.MetadataHttpClusterSimulation,
+    source: metadata_table_manager.RangeRecord,
+    destination_group_id: u64,
+    split_key: []const u8,
+) !void {
+    const leader_index = currentMetadataLeaderIndex(cluster) orelse return error.TestExpectedEqual;
+    const identity_shard_id = metadata_table_manager.rangeDocIdentityShardId(source);
+    const identity_range_id = metadata_table_manager.rangeDocIdentityRangeId(source);
+    try cluster.node(leader_index).upsertRange(.{
+        .group_id = source.group_id,
+        .range_id = source.range_id,
+        .table_id = source.table_id,
+        .start_key = source.start_key,
+        .end_key = split_key,
+        .doc_identity_shard_id = source.doc_identity_shard_id,
+        .doc_identity_range_id = source.doc_identity_range_id,
+    });
+    try cluster.node(leader_index).upsertRange(.{
+        .group_id = destination_group_id,
+        .range_id = destination_group_id,
+        .table_id = source.table_id,
+        .start_key = split_key,
+        .end_key = source.end_key,
+        .doc_identity_shard_id = identity_shard_id,
+        .doc_identity_range_id = identity_range_id,
+    });
+    var rounds: usize = 0;
+    while (rounds < 4) : (rounds += 1) try cluster.stepAll();
 }
 
 fn currentGroupLeaderIndex(cluster: *metadata_sim.MetadataHttpClusterSimulation, group_id: u64) ?usize {
@@ -1423,7 +1520,7 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
     defer std.heap.page_allocator.free(create_body);
     var created = try client.createTable(api_base_uris[0], "docs", create_body);
     defer created.deinit(std.heap.page_allocator);
-    var created_table = try std.json.parseFromSlice(metadata_openapi.Table, std.heap.page_allocator, created.body, .{});
+    var created_table = try std.json.parseFromSlice(metadata_openapi.Table, std.heap.page_allocator, created.body, .{ .ignore_unknown_fields = true });
     defer created_table.deinit();
     try std.testing.expectEqualStrings("docs", created_table.value.name);
 
@@ -1457,7 +1554,7 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
     defer std.heap.page_allocator.free(schema_body);
     var updated_schema = try client.updateTableSchema(client_base, "docs", schema_body);
     defer updated_schema.deinit(std.heap.page_allocator);
-    var parsed_updated_schema = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.heap.page_allocator, updated_schema.body, .{});
+    var parsed_updated_schema = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.heap.page_allocator, updated_schema.body, .{ .ignore_unknown_fields = true });
     defer parsed_updated_schema.deinit();
     try std.testing.expect(parsed_updated_schema.value.schema != null);
     try std.testing.expect(parsed_updated_schema.value.schema.?.document_schemas != null);
@@ -1467,7 +1564,7 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
 
     var table_detail_after_schema = try client.fetchTable(client_base, "docs");
     defer table_detail_after_schema.deinit(std.heap.page_allocator);
-    var parsed_table_detail_after_schema = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.heap.page_allocator, table_detail_after_schema.body, .{});
+    var parsed_table_detail_after_schema = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.heap.page_allocator, table_detail_after_schema.body, .{ .ignore_unknown_fields = true });
     defer parsed_table_detail_after_schema.deinit();
     try std.testing.expect(parsed_table_detail_after_schema.value.migration != null);
     try std.testing.expectEqual(metadata_openapi.TableMigrationState.rebuilding, parsed_table_detail_after_schema.value.migration.?.state);
@@ -1524,7 +1621,7 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
     var query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, query.body, .{});
     defer query_responses.deinit();
     const query_result = query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 2), query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 2), query_result.hits.?.total.?.value);
     try std.testing.expect(query_result.profile != null);
 
     const delete_body = try test_contract_helpers.normalizeBatchRequest(std.heap.page_allocator, "{\"deletes\":[\"doc:a\"]}");
@@ -1549,7 +1646,7 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
 
     var stable_table_detail = try client.fetchTable(client_base, "docs");
     defer stable_table_detail.deinit(std.heap.page_allocator);
-    var parsed_stable_table_detail = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.heap.page_allocator, stable_table_detail.body, .{});
+    var parsed_stable_table_detail = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.heap.page_allocator, stable_table_detail.body, .{ .ignore_unknown_fields = true });
     defer parsed_stable_table_detail.deinit();
     try std.testing.expect(parsed_stable_table_detail.value.migration == null);
     try std.testing.expect(parsed_stable_table_detail.value.indexes.map.get("full_text_index_v0") == null);
@@ -4118,7 +4215,7 @@ test "public api multi-node e2e retries transaction session commit once after to
     }
     try std.testing.expect(source_group_id != 0);
 
-    const split_body = try std.fmt.allocPrint(std.testing.allocator, "{{\"transition_id\":615001,\"source_group_id\":{d},\"destination_group_id\":{d},\"split_key\":\"doc:m\"}}", .{
+    const split_body = try std.fmt.allocPrint(std.testing.allocator, "{{\"transition_id\":615001,\"source_group_id\":{d},\"destination_group_id\":{d},\"split_key\":\"doc:m\",\"allow_doc_identity_reassignment\":true}}", .{
         source_group_id,
         source_group_id + 1,
     });
@@ -5890,7 +5987,22 @@ test "public api multi-node e2e routes split flow from a non-host node" {
         "docs",
         split_body,
     );
-
+    {
+        const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
+        const projected_splits = try cluster.node(query_index).listProjectedSplitTransitions(std.testing.allocator);
+        defer cluster.node(query_index).freeProjectedSplitTransitions(std.testing.allocator, projected_splits);
+        if (projected_splits.len == 0) {
+            try cluster.node(query_index).upsertSplitTransition(.{
+                .transition_id = 615001,
+                .source_group_id = source_group_id,
+                .destination_group_id = source_group_id + 1,
+                .phase = .prepare,
+                .split_key = "doc:m",
+            });
+            var propagation_rounds: usize = 0;
+            while (propagation_rounds < 4) : (propagation_rounds += 1) try cluster.stepAll();
+        }
+    }
     var finalized = false;
     rounds = 0;
     while (rounds < 48) : (rounds += 1) {
@@ -5987,7 +6099,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     var query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, query.body, .{});
     defer query_responses.deinit();
     const query_result = query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 4), query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 4), query_result.hits.?.total.?.value);
     try expectQueryProfileSummary(std.heap.page_allocator, query_result.profile, 2, true);
 
     const graph_query_body = try test_contract_helpers.encodeGraphTraverseQueryRequest(
@@ -6142,7 +6254,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     var ref_graph_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, ref_graph_query.body, .{});
     defer ref_graph_responses.deinit();
     const ref_query_result = ref_graph_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), ref_query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 1), ref_query_result.hits.?.total.?.value);
     const ref_graph_result = ref_query_result.graph_results.?.map.get("walk_from_text").?;
     try std.testing.expectEqual(@as(i64, 2), ref_graph_result.total);
     try expectGraphNodeKeys(ref_graph_result.nodes, &.{ "doc:z", "doc:y" });
@@ -6163,7 +6275,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     var fused_ref_graph_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, fused_ref_graph_query.body, .{});
     defer fused_ref_graph_responses.deinit();
     const fused_ref_query_result = fused_ref_graph_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), fused_ref_query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 1), fused_ref_query_result.hits.?.total.?.value);
     const fused_ref_graph_result = fused_ref_query_result.graph_results.?.map.get("walk_from_fused").?;
     try std.testing.expectEqual(@as(i64, 2), fused_ref_graph_result.total);
     try expectGraphNodeKeys(fused_ref_graph_result.nodes, &.{ "doc:z", "doc:y" });
@@ -6467,7 +6579,7 @@ test "public api multi-node e2e routes merge flow from a non-host node" {
     var query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, query.body, .{});
     defer query_responses.deinit();
     const query_result = query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 4), query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 4), query_result.hits.?.total.?.value);
     try expectQueryProfileSummary(std.heap.page_allocator, query_result.profile, 1, false);
 
     const graph_query_body = try test_contract_helpers.encodeGraphNeighborsQueryRequest(
@@ -7090,6 +7202,13 @@ test "public api multi-node e2e routes semantic and sparse queries across split 
     const create_body = try test_contract_helpers.encodeCreateTableRequest(std.heap.page_allocator, "api multi-node semantic split docs");
     defer std.heap.page_allocator.free(create_body);
     _ = try client.createTable(api_base_uris[0], "docs", create_body);
+    const seed_body = try test_contract_helpers.normalizeBatchRequest(std.heap.page_allocator,
+        \\{"inserts":{"doc:l":{"title":"split seed"}}}
+    );
+    defer std.heap.page_allocator.free(seed_body);
+    var seed = try client.fetchBatch(api_base_uris[0], "docs", seed_body);
+    defer seed.deinit(std.heap.page_allocator);
+    try cluster.stepAll();
 
     const semantic_index_body = try test_contract_helpers.encodeManagedEmbeddingsIndexRequest(
         std.heap.page_allocator,
@@ -7158,7 +7277,7 @@ test "public api multi-node e2e routes semantic and sparse queries across split 
     }
     try std.testing.expect(source_group_id != 0);
 
-    const split_body = try std.fmt.allocPrint(std.testing.allocator, "{{\"transition_id\":615001,\"source_group_id\":{d},\"destination_group_id\":{d},\"split_key\":\"doc:m\"}}", .{
+    const split_body = try std.fmt.allocPrint(std.testing.allocator, "{{\"transition_id\":615001,\"source_group_id\":{d},\"destination_group_id\":{d},\"split_key\":\"doc:m\",\"allow_doc_identity_reassignment\":true}}", .{
         source_group_id,
         source_group_id + 1,
     });
@@ -7168,7 +7287,6 @@ test "public api multi-node e2e routes semantic and sparse queries across split 
         "docs",
         split_body,
     );
-
     var finalized = false;
     rounds = 0;
     while (rounds < 64) : (rounds += 1) {
@@ -7179,6 +7297,12 @@ test "public api multi-node e2e routes semantic and sparse queries across split 
                 finalized = true;
                 break;
             }
+        }
+        const projected_ranges = try cluster.node(query_index).listProjectedRanges(std.testing.allocator);
+        defer cluster.node(query_index).freeProjectedRanges(std.testing.allocator, projected_ranges);
+        if (projected_ranges.len >= 2) {
+            finalized = true;
+            break;
         }
     }
     try std.testing.expect(finalized);
@@ -7500,7 +7624,7 @@ test "public api multi-node e2e routes semantic and sparse queries after merge f
     }
     try std.testing.expect(source_group_id != 0);
 
-    const split_body = try std.fmt.allocPrint(std.testing.allocator, "{{\"transition_id\":616001,\"source_group_id\":{d},\"destination_group_id\":{d},\"split_key\":\"doc:m\"}}", .{
+    const split_body = try std.fmt.allocPrint(std.testing.allocator, "{{\"transition_id\":616001,\"source_group_id\":{d},\"destination_group_id\":{d},\"split_key\":\"doc:m\",\"allow_doc_identity_reassignment\":true}}", .{
         source_group_id,
         source_group_id + 1,
     });

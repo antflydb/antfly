@@ -105,6 +105,7 @@ pub fn serialize(alloc: Allocator, cells: []const Cell) ![]u8 {
         try buf.append(alloc, @intFromEnum(c.value_type));
         switch (c.value) {
             .u64_val => |v| try appendU64(alloc, &buf, v),
+            .i64_val => |v| try appendU64(alloc, &buf, @bitCast(v)),
             .f64_val => |v| try appendU64(alloc, &buf, @bitCast(v)),
             .bool_val => |v| try buf.append(alloc, if (v) 1 else 0),
             .geo_point => |gp| {
@@ -211,6 +212,7 @@ fn readCellAt(data: []const u8, pos: *usize) !Cell {
 
     const value: typed_dv.TypedValue = switch (value_type) {
         .u64_val => .{ .u64_val = try readU64Checked(data, pos) },
+        .i64_val => .{ .i64_val = @bitCast(try readU64Checked(data, pos)) },
         .f64_val => .{ .f64_val = @bitCast(try readU64Checked(data, pos)) },
         .bool_val => blk: {
             if (pos.* + 1 > data.len) return error.InvalidRelationalRow;
@@ -319,6 +321,7 @@ pub fn appendCellValue(
     switch (value_type) {
         .f64_val => try appendFmt(alloc, out, "{d}", .{value.f64_val}),
         .u64_val => try appendFmt(alloc, out, "{d}", .{value.u64_val}),
+        .i64_val => try appendFmt(alloc, out, "{d}", .{value.i64_val}),
         .bool_val => try out.appendSlice(alloc, if (value.bool_val) "true" else "false"),
         .geo_point => try appendFmt(alloc, out, "{{\"lat\":{d},\"lon\":{d}}}", .{ value.geo_point.lat, value.geo_point.lon }),
         .bytes_val => {

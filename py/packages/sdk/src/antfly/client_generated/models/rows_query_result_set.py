@@ -21,17 +21,21 @@ class RowsQueryResultSet:
     """
     Attributes:
         total (int | Unset):
+        total_exact (bool | Unset): False when `total` is a bounded or no-total value rather than an exact match count.
         result_schema (list[RowsResultColumn] | Unset):
         rows (list[RowsQueryResultSetRowsItem] | Unset):
     """
 
     total: int | Unset = UNSET
+    total_exact: bool | Unset = UNSET
     result_schema: list[RowsResultColumn] | Unset = UNSET
     rows: list[RowsQueryResultSetRowsItem] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         total = self.total
+
+        total_exact = self.total_exact
 
         result_schema: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.result_schema, Unset):
@@ -52,6 +56,8 @@ class RowsQueryResultSet:
         field_dict.update({})
         if total is not UNSET:
             field_dict["total"] = total
+        if total_exact is not UNSET:
+            field_dict["total_exact"] = total_exact
         if result_schema is not UNSET:
             field_dict["result_schema"] = result_schema
         if rows is not UNSET:
@@ -66,6 +72,8 @@ class RowsQueryResultSet:
 
         d = dict(src_dict)
         total = d.pop("total", UNSET)
+
+        total_exact = d.pop("total_exact", UNSET)
 
         _result_schema = d.pop("result_schema", UNSET)
         result_schema: list[RowsResultColumn] | Unset = UNSET
@@ -87,6 +95,7 @@ class RowsQueryResultSet:
 
         rows_query_result_set = cls(
             total=total,
+            total_exact=total_exact,
             result_schema=result_schema,
             rows=rows,
         )

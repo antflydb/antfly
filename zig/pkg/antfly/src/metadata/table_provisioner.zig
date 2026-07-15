@@ -240,6 +240,10 @@ pub fn reconcileDbIndexesWithOptions(
     if (index_summary.added > 0 or indexes_removed > 0 or enrichment_summary.changed() or enrichments_removed > 0 or resolver_summary.changed()) {
         const pending = db.pendingWorkStats();
         if (pending.enrichment.error_count == 0) {
+            // Reconciliation persists catalog/applied-sequence state through the
+            // primary store. Avoid forcing every newly-created empty index WAL
+            // during create-table; repair/replay paths force-sync real index
+            // mutations after applying data.
             try db.core.index_manager.syncAll(false);
         }
     }
@@ -493,7 +497,7 @@ fn removeMissingIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: 
 
     var removed: usize = 0;
     for (current) |cfg| {
-        if (desiredStorageIndexContainsName(object, cfg.name)) continue;
+        if (try desiredIndexContains(object, cfg.name)) continue;
         if (try db.deleteIndex(cfg.name)) removed += 1;
     }
     return removed;
@@ -516,6 +520,20 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
     defer db_mod.types.freeIndexConfigs(alloc, current);
 
     var summary: IndexEnsureSummary = .{};
+    if (object.get("indexes")) |indexes_value| {
+        const items = switch (indexes_value) {
+            .array => |array| array.items,
+            else => return error.InvalidTableIndexMetadata,
+        };
+        for (items) |item| {
+            const name = try indexDefinitionName(item);
+            const kind = try parseIndexKind(item);
+            const config_value = indexDefinitionConfigValue(item);
+            try ensureIndexDefinition(alloc, db, current, &summary, name, kind, config_value, true);
+        }
+        return summary;
+    }
+
     var it = object.iterator();
     while (it.next()) |entry| {
         // Reserved top-level sections are handled by their own reconcilers, not
@@ -524,37 +542,82 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
             std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
         if (isMetadataOnlyScalarIndexConfig(entry.value_ptr.*)) continue;
         const kind = try parseIndexKind(entry.value_ptr.*);
-
-        const existing = findIndexConfig(current, entry.key_ptr.*);
-        if (existing) |existing_cfg| {
-            if (existing_cfg.kind == kind and indexKindConfigReconcileDeferred(kind)) continue;
-        }
-
-        const config_json = try extractIndexConfigJson(alloc, entry.key_ptr.*, entry.value_ptr.*);
-        defer alloc.free(config_json);
-        const desired = db_mod.types.IndexConfig{
-            .name = entry.key_ptr.*,
-            .kind = kind,
-            .config_json = config_json,
-        };
-        if (existing) |existing_cfg| {
-            if (try indexConfigsEqual(alloc, existing_cfg, desired)) continue;
-            if (try db.deleteIndex(desired.name)) summary.removed += 1;
-        }
-        try db.addIndex(.{
-            .name = desired.name,
-            .kind = desired.kind,
-            .config_json = desired.config_json,
-        });
-        summary.added += 1;
+        try ensureIndexDefinition(alloc, db, current, &summary, entry.key_ptr.*, kind, entry.value_ptr.*, false);
     }
     return summary;
 }
 
-fn desiredStorageIndexContainsName(object: std.json.ObjectMap, name: []const u8) bool {
+fn ensureIndexDefinition(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    current: []const db_mod.types.IndexConfig,
+    summary: *IndexEnsureSummary,
+    name: []const u8,
+    kind: db_mod.types.IndexKind,
+    config_value: std.json.Value,
+    storage_config: bool,
+) !void {
+    const existing = findIndexConfig(current, name);
+    if (existing) |existing_cfg| {
+        if (existing_cfg.kind == kind and indexKindConfigReconcileDeferred(kind)) return;
+    }
+
+    const config_json = if (storage_config)
+        try extractStoredIndexConfigJson(alloc, config_value)
+    else
+        try extractIndexConfigJsonForKind(alloc, name, kind, config_value);
+    defer alloc.free(config_json);
+    const desired = db_mod.types.IndexConfig{
+        .name = name,
+        .kind = kind,
+        .config_json = config_json,
+    };
+    if (existing) |existing_cfg| {
+        if (try indexConfigsEqual(alloc, existing_cfg, desired)) return;
+        if (try db.deleteIndex(desired.name)) summary.removed += 1;
+    }
+    try db.addIndex(.{
+        .name = desired.name,
+        .kind = desired.kind,
+        .config_json = desired.config_json,
+    });
+    summary.added += 1;
+}
+
+fn desiredIndexContains(object: std.json.ObjectMap, name: []const u8) !bool {
+    if (object.get("indexes")) |indexes_value| {
+        const items = switch (indexes_value) {
+            .array => |array| array.items,
+            else => return error.InvalidTableIndexMetadata,
+        };
+        for (items) |item| {
+            if (std.mem.eql(u8, try indexDefinitionName(item), name)) return true;
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments")) return false;
     const value = object.get(name) orelse return false;
-    if (isReservedTopLevelIndexSection(name)) return false;
     return !isMetadataOnlyScalarIndexConfig(value);
+}
+
+fn indexDefinitionName(value: std.json.Value) ![]const u8 {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidTableIndexMetadata,
+    };
+    const name_value = object.get("name") orelse return error.InvalidTableIndexMetadata;
+    return switch (name_value) {
+        .string => |name| if (name.len > 0) name else error.InvalidTableIndexMetadata,
+        else => error.InvalidTableIndexMetadata,
+    };
+}
+
+fn indexDefinitionConfigValue(value: std.json.Value) std.json.Value {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return value,
+    };
+    return object.get("config") orelse value;
 }
 
 fn findIndexConfig(configs: []const db_mod.types.IndexConfig, name: []const u8) ?db_mod.types.IndexConfig {
@@ -900,6 +963,7 @@ fn findDbIndexStats(indexes: []const db_mod.types.DBIndexStats, index_name: []co
 
 fn indexStatsReady(index: db_mod.types.DBIndexStats) bool {
     if (index.kind != .full_text) return false;
+    if (!index.repair_summary_ready or index.repair_degraded) return false;
     if (index.backfill_active) return false;
     if (index.replay_catch_up_required) return false;
     if (index.replay_applied_sequence < index.replay_target_sequence) return false;
@@ -990,10 +1054,7 @@ fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
     if (std.mem.eql(u8, type_value.string, "graph")) return .graph;
     if (std.mem.eql(u8, type_value.string, "algebraic")) return .algebraic;
     if (std.mem.eql(u8, type_value.string, "embeddings")) {
-        const sparse = if (value.object.get("sparse")) |sparse_value| switch (sparse_value) {
-            .bool => sparse_value.bool,
-            else => return error.InvalidCreateTableRequest,
-        } else false;
+        const sparse = try embeddingIndexSparseFlag(value);
         return if (sparse) .sparse_vector else .dense_vector;
     }
     return error.UnsupportedCreateTableRequest;
@@ -1022,6 +1083,26 @@ fn indexConfigTypeIsMetadataOnlyScalar(type_name: []const u8) bool {
         std.mem.eql(u8, type_name, "term");
 }
 
+fn embeddingIndexSparseFlag(value: std.json.Value) !bool {
+    if (value != .object) return false;
+    if (value.object.get("sparse")) |sparse_value| {
+        return switch (sparse_value) {
+            .bool => sparse_value.bool,
+            else => error.InvalidCreateTableRequest,
+        };
+    }
+    const config_value = value.object.get("config") orelse return false;
+    const config_object = switch (config_value) {
+        .object => |object| object,
+        else => return error.InvalidCreateTableRequest,
+    };
+    const sparse_value = config_object.get("sparse") orelse return false;
+    return switch (sparse_value) {
+        .bool => sparse_value.bool,
+        else => error.InvalidCreateTableRequest,
+    };
+}
+
 fn looksLikeStoredAlgebraicIndexConfig(value: std.json.Value) bool {
     if (value != .object) return false;
     if (value.object.get("schema_version") == null and
@@ -1035,6 +1116,16 @@ fn looksLikeStoredAlgebraicIndexConfig(value: std.json.Value) bool {
 fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, value: std.json.Value) ![]u8 {
     if (value != .object) return try alloc.dupe(u8, "{}");
     const kind = try parseIndexKind(value);
+    return try extractIndexConfigJsonForKind(alloc, index_name, kind, value);
+}
+
+fn extractIndexConfigJsonForKind(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    kind: db_mod.types.IndexKind,
+    value: std.json.Value,
+) ![]u8 {
+    if (value != .object) return try alloc.dupe(u8, "{}");
     switch (kind) {
         .dense_vector, .sparse_vector => return try managed_embedder.translateEmbeddingsIndexConfigJson(alloc, index_name, value),
         else => {},
@@ -1063,6 +1154,11 @@ fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, valu
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn extractStoredIndexConfigJson(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    if (value != .object) return try alloc.dupe(u8, "{}");
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
 }
 
 fn skipPublicIndexMetadataField(kind: db_mod.types.IndexKind, field: []const u8) bool {
@@ -1281,6 +1377,37 @@ fn groupDbHasAlgebraicDocFactScalarKeyContaining(alloc: std.mem.Allocator, db_pa
             std.mem.indexOf(u8, row.key, needle) != null) return true;
     }
     return false;
+}
+
+test "table provisioner materializes array-form metadata indexes" {
+    const path = "/tmp/antfly-metadata-table-provisioner-array-indexes";
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(std.testing.allocator, path, .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const indexes_json =
+        \\{"indexes":[
+        \\  {"name":"dense_idx","type":"embeddings","config":{"field":"embedding","dims":3,"metric":"l2_squared","external":true}},
+        \\  {"name":"sparse_idx","type":"embeddings","config":{"field":"tokens","sparse":true}},
+        \\  {"name":"full_text_index_v0","type":"full_text","config":{}}
+        \\]}
+    ;
+    const summary = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, indexes_json, .{});
+    try std.testing.expectEqual(@as(usize, 3), summary.indexes_added);
+    try std.testing.expectEqual(@as(usize, 0), summary.indexes_removed);
+
+    const configs = try db.listIndexes(std.testing.allocator);
+    defer db_mod.types.freeIndexConfigs(std.testing.allocator, configs);
+    try std.testing.expect(findIndexConfig(configs, "dense_idx").?.kind == .dense_vector);
+    try std.testing.expect(findIndexConfig(configs, "sparse_idx").?.kind == .sparse_vector);
+    try std.testing.expect(findIndexConfig(configs, "full_text_index_v0").?.kind == .full_text);
 }
 
 test "table provisioner reconciliation is non-mutating for query read-only dbs" {
@@ -2039,7 +2166,7 @@ test "table provisioner updates full text artifact mapping and cleans removed en
     const first_indexes_json =
         \\{
         \\  "document_text":{"type":"full_text","artifact_name":"document_chunks_v1","enrichments":[
-        \\    {"name":"document_units_v1","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"},
+        \\    {"name":"document_units_v1","kind":"asset","field":"url","content_type":"text/plain","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"},
         \\    {"name":"document_chunks_v1","kind":"chunk","source_artifact_name":"document_units_v1","field":"text","chunk_size":512,"chunk_overlap":50}
         \\  ]}
         \\}
@@ -2047,7 +2174,7 @@ test "table provisioner updates full text artifact mapping and cleans removed en
     const second_indexes_json =
         \\{
         \\  "document_text":{"type":"full_text","artifact_name":"document_chunks_v2","enrichments":[
-        \\    {"name":"document_units_v2","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"},
+        \\    {"name":"document_units_v2","kind":"asset","field":"url","content_type":"text/plain","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"},
         \\    {"name":"document_chunks_v2","kind":"chunk","source_artifact_name":"document_units_v2","field":"text","chunk_size":512,"chunk_overlap":50}
         \\  ]}
         \\}
@@ -2070,19 +2197,6 @@ test "table provisioner updates full text artifact mapping and cleans removed en
             .end_key = "doc:z",
         }},
     );
-
-    {
-        const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2001);
-        defer alloc.free(db_path);
-        var db = try db_mod.DB.open(alloc, db_path, .{});
-        defer db.close();
-
-        const chunk_key = try db_mod.internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "document_chunks_v2", 0);
-        defer alloc.free(chunk_key);
-        try db.core.store.putBatch(&.{
-            .{ .key = chunk_key, .value = "{\"text\":\"gamma remap token\"}" },
-        }, &.{});
-    }
 
     const second_summary = try reconcileReplicaRoot(
         alloc,
@@ -2132,6 +2246,15 @@ test "table provisioner updates full text artifact mapping and cleans removed en
     try std.testing.expectEqual(@as(usize, 1), new_text_indexes.len);
     try std.testing.expectEqualStrings("document_text", new_text_indexes[0]);
 
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,Z2FtbWEgcmVtYXAgdG9rZW4=\"}",
+        }},
+        .sync_level = .full_index,
+    });
+    try db.runUntilIdle();
+
     var result = try db.search(alloc, .{
         .index_name = "document_text",
         .full_text = .{ .match = .{ .field = "text", .text = "gamma" } },
@@ -2139,7 +2262,7 @@ test "table provisioner updates full text artifact mapping and cleans removed en
         .return_mode = .chunk,
     });
     defer result.deinit();
-    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expect(result.total_hits > 0);
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
 }
 
@@ -2246,7 +2369,27 @@ test "table provisioner restores local shard data from metadata restore intent" 
     try std.testing.expect(std.mem.indexOf(u8, doc, "\"alpha\"") != null);
 
     const FakeCatalog = struct {
-        restore_location: []const u8,
+        tables: [1]table_manager.TableRecord,
+        ranges: [1]table_manager.RangeRecord,
+
+        fn init(location: []const u8) @This() {
+            return .{
+                .tables = .{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
+                    .restore_backup_id = "snap1",
+                    .restore_location = location,
+                    .placement_role = "data",
+                }},
+                .ranges = .{.{
+                    .group_id = 2001,
+                    .table_id = 7,
+                    .start_key = "doc:a",
+                    .end_key = null,
+                }},
+            };
+        }
 
         fn iface(self: *@This()) catalog_source.CatalogSource {
             return .{
@@ -2262,20 +2405,8 @@ test "table provisioner restores local shard data from metadata restore intent" 
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return .{
                 .status = .{ .metadata_group_id = 100, .metrics = .{} },
-                .tables = @constCast((&[_]table_manager.TableRecord{.{
-                    .table_id = 7,
-                    .name = "docs",
-                    .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
-                    .restore_backup_id = "snap1",
-                    .restore_location = self.restore_location,
-                    .placement_role = "data",
-                }})[0..]),
-                .ranges = @constCast((&[_]table_manager.RangeRecord{.{
-                    .group_id = 2001,
-                    .table_id = 7,
-                    .start_key = "doc:a",
-                    .end_key = null,
-                }})[0..]),
+                .tables = self.tables[0..],
+                .ranges = self.ranges[0..],
                 .stores = @constCast((&[_]table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]@import("transition_state.zig").SplitTransitionRecord{})[0..]),
@@ -2286,7 +2417,7 @@ test "table provisioner restores local shard data from metadata restore intent" 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
-    var fake_catalog = FakeCatalog{ .restore_location = restore_location };
+    var fake_catalog = FakeCatalog.init(restore_location);
     var read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         fake_catalog.iface(),

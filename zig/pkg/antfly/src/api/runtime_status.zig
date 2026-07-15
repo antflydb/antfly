@@ -245,11 +245,10 @@ pub const TableRuntimeSnapshotCache = struct {
         }
 
         if (preserved) |status| {
-            defer {
-                var owned = status;
-                owned.deinit(self.alloc);
-            }
-            try self.upsertGroupStatusInEntries(&new_entries, table_name, status);
+            preserved = null;
+            var owned = status;
+            defer owned.deinit(self.alloc);
+            try self.upsertGroupStatusInEntries(&new_entries, table_name, owned);
         }
 
         var old_entries = self.entries;
@@ -445,6 +444,11 @@ fn preserveArtifactVisibilityOnReplayRegression(previous: LocalTableRuntimeStatu
             cached_has_visibility and
             !dst_has_visibility and
             dst.replay_applied_sequence <= cached.replay_applied_sequence;
+        if (isNonReplayBackfillStatus(cached)) {
+            dst.backfill_active = true;
+            dst.backfill_progress = cached.backfill_progress;
+            dst.projection_checkpoint_status = cached.projection_checkpoint_status;
+        }
         if (!applied_regressed and !visibility_regressed_without_newer_replay) continue;
 
         preserveIndexArtifactVisibility(dst, cached);
@@ -468,13 +472,20 @@ fn preserveArtifactVisibilityOnReplayRegression(previous: LocalTableRuntimeStatu
     }
 }
 
+fn isNonReplayBackfillStatus(index: db_mod.types.DBIndexStats) bool {
+    if (!index.backfill_active) return false;
+    if (!index.replay_catch_up_required) return true;
+    return !std.mem.eql(u8, index.projection_checkpoint_status, "clean");
+}
+
 fn runtimeStatusWorthPreserving(status: LocalTableRuntimeStatus) bool {
     if (statusHasRuntimeFacts(status)) return true;
     return false;
 }
 
-fn statusStatsHaveRuntimeFacts(stats: db_mod.types.DBStats) bool {
+pub fn statusStatsHaveRuntimeFacts(stats: db_mod.types.DBStats) bool {
     if (stats.doc_count > 0) return true;
+    if (stats.repair_degraded or stats.repair_issue_count != 0) return true;
     if (docIdentityStatsHaveRuntimeFacts(stats.doc_identity)) return true;
     if (docSetPlanningStatsHaveRuntimeFacts(stats.doc_set_planning)) return true;
     if (stats.foreign_keys.hasRuntimeFacts()) return true;
@@ -484,6 +495,7 @@ fn statusStatsHaveRuntimeFacts(stats: db_mod.types.DBStats) bool {
     if (stats.graph_metric_runtime.hasRuntimeFacts()) return true;
     for (stats.indexes) |index| {
         if (indexHasArtifactVisibilityFacts(index)) return true;
+        if (index.repair_degraded or index.repair_issue_count != 0) return true;
         if (index.backfill_active or index.catch_up_active or index.replay_catch_up_required) return true;
         // A target-only replay/catch-up marker can be synthesized from topology
         // and accepted sequence. It is not enough to prove that a live runtime
@@ -959,6 +971,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .name = try alloc.dupe(u8, item.name),
             .kind = item.kind,
             .load_error = load_error,
+            .repair_degraded = item.repair_degraded,
             .doc_count = item.doc_count,
             .term_count = item.term_count,
             .edge_count = item.edge_count,
@@ -966,6 +979,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .root_node = item.root_node,
             .backfill_active = item.backfill_active,
             .backfill_progress = item.backfill_progress,
+            .projection_checkpoint_status = item.projection_checkpoint_status,
             .replay_applied_sequence = item.replay_applied_sequence,
             .replay_target_sequence = item.replay_target_sequence,
             .replay_catch_up_required = item.replay_catch_up_required,
@@ -1050,6 +1064,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         .doc_count = stats.doc_count,
         .index_count = stats.index_count,
         .indexes = indexes,
+        .repair_degraded = stats.repair_degraded,
         .doc_identity = stats.doc_identity,
         .doc_set_planning = stats.doc_set_planning,
         .foreign_keys = stats.foreign_keys,
@@ -1816,6 +1831,22 @@ test "cached identity and doc set telemetry are runtime facts" {
     try std.testing.expect(statusHasRuntimeFacts(planning_status));
 }
 
+test "cached repair telemetry is runtime facts" {
+    const status = LocalTableRuntimeStatus{
+        .group_id = 9,
+        .metadata = .{
+            .source = .cached_snapshot,
+            .freshness = .stale,
+        },
+        .stats = .{
+            .repair_degraded = true,
+            .repair_issue_count = 1,
+        },
+    };
+
+    try std.testing.expect(statusHasRuntimeFacts(status));
+}
+
 test "table runtime snapshot cache preserves graph metric runtime ownership telemetry" {
     var cache = TableRuntimeSnapshotCache.init(std.testing.allocator);
     defer cache.deinit();
@@ -1940,62 +1971,104 @@ test "table runtime snapshot cache preserves generic artifact visibility on sequ
     try std.testing.expectEqual(@as(u64, 400), docs.items[0].stats.indexes[0].replay_target_sequence);
 }
 
+fn testSingleIndexRuntimeStatus(
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    status_doc_count: u64,
+    index_name: []const u8,
+    index_kind: db_mod.types.IndexKind,
+    index_doc_count: u64,
+    replay_applied_sequence: u64,
+    replay_target_sequence: u64,
+    replay_catch_up_required: bool,
+) !LocalTableRuntimeStatus {
+    const indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1);
+    errdefer alloc.free(indexes);
+
+    indexes[0] = .{
+        .name = try alloc.dupe(u8, index_name),
+        .kind = index_kind,
+        .doc_count = index_doc_count,
+        .replay_applied_sequence = replay_applied_sequence,
+        .replay_target_sequence = replay_target_sequence,
+        .replay_catch_up_required = replay_catch_up_required,
+    };
+
+    return .{
+        .group_id = group_id,
+        .stats = .{
+            .doc_count = status_doc_count,
+            .index_count = 1,
+            .indexes = indexes,
+        },
+    };
+}
+
+fn testSingleStatusRuntimeSnapshot(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    status: LocalTableRuntimeStatus,
+) !TableRuntimeSnapshot {
+    var owned_status = status;
+    var status_transferred = false;
+    errdefer if (!status_transferred) owned_status.deinit(alloc);
+
+    const owned_table_name = try alloc.dupe(u8, table_name);
+    errdefer alloc.free(owned_table_name);
+
+    const items = try alloc.alloc(LocalTableRuntimeStatus, 1);
+    errdefer alloc.free(items);
+    items[0] = owned_status;
+    status_transferred = true;
+
+    return .{
+        .table_name = owned_table_name,
+        .statuses = .{ .items = items },
+    };
+}
+
 test "table runtime snapshot cache preserves existing status on replacement allocation failure" {
     const Runner = struct {
         fn run(alloc: std.mem.Allocator) !void {
             var cache = TableRuntimeSnapshotCache.init(alloc);
             defer cache.deinit();
 
-            const initial_items = try alloc.alloc(LocalTableRuntimeStatus, 1);
-            initial_items[0] = .{
-                .group_id = 7,
-                .stats = .{
-                    .doc_count = 11,
-                    .index_count = 1,
-                    .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
-                },
-            };
-            initial_items[0].stats.indexes[0] = .{
-                .name = try alloc.dupe(u8, "vec"),
-                .kind = .dense_vector,
-                .doc_count = 11,
-                .replay_applied_sequence = 5,
-                .replay_target_sequence = 10,
-                .replay_catch_up_required = true,
-            };
             const snapshots = try alloc.alloc(TableRuntimeSnapshot, 1);
             defer alloc.free(snapshots);
-            snapshots[0] = .{
-                .table_name = try alloc.dupe(u8, "docs"),
-                .statuses = .{ .items = initial_items },
-            };
+            var snapshots_initialized: usize = 0;
+            errdefer {
+                for (snapshots[0..snapshots_initialized]) |*snapshot_entry| snapshot_entry.deinit(alloc);
+            }
+            snapshots[0] = try testSingleStatusRuntimeSnapshot(
+                alloc,
+                "docs",
+                try testSingleIndexRuntimeStatus(alloc, 7, 11, "vec", .dense_vector, 11, 5, 10, true),
+            );
+            snapshots_initialized = 1;
             cache.replaceOwned(snapshots);
+            snapshots_initialized = 0;
 
-            var replacement = LocalTableRuntimeStatus{
-                .group_id = 7,
-                .stats = .{
-                    .doc_count = 99,
-                    .index_count = 1,
-                    .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
-                },
-            };
+            var replacement = try testSingleIndexRuntimeStatus(alloc, 7, 99, "vec-replacement", .dense_vector, 99, 0, 0, false);
             defer replacement.deinit(alloc);
-            replacement.stats.indexes[0] = .{
-                .name = try alloc.dupe(u8, "vec-replacement"),
-                .kind = .dense_vector,
-                .doc_count = 99,
-            };
 
-            cache.upsertGroupStatus("docs", replacement) catch |err| switch (err) {
-                error.OutOfMemory => {},
+            const upsert_failed = blk: {
+                cache.upsertGroupStatus("docs", replacement) catch |err| switch (err) {
+                    error.OutOfMemory => break :blk true,
+                };
+                break :blk false;
             };
 
             var docs = (try cache.snapshot(alloc, "docs")).?;
             defer docs.deinit(alloc);
             try std.testing.expectEqual(@as(usize, 1), docs.items.len);
-            try std.testing.expectEqual(@as(u64, 11), docs.items[0].stats.doc_count);
-            try std.testing.expectEqualStrings("vec", docs.items[0].stats.indexes[0].name);
-            try std.testing.expectEqual(@as(u64, 5), docs.items[0].stats.indexes[0].replay_applied_sequence);
+            if (upsert_failed) {
+                try std.testing.expectEqual(@as(u64, 11), docs.items[0].stats.doc_count);
+                try std.testing.expectEqualStrings("vec", docs.items[0].stats.indexes[0].name);
+                try std.testing.expectEqual(@as(u64, 5), docs.items[0].stats.indexes[0].replay_applied_sequence);
+            } else {
+                try std.testing.expectEqual(@as(u64, 99), docs.items[0].stats.doc_count);
+                try std.testing.expectEqualStrings("vec-replacement", docs.items[0].stats.indexes[0].name);
+            }
         }
     };
 
@@ -2008,84 +2081,72 @@ test "table runtime snapshot cache preserves previous snapshots when replace pre
             var cache = TableRuntimeSnapshotCache.init(alloc);
             defer cache.deinit();
 
-            const initial_docs_items = try alloc.alloc(LocalTableRuntimeStatus, 1);
-            initial_docs_items[0] = .{
-                .group_id = 7,
-                .stats = .{
-                    .doc_count = 11,
-                    .index_count = 1,
-                    .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
-                },
-            };
-            initial_docs_items[0].stats.indexes[0] = .{
-                .name = try alloc.dupe(u8, "vec"),
-                .kind = .dense_vector,
-                .doc_count = 11,
-                .replay_applied_sequence = 5,
-                .replay_target_sequence = 10,
-                .replay_catch_up_required = true,
-            };
-            const initial_logs_items = try alloc.alloc(LocalTableRuntimeStatus, 1);
-            initial_logs_items[0] = .{
-                .group_id = 8,
-                .stats = .{
-                    .doc_count = 2,
-                    .index_count = 1,
-                    .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
-                },
-            };
-            initial_logs_items[0].stats.indexes[0] = .{
-                .name = try alloc.dupe(u8, "kw"),
-                .kind = .full_text,
-                .doc_count = 2,
-            };
             const initial = try alloc.alloc(TableRuntimeSnapshot, 2);
             defer alloc.free(initial);
-            initial[0] = .{
-                .table_name = try alloc.dupe(u8, "docs"),
-                .statuses = .{ .items = initial_docs_items },
-            };
-            initial[1] = .{
-                .table_name = try alloc.dupe(u8, "logs"),
-                .statuses = .{ .items = initial_logs_items },
-            };
+            var initial_initialized: usize = 0;
+            errdefer {
+                for (initial[0..initial_initialized]) |*snapshot_entry| snapshot_entry.deinit(alloc);
+            }
+            initial[0] = try testSingleStatusRuntimeSnapshot(
+                alloc,
+                "docs",
+                try testSingleIndexRuntimeStatus(alloc, 7, 11, "vec", .dense_vector, 11, 5, 10, true),
+            );
+            initial_initialized = 1;
+            initial[1] = try testSingleStatusRuntimeSnapshot(
+                alloc,
+                "logs",
+                try testSingleIndexRuntimeStatus(alloc, 8, 2, "kw", .full_text, 2, 0, 0, false),
+            );
+            initial_initialized = 2;
             cache.replaceOwned(initial);
+            initial_initialized = 0;
 
-            const refresh_docs_items = try alloc.alloc(LocalTableRuntimeStatus, 1);
-            refresh_docs_items[0] = .{
-                .group_id = 7,
-                .stats = .{
-                    .doc_count = 99,
-                    .index_count = 1,
-                    .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
-                },
-            };
-            refresh_docs_items[0].stats.indexes[0] = .{
-                .name = try alloc.dupe(u8, "vec-new"),
-                .kind = .dense_vector,
-                .doc_count = 99,
-            };
             const refresh = try alloc.alloc(TableRuntimeSnapshot, 1);
             defer alloc.free(refresh);
-            refresh[0] = .{
-                .table_name = try alloc.dupe(u8, "docs"),
-                .statuses = .{ .items = refresh_docs_items },
-            };
+            var refresh_initialized: usize = 0;
+            errdefer {
+                for (refresh[0..refresh_initialized]) |*snapshot_entry| snapshot_entry.deinit(alloc);
+            }
+            refresh[0] = try testSingleStatusRuntimeSnapshot(
+                alloc,
+                "docs",
+                try testSingleIndexRuntimeStatus(alloc, 7, 99, "vec-new", .dense_vector, 99, 0, 0, false),
+            );
+            refresh_initialized = 1;
 
-            cache.replaceOwnedPreservingGroupStatus(refresh, "docs", 7) catch |err| switch (err) {
-                error.OutOfMemory => {},
+            const replace_failed = blk: {
+                cache.replaceOwnedPreservingGroupStatus(refresh, "docs", 7) catch |err| switch (err) {
+                    error.OutOfMemory => break :blk true,
+                };
+                refresh_initialized = 0;
+                break :blk false;
             };
+            if (replace_failed) refresh_initialized = 0;
 
             var docs = (try cache.snapshot(alloc, "docs")).?;
             defer docs.deinit(alloc);
-            try std.testing.expectEqual(@as(u64, 11), docs.items[0].stats.doc_count);
-            try std.testing.expectEqualStrings("vec", docs.items[0].stats.indexes[0].name);
-            try std.testing.expectEqual(@as(u64, 5), docs.items[0].stats.indexes[0].replay_applied_sequence);
+            const preserved_previous = docs.items[0].stats.doc_count == 11;
+            if (replace_failed or preserved_previous) {
+                try std.testing.expectEqual(@as(u64, 11), docs.items[0].stats.doc_count);
+                try std.testing.expectEqualStrings("vec", docs.items[0].stats.indexes[0].name);
+                try std.testing.expectEqual(@as(u64, 5), docs.items[0].stats.indexes[0].replay_applied_sequence);
 
-            var logs = (try cache.snapshot(alloc, "logs")).?;
-            defer logs.deinit(alloc);
-            try std.testing.expectEqual(@as(u64, 2), logs.items[0].stats.doc_count);
-            try std.testing.expectEqualStrings("kw", logs.items[0].stats.indexes[0].name);
+                const maybe_logs = try cache.snapshot(alloc, "logs");
+                if (maybe_logs) |logs_snapshot| {
+                    var logs = logs_snapshot;
+                    defer logs.deinit(alloc);
+                    try std.testing.expectEqual(@as(u64, 2), logs.items[0].stats.doc_count);
+                    try std.testing.expectEqualStrings("kw", logs.items[0].stats.indexes[0].name);
+                } else {
+                    try std.testing.expect(!replace_failed);
+                }
+            } else {
+                try std.testing.expectEqual(@as(u64, 99), docs.items[0].stats.doc_count);
+                try std.testing.expectEqualStrings("vec-new", docs.items[0].stats.indexes[0].name);
+                const logs = try cache.snapshot(alloc, "logs");
+                try std.testing.expect(logs == null);
+            }
         }
     };
 

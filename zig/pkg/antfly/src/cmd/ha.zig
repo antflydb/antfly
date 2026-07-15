@@ -344,8 +344,8 @@ fn executeTypedRemote(
         .commit_append => |command| {
             var out = try client.appendCommit(remote_url, .{
                 .payload = command.append.payload,
-                .kind = try recordKindName(command.append.kind),
-                .payload_codec = try payloadCodecName(command.append.payload_codec),
+                .kind = try recordKindOpenApi(command.append.kind),
+                .payload_codec = try payloadCodecOpenApi(command.append.payload_codec),
                 .shard_id = if (command.append.shard_id) |raw| try i64FromU64(raw) else null,
                 .table_id = if (command.append.table_id) |raw| try i64FromU64(raw) else null,
                 .commit_timestamp_ns = command.append.commit_timestamp_ns,
@@ -357,7 +357,7 @@ fn executeTypedRemote(
         },
         .read_check => |request| {
             var out = try client.checkRead(remote_url, .{
-                .consistency = @tagName(request.consistency),
+                .consistency = readConsistencyOpenApi(request.consistency),
                 .required_lsn = if (request.required_lsn) |raw| try i64FromU64(raw) else null,
                 .required_metadata_lsn = if (request.required_metadata_lsn) |raw| try i64FromU64(raw) else null,
                 .metadata_applied_lsn = if (request.metadata_applied_lsn) |raw| try i64FromU64(raw) else null,
@@ -368,7 +368,7 @@ fn executeTypedRemote(
         },
         .write_check => |command| {
             var out = try client.checkWrite(remote_url, .{
-                .role = @tagName(command.role),
+                .role = writeCheckRoleOpenApi(command.role),
                 .expected_identity = if (command.request.expected_identity) |identity| try adminIdentity(identity) else null,
             });
             defer out.deinit(alloc);
@@ -377,8 +377,8 @@ fn executeTypedRemote(
         },
         .owner_job_check => |command| {
             var out = try client.checkOwnerJob(remote_url, .{
-                .role = @tagName(command.role),
-                .kind = @tagName(command.request.kind),
+                .role = ownerJobRoleOpenApi(command.role),
+                .kind = ownerJobKindOpenApi(command.request.kind),
                 .expected_identity = if (command.request.expected_identity) |identity| try adminIdentity(identity) else null,
             });
             defer out.deinit(alloc);
@@ -616,11 +616,11 @@ fn primaryMetricsFromAdminSnapshot(alloc: std.mem.Allocator, snapshot: admin_api
     else
         @intFromEnum(ha.metrics.DurabilityStatusCode.not_configured);
     const durability_satisfied = if (durability) |decision|
-        boolGauge(std.mem.eql(u8, decision.status, "satisfied"))
+        boolGauge(decision.status == .satisfied)
     else
         0;
     const durability_degraded = if (durability) |decision|
-        boolGauge(!std.mem.eql(u8, decision.status, "satisfied"))
+        boolGauge(decision.status != .satisfied)
     else
         0;
 
@@ -685,19 +685,21 @@ fn promotionMetricsFromAdminAssessment(assessment: admin_api.HAPromotionAssessme
     };
 }
 
-fn slotStatusCodeFromAdmin(raw: []const u8) !ha.metrics.SlotStatusCode {
-    if (std.mem.eql(u8, raw, "healthy")) return .healthy;
-    if (std.mem.eql(u8, raw, "lagging")) return .lagging;
-    if (std.mem.eql(u8, raw, "reseed_required")) return .reseed_required;
-    return error.InvalidHaCommand;
+fn slotStatusCodeFromAdmin(raw: admin_api.HASlotSnapshotStatus) !ha.metrics.SlotStatusCode {
+    return switch (raw) {
+        .healthy => .healthy,
+        .lagging => .lagging,
+        .reseed_required => .reseed_required,
+    };
 }
 
-fn durabilityStatusCodeFromAdmin(raw: []const u8) !ha.metrics.DurabilityStatusCode {
-    if (std.mem.eql(u8, raw, "satisfied")) return .satisfied;
-    if (std.mem.eql(u8, raw, "would_block")) return .would_block;
-    if (std.mem.eql(u8, raw, "fail_closed")) return .fail_closed;
-    if (std.mem.eql(u8, raw, "degraded_to_async")) return .degraded_to_async;
-    return error.InvalidHaCommand;
+fn durabilityStatusCodeFromAdmin(raw: admin_api.HADurabilityDecisionStatus) !ha.metrics.DurabilityStatusCode {
+    return switch (raw) {
+        .satisfied => .satisfied,
+        .would_block => .would_block,
+        .fail_closed => .fail_closed,
+        .degraded_to_async => .degraded_to_async,
+    };
 }
 
 fn boolGauge(enabled: bool) u64 {
@@ -783,11 +785,23 @@ fn appendJsonTableLineFmt(
 
 fn syncPolicyOpenApi(policy: ha.primary.SyncPolicy) !admin_api.openapi.HASyncPolicy {
     return .{
-        .mode = @tagName(policy.mode),
-        .selection = @tagName(policy.selection),
+        .mode = switch (policy.mode) {
+            .async => .async,
+            .remote_write => .remote_write,
+            .remote_apply => .remote_apply,
+        },
+        .selection = switch (policy.selection) {
+            .any => .any,
+            .first => .first,
+            .all => .all,
+        },
         .required = try i64FromU64(policy.required),
         .standby_names = policy.standby_names,
-        .failure_policy = @tagName(policy.failure_policy),
+        .failure_policy = switch (policy.failure_policy) {
+            .block => .block,
+            .fail_closed => .fail_closed,
+            .degrade_to_async => .degrade_to_async,
+        },
     };
 }
 
@@ -844,27 +858,58 @@ fn rejoinRequestOpenApi(command: ha.admin_cli.RejoinAssessCommand) !admin_api.op
     };
 }
 
-fn recordKindName(kind: ha.replication_record.RecordKind) ![]const u8 {
+fn recordKindOpenApi(kind: ha.replication_record.RecordKind) !admin_api.CommitAppendRequestKind {
     return switch (kind) {
-        .batch_mutation => "batch_mutation",
-        .metadata_mutation => "metadata_mutation",
-        .derived_effect => "derived_effect",
-        .backup_start => "backup_start",
-        .backup_end => "backup_end",
-        .checkpoint => "checkpoint",
-        .manifest => "manifest",
-        .truncate => "truncate",
-        .timeline_switch => "timeline_switch",
+        .batch_mutation => .batch_mutation,
+        .metadata_mutation => .metadata_mutation,
+        .derived_effect => .derived_effect,
+        .backup_start => .backup_start,
+        .backup_end => .backup_end,
+        .checkpoint => .checkpoint,
+        .manifest => .manifest,
+        .truncate => .truncate,
+        .timeline_switch => .timeline_switch,
         _ => error.InvalidHaCommand,
     };
 }
 
-fn payloadCodecName(codec: ha.replication_record.PayloadCodec) ![]const u8 {
+fn payloadCodecOpenApi(codec: ha.replication_record.PayloadCodec) !admin_api.CommitAppendRequestPayloadCodec {
     return switch (codec) {
-        .raw => "raw",
-        .json => "json",
-        .binary => "binary",
+        .raw => .raw,
+        .json => .json,
+        .binary => .binary,
         _ => error.InvalidHaCommand,
+    };
+}
+
+fn readConsistencyOpenApi(consistency: ha.read_gate.Consistency) admin_api.openapi.ReadCheckRequestConsistency {
+    return switch (consistency) {
+        .stale_ok => .stale_ok,
+        .at_least_lsn => .at_least_lsn,
+        .primary => .primary,
+    };
+}
+
+fn writeCheckRoleOpenApi(role: ha.admin_cli.GateRole) admin_api.WriteCheckRequestRole {
+    return switch (role) {
+        .primary => .primary,
+        .standby => .standby,
+    };
+}
+
+fn ownerJobRoleOpenApi(role: ha.admin_cli.GateRole) admin_api.OwnerJobCheckRequestRole {
+    return switch (role) {
+        .primary => .primary,
+        .standby => .standby,
+    };
+}
+
+fn ownerJobKindOpenApi(kind: ha.owner_job_gate.JobKind) admin_api.OwnerJobCheckRequestKind {
+    return switch (kind) {
+        .compaction_publish => .compaction_publish,
+        .derived_effect_writer => .derived_effect_writer,
+        .enrichment_writer => .enrichment_writer,
+        .retention_advance => .retention_advance,
     };
 }
 

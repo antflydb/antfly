@@ -6,21 +6,9 @@ info:
 components:
   schemas:
     SortDirection:
-      type: boolean
-      description: "Sort direction for a single field. true = descending, false = ascending."
+      $ref: "sort.yaml#/components/schemas/SortDirection"
     SortField:
-      type: object
-      description: "A single sort field with direction."
-      required:
-        - field
-      properties:
-        field:
-          type: string
-          description: "The field name to sort by."
-        desc:
-          type: boolean
-          default: false
-          description: "Sort direction. true = descending, false = ascending."
+      $ref: "sort.yaml#/components/schemas/SortField"
     IndexType:
       # FIXME (ajr) Looks like a bug in oapi-codegen where it doesn't respect
       # the x-go-type-skip-optional-pointer when the schema is referenced from
@@ -131,7 +119,7 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           default: false
-          description: "When true on a chunk enrichment, route generated chunk text into the table's default full-text index."
+          description: "When true on a chunk or asset enrichment, route generated text into the table's default full-text index."
         content_type:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -184,6 +172,10 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether the index is currently rebuilding"
+        backfill_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Whether the index is actively rebuilding, replaying, or catching up."
         backfill_progress:
           x-go-type-skip-optional-pointer: true
           type: number
@@ -194,6 +186,154 @@ components:
           type: integer
           format: uint64
           description: "Number of documents indexed during current rebuild"
+        backfill_state:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Operational readiness state such as ready, running, retrying, or failed."
+        doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of documents visible to the index."
+        term_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of indexed terms when available."
+        replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Highest replay sequence applied to the index runtime."
+        replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Replay sequence the index runtime must reach to be current."
+        replay_catch_up_required:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Whether replay must catch up before the index is fully current."
+        runtime_present:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_fresh:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        runtime_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        catch_up_phase:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        catch_up_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        text_merge:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Full-text merge runtime diagnostics."
+        async_indexing:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Asynchronous indexer runtime diagnostics."
+        projection_checkpoint_status:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required."
+        projection_checkpoint_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Highest derived-log sequence covered by the durable projection checkpoint."
+        projection_checkpoint_generation:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Projection generation associated with the durable checkpoint."
+        projection_checkpoint_config_hash:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Projection configuration identity associated with the durable checkpoint."
+        checkpoint_replay_tail_sequence_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of derived-log sequences after the durable checkpoint that still need replay."
+        repair_scan_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Repair issues found by explicit repair-scan accounting for this projection."
+        edge_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Artifact resolution replay diagnostics."
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Artifact promotion replay diagnostics."
     EmbeddingsIndexConfig:
       type: object
       description: >-
@@ -314,6 +454,10 @@ components:
           type: integer
           format: uint64
           description: "Number of documents pending enrichment in the WAL"
+        backfill_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Whether the index is actively rebuilding, replaying, enriching, or catching up."
         backfill_progress:
           x-go-type-skip-optional-pointer: true
           type: number
@@ -324,6 +468,226 @@ components:
           type: integer
           format: uint64
           description: "Total items processed during backfill"
+        backfill_state:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Operational readiness state such as ready, running, retrying, or failed."
+        doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of documents visible to the index."
+        query_visible_doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Documents currently visible to queries."
+        published_doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        published_node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        root_node:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        published_root_node:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        dense_replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        dense_replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        dense_publish_pending:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Whether dense/vector artifacts still need publication before queries see the latest data."
+        coverage:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: false
+          description: "Source document coverage accounting for embeddings indexes."
+          properties:
+            policy:
+              type: string
+              description: "Coverage policy used to decide readiness."
+            source_total:
+              type: integer
+              format: uint64
+              description: "Total source documents expected for coverage."
+            produced:
+              type: integer
+              format: uint64
+              description: "Source documents with produced embeddings."
+            skipped:
+              type: integer
+              format: uint64
+              description: "Source documents intentionally skipped by coverage policy."
+            terminal_failed:
+              type: integer
+              format: uint64
+              description: "Source documents that reached a terminal enrichment failure."
+            covered:
+              type: integer
+              format: uint64
+              description: "Source documents counted as covered by the coverage policy."
+            complete:
+              type: boolean
+              description: "Whether the coverage policy considers the index complete."
+        replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_catch_up_required:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_present:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_fresh:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        runtime_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        catch_up_phase:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        catch_up_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        enrichment_runtime:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          properties:
+            pending_sequence_count:
+              type: integer
+              format: uint64
+          description: "Embedding enrichment worker runtime diagnostics."
+        hbc_cache:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+        hbc_posting:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+        async_indexing:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+        projection_checkpoint_status:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required."
+        projection_checkpoint_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Highest derived-log sequence covered by the durable projection checkpoint."
+        projection_checkpoint_generation:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Projection generation associated with the durable checkpoint."
+        projection_checkpoint_config_hash:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Projection configuration identity associated with the durable checkpoint."
+        checkpoint_replay_tail_sequence_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of derived-log sequences after the durable checkpoint that still need replay."
+        repair_scan_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Repair issues found by explicit repair-scan accounting for this projection."
+        term_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        edge_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Artifact resolution replay diagnostics."
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Artifact promotion replay diagnostics."
     RelationalIndexRepairReport:
       type: object
       description: "Counters from relational column-backed index repair. These counters describe disposable derived-index artifacts rebuilt from authoritative packed rows."
@@ -505,6 +869,10 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether the sidecar is currently rebuilding"
+        backfill_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Whether the sidecar is actively rebuilding, replaying, or catching up."
         backfill_progress:
           x-go-type-skip-optional-pointer: true
           type: number
@@ -515,6 +883,60 @@ components:
           type: integer
           format: uint64
           description: "Number of documents processed during current backfill"
+        backfill_state:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Operational readiness state such as ready, running, retrying, or failed."
+        doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of documents visible to the sidecar."
+        term_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_catch_up_required:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_present:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_fresh:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        runtime_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        catch_up_phase:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        catch_up_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        async_indexing:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
         healthy:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -613,6 +1035,100 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: uint64
+        projection_checkpoint_status:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required."
+        projection_checkpoint_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Highest derived-log sequence covered by the durable projection checkpoint."
+        projection_checkpoint_generation:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Projection generation associated with the durable checkpoint."
+        projection_checkpoint_config_hash:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Projection configuration identity associated with the durable checkpoint."
+        checkpoint_replay_tail_sequence_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of derived-log sequences after the durable checkpoint that still need replay."
+        repair_scan_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Repair issues found by explicit repair-scan accounting for this projection."
+        edge_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        source_artifact:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Source artifact stream used to materialize graph edges."
+        resolver_replay:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Graph resolver replay diagnostics."
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Artifact resolution replay diagnostics."
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Artifact promotion replay diagnostics."
     MergeStrategy:
       type: string
       enum:
@@ -833,6 +1349,10 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether the index is currently rebuilding"
+        backfill_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Whether the index is actively rebuilding, materializing, or catching up."
         backfill_progress:
           x-go-type-skip-optional-pointer: true
           type: number
@@ -843,6 +1363,156 @@ components:
           type: integer
           format: uint64
           description: "Number of edges indexed during current rebuild"
+        backfill_state:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Operational readiness state such as ready, running, retrying, or failed."
+        doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of documents covered by the graph index."
+        edge_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of graph edges currently indexed."
+        node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of graph nodes currently indexed."
+        replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_catch_up_required:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_present:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_fresh:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        runtime_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        catch_up_phase:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        catch_up_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        source_artifact:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Graph source artifact materialization status."
+        resolver_replay:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Resolver replay diagnostics for graph materialization."
+        async_indexing:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+        projection_checkpoint_status:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required."
+        projection_checkpoint_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Highest derived-log sequence covered by the durable projection checkpoint."
+        projection_checkpoint_generation:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Projection generation associated with the durable checkpoint."
+        projection_checkpoint_config_hash:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Projection configuration identity associated with the durable checkpoint."
+        checkpoint_replay_tail_sequence_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of derived-log sequences after the durable checkpoint that still need replay."
+        repair_scan_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Repair issues found by explicit repair-scan accounting for this projection."
+        term_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Artifact resolution replay diagnostics."
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Artifact promotion replay diagnostics."
         algebraic_graph:
           x-go-type-skip-optional-pointer: true
           type: object

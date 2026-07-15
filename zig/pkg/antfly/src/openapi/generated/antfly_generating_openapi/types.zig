@@ -3,66 +3,56 @@
 
 const std = @import("std");
 
-/// The generative AI provider to use.
-pub const GeneratorProvider = enum {
-    gemini,
-    vertex,
-    ollama,
-    openai,
-    openrouter,
-    bedrock,
-    anthropic,
-    cohere,
-    antfly,
-    mock,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .gemini => "gemini",
-            .vertex => "vertex",
-            .ollama => "ollama",
-            .openai => "openai",
-            .openrouter => "openrouter",
-            .bedrock => "bedrock",
-            .anthropic => "anthropic",
-            .cohere => "cohere",
-            .antfly => "antfly",
-            .mock => "mock",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "gemini", .gemini },
-            .{ "vertex", .vertex },
-            .{ "ollama", .ollama },
-            .{ "openai", .openai },
-            .{ "openrouter", .openrouter },
-            .{ "bedrock", .bedrock },
-            .{ "anthropic", .anthropic },
-            .{ "cohere", .cohere },
-            .{ "antfly", .antfly },
-            .{ "mock", .mock },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
+/// Configuration for the Antfly inference generative AI provider.
+pub const AntflyGeneratorConfig = struct {
+    /// The name of the generator model.
+    model: []const u8,
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter.
+    top_p: ?f32 = null,
+    /// Top-k sampling parameter.
+    top_k: ?i64 = null,
+    /// HTTP response timeout in seconds for Inference API calls.
+    timeout: ?i64 = null,
 };
 
-/// Retry configuration for generator calls
-pub const RetryConfig = struct {
-    /// Maximum number of retry attempts
-    max_attempts: ?i64 = null,
-    /// Initial backoff delay in milliseconds
-    initial_backoff_ms: ?i64 = null,
-    /// Multiplier for exponential backoff
-    backoff_multiplier: ?f32 = null,
-    /// Maximum backoff delay in milliseconds
-    max_backoff_ms: ?i64 = null,
+/// Configuration for the Anthropic generative AI provider.
+pub const AnthropicGeneratorConfig = struct {
+    /// The full model ID of the Anthropic model to use.
+    model: []const u8,
+    /// The Anthropic API key.
+    api_key: ?[]const u8 = null,
+    /// The URL of the Anthropic API endpoint.
+    url: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-1.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate in the response.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter (0.0-1.0).
+    top_p: ?f32 = null,
+    /// Top-k sampling parameter.
+    top_k: ?i64 = null,
+};
+
+/// Configuration for the AWS Bedrock generative AI provider.
+pub const BedrockGeneratorConfig = struct {
+    /// The Bedrock model ID to use.
+    model: []const u8,
+    /// The AWS region for the Bedrock service.
+    region: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-1.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter.
+    top_p: ?f32 = null,
+    /// Top-k sampling parameter.
+    top_k: ?i64 = null,
 };
 
 /// Condition for trying the next generator in chain: - always: Always try next regardless of outcome - on_error: Try next on any error (default) - on_timeout: Try next only on timeout errors - on_rate_limit: Try next only on rate limit errors
@@ -97,6 +87,30 @@ pub const ChainCondition = enum {
     }
 };
 
+/// A single link in a generator chain with optional retry and condition
+pub const ChainLink = struct {
+    generator: GeneratorConfig,
+    /// Retry configuration for this generator
+    retry: ?RetryConfig = null,
+    /// When to try the next generator in chain
+    condition: ?ChainCondition = null,
+};
+
+/// OpenAI-compatible message in a generation/chat conversation.
+pub const ChatMessage = struct {
+    role: ChatMessageRole,
+    content: ?ChatMessageContent = null,
+    /// Tool calls made by the assistant (only for role=assistant).
+    tool_calls: ?[]const ToolCall = null,
+    /// ID of the tool call this message responds to (only for role=tool).
+    tool_call_id: ?[]const u8 = null,
+    /// Optional tool name for tool messages when model templates need it.
+    name: ?[]const u8 = null,
+};
+
+/// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts: [{"type": "text", "text": "Hello"}]
+pub const ChatMessageContent = std.json.Value;
+
 /// Role of the message sender in a generation/chat conversation
 pub const ChatMessageRole = enum {
     user,
@@ -129,212 +143,6 @@ pub const ChatMessageRole = enum {
     }
 };
 
-pub const TextContentPartType = enum {
-    text,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .text => "text",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "text", .text },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Text content for multimodal input.
-pub const TextContentPart = struct {
-    type: TextContentPartType,
-    /// Text content.
-    text: []const u8,
-};
-
-/// Image URL or data URI.
-pub const ImageURL = struct {
-    /// URL or data URI (data:image/png;base64,...).
-    url: []const u8,
-};
-
-pub const MediaContentPartType = enum {
-    media,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .media => "media",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "media", .media },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Inline binary media content (audio, image, etc.).
-pub const MediaContentPart = struct {
-    type: MediaContentPartType,
-    /// Base64-encoded binary data.
-    data: []const u8,
-    /// MIME type (audio/wav, image/gif, image/png, etc.).
-    mime_type: []const u8,
-};
-
-/// The function called by a model tool call.
-pub const ToolCallFunction = struct {
-    /// Function name.
-    name: []const u8,
-    /// JSON string of function arguments.
-    arguments: []const u8,
-};
-
-/// Configuration for the Google generative AI provider (Gemini).
-pub const GoogleGeneratorConfig = struct {
-    /// The Google Cloud project ID.
-    project_id: ?[]const u8 = null,
-    /// The Google Cloud location (e.g., 'us-central1').
-    location: ?[]const u8 = null,
-    /// The name of the generative model to use.
-    model: []const u8,
-    /// Controls randomness in generation (0.0-2.0).
-    temperature: ?f32 = null,
-    /// Maximum number of tokens to generate.
-    max_tokens: ?i64 = null,
-    /// Nucleus sampling parameter.
-    top_p: ?f32 = null,
-    /// Top-k sampling parameter.
-    top_k: ?i64 = null,
-    /// The Google API key.
-    api_key: ?[]const u8 = null,
-    /// The URL of the Google API endpoint.
-    url: ?[]const u8 = null,
-};
-
-/// Configuration for Google Cloud Vertex AI generative models.
-pub const VertexGeneratorConfig = struct {
-    /// The name of the Vertex AI model to use.
-    model: []const u8,
-    /// Google Cloud project ID.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud region for Vertex AI API.
-    location: ?[]const u8 = null,
-    /// Path to service account JSON key file.
-    credentials_path: ?[]const u8 = null,
-    /// Controls randomness in generation (0.0-2.0).
-    temperature: ?f32 = null,
-    /// Maximum number of tokens to generate in the response.
-    max_tokens: ?i64 = null,
-    /// Nucleus sampling parameter (0.0-1.0).
-    top_p: ?f32 = null,
-    /// Top-k sampling parameter.
-    top_k: ?i64 = null,
-};
-
-/// Configuration for the Ollama generative AI provider.
-pub const OllamaGeneratorConfig = struct {
-    /// The name of the Ollama model to use.
-    model: []const u8,
-    /// The URL of the Ollama API endpoint.
-    url: ?[]const u8 = null,
-    /// Controls randomness in generation (0.0-2.0).
-    temperature: ?f32 = null,
-    /// Maximum number of tokens to generate.
-    max_tokens: ?i64 = null,
-    /// Nucleus sampling parameter.
-    top_p: ?f32 = null,
-    /// Top-k sampling parameter.
-    top_k: ?i64 = null,
-    /// HTTP response timeout in seconds for Ollama API calls.
-    timeout: ?i64 = null,
-};
-
-/// Configuration for the Antfly inference generative AI provider.
-pub const AntflyGeneratorConfig = struct {
-    /// The name of the generator model.
-    model: []const u8,
-    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
-    api_url: ?[]const u8 = null,
-    /// Controls randomness in generation (0.0-2.0).
-    temperature: ?f32 = null,
-    /// Maximum number of tokens to generate.
-    max_tokens: ?i64 = null,
-    /// Nucleus sampling parameter.
-    top_p: ?f32 = null,
-    /// Top-k sampling parameter.
-    top_k: ?i64 = null,
-    /// HTTP response timeout in seconds for Inference API calls.
-    timeout: ?i64 = null,
-};
-
-/// Configuration for the OpenAI generative AI provider.
-pub const OpenAIGeneratorConfig = struct {
-    /// The name of the OpenAI model to use.
-    model: []const u8,
-    /// The URL of the OpenAI API endpoint.
-    url: ?[]const u8 = null,
-    /// The OpenAI API key.
-    api_key: ?[]const u8 = null,
-    /// Controls randomness in generation (0.0-2.0).
-    temperature: ?f32 = null,
-    /// Maximum number of tokens to generate.
-    max_tokens: ?i64 = null,
-    /// Nucleus sampling parameter.
-    top_p: ?f32 = null,
-    /// Penalty for token frequency (-2.0 to 2.0).
-    frequency_penalty: ?f32 = null,
-    /// Penalty for token presence (-2.0 to 2.0).
-    presence_penalty: ?f32 = null,
-};
-
-/// Configuration for the AWS Bedrock generative AI provider.
-pub const BedrockGeneratorConfig = struct {
-    /// The Bedrock model ID to use.
-    model: []const u8,
-    /// The AWS region for the Bedrock service.
-    region: ?[]const u8 = null,
-    /// Controls randomness in generation (0.0-1.0).
-    temperature: ?f32 = null,
-    /// Maximum number of tokens to generate.
-    max_tokens: ?i64 = null,
-    /// Nucleus sampling parameter.
-    top_p: ?f32 = null,
-    /// Top-k sampling parameter.
-    top_k: ?i64 = null,
-};
-
-/// Configuration for the Anthropic generative AI provider.
-pub const AnthropicGeneratorConfig = struct {
-    /// The full model ID of the Anthropic model to use.
-    model: []const u8,
-    /// The Anthropic API key.
-    api_key: ?[]const u8 = null,
-    /// The URL of the Anthropic API endpoint.
-    url: ?[]const u8 = null,
-    /// Controls randomness in generation (0.0-1.0).
-    temperature: ?f32 = null,
-    /// Maximum number of tokens to generate in the response.
-    max_tokens: ?i64 = null,
-    /// Nucleus sampling parameter (0.0-1.0).
-    top_p: ?f32 = null,
-    /// Top-k sampling parameter.
-    top_k: ?i64 = null,
-};
-
 /// Configuration for the Cohere generative AI provider.
 pub const CohereGeneratorConfig = struct {
     /// The name of the Cohere model to use.
@@ -353,121 +161,6 @@ pub const CohereGeneratorConfig = struct {
     frequency_penalty: ?f32 = null,
     /// Penalty for token presence (0.0-1.0).
     presence_penalty: ?f32 = null,
-};
-
-/// Configuration for the OpenRouter generative AI provider.
-pub const OpenRouterGeneratorConfig = struct {
-    /// Single model identifier. Either model or models must be provided.
-    model: ?[]const u8 = null,
-    /// Array of model identifiers for fallback routing. Either model or models must be provided.
-    models: ?[]const []const u8 = null,
-    /// The OpenRouter API key.
-    api_key: ?[]const u8 = null,
-    /// Controls randomness in generation (0.0-2.0).
-    temperature: ?f32 = null,
-    /// Maximum number of tokens to generate in the response.
-    max_tokens: ?i64 = null,
-    /// Nucleus sampling parameter (0.0-1.0).
-    top_p: ?f32 = null,
-    /// Penalty for token frequency (-2.0 to 2.0).
-    frequency_penalty: ?f32 = null,
-    /// Penalty for token presence (-2.0 to 2.0).
-    presence_penalty: ?f32 = null,
-};
-
-pub const ImageURLContentPartType = enum {
-    image_url,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .image_url => "image_url",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "image_url", .image_url },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Image content in OpenAI-compatible format.
-pub const ImageURLContentPart = struct {
-    type: ImageURLContentPartType,
-    image_url: ImageURL,
-};
-
-pub const ToolCallType = enum {
-    function,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .function => "function",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "function", .function },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// OpenAI-compatible assistant tool call.
-pub const ToolCall = struct {
-    /// Tool call identifier.
-    id: []const u8,
-    type: ToolCallType,
-    function: ToolCallFunction,
-};
-
-/// A unified configuration for a generative AI provider.
-pub const GeneratorConfig = struct {
-    /// The Google Cloud project ID.
-    project_id: ?[]const u8 = null,
-    /// The Google Cloud location (e.g., 'us-central1').
-    location: ?[]const u8 = null,
-    /// The name of the generative model to use.
-    model: ?[]const u8 = null,
-    /// Controls randomness in generation (0.0-2.0).
-    temperature: ?f32 = null,
-    /// Maximum number of tokens to generate.
-    max_tokens: ?i64 = null,
-    /// Nucleus sampling parameter.
-    top_p: ?f32 = null,
-    /// Top-k sampling parameter.
-    top_k: ?i64 = null,
-    /// The Google API key.
-    api_key: ?[]const u8 = null,
-    /// The URL of the Google API endpoint.
-    url: ?[]const u8 = null,
-    /// Path to service account JSON key file.
-    credentials_path: ?[]const u8 = null,
-    /// HTTP response timeout in seconds for Ollama API calls.
-    timeout: ?i64 = null,
-    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
-    api_url: ?[]const u8 = null,
-    /// Penalty for token frequency (-2.0 to 2.0).
-    frequency_penalty: ?f32 = null,
-    /// Penalty for token presence (-2.0 to 2.0).
-    presence_penalty: ?f32 = null,
-    /// Array of model identifiers for fallback routing. Either model or models must be provided.
-    models: ?[]const []const u8 = null,
-    /// The AWS region for the Bedrock service.
-    region: ?[]const u8 = null,
-    provider: GeneratorProvider,
 };
 
 /// A content part for multimodal input (text, image URL, or inline media).
@@ -540,26 +233,333 @@ pub const ContentPart = union(enum) {
     }
 };
 
-/// A single link in a generator chain with optional retry and condition
-pub const ChainLink = struct {
-    generator: GeneratorConfig,
-    /// Retry configuration for this generator
-    retry: ?RetryConfig = null,
-    /// When to try the next generator in chain
-    condition: ?ChainCondition = null,
+/// A unified configuration for a generative AI provider.
+pub const GeneratorConfig = struct {
+    /// The Google Cloud project ID.
+    project_id: ?[]const u8 = null,
+    /// The Google Cloud location (e.g., 'us-central1').
+    location: ?[]const u8 = null,
+    /// The name of the generative model to use.
+    model: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter.
+    top_p: ?f32 = null,
+    /// Top-k sampling parameter.
+    top_k: ?i64 = null,
+    /// The Google API key.
+    api_key: ?[]const u8 = null,
+    /// The URL of the Google API endpoint.
+    url: ?[]const u8 = null,
+    /// Path to service account JSON key file.
+    credentials_path: ?[]const u8 = null,
+    /// HTTP response timeout in seconds for Ollama API calls.
+    timeout: ?i64 = null,
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    /// Penalty for token frequency (-2.0 to 2.0).
+    frequency_penalty: ?f32 = null,
+    /// Penalty for token presence (-2.0 to 2.0).
+    presence_penalty: ?f32 = null,
+    /// Array of model identifiers for fallback routing. Either model or models must be provided.
+    models: ?[]const []const u8 = null,
+    /// The AWS region for the Bedrock service.
+    region: ?[]const u8 = null,
+    provider: GeneratorProvider,
 };
 
-/// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts: [{"type": "text", "text": "Hello"}]
-pub const ChatMessageContent = std.json.Value;
+/// The generative AI provider to use.
+pub const GeneratorProvider = enum {
+    gemini,
+    vertex,
+    ollama,
+    openai,
+    openrouter,
+    bedrock,
+    anthropic,
+    cohere,
+    antfly,
+    mock,
 
-/// OpenAI-compatible message in a generation/chat conversation.
-pub const ChatMessage = struct {
-    role: ChatMessageRole,
-    content: ?ChatMessageContent = null,
-    /// Tool calls made by the assistant (only for role=assistant).
-    tool_calls: ?[]const ToolCall = null,
-    /// ID of the tool call this message responds to (only for role=tool).
-    tool_call_id: ?[]const u8 = null,
-    /// Optional tool name for tool messages when model templates need it.
-    name: ?[]const u8 = null,
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .gemini => "gemini",
+            .vertex => "vertex",
+            .ollama => "ollama",
+            .openai => "openai",
+            .openrouter => "openrouter",
+            .bedrock => "bedrock",
+            .anthropic => "anthropic",
+            .cohere => "cohere",
+            .antfly => "antfly",
+            .mock => "mock",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "gemini", .gemini },
+            .{ "vertex", .vertex },
+            .{ "ollama", .ollama },
+            .{ "openai", .openai },
+            .{ "openrouter", .openrouter },
+            .{ "bedrock", .bedrock },
+            .{ "anthropic", .anthropic },
+            .{ "cohere", .cohere },
+            .{ "antfly", .antfly },
+            .{ "mock", .mock },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Configuration for the Google generative AI provider (Gemini).
+pub const GoogleGeneratorConfig = struct {
+    /// The Google Cloud project ID.
+    project_id: ?[]const u8 = null,
+    /// The Google Cloud location (e.g., 'us-central1').
+    location: ?[]const u8 = null,
+    /// The name of the generative model to use.
+    model: []const u8,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter.
+    top_p: ?f32 = null,
+    /// Top-k sampling parameter.
+    top_k: ?i64 = null,
+    /// The Google API key.
+    api_key: ?[]const u8 = null,
+    /// The URL of the Google API endpoint.
+    url: ?[]const u8 = null,
+};
+
+/// Image URL or data URI.
+pub const ImageURL = struct {
+    /// URL or data URI (data:image/png;base64,...).
+    url: []const u8,
+};
+
+pub const ImageURLContentPartType = enum {
+    image_url,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .image_url => "image_url",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "image_url", .image_url },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Image content in OpenAI-compatible format.
+pub const ImageURLContentPart = struct {
+    type: ImageURLContentPartType,
+    image_url: ImageURL,
+};
+
+pub const MediaContentPartType = enum {
+    media,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .media => "media",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "media", .media },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Inline binary media content (audio, image, etc.).
+pub const MediaContentPart = struct {
+    type: MediaContentPartType,
+    /// Base64-encoded binary data.
+    data: []const u8,
+    /// MIME type (audio/wav, image/gif, image/png, etc.).
+    mime_type: []const u8,
+};
+
+/// Configuration for the Ollama generative AI provider.
+pub const OllamaGeneratorConfig = struct {
+    /// The name of the Ollama model to use.
+    model: []const u8,
+    /// The URL of the Ollama API endpoint.
+    url: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter.
+    top_p: ?f32 = null,
+    /// Top-k sampling parameter.
+    top_k: ?i64 = null,
+    /// HTTP response timeout in seconds for Ollama API calls.
+    timeout: ?i64 = null,
+};
+
+/// Configuration for the OpenAI generative AI provider.
+pub const OpenAIGeneratorConfig = struct {
+    /// The name of the OpenAI model to use.
+    model: []const u8,
+    /// The URL of the OpenAI API endpoint.
+    url: ?[]const u8 = null,
+    /// The OpenAI API key.
+    api_key: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter.
+    top_p: ?f32 = null,
+    /// Penalty for token frequency (-2.0 to 2.0).
+    frequency_penalty: ?f32 = null,
+    /// Penalty for token presence (-2.0 to 2.0).
+    presence_penalty: ?f32 = null,
+};
+
+/// Configuration for the OpenRouter generative AI provider.
+pub const OpenRouterGeneratorConfig = struct {
+    /// Single model identifier. Either model or models must be provided.
+    model: ?[]const u8 = null,
+    /// Array of model identifiers for fallback routing. Either model or models must be provided.
+    models: ?[]const []const u8 = null,
+    /// The OpenRouter API key.
+    api_key: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate in the response.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter (0.0-1.0).
+    top_p: ?f32 = null,
+    /// Penalty for token frequency (-2.0 to 2.0).
+    frequency_penalty: ?f32 = null,
+    /// Penalty for token presence (-2.0 to 2.0).
+    presence_penalty: ?f32 = null,
+};
+
+/// Retry configuration for generator calls
+pub const RetryConfig = struct {
+    /// Maximum number of retry attempts
+    max_attempts: ?i64 = null,
+    /// Initial backoff delay in milliseconds
+    initial_backoff_ms: ?i64 = null,
+    /// Multiplier for exponential backoff
+    backoff_multiplier: ?f32 = null,
+    /// Maximum backoff delay in milliseconds
+    max_backoff_ms: ?i64 = null,
+};
+
+pub const TextContentPartType = enum {
+    text,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Text content for multimodal input.
+pub const TextContentPart = struct {
+    type: TextContentPartType,
+    /// Text content.
+    text: []const u8,
+};
+
+pub const ToolCallType = enum {
+    function,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .function => "function",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "function", .function },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// OpenAI-compatible assistant tool call.
+pub const ToolCall = struct {
+    /// Tool call identifier.
+    id: []const u8,
+    type: ToolCallType,
+    function: ToolCallFunction,
+};
+
+/// The function called by a model tool call.
+pub const ToolCallFunction = struct {
+    /// Function name.
+    name: []const u8,
+    /// JSON string of function arguments.
+    arguments: []const u8,
+};
+
+/// Configuration for Google Cloud Vertex AI generative models.
+pub const VertexGeneratorConfig = struct {
+    /// The name of the Vertex AI model to use.
+    model: []const u8,
+    /// Google Cloud project ID.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud region for Vertex AI API.
+    location: ?[]const u8 = null,
+    /// Path to service account JSON key file.
+    credentials_path: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate in the response.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter (0.0-1.0).
+    top_p: ?f32 = null,
+    /// Top-k sampling parameter.
+    top_k: ?i64 = null,
 };

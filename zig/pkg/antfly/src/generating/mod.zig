@@ -305,7 +305,7 @@ test "generating optional env auth is skipped when unset" {
 
 test "generating explicit missing secret auth remains strict" {
     const alloc = std.testing.allocator;
-    var api_key = try common_secrets.SecretValue.initConfig(alloc, "secret://missing.generator_key") orelse return error.TestUnexpectedResult;
+    var api_key = try common_secrets.SecretValue.initConfig(alloc, "${secret:missing.generator_key}") orelse return error.TestUnexpectedResult;
     defer api_key.deinit(alloc);
 
     var state = BackendState{

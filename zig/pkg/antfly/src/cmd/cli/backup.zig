@@ -103,7 +103,7 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
             break :blk out_plan.?.backup_id;
         } else opts.backup_id orelse cli.fatal("--backup-id is required", .{});
         const location = if (out_plan) |plan| plan.location else opts.location;
-        try client.backupTable(tbl, .{ .backup_id = bid, .location = location, .format = selected_format });
+        try client.backupTable(tbl, .{ .backup_id = bid, .location = location, .format = backupFormatOpenApi(selected_format) });
         if (out_plan) |plan| {
             validatePortableOutputFile(allocator, io, plan.out_path) catch |err| switch (err) {
                 error.EmptyPortableOutput => cli.fatal("portable backup completed but local --out file is empty: {s}", .{plan.out_path}),
@@ -141,6 +141,24 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
     std.debug.print("Backup command successful.\n", .{});
 }
 
+fn backupFormatOpenApi(format: []const u8) antfly_client.types.BackupRequestFormat {
+    if (std.mem.eql(u8, format, "portable")) return .portable;
+    return .native;
+}
+
+fn restoreFormatOpenApi(format: ?[]const u8) ?antfly_client.types.RestoreRequestFormat {
+    const value = format orelse return null;
+    if (std.mem.eql(u8, value, "portable")) return .portable;
+    return .native;
+}
+
+fn clusterRestoreModeOpenApi(mode: ?[]const u8) ?antfly_client.types.ClusterRestoreRequestRestoreMode {
+    const value = mode orelse return null;
+    if (std.mem.eql(u8, value, "skip_if_exists")) return .skip_if_exists;
+    if (std.mem.eql(u8, value, "overwrite") or std.mem.eql(u8, value, "replace")) return .overwrite;
+    return .fail_if_exists;
+}
+
 pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const opts = parseRestoreArgs(args) catch cli.fatal("invalid restore arguments", .{});
     if (opts.help) {
@@ -176,7 +194,7 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
     const bid = opts.backup_id orelse cli.fatal("--backup-id is required", .{});
 
     if (opts.table_name) |tbl| {
-        try client.restoreTable(tbl, .{ .backup_id = bid, .location = opts.location, .format = opts.format });
+        try client.restoreTable(tbl, .{ .backup_id = bid, .location = opts.location, .format = restoreFormatOpenApi(opts.format) });
         std.debug.print("Restore command successfully initiated.\n", .{});
         return;
     }
@@ -195,7 +213,7 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
         .backup_id = bid,
         .location = opts.location,
         .table_names = table_names,
-        .restore_mode = opts.restore_mode,
+        .restore_mode = clusterRestoreModeOpenApi(opts.restore_mode),
     });
     defer resp.deinit();
     if (resp.data) |data| {
@@ -229,7 +247,7 @@ fn prepareInputRestorePlan(
         .request = .{
             .backup_id = staged.backup_id,
             .location = staged.location,
-            .format = "portable",
+            .format = .portable,
         },
     };
 }
@@ -609,7 +627,7 @@ test "restore input plan stages aflite as portable table restore" {
     try std.testing.expectEqualStrings("docs", plan.tableName());
     try std.testing.expectEqualStrings("lite-restore-input-plan-src", plan.request.backup_id);
     try std.testing.expectEqualStrings(location, plan.request.location);
-    try std.testing.expectEqualStrings("portable", plan.request.format.?);
+    try std.testing.expectEqual(antfly_client.types.RestoreRequestFormat.portable, plan.request.format.?);
     try std.testing.expectEqualStrings("lite-restore-input-plan-src.afb", plan.staged.snapshot_path);
 
     var backup_location = try antfly.public_api.backups.openBackupLocation(allocator, location);

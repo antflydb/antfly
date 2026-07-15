@@ -17,9 +17,23 @@
       ]
     },
     {
+      "reason": "cte_body_join_plan",
+      "coverage": [
+        "read_cte_body_join",
+        "read_cte_body_multi_join"
+      ]
+    },
+    {
       "reason": "cte_mutation_source_plan",
       "coverage": [
         "merge_mutation_data_modifying_cte"
+      ]
+    },
+    {
+      "reason": "default_scalar_subquery_plan",
+      "coverage": [
+        "ddl_add_column_default_rewrite",
+        "ddl_alter_column_default"
       ]
     },
     {
@@ -48,6 +62,18 @@
       ]
     },
     {
+      "reason": "document_sql_bounded_scan_unsupported_residual",
+      "coverage": [
+        "document_query_view_mapping_residual_predicate_native_equivalence"
+      ]
+    },
+    {
+      "reason": "document_sql_lateral_requires_native_producer",
+      "coverage": [
+        "document_query_view_mapping_correlated_lateral_native_equivalence"
+      ]
+    },
+    {
       "reason": "document_sql_unnest_unsupported",
       "coverage": [
         "document_query_array_unnest_rejected_cartesian"
@@ -65,6 +91,51 @@
       "reason": "document_sql_view_mapping_unsupported",
       "coverage": [
         "unsupported_read_document_view_mapping_projection_path"
+      ]
+    },
+    {
+      "reason": "document_sql_write_merge_requires_native_producer",
+      "coverage": [
+        "document_write_document_sql_merge_delete",
+        "document_write_document_sql_merge_returning"
+      ]
+    },
+    {
+      "reason": "document_sql_write_returning_all_unsupported",
+      "coverage": [
+        "returning_all_delete",
+        "returning_all_insert",
+        "returning_all_update"
+      ]
+    },
+    {
+      "reason": "document_sql_write_returning_duplicate_output",
+      "coverage": [
+        "deterministic_returning_rows"
+      ]
+    },
+    {
+      "reason": "document_sql_write_returning_expression_unsupported",
+      "coverage": [
+        "document_write_document_sql_projection_on_conflict_do_update_returning"
+      ]
+    },
+    {
+      "reason": "document_sql_write_returning_generated_field",
+      "coverage": [
+        "document_write_document_sql_json_patch_generated_field"
+      ]
+    },
+    {
+      "reason": "document_sql_write_returning_version_unsupported",
+      "coverage": [
+        "document_write_document_sql_merge_returning"
+      ]
+    },
+    {
+      "reason": "document_sql_write_returning_virtual_field_unsupported",
+      "coverage": [
+        "document_write_document_sql_merge_returning"
       ]
     },
     {
@@ -198,6 +269,12 @@
       ]
     },
     {
+      "reason": "row_batch_scalar_subquery_plan",
+      "coverage": [
+        "insert_source_scalar_subquery_assignment"
+      ]
+    },
+    {
       "reason": "row_lock_mode_plan",
       "coverage": [
         "invalid_read_row_lock_target",
@@ -240,6 +317,30 @@
       "coverage": [
         "read_set_operation_cross_table_source_schema",
         "read_set_operation_cross_table_source_schema_classifier"
+      ]
+    },
+    {
+      "reason": "subquery_expression_plan",
+      "coverage": [
+        "read_or_correlated_subquery"
+      ]
+    },
+    {
+      "reason": "subquery_quantified_plan",
+      "coverage": [
+        "read_quantified_subquery_not_equal_any"
+      ]
+    },
+    {
+      "reason": "subquery_scalar_plan",
+      "coverage": [
+        "update_source_scalar_subquery_expression_update"
+      ]
+    },
+    {
+      "reason": "subquery_semijoin_plan",
+      "coverage": [
+        "update_joined_source_exists_semijoin"
       ]
     },
     {

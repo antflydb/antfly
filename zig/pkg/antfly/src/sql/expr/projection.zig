@@ -45,6 +45,7 @@ const freeExpressionProjections = plan_mod.freeExpressionProjections;
 
 pub const SelectItemStart = enum {
     pipe_concat,
+    unary_positive,
     unary_negative,
     boolean_not,
     extension_function,
@@ -53,6 +54,7 @@ pub const SelectItemStart = enum {
     now,
     current_date,
     typed_datetime_literal,
+    array_constructor,
     json_extract_path,
     json_typeof,
     json_array_length,
@@ -110,12 +112,14 @@ pub const SelectItemStart = enum {
 
 pub fn selectItemStartAt(tokens: []const Token, pos: usize) ?SelectItemStart {
     if (expr_parse.rowExpressionHasTopLevelPipeConcat(tokens, pos)) return .pipe_concat;
+    if (parser.peekKind(tokens, pos, .plus)) return .unary_positive;
     if (expr_token.peekUnaryNegativeExpressionSyntax(tokens, pos)) return .unary_negative;
     if (expr_token.peekBooleanNotExpressionSyntax(tokens, pos)) return .boolean_not;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsUuidV4Function)) return .uuid_v4;
     if (expr_token.peekSqlNowExpressionSyntax(tokens, pos)) return .now;
     if (expr_token.peekSqlCurrentDateExpressionSyntax(tokens, pos)) return .current_date;
     if (expr_parse.peekSqlTypedDatetimeLiteral(tokens, pos)) return .typed_datetime_literal;
+    if (parser.peekKeywordTag(tokens, pos, .array)) return .array_constructor;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsJsonExtractPathFunction)) return .json_extract_path;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsJsonTypeofFunction)) return .json_typeof;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsJsonArrayLengthFunction)) return .json_array_length;
@@ -741,6 +745,21 @@ pub fn parseGenericExpressionProjectionAlloc(
     return try buildNumericExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, type_context, expression);
 }
 
+pub fn parseUnaryPositiveExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: expr_type.RowExpressionTypeContext,
+    options: ExpressionProjectionParserOptions,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const start = pos.*;
+    try parser.expectToken(tokens, pos, .plus);
+    const expression = try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
+    errdefer freeExpression(alloc, expression);
+    try validateGeneratedExpressionProjectionIdentity(alloc, tokens, start, pos.*, expression, options);
+    return try buildNumericExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, type_context, expression);
+}
+
 pub fn parseBooleanExpressionProjectionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -913,6 +932,24 @@ pub fn parseJsonValueExpressionProjectionAlloc(
         .value_json = value_json,
     };
     return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, default_output);
+}
+
+pub fn parseArrayConstructorExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    options: ExpressionProjectionParserOptions,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const start = pos.*;
+    const value_json = try value_mod.parseSqlArrayConstructorJsonAlloc(alloc, tokens, pos, params);
+    const expression: db_mod.types.RelationalRowsExpression = .{
+        .kind = .value,
+        .value_json = value_json,
+    };
+    errdefer freeExpression(alloc, expression);
+    try validateGeneratedExpressionProjectionIdentity(alloc, tokens, start, pos.*, expression, options);
+    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, "array");
 }
 
 pub fn parseArithmeticExpressionProjectionFromFieldAlloc(
@@ -1970,6 +2007,7 @@ fn generatedSelectItemStartAllowsExpressionKind(
 ) bool {
     return switch (start) {
         .pipe_concat => kind == .string_concat,
+        .unary_positive => kind == .unary_positive,
         .unary_negative => kind == .unary_negative,
         .boolean_not => kind == .logical_not,
         .extension_function,
@@ -2029,6 +2067,7 @@ fn generatedSelectItemStartAllowsExpressionKind(
         .now => kind == .function_call or kind == .current_timestamp,
         .current_date => kind == .current_date,
         .typed_datetime_literal => kind == .timestamp_literal,
+        .array_constructor => kind == .array_constructor,
         .case => kind == .case_expression,
         .cast => kind == .cast,
         .parenthesized => kind == .grouped,
@@ -2539,6 +2578,7 @@ pub fn parseSelectItemAlloc(
         try validateGeneratedSelectItemStartForExpression(tokens, start, options.generated_expression_ast);
         switch (start) {
             .pipe_concat => return .{ .expression = try parseTextExpressionProjectionAlloc(alloc, tokens, pos, type_context, options.expression) },
+            .unary_positive => return .{ .expression = try parseUnaryPositiveExpressionProjectionAlloc(alloc, tokens, pos, type_context, options.expression) },
             .unary_negative => return .{ .expression = try parseGenericExpressionProjectionAlloc(alloc, tokens, pos, type_context, options.expression) },
             .boolean_not => return .{ .expression = try parseBooleanExpressionProjectionAlloc(alloc, tokens, pos, type_context, options.expression) },
             .extension_function => return .{ .expression = try parseExtensionFunctionExpressionProjectionAlloc(alloc, tokens, pos, function_bindings.extension_functions, options.extension_function) },
@@ -2547,6 +2587,7 @@ pub fn parseSelectItemAlloc(
             .now => return .{ .expression = try parseNowExpressionProjectionAlloc(alloc, tokens, pos) },
             .current_date => return .{ .expression = try parseCurrentDateExpressionProjectionAlloc(alloc, tokens, pos) },
             .typed_datetime_literal => return .{ .expression = try parseTypedDatetimeLiteralExpressionProjectionAlloc(alloc, tokens, pos) },
+            .array_constructor => return .{ .expression = try parseArrayConstructorExpressionProjectionAlloc(alloc, tokens, pos, params, options.expression) },
             .json_extract_path => return .{ .expression = try parseJsonExtractPathExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
             .json_typeof => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "json_typeof", options.expression) },
             .json_array_length => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "json_array_length", options.expression) },

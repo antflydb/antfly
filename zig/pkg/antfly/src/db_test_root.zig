@@ -19,6 +19,7 @@ test {
     _ = @import("storage/db/mod.zig");
     _ = @import("storage/db/internal.zig");
     _ = @import("storage/db/lifecycle.zig");
+    _ = @import("storage/db/artifact_repair.zig");
     _ = @import("storage/db/ha_replication.zig");
     _ = @import("storage/db/write_path.zig");
     _ = @import("storage/db/transactions.zig");

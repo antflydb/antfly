@@ -22,9 +22,16 @@ pub const OwnedKVPair = struct {
 
 pub const ScanOptions = struct {
     skip_fn: ?*const fn (key: []const u8) bool = null,
+    reverse: bool = false,
 };
 
 pub const ScanAction = enum { @"continue", stop };
+
+pub const ScanWithContextCallback = *const fn (
+    ctx: ?*anyopaque,
+    key: []const u8,
+    value: []const u8,
+) anyerror!ScanAction;
 
 pub fn freeResults(alloc: std.mem.Allocator, results: []OwnedKVPair) void {
     for (results) |item| {
@@ -41,12 +48,16 @@ pub fn scan(
     options: ScanOptions,
     callback: *const fn (key: []const u8, value: []const u8) anyerror!ScanAction,
 ) !void {
-    var txn = try store.beginRead();
-    defer txn.abort();
+    const Adapter = struct {
+        callback: *const fn (key: []const u8, value: []const u8) anyerror!ScanAction,
 
-    var cur = try txn.openCursor();
-    defer cur.close();
-    try scanCursor(&cur, lower, upper, options, callback);
+        fn run(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!ScanAction {
+            const adapter: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try adapter.callback(key, value);
+        }
+    };
+    var adapter = Adapter{ .callback = callback };
+    return try scanWithContext(store, lower, upper, options, &adapter, Adapter.run);
 }
 
 pub fn scanCurrent(
@@ -56,12 +67,48 @@ pub fn scanCurrent(
     options: ScanOptions,
     callback: *const fn (key: []const u8, value: []const u8) anyerror!ScanAction,
 ) !void {
+    const Adapter = struct {
+        callback: *const fn (key: []const u8, value: []const u8) anyerror!ScanAction,
+
+        fn run(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!ScanAction {
+            const adapter: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try adapter.callback(key, value);
+        }
+    };
+    var adapter = Adapter{ .callback = callback };
+    return try scanCurrentWithContext(store, lower, upper, options, &adapter, Adapter.run);
+}
+
+pub fn scanWithContext(
+    store: *backend_erased.Store,
+    lower: []const u8,
+    upper: []const u8,
+    options: ScanOptions,
+    ctx: ?*anyopaque,
+    callback: ScanWithContextCallback,
+) !void {
+    var txn = try store.beginRead();
+    defer txn.abort();
+
+    var cur = try txn.openCursor();
+    defer cur.close();
+    try scanCursorWithContext(&cur, lower, upper, options, ctx, callback);
+}
+
+pub fn scanCurrentWithContext(
+    store: *backend_erased.Store,
+    lower: []const u8,
+    upper: []const u8,
+    options: ScanOptions,
+    ctx: ?*anyopaque,
+    callback: ScanWithContextCallback,
+) !void {
     var txn = try store.beginCurrentScan();
     defer txn.abort();
 
     var cur = try txn.openCursor();
     defer cur.close();
-    try scanCursor(&cur, lower, upper, options, callback);
+    try scanCursorWithContext(&cur, lower, upper, options, ctx, callback);
 }
 
 fn scanCursor(
@@ -71,26 +118,69 @@ fn scanCursor(
     options: ScanOptions,
     callback: *const fn (key: []const u8, value: []const u8) anyerror!ScanAction,
 ) !void {
-    cur.setUpperBound(if (upper.len > 0) upper else null);
+    const Adapter = struct {
+        callback: *const fn (key: []const u8, value: []const u8) anyerror!ScanAction,
 
-    const first = if (lower.len == 0)
-        (try cur.first()) orelse return
-    else
-        (try cur.seekAtOrAfter(lower)) orelse return;
+        fn run(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!ScanAction {
+            const adapter: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try adapter.callback(key, value);
+        }
+    };
+    var adapter = Adapter{ .callback = callback };
+    try scanCursorWithContext(cur, lower, upper, options, &adapter, Adapter.run);
+}
 
-    if (upper.len > 0 and std.mem.order(u8, first.key, upper) != .lt) return;
+fn scanCursorWithContext(
+    cur: *backend_erased.Cursor,
+    lower: []const u8,
+    upper: []const u8,
+    options: ScanOptions,
+    ctx: ?*anyopaque,
+    callback: ScanWithContextCallback,
+) !void {
+    if (!options.reverse) {
+        cur.setUpperBound(if (upper.len > 0) upper else null);
 
-    if (options.skip_fn == null or !options.skip_fn.?(first.key)) {
-        if (try callback(first.key, first.value) == .stop) return;
+        const first = if (lower.len == 0)
+            (try cur.first()) orelse return
+        else
+            (try cur.seekAtOrAfter(lower)) orelse return;
+
+        if (upper.len > 0 and std.mem.order(u8, first.key, upper) != .lt) return;
+
+        if (options.skip_fn == null or !options.skip_fn.?(first.key)) {
+            if (try callback(ctx, first.key, first.value) == .stop) return;
+        }
+
+        var entry = try cur.next();
+        while (entry) |kv| : (entry = try cur.next()) {
+            if (upper.len > 0 and std.mem.order(u8, kv.key, upper) != .lt) break;
+            if (options.skip_fn) |skip| {
+                if (skip(kv.key)) continue;
+            }
+            if (try callback(ctx, kv.key, kv.value) == .stop) return;
+        }
+        return;
     }
 
-    var entry = try cur.next();
-    while (entry) |kv| : (entry = try cur.next()) {
-        if (upper.len > 0 and std.mem.order(u8, kv.key, upper) != .lt) break;
-        if (options.skip_fn) |skip| {
-            if (skip(kv.key)) continue;
+    var entry = if (upper.len == 0)
+        try cur.last()
+    else
+        try cur.seekAtOrBefore(upper);
+    while (entry) |kv| {
+        if (upper.len > 0 and std.mem.order(u8, kv.key, upper) != .lt) {
+            entry = try cur.prev();
+            continue;
         }
-        if (try callback(kv.key, kv.value) == .stop) return;
+        if (lower.len > 0 and std.mem.order(u8, kv.key, lower) == .lt) break;
+        if (options.skip_fn) |skip| {
+            if (skip(kv.key)) {
+                entry = try cur.prev();
+                continue;
+            }
+        }
+        if (try callback(ctx, kv.key, kv.value) == .stop) return;
+        entry = try cur.prev();
     }
 }
 

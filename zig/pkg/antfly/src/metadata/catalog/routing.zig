@@ -82,6 +82,7 @@ pub const TableDocKeyRangePlan = struct {
     start_key: []u8,
     end_key: []u8,
     topology_epoch: u64 = 0,
+    inclusive_start: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.start_key.len > 0) alloc.free(self.start_key);
@@ -228,6 +229,7 @@ pub fn resolveTableDocKeyRanges(
             .start_key = try alloc.dupe(u8, clipped_start),
             .end_key = try alloc.dupe(u8, clipped_end),
             .topology_epoch = epoch,
+            .inclusive_start = from_key.len == 0 or (range.start_key.len > 0 and std.mem.order(u8, from_key, range.start_key) == .lt),
         });
     }
     return try plans.toOwnedSlice(alloc);
@@ -836,10 +838,12 @@ test "catalog source resolves groups by key and span" {
     try std.testing.expectEqualStrings("doc:b", spans[0].start_key);
     try std.testing.expectEqualStrings("doc:m", spans[0].end_key);
     try std.testing.expectEqual(epoch, spans[0].topology_epoch);
+    try std.testing.expect(!spans[0].inclusive_start);
     try std.testing.expectEqual(@as(u64, 7002), spans[1].group_id);
     try std.testing.expectEqualStrings("doc:m", spans[1].start_key);
     try std.testing.expectEqualStrings("doc:z", spans[1].end_key);
     try std.testing.expectEqual(epoch, spans[1].topology_epoch);
+    try std.testing.expect(spans[1].inclusive_start);
 
     const tail = try resolveTableDocKeyRanges(std.testing.allocator, FakeCatalog.iface(), "docs", "doc:x", "");
     defer {
@@ -850,6 +854,7 @@ test "catalog source resolves groups by key and span" {
     try std.testing.expectEqual(@as(u64, 7002), tail[0].group_id);
     try std.testing.expectEqualStrings("doc:x", tail[0].start_key);
     try std.testing.expectEqualStrings("", tail[0].end_key);
+    try std.testing.expect(!tail[0].inclusive_start);
 
     try std.testing.expectError(error.InvalidRangeBounds, resolveTableDocKeyRanges(std.testing.allocator, FakeCatalog.iface(), "docs", "doc:z", "doc:b"));
 }

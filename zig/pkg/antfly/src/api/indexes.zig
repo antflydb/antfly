@@ -790,10 +790,10 @@ fn appendIndexStatus(
     local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
 ) !void {
     const index_type = inferIndexType(index_name, config) orelse return error.InvalidTableIndexMetadata;
-    const embeddings_require_table_coverage = if (index_type == .embeddings)
-        embeddingsRequiresTableCoverage(config)
+    const embeddings_coverage_policy = if (index_type == .embeddings)
+        embeddingsCoveragePolicy(config)
     else
-        false;
+        .strict;
     const embeddings_sparse = if (index_type == .embeddings)
         embeddingsIsSparse(config)
     else
@@ -805,9 +805,9 @@ fn appendIndexStatus(
     try out.appendSlice(alloc, "{\"config\":");
     try appendIndexConfig(alloc, out, index_name, config);
     try out.appendSlice(alloc, ",\"status\":");
-    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, expected_group_ids, local_statuses, false);
+    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_coverage_policy, embeddings_sparse, graph_source_status, expected_group_ids, local_statuses, false);
     try out.appendSlice(alloc, ",\"shard_status\":");
-    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, expected_group_ids, local_statuses, true);
+    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_coverage_policy, embeddings_sparse, graph_source_status, expected_group_ids, local_statuses, true);
     try out.append(alloc, '}');
 }
 
@@ -1298,13 +1298,60 @@ fn canonicalIndexConfigJson(
     return try out.toOwnedSlice(alloc);
 }
 
-fn embeddingsRequiresTableCoverage(config: std.json.Value) bool {
-    if (config != .object) return true;
-    const external = config.object.get("external") orelse return true;
-    return switch (external) {
-        .bool => |value| !value,
-        else => true,
+const EmbeddingsCoveragePolicy = enum {
+    strict,
+    partial,
+    best_effort,
+    external,
+};
+
+fn embeddingsCoveragePolicyName(policy: EmbeddingsCoveragePolicy) []const u8 {
+    return switch (policy) {
+        .strict => "strict",
+        .partial => "partial",
+        .best_effort => "best_effort",
+        .external => "external",
     };
+}
+
+fn embeddingsCoveragePolicyAllowsSkips(policy: EmbeddingsCoveragePolicy) bool {
+    return policy == .partial or policy == .best_effort or policy == .external;
+}
+
+fn embeddingsCoveragePolicyRequiresTableCoverage(policy: EmbeddingsCoveragePolicy) bool {
+    return policy == .strict;
+}
+
+fn parseEmbeddingsCoveragePolicy(value: std.json.Value) ?EmbeddingsCoveragePolicy {
+    if (value != .string) return null;
+    if (std.mem.eql(u8, value.string, "strict")) return .strict;
+    if (std.mem.eql(u8, value.string, "full")) return .strict;
+    if (std.mem.eql(u8, value.string, "partial")) return .partial;
+    if (std.mem.eql(u8, value.string, "best_effort")) return .best_effort;
+    return null;
+}
+
+fn embeddingsCoveragePolicy(config: std.json.Value) EmbeddingsCoveragePolicy {
+    if (config != .object) return .strict;
+    if (config.object.get("external")) |external| {
+        switch (external) {
+            .bool => |value| if (value) return .external,
+            else => {},
+        }
+    }
+    if (config.object.get("partial")) |partial| {
+        switch (partial) {
+            .bool => |value| if (value) return .partial,
+            else => {},
+        }
+    }
+    if (config.object.get("coverage_policy")) |policy| {
+        if (parseEmbeddingsCoveragePolicy(policy)) |parsed| return parsed;
+    }
+    if (config.object.get("coverage")) |policy| {
+        if (parseEmbeddingsCoveragePolicy(policy)) |parsed| return parsed;
+    }
+    return .strict;
 }
 
 fn embeddingsIsSparse(config: std.json.Value) bool {
@@ -1546,7 +1593,7 @@ fn appendIndexRuntimeStatus(
     out: *std.ArrayListUnmanaged(u8),
     index_name: []const u8,
     index_type: ApiIndexType,
-    embeddings_require_table_coverage: bool,
+    embeddings_coverage_policy: EmbeddingsCoveragePolicy,
     embeddings_sparse: bool,
     graph_source_status: ?GraphSourceStatus,
     expected_group_ids: []const u64,
@@ -1580,7 +1627,7 @@ fn appendIndexRuntimeStatus(
                 defer alloc.free(key);
                 try appendJsonString(alloc, out, key);
                 try out.append(alloc, ':');
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.stats.graph_metric_runtime, item_runtime.stats.resolution, item_runtime.stats.promotion, item_runtime.stats.resolver_replay, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
+                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.doc_count, embeddings_coverage_policy, embeddings_sparse, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.stats.graph_metric_runtime, item_runtime.stats.resolution, item_runtime.stats.promotion, item_runtime.stats.resolver_replay, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
             }
         }
         if (expected_group_ids.len > 0) {
@@ -1593,7 +1640,7 @@ fn appendIndexRuntimeStatus(
                 defer alloc.free(key);
                 try appendJsonString(alloc, out, key);
                 try out.append(alloc, ':');
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, missing, 0, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, .{}, null, .{}, null, null, .{}, .{
+                try appendSingleIndexRuntimeStatus(alloc, out, index_type, missing, 0, embeddings_coverage_policy, embeddings_sparse, graph_source_status, .{}, null, .{}, null, null, .{}, .{
                     .source = .synthetic_config,
                     .freshness = .missing,
                 }, false);
@@ -1613,7 +1660,7 @@ fn appendIndexRuntimeStatus(
         try out.appendSlice(alloc, "{}");
         return;
     };
-    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, item.graph_metric_runtime, item.resolution, item.promotion, item.resolver_replay, null, item.runtime_present);
+    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_coverage_policy, embeddings_sparse, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, item.graph_metric_runtime, item.resolution, item.promotion, item.resolver_replay, null, item.runtime_present);
 }
 
 const AggregatedIndexStatus = struct {
@@ -1641,6 +1688,7 @@ const AggregatedIndexStatus = struct {
     async_indexing: db_mod.types.AsyncIndexingStats = .{},
     enrichment: db_mod.types.EnrichmentStats = .{},
     graph_metric_runtime: db_mod.types.GraphMetricRuntimeStats = .{},
+    graph_metric_status: []const db_mod.types.GraphMetricStatus = &.{},
     resolution: db_mod.types.ReplayStageStats = .{},
     promotion: db_mod.types.ReplayStageStats = .{},
     resolver_replay: db_mod.types.ResolverReplayDiagnostics = .{},
@@ -1757,6 +1805,9 @@ fn aggregateIndexStatus(
         aggregate.term_count += item.term_count;
         aggregate.edge_count += item.edge_count;
         aggregate.node_count += item.node_count;
+        if (item.graph_metric_status.len > 0 and aggregate.graph_metric_status.len == 0) {
+            aggregate.graph_metric_status = item.graph_metric_status;
+        }
         aggregate.root_node = if (runtime_count == 1) item.root_node else 0;
         aggregate.replay_applied_sequence += item.replay_applied_sequence;
         aggregate.replay_target_sequence += item.replay_target_sequence;
@@ -1825,6 +1876,7 @@ fn aggregateIndexStatus(
         if (active_count == 0) aggregate.backfill_progress = 0.0;
     }
     if (!found and expected_group_ids.len == 0) return null;
+    if (aggregate.reported_group_count != 1) aggregate.graph_metric_status = &.{};
     if (active_count > 0) aggregate.backfill_progress = active_progress_sum / @as(f64, @floatFromInt(active_count));
     normalizeReadyFullTextAggregate(&aggregate);
     return aggregate;
@@ -1901,6 +1953,7 @@ fn aggregateEnrichmentStats(dst: *db_mod.types.EnrichmentStats, src: db_mod.type
     dst.retrying = dst.retrying or src.retrying;
     dst.worker_failed = dst.worker_failed or src.worker_failed;
     dst.skip_by_hash_count += src.skip_by_hash_count;
+    dst.skipped_source_count += src.skipped_source_count;
     dst.codec_decode_failures += src.codec_decode_failures;
     dst.embed_batches_started += src.embed_batches_started;
     dst.embed_batches_completed += src.embed_batches_completed;
@@ -2053,7 +2106,7 @@ const EmbeddingsRuntimeView = struct {
     replay_catch_up_required: bool,
 };
 
-fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, require_table_coverage: bool, sparse: bool, enrichment: ?db_mod.types.EnrichmentStats) EmbeddingsRuntimeView {
+fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: EmbeddingsCoveragePolicy, sparse: bool, enrichment: ?db_mod.types.EnrichmentStats) EmbeddingsRuntimeView {
     var view: EmbeddingsRuntimeView = .{
         .backfill_active = item.backfill_active,
         .backfill_progress = item.backfill_progress,
@@ -2062,7 +2115,20 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, require_table_cove
         .replay_catch_up_required = item.replay_catch_up_required,
     };
     const coverage_incomplete = aggregateRuntimeCoverageIncomplete(item);
-    const dense_coverage_complete = !require_table_coverage or (table_doc_count > 0 and item.doc_count >= table_doc_count);
+    const skipped_count = if (@hasField(@TypeOf(item), "coverage_skipped_count")) item.coverage_skipped_count else 0;
+    const terminal_failed_count = if (@hasField(@TypeOf(item), "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
+    const counted_terminal_failed: u64 = if (coverage_policy == .best_effort) terminal_failed_count else 0;
+    const covered_source_count = item.doc_count +| skipped_count +| counted_terminal_failed;
+    const require_table_coverage = embeddingsCoveragePolicyRequiresTableCoverage(coverage_policy);
+    const source_coverage_visible = item.doc_count > 0 or (embeddingsCoveragePolicyAllowsSkips(coverage_policy) and skipped_count > 0);
+    const dense_coverage_complete = if (coverage_policy == .external)
+        true
+    else if (require_table_coverage)
+        table_doc_count > 0 and item.doc_count >= table_doc_count
+    else if (embeddingsCoveragePolicyAllowsSkips(coverage_policy) and table_doc_count > 0)
+        covered_source_count >= table_doc_count
+    else
+        true;
     if (enrichment) |stats| {
         const index_applied_sequence = view.replay_applied_sequence;
         const index_target_sequence = view.replay_target_sequence;
@@ -2086,11 +2152,16 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, require_table_cove
             if (view.backfill_progress >= 1.0) view.backfill_progress = 0.999;
         }
     }
+    const enrichment_pending = if (enrichment) |stats|
+        stats.enabled and (stats.worker_failed or stats.retrying or stats.applied_sequence < stats.target_sequence)
+    else
+        false;
     const enrichment_blocked = if (enrichment) |stats|
         stats.enabled and (stats.retrying or stats.worker_failed)
     else
         false;
-    if (!coverage_incomplete and dense_coverage_complete and item.doc_count > 0 and !enrichment_blocked) {
+    const produced_full_source_coverage = coverage_policy == .external or (table_doc_count > 0 and item.doc_count >= table_doc_count);
+    if (!coverage_incomplete and dense_coverage_complete and source_coverage_visible and !enrichment_blocked and (produced_full_source_coverage or !enrichment_pending)) {
         view.replay_applied_sequence = @max(view.replay_applied_sequence, view.replay_target_sequence);
         view.replay_catch_up_required = false;
         view.backfill_active = false;
@@ -2100,23 +2171,25 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, require_table_cove
     const replay_ready = view.replay_target_sequence > 0 and
         view.replay_target_sequence <= view.replay_applied_sequence and
         !(if (enrichment) |stats| stats.retrying or stats.worker_failed else false);
-    const enrichment_pending = if (enrichment) |stats|
-        stats.enabled and (stats.worker_failed or stats.retrying or stats.applied_sequence < stats.target_sequence)
-    else
-        false;
-    const artifact_visible = embeddingsArtifactVisible(item, sparse);
+    if (coverage_policy != .external and !coverage_incomplete and replay_ready and table_doc_count == 0 and item.doc_count == 0 and !enrichment_pending) {
+        view.replay_catch_up_required = false;
+        view.backfill_active = false;
+        view.backfill_progress = 1.0;
+        return view;
+    }
+    const artifact_visible = embeddingsArtifactPublishComplete(item, sparse, table_doc_count, coverage_policy);
     if (replay_ready and !artifact_visible and view.replay_target_sequence > 0) {
         view.backfill_active = true;
         view.backfill_progress = 0.0;
         return view;
     }
-    if (!coverage_incomplete and dense_coverage_complete and item.doc_count > 0 and !enrichment_pending) {
+    if (!coverage_incomplete and dense_coverage_complete and source_coverage_visible and !enrichment_pending) {
         view.backfill_active = false;
         view.backfill_progress = 1.0;
-    } else if (!coverage_incomplete and replay_ready and item.doc_count > 0 and (!require_table_coverage or table_doc_count == 0)) {
+    } else if (!coverage_incomplete and replay_ready and source_coverage_visible and (!require_table_coverage or table_doc_count == 0) and !enrichment_pending) {
         view.backfill_active = false;
         view.backfill_progress = 1.0;
-    } else if (require_table_coverage and table_doc_count > 0 and item.doc_count < table_doc_count) {
+    } else if (table_doc_count > 0 and !dense_coverage_complete) {
         view.backfill_active = true;
         if (view.replay_target_sequence > 0 and view.replay_applied_sequence >= view.replay_target_sequence) {
             view.replay_applied_sequence = view.replay_target_sequence - 1;
@@ -2142,6 +2215,11 @@ fn aggregateRuntimeCoverageIncomplete(item: anytype) bool {
 fn embeddingsArtifactVisible(item: anytype, sparse: bool) bool {
     if (sparse) return item.doc_count > 0;
     return item.doc_count > 0 and (item.node_count > 0 or item.root_node > 0);
+}
+
+fn embeddingsArtifactPublishComplete(item: anytype, sparse: bool, table_doc_count: u64, coverage_policy: EmbeddingsCoveragePolicy) bool {
+    if (coverage_policy != .external and table_doc_count == 0 and item.doc_count == 0) return true;
+    return embeddingsArtifactVisible(item, sparse);
 }
 
 fn backfillState(index_type: ApiIndexType, active: bool, enrichment_failed: bool, replay_applied_sequence: u64, replay_target_sequence: u64, enrichment: ?db_mod.types.EnrichmentStats) []const u8 {
@@ -2188,6 +2266,8 @@ fn appendEnrichmentRuntimeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUn
     try out.appendSlice(alloc, if (stats.worker_failed) "true" else "false");
     try out.appendSlice(alloc, ",\"skip_by_hash_count\":");
     try appendIntValue(alloc, out, stats.skip_by_hash_count);
+    try out.appendSlice(alloc, ",\"skipped_source_count\":");
+    try appendIntValue(alloc, out, stats.skipped_source_count);
     try out.appendSlice(alloc, ",\"codec_decode_failures\":");
     try appendIntValue(alloc, out, stats.codec_decode_failures);
     try out.appendSlice(alloc, ",\"embed_batches_started\":");
@@ -2322,7 +2402,7 @@ fn appendSingleIndexRuntimeStatus(
     index_type: ApiIndexType,
     item: anytype,
     table_doc_count: u64,
-    embeddings_require_table_coverage: bool,
+    embeddings_coverage_policy: EmbeddingsCoveragePolicy,
     embeddings_sparse: bool,
     graph_source_status: ?GraphSourceStatus,
     async_indexing: db_mod.types.AsyncIndexingStats,
@@ -2335,7 +2415,7 @@ fn appendSingleIndexRuntimeStatus(
     runtime_present: bool,
 ) !void {
     const embeddings_view = if (index_type == .embeddings)
-        embeddingsRuntimeView(item, table_doc_count, embeddings_require_table_coverage, embeddings_sparse, enrichment)
+        embeddingsRuntimeView(item, table_doc_count, embeddings_coverage_policy, embeddings_sparse, enrichment)
     else
         null;
     var backfill_active = if (embeddings_view) |view| view.backfill_active else item.backfill_active;
@@ -2446,7 +2526,22 @@ fn appendSingleIndexRuntimeStatus(
     try out.appendSlice(alloc, ",\"node_count\":");
     try appendIntValue(alloc, out, item.node_count);
     if (index_type == .embeddings) {
-        const artifact_publish_pending = replay_target_sequence > 0 and !embeddingsArtifactVisible(item, embeddings_sparse);
+        const skipped_count = if (@hasField(@TypeOf(item), "coverage_skipped_count")) item.coverage_skipped_count else 0;
+        const terminal_failed_count = if (@hasField(@TypeOf(item), "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
+        const produced_count = item.doc_count;
+        const counted_terminal_failed: u64 = if (embeddings_coverage_policy == .best_effort) terminal_failed_count else 0;
+        const covered_source_count = produced_count +| skipped_count +| counted_terminal_failed;
+        const coverage_complete = if (embeddings_coverage_policy == .external)
+            !backfill_active
+        else if (embeddingsCoveragePolicyRequiresTableCoverage(embeddings_coverage_policy))
+            table_doc_count > 0 and produced_count >= table_doc_count
+        else if (table_doc_count > 0)
+            covered_source_count >= table_doc_count
+        else
+            !backfill_active;
+        const artifact_publish_pending = replay_target_sequence > 0 and
+            !embeddingsArtifactPublishComplete(item, embeddings_sparse, table_doc_count, embeddings_coverage_policy) and
+            !coverage_complete;
         try out.appendSlice(alloc, ",\"query_visible_doc_count\":");
         try appendIntValue(alloc, out, item.doc_count);
         try out.appendSlice(alloc, ",\"published_doc_count\":");
@@ -2463,6 +2558,23 @@ fn appendSingleIndexRuntimeStatus(
         try appendIntValue(alloc, out, replay_target_sequence);
         try out.appendSlice(alloc, ",\"dense_publish_pending\":");
         try out.appendSlice(alloc, if (catch_up_active or replay_catch_up_required or artifact_publish_pending) "true" else "false");
+        try out.appendSlice(alloc, ",\"coverage\":{");
+        try appendJsonString(alloc, out, "policy");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, embeddingsCoveragePolicyName(embeddings_coverage_policy));
+        try out.appendSlice(alloc, ",\"source_total\":");
+        try appendIntValue(alloc, out, table_doc_count);
+        try out.appendSlice(alloc, ",\"produced\":");
+        try appendIntValue(alloc, out, produced_count);
+        try out.appendSlice(alloc, ",\"skipped\":");
+        try appendIntValue(alloc, out, skipped_count);
+        try out.appendSlice(alloc, ",\"terminal_failed\":");
+        try appendIntValue(alloc, out, terminal_failed_count);
+        try out.appendSlice(alloc, ",\"covered\":");
+        try appendIntValue(alloc, out, covered_source_count);
+        try out.appendSlice(alloc, ",\"complete\":");
+        try out.appendSlice(alloc, if (coverage_complete) "true" else "false");
+        try out.append(alloc, '}');
     }
     if (index_type == .graph) {
         try out.appendSlice(alloc, ",\"algebraic_graph\":{\"traversal\":{\"attempted\":");
@@ -5326,6 +5438,238 @@ test "managed embeddings readiness does not require table doc count once replay 
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":1.000") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"ready\"") != null);
+}
+
+test "single embeddings index encoder treats stale enrichment tail as ready when coverage is complete" {
+    const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
+    defer std.testing.allocator.free(indexes);
+    indexes[0] = .{
+        .name = try std.testing.allocator.dupe(u8, "semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 3,
+        .node_count = 1,
+        .root_node = 1,
+        .backfill_active = true,
+        .backfill_progress = 0.667,
+        .replay_applied_sequence = 2,
+        .replay_target_sequence = 3,
+        .replay_catch_up_required = true,
+    };
+    defer std.testing.allocator.free(indexes[0].name);
+
+    const local_items = try std.testing.allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+    defer std.testing.allocator.free(local_items);
+    local_items[0] = .{
+        .group_id = 7,
+        .stats = .{
+            .doc_count = 3,
+            .index_count = 1,
+            .indexes = indexes,
+            .enrichment = .{
+                .enabled = true,
+                .target_sequence = 3,
+                .applied_sequence = 2,
+                .retryable_error_count = 8,
+            },
+        },
+    };
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = local_items };
+
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
+}
+
+test "partial coverage embeddings readiness counts skipped source units" {
+    const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
+    defer std.testing.allocator.free(indexes);
+    indexes[0] = .{
+        .name = try std.testing.allocator.dupe(u8, "visual_idx"),
+        .kind = .dense_vector,
+        .doc_count = 1,
+        .node_count = 1,
+        .root_node = 1,
+        .coverage_skipped_count = 1,
+        .replay_applied_sequence = 2,
+        .replay_target_sequence = 2,
+        .backfill_active = false,
+        .backfill_progress = 1.0,
+    };
+    defer std.testing.allocator.free(indexes[0].name);
+
+    const local_items = try std.testing.allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+    defer std.testing.allocator.free(local_items);
+    local_items[0] = .{
+        .group_id = 7,
+        .stats = .{
+            .doc_count = 2,
+            .index_count = 1,
+            .indexes = indexes,
+            .enrichment = .{
+                .enabled = true,
+                .target_sequence = 2,
+                .applied_sequence = 2,
+                .skipped_source_count = 1,
+            },
+        },
+    };
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = local_items };
+
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"visual_idx\":{\"type\":\"embeddings\",\"coverage\":\"partial\",\"dimension\":512}}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "visual_idx", &local_status)).?;
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"coverage\":{\"policy\":\"partial\",\"source_total\":2,\"produced\":1,\"skipped\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"complete\":true") != null);
+}
+
+test "partial coverage embeddings readiness does not mask pending enrichment" {
+    const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
+    defer std.testing.allocator.free(indexes);
+    indexes[0] = .{
+        .name = try std.testing.allocator.dupe(u8, "visual_idx"),
+        .kind = .dense_vector,
+        .doc_count = 1,
+        .node_count = 1,
+        .root_node = 1,
+        .coverage_skipped_count = 1,
+        .replay_applied_sequence = 1,
+        .replay_target_sequence = 3,
+        .replay_catch_up_required = true,
+        .backfill_active = true,
+        .backfill_progress = 0.333,
+    };
+    defer std.testing.allocator.free(indexes[0].name);
+
+    const local_items = try std.testing.allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+    defer std.testing.allocator.free(local_items);
+    local_items[0] = .{
+        .group_id = 7,
+        .stats = .{
+            .doc_count = 2,
+            .index_count = 1,
+            .indexes = indexes,
+            .enrichment = .{
+                .enabled = true,
+                .target_sequence = 3,
+                .applied_sequence = 1,
+                .skipped_source_count = 1,
+            },
+        },
+    };
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = local_items };
+
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"visual_idx\":{\"type\":\"embeddings\",\"coverage\":\"partial\",\"dimension\":512}}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "visual_idx", &local_status)).?;
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"coverage\":{\"policy\":\"partial\",\"source_total\":2,\"produced\":1,\"skipped\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"complete\":true") != null);
+}
+
+test "empty embeddings index status is ready without dense artifact visibility" {
+    const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
+    defer std.testing.allocator.free(indexes);
+    indexes[0] = .{
+        .name = try std.testing.allocator.dupe(u8, "semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 0,
+        .node_count = 0,
+        .root_node = 0,
+        .replay_applied_sequence = 1,
+        .replay_target_sequence = 1,
+        .backfill_active = true,
+        .backfill_progress = 0.0,
+    };
+    defer std.testing.allocator.free(indexes[0].name);
+
+    const local_items = try std.testing.allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+    defer std.testing.allocator.free(local_items);
+    local_items[0] = .{
+        .group_id = 7,
+        .metadata = .{ .source = .background_refresh, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 0,
+            .index_count = 1,
+            .indexes = indexes,
+            .enrichment = .{
+                .enabled = true,
+                .applied_sequence = 1,
+                .target_sequence = 1,
+            },
+        },
+    };
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = local_items };
+
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"dense_publish_pending\":false") != null);
 }
 
 test "embeddings index replay completion without artifact visibility is not ready" {

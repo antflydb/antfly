@@ -1435,6 +1435,7 @@ fn generatedOperatorKindMatchesRowExpressionKind(
     parsed_expression: db_mod.types.RelationalRowsExpression,
 ) ?bool {
     return switch (generated_kind) {
+        .unary_positive => true,
         .unary_negative => generatedUnaryNegativeMatchesRowExpression(parsed_expression),
         .additive => parsed_expression.kind == .add,
         .subtractive => parsed_expression.kind == .sub,
@@ -1824,6 +1825,28 @@ fn validateGeneratedUnaryNegativeExpressionOperandsStrict(
         operand_tokens.start,
         operand_tokens.end,
         parsed_expression.operands[1],
+        operand_expression,
+    );
+    return true;
+}
+
+fn validateGeneratedUnaryPositiveExpressionOperandsStrict(
+    context: StrictValidationContext,
+    tokens: []const Token,
+    parsed_expression: db_mod.types.RelationalRowsExpression,
+    generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
+) anyerror!bool {
+    if (generated_expression.kind != .unary_positive) return false;
+    const operator_tokens = generated_expression.operator_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedExpressionOperatorTokens(tokens, generated_expression.kind, operator_tokens);
+    const operand_expression = generated_expression.right_expression orelse generated_expression.left_expression orelse return error.UnsupportedSqlShape;
+    const operand_tokens = generated_expression.right_tokens orelse generated_expression.left_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedRowExpressionIdentityStrictWithContext(
+        context,
+        tokens,
+        operand_tokens.start,
+        operand_tokens.end,
+        parsed_expression,
         operand_expression,
     );
     return true;
@@ -2548,6 +2571,7 @@ fn validateGeneratedRowExpressionOperandsStrict(
     if (try validateGeneratedCaseExpressionOperandsStrict(context, tokens, parsed_expression, generated_expression)) return;
     if (try validateGeneratedArrayConstructorExpressionStrict(context, tokens, parsed_expression, generated_expression)) return;
     if (try validateGeneratedTemporalLeafExpressionStrict(context, tokens, parsed_expression, generated_expression)) return;
+    if (try validateGeneratedUnaryPositiveExpressionOperandsStrict(context, tokens, parsed_expression, generated_expression)) return;
     if (try validateGeneratedUnaryNegativeExpressionOperandsStrict(context, tokens, parsed_expression, generated_expression)) return;
     if (parsed_expression.operands.len == 0) return;
     if (parsed_expression.kind == .concat and generated_expression.kind == .string_concat) {

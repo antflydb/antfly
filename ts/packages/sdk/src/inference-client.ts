@@ -179,7 +179,7 @@ export class InferenceClient {
   ): Promise<ChunkResponse> {
     const { data, error } = await this.client.POST("/ai/v1/chunk", {
       body: {
-        text,
+        input: text,
         config,
       },
       signal: options?.signal,

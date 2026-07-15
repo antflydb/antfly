@@ -596,6 +596,27 @@ test "search plan rejects internal doc identity controls" {
     ));
 }
 
+test "serverless search plan rejects public exact sort controls" {
+    const alloc = std.testing.allocator;
+    const sources = search_sources.defaultPublishedSearchSources();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseSearchPlanAlloc(
+        alloc,
+        "{\"order_by\":[{\"field\":\"created_at\"}]}",
+        sources,
+    ));
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseSearchPlanAlloc(
+        alloc,
+        "{\"search_after\":[\"2026-01-01T00:00:00Z\",\"doc:1\"]}",
+        sources,
+    ));
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseSearchPlanAlloc(
+        alloc,
+        "{\"search_before\":[\"2025-12-31T23:59:59Z\",\"doc:0\"]}",
+        sources,
+    ));
+}
+
 test "serverless graph plans reject internal doc identity controls" {
     const alloc = std.testing.allocator;
 

@@ -72,19 +72,21 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         if (schema_value != .null) {
             const raw_schema = try stringifyJsonAlloc(alloc, schema_value);
             defer alloc.free(raw_schema);
+            if (publicSchemaMentionsInternalDocValues(raw_schema)) return error.InvalidCreateTableSchemaRequest;
             const validated_schema = tables_api.parseSchemaUpdateRequest(alloc, raw_schema) catch |err| switch (err) {
-                error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
+                error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableSchemaRequest,
                 else => return err,
             };
             defer alloc.free(validated_schema);
             req.schema_json = tables_api.normalizeSchemaVersion(alloc, validated_schema, 0) catch |err| switch (err) {
-                error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
+                error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableSchemaRequest,
                 else => return err,
             };
         }
     } else if (parsed.value.schema) |schema| {
         const raw_schema = try stringifyJsonAlloc(alloc, schema);
         defer alloc.free(raw_schema);
+        if (publicSchemaMentionsInternalDocValues(raw_schema)) return error.InvalidCreateTableSchemaRequest;
         const validated_schema = tables_api.parseSchemaUpdateRequest(alloc, raw_schema) catch |err| switch (err) {
             error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
             else => return err,
@@ -197,9 +199,28 @@ pub fn encodeCreateTableRequest(alloc: std.mem.Allocator, req: tables_api.Create
 
 pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     if (body.len == 0) return error.InvalidSchemaUpdateRequest;
+    if (publicSchemaMentionsInternalDocValues(body)) return error.InvalidSchemaUpdateRequest;
     // Pass the raw body directly to preserve x-antfly-* extension properties
     // that would be lost if round-tripped through the typed OpenAPI TableSchema struct.
     return try tables_api.parseSchemaUpdateRequest(alloc, body);
+}
+
+fn publicSchemaMentionsInternalDocValues(body: []const u8) bool {
+    return std.mem.indexOf(u8, body, "\"doc_values\"") != null;
+}
+
+pub fn schemaUpdateRequestErrorMessage(body: []const u8) []const u8 {
+    if (publicSchemaMentionsInternalDocValues(body)) {
+        return "invalid schema update request: doc_values is internal; use sortable: true on scalar mappings";
+    }
+    return "invalid schema update request";
+}
+
+pub fn createTableRequestErrorMessage(body: []const u8) []const u8 {
+    if (publicSchemaMentionsInternalDocValues(body)) {
+        return "invalid create table request: schema doc_values is internal; use sortable: true on scalar mappings";
+    }
+    return "invalid create table request";
 }
 
 pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, index_name: []const u8, body: []const u8) ![]u8 {
@@ -245,7 +266,7 @@ pub fn parseArtifactEnrichmentRequest(alloc: std.mem.Allocator, artifact_name: [
         if (value != .bool) return error.InvalidArtifactEnrichmentRequest;
         if (value.bool) {
             const kind = root.get("kind") orelse return error.InvalidArtifactEnrichmentRequest;
-            if (kind != .string or !std.mem.eql(u8, kind.string, "chunk")) return error.InvalidArtifactEnrichmentRequest;
+            if (kind != .string or (!std.mem.eql(u8, kind.string, "chunk") and !std.mem.eql(u8, kind.string, "asset"))) return error.InvalidArtifactEnrichmentRequest;
         }
     }
 
@@ -612,8 +633,12 @@ test "table contract rejects malformed schema payloads" {
         parseSchemaUpdateRequest(std.testing.allocator, "{\"document_schemas\":{\"doc\":{}}}"),
     );
     try std.testing.expectError(
-        error.InvalidCreateTableRequest,
+        error.InvalidCreateTableSchemaRequest,
         parseCreateTableRequest(std.testing.allocator, "{\"schema\":{\"ttl_duration_ns\":-1}}"),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateTableSchemaRequest,
+        parseCreateTableRequest(std.testing.allocator, "{\"schema\":{\"dynamic_templates\":[{\"name\":\"rank\",\"path_match\":\"rank\",\"mapping\":{\"type\":\"numeric\",\"doc_values\":true}}]}}"),
     );
 }
 
@@ -759,14 +784,15 @@ test "table contract normalizes public artifact enrichment request" {
             "{\"name\":\"other\",\"kind\":\"chunk\",\"field\":\"text\",\"chunk_size\":512}",
         ),
     );
-    try std.testing.expectError(
-        error.InvalidArtifactEnrichmentRequest,
-        parseArtifactEnrichmentRequest(
-            std.testing.allocator,
-            "document_units_v1",
-            "{\"kind\":\"asset\",\"field\":\"url\",\"full_text_index\":true}",
-        ),
+    const asset_config_json = try parseArtifactEnrichmentRequest(
+        std.testing.allocator,
+        "document_units_v1",
+        "{\"kind\":\"asset\",\"field\":\"url\",\"full_text_index\":true}",
     );
+    defer std.testing.allocator.free(asset_config_json);
+    try std.testing.expect(std.mem.indexOf(u8, asset_config_json, "\"name\":\"document_units_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, asset_config_json, "\"kind\":\"asset\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, asset_config_json, "\"full_text_index\":true") != null);
 }
 
 test "table contract rejects reserved full text index names on create table" {
@@ -821,4 +847,23 @@ test "table contract skips arbitrary public full text names in table-definition 
     defer std.testing.allocator.free(normalized);
     try std.testing.expect(std.mem.indexOf(u8, normalized, "\"search_idx\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, normalized, "\"full_text_index_v0\"") != null);
+}
+
+test "table contract schema update error message explains public sortable replacement for doc values" {
+    try std.testing.expectEqualStrings(
+        "invalid schema update request: doc_values is internal; use sortable: true on scalar mappings",
+        schemaUpdateRequestErrorMessage("{\"dynamic_templates\":[{\"mapping\":{\"type\":\"keyword\",\"doc_values\":true}}]}"),
+    );
+    try std.testing.expectEqualStrings(
+        "invalid schema update request",
+        schemaUpdateRequestErrorMessage("{\"dynamic_templates\":[{\"mapping\":{\"type\":\"keyword\",\"sortable\":true}}]}"),
+    );
+    try std.testing.expectEqualStrings(
+        "invalid create table request: schema doc_values is internal; use sortable: true on scalar mappings",
+        createTableRequestErrorMessage("{\"schema\":{\"dynamic_templates\":[{\"mapping\":{\"type\":\"keyword\",\"doc_values\":true}}]}}"),
+    );
+    try std.testing.expectEqualStrings(
+        "invalid create table request",
+        createTableRequestErrorMessage("{\"schema\":{\"dynamic_templates\":[{\"mapping\":{\"type\":\"keyword\",\"sortable\":true}}]}}"),
+    );
 }

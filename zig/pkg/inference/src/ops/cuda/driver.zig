@@ -122,6 +122,7 @@ pub const CudaDriver = struct {
         cuModuleLoadDataEx: *const fn (module: *CUmodule, image: ?*const anyopaque, numOptions: c_uint, options: ?[*]CUjit_option, optionValues: ?[*]?*anyopaque) callconv(.c) CUresult,
         cuModuleUnload: *const fn (hmod: CUmodule) callconv(.c) CUresult,
         cuModuleGetFunction: *const fn (hfunc: *CUfunction, hmod: CUmodule, name: [*:0]const u8) callconv(.c) CUresult,
+        cuFuncSetAttribute: ?*const fn (hfunc: CUfunction, attrib: c_int, value: c_int) callconv(.c) CUresult,
         cuLaunchKernel: *const fn (
             f: CUfunction,
             gridDimX: c_uint,
@@ -181,6 +182,7 @@ pub const CudaDriver = struct {
                 .cuModuleLoadDataEx = lookup(&lib, @TypeOf(@as(Table, undefined).cuModuleLoadDataEx), "cuModuleLoadDataEx") catch return error.CudaSymbolMissing,
                 .cuModuleUnload = lookup(&lib, @TypeOf(@as(Table, undefined).cuModuleUnload), "cuModuleUnload") catch return error.CudaSymbolMissing,
                 .cuModuleGetFunction = lookup(&lib, @TypeOf(@as(Table, undefined).cuModuleGetFunction), "cuModuleGetFunction") catch return error.CudaSymbolMissing,
+                .cuFuncSetAttribute = lookupOptional(&lib, *const fn (hfunc: CUfunction, attrib: c_int, value: c_int) callconv(.c) CUresult, "cuFuncSetAttribute"),
                 .cuLaunchKernel = lookup(&lib, @TypeOf(@as(Table, undefined).cuLaunchKernel), "cuLaunchKernel") catch return error.CudaSymbolMissing,
                 .cuGraphInstantiate = lookup(&lib, @TypeOf(@as(Table, undefined).cuGraphInstantiate), "cuGraphInstantiateWithFlags") catch return error.CudaSymbolMissing,
                 .cuGraphInstantiateWithParams = lookupOptional(&lib, *const fn (phGraphExec: *CUgraphExec, hGraph: CUgraph, instantiateParams: *CUDA_GRAPH_INSTANTIATE_PARAMS) callconv(.c) CUresult, "cuGraphInstantiateWithParams"),

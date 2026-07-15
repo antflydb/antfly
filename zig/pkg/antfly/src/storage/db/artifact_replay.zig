@@ -20,6 +20,8 @@ const internal_keys = @import("../internal_keys.zig");
 const artifact_ids = @import("artifact_ids.zig");
 const db_internal = @import("internal.zig");
 const mapper = @import("document_mapper.zig");
+const artifact_repair = @import("artifact_repair.zig");
+const asset_producer_mod = @import("enrichment/asset_producer.zig");
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const types = @import("types.zig");
@@ -108,6 +110,64 @@ pub const OwnedGraphMutations = struct {
     }
 };
 
+pub const OwnedEmbeddingArtifactWriteIdentity = struct {
+    doc_key: []u8,
+    parent_doc_key: ?[]u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.doc_key);
+        if (self.parent_doc_key) |parent_doc_key| alloc.free(parent_doc_key);
+        self.* = undefined;
+    }
+};
+
+pub fn decodeEmbeddingArtifactWriteIdentityAlloc(
+    alloc: Allocator,
+    artifact_key: []const u8,
+    expected_embedding_name: []const u8,
+) !?OwnedEmbeddingArtifactWriteIdentity {
+    if (artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key)) |maybe_identity| {
+        var identity = maybe_identity orelse return null;
+        defer identity.deinit(alloc);
+        if (!std.mem.eql(u8, identity.embedding_name, expected_embedding_name)) return null;
+
+        const doc_key = try alloc.dupe(u8, identity.doc_key);
+        errdefer alloc.free(doc_key);
+        const parent_doc_key = if (identity.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
+        errdefer if (parent_doc_key) |owned_parent| alloc.free(owned_parent);
+        return .{
+            .doc_key = doc_key,
+            .parent_doc_key = parent_doc_key,
+        };
+    } else |err| switch (err) {
+        error.InvalidInternalUserKey => {},
+        else => return err,
+    }
+
+    if (try internal_keys.parseEmbeddingArtifactKeyView(artifact_key)) |identity| {
+        if (!std.mem.eql(u8, identity.artifact_name, expected_embedding_name)) return null;
+        return .{
+            .doc_key = try alloc.dupe(u8, identity.doc_key),
+        };
+    }
+
+    return null;
+}
+
+test "artifact replay dense embedding write identity accepts legacy embedding artifact keys" {
+    const alloc = std.testing.allocator;
+
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
+    defer alloc.free(artifact_key);
+
+    var identity = (try decodeEmbeddingArtifactWriteIdentityAlloc(alloc, artifact_key, "dv_v1")).?;
+    defer identity.deinit(alloc);
+    try std.testing.expectEqualStrings("doc:a", identity.doc_key);
+    try std.testing.expect(identity.parent_doc_key == null);
+
+    try std.testing.expectEqual(null, try decodeEmbeddingArtifactWriteIdentityAlloc(alloc, artifact_key, "other_idx"));
+}
+
 pub fn collectDenseEmbeddingWritesForArtifacts(
     alloc: Allocator,
     index_manager: *index_manager_mod.IndexManager,
@@ -141,24 +201,17 @@ pub fn appendDenseEmbeddingWritesForArtifacts(
 ) !void {
     const expected_embedding_name = index_manager.denseEmbeddingName(index_name) orelse index_name;
     for (artifact_keys) |artifact_key| {
-        var identity = artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key) catch |err| switch (err) {
-            error.InvalidInternalUserKey => continue,
-            else => return err,
-        } orelse continue;
-        defer identity.deinit(alloc);
-        if (!std.mem.eql(u8, identity.embedding_name, expected_embedding_name)) continue;
-        const doc_key = try alloc.dupe(u8, identity.doc_key);
-        errdefer alloc.free(doc_key);
-        var parent_doc_key = if (identity.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
-        errdefer if (parent_doc_key) |owned_parent| alloc.free(owned_parent);
+        var identity = (try decodeEmbeddingArtifactWriteIdentityAlloc(alloc, artifact_key, expected_embedding_name)) orelse continue;
+        var identity_transferred = false;
+        defer if (!identity_transferred) identity.deinit(alloc);
         try out.append(alloc, .{
             .index_name = @constCast(index_name),
-            .doc_key = doc_key,
-            .parent_doc_key = parent_doc_key,
+            .doc_key = identity.doc_key,
+            .parent_doc_key = identity.parent_doc_key,
             .artifact_key = @constCast(artifact_key),
             .vector = &.{},
         });
-        parent_doc_key = null;
+        identity_transferred = true;
     }
 }
 
@@ -227,11 +280,16 @@ pub fn appendSparseEmbeddingWritesForArtifacts(
     }
 }
 
+pub const GraphMutationCollectionOptions = struct {
+    repair: GraphReplayRepairOptions = .{},
+};
+
 pub fn collectGraphMutationsForArtifacts(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     artifact_keys: []const []const u8,
     index_name: []const u8,
+    options: GraphMutationCollectionOptions,
 ) !OwnedGraphMutations {
     var writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
     errdefer {
@@ -273,7 +331,32 @@ pub fn collectGraphMutationsForArtifacts(
             else => return err,
         };
         if (raw) |value| {
-            var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, value);
+            var decoded = enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    if (options.repair.enabled) {
+                        const artifact_name = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ parsed.edge_type, parsed.target_doc_key });
+                        defer alloc.free(artifact_name);
+                        try artifact_repair.recordArtifactRepairIssueForReplay(
+                            alloc,
+                            store,
+                            .graph,
+                            parsed.index_name,
+                            parsed.doc_key,
+                            "",
+                            "",
+                            "",
+                            artifact_name,
+                            artifact_key,
+                            null,
+                            options.repair.sequence,
+                            .corrupt_artifact,
+                        );
+                        return error.ArtifactRepairRequired;
+                    }
+                    return err;
+                },
+            };
             errdefer decoded.deinit(alloc);
             try writes.append(alloc, .{
                 .index_name = try alloc.dupe(u8, parsed.index_name),
@@ -304,9 +387,132 @@ pub fn collectGraphMutationsForArtifacts(
     };
 }
 
+pub const GraphReplayRepairOptions = struct {
+    enabled: bool = false,
+    sequence: u64 = 0,
+};
+
+fn graphArtifactSourceConsumesRef(
+    index_manager: *index_manager_mod.IndexManager,
+    source: index_manager_mod.GraphArtifactSource,
+    artifact_ref: types.ArtifactRef,
+) bool {
+    if (!std.mem.eql(u8, source.artifact_name, artifact_ref.name)) return false;
+    return switch (artifact_ref.kind) {
+        .asset => graphAssetSourceConsumesAssetRef(index_manager, artifact_ref),
+        .chunk => index_manager.getEnrichment(.chunk, artifact_ref.name) != null,
+        .embedding => false,
+    };
+}
+
+const GraphArtifactRefView = struct {
+    name: []const u8,
+    kind: types.ArtifactKind,
+    unit_id_present: bool = false,
+};
+
+pub fn graphArtifactSourceConsumesArtifactKey(
+    index_manager: *index_manager_mod.IndexManager,
+    source: index_manager_mod.GraphArtifactSource,
+    artifact_key: []const u8,
+) bool {
+    if (decodeArtifactRefViewForGraphApplicability(artifact_key) catch null) |artifact_ref| {
+        return graphArtifactSourceConsumesRefView(index_manager, source, artifact_ref);
+    }
+
+    var artifact_ref = (artifact_ids.decodeArtifactRefAlloc(index_manager.alloc, artifact_key) catch return false) orelse return false;
+    defer artifact_ref.deinit(index_manager.alloc);
+    return graphArtifactSourceConsumesRef(index_manager, source, artifact_ref);
+}
+
+fn graphArtifactSourceConsumesRefView(
+    index_manager: *index_manager_mod.IndexManager,
+    source: index_manager_mod.GraphArtifactSource,
+    artifact_ref: GraphArtifactRefView,
+) bool {
+    if (!std.mem.eql(u8, source.artifact_name, artifact_ref.name)) return false;
+    return switch (artifact_ref.kind) {
+        .asset => graphAssetSourceConsumesAssetRefView(index_manager, artifact_ref),
+        .chunk => index_manager.getEnrichment(.chunk, artifact_ref.name) != null,
+        .embedding => false,
+    };
+}
+
+fn graphAssetSourceConsumesAssetRefView(index_manager: *index_manager_mod.IndexManager, artifact_ref: GraphArtifactRefView) bool {
+    if (index_manager.getEnrichment(.asset, artifact_ref.name) == null) return false;
+    if (artifact_ref.unit_id_present) return true;
+    const cfg = index_manager.getEnrichment(.asset, artifact_ref.name) orelse return false;
+    var producer_cfg = asset_producer_mod.parseProducerConfig(index_manager.alloc, cfg.producer_json) catch return true;
+    defer producer_cfg.deinit(index_manager.alloc);
+    return producer_cfg.type != .document_extraction;
+}
+
+fn decodeArtifactRefViewForGraphApplicability(key: []const u8) !?GraphArtifactRefView {
+    if (!internal_keys.isInternalUserKey(key)) return null;
+
+    const doc_term = internal_keys.findComponentTerminator(key, 1) orelse return null;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != internal_keys.artifact_kind) return null;
+    pos += 1;
+
+    const type_term = internal_keys.findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+    const raw_kind = (try internal_keys.decodeBodyView(key[pos..type_term])) orelse return null;
+    const kind = try artifactKindFromInternalLabel(raw_kind);
+    pos = type_term + 2;
+
+    const name_term = internal_keys.findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+    const name = (try internal_keys.decodeBodyView(key[pos..name_term])) orelse return null;
+    pos = name_term + 2;
+
+    var unit_id_present = false;
+    if (kind == .asset and pos < key.len and key[pos] == internal_keys.document_unit_record_kind) {
+        pos += 1;
+        const unit_term = internal_keys.findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+        if ((try internal_keys.decodeBodyView(key[pos..unit_term])) == null) return null;
+        pos = unit_term + 2;
+        if (pos == key.len) return .{ .name = name, .kind = .asset, .unit_id_present = true };
+    } else if (kind == .chunk) {
+        if (pos < key.len and key[pos] == internal_keys.document_unit_record_kind) {
+            pos += 1;
+            const unit_term = internal_keys.findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+            if ((try internal_keys.decodeBodyView(key[pos..unit_term])) == null) return null;
+            pos = unit_term + 2;
+            unit_id_present = true;
+        }
+        if (pos + 1 + @sizeOf(u32) > key.len or key[pos] != internal_keys.chunk_record_kind) return error.InvalidInternalUserKey;
+        pos += 1 + @sizeOf(u32);
+        if (pos == key.len) return .{ .name = name, .kind = .chunk, .unit_id_present = unit_id_present };
+    }
+
+    if (pos == key.len) return .{ .name = name, .kind = kind, .unit_id_present = unit_id_present };
+    if (key[pos] != internal_keys.derived_embedding_kind) return error.InvalidInternalUserKey;
+    pos += 1;
+    const derived_name_term = internal_keys.findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+    const derived_name = (try internal_keys.decodeBodyView(key[pos..derived_name_term])) orelse return null;
+    if (derived_name_term + 2 != key.len) return error.InvalidInternalUserKey;
+    return .{ .name = derived_name, .kind = .embedding };
+}
+
+fn artifactKindFromInternalLabel(raw_kind: []const u8) !types.ArtifactKind {
+    if (std.mem.eql(u8, raw_kind, "chunk")) return .chunk;
+    if (std.mem.eql(u8, raw_kind, "asset")) return .asset;
+    if (std.mem.eql(u8, raw_kind, "embedding")) return .embedding;
+    return error.InvalidInternalUserKey;
+}
+
+fn graphAssetSourceConsumesAssetRef(index_manager: *index_manager_mod.IndexManager, artifact_ref: types.ArtifactRef) bool {
+    if (index_manager.getEnrichment(.asset, artifact_ref.name) == null) return false;
+    if (artifact_ref.unit_id != null) return true;
+    const cfg = index_manager.getEnrichment(.asset, artifact_ref.name) orelse return false;
+    var producer_cfg = asset_producer_mod.parseProducerConfig(index_manager.alloc, cfg.producer_json) catch return true;
+    defer producer_cfg.deinit(index_manager.alloc);
+    return producer_cfg.type != .document_extraction;
+}
+
 pub const GraphMaterializationOptions = struct {
     relational_base_rows: bool = false,
     require_resolution_contract: bool = false,
+    repair: GraphReplayRepairOptions = .{},
 };
 
 pub fn materializeGraphSourceArtifactsForIndex(
@@ -327,10 +533,9 @@ pub fn materializeGraphSourceArtifactsForIndex(
             try materializeMentionEdgesForResolutionKey(alloc, store, index_manager, &changed, index_name, source, artifact_key, options);
             continue;
         }
-        if (!internal_keys.isAssetArtifactKey(artifact_key)) continue;
-        var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, artifact_key)) orelse continue;
+        var artifact_ref = (try db_internal.decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse continue;
         defer artifact_ref.deinit(alloc);
-        if (artifact_ref.kind != .asset or !std.mem.eql(u8, artifact_ref.name, source.artifact_name)) continue;
+        if (!graphArtifactSourceConsumesRef(index_manager, source, artifact_ref)) continue;
 
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer {
@@ -356,7 +561,16 @@ pub fn materializeGraphSourceArtifactsForIndex(
         if (raw) |value| {
             const raw_doc = try storeDocumentValueForGraphSource(alloc, store, artifact_ref.document_id, options.relational_base_rows);
             defer if (raw_doc) |doc_value| alloc.free(doc_value);
-            const graph_writes = try graphWritesFromArtifactValueAlloc(alloc, index_name, artifact_ref.document_id, value, source, graphArtifactContentType(index_manager, source.artifact_name), raw_doc);
+            const graph_writes = graphWritesFromArtifactValueAlloc(alloc, index_name, artifact_ref.document_id, value, source, graphArtifactContentType(index_manager, source.artifact_name), raw_doc) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    if (options.repair.enabled) {
+                        try artifact_repair.recordArtifactRepairIssueForRefReplay(alloc, store, index_name, artifact_ref, artifact_key, options.repair.sequence, .corrupt_artifact);
+                        return error.ArtifactRepairRequired;
+                    }
+                    return err;
+                },
+            };
             defer freeGraphWrites(alloc, graph_writes);
             for (graph_writes) |write| {
                 const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);

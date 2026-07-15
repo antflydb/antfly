@@ -102,6 +102,7 @@ pub const DistributedEntitySink = struct {
 
         const outcome = try self.writes.commitTransaction(allocator, reqs.items, self.sync_level);
         if (outcome) |result| {
+            defer result.deinit(allocator);
             switch (result) {
                 .committed => return,
                 .conflict => return error.EntityPromotionConflict,
@@ -135,6 +136,7 @@ pub const DistributedEntitySink = struct {
             // back to a plain batch.
             const outcome = try self.writes.commitTransaction(allocator, &.{.{ .table_name = table, .transforms = &.{transform} }}, self.sync_level);
             if (outcome) |result| {
+                defer result.deinit(allocator);
                 switch (result) {
                     .committed => return,
                     // The idempotent merge carries no version predicate, so a

@@ -17,6 +17,7 @@ const antfly = @import("antfly-zig");
 
 const serverless = antfly.serverless;
 const serverless_default_max_request_bytes: usize = antfly.public_api.http_server.public_api_max_request_body_bytes;
+const serverless_default_max_connection_threads: u32 = 64;
 
 const CliConfig = struct {
     artifacts_uri: ?[]const u8 = null,
@@ -35,6 +36,7 @@ const CliConfig = struct {
     bind_port: ?u16 = null,
     health_port: ?u16 = null,
     max_request_bytes: ?usize = null,
+    max_connection_threads: ?u32 = null,
     role: ?[]const u8 = null,
     tick_ms: ?u64 = null,
     publish_enabled: ?bool = null,
@@ -267,6 +269,10 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             cfg.max_request_bytes = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--max-connection-threads")) {
+            cfg.max_connection_threads = try std.fmt.parseInt(u32, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--role")) {
             cfg.role = args.next() orelse return error.InvalidArguments;
             continue;
@@ -352,6 +358,13 @@ fn serverless_serverConfigFromEnv(
             "ANTFLY_SERVERLESS_MAX_REQUEST_BYTES",
             serverless_default_max_request_bytes,
         ),
+        .serve_in_connection_threads = true,
+        .max_connection_threads = cli.max_connection_threads orelse parseEnvIntOrDefault(
+            env_map,
+            u32,
+            "ANTFLY_SERVERLESS_MAX_CONNECTION_THREADS",
+            serverless_default_max_connection_threads,
+        ),
     };
 }
 
@@ -397,6 +410,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --port <port>
         \\  --health-port <port>
         \\  --max-request-bytes <bytes>
+        \\  --max-connection-threads <count>
         \\  --role <combined|api|query|maintenance>
         \\  --tick-ms <milliseconds>
         \\  --publish-enabled <true|false>
@@ -424,6 +438,7 @@ fn printUsage(argv0: []const u8) void {
         \\  ANTFLY_SERVERLESS_BIND_PORT      default: 8080
         \\  ANTFLY_SERVERLESS_HEALTH_PORT    default: unset (disables dedicated health server)
         \\  ANTFLY_SERVERLESS_MAX_REQUEST_BYTES default: 33554432
+        \\  ANTFLY_SERVERLESS_MAX_CONNECTION_THREADS default: 64 (0 unbounded)
         \\  ANTFLY_SERVERLESS_ROLE           default: combined
         \\  ANTFLY_SERVERLESS_TICK_INTERVAL_MS default: 25
         \\  ANTFLY_SERVERLESS_PUBLISH_ENABLED default: true
@@ -535,18 +550,26 @@ test "serverless main listener config defaults request limit to public API limit
 
     const cfg = serverless_serverConfigFromEnv(&env_map, .{});
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_request_bytes);
+    try std.testing.expect(cfg.serve_in_connection_threads);
+    try std.testing.expectEqual(serverless_default_max_connection_threads, cfg.max_connection_threads);
 }
 
-test "serverless main listener config allows env and cli request limit overrides" {
+test "serverless main listener config allows env and cli listener limit overrides" {
     var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
     try env_map.put("ANTFLY_SERVERLESS_MAX_REQUEST_BYTES", "4194304");
+    try env_map.put("ANTFLY_SERVERLESS_MAX_CONNECTION_THREADS", "7");
 
     const env_cfg = serverless_serverConfigFromEnv(&env_map, .{});
     try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), env_cfg.max_request_bytes);
+    try std.testing.expectEqual(@as(u32, 7), env_cfg.max_connection_threads);
 
-    const cli_cfg = serverless_serverConfigFromEnv(&env_map, .{ .max_request_bytes = 8 * 1024 * 1024 });
+    const cli_cfg = serverless_serverConfigFromEnv(&env_map, .{
+        .max_request_bytes = 8 * 1024 * 1024,
+        .max_connection_threads = 11,
+    });
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), cli_cfg.max_request_bytes);
+    try std.testing.expectEqual(@as(u32, 11), cli_cfg.max_connection_threads);
 }
 
 test "serverless main parses maintenance booleans" {

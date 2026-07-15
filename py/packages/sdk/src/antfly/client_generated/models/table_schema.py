@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ..models.dynamic_template import DynamicTemplate
     from ..models.foreign_key import ForeignKey
     from ..models.primary_key import PrimaryKey
+    from ..models.relational_index import RelationalIndex
     from ..models.relational_period import RelationalPeriod
     from ..models.table_schema_document_schemas import TableSchemaDocumentSchemas
     from ..models.unique_constraint import UniqueConstraint
@@ -76,6 +77,12 @@ class TableSchema:
             non-json relational columns. Present scalar tuples are enforced by
             committed integrity rows; rows with any absent nullable component do
             not create unique rows.
+        relational_indexes (list[RelationalIndex] | Unset): Durable relational secondary-index catalog entries. This is
+            the
+            public schema shape for relational scalar-column, ordered-tuple,
+            algebraic-filter, and text-search index metadata; lifecycle,
+            generation, and schema_fingerprint identify the physical index
+            generation that may be promoted to ready.
     """
 
     version: int | Unset = UNSET
@@ -90,6 +97,7 @@ class TableSchema:
     periods: list[RelationalPeriod] | Unset = UNSET
     primary_key: PrimaryKey | Unset = UNSET
     unique_constraints: list[UniqueConstraint] | Unset = UNSET
+    relational_indexes: list[RelationalIndex] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -143,6 +151,13 @@ class TableSchema:
                 unique_constraints_item = unique_constraints_item_data.to_dict()
                 unique_constraints.append(unique_constraints_item)
 
+        relational_indexes: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.relational_indexes, Unset):
+            relational_indexes = []
+            for relational_indexes_item_data in self.relational_indexes:
+                relational_indexes_item = relational_indexes_item_data.to_dict()
+                relational_indexes.append(relational_indexes_item)
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -170,6 +185,8 @@ class TableSchema:
             field_dict["primary_key"] = primary_key
         if unique_constraints is not UNSET:
             field_dict["unique_constraints"] = unique_constraints
+        if relational_indexes is not UNSET:
+            field_dict["relational_indexes"] = relational_indexes
 
         return field_dict
 
@@ -178,6 +195,7 @@ class TableSchema:
         from ..models.dynamic_template import DynamicTemplate
         from ..models.foreign_key import ForeignKey
         from ..models.primary_key import PrimaryKey
+        from ..models.relational_index import RelationalIndex
         from ..models.relational_period import RelationalPeriod
         from ..models.table_schema_document_schemas import TableSchemaDocumentSchemas
         from ..models.unique_constraint import UniqueConstraint
@@ -250,6 +268,15 @@ class TableSchema:
 
                 unique_constraints.append(unique_constraints_item)
 
+        _relational_indexes = d.pop("relational_indexes", UNSET)
+        relational_indexes: list[RelationalIndex] | Unset = UNSET
+        if _relational_indexes is not UNSET:
+            relational_indexes = []
+            for relational_indexes_item_data in _relational_indexes:
+                relational_indexes_item = RelationalIndex.from_dict(relational_indexes_item_data)
+
+                relational_indexes.append(relational_indexes_item)
+
         table_schema = cls(
             version=version,
             storage_mode=storage_mode,
@@ -263,6 +290,7 @@ class TableSchema:
             periods=periods,
             primary_key=primary_key,
             unique_constraints=unique_constraints,
+            relational_indexes=relational_indexes,
         )
 
         table_schema.additional_properties = d

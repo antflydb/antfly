@@ -1238,6 +1238,44 @@ pub fn decodeRgba(alloc: Allocator, jpeg_bytes: []const u8) !DecodedImage {
     return error.JpegDecodeFailed;
 }
 
+pub fn preprocessClipChw(
+    alloc: Allocator,
+    jpeg_bytes: []const u8,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) ![]f32 {
+    return preprocessClipChwWithOptions(alloc, jpeg_bytes, target_size, mean, std_dev, false);
+}
+
+/// CLIP JPEG preprocessing using JPEG DCT scaling. This is a speed/quality
+/// tradeoff and is not bit-identical to full decode plus resize.
+pub fn preprocessClipChwDctScaled(
+    alloc: Allocator,
+    jpeg_bytes: []const u8,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) ![]f32 {
+    return preprocessClipChwWithOptions(alloc, jpeg_bytes, target_size, mean, std_dev, true);
+}
+
+fn preprocessClipChwWithOptions(
+    alloc: Allocator,
+    jpeg_bytes: []const u8,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    allow_dct_scale: bool,
+) ![]f32 {
+    const structure = try parseStructure(jpeg_bytes);
+    if (target_size == 0) return error.JpegDecodeFailed;
+    if (canPureZigDecodeColorBaseline(structure)) {
+        return preprocessClipChwPureZigColorBaseline(alloc, jpeg_bytes, structure, target_size, mean, std_dev, allow_dct_scale);
+    }
+    return error.UnsupportedJpegFormat;
+}
+
 pub fn supportsPlannedLosslessDecode(structure: Structure) bool {
     if (structure.info.frame_kind != .lossless) return false;
     if (structure.info.bits_per_sample == 0 or structure.info.bits_per_sample > 16) return false;
@@ -2602,6 +2640,157 @@ fn decodeRgbaPureZigColorBaseline(
     };
 }
 
+fn preprocessClipChwPureZigColorBaseline(
+    alloc: Allocator,
+    jpeg_bytes: []const u8,
+    structure: Structure,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    allow_dct_scale: bool,
+) ![]f32 {
+    const width = structure.info.width;
+    const height = structure.info.height;
+    const color_encoding = colorEncodingForStructure(structure) orelse return error.JpegDecodeFailed;
+    const dct_scale = if (allow_dct_scale) clipDctScale(width, height, target_size) else 1;
+
+    const scan = structure.scans[0];
+    const entropy_bytes = try scanEntropyBytes(structure, jpeg_bytes, 0);
+    var reader = EntropyBitReader.init(entropy_bytes);
+    var dc_predictors = [_]i64{0} ** max_components;
+    const restart_interval = structure.restart_interval orelse 0;
+    var restart_index: u8 = 0;
+
+    var component_dc_tables: [max_components]CanonicalHuffmanTable = undefined;
+    var component_ac_tables: [max_components]CanonicalHuffmanTable = undefined;
+    var component_quant_tables: [max_components][64]u16 = undefined;
+    var max_h: u8 = 1;
+    var max_v: u8 = 1;
+
+    for (0..structure.info.component_count) |frame_index| {
+        const component = structure.info.components[frame_index];
+        const scan_component = scan.components[frame_index];
+        component_dc_tables[frame_index] = try buildCanonicalHuffmanTable(scan.dc_tables[scan_component.dc_table_id]);
+        component_ac_tables[frame_index] = try buildCanonicalHuffmanTable(scan.ac_tables[scan_component.ac_table_id]);
+        component_quant_tables[frame_index] = quantTableNaturalOrder(structure.quant_tables[component.quant_table_id]);
+        if (component.horizontal_sampling > max_h) max_h = component.horizontal_sampling;
+        if (component.vertical_sampling > max_v) max_v = component.vertical_sampling;
+    }
+
+    const mcu_width = @as(usize, max_h) * 8;
+    const mcu_height = @as(usize, max_v) * 8;
+    const blocks_x = @divFloor(@as(usize, width) + (mcu_width - 1), mcu_width);
+    const blocks_y = @divFloor(@as(usize, height) + (mcu_height - 1), mcu_height);
+    const total_mcus = blocks_x * blocks_y;
+    var mcus_decoded: usize = 0;
+
+    var component_planes = try initComponentSamplePlanes(
+        alloc,
+        scaledDimension(width, dct_scale),
+        scaledDimension(height, dct_scale),
+        structure.info.components,
+        structure.info.component_count,
+        max_h,
+        max_v,
+    );
+    defer freeComponentSamplePlanes(alloc, &component_planes);
+
+    for (0..blocks_y) |mcu_y| {
+        for (0..blocks_x) |mcu_x| {
+            for (0..structure.info.component_count) |frame_index| {
+                const component = structure.info.components[frame_index];
+                const block_count = @as(usize, component.horizontal_sampling) * @as(usize, component.vertical_sampling);
+                for (0..block_count) |block_index| {
+                    const block = decodeBaselineBlock(
+                        &reader,
+                        component_dc_tables[frame_index],
+                        component_ac_tables[frame_index],
+                        dc_predictors[frame_index],
+                    ) catch |err| return err;
+                    dc_predictors[frame_index] = block.dc_predictor;
+
+                    const block_col = block_index % @as(usize, component.horizontal_sampling);
+                    const block_row = block_index / @as(usize, component.horizontal_sampling);
+                    const plane_block_x = mcu_x * @as(usize, component.horizontal_sampling) + block_col;
+                    const plane_block_y = mcu_y * @as(usize, component.vertical_sampling) + block_row;
+                    switch (dct_scale) {
+                        8 => writeScaledDctBlockToPlane(
+                            component_planes[frame_index],
+                            plane_block_x,
+                            plane_block_y,
+                            8,
+                            dequantizeAndInverseDctScaledNative(
+                                block.coefficients,
+                                component_quant_tables[frame_index],
+                                structure.info.bits_per_sample,
+                                8,
+                            ),
+                        ),
+                        4 => writeScaledDctBlockToPlane(
+                            component_planes[frame_index],
+                            plane_block_x,
+                            plane_block_y,
+                            4,
+                            dequantizeAndInverseDctScaledNative(
+                                block.coefficients,
+                                component_quant_tables[frame_index],
+                                structure.info.bits_per_sample,
+                                4,
+                            ),
+                        ),
+                        2 => writeScaledDctBlockToPlane(
+                            component_planes[frame_index],
+                            plane_block_x,
+                            plane_block_y,
+                            2,
+                            dequantizeAndInverseDctScaledNative(
+                                block.coefficients,
+                                component_quant_tables[frame_index],
+                                structure.info.bits_per_sample,
+                                2,
+                            ),
+                        ),
+                        else => {
+                            const spatial = dequantizeAndInverseDctNativeWithSamplePrecision(
+                                block.coefficients,
+                                component_quant_tables[frame_index],
+                                structure.info.bits_per_sample,
+                            );
+                            writeSpatialBlockToPlane(component_planes[frame_index], plane_block_x, plane_block_y, spatial);
+                        },
+                    }
+                }
+            }
+
+            mcus_decoded += 1;
+            if (restart_interval != 0 and mcus_decoded < total_mcus and mcus_decoded % restart_interval == 0) {
+                try reader.consumeExpectedRestartMarker(0xd0 + restart_index);
+                restart_index = (restart_index + 1) & 0x7;
+                dc_predictors = [_]i64{0} ** max_components;
+            }
+        }
+    }
+
+    const ts: usize = @intCast(target_size);
+    const result = try alloc.alloc(f32, 3 * ts * ts);
+    errdefer alloc.free(result);
+    writeClipColorPlanesToChw(
+        result,
+        scaledDimension(width, dct_scale),
+        scaledDimension(height, dct_scale),
+        target_size,
+        mean,
+        std_dev,
+        structure.info.bits_per_sample,
+        color_encoding,
+        structure.info.components,
+        max_h,
+        max_v,
+        component_planes,
+    );
+    return result;
+}
+
 fn decodeRgbaPureZigLossless(
     alloc: Allocator,
     jpeg_bytes: []const u8,
@@ -2807,6 +2996,29 @@ fn dequantizeAndInverseDct(coefficients: anytype, quant_table: [64]u16) [64]u8 {
     return dequantizeAndInverseDctWithSamplePrecision(coefficients, quant_table, 8);
 }
 
+fn dequantizeAndInverseDctScaledNative(
+    coefficients: anytype,
+    quant_table: [64]u16,
+    bits_per_sample: u8,
+    comptime dct_scale: u8,
+) [scaledBlockSampleCount(dct_scale)]u16 {
+    var out = std.mem.zeroes([scaledBlockSampleCount(dct_scale)]u16);
+    const sample_center: i64 = @as(i64, 1) << @as(u6, @intCast(bits_per_sample - 1));
+    const sample_max: f64 = @floatFromInt((@as(u64, 1) << @as(u6, @intCast(bits_per_sample))) - 1);
+    const dequantized = dequantizeCoefficientsSimd(coefficients, quant_table);
+    const kernel = comptime scaledDctKernel(dct_scale);
+
+    for (0..scaledBlockSampleCount(dct_scale)) |sample_index| {
+        var sum: f64 = 0.0;
+        for (0..64) |i| {
+            sum += @as(f64, @floatFromInt(dequantized[i])) * kernel[sample_index][i];
+        }
+        const sample = std.math.clamp(@round(sum + @as(f64, @floatFromInt(sample_center))), 0.0, sample_max);
+        out[sample_index] = @intFromFloat(sample);
+    }
+    return out;
+}
+
 fn dequantizeAndInverseDctNativeWithSamplePrecision(
     coefficients: anytype,
     quant_table: [64]u16,
@@ -2979,6 +3191,41 @@ fn dequantizeAndInverseDctWithSamplePrecision(
     return out;
 }
 
+fn scaledBlockSide(comptime dct_scale: u8) usize {
+    return 8 / dct_scale;
+}
+
+fn scaledBlockSampleCount(comptime dct_scale: u8) usize {
+    const side = scaledBlockSide(dct_scale);
+    return side * side;
+}
+
+fn scaledDctKernel(comptime dct_scale: u8) [scaledBlockSampleCount(dct_scale)][64]f64 {
+    @setEvalBranchQuota(10000);
+    const out_side = scaledBlockSide(dct_scale);
+    var kernel: [scaledBlockSampleCount(dct_scale)][64]f64 = undefined;
+    inline for (0..out_side) |y| {
+        inline for (0..out_side) |x| {
+            const sample_index = y * out_side + x;
+            inline for (0..8) |v| {
+                const cv: f64 = if (v == 0) 0.7071067811865476 else 1.0;
+                const cy = scaledDctCos(dct_scale, y, v);
+                inline for (0..8) |u| {
+                    const cu: f64 = if (u == 0) 0.7071067811865476 else 1.0;
+                    const cx = scaledDctCos(dct_scale, x, u);
+                    kernel[sample_index][v * 8 + u] = 0.25 * cu * cv * cx * cy;
+                }
+            }
+        }
+    }
+    return kernel;
+}
+
+fn scaledDctCos(comptime dct_scale: u8, comptime output_index: usize, comptime frequency: usize) f64 {
+    const position = (@as(f64, @floatFromInt(output_index)) + 0.5) * @as(f64, @floatFromInt(dct_scale));
+    return std.math.cos(position * @as(f64, @floatFromInt(frequency)) * std.math.pi / 8.0);
+}
+
 fn rangeLimitSampleIjpeg(value: i64, bits_per_sample: u8) i64 {
     const sample_count: i64 = @as(i64, 1) << @as(u6, @intCast(bits_per_sample));
     const center: i64 = sample_count >> 1;
@@ -3101,6 +3348,31 @@ fn writeSpatialBlockToPlane(
     }
 }
 
+fn writeScaledDctBlockToPlane(
+    plane: SamplePlane,
+    block_x: usize,
+    block_y: usize,
+    comptime dct_scale: u8,
+    block: [scaledBlockSampleCount(dct_scale)]u16,
+) void {
+    const out_side: comptime_int = 8 / dct_scale;
+    const start_x = block_x * out_side;
+    const start_y = block_y * out_side;
+    if (start_x >= plane.width or start_y >= plane.height) return;
+
+    for (0..out_side) |local_y| {
+        const sample_y = start_y + local_y;
+        if (sample_y >= plane.height) break;
+
+        const src_off = local_y * out_side;
+        const dst_off = sample_y * plane.width + start_x;
+        const copy_len = @min(out_side, plane.width - start_x);
+        for (0..copy_len) |i| {
+            plane.samples[dst_off + i] = block[src_off + i];
+        }
+    }
+}
+
 fn renderColorPlanesToRgba(
     rgba: []u8,
     width: u32,
@@ -3181,6 +3453,146 @@ fn renderColorPlanesToRgba(
             rgba[pixel_index + 3] = 0xff;
         }
     }
+}
+
+fn writeClipColorPlanesToChw(
+    result: []f32,
+    width: u32,
+    height: u32,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    bits_per_sample: u8,
+    color_encoding: ColorEncoding,
+    components: [max_components]ComponentInfo,
+    max_h: u8,
+    max_v: u8,
+    planes: [max_components]SamplePlane,
+) void {
+    const ts: usize = @intCast(target_size);
+    const resized = clipResizeDimsForTarget(width, height, target_size);
+    const crop_left = (resized.width - target_size) / 2;
+    const crop_top = (resized.height - target_size) / 2;
+    const scale_x = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(resized.width));
+    const scale_y = @as(f32, @floatFromInt(height)) / @as(f32, @floatFromInt(resized.height));
+    const plane_stride = ts * ts;
+
+    for (0..ts) |y| {
+        const src_y = @as(f32, @floatFromInt(crop_top + @as(u32, @intCast(y)))) * scale_y;
+        const y0: usize = @intFromFloat(@floor(src_y));
+        const y1 = @min(y0 + 1, @as(usize, height) - 1);
+        const fy = src_y - @as(f32, @floatFromInt(y0));
+
+        for (0..ts) |x| {
+            const src_x = @as(f32, @floatFromInt(crop_left + @as(u32, @intCast(x)))) * scale_x;
+            const x0: usize = @intFromFloat(@floor(src_x));
+            const x1 = @min(x0 + 1, @as(usize, width) - 1);
+            const fx = src_x - @as(f32, @floatFromInt(x0));
+
+            const p00 = rgbAtColorPlanes(bits_per_sample, color_encoding, components, max_h, max_v, planes, x0, y0);
+            const p10 = rgbAtColorPlanes(bits_per_sample, color_encoding, components, max_h, max_v, planes, x1, y0);
+            const p01 = rgbAtColorPlanes(bits_per_sample, color_encoding, components, max_h, max_v, planes, x0, y1);
+            const p11 = rgbAtColorPlanes(bits_per_sample, color_encoding, components, max_h, max_v, planes, x1, y1);
+            const dst = y * ts + x;
+
+            inline for (0..3) |ch| {
+                const top = @as(f32, @floatFromInt(p00[ch])) * (1.0 - fx) + @as(f32, @floatFromInt(p10[ch])) * fx;
+                const bottom = @as(f32, @floatFromInt(p01[ch])) * (1.0 - fx) + @as(f32, @floatFromInt(p11[ch])) * fx;
+                const value = (top * (1.0 - fy) + bottom * fy) / 255.0;
+                result[ch * plane_stride + dst] = (value - mean[ch]) / std_dev[ch];
+            }
+        }
+    }
+}
+
+fn rgbAtColorPlanes(
+    bits_per_sample: u8,
+    color_encoding: ColorEncoding,
+    components: [max_components]ComponentInfo,
+    max_h: u8,
+    max_v: u8,
+    planes: [max_components]SamplePlane,
+    x: usize,
+    y: usize,
+) [3]u8 {
+    return switch (color_encoding) {
+        .rgb => blk: {
+            const r = samplePlaneValue(planes[0], components[0], max_h, max_v, bits_per_sample, x, y);
+            const g = samplePlaneValue(planes[1], components[1], max_h, max_v, bits_per_sample, x, y);
+            const b = samplePlaneValue(planes[2], components[2], max_h, max_v, bits_per_sample, x, y);
+            break :blk if (bits_per_sample == 8)
+                [3]u8{ @intCast(r), @intCast(g), @intCast(b) }
+            else
+                [3]u8{
+                    scaleSampleToByteWide(r, bits_per_sample),
+                    scaleSampleToByteWide(g, bits_per_sample),
+                    scaleSampleToByteWide(b, bits_per_sample),
+                };
+        },
+        .ycbcr => blk: {
+            const yy = samplePlaneValue(planes[0], components[0], max_h, max_v, bits_per_sample, x, y);
+            const cb = samplePlaneValue(planes[1], components[1], max_h, max_v, bits_per_sample, x, y);
+            const cr = samplePlaneValue(planes[2], components[2], max_h, max_v, bits_per_sample, x, y);
+            break :blk if (bits_per_sample == 8)
+                ycbcrToRgb(@intCast(yy), @intCast(cb), @intCast(cr))
+            else
+                ycbcrToRgbWide(yy, cb, cr, bits_per_sample);
+        },
+        .cmyk => blk: {
+            const c = samplePlaneValue(planes[0], components[0], max_h, max_v, bits_per_sample, x, y);
+            const m = samplePlaneValue(planes[1], components[1], max_h, max_v, bits_per_sample, x, y);
+            const yy = samplePlaneValue(planes[2], components[2], max_h, max_v, bits_per_sample, x, y);
+            const k = samplePlaneValue(planes[3], components[3], max_h, max_v, bits_per_sample, x, y);
+            break :blk if (bits_per_sample == 8)
+                invertedCmykToRgb(@intCast(c), @intCast(m), @intCast(yy), @intCast(k))
+            else
+                invertedCmykToRgbWide(c, m, yy, k, bits_per_sample);
+        },
+        .ycck => blk: {
+            const yy = samplePlaneValue(planes[0], components[0], max_h, max_v, bits_per_sample, x, y);
+            const cb = samplePlaneValue(planes[1], components[1], max_h, max_v, bits_per_sample, x, y);
+            const cr = samplePlaneValue(planes[2], components[2], max_h, max_v, bits_per_sample, x, y);
+            const k = samplePlaneValue(planes[3], components[3], max_h, max_v, bits_per_sample, x, y);
+            break :blk if (bits_per_sample == 8)
+                ycckToRgb(@intCast(yy), @intCast(cb), @intCast(cr), @intCast(k))
+            else
+                ycckToRgbWide(yy, cb, cr, k, bits_per_sample);
+        },
+    };
+}
+
+const ClipResizeDims = struct {
+    width: u32,
+    height: u32,
+};
+
+fn clipResizeDimsForTarget(width: u32, height: u32, target_size: u32) ClipResizeDims {
+    if (width <= height) {
+        return .{ .width = target_size, .height = scaledLongEdgeForTarget(height, width, target_size) };
+    }
+    return .{ .width = scaledLongEdgeForTarget(width, height, target_size), .height = target_size };
+}
+
+fn scaledLongEdgeForTarget(long_edge: u32, short_edge: u32, target_size: u32) u32 {
+    const scaled = @divFloor(@as(u64, long_edge) * @as(u64, target_size), @as(u64, short_edge));
+    return @max(target_size, @as(u32, @intCast(scaled)));
+}
+
+fn clipDctScale(width: u32, height: u32, target_size: u32) u8 {
+    const short_edge = @min(width, height);
+    if (edgeAtLeastScaledTarget(short_edge, target_size, 32)) return 8;
+    if (edgeAtLeastScaledTarget(short_edge, target_size, 8)) return 4;
+    if (edgeAtLeastScaledTarget(short_edge, target_size, 4)) return 2;
+    return 1;
+}
+
+fn edgeAtLeastScaledTarget(edge: u32, target_size: u32, scale: u32) bool {
+    return @as(u64, edge) >= @as(u64, target_size) * @as(u64, scale);
+}
+
+fn scaledDimension(value: u32, dct_scale: u8) u32 {
+    if (dct_scale == 1) return value;
+    return @intCast(@divFloor(@as(usize, value) + @as(usize, dct_scale) - 1, @as(usize, dct_scale)));
 }
 
 fn canRenderDirectRgb8(
@@ -4219,6 +4631,69 @@ test "decode rgba matches manifest-backed white fixture" {
     const actual_hex = try test_support.sha256HexAlloc(alloc, decoded.rgba);
     defer alloc.free(actual_hex);
     try std.testing.expectEqualStrings(fixture.pixel_hashes[0], actual_hex);
+}
+
+test "preprocess clip chw matches full decode resize crop on 420 fixture" {
+    const alloc = std.testing.allocator;
+    const fixture_bytes = try test_support.readFixtureAlloc(alloc, std.testing.io, "jpeg/upstream/libjpeg_turbo_seed_corpora/8x8_420.jpg");
+    defer alloc.free(fixture_bytes);
+
+    const full = try decodeRgba(alloc, fixture_bytes);
+    defer alloc.free(full.rgba);
+    const target_size: u32 = 4;
+    const fast = try preprocessClipChw(alloc, fixture_bytes, target_size, .{ 0.0, 0.0, 0.0 }, .{ 1.0, 1.0, 1.0 });
+    defer alloc.free(fast);
+
+    try std.testing.expectEqual(@as(u32, 8), full.width);
+    try std.testing.expectEqual(@as(u32, 8), full.height);
+    try std.testing.expectEqual(@as(usize, 3 * 4 * 4), fast.len);
+
+    const ts: usize = @intCast(target_size);
+    const resized = clipResizeDimsForTarget(full.width, full.height, target_size);
+    const crop_left = (resized.width - target_size) / 2;
+    const crop_top = (resized.height - target_size) / 2;
+    const scale_x = @as(f32, @floatFromInt(full.width)) / @as(f32, @floatFromInt(resized.width));
+    const scale_y = @as(f32, @floatFromInt(full.height)) / @as(f32, @floatFromInt(resized.height));
+
+    for (0..ts) |y| {
+        const src_y = @as(f32, @floatFromInt(crop_top + @as(u32, @intCast(y)))) * scale_y;
+        const y0: usize = @intFromFloat(@floor(src_y));
+        const y1 = @min(y0 + 1, @as(usize, full.height) - 1);
+        const fy = src_y - @as(f32, @floatFromInt(y0));
+        for (0..ts) |x| {
+            const src_x = @as(f32, @floatFromInt(crop_left + @as(u32, @intCast(x)))) * scale_x;
+            const x0: usize = @intFromFloat(@floor(src_x));
+            const x1 = @min(x0 + 1, @as(usize, full.width) - 1);
+            const fx = src_x - @as(f32, @floatFromInt(x0));
+            inline for (0..3) |ch| {
+                const p00 = @as(f32, @floatFromInt(full.rgba[(y0 * @as(usize, full.width) + x0) * 4 + ch]));
+                const p10 = @as(f32, @floatFromInt(full.rgba[(y0 * @as(usize, full.width) + x1) * 4 + ch]));
+                const p01 = @as(f32, @floatFromInt(full.rgba[(y1 * @as(usize, full.width) + x0) * 4 + ch]));
+                const p11 = @as(f32, @floatFromInt(full.rgba[(y1 * @as(usize, full.width) + x1) * 4 + ch]));
+                const top = p00 * (1.0 - fx) + p10 * fx;
+                const bottom = p01 * (1.0 - fx) + p11 * fx;
+                const expected = (top * (1.0 - fy) + bottom * fy) / 255.0;
+                try std.testing.expectApproxEqAbs(expected, fast[ch * ts * ts + y * ts + x], 1e-6);
+            }
+        }
+    }
+}
+
+test "preprocess clip chw uses scaled dct path when source is large enough" {
+    const alloc = std.testing.allocator;
+    const fixture_bytes = try test_support.readFixtureAlloc(alloc, std.testing.io, "jpeg/upstream/libjpeg_turbo_seed_corpora/8x8_420.jpg");
+    defer alloc.free(fixture_bytes);
+
+    try std.testing.expectEqual(@as(u8, 4), clipDctScale(8, 8, 1));
+    try std.testing.expectEqual(@as(u8, 8), clipDctScale(32, 32, 1));
+    const fast = try preprocessClipChwDctScaled(alloc, fixture_bytes, 1, .{ 0.0, 0.0, 0.0 }, .{ 1.0, 1.0, 1.0 });
+    defer alloc.free(fast);
+
+    try std.testing.expectEqual(@as(usize, 3), fast.len);
+    for (fast) |value| {
+        try std.testing.expect(std.math.isFinite(value));
+        try std.testing.expect(value >= 0.0 and value <= 1.0);
+    }
 }
 
 test "probe matches manifest-backed baseline jpeg metadata" {

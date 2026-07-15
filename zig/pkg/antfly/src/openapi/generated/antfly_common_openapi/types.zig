@@ -2,26 +2,99 @@
 // Package: antfly_common_openapi
 
 const std = @import("std");
-const antfly_generating_openapi = @import("antfly_generating_openapi");
-const antfly_logging_openapi = @import("antfly_logging_openapi");
-const antfly_inference_config_openapi = @import("antfly_inference_config_openapi");
-const antfly_scraping_openapi = @import("antfly_scraping_openapi");
 const antfly_audio_openapi = @import("antfly_audio_openapi");
-const antfly_middleware_openapi = @import("antfly_middleware_openapi");
-const antfly_embeddings_openapi = @import("antfly_embeddings_openapi");
-const antfly_reranking_openapi = @import("antfly_reranking_openapi");
 const antfly_chunking_openapi = @import("antfly_chunking_openapi");
+const antfly_embeddings_openapi = @import("antfly_embeddings_openapi");
+const antfly_generating_openapi = @import("antfly_generating_openapi");
+const antfly_inference_config_openapi = @import("antfly_inference_config_openapi");
+const antfly_logging_openapi = @import("antfly_logging_openapi");
+const antfly_middleware_openapi = @import("antfly_middleware_openapi");
+const antfly_reranking_openapi = @import("antfly_reranking_openapi");
+const antfly_scraping_openapi = @import("antfly_scraping_openapi");
 
-/// A link in a chain that can reference a generator by name OR provide an inline config. Use `generator` (string) to reference a named generator from the `generators` map. Use `generator_config` (object) to provide an inline generator configuration. Only one of `generator` or `generator_config` should be specified.
-pub const NamedChainLink = struct {
-    /// Name of the generator from the generators map
-    generator: ?[]const u8 = null,
-    /// Inline generator configuration (alternative to referencing by name)
-    generator_config: ?antfly_generating_openapi.GeneratorConfig = null,
-    /// Retry configuration for this generator
-    retry: ?antfly_generating_openapi.RetryConfig = null,
-    /// When to try the next generator in chain
-    condition: ?antfly_generating_openapi.ChainCondition = null,
+pub const CdcConnectionConfig = struct {
+    /// CDC provider type. Initially postgres.
+    provider: []const u8,
+    /// Source DSN or secret reference. Never returned by inventory APIs.
+    dsn: ?[]const u8 = null,
+    /// Antfly table receiving changes from this CDC source.
+    table_name: ?[]const u8 = null,
+    /// Zero-based ordinal of the source within the table's CDC runtime.
+    source_ordinal: ?i64 = null,
+    /// Source-side table or stream name.
+    external_table: ?[]const u8 = null,
+    /// Provider replication cursor or slot name when applicable.
+    slot_name: ?[]const u8 = null,
+    /// Provider publication or stream grouping name when applicable.
+    publication_name: ?[]const u8 = null,
+};
+
+pub const Config = struct {
+    /// Internal version of antfly
+    version: ?[]const u8 = null,
+    log: ?antfly_logging_openapi.Config = null,
+    /// Enables the health/metrics server. Defaults to true.
+    health_enabled: ?bool = null,
+    /// Port for the health/metrics server. Defaults to 4200.
+    health_port: ?i64 = null,
+    storage: ?StorageConfig = null,
+    metadata: ?MetadataInfo = null,
+    inference: ?antfly_inference_config_openapi.Config = null,
+    tls: ?TLSInfo = null,
+    remote_content: ?antfly_scraping_openapi.RemoteContentConfig = null,
+    /// Public connection resources keyed by stable connection ID. These are the external systems Antfly can use for inference, external IO, CDC, backups, indexing, agents, and related workflows.
+    connections: ?std.json.ArrayHashMap(ConnectionConfig) = null,
+    /// Named speech-to-text provider configurations. Define named STT providers that can be referenced by templates and API calls. The first provider defined becomes the default when no provider name is specified. **Example:** ```yaml speech_to_text: antfly-whisper: provider: antfly api_url: "http://localhost:8080" model: openai/whisper-base openai-whisper: provider: openai model: whisper-1 ``` Then in templates: `{{transcribeAudio url="..." provider="whisper-local"}}`
+    speech_to_text: ?std.json.ArrayHashMap(antfly_audio_openapi.STTConfig) = null,
+    cors: ?antfly_middleware_openapi.CORSConfig = null,
+    /// How many replicas of each shard should be maintained.
+    replication_factor: ?i64 = null,
+    /// Enables authentication and authorization (RBAC) for the API.
+    enable_auth: ?bool = null,
+    /// Disables automatic shard reallocation (splitting/merging).
+    disable_shard_alloc: ?bool = null,
+    /// Cooldown period after shard operations (start/stop/split). Format: duration string like '1m', '30s'. Default: '1m' (one minute).
+    shard_cooldown_period: ?[]const u8 = null,
+    /// Maximum duration for a shard split operation before triggering rollback. Format: duration string like '5m', '30s'. Default: '5m' (five minutes).
+    split_timeout: ?[]const u8 = null,
+    /// Minimum continuous readiness duration required before finalizing a split. Format: duration string like '15s', '1m'. Default: '15s'.
+    split_finalize_grace_period: ?[]const u8 = null,
+    /// Maximum size of a shard in bytes. Used to determine when to split shards.
+    max_shard_size_bytes: ?i64 = null,
+    /// Minimum size of a shard in bytes before it becomes eligible for automatic merge consideration. If unset, defaults to one quarter of max_shard_size_bytes.
+    min_shard_size_bytes: ?i64 = null,
+    /// Minimum number of shards to keep for a table. Automatic merges will not reduce a table below this count.
+    min_shards_per_table: ?i64 = null,
+    /// Maximum number of shards that can be created for a single table.
+    max_shards_per_table: ?i64 = null,
+    /// Default number of shards to create for a new table.
+    default_shards_per_table: ?i64 = null,
+    /// Bypasses Raft consensus for shards, using direct writes instead. Useful for development and testing with a single node.
+    swarm_mode: ?bool = null,
+    /// Named embedder configurations for embedding operations. Define named embedders that can be referenced by indexes, templates, and API calls. The first embedder defined becomes the default when no embedder name is specified. **API Key Configuration:** API keys can be provided via the encrypted keystore (recommended) or environment variables: 1. **Keystore** (recommended for production): ```bash antfly keystore create antfly keystore add openai.api_key ``` Then reference in config: `api_key: ${secret:openai.api_key}` 2. **Environment variable** (simpler for development): Omit `api_key` from config and set the appropriate env var: - OpenAI: `OPENAI_API_KEY` - Gemini: `GEMINI_API_KEY` - Anthropic: `ANTHROPIC_API_KEY` - Cohere: `COHERE_API_KEY` See [Secrets Management](/docs/secrets) for complete documentation. **Example:** ```yaml embedders: openai-small: provider: openai model: text-embedding-3-small antfly-local: provider: antfly model: bge-base-en-v1.5 api_url: "http://localhost:8082" ```
+    embedders: ?std.json.ArrayHashMap(antfly_embeddings_openapi.EmbedderConfig) = null,
+    /// Named generator configurations for AI operations. Define named generators that can be referenced by chains, templates, and API calls. The first generator defined becomes the default when no generator name is specified. **API Key Configuration:** API keys can be provided via the encrypted keystore (recommended) or environment variables: 1. **Keystore** (recommended for production): ```bash antfly keystore create antfly keystore add gemini.api_key ``` Then reference in config: `api_key: ${secret:gemini.api_key}` 2. **Environment variable** (simpler for development): Omit `api_key` from config and set the appropriate env var: - Gemini: `GEMINI_API_KEY` - OpenAI: `OPENAI_API_KEY` - Anthropic: `ANTHROPIC_API_KEY` See [Secrets Management](/docs/secrets) for complete documentation. **Example:** ```yaml generators: gemini-flash: provider: gemini model: gemini-2.5-flash ollama-local: provider: ollama model: llama3 openai-gpt4: provider: openai model: gpt-4.1 ```
+    generators: ?std.json.ArrayHashMap(antfly_generating_openapi.GeneratorConfig) = null,
+    /// Named chain configurations for fallback/retry logic. Chains are ordered lists of generators with retry and fallback logic. Each link references a generator by name from the `generators` map. The first chain defined becomes the default when no chain name is specified. **Chain Conditions:** - `on_error`: Try next generator on any error (default) - `on_rate_limit`: Try next only on rate limit (429) errors - `on_timeout`: Try next only on timeout errors - `always`: Always try the next generator **Example:** ```yaml chains: default: - generator: gemini-flash # Reference by name retry: max_attempts: 3 condition: on_rate_limit - generator: ollama-local # Reference by name with-inline: - generator: gemini-flash - generator_config: # Inline config provider: anthropic model: claude-sonnet-4-5-20250929 ``` Then in API calls: `chain: "default"` or `chain: "with-inline"`
+    chains: ?std.json.ArrayHashMap([]const NamedChainLink) = null,
+    /// Named reranker configurations for search result reranking. Define named rerankers that can be referenced by indexes, search queries, and API calls. The first reranker defined becomes the default when no reranker name is specified. **Example:** ```yaml rerankers: cohere-english: provider: cohere model: rerank-english-v3.0 antfly-local: provider: antfly model: mxbai-rerank-base-v1 url: "http://localhost:8080" ```
+    rerankers: ?std.json.ArrayHashMap(antfly_reranking_openapi.RerankerConfig) = null,
+    /// Named chunker configurations for text chunking. Define named chunkers that can be referenced by indexes and API calls. The first chunker defined becomes the default when no chunker name is specified. **Example:** ```yaml chunkers: fixed-500: provider: antfly model: fixed target_tokens: 500 overlap_tokens: 50 semantic: provider: antfly model: semantic-chunker api_url: "http://localhost:8080" ```
+    chunkers: ?std.json.ArrayHashMap(antfly_chunking_openapi.ChunkerConfig) = null,
+};
+
+pub const ConnectionConfig = struct {
+    /// Optional display name for UIs.
+    display_name: ?[]const u8 = null,
+    /// Provider token for connection kinds that have a provider-level service identity, such as web_search.
+    provider: ?[]const u8 = null,
+    kind: ConnectionKind,
+    /// Namespaced actions and workflow uses this connection supports.
+    capabilities: []const []const u8,
+    inference: ?InferenceConnectionConfig = null,
+    web_search: ?WebSearchConnectionConfig = null,
+    external_io: ?ExternalIoConnectionConfig = null,
+    cdc: ?CdcConnectionConfig = null,
 };
 
 /// Broad physical category for a configured connection.
@@ -54,6 +127,28 @@ pub const ConnectionKind = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+pub const ExternalIoConnectionConfig = struct {
+    protocol: ExternalIoProtocol,
+    /// Custom endpoint URL when configured.
+    endpoint: ?[]const u8 = null,
+    /// Buckets this connection is configured for.
+    buckets: ?[]const []const u8 = null,
+    /// Key prefix when configured.
+    prefix: ?[]const u8 = null,
+    /// Hosts or base URLs this connection applies to.
+    hosts: ?[]const []const u8 = null,
+    /// HTTP headers or secret references. Never returned by inventory APIs.
+    headers: ?std.json.ArrayHashMap([]const u8) = null,
+    /// Object-store access key or secret reference. Never returned by inventory APIs.
+    access_key_id: ?[]const u8 = null,
+    /// Object-store secret key or secret reference. Never returned by inventory APIs.
+    secret_access_key: ?[]const u8 = null,
+    /// Object-store session token or secret reference. Never returned by inventory APIs.
+    session_token: ?[]const u8 = null,
+    /// Whether S3-compatible endpoints should use TLS.
+    use_ssl: ?bool = null,
 };
 
 /// External IO transport protocol.
@@ -109,58 +204,9 @@ pub const InferenceConnectionConfig = struct {
     configured_model_types: ?[]const []const u8 = null,
 };
 
-pub const WebSearchConnectionConfig = struct {
-    /// Provider-specific service flavor, such as agent_search for provider vertex.
-    service: ?[]const u8 = null,
-    /// Maximum ranked results to return.
-    max_results: ?i64 = null,
-    /// Provider request timeout in milliseconds.
-    timeout_ms: ?i64 = null,
-    /// Request provider safe-search filtering.
-    safe_search: ?bool = null,
-    /// Preferred result language, such as en.
-    language: ?[]const u8 = null,
-    /// Preferred result region, such as us.
-    region: ?[]const u8 = null,
-    /// Ask the provider to return extracted page content when supported.
-    include_content: ?bool = null,
-    /// Ask the provider to return highlighted passages when supported.
-    include_highlights: ?bool = null,
-    /// Provider API key or secret reference. Never returned by inventory APIs.
-    api_key: ?[]const u8 = null,
-    /// Provider endpoint override when applicable.
-    endpoint: ?[]const u8 = null,
-    /// Google Cloud project for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
-    location: ?[]const u8 = null,
-    /// Agent Search data store ID for provider vertex.
-    data_store: ?[]const u8 = null,
-    /// Agent Search serving config ID for provider vertex.
-    serving_config: ?[]const u8 = null,
-    /// Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
-    credentials_path: ?[]const u8 = null,
-    /// Only include results from these domains when provider supports it.
-    include_domains: ?[]const []const u8 = null,
-    /// Exclude results from these domains when provider supports it.
-    exclude_domains: ?[]const []const u8 = null,
-};
-
-pub const CdcConnectionConfig = struct {
-    /// CDC provider type. Initially postgres.
-    provider: []const u8,
-    /// Source DSN or secret reference. Never returned by inventory APIs.
-    dsn: ?[]const u8 = null,
-    /// Antfly table receiving changes from this CDC source.
-    table_name: ?[]const u8 = null,
-    /// Zero-based ordinal of the source within the table's CDC runtime.
-    source_ordinal: ?i64 = null,
-    /// Source-side table or stream name.
-    external_table: ?[]const u8 = null,
-    /// Provider replication cursor or slot name when applicable.
-    slot_name: ?[]const u8 = null,
-    /// Provider publication or stream grouping name when applicable.
-    publication_name: ?[]const u8 = null,
+pub const LocalStorageConfig = struct {
+    /// Root directory for all antfly data storage. Defaults to 'antflydb'.
+    base_dir: ?[]const u8 = null,
 };
 
 pub const MetadataInfo = struct {
@@ -168,16 +214,16 @@ pub const MetadataInfo = struct {
     orchestration_urls: ?std.json.ArrayHashMap([]const u8) = null,
 };
 
-pub const TLSInfo = struct {
-    /// Path to TLS certificate file
-    cert: ?[]const u8 = null,
-    /// Path to TLS key file
-    key: ?[]const u8 = null,
-};
-
-pub const LocalStorageConfig = struct {
-    /// Root directory for all antfly data storage. Defaults to 'antflydb'.
-    base_dir: ?[]const u8 = null,
+/// A link in a chain that can reference a generator by name OR provide an inline config. Use `generator` (string) to reference a named generator from the `generators` map. Use `generator_config` (object) to provide an inline generator configuration. Only one of `generator` or `generator_config` should be specified.
+pub const NamedChainLink = struct {
+    /// Name of the generator from the generators map
+    generator: ?[]const u8 = null,
+    /// Inline generator configuration (alternative to referencing by name)
+    generator_config: ?antfly_generating_openapi.GeneratorConfig = null,
+    /// Retry configuration for this generator
+    retry: ?antfly_generating_openapi.RetryConfig = null,
+    /// When to try the next generator in chain
+    condition: ?antfly_generating_openapi.ChainCondition = null,
 };
 
 pub const S3Info = struct {
@@ -213,28 +259,6 @@ pub const StorageBackend = enum {
     }
 };
 
-pub const ExternalIoConnectionConfig = struct {
-    protocol: ExternalIoProtocol,
-    /// Custom endpoint URL when configured.
-    endpoint: ?[]const u8 = null,
-    /// Buckets this connection is configured for.
-    buckets: ?[]const []const u8 = null,
-    /// Key prefix when configured.
-    prefix: ?[]const u8 = null,
-    /// Hosts or base URLs this connection applies to.
-    hosts: ?[]const []const u8 = null,
-    /// HTTP headers or secret references. Never returned by inventory APIs.
-    headers: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Object-store access key or secret reference. Never returned by inventory APIs.
-    access_key_id: ?[]const u8 = null,
-    /// Object-store secret key or secret reference. Never returned by inventory APIs.
-    secret_access_key: ?[]const u8 = null,
-    /// Object-store session token or secret reference. Never returned by inventory APIs.
-    session_token: ?[]const u8 = null,
-    /// Whether S3-compatible endpoints should use TLS.
-    use_ssl: ?bool = null,
-};
-
 pub const StorageConfig = struct {
     local: ?LocalStorageConfig = null,
     data: ?StorageBackend = null,
@@ -242,70 +266,46 @@ pub const StorageConfig = struct {
     s3: ?S3Info = null,
 };
 
-pub const ConnectionConfig = struct {
-    /// Optional display name for UIs.
-    display_name: ?[]const u8 = null,
-    /// Provider token for connection kinds that have a provider-level service identity, such as web_search.
-    provider: ?[]const u8 = null,
-    kind: ConnectionKind,
-    /// Namespaced actions and workflow uses this connection supports.
-    capabilities: []const []const u8,
-    inference: ?InferenceConnectionConfig = null,
-    web_search: ?WebSearchConnectionConfig = null,
-    external_io: ?ExternalIoConnectionConfig = null,
-    cdc: ?CdcConnectionConfig = null,
+pub const TLSInfo = struct {
+    /// Path to TLS certificate file
+    cert: ?[]const u8 = null,
+    /// Path to TLS key file
+    key: ?[]const u8 = null,
 };
 
-pub const Config = struct {
-    /// Internal version of antfly
-    version: ?[]const u8 = null,
-    log: ?antfly_logging_openapi.Config = null,
-    /// Enables the health/metrics server. Defaults to true.
-    health_enabled: ?bool = null,
-    /// Port for the health/metrics server. Defaults to 4200.
-    health_port: ?i64 = null,
-    storage: ?StorageConfig = null,
-    metadata: ?MetadataInfo = null,
-    inference: ?antfly_inference_config_openapi.Config = null,
-    tls: ?TLSInfo = null,
-    remote_content: ?antfly_scraping_openapi.RemoteContentConfig = null,
-    /// Public connection resources keyed by stable connection ID. These are the external systems Antfly can use for inference, external IO, CDC, backups, indexing, agents, and related workflows.
-    connections: ?std.json.ArrayHashMap(ConnectionConfig) = null,
-    /// Named speech-to-text provider configurations. Define named STT providers that can be referenced by templates and API calls. The first provider defined becomes the default when no provider name is specified. **Example:** ```yaml speech_to_text: antfly-whisper: provider: antfly api_url: "http://localhost:8080" model: openai/whisper-base openai-whisper: provider: openai model: whisper-1 ``` Then in templates: `{{transcribeAudio url="..." provider="whisper-local"}}`
-    speech_to_text: ?std.json.ArrayHashMap(antfly_audio_openapi.STTConfig) = null,
-    cors: ?antfly_middleware_openapi.CORSConfig = null,
-    /// How many replicas of each shard should be maintained.
-    replication_factor: ?i64 = null,
-    /// Enables authentication and authorization (RBAC) for the API.
-    enable_auth: ?bool = null,
-    /// Disables automatic shard reallocation (splitting/merging).
-    disable_shard_alloc: ?bool = null,
-    /// Cooldown period after shard operations (start/stop/split). Format: duration string like '1m', '30s'. Default: '1m' (one minute).
-    shard_cooldown_period: ?[]const u8 = null,
-    /// Maximum duration for a shard split operation before triggering rollback. Format: duration string like '5m', '30s'. Default: '5m' (five minutes).
-    split_timeout: ?[]const u8 = null,
-    /// Minimum continuous readiness duration required before finalizing a split. Format: duration string like '15s', '1m'. Default: '15s'.
-    split_finalize_grace_period: ?[]const u8 = null,
-    /// Maximum size of a shard in bytes. Used to determine when to split shards.
-    max_shard_size_bytes: ?i64 = null,
-    /// Minimum size of a shard in bytes before it becomes eligible for automatic merge consideration. If unset, defaults to one quarter of max_shard_size_bytes.
-    min_shard_size_bytes: ?i64 = null,
-    /// Minimum number of shards to keep for a table. Automatic merges will not reduce a table below this count.
-    min_shards_per_table: ?i64 = null,
-    /// Maximum number of shards that can be created for a single table.
-    max_shards_per_table: ?i64 = null,
-    /// Default number of shards to create for a new table.
-    default_shards_per_table: ?i64 = null,
-    /// Bypasses Raft consensus for shards, using direct writes instead. Useful for development and testing with a single node.
-    swarm_mode: ?bool = null,
-    /// Named embedder configurations for embedding operations. Define named embedders that can be referenced by indexes, templates, and API calls. The first embedder defined becomes the default when no embedder name is specified. **API Key Configuration:** API keys can be provided via the encrypted keystore (recommended) or environment variables: 1. **Keystore** (recommended for production): ```bash antfly keystore create antfly keystore add openai.api_key ``` Then reference in config: `api_key: ${secret:openai.api_key}` 2. **Environment variable** (simpler for development): Omit `api_key` from config and set the appropriate env var: - OpenAI: `OPENAI_API_KEY` - Gemini: `GEMINI_API_KEY` - Anthropic: `ANTHROPIC_API_KEY` - Cohere: `COHERE_API_KEY` See [Secrets Management](/docs/secrets) for complete documentation. **Example:** ```yaml embedders: openai-small: provider: openai model: text-embedding-3-small antfly-local: provider: antfly model: bge-base-en-v1.5 api_url: "http://localhost:8082" ```
-    embedders: ?std.json.ArrayHashMap(antfly_embeddings_openapi.EmbedderConfig) = null,
-    /// Named generator configurations for AI operations. Define named generators that can be referenced by chains, templates, and API calls. The first generator defined becomes the default when no generator name is specified. **API Key Configuration:** API keys can be provided via the encrypted keystore (recommended) or environment variables: 1. **Keystore** (recommended for production): ```bash antfly keystore create antfly keystore add gemini.api_key ``` Then reference in config: `api_key: ${secret:gemini.api_key}` 2. **Environment variable** (simpler for development): Omit `api_key` from config and set the appropriate env var: - Gemini: `GEMINI_API_KEY` - OpenAI: `OPENAI_API_KEY` - Anthropic: `ANTHROPIC_API_KEY` See [Secrets Management](/docs/secrets) for complete documentation. **Example:** ```yaml generators: gemini-flash: provider: gemini model: gemini-2.5-flash ollama-local: provider: ollama model: llama3 openai-gpt4: provider: openai model: gpt-4.1 ```
-    generators: ?std.json.ArrayHashMap(antfly_generating_openapi.GeneratorConfig) = null,
-    /// Named chain configurations for fallback/retry logic. Chains are ordered lists of generators with retry and fallback logic. Each link references a generator by name from the `generators` map. The first chain defined becomes the default when no chain name is specified. **Chain Conditions:** - `on_error`: Try next generator on any error (default) - `on_rate_limit`: Try next only on rate limit (429) errors - `on_timeout`: Try next only on timeout errors - `always`: Always try the next generator **Example:** ```yaml chains: default: - generator: gemini-flash # Reference by name retry: max_attempts: 3 condition: on_rate_limit - generator: ollama-local # Reference by name with-inline: - generator: gemini-flash - generator_config: # Inline config provider: anthropic model: claude-sonnet-4-5-20250929 ``` Then in API calls: `chain: "default"` or `chain: "with-inline"`
-    chains: ?std.json.ArrayHashMap([]const NamedChainLink) = null,
-    /// Named reranker configurations for search result reranking. Define named rerankers that can be referenced by indexes, search queries, and API calls. The first reranker defined becomes the default when no reranker name is specified. **Example:** ```yaml rerankers: cohere-english: provider: cohere model: rerank-english-v3.0 antfly-local: provider: antfly model: mxbai-rerank-base-v1 url: "http://localhost:8080" ```
-    rerankers: ?std.json.ArrayHashMap(antfly_reranking_openapi.RerankerConfig) = null,
-    /// Named chunker configurations for text chunking. Define named chunkers that can be referenced by indexes and API calls. The first chunker defined becomes the default when no chunker name is specified. **Example:** ```yaml chunkers: fixed-500: provider: antfly model: fixed target_tokens: 500 overlap_tokens: 50 semantic: provider: antfly model: semantic-chunker api_url: "http://localhost:8080" ```
-    chunkers: ?std.json.ArrayHashMap(antfly_chunking_openapi.ChunkerConfig) = null,
+pub const WebSearchConnectionConfig = struct {
+    /// Provider-specific service flavor, such as agent_search for provider vertex.
+    service: ?[]const u8 = null,
+    /// Maximum ranked results to return.
+    max_results: ?i64 = null,
+    /// Provider request timeout in milliseconds.
+    timeout_ms: ?i64 = null,
+    /// Request provider safe-search filtering.
+    safe_search: ?bool = null,
+    /// Preferred result language, such as en.
+    language: ?[]const u8 = null,
+    /// Preferred result region, such as us.
+    region: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported.
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported.
+    include_highlights: ?bool = null,
+    /// Provider API key or secret reference. Never returned by inventory APIs.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable.
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex.
+    serving_config: ?[]const u8 = null,
+    /// Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+    credentials_path: ?[]const u8 = null,
+    /// Only include results from these domains when provider supports it.
+    include_domains: ?[]const []const u8 = null,
+    /// Exclude results from these domains when provider supports it.
+    exclude_domains: ?[]const []const u8 = null,
 };

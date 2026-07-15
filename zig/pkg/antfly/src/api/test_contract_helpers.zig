@@ -35,7 +35,29 @@ pub fn encodeSchemaUpdateRequest(alloc: std.mem.Allocator) ![]u8 {
     var parsed = try std.json.parseFromSlice(
         schema_openapi.TableSchema,
         alloc,
-        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"}}}}}}",
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"},\"score\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"datetime\"},\"customer_id\":{\"type\":\"keyword\"}}}}}}",
+        .{},
+    );
+    defer parsed.deinit();
+    return try stringifyJsonAlloc(alloc, parsed.value);
+}
+
+pub fn encodeCustomersSchemaUpdateRequest(alloc: std.mem.Allocator) ![]u8 {
+    var parsed = try std.json.parseFromSlice(
+        schema_openapi.TableSchema,
+        alloc,
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"name\":{\"type\":\"text\"},\"tier\":{\"type\":\"keyword\"},\"address_id\":{\"type\":\"keyword\"}}}}}}",
+        .{},
+    );
+    defer parsed.deinit();
+    return try stringifyJsonAlloc(alloc, parsed.value);
+}
+
+pub fn encodeAddressesSchemaUpdateRequest(alloc: std.mem.Allocator) ![]u8 {
+    var parsed = try std.json.parseFromSlice(
+        schema_openapi.TableSchema,
+        alloc,
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"city\":{\"type\":\"text\"}}}}}}",
         .{},
     );
     defer parsed.deinit();
@@ -89,6 +111,30 @@ pub fn encodeManagedEmbeddingsIndexRequest(
     );
 }
 
+pub fn encodeManagedEmbeddingsIndexWithChunkerJsonRequest(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    field_name: []const u8,
+    dimension: i64,
+    embedder: embeddings_openapi.EmbedderConfig,
+    chunker_json: []const u8,
+) ![]u8 {
+    const embedder_json = try stringifyJsonAlloc(alloc, embedder);
+    defer alloc.free(embedder_json);
+
+    return try std.fmt.allocPrint(
+        alloc,
+        "{{\"name\":{f},\"type\":\"embeddings\",\"field\":{f},\"dimension\":{d},\"embedder\":{s},\"chunker\":{s}}}",
+        .{
+            std.json.fmt(index_name, .{}),
+            std.json.fmt(field_name, .{}),
+            dimension,
+            embedder_json,
+            chunker_json,
+        },
+    );
+}
+
 pub fn encodeManagedEmbeddingsIndexTemplateRequest(
     alloc: std.mem.Allocator,
     index_name: []const u8,
@@ -107,6 +153,30 @@ pub fn encodeManagedEmbeddingsIndexTemplateRequest(
             std.json.fmt(template_source, .{}),
             dimension,
             embedder_json,
+        },
+    );
+}
+
+pub fn encodeManagedEmbeddingsIndexTemplateWithChunkerJsonRequest(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    template_source: []const u8,
+    dimension: i64,
+    embedder: embeddings_openapi.EmbedderConfig,
+    chunker_json: []const u8,
+) ![]u8 {
+    const embedder_json = try stringifyJsonAlloc(alloc, embedder);
+    defer alloc.free(embedder_json);
+
+    return try std.fmt.allocPrint(
+        alloc,
+        "{{\"name\":{f},\"type\":\"embeddings\",\"template\":{f},\"dimension\":{d},\"embedder\":{s},\"chunker\":{s}}}",
+        .{
+            std.json.fmt(index_name, .{}),
+            std.json.fmt(template_source, .{}),
+            dimension,
+            embedder_json,
+            chunker_json,
         },
     );
 }

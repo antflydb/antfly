@@ -305,7 +305,13 @@ test "durable sql planner or adapter noop preserves extension compatibility no-o
 
     switch (planned) {
         .adapter_noop => |noop| try std.testing.expectEqual(ddl_plan.AdapterNoopDdlReason.extension, noop.reason),
-        else => return error.TestUnexpectedResult,
+        .durable => |durable| switch (durable) {
+            .extension => |extension| switch (extension) {
+                .create => |create| try std.testing.expectEqualStrings("pgcrypto", create.extension_name),
+                .update, .drop => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
     }
 }
 

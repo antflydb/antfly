@@ -607,8 +607,8 @@ fn convertSigmoid(builder: *Builder, input: NodeId) ConvertError!NodeId {
     const one = try builder.scalarConst(dtype, 1.0);
     const neg_x = try builder.neg(input);
     const exp_neg = try builder.expOp(neg_x);
-    const denom = try builder.add(one, exp_neg);
-    return builder.div(one, denom);
+    const denom = try broadcastBinaryOp(builder, .add, one, exp_neg);
+    return broadcastBinaryOp(builder, .div, one, denom);
 }
 
 fn convertSoftmax(builder: *Builder, _: *const NodeProto, input: NodeId, comptime is_log: bool) ConvertError!NodeId {
@@ -2805,8 +2805,12 @@ fn convertConv(builder: *Builder, node: *const NodeProto, inputs: []const NodeId
         const pad_begin: i64 = conv_attrs.padding[i][0];
         const pad_end: i64 = conv_attrs.padding[i][1];
         const dilation: i64 = if (i < dilations_attr.len) dilations_attr[i] else 1;
-        const effective_k = dilation * (k_d - 1) + 1;
-        out_dims[i + 2] = @divTrunc(in_d + pad_begin + pad_end - effective_k, stride) + 1;
+        if (in_d <= 0 or k_d <= 0 or stride <= 0 or dilation <= 0) {
+            out_dims[i + 2] = -1;
+        } else {
+            const effective_k = dilation * (k_d - 1) + 1;
+            out_dims[i + 2] = @divTrunc(in_d + pad_begin + pad_end - effective_k, stride) + 1;
+        }
     }
     const out_shape = Shape{ .dtype = x_shape.dtype, .dims = out_dims, .rank_ = x_shape.rank_ };
 
@@ -3907,6 +3911,11 @@ fn convertConvTranspose(builder: *Builder, node: *const NodeProto, inputs: []con
     const output_padding_attr = getInts(node.attributes, "output_padding");
     const group: u32 = @intCast(getInt(node.attributes, "group", 1));
 
+    for (0..num_spatial) |i| {
+        const stride: i64 = if (i < strides_attr.len) strides_attr[i] else 1;
+        if (stride != 1) return error.UnsupportedOp;
+    }
+
     // ConvTranspose: decompose as conv_general with adjusted padding.
     // For stride=1, ConvTranspose is conv with kernel spatially flipped and
     // padding = kernel_size - 1 - original_padding (full convolution).
@@ -3940,7 +3949,10 @@ fn convertConvTranspose(builder: *Builder, node: *const NodeProto, inputs: []con
         const out_pad: i64 = if (i < output_padding_attr.len) output_padding_attr[i] else 0;
         const effective_k = dilation * (k_d - 1) + 1;
 
-        out_dims[i + 2] = (in_d - 1) * stride - pad_begin - pad_end + effective_k + out_pad;
+        out_dims[i + 2] = if (in_d <= 0 or k_d <= 0)
+            -1
+        else
+            (in_d - 1) * stride - pad_begin - pad_end + effective_k + out_pad;
 
         // Effective padding for the transpose conv (full convolution padding)
         conv_attrs.padding[i][0] = @intCast(effective_k - 1 - pad_begin);
@@ -4011,8 +4023,12 @@ fn convertResize(builder: *Builder, node: *const NodeProto, inputs: []const Node
                 for (0..rank) |i| {
                     const s = scales_data[i];
                     const in_d = in_shape.dim(@intCast(i));
-                    out_dims[i] = @intFromFloat(@as(f32, @floatFromInt(in_d)) * s);
-                    if (out_dims[i] < 1) out_dims[i] = 1;
+                    if (in_d <= 0) {
+                        out_dims[i] = -1;
+                    } else {
+                        out_dims[i] = @intFromFloat(@as(f32, @floatFromInt(in_d)) * s);
+                        if (out_dims[i] < 1) out_dims[i] = 1;
+                    }
                     // Check if integer
                     const si: i64 = @intFromFloat(s);
                     if (s != @as(f32, @floatFromInt(si)) or si < 1) {
@@ -4051,7 +4067,7 @@ fn convertResize(builder: *Builder, node: *const NodeProto, inputs: []const Node
     // Check if all dims unchanged (no-op)
     var all_same = true;
     for (0..rank) |i| {
-        if (out_dims[i] != in_shape.dim(@intCast(i))) {
+        if (out_dims[i] != in_shape.dim(@intCast(i)) or scale_factors[i] != 1) {
             all_same = false;
             break;
         }
@@ -4142,7 +4158,8 @@ fn resizeIntegerBroadcast(builder: *Builder, input: NodeId, in_shape: Shape, ran
 
     var out_dims: [8]i64 = .{0} ** 8;
     for (0..rank) |i| {
-        out_dims[i] = in_shape.dim(@intCast(i)) * scale_factors[i];
+        const in_d = in_shape.dim(@intCast(i));
+        out_dims[i] = if (in_d <= 0) -1 else in_d * scale_factors[i];
     }
     const out_shape = Shape{
         .dtype = in_shape.dtype,
@@ -5130,6 +5147,35 @@ test "convertNode Add" {
     try std.testing.expect(std.meta.activeTag(g.node(result).op) == .add);
 }
 
+test "convertNode Add preserves dynamic non-singleton broadcast dimensions" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{ -1, 96, -1, -1 }));
+    const y = try b.parameter("y", Shape.init(.f32, &.{ 1, 96, 8, 8 }));
+    const node = NodeProto{ .op_type = "Add" };
+    const result = try convertNode(allocator, &b, &node, &.{ x, y }, null);
+    const out = g.node(result).output_shape;
+
+    try std.testing.expectEqualSlices(i64, &.{ -1, 96, -1, -1 }, out.dims[0..out.rank()]);
+}
+
+test "convertNode Sigmoid preserves dynamic input shape" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{ -1, 1, -1, -1 }));
+    const node = NodeProto{ .op_type = "Sigmoid" };
+    const result = try convertNode(allocator, &b, &node, &.{x}, null);
+    const out = g.node(result).output_shape;
+
+    try std.testing.expectEqualSlices(i64, &.{ -1, 1, -1, -1 }, out.dims[0..out.rank()]);
+}
+
 test "convertNode Relu emits fused" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
@@ -5470,6 +5516,29 @@ test "convertNode Conv 2D with stride/pad/groups emits fused_conv2d" {
     try std.testing.expectEqual(@as(i64, 8), out_shape.dim(2));
     try std.testing.expectEqual(@as(i64, 8), out_shape.dim(3));
     try std.testing.expect(std.meta.activeTag(g.node(result).op) == .fused_conv2d);
+}
+
+test "convertNode Conv preserves dynamic spatial dimensions" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{ -1, 32, -1, -1 }));
+    const w = try b.parameter("w", Shape.init(.f32, &.{ 32, 32, 3, 3 }));
+    var attrs = [_]AttributeProto{
+        .{ .name = "kernel_shape", .ints = @constCast(&[_]i64{ 3, 3 }) },
+        .{ .name = "strides", .ints = @constCast(&[_]i64{ 2, 2 }) },
+        .{ .name = "pads", .ints = @constCast(&[_]i64{ 1, 1, 1, 1 }) },
+    };
+    const node = NodeProto{ .op_type = "Conv", .attributes = &attrs };
+    const result = try convertNode(allocator, &b, &node, &.{ x, w }, null);
+    const out_shape = g.node(result).output_shape;
+
+    try std.testing.expectEqual(@as(i64, -1), out_shape.dim(0));
+    try std.testing.expectEqual(@as(i64, 32), out_shape.dim(1));
+    try std.testing.expectEqual(@as(i64, -1), out_shape.dim(2));
+    try std.testing.expectEqual(@as(i64, -1), out_shape.dim(3));
 }
 
 test "convertNode Conv falls back to conv_general on dilation" {
@@ -5986,6 +6055,25 @@ test "convertNode Resize nearest 2x with scales" {
     try std.testing.expectEqual(@as(i64, 1), out.dim(1));
     try std.testing.expectEqual(@as(i64, 4), out.dim(2));
     try std.testing.expectEqual(@as(i64, 6), out.dim(3));
+}
+
+test "convertNode Resize integer scale preserves dynamic spatial dimensions" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{ -1, 96, -1, -1 }));
+    const roi = try b.tensorConst(&.{}, Shape.init(.f32, &.{0}));
+    const scales = try b.tensorConst(&.{ 1.0, 1.0, 8.0, 8.0 }, Shape.init(.f32, &.{4}));
+    const node = NodeProto{ .op_type = "Resize" };
+    const result = try convertNode(allocator, &b, &node, &.{ x, roi, scales }, null);
+    const out = g.node(result).output_shape;
+
+    try std.testing.expectEqual(@as(i64, -1), out.dim(0));
+    try std.testing.expectEqual(@as(i64, 96), out.dim(1));
+    try std.testing.expectEqual(@as(i64, -1), out.dim(2));
+    try std.testing.expectEqual(@as(i64, -1), out.dim(3));
 }
 
 test "convertNode Resize nearest with output sizes" {
@@ -6958,7 +7046,7 @@ test "convertNode ConvTranspose 1D" {
     try std.testing.expectEqual(@as(i64, 10), out_shape.dim(2));
 }
 
-test "convertNode ConvTranspose 2D with stride" {
+test "convertNode ConvTranspose 2D with stride is unsupported until native upsampling is exact" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
     defer g.deinit();
@@ -6972,13 +7060,7 @@ test "convertNode ConvTranspose 2D with stride" {
         .{ .name = "strides", .ints = &strides },
     };
     const node = NodeProto{ .op_type = "ConvTranspose", .attributes = &attrs };
-    const result = try convertNode(allocator, &b, &node, &.{ x, w }, null);
-    const out_shape = g.node(result).output_shape;
-    // out = (4-1)*2 + 3 = 9
-    try std.testing.expectEqual(@as(i64, 1), out_shape.dim(0));
-    try std.testing.expectEqual(@as(i64, 2), out_shape.dim(1));
-    try std.testing.expectEqual(@as(i64, 9), out_shape.dim(2));
-    try std.testing.expectEqual(@as(i64, 9), out_shape.dim(3));
+    try std.testing.expectError(error.UnsupportedOp, convertNode(allocator, &b, &node, &.{ x, w }, null));
 }
 
 test "convertNode ConvTranspose with bias" {

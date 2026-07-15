@@ -879,7 +879,7 @@ fn generatedReadStatementKindFromStructuredClauses(
     return .query;
 }
 
-fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: *const generated_parser.GeneratedSqlReadAst) !void {
+pub fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: *const generated_parser.GeneratedSqlReadAst) !void {
     try validateGeneratedReadStatementSpans(tokens, read_ast);
     const ranges = [_]?generated_parser.GeneratedSqlTokenRange{
         read_ast.cte_tokens,
@@ -2081,7 +2081,7 @@ fn validateGeneratedSimpleQueryReadAst(tokens: []const tokenized.Token, read_ast
         try validateGeneratedReadRangePrecededByKeyword(tokens, range, .select);
         if (projection.start != range.end) return error.UnsupportedSqlShape;
     } else {
-        try validateGeneratedReadRangePrecededByKeyword(tokens, projection, .select);
+        try validateGeneratedReadProjectionRangeStart(tokens, projection);
     }
     try validateGeneratedReadRangePrecededByKeyword(tokens, source, .from);
     if (read_ast.where_tokens) |range| try validateGeneratedReadRangePrecededByKeyword(tokens, range, .where);
@@ -2336,6 +2336,26 @@ fn validateGeneratedReadTokenRange(
     if (last.source_end > read_ast.statement_span.end) return error.UnsupportedSqlShape;
 }
 
+fn validateGeneratedReadTokenRangeAllowEmpty(
+    tokens: []const tokenized.Token,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
+    range: generated_parser.GeneratedSqlTokenRange,
+) !void {
+    if (range.start == range.end) {
+        if (range.end > tokens.len) return error.UnsupportedSqlShape;
+        if (range.start > 0) {
+            const previous = tokens[range.start - 1];
+            if (previous.source_end < read_ast.statement_span.start) return error.UnsupportedSqlShape;
+        }
+        if (range.end < tokens.len) {
+            const next = tokens[range.end];
+            if (next.source_start > read_ast.statement_span.end) return error.UnsupportedSqlShape;
+        }
+        return;
+    }
+    try validateGeneratedReadTokenRange(tokens, read_ast, range);
+}
+
 fn validateGeneratedReadRangeContainsKeyword(
     tokens: []const tokenized.Token,
     range: generated_parser.GeneratedSqlTokenRange,
@@ -2411,6 +2431,23 @@ fn validateGeneratedReadRangePrecededByKeyword(
     keyword: token_mod.TokenKeyword,
 ) !void {
     if (range.start == 0 or !tokens[range.start - 1].matchesKeywordTag(keyword)) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedReadProjectionRangeStart(
+    tokens: []const tokenized.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) !void {
+    if (range.start == 0 or range.start > tokens.len) return error.UnsupportedSqlShape;
+    const previous = tokens[range.start - 1];
+    if (previous.matchesKeywordTag(.select)) {
+        if (range.start < range.end and tokens[range.start].matchesKeywordTag(.all)) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (previous.matchesKeywordTag(.all)) {
+        if (range.start < 2 or !tokens[range.start - 2].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
+        return;
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn validateGeneratedPredicateExpressionMatchesRange(
@@ -3405,6 +3442,8 @@ fn validateGeneratedReadListAstContainedByRange(
     if (list.nulls_orders.len != 0 and list.nulls_orders.len != list.count) return error.UnsupportedSqlShape;
     const first = list.first_tokens orelse return error.UnsupportedSqlShape;
     const last = list.last_tokens orelse return error.UnsupportedSqlShape;
+    if (!std.meta.eql(first, list.items[0])) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(last, list.items[list.count - 1])) return error.UnsupportedSqlShape;
     if (first.start < containing.start or first.end > containing.end) return error.UnsupportedSqlShape;
     if (last.start < containing.start or last.end > containing.end) return error.UnsupportedSqlShape;
 
@@ -4900,7 +4939,7 @@ fn validateGeneratedWindowAstListRanges(
     for (window_items, 0..) |window, index| {
         try validateGeneratedReadTokenRange(tokens, read_ast, window.tokens);
         try validateGeneratedReadTokenRange(tokens, read_ast, window.name_tokens);
-        try validateGeneratedReadTokenRange(tokens, read_ast, window.definition_tokens);
+        try validateGeneratedReadTokenRangeAllowEmpty(tokens, read_ast, window.definition_tokens);
         if (window.tokens.start < containing.start or window.tokens.end > containing.end) return error.UnsupportedSqlShape;
         if (window.name_tokens.start != window.tokens.start or window.name_tokens.end >= window.definition_tokens.start) return error.UnsupportedSqlShape;
         if (window.name_tokens.end != window.name_tokens.start + 1) return error.UnsupportedSqlShape;
@@ -6019,7 +6058,7 @@ test "sql adapter lowering context lowers generated set operations without query
 test "sql adapter lowering context requires generated read publication before generated lowering" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"status":{"type":"keyword"},"customer_id":{"type":"keyword"},"depth":{"type":"number"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
     ;
     const schema = try runtimeSchemaFromJsonForLoweringContextTestAlloc(alloc, schema_json);
     defer runtime_schema.freeSchema(alloc, schema);
@@ -6237,7 +6276,9 @@ test "sql adapter lowering context rejects stale native graph retained metadata"
 }
 
 test "sql adapter lowering context rejects malformed generated read AST ranges" {
-    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
     ;
@@ -6277,7 +6318,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT ALL id, status FROM usage_records",
     );
-    defer select_all_parsed_sql.deinit(alloc);
     const select_all_generated_raw = select_all_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var select_all_read_ast = switch (select_all_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast.*,
@@ -6295,7 +6335,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH source_rows AS (SELECT ALL id, status FROM usage_records) SELECT id FROM source_rows",
     );
-    defer cte_select_all_parsed_sql.deinit(alloc);
     const cte_select_all_generated_raw = cte_select_all_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var cte_select_all_read_ast = switch (cte_select_all_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast.*,
@@ -6345,7 +6384,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH open_usage AS (SELECT id FROM usage_records WHERE kind = 'order') SELECT id FROM open_usage",
     );
-    defer cte_command_span_parsed_sql.deinit(alloc);
     const cte_command_span_generated_raw = cte_command_span_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var cte_command_span_read_ast = switch (cte_command_span_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6381,7 +6419,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records FOR system_time AS OF 42 WHERE kind = 'order'",
     );
-    defer system_time_parsed_sql.deinit(alloc);
     const system_time_generated_raw = system_time_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var system_time_read_ast = switch (system_time_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast.*,
@@ -6411,7 +6448,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id, status FROM usage_records WHERE kind = 'order'",
     );
-    defer malformed_where_expression_span_parsed_sql.deinit(alloc);
     const malformed_where_expression_span_generated_raw = malformed_where_expression_span_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_where_expression_span_read_ast = switch (malformed_where_expression_span_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6428,7 +6464,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id, status FROM usage_records WHERE kind = 'order'",
     );
-    defer malformed_projection_list_parsed_sql.deinit(alloc);
     const malformed_projection_list_generated_raw = malformed_projection_list_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_projection_list_read_ast = switch (malformed_projection_list_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6444,7 +6479,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id, status FROM usage_records WHERE kind = 'order'",
     );
-    defer stale_projection_leading_gap_parsed_sql.deinit(alloc);
     var stale_projection_leading_gap_read_ast = switch ((stale_projection_leading_gap_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape).ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast.*,
         else => return error.UnsupportedSqlShape,
@@ -6473,7 +6507,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id, status FROM usage_records WHERE kind = 'order'",
     );
-    defer malformed_projection_expression_span_parsed_sql.deinit(alloc);
     const malformed_projection_expression_span_generated_raw = malformed_projection_expression_span_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_projection_expression_span_read_ast = switch (malformed_projection_expression_span_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6489,7 +6522,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id, status FROM usage_records WHERE kind = 'order'",
     );
-    defer malformed_token_range_payload_parsed_sql.deinit(alloc);
     const malformed_token_range_payload_generated_raw = malformed_token_range_payload_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_token_range_payload_read_ast = switch (malformed_token_range_payload_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6506,7 +6538,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id, status FROM usage_records WHERE kind = 'order'",
     );
-    defer malformed_projection_boundary_expression_parsed_sql.deinit(alloc);
     const malformed_projection_boundary_expression_generated_raw = malformed_projection_boundary_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_projection_boundary_expression_read_ast = switch (malformed_projection_boundary_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6523,7 +6554,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT status, COUNT(*) FROM usage_records GROUP BY status",
     );
-    defer malformed_group_list_containment_parsed_sql.deinit(alloc);
     const malformed_group_list_containment_generated_raw = malformed_group_list_containment_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_group_list_containment_read_ast = switch (malformed_group_list_containment_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6548,7 +6578,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT status, COUNT(*) FROM usage_records GROUP BY status",
     );
-    defer malformed_group_clause_parsed_sql.deinit(alloc);
     const malformed_group_clause_generated_raw = malformed_group_clause_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_group_clause_read_ast = switch (malformed_group_clause_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6568,7 +6597,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT status, COUNT(*) FROM usage_records GROUP BY status HAVING COUNT(*) > 1",
     );
-    defer malformed_having_clause_parsed_sql.deinit(alloc);
     const malformed_having_clause_generated_raw = malformed_having_clause_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_having_clause_read_ast = switch (malformed_having_clause_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6599,7 +6627,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT status, COUNT(*) FROM usage_records GROUP BY status",
     );
-    defer stale_having_shape_metadata_parsed_sql.deinit(alloc);
     const stale_having_shape_metadata_generated_raw = stale_having_shape_metadata_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var stale_having_shape_metadata_read_ast = switch (stale_having_shape_metadata_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6615,7 +6642,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records ORDER BY status",
     );
-    defer malformed_order_list_containment_parsed_sql.deinit(alloc);
     const malformed_order_list_containment_generated_raw = malformed_order_list_containment_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_order_list_containment_read_ast = switch (malformed_order_list_containment_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6640,7 +6666,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records ORDER BY status DESC NULLS LAST",
     );
-    defer malformed_order_direction_parsed_sql.deinit(alloc);
     const malformed_order_direction_generated_raw = malformed_order_direction_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_order_direction_read_ast = switch (malformed_order_direction_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6656,7 +6681,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records ORDER BY status DESC NULLS LAST",
     );
-    defer malformed_nulls_order_parsed_sql.deinit(alloc);
     const malformed_nulls_order_generated_raw = malformed_nulls_order_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_nulls_order_read_ast = switch (malformed_nulls_order_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6672,7 +6696,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records ORDER BY status USING <",
     );
-    defer malformed_order_using_parsed_sql.deinit(alloc);
     const malformed_order_using_generated_raw = malformed_order_using_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_order_using_read_ast = switch (malformed_order_using_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6688,7 +6711,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm",
     );
-    defer malformed_graph_source_parsed_sql.deinit(alloc);
     const malformed_graph_source_generated_raw = malformed_graph_source_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_graph_source_read_ast = switch (malformed_graph_source_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6722,7 +6744,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH ranked AS (SELECT * FROM antfly.graph_metric(table_name => 'usage_records', index => 'docs_edge_graph', metric => 'pagerank', top_k => 5) AS gm) SELECT id FROM ranked",
     );
-    defer malformed_cte_graph_source_parsed_sql.deinit(alloc);
     const malformed_cte_graph_source_generated_raw = malformed_cte_graph_source_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_cte_graph_source_read_ast = switch (malformed_cte_graph_source_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6747,7 +6768,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT * FROM antfly.full_text_search(index => 'docs_body_fts', query => 'refund', query => 'policy', limit => 10) AS hits",
     );
-    defer duplicate_antfly_argument_parsed_sql.deinit(alloc);
     const duplicate_antfly_argument_generated_raw = duplicate_antfly_argument_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     const duplicate_antfly_argument_read_ast = switch (duplicate_antfly_argument_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6762,7 +6782,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT * FROM antfly.full_text_search(index => 'docs_body_fts', query => 'refund', limit => 10) AS hits",
     );
-    defer stale_antfly_argument_empty_list_parsed_sql.deinit(alloc);
     var stale_antfly_argument_empty_list_read_ast = switch ((stale_antfly_argument_empty_list_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape).ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
         else => return error.UnsupportedSqlShape,
@@ -6772,6 +6791,8 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     {
         return error.TestUnexpectedResult;
     }
+    const original_empty_list_function_item = stale_antfly_argument_empty_list_read_ast.source_antfly_function_items[0];
+    defer stale_antfly_argument_empty_list_read_ast.source_antfly_function_items[0] = original_empty_list_function_item;
     stale_antfly_argument_empty_list_read_ast.source_antfly_function_items[0].argument_items = &.{};
     stale_antfly_argument_empty_list_read_ast.source_antfly_function_items[0].argument_count = 0;
     try std.testing.expectError(
@@ -6783,7 +6804,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT * FROM antfly.full_text_search(index => 'docs_body_fts', query => 'refund', limit => 10) AS hits",
     );
-    defer stale_antfly_argument_leading_gap_parsed_sql.deinit(alloc);
     var stale_antfly_argument_leading_gap_read_ast = switch ((stale_antfly_argument_leading_gap_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape).ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
         else => return error.UnsupportedSqlShape,
@@ -6793,6 +6813,8 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     {
         return error.TestUnexpectedResult;
     }
+    const original_leading_gap_function_item = stale_antfly_argument_leading_gap_read_ast.source_antfly_function_items[0];
+    defer stale_antfly_argument_leading_gap_read_ast.source_antfly_function_items[0] = original_leading_gap_function_item;
     stale_antfly_argument_leading_gap_read_ast.source_antfly_function_items[0].argument_items =
         stale_antfly_argument_leading_gap_read_ast.source_antfly_function_items[0].argument_items[1..];
     stale_antfly_argument_leading_gap_read_ast.source_antfly_function_items[0].argument_count =
@@ -6834,7 +6856,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records LIMIT 5",
     );
-    defer malformed_limit_expression_parsed_sql.deinit(alloc);
     const malformed_limit_expression_generated_raw = malformed_limit_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_limit_expression_read_ast = switch (malformed_limit_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6850,7 +6871,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records LIMIT ALL",
     );
-    defer malformed_limit_all_expression_parsed_sql.deinit(alloc);
     const malformed_limit_all_expression_generated_raw = malformed_limit_all_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_limit_all_expression_read_ast = switch (malformed_limit_all_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6876,7 +6896,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records OFFSET 2 ROWS",
     );
-    defer malformed_offset_expression_parsed_sql.deinit(alloc);
     const malformed_offset_expression_generated_raw = malformed_offset_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_offset_expression_read_ast = switch (malformed_offset_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6888,21 +6907,10 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_offset_expression_parsed_sql, malformed_offset_expression_read_ast),
     );
-    malformed_offset_expression_read_ast = switch (malformed_offset_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
-        .read => |ast| ast,
-        else => return error.UnsupportedSqlShape,
-    };
-    malformed_offset_expression_read_ast.offset_expression.tokens = malformed_offset_expression_read_ast.offset_tokens.?;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        validateGeneratedReadAstForStatement(malformed_offset_expression_parsed_sql.items(), malformed_offset_expression_read_ast),
-    );
-
     var malformed_fetch_count_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT id FROM usage_records FETCH FIRST 3 ROWS ONLY",
     );
-    defer malformed_fetch_count_expression_parsed_sql.deinit(alloc);
     const malformed_fetch_count_expression_generated_raw = malformed_fetch_count_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_fetch_count_expression_read_ast = switch (malformed_fetch_count_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6929,7 +6937,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id AS order_id, status FROM usage_records WHERE kind = 'order'",
     );
-    defer malformed_projection_alias_parsed_sql.deinit(alloc);
     const malformed_projection_alias_generated_raw = malformed_projection_alias_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_projection_alias_read_ast = switch (malformed_projection_alias_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6945,7 +6952,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id AS order_id, status FROM usage_records WHERE kind = 'order'",
     );
-    defer malformed_projection_alias_name_parsed_sql.deinit(alloc);
     const malformed_projection_alias_name_generated_raw = malformed_projection_alias_name_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_projection_alias_name_read_ast = switch (malformed_projection_alias_name_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6962,7 +6968,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id AS order_id, status FROM usage_records WHERE kind = 'order'",
     );
-    defer malformed_projection_missing_alias_name_parsed_sql.deinit(alloc);
     const malformed_projection_missing_alias_name_generated_raw = malformed_projection_missing_alias_name_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_projection_missing_alias_name_read_ast = switch (malformed_projection_missing_alias_name_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6978,7 +6983,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id order_id, status FROM usage_records WHERE kind = 'order'",
     );
-    defer malformed_projection_bare_alias_parsed_sql.deinit(alloc);
     const malformed_projection_bare_alias_generated_raw = malformed_projection_bare_alias_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_projection_bare_alias_read_ast = switch (malformed_projection_bare_alias_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -6998,7 +7002,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT lower(status) AS status_key FROM usage_records WHERE kind = 'order'",
     );
-    defer malformed_function_expression_parsed_sql.deinit(alloc);
     const malformed_function_expression_generated_raw = malformed_function_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_function_expression_read_ast = switch (malformed_function_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7024,7 +7027,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT concat(status, tenant) AS status_key FROM usage_records WHERE kind = 'order'",
     );
-    defer malformed_function_argument_list_parsed_sql.deinit(alloc);
     const malformed_function_argument_list_generated_raw = malformed_function_argument_list_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_function_argument_list_read_ast = switch (malformed_function_argument_list_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7056,6 +7058,8 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     };
     const malformed_function_argument_gap_list = &malformed_function_argument_list_read_ast.projection_items.expressions[0].argument_items;
     if (malformed_function_argument_gap_list.count < 2) return error.TestUnexpectedResult;
+    const original_function_argument_gap_list = malformed_function_argument_gap_list.*;
+    defer malformed_function_argument_gap_list.* = original_function_argument_gap_list;
     malformed_function_argument_gap_list.first_tokens = malformed_function_argument_gap_list.items[1];
     malformed_function_argument_gap_list.last_tokens = malformed_function_argument_gap_list.items[1];
     malformed_function_argument_gap_list.items = malformed_function_argument_gap_list.items[1..2];
@@ -7078,7 +7082,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT array_agg(DISTINCT status ORDER BY id DESC) AS statuses FROM usage_records WHERE kind = 'order'",
     );
-    defer malformed_function_argument_order_parsed_sql.deinit(alloc);
     const malformed_function_argument_order_generated_raw = malformed_function_argument_order_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_function_argument_order_read_ast = switch (malformed_function_argument_order_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7095,7 +7098,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT count(*) FILTER (WHERE status = 'open') AS open_count FROM usage_records WHERE kind = 'order'",
     );
-    defer malformed_function_filter_parsed_sql.deinit(alloc);
     const malformed_function_filter_generated_raw = malformed_function_filter_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_function_filter_read_ast = switch (malformed_function_filter_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7112,7 +7114,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id DESC) AS median_id FROM usage_records WHERE kind = 'order'",
     );
-    defer malformed_function_within_group_parsed_sql.deinit(alloc);
     const malformed_function_within_group_generated_raw = malformed_function_within_group_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_function_within_group_read_ast = switch (malformed_function_within_group_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7129,7 +7130,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE kind = 'order'",
     );
-    defer malformed_comparison_expression_parsed_sql.deinit(alloc);
     const malformed_comparison_expression_generated_raw = malformed_comparison_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_comparison_expression_read_ast = switch (malformed_comparison_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7164,7 +7164,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE metadata->>'source' = 'api'",
     );
-    defer malformed_json_operator_kind_parsed_sql.deinit(alloc);
     const malformed_json_operator_kind_generated_raw = malformed_json_operator_kind_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_json_operator_kind_read_ast = switch (malformed_json_operator_kind_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7180,7 +7179,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE status || ':' || id = 'open:u1'",
     );
-    defer malformed_concat_operator_kind_parsed_sql.deinit(alloc);
     const malformed_concat_operator_kind_generated_raw = malformed_concat_operator_kind_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_concat_operator_kind_read_ast = switch (malformed_concat_operator_kind_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7196,7 +7194,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE status ~ 'op.*'",
     );
-    defer malformed_regex_operator_kind_parsed_sql.deinit(alloc);
     const malformed_regex_operator_kind_generated_raw = malformed_regex_operator_kind_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_regex_operator_kind_read_ast = switch (malformed_regex_operator_kind_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7212,7 +7209,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE status NOT LIKE 'op%'",
     );
-    defer malformed_not_like_payload_parsed_sql.deinit(alloc);
     const malformed_not_like_payload_generated_raw = malformed_not_like_payload_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_not_like_payload_read_ast = switch (malformed_not_like_payload_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7229,7 +7225,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE status = ANY(ARRAY['active','pending']::text[])",
     );
-    defer malformed_quantified_comparison_payload_parsed_sql.deinit(alloc);
     const malformed_quantified_comparison_payload_generated_raw = malformed_quantified_comparison_payload_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_quantified_comparison_payload_read_ast = switch (malformed_quantified_comparison_payload_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7246,7 +7241,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE status IS TRUE",
     );
-    defer malformed_is_true_expression_parsed_sql.deinit(alloc);
     const malformed_is_true_expression_generated_raw = malformed_is_true_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_is_true_expression_read_ast = switch (malformed_is_true_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7272,7 +7266,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE status IS NOT FALSE",
     );
-    defer malformed_is_not_false_expression_parsed_sql.deinit(alloc);
     const malformed_is_not_false_expression_generated_raw = malformed_is_not_false_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_is_not_false_expression_read_ast = switch (malformed_is_not_false_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7288,7 +7281,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE status ISNULL",
     );
-    defer malformed_postfix_isnull_expression_parsed_sql.deinit(alloc);
     const malformed_postfix_isnull_expression_generated_raw = malformed_postfix_isnull_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_postfix_isnull_expression_read_ast = switch (malformed_postfix_isnull_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7309,7 +7301,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE kind = 'order'",
     );
-    defer malformed_comparison_child_parsed_sql.deinit(alloc);
     const malformed_comparison_child_generated_raw = malformed_comparison_child_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_comparison_child_read_ast = switch (malformed_comparison_child_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7325,7 +7316,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE status LIKE 'op%' ESCAPE '\\'",
     );
-    defer malformed_expression_owned_range_parsed_sql.deinit(alloc);
     const malformed_expression_owned_range_generated_raw = malformed_expression_owned_range_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_expression_owned_range_read_ast = switch (malformed_expression_owned_range_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7352,7 +7342,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE kind = 'order' AND tenant = 'acme' AND id = '1'",
     );
-    defer malformed_boolean_chain_parsed_sql.deinit(alloc);
     const malformed_boolean_chain_generated_raw = malformed_boolean_chain_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_boolean_chain_read_ast = switch (malformed_boolean_chain_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7412,7 +7401,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE (status = 'open')",
     );
-    defer malformed_grouped_expression_parsed_sql.deinit(alloc);
     const malformed_grouped_expression_generated_raw = malformed_grouped_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_grouped_expression_read_ast = switch (malformed_grouped_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7439,7 +7427,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT CAST(id AS text) AS id_text FROM usage_records WHERE kind = 'order'",
     );
-    defer malformed_cast_expression_parsed_sql.deinit(alloc);
     const malformed_cast_expression_generated_raw = malformed_cast_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_cast_expression_read_ast = switch (malformed_cast_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7466,7 +7453,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT -id AS neg_id FROM usage_records WHERE kind = 'order'",
     );
-    defer malformed_unary_expression_parsed_sql.deinit(alloc);
     const malformed_unary_expression_generated_raw = malformed_unary_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_unary_expression_read_ast = switch (malformed_unary_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7492,7 +7478,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE score BETWEEN 1 AND 10",
     );
-    defer malformed_between_expression_parsed_sql.deinit(alloc);
     const malformed_between_expression_generated_raw = malformed_between_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_between_expression_read_ast = switch (malformed_between_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7508,7 +7493,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE EXISTS (SELECT 1 FROM thresholds WHERE active IS TRUE)",
     );
-    defer malformed_exists_subquery_parsed_sql.deinit(alloc);
     const malformed_exists_subquery_generated_raw = malformed_exists_subquery_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_exists_subquery_read_ast = switch (malformed_exists_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7534,7 +7518,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE EXISTS (SELECT 1 FROM thresholds WHERE active IS TRUE)",
     );
-    defer malformed_exists_subquery_projection_parsed_sql.deinit(alloc);
     const malformed_exists_subquery_projection_generated_raw = malformed_exists_subquery_projection_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_exists_subquery_projection_read_ast = switch (malformed_exists_subquery_projection_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7560,7 +7543,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE EXISTS (SELECT tenant, id FROM thresholds WHERE active IS TRUE)",
     );
-    defer malformed_subquery_projection_gap_parsed_sql.deinit(alloc);
     const malformed_subquery_projection_gap_generated_raw = malformed_subquery_projection_gap_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_subquery_projection_gap_read_ast = switch (malformed_subquery_projection_gap_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7590,7 +7572,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE EXISTS (SELECT 1 FROM thresholds WHERE active IS TRUE)",
     );
-    defer malformed_exists_subquery_select_keyword_parsed_sql.deinit(alloc);
     const malformed_exists_subquery_select_keyword_generated_raw = malformed_exists_subquery_select_keyword_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     const malformed_exists_subquery_select_keyword_read_ast = switch (malformed_exists_subquery_select_keyword_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7669,7 +7650,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE EXISTS (SELECT id FROM thresholds UNION SELECT id FROM archived_thresholds)",
     );
-    defer malformed_subquery_set_operation_parsed_sql.deinit(alloc);
     const malformed_subquery_set_operation_generated_raw = malformed_subquery_set_operation_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_subquery_set_operation_read_ast = switch (malformed_subquery_set_operation_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7685,7 +7665,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE id IN (SELECT id FROM archived_records ORDER BY id LIMIT 5)",
     );
-    defer malformed_subquery_tail_parsed_sql.deinit(alloc);
     const malformed_subquery_tail_generated_raw = malformed_subquery_tail_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_subquery_tail_read_ast = switch (malformed_subquery_tail_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7725,7 +7704,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE id IN (SELECT id FROM archived_records ORDER BY tenant, id LIMIT 5)",
     );
-    defer malformed_subquery_tail_order_gap_parsed_sql.deinit(alloc);
     const malformed_subquery_tail_order_gap_generated_raw = malformed_subquery_tail_order_gap_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_subquery_tail_order_gap_read_ast = switch (malformed_subquery_tail_order_gap_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7761,7 +7739,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE id IN (SELECT id FROM archived_records WHERE archived IS TRUE)",
     );
-    defer malformed_in_subquery_parsed_sql.deinit(alloc);
     const malformed_in_subquery_generated_raw = malformed_in_subquery_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_in_subquery_read_ast = switch (malformed_in_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7777,7 +7754,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE lower(status) LIKE ANY (SELECT pattern FROM active_patterns)",
     );
-    defer malformed_like_any_subquery_parsed_sql.deinit(alloc);
     const malformed_like_any_subquery_generated_raw = malformed_like_any_subquery_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_like_any_subquery_read_ast = switch (malformed_like_any_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7793,7 +7769,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT (SELECT status FROM usage_records WHERE id = 'u1') AS status_scalar FROM usage_records",
     );
-    defer malformed_scalar_subquery_parsed_sql.deinit(alloc);
     const malformed_scalar_subquery_generated_raw = malformed_scalar_subquery_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_scalar_subquery_read_ast = switch (malformed_scalar_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7810,7 +7785,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE NOT EXISTS (SELECT 1 FROM usage_records WHERE status = 'archived')",
     );
-    defer malformed_not_exists_subquery_parsed_sql.deinit(alloc);
     const malformed_not_exists_subquery_generated_raw = malformed_not_exists_subquery_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_not_exists_subquery_read_ast = switch (malformed_not_exists_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7826,7 +7800,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE status NOT IN (SELECT status FROM usage_records WHERE kind = 'archived')",
     );
-    defer malformed_not_in_subquery_parsed_sql.deinit(alloc);
     const malformed_not_in_subquery_generated_raw = malformed_not_in_subquery_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_not_in_subquery_read_ast = switch (malformed_not_in_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7842,7 +7815,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE status = ANY (SELECT status FROM usage_records WHERE kind = 'active')",
     );
-    defer malformed_quantified_subquery_parsed_sql.deinit(alloc);
     const malformed_quantified_subquery_generated_raw = malformed_quantified_subquery_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_quantified_subquery_read_ast = switch (malformed_quantified_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7858,7 +7830,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE usage_records.tenant = outer_usage.tenant)",
     );
-    defer malformed_correlated_subquery_parsed_sql.deinit(alloc);
     const malformed_correlated_subquery_generated_raw = malformed_correlated_subquery_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_correlated_subquery_read_ast = switch (malformed_correlated_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7874,7 +7845,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE status IN (SELECT status FROM usage_records WHERE tenant IN (SELECT tenant FROM usage_records WHERE kind = 'active'))",
     );
-    defer malformed_nested_subquery_parsed_sql.deinit(alloc);
     const malformed_nested_subquery_generated_raw = malformed_nested_subquery_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_nested_subquery_read_ast = switch (malformed_nested_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7890,7 +7860,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH open_usage AS (SELECT id, status FROM usage_records WHERE status = 'open') SELECT id FROM usage_records WHERE status IN (SELECT status FROM open_usage)",
     );
-    defer malformed_cte_contained_subquery_parsed_sql.deinit(alloc);
     const malformed_cte_contained_subquery_generated_raw = malformed_cte_contained_subquery_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_cte_contained_subquery_read_ast = switch (malformed_cte_contained_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7907,7 +7876,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT DISTINCT status FROM usage_records",
     );
-    defer malformed_distinct_keyword_parsed_sql.deinit(alloc);
     const malformed_distinct_keyword_generated_raw = malformed_distinct_keyword_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     const malformed_distinct_keyword_read_ast = switch (malformed_distinct_keyword_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7924,7 +7892,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC",
     );
-    defer malformed_distinct_on_parsed_sql.deinit(alloc);
     const malformed_distinct_on_generated_raw = malformed_distinct_on_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_distinct_on_read_ast = switch (malformed_distinct_on_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7940,7 +7907,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT CASE WHEN status IS NULL THEN 'missing' ELSE status END AS status_key FROM usage_records WHERE kind = 'order'",
     );
-    defer malformed_case_expression_parsed_sql.deinit(alloc);
     const malformed_case_expression_generated_raw = malformed_case_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_case_expression_read_ast = switch (malformed_case_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -7986,7 +7952,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT EXTRACT(dow FROM amount) AS amount_dow FROM usage_records WHERE id = 'u1'",
     );
-    defer malformed_extract_expression_parsed_sql.deinit(alloc);
     const malformed_extract_expression_generated_raw = malformed_extract_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_extract_expression_read_ast = switch (malformed_extract_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8025,7 +7990,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE status = ANY(ARRAY['active','pending']::text[])",
     );
-    defer malformed_array_expression_parsed_sql.deinit(alloc);
     const malformed_array_expression_generated_raw = malformed_array_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_array_expression_read_ast = switch (malformed_array_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8056,7 +8020,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE NOT (status IS NULL)",
     );
-    defer malformed_logical_not_expression_parsed_sql.deinit(alloc);
     const malformed_logical_not_expression_generated_raw = malformed_logical_not_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_logical_not_expression_read_ast = switch (malformed_logical_not_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8073,7 +8036,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT CURRENT_TIMESTAMP FROM usage_records WHERE id = 'u1'",
     );
-    defer malformed_current_timestamp_parsed_sql.deinit(alloc);
     const malformed_current_timestamp_generated_raw = malformed_current_timestamp_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_current_timestamp_read_ast = switch (malformed_current_timestamp_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8089,7 +8051,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT CURRENT_TIMESTAMP(6) FROM usage_records WHERE id = 'u1'",
     );
-    defer malformed_current_timestamp_precision_parsed_sql.deinit(alloc);
     const malformed_current_timestamp_precision_generated_raw = malformed_current_timestamp_precision_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_current_timestamp_precision_read_ast = switch (malformed_current_timestamp_precision_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8109,7 +8070,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT INTERVAL '1 day' FROM usage_records WHERE id = 'u1'",
     );
-    defer malformed_interval_literal_parsed_sql.deinit(alloc);
     const malformed_interval_literal_generated_raw = malformed_interval_literal_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_interval_literal_read_ast = switch (malformed_interval_literal_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8138,7 +8098,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT TIMESTAMP '2026-01-01 00:00:00' FROM usage_records WHERE id = 'u1'",
     );
-    defer malformed_timestamp_literal_parsed_sql.deinit(alloc);
     const malformed_timestamp_literal_generated_raw = malformed_timestamp_literal_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_timestamp_literal_read_ast = switch (malformed_timestamp_literal_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8168,7 +8127,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.id = accounts.id JOIN tenants ON accounts.tenant = tenants.id",
     );
-    defer malformed_join_tree_parsed_sql.deinit(alloc);
     const malformed_join_tree_generated_raw = malformed_join_tree_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_join_tree_read_ast = switch (malformed_join_tree_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8184,7 +8142,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.id = accounts.id JOIN tenants ON accounts.tenant = tenants.id",
     );
-    defer malformed_join_child_parsed_sql.deinit(alloc);
     const malformed_join_child_generated_raw = malformed_join_child_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_join_child_read_ast = switch (malformed_join_child_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8200,7 +8157,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT usage_records.id FROM usage_records JOIN accounts AS a ON usage_records.id = a.id",
     );
-    defer malformed_join_gap_parsed_sql.deinit(alloc);
     const malformed_join_gap_generated_raw = malformed_join_gap_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_join_gap_read_ast = switch (malformed_join_gap_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8217,7 +8173,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT usage_records.id FROM usage_records LEFT JOIN accounts ON usage_records.id = accounts.id",
     );
-    defer malformed_join_kind_parsed_sql.deinit(alloc);
     const malformed_join_kind_generated_raw = malformed_join_kind_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_join_kind_read_ast = switch (malformed_join_kind_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8234,7 +8189,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.id = accounts.id",
     );
-    defer malformed_join_side_table_parsed_sql.deinit(alloc);
     const malformed_join_side_table_generated_raw = malformed_join_side_table_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_join_side_table_read_ast = switch (malformed_join_side_table_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8251,7 +8205,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT usage_records.id FROM usage_records JOIN accounts AS a ON usage_records.id = a.id",
     );
-    defer stale_non_lateral_join_payload_parsed_sql.deinit(alloc);
     const stale_non_lateral_join_payload_generated_raw = stale_non_lateral_join_payload_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var stale_non_lateral_join_payload_read_ast = switch (stale_non_lateral_join_payload_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8271,7 +8224,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM LATERAL (SELECT id FROM usage_records) AS source_rows",
     );
-    defer standalone_lateral_source_parsed_sql.deinit(alloc);
     const standalone_lateral_source_generated_raw = standalone_lateral_source_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     const standalone_lateral_source_read_ast = switch (standalone_lateral_source_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8286,7 +8238,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.id = accounts.id ORDER BY usage_records.id",
     );
-    defer malformed_join_tail_parsed_sql.deinit(alloc);
     const malformed_join_tail_generated_raw = malformed_join_tail_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_join_tail_read_ast = switch (malformed_join_tail_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8311,7 +8262,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.id = accounts.id",
     );
-    defer malformed_join_condition_keyword_parsed_sql.deinit(alloc);
     const malformed_join_condition_keyword_generated_raw = malformed_join_condition_keyword_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_join_condition_keyword_read_ast = switch (malformed_join_condition_keyword_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8339,7 +8289,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT usage_records.id FROM usage_records JOIN accounts USING (id)",
     );
-    defer malformed_using_join_parsed_sql.deinit(alloc);
     const malformed_using_join_generated_raw = malformed_using_join_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_using_join_read_ast = switch (malformed_using_join_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8388,7 +8337,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT usage_records.id FROM usage_records JOIN accounts USING (id, status)",
     );
-    defer stale_using_list_leading_gap_parsed_sql.deinit(alloc);
     var stale_using_list_leading_gap_read_ast = switch ((stale_using_list_leading_gap_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape).ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
         else => return error.UnsupportedSqlShape,
@@ -8412,7 +8360,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT usage_records.id FROM usage_records JOIN accounts USING (id, status)",
     );
-    defer stale_using_list_trailing_gap_parsed_sql.deinit(alloc);
     var stale_using_list_trailing_gap_read_ast = switch ((stale_using_list_trailing_gap_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape).ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
         else => return error.UnsupportedSqlShape,
@@ -8439,7 +8386,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records UNION ALL SELECT id FROM usage_archive",
     );
-    defer malformed_set_operation_parsed_sql.deinit(alloc);
     const malformed_set_operation_generated_raw = malformed_set_operation_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_set_operation_read_ast = switch (malformed_set_operation_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8455,7 +8401,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records UNION SELECT DISTINCT id FROM usage_archive",
     );
-    defer malformed_set_operation_distinct_keyword_parsed_sql.deinit(alloc);
     const malformed_set_operation_distinct_keyword_generated_raw = malformed_set_operation_distinct_keyword_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     const malformed_set_operation_distinct_keyword_read_ast = switch (malformed_set_operation_distinct_keyword_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8514,7 +8459,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records UNION SELECT id FROM usage_archive WHERE status = 'ready'",
     );
-    defer malformed_set_operation_where_parsed_sql.deinit(alloc);
     const malformed_set_operation_where_generated_raw = malformed_set_operation_where_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_set_operation_where_read_ast = switch (malformed_set_operation_where_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8542,7 +8486,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records UNION SELECT id FROM usage_archive WHERE lower(status) = 'ready'",
     );
-    defer malformed_set_operation_where_child_parsed_sql.deinit(alloc);
     const malformed_set_operation_where_child_generated_raw = malformed_set_operation_where_child_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_set_operation_where_child_read_ast = switch (malformed_set_operation_where_child_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8559,7 +8502,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id, row_number() OVER usage_window AS rn FROM usage_records WINDOW usage_window AS (ORDER BY id)",
     );
-    defer malformed_window_parsed_sql.deinit(alloc);
     const malformed_window_generated_raw = malformed_window_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_window_read_ast = switch (malformed_window_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8575,7 +8517,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id, row_number() OVER usage_window AS rn FROM usage_records WINDOW first_window AS (ORDER BY tenant), usage_window AS (ORDER BY id)",
     );
-    defer stale_named_window_leading_gap_parsed_sql.deinit(alloc);
     var stale_named_window_leading_gap_read_ast = switch ((stale_named_window_leading_gap_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape).ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
         else => return error.UnsupportedSqlShape,
@@ -8592,7 +8533,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id, sum(amount) OVER usage_window AS running FROM usage_records WINDOW usage_window AS (ORDER BY amount ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
     );
-    defer stale_named_window_frame_parsed_sql.deinit(alloc);
     const stale_named_window_frame_generated_raw = stale_named_window_frame_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var stale_named_window_frame_read_ast = switch (stale_named_window_frame_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8612,7 +8552,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id, row_number() OVER (PARTITION BY tenant ORDER BY id) AS rn FROM usage_records",
     );
-    defer malformed_inline_window_parsed_sql.deinit(alloc);
     const malformed_inline_window_generated_raw = malformed_inline_window_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_inline_window_read_ast = switch (malformed_inline_window_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8641,7 +8580,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id, count(*) OVER (ORDER BY amount ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS current_and_next FROM usage_records",
     );
-    defer malformed_inline_window_frame_parsed_sql.deinit(alloc);
     const malformed_inline_window_frame_generated_raw = malformed_inline_window_frame_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_inline_window_frame_read_ast = switch (malformed_inline_window_frame_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8670,7 +8608,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows",
     );
-    defer cte_parsed_sql.deinit(alloc);
     const cte_generated_raw = cte_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var cte_read_ast = switch (cte_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8731,7 +8668,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH source_rows AS (SELECT id FROM usage_records FOR system_time AS OF 42) SELECT id FROM source_rows",
     );
-    defer cte_system_time_parsed_sql.deinit(alloc);
     const cte_system_time_generated_raw = cte_system_time_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var cte_system_time_read_ast = switch (cte_system_time_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast.*,
@@ -8761,7 +8697,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records WHERE id = 'u1'",
     );
-    defer stale_source_table_parsed_sql.deinit(alloc);
     const stale_source_table_generated_raw = stale_source_table_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var stale_source_table_read_ast = switch (stale_source_table_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8778,7 +8713,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records FOR UPDATE SKIP LOCKED",
     );
-    defer stale_row_lock_tail_parsed_sql.deinit(alloc);
     const stale_row_lock_tail_generated_raw = stale_row_lock_tail_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var stale_row_lock_tail_read_ast = switch (stale_row_lock_tail_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8797,7 +8731,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH source_rows AS (SELECT id FROM usage_records WHERE id = 'u1') SELECT id FROM source_rows",
     );
-    defer stale_cte_body_source_table_parsed_sql.deinit(alloc);
     const stale_cte_body_source_table_generated_raw = stale_cte_body_source_table_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var stale_cte_body_source_table_read_ast = switch (stale_cte_body_source_table_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8814,7 +8747,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records UNION ALL SELECT id FROM usage_archive",
     );
-    defer stale_set_operation_source_table_parsed_sql.deinit(alloc);
     const stale_set_operation_source_table_generated_raw = stale_set_operation_source_table_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var stale_set_operation_source_table_read_ast = switch (stale_set_operation_source_table_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8831,7 +8763,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN accounts AS a ON child.id = a.id",
     );
-    defer stale_set_operation_right_join_parsed_sql.deinit(alloc);
     const stale_set_operation_right_join_generated_raw = stale_set_operation_right_join_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var stale_set_operation_right_join_read_ast = switch (stale_set_operation_right_join_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8849,7 +8780,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records",
     );
-    defer stale_absent_where_expression_list_parsed_sql.deinit(alloc);
     const stale_absent_where_expression_list_generated_raw = stale_absent_where_expression_list_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var stale_absent_where_expression_list_read_ast = switch (stale_absent_where_expression_list_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8869,7 +8799,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records",
     );
-    defer stale_absent_set_operation_list_parsed_sql.deinit(alloc);
     const stale_absent_set_operation_list_generated_raw = stale_absent_set_operation_list_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var stale_absent_set_operation_list_read_ast = switch (stale_absent_set_operation_list_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8889,7 +8818,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id FROM usage_records ORDER BY id DESC NULLS LAST",
     );
-    defer stale_absent_order_list_direction_parsed_sql.deinit(alloc);
     const stale_absent_order_list_direction_generated_raw = stale_absent_order_list_direction_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var stale_absent_order_list_direction_read_ast = switch (stale_absent_order_list_direction_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8918,7 +8846,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT count(*) OVER () AS total_rows FROM usage_records",
     );
-    defer stale_empty_over_order_list_parsed_sql.deinit(alloc);
     const stale_empty_over_order_list_generated_raw = stale_empty_over_order_list_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var stale_empty_over_order_list_read_ast = switch (stale_empty_over_order_list_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8942,7 +8869,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT row_number() OVER () AS rn FROM usage_records",
     );
-    defer stale_empty_function_argument_list_parsed_sql.deinit(alloc);
     const stale_empty_function_argument_list_generated_raw = stale_empty_function_argument_list_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var stale_empty_function_argument_list_read_ast = switch (stale_empty_function_argument_list_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -8968,7 +8894,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id AS usage_id FROM usage_records WHERE metadata ?| ARRAY[]",
     );
-    defer stale_empty_array_list_parsed_sql.deinit(alloc);
     const stale_empty_array_list_generated_raw = stale_empty_array_list_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     const stale_empty_array_list_read_ast = switch (stale_empty_array_list_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9006,7 +8931,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT DISTINCT id AS usage_id FROM usage_records",
     );
-    defer stale_plain_distinct_list_parsed_sql.deinit(alloc);
     const stale_plain_distinct_list_generated_raw = stale_plain_distinct_list_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var stale_plain_distinct_list_read_ast = switch (stale_plain_distinct_list_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9061,7 +8985,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "SELECT id AS usage_id FROM usage_records",
     );
-    defer stale_projection_list_slice_parsed_sql.deinit(alloc);
     const stale_projection_list_slice_generated_raw = stale_projection_list_slice_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var stale_projection_list_slice_read_ast = switch (stale_projection_list_slice_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9094,7 +9017,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH first_rows AS (SELECT id FROM usage_records), second_rows AS (SELECT id FROM first_rows) SELECT id FROM second_rows",
     );
-    defer multi_cte_parsed_sql.deinit(alloc);
     const multi_cte_generated_raw = multi_cte_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var multi_cte_read_ast = switch (multi_cte_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9123,7 +9045,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH source_rows(id) AS NOT MATERIALIZED (SELECT id FROM usage_records) SELECT id FROM source_rows",
     );
-    defer materialized_cte_parsed_sql.deinit(alloc);
     const materialized_cte_generated_raw = materialized_cte_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var materialized_cte_read_ast = switch (materialized_cte_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9152,7 +9073,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows",
     );
-    defer malformed_cte_body_kind_parsed_sql.deinit(alloc);
     const malformed_cte_body_kind_generated_raw = malformed_cte_body_kind_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_cte_body_kind_read_ast = switch (malformed_cte_body_kind_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9168,7 +9088,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows",
     );
-    defer malformed_cte_body_select_keyword_parsed_sql.deinit(alloc);
     const malformed_cte_body_select_keyword_generated_raw = malformed_cte_body_select_keyword_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     const malformed_cte_body_select_keyword_read_ast = switch (malformed_cte_body_select_keyword_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9186,7 +9105,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows",
     );
-    defer malformed_cte_body_projection_parsed_sql.deinit(alloc);
     const malformed_cte_body_projection_generated_raw = malformed_cte_body_projection_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_cte_body_projection_read_ast = switch (malformed_cte_body_projection_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9202,7 +9120,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH source_rows AS (SELECT id FROM usage_records WHERE active IS TRUE) SELECT id FROM source_rows",
     );
-    defer malformed_cte_body_source_parsed_sql.deinit(alloc);
     const malformed_cte_body_source_generated_raw = malformed_cte_body_source_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_cte_body_source_read_ast = switch (malformed_cte_body_source_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9243,7 +9160,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows",
     );
-    defer malformed_cte_body_projection_list_parsed_sql.deinit(alloc);
     const malformed_cte_body_projection_list_generated_raw = malformed_cte_body_projection_list_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_cte_body_projection_list_read_ast = switch (malformed_cte_body_projection_list_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9289,7 +9205,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH source_rows AS (SELECT DISTINCT status FROM usage_records) SELECT status FROM source_rows",
     );
-    defer malformed_cte_body_distinct_keyword_parsed_sql.deinit(alloc);
     const malformed_cte_body_distinct_keyword_generated_raw = malformed_cte_body_distinct_keyword_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     const malformed_cte_body_distinct_keyword_read_ast = switch (malformed_cte_body_distinct_keyword_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9307,7 +9222,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH source_rows AS (SELECT DISTINCT ON (organization_id) organization_id FROM usage_records ORDER BY organization_id) SELECT organization_id FROM source_rows",
     );
-    defer malformed_cte_body_distinct_on_parsed_sql.deinit(alloc);
     const malformed_cte_body_distinct_on_generated_raw = malformed_cte_body_distinct_on_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_cte_body_distinct_on_read_ast = switch (malformed_cte_body_distinct_on_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9323,7 +9237,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH joined_rows AS (SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id JOIN tenants ON accounts.tenant_id = tenants.id) SELECT id FROM joined_rows",
     );
-    defer malformed_cte_body_join_parsed_sql.deinit(alloc);
     const malformed_cte_body_join_generated_raw = malformed_cte_body_join_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_cte_body_join_read_ast = switch (malformed_cte_body_join_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9361,7 +9274,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH source_rows AS (SELECT id FROM usage_records UNION SELECT id FROM usage_archive) SELECT id FROM source_rows",
     );
-    defer malformed_cte_body_set_operation_parsed_sql.deinit(alloc);
     const malformed_cte_body_set_operation_generated_raw = malformed_cte_body_set_operation_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_cte_body_set_operation_read_ast = switch (malformed_cte_body_set_operation_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9377,7 +9289,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH source_rows AS (SELECT status, COUNT(*) FROM usage_records GROUP BY status HAVING COUNT(*) > 1) SELECT status FROM source_rows",
     );
-    defer malformed_cte_body_having_parsed_sql.deinit(alloc);
     const malformed_cte_body_having_generated_raw = malformed_cte_body_having_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_cte_body_having_read_ast = switch (malformed_cte_body_having_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9394,7 +9305,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH source_rows AS (SELECT id, row_number() OVER usage_window AS rn FROM usage_records WINDOW usage_window AS (ORDER BY id)) SELECT rn FROM source_rows",
     );
-    defer malformed_cte_body_window_parsed_sql.deinit(alloc);
     const malformed_cte_body_window_generated_raw = malformed_cte_body_window_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_cte_body_window_read_ast = switch (malformed_cte_body_window_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9410,7 +9320,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH source_rows AS (SELECT id FROM usage_records ORDER BY id) SELECT id FROM source_rows",
     );
-    defer malformed_cte_body_order_keyword_parsed_sql.deinit(alloc);
     const malformed_cte_body_order_keyword_generated_raw = malformed_cte_body_order_keyword_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_cte_body_order_keyword_read_ast = switch (malformed_cte_body_order_keyword_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9427,7 +9336,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH source_rows AS (SELECT id FROM usage_records LIMIT 5) SELECT id FROM source_rows",
     );
-    defer malformed_cte_body_limit_parsed_sql.deinit(alloc);
     const malformed_cte_body_limit_generated_raw = malformed_cte_body_limit_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_cte_body_limit_read_ast = switch (malformed_cte_body_limit_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9454,7 +9362,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH source_rows AS (SELECT id FROM usage_records FOR UPDATE SKIP LOCKED) SELECT id FROM source_rows",
     );
-    defer malformed_cte_body_row_lock_parsed_sql.deinit(alloc);
     const malformed_cte_body_row_lock_generated_raw = malformed_cte_body_row_lock_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var malformed_cte_body_row_lock_read_ast = switch (malformed_cte_body_row_lock_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9482,7 +9389,6 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         alloc,
         "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records WHERE kind = 'order' UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.customer_id = parent.id) SELECT id FROM source_rows",
     );
-    defer recursive_cte_parsed_sql.deinit(alloc);
     const recursive_cte_generated_raw = recursive_cte_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var recursive_cte_read_ast = switch (recursive_cte_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
@@ -9506,9 +9412,8 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
 
     var recursive_cte_alias_parsed_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
-        "WITH RECURSIVE walk(id, depth) AS (SELECT id, depth FROM usage_records WHERE kind = 'order' UNION ALL SELECT child.id, walk.depth + 1 FROM usage_records AS child JOIN walk ON child.customer_id = walk.id) SELECT id FROM walk WHERE depth > 1 ORDER BY id",
+        "WITH RECURSIVE walk(id) AS (SELECT id FROM usage_records WHERE kind = 'order' UNION ALL SELECT child.id FROM usage_records AS child JOIN walk ON child.id = walk.id) SELECT id FROM walk ORDER BY id",
     );
-    defer recursive_cte_alias_parsed_sql.deinit(alloc);
     const recursive_cte_alias_generated_raw = recursive_cte_alias_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     const recursive_cte_alias_read_ast = switch (recursive_cte_alias_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,

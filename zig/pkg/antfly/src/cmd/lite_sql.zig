@@ -210,7 +210,11 @@ fn executeParsedSqlJsonAlloc(allocator: Allocator, db: *antfly.db.DB, session: *
     switch (parsed_sql.statement) {
         .read => return try executeReadAlloc(allocator, db, session, parsed_sql),
         .write => return try executeWriteAlloc(allocator, db, session, parsed_sql),
-        else => return try executeNonRowAlloc(allocator, db, session, parsed_sql),
+        else => switch (parsed_sql.generatedStatementKind() orelse .other) {
+            .read => return try executeReadAlloc(allocator, db, session, parsed_sql),
+            .dml => return try executeWriteAlloc(allocator, db, session, parsed_sql),
+            else => return try executeNonRowAlloc(allocator, db, session, parsed_sql),
+        },
     }
 }
 
@@ -496,7 +500,10 @@ fn executeWriteAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session,
             lowered_statement_kind = "insert_source";
             break :blk &owned_insert_source_batch.?;
         },
-        else => return error.UnsupportedSqlShape,
+        else => {
+            if (schema.storage_mode == .document) return error.DocumentSqlWriteUnsupported;
+            return error.UnsupportedSqlShape;
+        },
     };
     if (rows_batch.writes.len != 0 or rows_batch.deletes.len != 0 or rows_batch.transforms.len != 0 or rows_batch.predicates.len != 0) {
         _ = (try write_source.source().batch(allocator, target_table, rows_batch.req)) orelse return error.TableNotFound;
@@ -567,7 +574,7 @@ fn executeLiteAntflyQueryFunctionReadAlloc(
     parsed_sql: *const sql_adapter.ParsedSql,
 ) !?[]u8 {
     const statement_kind = parsed_sql.readStatementKindIncludingGeneratedAst() orelse {
-        if (parsed_sql.generatedStatementKind() == .read) return error.UnsupportedSqlShape;
+        if (sql_adapter.parsedSqlHasGeneratedAntflyReadSource(parsed_sql)) return error.UnsupportedSqlShape;
         return null;
     };
     return try executeAntflyQueryFunctionReadAlloc(allocator, db, session, parsed_sql, statement_kind);
@@ -633,7 +640,7 @@ fn liteReadStatementKindForParsedCatalogRead(
     parsed_sql: *const sql_adapter.ParsedSql,
 ) !sql_adapter.SqlReadStatementKind {
     const parsed_kind = parsed_sql.readStatementKindIncludingGeneratedAst();
-    if (parsed_sql.generatedStatementKind() == .read) return parsed_kind orelse error.UnsupportedSqlShape;
+    if (parsed_sql.generatedStatementKind() == .read) return parsed_kind orelse read.statement.readKind() orelse .query;
     return read.statement.readKind() orelse parsed_kind orelse error.UnsupportedSqlShape;
 }
 
@@ -724,11 +731,7 @@ fn sqlQueryFunctionRowsFromQueryResponseAlloc(
     const hits_value = first_response.object.get("hits") orelse return error.InvalidQueryRequest;
     if (hits_value != .object) return error.InvalidQueryRequest;
     const total_value = hits_value.object.get("total") orelse return error.InvalidQueryRequest;
-    const total = switch (total_value) {
-        .integer => |value| if (value >= 0 and value <= std.math.maxInt(u32)) @as(u32, @intCast(value)) else return error.InvalidQueryRequest,
-        .number_string => |text| std.fmt.parseUnsigned(u32, text, 10) catch return error.InvalidQueryRequest,
-        else => return error.InvalidQueryRequest,
-    };
+    const total = try queryHitsTotalValueAsU32(total_value);
     const hit_items = hits_value.object.get("hits") orelse return error.InvalidQueryRequest;
     if (hit_items != .array) return error.InvalidQueryRequest;
 
@@ -746,6 +749,18 @@ fn sqlQueryFunctionRowsFromQueryResponseAlloc(
     return .{
         .rows = rows,
         .total = total,
+    };
+}
+
+fn queryHitsTotalValueAsU32(total_value: std.json.Value) !u32 {
+    return switch (total_value) {
+        .integer => |value| if (value >= 0 and value <= std.math.maxInt(u32)) @as(u32, @intCast(value)) else error.InvalidQueryRequest,
+        .number_string => |text| std.fmt.parseUnsigned(u32, text, 10) catch error.InvalidQueryRequest,
+        .object => |object| blk: {
+            const value = object.get("value") orelse return error.InvalidQueryRequest;
+            break :blk try queryHitsTotalValueAsU32(value);
+        },
+        else => error.InvalidQueryRequest,
     };
 }
 

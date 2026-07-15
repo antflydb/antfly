@@ -53,12 +53,30 @@ pub const ProvisionedTableReadCache = struct {
     miss_count: std.atomic.Value(u64) = .init(0),
     mutex: Io.Mutex = .init,
     ready: Io.Condition = .init,
-    epoch: u64 = 1,
+    table_epochs: std.StringHashMapUnmanaged(u64) = .empty,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
     retired_entries: std.ArrayListUnmanaged(*Entry) = .empty,
     pending_opens: std.ArrayListUnmanaged(PendingOpen) = .empty,
 
     const max_cached_tables = 64;
+    const pending_open_wait_poll_ns: u64 = 25 * std.time.ns_per_ms;
+    const pending_open_wait_timeout_ns: u64 = 5 * std.time.ns_per_s;
+
+    fn epochForTableLocked(self: *ProvisionedTableReadCache, table_name: []const u8) !u64 {
+        const gop = try self.table_epochs.getOrPut(self.alloc, table_name);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.alloc.dupe(u8, table_name) catch |err| {
+                self.table_epochs.removeByPtr(gop.key_ptr);
+                return err;
+            };
+            gop.value_ptr.* = 1;
+        }
+        return gop.value_ptr.*;
+    }
+
+    fn bumpEpochLocked(self: *ProvisionedTableReadCache, table_name: []const u8) void {
+        if (self.table_epochs.getPtr(table_name)) |epoch| epoch.* +%= 1;
+    }
 
     pub const CacheStats = struct {
         hit_count: u64 = 0,
@@ -126,6 +144,9 @@ pub const ProvisionedTableReadCache = struct {
         self.retired_entries.deinit(self.alloc);
         for (self.pending_opens.items) |*pending| pending.deinit(self.alloc);
         self.pending_opens.deinit(self.alloc);
+        var epoch_keys = self.table_epochs.keyIterator();
+        while (epoch_keys.next()) |key| self.alloc.free(key.*);
+        self.table_epochs.deinit(self.alloc);
         self.mutex.unlock(io);
         self.threaded.deinit();
         self.* = undefined;
@@ -146,11 +167,16 @@ pub const ProvisionedTableReadCache = struct {
         lsm_root_generation: u64,
         table_name: []const u8,
     ) !Lease {
-        const identity_namespace = try loadTableIdentityNamespaceForGroup(self.alloc, catalog, table_name, group_id);
         const io = self.threaded.io();
+        var stale_epoch_retries: u8 = 0;
+        var pending_open_wait_started_ns: u64 = 0;
         while (true) {
+            const identity_namespace = try loadTableIdentityNamespaceForGroup(self.alloc, catalog, table_name, group_id);
             self.mutex.lockUncancelable(io);
-            const open_epoch = self.epoch;
+            const open_epoch = self.epochForTableLocked(table_name) catch |err| {
+                self.mutex.unlock(io);
+                return err;
+            };
             if (self.findEntryForNamespaceLocked(group_id, lsm_root_generation, identity_namespace, table_name)) |entry| {
                 entry.active_leases += 1;
                 _ = self.hit_count.fetchAdd(1, .monotonic);
@@ -162,10 +188,15 @@ pub const ProvisionedTableReadCache = struct {
                 };
             }
             if (self.hasPendingOpenForNamespaceLocked(group_id, identity_namespace, table_name)) {
-                self.ready.waitUncancelable(io, &self.mutex);
                 self.mutex.unlock(io);
+                const now_ns = platform_time.monotonicNs();
+                if (pending_open_wait_started_ns == 0) pending_open_wait_started_ns = now_ns;
+                const waited_ns = now_ns -| pending_open_wait_started_ns;
+                if (waited_ns >= pending_open_wait_timeout_ns) return error.TableReadChurn;
+                io.sleep(Io.Duration.fromNanoseconds(@min(pending_open_wait_poll_ns, pending_open_wait_timeout_ns - waited_ns)), .awake) catch {};
                 continue;
             }
+            pending_open_wait_started_ns = 0;
             const owned_pending_name = try self.alloc.dupe(u8, table_name);
             var pending_name_owned_locally = true;
             errdefer if (pending_name_owned_locally) self.alloc.free(owned_pending_name);
@@ -204,8 +235,13 @@ pub const ProvisionedTableReadCache = struct {
 
             self.mutex.lockUncancelable(io);
             self.removePendingOpenForNamespaceLocked(group_id, identity_namespace, table_name);
-            if (self.epoch != open_epoch) {
+            if ((self.table_epochs.get(table_name) orelse open_epoch +% 1) != open_epoch) {
+                stale_epoch_retries += 1;
                 self.ready.broadcast(io);
+                if (stale_epoch_retries > 2) {
+                    self.mutex.unlock(io);
+                    return error.TableReadChurn;
+                }
                 db.close();
                 self.mutex.unlock(io);
                 continue;
@@ -287,7 +323,7 @@ pub const ProvisionedTableReadCache = struct {
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        self.epoch +%= 1;
+        self.bumpEpochLocked(table_name);
         self.removeEntriesForTableLocked(table_name);
         self.ready.broadcast(io);
     }
@@ -307,7 +343,8 @@ pub const ProvisionedTableReadCache = struct {
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        self.epoch +%= 1;
+        var epochs = self.table_epochs.valueIterator();
+        while (epochs.next()) |epoch| epoch.* +%= 1;
         for (self.entries.items) |entry| self.retireEntryLocked(entry);
         self.entries.clearRetainingCapacity();
         self.ready.broadcast(io);
@@ -635,16 +672,21 @@ pub fn openProvisionedQueryDbForTableWithCache(
             remote: ?*const scraping.RemoteContentConfig,
         ) !EnrichmentSet {
             _ = runtime;
+            const dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote, .inference_api_url = local_inference_api_url });
+            errdefer if (dense) |owned| owned.deinit(allocator);
+            const sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote, .inference_api_url = local_inference_api_url });
+            errdefer if (sparse) |owned| owned.deinit(allocator);
+            const generated = try indexesJsonHasGeneratedEnrichment(allocator, raw_indexes_json);
             return .{
-                .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote, .inference_api_url = local_inference_api_url }),
-                .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote, .inference_api_url = local_inference_api_url }),
-                .generated = try indexesJsonHasGeneratedEnrichment(allocator, raw_indexes_json),
+                .dense = dense,
+                .sparse = sparse,
+                .generated = generated,
             };
         }
     }.run;
 
     var enrichments = try createEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, inference_api_url, secret_store, remote_content);
-    errdefer enrichments.deinit(alloc);
+    defer enrichments.deinit(alloc);
 
     var db = if (enrichments.enabled()) blk: {
         const enrichment_cfg = enrichments.config();
@@ -661,7 +703,7 @@ pub fn openProvisionedQueryDbForTableWithCache(
             .prefer_existing_identity_namespace = identity_namespace != null,
             .enrichment = enrichment_cfg,
         });
-        enrichments.take();
+        if (opened.enrichment_runtime != null) enrichments.take();
         break :blk opened;
     } else try db_mod.DB.open(alloc, path, .{
         .open_mode = .query_readonly,
@@ -1279,7 +1321,7 @@ test "provisioned read cache invalidates repeated ownership moves with pinned le
     try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
 }
 
-test "provisioned read cache clear preserves in-flight pending opens and bumps epoch" {
+test "provisioned read cache clear preserves in-flight pending opens and bumps table epoch" {
     const alloc = std.testing.allocator;
 
     var cache = ProvisionedTableReadCache.init(alloc);
@@ -1290,10 +1332,14 @@ test "provisioned read cache clear preserves in-flight pending opens and bumps e
         .table_name = try alloc.dupe(u8, "docs"),
     });
 
-    const before_epoch = cache.epoch;
+    const io = cache.threaded.io();
+    cache.mutex.lockUncancelable(io);
+    const before_epoch = try cache.epochForTableLocked("docs");
+    cache.mutex.unlock(io);
+
     cache.clear();
 
-    try std.testing.expectEqual(before_epoch +% 1, cache.epoch);
+    try std.testing.expectEqual(before_epoch +% 1, cache.table_epochs.get("docs").?);
     try std.testing.expectEqual(@as(usize, 1), cache.pending_opens.items.len);
     try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
     try std.testing.expect(cache.hasPendingOpenLocked(7001, "docs"));
@@ -1362,10 +1408,10 @@ test "provisioned read cache invalidate removes entries without dropping pending
         .table_name = try alloc.dupe(u8, "docs"),
     });
 
-    const before_epoch = cache.epoch;
+    const before_epoch = cache.table_epochs.get("docs").?;
     cache.invalidateTable("docs");
 
-    try std.testing.expectEqual(before_epoch +% 1, cache.epoch);
+    try std.testing.expectEqual(before_epoch +% 1, cache.table_epochs.get("docs").?);
     try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
     try std.testing.expect(cache.hasPendingOpenLocked(7001, "docs"));
 }

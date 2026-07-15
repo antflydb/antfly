@@ -3488,10 +3488,34 @@ test "db resolution runtime starts resolver replay workers only while resolver c
     });
     try std.testing.expect(db.resolution_runtime.?.worker_started.load(.acquire));
     try std.testing.expect(db.promotion_runtime.?.worker_started.load(.acquire));
+    {
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1), stats.resolver_replay.resolver_count);
+        try std.testing.expect(stats.resolver_replay.resolution_runtime_present);
+        try std.testing.expect(stats.resolver_replay.resolution_worker_started);
+        try std.testing.expect(stats.resolver_replay.promotion_runtime_present);
+        try std.testing.expect(stats.resolver_replay.promotion_worker_started);
+        try std.testing.expectEqual(@as(usize, 1), stats.resolver_replay.resolvers.len);
+        try std.testing.expectEqualStrings("kg_lifecycle", stats.resolver_replay.resolvers[0].name);
+        try std.testing.expectEqualStrings("entities", stats.resolver_replay.resolvers[0].table);
+        try std.testing.expectEqualStrings("relations_v1", stats.resolver_replay.resolvers[0].source_artifact);
+        try std.testing.expectEqualStrings("resolution_lifecycle_v1", stats.resolver_replay.resolvers[0].resolution_artifact);
+    }
 
     try std.testing.expect(try db.removeResolver("kg_lifecycle"));
     try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
     try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+    {
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 0), stats.resolver_replay.resolver_count);
+        try std.testing.expect(stats.resolver_replay.resolution_runtime_present);
+        try std.testing.expect(!stats.resolver_replay.resolution_worker_started);
+        try std.testing.expect(stats.resolver_replay.promotion_runtime_present);
+        try std.testing.expect(!stats.resolver_replay.promotion_worker_started);
+        try std.testing.expectEqual(@as(usize, 0), stats.resolver_replay.resolvers.len);
+    }
 }
 
 test "db resolution runtime backfills a mention name embedding so ann/cosine resolution links end-to-end" {

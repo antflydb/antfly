@@ -24,6 +24,24 @@ const peer_resolver = @import("peer_resolver.zig");
 const transport = @import("transport/mod.zig");
 
 pub const default_max_inbound_messages_per_round: usize = 1024;
+pub const default_http_listener_max_connection_threads: u32 = 32;
+
+pub fn httpListenerConfig(bind_host: []const u8, bind_port: u16) transport.StdHttpListenerConfig {
+    return .{
+        .bind_host = bind_host,
+        .bind_port = bind_port,
+        .serve_in_connection_threads = true,
+        .max_connection_threads = default_http_listener_max_connection_threads,
+    };
+}
+
+test "raft http listener config uses bounded per-connection serving" {
+    const cfg = httpListenerConfig("127.0.0.1", 8081);
+    try std.testing.expectEqualStrings("127.0.0.1", cfg.bind_host);
+    try std.testing.expectEqual(@as(u16, 8081), cfg.bind_port);
+    try std.testing.expect(cfg.serve_in_connection_threads);
+    try std.testing.expectEqual(default_http_listener_max_connection_threads, cfg.max_connection_threads);
+}
 
 pub const ReplicaStateBackend = enum {
     file_image,

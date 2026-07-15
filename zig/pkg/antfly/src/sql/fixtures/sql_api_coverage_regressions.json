@@ -7,16 +7,16 @@
         {
           "name": "stale temporal table token",
           "family": "insert",
-          "sql": "INSERT INTO products VALUES ('[2025-01-01,)'::daterange)",
+          "sql": "INSERT INTO products VALUES ('[2026-01-01,)'::daterange)",
           "plan": "insert:table=products_extra:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
           "apply_setup_sql": ["CREATE TABLE products (id text PRIMARY KEY)"]
         },
         {
           "name": "stale insert source table token",
           "family": "insert_source",
-          "sql": "INSERT INTO usage_records SELECT * FROM archived_records",
+        "sql": "INSERT INTO usage_records (id) SELECT id FROM archived_records",
           "plan": "insert_source:table=usage_records:source_table=archived_records_extra:source_pred=0:source_order=0:source_limit=-1:assignments=0:conflict=0:returning=0:returning_expr=0:returning_all=0",
-          "source_schema_json": "{\"storage_mode\":\"relational\",\"relational\":{\"primary_key\":{\"columns\":[\"id\"]},\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}]}}"
+          "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"
         }
       ],
       "expect_false": [
@@ -30,16 +30,16 @@
         {
           "name": "exact temporal table token",
           "family": "insert",
-          "sql": "INSERT INTO products VALUES ('[2025-01-01,)'::daterange)",
+          "sql": "INSERT INTO products VALUES ('[2026-01-01,)'::daterange)",
           "plan": "insert:table=products:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
           "apply_setup_sql": ["CREATE TABLE products (id text PRIMARY KEY)"]
         },
         {
           "name": "exact insert source table token",
           "family": "insert_source",
-          "sql": "INSERT INTO usage_records SELECT * FROM archived_records",
+        "sql": "INSERT INTO usage_records (id) SELECT id FROM archived_records",
           "plan": "insert_source:table=usage_records:source_table=archived_records:source_pred=0:source_order=0:source_limit=-1:assignments=0:conflict=0:returning=0:returning_expr=0:returning_all=0",
-          "source_schema_json": "{\"storage_mode\":\"relational\",\"relational\":{\"primary_key\":{\"columns\":[\"id\"]},\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}]}}"
+          "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"
         }
       ],
       "expect_true": [
@@ -189,7 +189,7 @@
         {
           "name": "stale lateral source schema token",
           "family": "lateral",
-          "sql": "SELECT usage_records.id, balance_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM balance_records LIMIT 1) balance_records ON true",
+          "sql": "SELECT usage_records.id, balance_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM balance_records LIMIT 1) AS balance_records ON true",
           "plan": "lateral:left=usage_records:right=balance_records_extra:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
           "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"
         },
@@ -228,7 +228,7 @@
         {
           "name": "exact lateral source schema token",
           "family": "lateral",
-          "sql": "SELECT usage_records.id, balance_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM balance_records LIMIT 1) balance_records ON true",
+          "sql": "SELECT usage_records.id, balance_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM balance_records LIMIT 1) AS balance_records ON true",
           "plan": "lateral:left=usage_records:right=balance_records:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
           "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"
         },
@@ -260,7 +260,7 @@
         {
           "name": "stale read lateral source schema token",
           "family": "read",
-          "sql": "SELECT usage_records.id, balance_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM balance_records LIMIT 1) balance_records ON true",
+          "sql": "SELECT usage_records.id, balance_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM balance_records LIMIT 1) AS balance_records ON true",
           "plan": "read:lateral:lateral:left=usage_records:right=balance_records_extra:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
           "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"
         }
@@ -283,7 +283,7 @@
         {
           "name": "exact read lateral source schema token",
           "family": "read",
-          "sql": "SELECT usage_records.id, balance_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM balance_records LIMIT 1) balance_records ON true",
+          "sql": "SELECT usage_records.id, balance_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM balance_records LIMIT 1) AS balance_records ON true",
           "plan": "read:lateral:lateral:left=usage_records:right=balance_records:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
           "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"
         }
@@ -480,7 +480,7 @@
         {
           "name": "malformed lateral side access",
           "family": "lateral",
-          "sql": "SELECT usage_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM usage_records LIMIT 1) related ON true",
+          "sql": "SELECT usage_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM usage_records LIMIT 1) AS related ON true",
           "plan": "lateral:left=usage_records:right=usage_records:ctes=0:left_pred=0:right_pred=0:right_order=1:right_limit=1:corr=1:select=2:order=0:limit=-1:left_json_contains=0:right_json_exists=1x"
         }
       ],
@@ -501,7 +501,7 @@
         {
           "name": "exact lateral side access",
           "family": "lateral",
-          "sql": "SELECT usage_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM usage_records LIMIT 1) related ON true",
+          "sql": "SELECT usage_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM usage_records LIMIT 1) AS related ON true",
           "plan": "lateral:left=usage_records:right=usage_records:ctes=0:left_pred=0:right_pred=0:right_order=1:right_limit=1:corr=1:select=2:order=0:limit=-1:left_json_contains=0:right_json_exists=1"
         }
       ],
@@ -577,7 +577,7 @@
         {
           "name": "malformed conflict guard returning count",
           "family": "insert",
-          "sql": "INSERT INTO usage_records (id) VALUES ('a') ON CONFLICT DO UPDATE SET status = excluded.status WHERE false",
+          "sql": "INSERT INTO usage_records (id) VALUES ('a') ON CONFLICT (id) DO UPDATE SET status = excluded.status WHERE false",
           "plan": "insert:table=usage_records:writes=0:transforms=0:ops=1:deletes=0:returning_rows=00x:returning_expr=0:conflict_where=1"
         }
       ],
@@ -606,7 +606,7 @@
         {
           "name": "exact conflict guard returning count",
           "family": "insert",
-          "sql": "INSERT INTO usage_records (id) VALUES ('a') ON CONFLICT DO UPDATE SET status = excluded.status WHERE false",
+          "sql": "INSERT INTO usage_records (id) VALUES ('a') ON CONFLICT (id) DO UPDATE SET status = excluded.status WHERE false",
           "plan": "insert:table=usage_records:writes=0:transforms=0:ops=1:deletes=0:returning_rows=0:returning_expr=0:conflict_where=1"
         }
       ],
@@ -622,7 +622,7 @@
         {
           "name": "insert source missing source table evidence",
           "family": "insert_source",
-          "sql": "INSERT INTO usage_records SELECT * FROM archived_records",
+          "sql": "INSERT INTO usage_records (id) SELECT id FROM archived_records",
           "plan": "insert_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:assignments=0:conflict=0:returning=0:returning_expr=0:returning_all=0"
         },
         {
@@ -662,7 +662,7 @@
         {
           "name": "typed insert source backfill",
           "family": "insert_source",
-          "sql": "INSERT INTO usage_records SELECT * FROM archived_records",
+          "sql": "INSERT INTO usage_records (id) SELECT id FROM archived_records",
           "plan": "insert_source:table=usage_records:source_table=archived_records:source_pred=0:source_order=0:source_limit=-1:assignments=0:conflict=0:returning=0:returning_expr=0:returning_all=0"
         },
         {

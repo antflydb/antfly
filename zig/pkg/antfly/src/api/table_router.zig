@@ -252,7 +252,7 @@ fn catalogBackedRouterGroupLeaderNodeId(ptr: *anyopaque, group_id: u64) ?u64 {
     const leader_store_id = groupLeaderStoreId(snapshot.merged_group_statuses, group_id) orelse return null;
     const store = storeForStoreId(snapshot.stores, leader_store_id) orelse return null;
     if (!storeUsableForRemoteWrites(store)) return null;
-    if (!nodeHasGroupPlacement(snapshot.placement_intents, group_id, store.node_id)) return null;
+    if (!nodeHasReadableGroupPlacement(snapshot.placement_intents, group_id, store.node_id)) return null;
     return store.node_id;
 }
 
@@ -265,6 +265,7 @@ fn catalogBackedRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, gr
     errdefer node_ids.deinit(alloc);
     for (snapshot.placement_intents) |intent| {
         if (intent.record.group_id != group_id) continue;
+        if (!raft_reconciler.placementReadableWithPeers(snapshot.placement_intents, intent)) continue;
         if (containsNodeId(node_ids.items, intent.record.local_node_id)) continue;
         try node_ids.append(alloc, intent.record.local_node_id);
     }
@@ -277,7 +278,7 @@ fn catalogBackedRouterNodeStatus(ptr: *anyopaque, node_id: u64, group_id: u64) r
     defer router.catalog.freeAdminSnapshot(&snapshot);
     const store = storeForNode(snapshot.stores, node_id) orelse return .absent;
     if (!storeUsableForRemoteWrites(store)) return .absent;
-    if (!nodeHasGroupPlacement(snapshot.placement_intents, group_id, node_id)) return .absent;
+    if (!nodeHasReadableGroupPlacement(snapshot.placement_intents, group_id, node_id)) return .absent;
     return .active;
 }
 
@@ -294,7 +295,7 @@ fn catalogBackedRouterNodeBaseUriForGroup(ptr: *anyopaque, alloc: std.mem.Alloca
     const router: *CatalogBackedGroupRouter = @ptrCast(@alignCast(ptr));
     var snapshot = try router.catalog.adminSnapshot();
     defer router.catalog.freeAdminSnapshot(&snapshot);
-    if (!nodeHasGroupPlacement(snapshot.placement_intents, group_id, node_id)) return null;
+    if (!nodeHasReadableGroupPlacement(snapshot.placement_intents, group_id, node_id)) return null;
     const store = storeForNode(snapshot.stores, node_id) orelse return null;
     if (!storeUsableForRemoteWrites(store)) return null;
     return try alloc.dupe(u8, store.api_url);
@@ -329,9 +330,10 @@ fn storeUsableForRemoteWrites(store: metadata_table_manager.StoreRecord) bool {
         store.api_url.len > 0;
 }
 
-fn nodeHasGroupPlacement(placements: []const raft_reconciler.PlacementIntent, group_id: u64, node_id: u64) bool {
+fn nodeHasReadableGroupPlacement(placements: []const raft_reconciler.PlacementIntent, group_id: u64, node_id: u64) bool {
     for (placements) |intent| {
-        if (intent.record.group_id == group_id and intent.record.local_node_id == node_id) return true;
+        if (intent.record.group_id != group_id or intent.record.local_node_id != node_id) continue;
+        return raft_reconciler.placementReadableWithPeers(placements, intent);
     }
     return false;
 }
@@ -530,6 +532,55 @@ test "catalog backed router routes metadata-owned writes to placement leader api
         .remote => |remote| {
             try std.testing.expectEqual(@as(u64, 2), remote.node_id);
             try std.testing.expectEqualStrings("http://node-2", remote.base_uri);
+        },
+    }
+}
+
+test "catalog backed router skips non-serving relocation placements" {
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{
+                    .{ .store_id = 10, .node_id = 1, .api_url = "http://node-1", .role = "data", .health_class = "healthy", .live = true },
+                    .{ .store_id = 20, .node_id = 2, .api_url = "http://node-2", .role = "data", .health_class = "healthy", .live = true },
+                })[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{
+                    .{ .store_id = 10, .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 }, .serving_state = .serving },
+                    .{ .store_id = 20, .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 }, .serving_state = .bootstrapping },
+                })[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast((&[_]metadata_reconciler.MergedGroupStatus{
+                    .{ .group_id = 77, .leader_known = true, .leader_store_id = 20 },
+                })[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var catalog_router = CatalogBackedGroupRouter.init(FakeCatalog.iface(), 0);
+    try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, catalog_router.router().nodeStatus(2, 77).?);
+    var route = (try resolveGroupRoute(std.testing.allocator, FakeCatalog.iface(), catalog_router.router(), 77, .prefer_leader)).?;
+    defer route.deinit(std.testing.allocator);
+    switch (route) {
+        .local => return error.TestExpectedRemoteServingRoute,
+        .remote => |remote| {
+            try std.testing.expectEqual(@as(u64, 1), remote.node_id);
+            try std.testing.expectEqualStrings("http://node-1", remote.base_uri);
         },
     }
 }

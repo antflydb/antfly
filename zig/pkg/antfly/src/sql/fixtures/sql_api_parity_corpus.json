@@ -24662,27 +24662,29 @@
     },
     {
       "name": "unsupported document sql non identity delete",
-      "family": "document_write",
+      "family": "unsupported_write",
       "summary": {
         "table_name": "docs"
       },
       "native_request_kind": "document_write_request",
-      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"document_write\",\"native_model\":\"document_write_request\",\"native_route\":\"document_write\",\"target_resource\":\"docs\",\"permission\":\"write\",\"diagnostic\":\"\",\"sql_plan\":\"document_write:table=docs:operation=non_identity_delete:producer=bounded_scan:producer_scan_rows=10000:producer_scan_bytes=8388608:producer_residual=1:template=delete\",\"execution_plan\":\"\"}",
-      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=document_write:model=document_write_request:route=document_write:target=docs:permission=write:diagnostic=:plan=document_write:table=docs:operation=non_identity_delete:producer=bounded_scan:producer_scan_rows=10000:producer_scan_bytes=8388608:producer_residual=1:template=delete:execution=",
-      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=document_write:model=document_write_request:route=document_write:target=docs:permission=write:diagnostic=:plan=document_write:table=docs:operation=non_identity_delete:producer=bounded_scan:producer_scan_rows=10000:producer_scan_bytes=8388608:producer_residual=1:template=delete:execution=",
+      "native_request_json": "{\"classification\":\"unsupported\",\"surface\":\"document_write\",\"native_model\":\"document_write_request\",\"native_route\":\"unsupported\",\"target_resource\":\"docs\",\"permission\":\"none\",\"diagnostic\":\"document_sql_write_unsupported\",\"sql_plan\":\"unsupported:write:requires=document_sql_write_unsupported\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=unsupported:surface=document_write:model=document_write_request:route=unsupported:target=docs:permission=none:diagnostic=document_sql_write_unsupported:plan=unsupported:write:requires=document_sql_write_unsupported:execution=",
+      "native_fingerprint": "native_equivalence:class=unsupported:surface=document_write:model=document_write_request:route=unsupported:target=docs:permission=none:diagnostic=document_sql_write_unsupported:plan=unsupported:write:requires=document_sql_write_unsupported:execution=",
       "native_equivalence": {
-        "classification": "native_equivalent",
+        "classification": "unsupported",
         "surface": "document_write",
         "native_model": "document_write_request",
-        "native_route": "document_write",
+        "native_route": "unsupported",
         "target_resource": "docs",
-        "auth_resource": "table",
-        "permission": "write",
-        "audit_action": "mutate_documents",
+        "auth_resource": "none",
+        "permission": "none",
+        "audit_action": "reject",
         "row_filter": "preserved",
-        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=document_write:model=document_write_request:route=document_write:target=docs:permission=write:diagnostic=:plan=document_write:table=docs:operation=non_identity_delete:producer=bounded_scan:producer_scan_rows=10000:producer_scan_bytes=8388608:producer_residual=1:template=delete:execution="
+        "request_fingerprint": "native_equivalence:class=unsupported:surface=document_write:model=document_write_request:route=unsupported:target=docs:permission=none:diagnostic=document_sql_write_unsupported:plan=unsupported:write:requires=document_sql_write_unsupported:execution=",
+        "diagnostic": "document_sql_write_unsupported"
       },
-      "plan": "document_write:table=docs:operation=non_identity_delete:producer=bounded_scan:producer_scan_rows=10000:producer_scan_bytes=8388608:producer_residual=1:template=delete",
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
       "sql": "DELETE FROM docs WHERE status = 'draft' AND lower(title) = 'launch'"
     },

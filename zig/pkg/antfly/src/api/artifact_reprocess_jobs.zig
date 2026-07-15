@@ -66,6 +66,7 @@ pub const StartRequest = struct {
 
 pub const JobState = struct {
     job_id: u64,
+    attempt_id: u64 = 0,
     table_name: []const u8,
     artifact_name: []const u8,
     phase: []const u8,
@@ -82,6 +83,7 @@ pub const JobState = struct {
     failures: []const db_mod.types.DocumentArtifactReprocessFailure = &.{},
     shard_cursors: []const db_mod.types.DocumentArtifactReprocessShardCursor = &.{},
     last_error: ?[]const u8 = null,
+    cancel_requested: bool = false,
     created_at_millis: u64,
     last_updated_at_millis: u64,
     expires_at_millis: u64,
@@ -141,6 +143,7 @@ pub const Store = struct {
         const reserved = self.reserveJobId();
         const encoded = try encodeState(alloc, .{
             .job_id = reserved.job_id,
+            .attempt_id = 0,
             .table_name = table_name,
             .artifact_name = artifact_name,
             .phase = phaseString(.queued),
@@ -148,6 +151,7 @@ pub const Store = struct {
             .from_key = req.from_key,
             .to_key = req.to_key,
             .limit = if (req.limit == 0) 100 else req.limit,
+            .cancel_requested = false,
             .created_at_millis = now_ms,
             .last_updated_at_millis = now_ms,
             .expires_at_millis = now_ms + self.retentionMillis(),
@@ -191,9 +195,12 @@ pub const Store = struct {
         if (!jobStateTransitionTokenMatches(parsed_current.value, previous)) {
             return try alloc.dupe(u8, current_encoded);
         }
+        const current = parsed_current.value;
+        const cancel_requested = phase == .cancelled or previous.cancel_requested or current.cancel_requested;
 
         const encoded = try encodeState(alloc, .{
             .job_id = previous.job_id,
+            .attempt_id = previous.attempt_id,
             .table_name = previous.table_name,
             .artifact_name = previous.artifact_name,
             .phase = phaseString(phase),
@@ -209,7 +216,8 @@ pub const Store = struct {
             .pending_shards = previous.pending_shards,
             .failures = previous.failures,
             .shard_cursors = previous.shard_cursors,
-            .last_error = last_error,
+            .last_error = if (cancel_requested) "cancel_requested" else last_error,
+            .cancel_requested = cancel_requested,
             .created_at_millis = previous.created_at_millis,
             .last_updated_at_millis = now_ms,
             .expires_at_millis = now_ms + self.retentionMillis(),
@@ -242,13 +250,17 @@ pub const Store = struct {
         if (!jobStateTransitionTokenMatches(parsed_current.value, previous)) {
             return try alloc.dupe(u8, current_encoded);
         }
+        const current = parsed_current.value;
+        const cancel_requested = previous.cancel_requested or current.cancel_requested;
+        const final_phase: JobPhase = if (cancel_requested) .cancelled else phase;
 
         const encoded = try encodeState(alloc, .{
             .job_id = previous.job_id,
+            .attempt_id = previous.attempt_id,
             .table_name = previous.table_name,
             .artifact_name = previous.artifact_name,
-            .phase = phaseString(phase),
-            .reprocess_status = reprocessStatusForPhase(phase, pending_shards),
+            .phase = phaseString(final_phase),
+            .reprocess_status = reprocessStatusForPhase(final_phase, pending_shards),
             .from_key = previous.from_key,
             .to_key = previous.to_key,
             .limit = pass.limit,
@@ -260,6 +272,8 @@ pub const Store = struct {
             .pending_shards = pending_shards,
             .failures = pass.failures,
             .shard_cursors = pass.shard_cursors,
+            .last_error = if (cancel_requested) "cancel_requested" else null,
+            .cancel_requested = cancel_requested,
             .created_at_millis = previous.created_at_millis,
             .last_updated_at_millis = now_ms,
             .expires_at_millis = now_ms + self.retentionMillis(),
@@ -282,7 +296,10 @@ pub const Store = struct {
             return .{ .encoded = try alloc.dupe(u8, current_encoded), .started = false };
         }
         const is_running = std.mem.eql(u8, current.phase, phaseString(.running));
-        const running_expired = is_running and now_ms > current.last_updated_at_millis +| running_lease_timeout_ms;
+        const running_expired = is_running and leaseExpired(now_ms, current.last_updated_at_millis, running_lease_timeout_ms);
+        if (current.cancel_requested and (!is_running or running_expired)) {
+            return .{ .encoded = try self.encodeCancelledCurrentLocked(alloc, current, now_ms), .started = false };
+        }
         if (is_running and !running_expired) {
             return .{ .encoded = try alloc.dupe(u8, current_encoded), .started = false };
         }
@@ -292,6 +309,7 @@ pub const Store = struct {
 
         const encoded = try encodeState(alloc, .{
             .job_id = current.job_id,
+            .attempt_id = current.attempt_id +| 1,
             .table_name = current.table_name,
             .artifact_name = current.artifact_name,
             .phase = phaseString(.running),
@@ -307,6 +325,8 @@ pub const Store = struct {
             .pending_shards = current.pending_shards,
             .failures = current.failures,
             .shard_cursors = current.shard_cursors,
+            .last_error = current.last_error,
+            .cancel_requested = false,
             .created_at_millis = current.created_at_millis,
             .last_updated_at_millis = now_ms,
             .expires_at_millis = now_ms + self.retentionMillis(),
@@ -314,6 +334,49 @@ pub const Store = struct {
         errdefer alloc.free(encoded);
         try self.storeEncodedLocked(current.job_id, encoded, null);
         return .{ .encoded = encoded, .started = true };
+    }
+
+    pub fn requestCancel(self: *Store, alloc: std.mem.Allocator, expected: JobState) ![]u8 {
+        const now_ms = nowMillis();
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const current_encoded = (try self.loadJobLocked(expected.job_id)) orelse return error.NotFound;
+        var parsed_current = try std.json.parseFromSlice(JobState, self.alloc, current_encoded, .{ .ignore_unknown_fields = true });
+        defer parsed_current.deinit();
+        const current = parsed_current.value;
+        if (isTerminalPhase(current.phase)) return try alloc.dupe(u8, current_encoded);
+        if (!std.mem.eql(u8, current.table_name, expected.table_name) or !std.mem.eql(u8, current.artifact_name, expected.artifact_name)) return error.NotFound;
+        if (current.cancel_requested) return try alloc.dupe(u8, current_encoded);
+
+        const phase: JobPhase = if (std.mem.eql(u8, current.phase, phaseString(.running))) .running else .cancelled;
+        const encoded = try encodeState(alloc, .{
+            .job_id = current.job_id,
+            .attempt_id = current.attempt_id,
+            .table_name = current.table_name,
+            .artifact_name = current.artifact_name,
+            .phase = phaseString(phase),
+            .reprocess_status = reprocessStatusForPhase(phase, current.pending_shards),
+            .from_key = current.from_key,
+            .to_key = current.to_key,
+            .limit = current.limit,
+            .next_key = current.next_key,
+            .scanned = current.scanned,
+            .reprocessed = current.reprocessed,
+            .skipped = current.skipped,
+            .failed = current.failed,
+            .pending_shards = current.pending_shards,
+            .failures = current.failures,
+            .shard_cursors = current.shard_cursors,
+            .last_error = "cancel_requested",
+            .cancel_requested = true,
+            .created_at_millis = current.created_at_millis,
+            .last_updated_at_millis = now_ms,
+            .expires_at_millis = now_ms + self.retentionMillis(),
+        });
+        errdefer alloc.free(encoded);
+        try self.storeEncodedLocked(current.job_id, encoded, null);
+        return encoded;
     }
 
     pub fn cleanupExpiredJobs(self: *Store) void {
@@ -380,7 +443,8 @@ pub const Store = struct {
             const key = try jobKey(self.alloc, job_id);
             defer self.alloc.free(key);
             if (next_job_id) |next| {
-                const next_raw = try encodeNextJobId(self.alloc, next);
+                const durable_next = @max(next, self.next_job_id);
+                const next_raw = try encodeNextJobId(self.alloc, durable_next);
                 defer self.alloc.free(next_raw);
                 const writes = [_]docstore_mod.KVPair{
                     .{ .key = key, .value = encoded },
@@ -415,8 +479,40 @@ pub const Store = struct {
         for (results) |kv| {
             var parsed = std.json.parseFromSlice(JobState, self.alloc, kv.value, .{ .ignore_unknown_fields = true }) catch continue;
             defer parsed.deinit();
-            const cached = try self.alloc.dupe(u8, kv.value);
+            const now_ms = nowMillis();
+            const cached = if (std.mem.eql(u8, parsed.value.phase, phaseString(.running))) blk: {
+                const recovered_phase: JobPhase = if (parsed.value.cancel_requested) .cancelled else .queued;
+                break :blk try encodeState(self.alloc, .{
+                    .job_id = parsed.value.job_id,
+                    .attempt_id = parsed.value.attempt_id,
+                    .table_name = parsed.value.table_name,
+                    .artifact_name = parsed.value.artifact_name,
+                    .phase = phaseString(recovered_phase),
+                    .reprocess_status = reprocessStatusForPhase(recovered_phase, parsed.value.pending_shards),
+                    .from_key = parsed.value.from_key,
+                    .to_key = parsed.value.to_key,
+                    .limit = parsed.value.limit,
+                    .next_key = parsed.value.next_key,
+                    .scanned = parsed.value.scanned,
+                    .reprocessed = parsed.value.reprocessed,
+                    .skipped = parsed.value.skipped,
+                    .failed = parsed.value.failed,
+                    .pending_shards = parsed.value.pending_shards,
+                    .failures = parsed.value.failures,
+                    .shard_cursors = parsed.value.shard_cursors,
+                    .last_error = if (parsed.value.cancel_requested) "cancel_requested" else "recovered_interrupted_attempt",
+                    .cancel_requested = parsed.value.cancel_requested,
+                    .created_at_millis = parsed.value.created_at_millis,
+                    .last_updated_at_millis = now_ms,
+                    .expires_at_millis = now_ms + self.retentionMillis(),
+                });
+            } else try self.alloc.dupe(u8, kv.value);
             errdefer self.alloc.free(cached);
+            if (std.mem.eql(u8, parsed.value.phase, phaseString(.running))) {
+                const key = try jobKey(self.alloc, parsed.value.job_id);
+                defer self.alloc.free(key);
+                try opened.docstore.put(key, cached);
+            }
             if (try self.jobs.fetchPut(self.alloc, parsed.value.job_id, cached)) |old| self.alloc.free(old.value);
             recovered_max_job_id = @max(recovered_max_job_id, parsed.value.job_id);
         }
@@ -427,6 +523,36 @@ pub const Store = struct {
         self.next_job_id = @max(self.next_job_id, recovered_next_job_id);
         try persistNextJobId(opened.docstore, self.alloc, self.next_job_id);
     }
+
+    fn encodeCancelledCurrentLocked(self: *Store, alloc: std.mem.Allocator, current: JobState, now_ms: u64) ![]u8 {
+        const encoded = try encodeState(alloc, .{
+            .job_id = current.job_id,
+            .attempt_id = current.attempt_id,
+            .table_name = current.table_name,
+            .artifact_name = current.artifact_name,
+            .phase = phaseString(.cancelled),
+            .reprocess_status = reprocessStatusForPhase(.cancelled, current.pending_shards),
+            .from_key = current.from_key,
+            .to_key = current.to_key,
+            .limit = current.limit,
+            .next_key = current.next_key,
+            .scanned = current.scanned,
+            .reprocessed = current.reprocessed,
+            .skipped = current.skipped,
+            .failed = current.failed,
+            .pending_shards = current.pending_shards,
+            .failures = current.failures,
+            .shard_cursors = current.shard_cursors,
+            .last_error = "cancel_requested",
+            .cancel_requested = true,
+            .created_at_millis = current.created_at_millis,
+            .last_updated_at_millis = now_ms,
+            .expires_at_millis = now_ms + self.retentionMillis(),
+        });
+        errdefer alloc.free(encoded);
+        try self.storeEncodedLocked(current.job_id, encoded, null);
+        return encoded;
+    }
 };
 
 const running_lease_timeout_ms: u64 = 300_000;
@@ -434,7 +560,7 @@ const running_lease_timeout_ms: u64 = 300_000;
 fn jobStateTransitionTokenMatches(current: JobState, expected: JobState) bool {
     return current.job_id == expected.job_id and
         std.mem.eql(u8, current.phase, expected.phase) and
-        current.last_updated_at_millis == expected.last_updated_at_millis;
+        current.attempt_id == expected.attempt_id;
 }
 
 pub fn encodeState(alloc: std.mem.Allocator, state: JobState) ![]u8 {
@@ -466,7 +592,12 @@ pub fn reprocessStatusForPhase(phase: JobPhase, pending_shards: usize) []const u
 }
 
 pub fn nowMillis() u64 {
-    return @divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms);
+    return @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+}
+
+fn leaseExpired(now_ms: u64, last_updated_ms: u64, timeout_ms: u64) bool {
+    if (now_ms < last_updated_ms) return false;
+    return now_ms >= last_updated_ms +| timeout_ms;
 }
 
 fn jobKey(alloc: std.mem.Allocator, job_id: u64) ![]u8 {
@@ -610,6 +741,88 @@ test "artifact reprocess job store recovers durable jobs and reseeds ids" {
         defer parsed_first.deinit();
         try std.testing.expectEqual(@as(u64, 1), parsed_first.value.job_id);
         try std.testing.expectEqualStrings("queued", parsed_first.value.phase);
+    }
+}
+
+test "artifact reprocess job store persists monotonic next id across stale durable writes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/artifact-reprocess-jobs-monotonic-next-id", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    {
+        const opened = try alloc.create(OpenedStore);
+        errdefer alloc.destroy(opened);
+        opened.* = try OpenedStore.open(alloc, path);
+        var store = Store.init(alloc, .{});
+        defer store.deinit();
+        try store.attachOpenedStore(opened);
+
+        const first = store.reserveJobId();
+        const second = store.reserveJobId();
+        try std.testing.expectEqual(@as(u64, 1), first.job_id);
+        try std.testing.expectEqual(@as(u64, 2), second.job_id);
+
+        const now_ms = nowMillis();
+        const encoded_second = try encodeState(alloc, .{
+            .job_id = second.job_id,
+            .table_name = "docs",
+            .artifact_name = "document_units_v1",
+            .phase = phaseString(.queued),
+            .reprocess_status = "in_progress",
+            .from_key = "",
+            .to_key = "",
+            .limit = 1,
+            .created_at_millis = now_ms,
+            .last_updated_at_millis = now_ms,
+            .expires_at_millis = now_ms + store.retentionMillis(),
+        });
+        defer alloc.free(encoded_second);
+        try store.storeEncoded(second.job_id, encoded_second, second.next_job_id);
+
+        const encoded_first = try encodeState(alloc, .{
+            .job_id = first.job_id,
+            .table_name = "docs",
+            .artifact_name = "document_units_v1",
+            .phase = phaseString(.queued),
+            .reprocess_status = "in_progress",
+            .from_key = "",
+            .to_key = "",
+            .limit = 1,
+            .created_at_millis = now_ms,
+            .last_updated_at_millis = now_ms,
+            .expires_at_millis = now_ms + store.retentionMillis(),
+        });
+        defer alloc.free(encoded_first);
+        try store.storeEncoded(first.job_id, encoded_first, first.next_job_id);
+    }
+
+    {
+        const opened = try alloc.create(OpenedStore);
+        errdefer alloc.destroy(opened);
+        opened.* = try OpenedStore.open(alloc, path);
+        var store = Store.init(alloc, .{});
+        defer store.deinit();
+        try store.attachOpenedStore(opened);
+
+        const third = try store.startJob(alloc, "docs", "document_units_v1", .{ .limit = 1 });
+        defer alloc.free(third);
+        var parsed_third = try std.json.parseFromSlice(JobState, alloc, third, .{ .ignore_unknown_fields = true });
+        defer parsed_third.deinit();
+        try std.testing.expectEqual(@as(u64, 3), parsed_third.value.job_id);
+
+        const first = (try store.loadJobAlloc(alloc, 1)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(first);
+        var parsed_first = try std.json.parseFromSlice(JobState, alloc, first, .{ .ignore_unknown_fields = true });
+        defer parsed_first.deinit();
+        try std.testing.expectEqual(@as(u64, 1), parsed_first.value.job_id);
+
+        const second = (try store.loadJobAlloc(alloc, 2)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(second);
+        var parsed_second = try std.json.parseFromSlice(JobState, alloc, second, .{ .ignore_unknown_fields = true });
+        defer parsed_second.deinit();
+        try std.testing.expectEqual(@as(u64, 2), parsed_second.value.job_id);
     }
 }
 

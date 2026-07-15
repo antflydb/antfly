@@ -4,6 +4,7 @@
     {
       "name": "explain write kind suffix does not satisfy write assertions",
       "entry": {
+        "name": "explain write kind suffix synthetic entry",
         "family": "explain",
         "summary": { "returning": 1 },
         "plan": "explain:kind=write_extra:analyze=false:inner=insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0",
@@ -18,6 +19,7 @@
     {
       "name": "duplicate explain inner token does not satisfy write inner assertion",
       "entry": {
+        "name": "duplicate explain inner token synthetic entry",
         "family": "explain",
         "summary": { "returning": 1 },
         "plan": "explain:kind=write:analyze=false:inner=insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0:inner=update_source:table=usage_records",
@@ -30,6 +32,7 @@
     {
       "name": "explain read kind suffix does not satisfy read assertion",
       "entry": {
+        "name": "explain read kind suffix synthetic entry",
         "family": "explain",
         "plan": "explain:kind=read_extra:analyze=false:inner=read:query:query:table=usage_records:ctes=0:pred=0:select=1:order=0:limit=none:claim=none",
         "sql": "EXPLAIN SELECT id FROM usage_records"
@@ -41,6 +44,7 @@
     {
       "name": "stray read prefix does not satisfy wrapped read assertion",
       "entry": {
+        "name": "stray read prefix synthetic entry",
         "family": "explain",
         "plan": "explain:kind=read:analyze=false:detail=read:query:inner=read:join:join:type=inner:left=usage_records:right=customer_records:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=none",
         "sql": "EXPLAIN SELECT usage_records.id FROM usage_records JOIN customer_records ON customer_records.id = usage_records.customer_id"
@@ -52,6 +56,7 @@
     {
       "name": "explain option exact tokens are structured",
       "entry": {
+        "name": "explain option exact token synthetic entry",
         "family": "explain",
         "plan": "explain:kind=read:analyze=true_extra:inner=read:query:query:table=usage_records:format=:verbose=1:costs=0",
         "sql": "EXPLAIN SELECT id FROM usage_records"

@@ -26,13 +26,13 @@ import (
 
 func TestMergeIndexStats_FullText(t *testing.T) {
 	t.Run("sum numeric fields", func(t *testing.T) {
-		dst := FullTextIndexStats{TotalIndexed: 100, DiskUsage: 500}.AsIndexStats()
-		src := FullTextIndexStats{TotalIndexed: 200, DiskUsage: 300}.AsIndexStats()
+		dst := FullTextIndexStats{TotalIndexed: 100, DocCount: 100}.AsIndexStats()
+		src := FullTextIndexStats{TotalIndexed: 200, DocCount: 200}.AsIndexStats()
 		MergeIndexStats(&dst, src)
 		got, err := dst.AsFullTextIndexStats()
 		assert.NoError(t, err)
 		assert.Equal(t, uint64(300), got.TotalIndexed)
-		assert.Equal(t, uint64(800), got.DiskUsage)
+		assert.Equal(t, uint64(300), got.DocCount)
 	})
 
 	t.Run("OR rebuilding", func(t *testing.T) {
@@ -61,12 +61,13 @@ func TestMergeIndexStats_FullText(t *testing.T) {
 		assert.Equal(t, 0.3, got.BackfillProgress)
 	})
 
-	t.Run("sum backfill items processed", func(t *testing.T) {
-		dst := FullTextIndexStats{BackfillItemsProcessed: 100}.AsIndexStats()
-		src := FullTextIndexStats{BackfillItemsProcessed: 200}.AsIndexStats()
+	t.Run("OR backfill active", func(t *testing.T) {
+		dst := FullTextIndexStats{BackfillActive: false}.AsIndexStats()
+		src := FullTextIndexStats{BackfillActive: true, BackfillProgress: 0.2}.AsIndexStats()
 		MergeIndexStats(&dst, src)
 		got, _ := dst.AsFullTextIndexStats()
-		assert.Equal(t, uint64(300), got.BackfillItemsProcessed)
+		assert.True(t, got.BackfillActive)
+		assert.Equal(t, 0.2, got.BackfillProgress)
 	})
 
 	t.Run("concatenate errors", func(t *testing.T) {
@@ -89,12 +90,13 @@ func TestMergeIndexStats_FullText(t *testing.T) {
 
 func TestMergeIndexStats_Embeddings(t *testing.T) {
 	t.Run("sum numeric fields", func(t *testing.T) {
-		dst := EmbeddingsIndexStats{TotalIndexed: 10, WalBacklog: 5}.AsIndexStats()
-		src := EmbeddingsIndexStats{TotalIndexed: 20, WalBacklog: 3}.AsIndexStats()
+		dst := EmbeddingsIndexStats{TotalIndexed: 10, DocCount: 10, QueryVisibleDocCount: 8}.AsIndexStats()
+		src := EmbeddingsIndexStats{TotalIndexed: 20, DocCount: 20, QueryVisibleDocCount: 18}.AsIndexStats()
 		MergeIndexStats(&dst, src)
 		got, _ := dst.AsEmbeddingsIndexStats()
 		assert.Equal(t, uint64(30), got.TotalIndexed)
-		assert.Equal(t, uint64(8), got.WalBacklog)
+		assert.Equal(t, uint64(30), got.DocCount)
+		assert.Equal(t, uint64(26), got.QueryVisibleDocCount)
 	})
 
 	t.Run("min progress only among rebuilding shards", func(t *testing.T) {
@@ -232,7 +234,7 @@ func TestMergeIndexStats_Algebraic(t *testing.T) {
 	t.Run("sum public counters", func(t *testing.T) {
 		dst := AlgebraicIndexStats{
 			TotalIndexed:          10,
-			DiskUsage:             100,
+			DocCount:              10,
 			PlannerSelected:       2,
 			PlannerFallbackCount:  1,
 			AdaptiveProgressCount: 3,
@@ -240,7 +242,7 @@ func TestMergeIndexStats_Algebraic(t *testing.T) {
 		}.AsIndexStats()
 		src := AlgebraicIndexStats{
 			TotalIndexed:          20,
-			DiskUsage:             300,
+			DocCount:              20,
 			PlannerSelected:       4,
 			PlannerFallbackCount:  5,
 			AdaptiveProgressCount: 6,
@@ -250,7 +252,7 @@ func TestMergeIndexStats_Algebraic(t *testing.T) {
 		got, err := dst.AsAlgebraicIndexStats()
 		assert.NoError(t, err)
 		assert.Equal(t, uint64(30), got.TotalIndexed)
-		assert.Equal(t, uint64(400), got.DiskUsage)
+		assert.Equal(t, uint64(30), got.DocCount)
 		assert.Equal(t, uint64(6), got.PlannerSelected)
 		assert.Equal(t, uint64(6), got.PlannerFallbackCount)
 		assert.Equal(t, uint64(9), got.AdaptiveProgressCount)
@@ -303,8 +305,8 @@ func TestMergeIndexStats_EmptySrc(t *testing.T) {
 
 func TestMergeIndexStats_TypeMismatch(t *testing.T) {
 	dst := FullTextIndexStats{TotalIndexed: 42}.AsIndexStats()
-	// Use WalBacklog to make this distinguishable as embeddings type
-	src := EmbeddingsIndexStats{TotalIndexed: 10, WalBacklog: 1}.AsIndexStats()
+	// Use a vector-specific field to make this distinguishable as embeddings type.
+	src := EmbeddingsIndexStats{TotalIndexed: 10, DensePublishPending: true}.AsIndexStats()
 	// Should not panic, just warn
 	MergeIndexStats(&dst, src)
 	// dst should be unchanged
@@ -440,8 +442,8 @@ func TestGraphIndexStats(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, uint64(42), gs.TotalEdges) // 30 + 12
 	assert.True(t, gs.Rebuilding)
+	assert.True(t, gs.BackfillActive)
 	assert.Equal(t, 0.7, gs.BackfillProgress)
-	assert.Equal(t, uint64(100), gs.BackfillItemsProcessed)
 	assert.NotNil(t, gs.EdgeTypes)
 	assert.Equal(t, uint64(30), (*gs.EdgeTypes)["parent"])
 	assert.Equal(t, uint64(12), (*gs.EdgeTypes)["child"])

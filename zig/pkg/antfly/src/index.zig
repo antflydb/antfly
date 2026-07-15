@@ -211,6 +211,14 @@ const LiveDocCollector = struct {
         self.base.markLowerBound();
     }
 
+    pub fn markSkippedLowerBound(self: *LiveDocCollector) void {
+        if (self.deleted != null) {
+            self.base.markLowerBound();
+        } else {
+            self.base.markSkippedLowerBound();
+        }
+    }
+
     pub fn collect(self: *LiveDocCollector, hit: scorer_mod.ScoredHit) !void {
         if (self.deleted) |deleted| {
             if (deleted.contains(hit.doc_id - self.doc_offset)) return;

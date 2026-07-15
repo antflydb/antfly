@@ -476,7 +476,9 @@ fn effectiveK(request: SearchRequest, snap: *const index_mod.IndexSnapshot) u32 
         // Retrieve all matching results so cursor filtering works correctly
         return snap.global_doc_count;
     }
-    return request.k + request.offset;
+    if (request.k == 0) return 0;
+    const requested_end = request.k +| request.offset;
+    return @min(snap.global_doc_count, requested_end +| 1);
 }
 
 /// Execute a search request against an index snapshot.
@@ -1239,6 +1241,37 @@ fn subtractScoresFromHits(alloc: Allocator, map: *ScoreMap, hits: []const scorer
     }
 }
 
+fn requestHasDocNumConstraints(request: SearchRequest) bool {
+    return request.filter_doc_nums_positive or request.exclude_doc_nums.len > 0;
+}
+
+fn requestAllowsDocNum(request: SearchRequest, doc_id: u32) bool {
+    if (request.filter_doc_nums_positive and !containsSortedU32(request.filter_doc_nums, doc_id)) return false;
+    if (containsSortedU32(request.exclude_doc_nums, doc_id)) return false;
+    return true;
+}
+
+fn applyDocNumConstraintsToScoreMap(
+    alloc: Allocator,
+    map: *ScoreMap,
+    request: SearchRequest,
+) !void {
+    if (!requestHasDocNumConstraints(request)) return;
+
+    var to_remove = std.ArrayListUnmanaged(u32).empty;
+    defer to_remove.deinit(alloc);
+
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        if (!requestAllowsDocNum(request, entry.key_ptr.*)) {
+            try to_remove.append(alloc, entry.key_ptr.*);
+        }
+    }
+    for (to_remove.items) |doc_id| {
+        _ = map.remove(doc_id);
+    }
+}
+
 fn scoreMapToSortedHits(alloc: Allocator, map: ScoreMap, boost: f32) ![]scorer_mod.ScoredHit {
     var hits = try alloc.alloc(scorer_mod.ScoredHit, map.count());
     errdefer alloc.free(hits);
@@ -1747,6 +1780,8 @@ fn executeBool(
         defer alloc.free(sub_hits);
         try subtractScoresFromHits(alloc, &combined, sub_hits);
     }
+
+    try applyDocNumConstraintsToScoreMap(alloc, &combined, request);
 
     const all_scored = try scoreMapToSortedHits(alloc, combined, bq.boost);
     defer alloc.free(all_scored);
@@ -2334,6 +2369,10 @@ fn buildResult(
     const start = @min(request.offset, total);
     const end = @min(start + request.k, total);
     const result_slice = after_cursor[start..end];
+    const reported_total = if (total_relation == .gte and request.k > 0 and result_slice.len == request.k)
+        @max(total_count, request.offset +| request.k +| 1)
+    else
+        total_count;
 
     var hits = try alloc.alloc(ScoredHit, result_slice.len);
     errdefer alloc.free(hits);
@@ -2365,7 +2404,7 @@ fn buildResult(
         result_cursor = .{ .score = last.score, .doc_id = last.doc_id };
     }
 
-    return .{ .alloc = alloc, .hits = hits, .total_hits = total_count, .total_hits_relation = total_relation, .aggregations = agg_results, .cursor = result_cursor };
+    return .{ .alloc = alloc, .hits = hits, .total_hits = reported_total, .total_hits_relation = total_relation, .aggregations = agg_results, .cursor = result_cursor };
 }
 
 /// Collect aggregation results by reading typed doc values for each matching doc.
@@ -2918,6 +2957,59 @@ test "search term query" {
     try std.testing.expect(result.hits[0].id != null);
 }
 
+test "bool fallback applies native doc number constraints" {
+    const alloc = std.testing.allocator;
+
+    const seg_bytes = try buildTestSegmentWithStoredDocs(alloc, &.{
+        .{ .id = "doc1", .data = "{\"title\":\"hello one\"}", .terms = &.{
+            .{ .term = "hello", .freq = 1, .norm = 10 },
+        } },
+        .{ .id = "doc2", .data = "{\"title\":\"hello two\"}", .terms = &.{
+            .{ .term = "hello", .freq = 1, .norm = 10 },
+        } },
+        .{ .id = "doc3", .data = "{\"title\":\"hello three\"}", .terms = &.{
+            .{ .term = "hello", .freq = 1, .norm = 10 },
+        } },
+    });
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+
+    const stats_terms = [_]distributed_stats_mod.TermDocFreq{
+        .{ .term = "hello", .doc_freq = 3 },
+    };
+    const distributed_stats = [_]distributed_stats_mod.TextFieldStats{
+        .{
+            .field = "title",
+            .global_doc_count = 3,
+            .global_total_field_len = 30,
+            .term_doc_freqs = &stats_terms,
+        },
+    };
+    const include_doc_nums = [_]u32{ 0, 2 };
+    const exclude_doc_nums = [_]u32{2};
+
+    const snap = writer.snapshot();
+    var result = try execute(alloc, snap, .{
+        .query = .{ .bool_query = .{
+            .must = &.{.{ .term = .{ .field = "title", .term = "hello" } }},
+        } },
+        .k = 10,
+        .distributed_text_stats = &distributed_stats,
+        .filter_doc_nums = &include_doc_nums,
+        .filter_doc_nums_positive = true,
+        .exclude_doc_nums = &exclude_doc_nums,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 0), result.hits[0].doc_id);
+    try std.testing.expectEqualStrings("doc1", result.hits[0].id.?);
+}
+
 test "search match query with analysis" {
     const alloc = std.testing.allocator;
 
@@ -3111,6 +3203,49 @@ test "search bool should-only query" {
 
     try std.testing.expectEqual(@as(u32, 2), result.total_hits);
     try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+}
+
+test "search bool query general path respects doc number constraints" {
+    const alloc = std.testing.allocator;
+
+    const seg_bytes = try buildTestSegmentWithStoredDocs(alloc, &.{
+        .{ .id = "doc1", .data = "{}", .terms = &.{
+            .{ .term = "alpha", .freq = 1, .norm = 10 },
+        } },
+        .{ .id = "doc2", .data = "{}", .terms = &.{
+            .{ .term = "alpha", .freq = 1, .norm = 10 },
+        } },
+        .{ .id = "doc3", .data = "{}", .terms = &.{
+            .{ .term = "alpha", .freq = 1, .norm = 10 },
+            .{ .term = "blocked", .freq = 1, .norm = 10 },
+        } },
+    });
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+
+    const snap = writer.snapshot();
+    const filter_doc_nums = [_]u32{ 0, 1, 2 };
+    const exclude_doc_nums = [_]u32{0};
+
+    var result = try execute(alloc, snap, .{
+        .query = .{ .bool_query = .{
+            .must = &.{.{ .term = .{ .field = "title", .term = "alpha" } }},
+            .must_not = &.{.{ .prefix = .{ .field = "title", .prefix = "blo" } }},
+        } },
+        .k = 10,
+        .filter_doc_nums = &filter_doc_nums,
+        .filter_doc_nums_positive = true,
+        .exclude_doc_nums = &exclude_doc_nums,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 1), result.hits[0].doc_id);
+    try std.testing.expectEqualStrings("doc2", result.hits[0].id.?);
 }
 
 test "count candidate scan matches empty analyzed query semantics" {

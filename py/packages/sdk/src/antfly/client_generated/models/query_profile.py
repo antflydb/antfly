@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from ..models.merge_profile import MergeProfile
     from ..models.reranker_profile import RerankerProfile
     from ..models.shards_profile import ShardsProfile
+    from ..models.sort_profile import SortProfile
 
 
 T = TypeVar("T", bound="QueryProfile")
@@ -31,6 +32,12 @@ class QueryProfile:
             merge (MergeProfile | Unset): Result merge statistics for hybrid search.
             graph_metrics (list[GraphMetricProfile] | Unset): Graph metric freshness and generation details for metric-aware
                 query work.
+            sort (SortProfile | Unset): Sort execution profile. These fields are the stable public diagnostic
+                surface. Low-level implementation counters such as doc-value load
+                timings, stored-source loads, collector/window internals, cost-model
+                inputs, native-filter modes, and index-sort availability flags are kept
+                out of normal SDK-facing query responses and may appear only in
+                internal debug logs or explicit debug surfaces.
     """
 
     shards: ShardsProfile | Unset = UNSET
@@ -38,6 +45,7 @@ class QueryProfile:
     reranker: RerankerProfile | Unset = UNSET
     merge: MergeProfile | Unset = UNSET
     graph_metrics: list[GraphMetricProfile] | Unset = UNSET
+    sort: SortProfile | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -64,6 +72,10 @@ class QueryProfile:
                 graph_metrics_item = graph_metrics_item_data.to_dict()
                 graph_metrics.append(graph_metrics_item)
 
+        sort: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.sort, Unset):
+            sort = self.sort.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -77,6 +89,8 @@ class QueryProfile:
             field_dict["merge"] = merge
         if graph_metrics is not UNSET:
             field_dict["graph_metrics"] = graph_metrics
+        if sort is not UNSET:
+            field_dict["sort"] = sort
 
         return field_dict
 
@@ -87,6 +101,7 @@ class QueryProfile:
         from ..models.merge_profile import MergeProfile
         from ..models.reranker_profile import RerankerProfile
         from ..models.shards_profile import ShardsProfile
+        from ..models.sort_profile import SortProfile
 
         d = dict(src_dict)
         _shards = d.pop("shards", UNSET)
@@ -126,12 +141,20 @@ class QueryProfile:
 
                 graph_metrics.append(graph_metrics_item)
 
+        _sort = d.pop("sort", UNSET)
+        sort: SortProfile | Unset
+        if isinstance(_sort, Unset):
+            sort = UNSET
+        else:
+            sort = SortProfile.from_dict(_sort)
+
         query_profile = cls(
             shards=shards,
             join=join,
             reranker=reranker,
             merge=merge,
             graph_metrics=graph_metrics,
+            sort=sort,
         )
 
         query_profile.additional_properties = d

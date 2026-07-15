@@ -280,6 +280,7 @@ fn collectJsonValuesAtPath(alloc: Allocator, value: std.json.Value, path: []cons
 
 fn jsonValuesContainTerm(values: []const std.json.Value, term: []const u8) bool {
     for (values) |value| switch (value) {
+        .array => |array| if (jsonValuesContainTerm(array.items, term)) return true,
         .string => |text| if (std.mem.eql(u8, text, term)) return true,
         .integer => |number| {
             var buf: [32]u8 = undefined;

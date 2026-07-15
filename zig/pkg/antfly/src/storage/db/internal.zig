@@ -649,9 +649,11 @@ pub fn waitForAtomicU8(flag: *const std.atomic.Value(u8), expected: u8, max_atte
 }
 
 pub const QueryVisibilityChange = enum {
+    status,
     invalidate,
     publish,
     publish_consistent,
+    publish_blocking,
 };
 
 pub const ReplayProgress = struct {
@@ -917,9 +919,11 @@ pub fn AsyncContext(comptime DB: type) type {
         alloc: Allocator,
         io: ?std.Io = null,
         store: *docstore_mod.DocStore,
+        snapshot_read_txn: ?*docstore_mod.DocStore.Txn = null,
         applied_sequence_checkpoint_path: ?[]const u8 = null,
         index_manager: *index_manager_mod.IndexManager,
         apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+        repair_sequence: u64 = 0,
         allow_graph_materialization: bool = true,
         require_graph_resolution_contract: bool = false,
         query_visibility_hook: ?QueryVisibilityHook(DB) = null,
@@ -931,11 +935,13 @@ pub fn AsyncContext(comptime DB: type) type {
         deferred_external_bulk_notify_sequence: AtomicU64 = AtomicU64.init(0),
         dense_bulk_session_scope: DenseBulkSessionScope = .auto,
         dense_maintenance_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
+        target_advance_repair_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
         text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime = null,
         sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime = null,
         relational_base_rows: bool = false,
         resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
         promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
+        repair_options: types.ArtifactRepairRunOptions = .{},
         applied_sequence_coalescer: AppliedSequenceCoalescer = .{},
         stats: AsyncContentionStats = .{},
 
@@ -944,8 +950,19 @@ pub fn AsyncContext(comptime DB: type) type {
             var maintenance_it = self.dense_maintenance_last_ns.iterator();
             while (maintenance_it.next()) |entry| alloc.free(@constCast(entry.key_ptr.*));
             self.dense_maintenance_last_ns.deinit(alloc);
+            var target_repair_it = self.target_advance_repair_last_ns.iterator();
+            while (target_repair_it.next()) |entry| alloc.free(@constCast(entry.key_ptr.*));
+            self.target_advance_repair_last_ns.deinit(alloc);
         }
     };
+}
+
+pub fn checkArtifactRepairCancelled(options: types.ArtifactRepairRunOptions) !void {
+    if (options.cancelled()) return error.Canceled;
+}
+
+pub fn checkAsyncRepairCancelled(ctx: anytype) !void {
+    try checkArtifactRepairCancelled(ctx.repair_options);
 }
 
 pub fn BatchExecutionContext(comptime DB: type) type {
@@ -1373,7 +1390,7 @@ pub fn resumeDeferredBackgroundMaintenanceIfIdle(ctx: anytype) void {
 pub fn deferExternalBulkExecutorNotification(ctx: anytype, sync_level: types.SyncLevel, sequence: u64) bool {
     switch (sync_level) {
         .propose, .write, .enrichments => {},
-        .full_text, .aknn, .full_index => return false,
+        .full_text, .full_index => return false,
     }
     if (ctx.active_external_dense_bulk_sessions.load(.acquire) == 0) return false;
     storeMaxAtomicU64(&ctx.deferred_external_bulk_notify_sequence, sequence);
@@ -1410,7 +1427,7 @@ pub fn notifyExecutorForSyncLevel(
 ) void {
     switch (sync_level) {
         .full_text => executor.notifyIndexes(sequence, sync_targets.full_text_indexes),
-        .propose, .write, .enrichments, .aknn, .full_index => executor.notifySequence(sequence),
+        .propose, .write, .enrichments, .full_index => executor.notifySequence(sequence),
     }
 }
 
@@ -1488,8 +1505,6 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
     try std.testing.expect(deferExternalBulkExecutorNotification(&ctx, .enrichments, 13));
     try std.testing.expectEqual(@as(u64, 13), ctx.deferred_external_bulk_notify_sequence.load(.monotonic));
     try std.testing.expect(!deferExternalBulkExecutorNotification(&ctx, .full_text, 17));
-    try std.testing.expectEqual(@as(u64, 13), ctx.deferred_external_bulk_notify_sequence.load(.monotonic));
-    try std.testing.expect(!deferExternalBulkExecutorNotification(&ctx, .aknn, 19));
     try std.testing.expectEqual(@as(u64, 13), ctx.deferred_external_bulk_notify_sequence.load(.monotonic));
     try std.testing.expect(!deferExternalBulkExecutorNotification(&ctx, .full_index, 23));
     try std.testing.expectEqual(@as(u64, 13), ctx.deferred_external_bulk_notify_sequence.load(.monotonic));

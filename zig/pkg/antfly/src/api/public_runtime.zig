@@ -50,7 +50,6 @@ pub const PublicApiSurface = struct {
     owns_api_server: bool = false,
     owned_metadata_read_source: ?*table_reads.HostedProvisionedTableReadSource = null,
     owned_metadata_write_source: ?*table_writes.HostedProvisionedTableWriteSource = null,
-    owned_metadata_forwarder: ?*MetadataPublicApiForwarder = null,
     pgwire_server: ?pgwire.Server = null,
 
     pub fn empty(alloc: std.mem.Allocator) PublicApiSurface {
@@ -96,12 +95,7 @@ pub const PublicApiSurface = struct {
         _ = write_source.withRemoteContent(cfg.api_server_cfg.remote_content);
         self.owned_metadata_write_source = write_source;
 
-        const forwarder = try alloc.create(MetadataPublicApiForwarder);
-        forwarder.* = .{ .svc = cfg.svc };
-        self.owned_metadata_forwarder = forwarder;
-
-        var api_server_cfg = cfg.api_server_cfg;
-        api_server_cfg.metadata_mutation_forwarder = forwarder.forwarder();
+        const api_server_cfg = cfg.api_server_cfg;
 
         const api_server = try alloc.create(ApiHttpServer);
         api_server.* = ApiHttpServer.init(
@@ -129,9 +123,6 @@ pub const PublicApiSurface = struct {
         }
         if (self.owned_metadata_write_source) |write_source| {
             self.alloc.destroy(write_source);
-        }
-        if (self.owned_metadata_forwarder) |forwarder| {
-            self.alloc.destroy(forwarder);
         }
         if (self.owned_metadata_read_source) |read_source| {
             self.alloc.destroy(read_source);
@@ -161,21 +152,5 @@ pub const PublicApiSurface = struct {
             .bind_port = cfg.bind_port,
             .backend = backend,
         });
-    }
-};
-
-const MetadataPublicApiForwarder = struct {
-    svc: *metadata_service.MetadataHttpService,
-
-    fn forwarder(self: *@This()) http_server.RequestForwarder {
-        return .{
-            .ptr = self,
-            .vtable = &.{ .forward = forward },
-        };
-    }
-
-    fn forward(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.svc.forwardMetadataLeaderRequest(alloc, req);
     }
 };
