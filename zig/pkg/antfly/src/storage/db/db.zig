@@ -132,8 +132,8 @@ const db_split_sim_fixture = @import("db_split_sim_fixture.zig");
 const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
     pub const sim = struct {};
 };
-const platform_clock = @import("../../platform/clock.zig");
-const platform_time = @import("../../platform/time.zig");
+const platform_clock = @import("antfly_platform").clock;
+const platform_time = @import("antfly_platform").time;
 const public_schema_json_key = "\x00\x00__metadata__:schema_json";
 const generated_embed_default_batch_items: usize = 8;
 const generated_embed_default_batch_bytes: usize = 256 * 1024;
@@ -29635,6 +29635,28 @@ fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.Deriv
     return true;
 }
 
+fn beginDenseBulkIngestSessionForAsyncCatchUp(ctx: *AsyncContext, index_ref: index_manager_mod.ManagedIndexRef) !void {
+    var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
+    defer index_apply_guard.unlock();
+    try ctx.index_manager.beginDenseBulkIngestSessionByName(index_ref.name);
+}
+
+fn finishDenseBulkIngestSessionForAsyncCatchUp(
+    ctx: *AsyncContext,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    options: backend_types.BulkIngestFinishOptions,
+) !void {
+    var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
+    defer index_apply_guard.unlock();
+    try ctx.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_ref.name, options);
+}
+
+fn abortDenseBulkIngestSessionForAsyncCatchUp(ctx: *AsyncContext, index_ref: index_manager_mod.ManagedIndexRef) void {
+    var index_apply_guard = ctx.index_manager.lockManagedIndexApply(index_ref) catch return;
+    defer index_apply_guard.unlock();
+    ctx.index_manager.abortDenseBulkIngestSessionByName(index_ref.name);
+}
+
 fn beginDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) !void {
     if (index_ref.kind != .dense_vector) return;
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
@@ -29642,8 +29664,8 @@ fn beginDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manager
 
     try beginDenseCatchUpSessionTracked(ctx, index_ref.name);
     errdefer finishDenseCatchUpSessionTracked(ctx, index_ref.name);
-    try ctx.index_manager.beginDenseBulkIngestSessionByName(index_ref.name);
-    errdefer ctx.index_manager.abortDenseBulkIngestSessionByName(index_ref.name);
+    try beginDenseBulkIngestSessionForAsyncCatchUp(ctx, index_ref);
+    errdefer abortDenseBulkIngestSessionForAsyncCatchUp(ctx, index_ref);
     _ = ctx.stats.dense_catch_up.begin_calls.fetchAdd(1, .monotonic);
 }
 
@@ -29656,14 +29678,14 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
         var seq_lock = lockAtomicWithBackoffProfiled(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex);
         ctx.applied_sequence_coalescer.removePending(ctx.alloc, index_ref.name);
         seq_lock.unlock();
-        ctx.index_manager.abortDenseBulkIngestSessionByName(index_ref.name);
+        abortDenseBulkIngestSessionForAsyncCatchUp(ctx, index_ref);
         finishDenseCatchUpSessionTracked(ctx, index_ref.name);
         return;
     }
     var catch_up_tracked = true;
     errdefer if (catch_up_tracked) finishDenseCatchUpSessionTracked(ctx, index_ref.name);
     var bulk_session_finished = false;
-    errdefer if (!bulk_session_finished) ctx.index_manager.abortDenseBulkIngestSessionByName(index_ref.name);
+    errdefer if (!bulk_session_finished) abortDenseBulkIngestSessionForAsyncCatchUp(ctx, index_ref);
     const finish_start_ns = monotonicTimeNs();
     const before_lsm_stats = denseLsmWriteStatsSnapshot(ctx, index_ref.name);
 
@@ -29679,7 +29701,7 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     finish_options.progress_ctx = ctx;
     finish_options.progress_fn = noteDenseBulkFinishProgress;
     const finalize_start_ns = monotonicTimeNs();
-    try ctx.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_ref.name, finish_options);
+    try finishDenseBulkIngestSessionForAsyncCatchUp(ctx, index_ref, finish_options);
     bulk_session_finished = true;
     const finalize_ns = elapsedSince(finalize_start_ns);
     setDenseCatchUpPhase(ctx, .applied_sequence_flush);
@@ -56473,8 +56495,12 @@ test "db runUntilIdle drains scheduled text merges after repeated writes" {
 
     try db.runUntilIdle();
 
+    const merge_stats = db.pendingWorkStats().text_merge;
+    try std.testing.expectEqual(@as(u64, 0), merge_stats.pending_indexes);
+    try std.testing.expectEqual(@as(u64, 0), merge_stats.in_flight_merges);
+
     const text_index = db.core.index_manager.textIndex("ft_v1").?;
-    try std.testing.expectEqual(@as(usize, 1), text_index.snapshot().segments.len);
+    try std.testing.expect(text_index.snapshot().segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
 
     var result = try db.search(alloc, .{
         .index_name = "ft_v1",

@@ -25,7 +25,7 @@ const schema_mod = @import("../../schema.zig");
 const ttl_mod = @import("../../ttl.zig");
 const types = @import("../types.zig");
 const ownership_mod = @import("../ownership.zig");
-const platform_clock = @import("../../../platform/clock.zig");
+const platform_clock = @import("antfly_platform").clock;
 const background_runtime_mod = @import("../../background_runtime.zig");
 
 pub const Config = struct {

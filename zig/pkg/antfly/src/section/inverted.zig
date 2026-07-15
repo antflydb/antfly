@@ -29,7 +29,7 @@ const chunked = @import("../encoding/chunked_coder.zig");
 const simd_bitpack = @import("../encoding/simd_bitpack.zig");
 const vellum = @import("antfly_vellum");
 const bloom = @import("bloom");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 // ============================================================================
 // Wire format versions
@@ -5939,6 +5939,10 @@ test "current one posting block retains one global impact bound" {
     switch (result) {
         .postings => |p| {
             const bm = p.block_max orelse return error.TestExpectedEqual;
+            const expected_header_len = varintU32Size(p.doc_freq) +
+                varintU32Size(@intCast(p.payload_data.len)) +
+                varintU32Size(0);
+            try std.testing.expectEqual(expected_header_len, p.header_len);
             try std.testing.expectEqual(@as(usize, 1), bm.chunkCount());
             try std.testing.expectEqual(@as(usize, 2), bm.meta.len);
             try std.testing.expectEqual(@as(u16, 3), bm.maxFreqAt(0));
@@ -6637,6 +6641,14 @@ test "PostingsIterator advanceTo uses sparse skip data for long postings" {
         .postings => |postings| {
             try std.testing.expect(postings.skip_data != null);
             try std.testing.expectEqual(@as(usize, 2 * postings_skip_record_size_v24), postings.skip_data.?.len);
+            const bm = postings.block_max orelse return error.TestExpectedEqual;
+            const ids_len = (postings.impact_chunk_ids_data orelse return error.TestExpectedEqual).len;
+            const expected_header_len = varintU32Size(postings.doc_freq) +
+                varintU32Size(@intCast(postings.payload_data.len)) +
+                varintU32Size(0) +
+                varintU32Size(@intCast(bm.chunkCount())) +
+                varintU32Size(@intCast(ids_len));
+            try std.testing.expectEqual(expected_header_len, postings.header_len);
         },
         .one_hit => return error.TestUnexpectedResult,
     }

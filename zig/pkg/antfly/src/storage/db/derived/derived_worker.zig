@@ -24,7 +24,7 @@ const internal_keys = @import("../../internal_keys.zig");
 const docstore_mod = @import("../../docstore.zig");
 const mem_backend_mod = @import("../../mem_backend.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
-const platform_time = @import("../../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 pub const ApplyFn = batcher.ApplyFn;
 pub const PersistProgressFn = *const fn (ctx: *anyopaque, index_name: []const u8, sequence: u64) anyerror!void;

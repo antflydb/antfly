@@ -21,7 +21,7 @@ const raft_engine = @import("raft_engine");
 const platform = @import("antfly_platform");
 const tracing = @import("../tracing/mod.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 const setup_io_thread_stack_size = 1 * 1024 * 1024;
 const metadata_raft_retained_entries = 1024;

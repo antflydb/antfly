@@ -4852,6 +4852,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "resource manager observes over-budget external usage",
             "resource manager evaluates projected admission with configured action",
+            "resource manager bounds soft write throttling without waiting for compaction publication",
             "cache reports shared byte usage to resource manager",
             "lsm backend resource manager throttles projected immutable state",
             "lsm backend resource manager rejects before wal apply",
@@ -4860,6 +4861,7 @@ pub fn build(b: *std.Build) void {
             "hbc shared cache evicts across namespaces under one resource budget",
             "hbc cache reports byte usage to resource manager",
             "hbc cache shrinks to resource budget under pressure",
+            "resource-managed mapped residency evicts cold segments and preserves hot mappings",
             "provisioned group storage derives all resource budgets",
         },
         .test_runner = .{

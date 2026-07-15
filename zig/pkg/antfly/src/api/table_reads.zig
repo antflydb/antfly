@@ -31,6 +31,7 @@ const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const doc_set = @import("../storage/db/doc_set.zig");
+const doc_identity = @import("../storage/db/doc_identity.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const asset_producer_mod = @import("../storage/db/enrichment/asset_producer.zig");
 const ha_public_gate_state = @import("../storage/ha/public_gate_state.zig");
@@ -55,7 +56,7 @@ const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
 const http_client = @import("http_client.zig");
 const http_common = @import("../raft/transport/http_common.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
 const fusion_mod = @import("../search/fusion.zig");
 const regex_mod = @import("../search/regex.zig");
@@ -17329,12 +17330,10 @@ test "explicit text stats requests preserve identity generation" {
 
 test "explicit text stats requests carry resolved doc filters and apply exact projection" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-text-stats-resolved-doc-filter";
-
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/text-stats", .{tmp.sub_path});
 
     var db = try db_mod.DB.open(alloc, path, .{ .start_index_workers = false });
     defer db.close();
@@ -17350,8 +17349,11 @@ test "explicit text stats requests carry resolved doc filters and apply exact pr
     });
 
     const generation = try db.currentIdentityReadGenerationForRequest(null);
+    var identity_txn = try db.core.store.beginProbeTxn();
+    const doc_a_ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &identity_txn, "doc:a")) orelse return error.TestUnexpectedResult;
+    identity_txn.abort();
     var filter = doc_set.ResolvedDocFilter{
-        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{1}),
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{doc_a_ordinal}),
     };
     defer filter.deinit(alloc);
     const req = db_mod.types.SearchRequest{

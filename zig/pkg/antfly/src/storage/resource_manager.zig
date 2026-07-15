@@ -14,6 +14,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const platform_time = @import("antfly_platform").time;
+const shared_platform_time = @import("antfly_platform").time;
 
 const MiB: u64 = 1024 * 1024;
 const dense_replay_window_min_bytes: u64 = 16 * MiB;
@@ -24,6 +26,7 @@ const dense_replay_window_shrink_denominator: u64 = 4;
 const dense_replay_finish_target_ns: u64 = 3 * std.time.ns_per_s;
 const dense_replay_finish_hard_ns: u64 = 8 * std.time.ns_per_s;
 const dense_replay_write_pressure_hard_ns: u64 = std.time.ns_per_s;
+const soft_throttle_delay_ns: u64 = 10 * std.time.ns_per_ms;
 const supports_pressure_wait = builtin.os.tag != .freestanding and
     builtin.link_libc and
     @hasDecl(std.c, "pthread_cond_wait");
@@ -83,6 +86,7 @@ pub const Slice = enum(u8) {
     derived_replay_window,
     full_text_pending_segments,
     full_text_build_working_set,
+    full_text_segment_residency,
     document_extraction_working_set,
     derived_backlog,
     text_merge_buffers,
@@ -109,6 +113,7 @@ pub const Slice = enum(u8) {
             .derived_replay_window => "derived.replay_window",
             .full_text_pending_segments => "full_text.pending_segments",
             .full_text_build_working_set => "full_text.build_working_set",
+            .full_text_segment_residency => "full_text.segment_residency",
             .document_extraction_working_set => "document_extraction.working_set",
             .derived_backlog => "derived.backlog",
             .text_merge_buffers => "text_merge.buffers",
@@ -187,6 +192,7 @@ pub const Options = struct {
             .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
             .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
             .{ .soft_limit_bytes = 256 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
+            .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
             .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 192 * 1024 * 1024 },
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 192 * 1024 * 1024 },
@@ -215,6 +221,7 @@ pub const Options = struct {
             .{ .soft_action = .report, .hard_action = .reject_work },
             .{ .soft_action = .defer_background_work, .hard_action = .defer_background_work },
             .{ .soft_action = .throttle_writes, .hard_action = .reject_work },
+            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
             .{ .soft_action = .throttle_writes, .hard_action = .throttle_writes },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
@@ -359,7 +366,7 @@ pub const ResourceManager = struct {
         defer self.mutex.unlock();
 
         var stats: [slice_count]SliceStats = undefined;
-        inline for (.{ Slice.lsm_block_table_cache, Slice.lsm_compaction_work, Slice.lsm_table_builder_working_set, Slice.lsm_in_memory_state, Slice.lsm_wal_write_working_set, Slice.lsm_wal_retention, Slice.lsm_recovery_working_set, Slice.hbc_node_metadata_cache, Slice.dense_search_working_set, Slice.dense_apply_working_set, Slice.dense_routing_working_set, Slice.derived_replay_window, Slice.full_text_pending_segments, Slice.full_text_build_working_set, Slice.document_extraction_working_set, Slice.derived_backlog, Slice.text_merge_buffers, Slice.algebraic_tensor_accumulators, Slice.sparse_apply_working_set, Slice.lite_native_page_cache, Slice.lite_native_link_cache, Slice.lite_docstore_snapshot_cache, Slice.inference_prompt_cache }, 0..) |slice, i| {
+        inline for (.{ Slice.lsm_block_table_cache, Slice.lsm_compaction_work, Slice.lsm_table_builder_working_set, Slice.lsm_in_memory_state, Slice.lsm_wal_write_working_set, Slice.lsm_wal_retention, Slice.lsm_recovery_working_set, Slice.hbc_node_metadata_cache, Slice.dense_search_working_set, Slice.dense_apply_working_set, Slice.dense_routing_working_set, Slice.derived_replay_window, Slice.full_text_pending_segments, Slice.full_text_build_working_set, Slice.full_text_segment_residency, Slice.document_extraction_working_set, Slice.derived_backlog, Slice.text_merge_buffers, Slice.algebraic_tensor_accumulators, Slice.sparse_apply_working_set, Slice.lite_native_page_cache, Slice.lite_native_link_cache, Slice.lite_docstore_snapshot_cache, Slice.inference_prompt_cache }, 0..) |slice, i| {
             const state = self.slices[i];
             stats[i] = .{
                 .name = slice.name(),
@@ -436,9 +443,23 @@ pub const ResourceManager = struct {
             switch (decision.action) {
                 .report, .shrink_cache, .defer_background_work => return,
                 .reject_work => return error.ResourceBudgetExceeded,
-                .throttle_writes => {},
+                .throttle_writes => {
+                    // Soft pressure is pacing, not a request to hold an HTTP
+                    // write until an arbitrarily large compaction publishes.
+                    // Apply a small bounded delay, then let the caller reach
+                    // its non-blocking projected hard guard. Hard pressure
+                    // keeps waiting on an ownership change because admitting
+                    // it would only be rejected before WAL append below.
+                    if (decision.pressure == .soft) {
+                        shared_platform_time.sleepNs(soft_throttle_delay_ns);
+                        return;
+                    }
+                },
             }
-            if (!self.canWaitForPressureChange()) return error.ResourceBudgetExceeded;
+            if (!self.canWaitForPressureChange()) {
+                if (decision.pressure == .soft) return;
+                return error.ResourceBudgetExceeded;
+            }
             self.waitForPressureChange(decision.change_epoch);
         }
     }
@@ -691,4 +712,21 @@ test "resource manager evaluates projected admission with configured action" {
     try std.testing.expectEqual(Pressure.hard, projected.pressure);
     try std.testing.expectEqual(PressureAction.reject_work, projected.action);
     try std.testing.expect(projected.change_epoch >= current_decision.change_epoch);
+}
+
+test "resource manager bounds soft write throttling without waiting for compaction publication" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.lsm_in_memory_state)] = .{
+        .soft_limit_bytes = 10,
+        .hard_limit_bytes = 20,
+    };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    var current: u64 = 0;
+    manager.observeUsage(.lsm_in_memory_state, &current, 12);
+
+    const started_ns = platform_time.monotonicNs();
+    try manager.awaitAdmission(.lsm_in_memory_state, 0);
+    const elapsed_ns = platform_time.monotonicNs() - started_ns;
+    try std.testing.expect(elapsed_ns < std.time.ns_per_s);
+    try std.testing.expectEqual(Pressure.soft, manager.sliceStats(.lsm_in_memory_state).pressure);
 }

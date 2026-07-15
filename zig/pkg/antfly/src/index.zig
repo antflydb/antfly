@@ -33,6 +33,15 @@ const roaring = @import("encoding/roaring.zig");
 const scorer_mod = @import("search/scorer.zig");
 const query_mod = @import("search/query.zig");
 const distributed_stats_mod = @import("search/distributed_stats.zig");
+const platform_time = @import("antfly_platform").time;
+const resource_manager_mod = @import("storage/resource_manager.zig");
+
+const mapped_residency_cold: u8 = 0;
+const mapped_residency_resident: u8 = 1;
+const mapped_residency_evicting: u8 = 2;
+const mapped_residency_check_interval_ns: u64 = std.time.ns_per_s;
+const mapped_residency_recent_ns: u64 = 30 * std.time.ns_per_s;
+const mapped_residency_hard_min_age_ns: u64 = 5 * std.time.ns_per_s;
 
 fn spinOrYield() void {
     if (@import("builtin").os.tag == .freestanding) {
@@ -123,6 +132,12 @@ pub const SegmentData = union(enum) {
 /// leaked snapshot pinned every future generation).
 pub const SegmentShared = struct {
     ref_count: u32,
+    /// Conservative per-mapping residency state. The virtual mapping remains
+    /// intact when this transitions to cold; only clean file-backed pages are
+    /// advised away. A subsequent query marks the segment resident again.
+    mapped_residency_state: std.atomic.Value(u8) = .init(mapped_residency_cold),
+    last_mapped_access_ns: std.atomic.Value(u64) = .init(0),
+    active_mapped_readers: std.atomic.Value(u32) = .init(0),
     /// Deletion bitmap shared by every snapshot referencing this segment.
     /// Mutated only under the writer mutex. Readers of older snapshots may
     /// observe deletions made after their snapshot was taken — acceptable
@@ -133,6 +148,11 @@ pub const SegmentShared = struct {
     /// Set when the segment is replaced/removed from the live index. Runs
     /// once the last reference dies, after resources are deinited.
     retired_cleanup: ?RetiredSegmentCleanup = null,
+
+    fn noteMappedAccess(self: *SegmentShared) void {
+        self.last_mapped_access_ns.store(platform_time.monotonicNs(), .release);
+        self.mapped_residency_state.store(mapped_residency_resident, .release);
+    }
 };
 
 pub const SegmentEntry = struct {
@@ -141,6 +161,30 @@ pub const SegmentEntry = struct {
     reader: segment_mod.SegmentReader,
     layout_stats: segment_mod.SegmentLayoutStats = .{},
     shared: *SegmentShared,
+
+    fn initShared(shared: *SegmentShared, data: SegmentData) void {
+        shared.* = .{ .ref_count = 1 };
+        if (data.isFileBacked()) {
+            // Opening a segment reads headers and dictionaries. Count the
+            // whole mapping conservatively until the owner advises it cold.
+            shared.mapped_residency_state.store(mapped_residency_resident, .release);
+        }
+    }
+
+    pub fn noteAccess(self: *const SegmentEntry) void {
+        if (self.data.isFileBacked()) self.shared.noteMappedAccess();
+    }
+
+    pub fn beginAccess(self: *const SegmentEntry) void {
+        if (!self.data.isFileBacked()) return;
+        _ = self.shared.active_mapped_readers.fetchAdd(1, .acq_rel);
+        self.shared.noteMappedAccess();
+    }
+
+    pub fn endAccess(self: *const SegmentEntry) void {
+        if (!self.data.isFileBacked()) return;
+        _ = self.shared.active_mapped_readers.fetchSub(1, .acq_rel);
+    }
 
     fn retain(self: *const SegmentEntry) void {
         _ = @atomicRmw(u32, &self.shared.ref_count, .Add, 1, .monotonic);
@@ -545,6 +589,8 @@ pub const IndexSnapshot = struct {
                 if (diagnostics) |diag| diag.segments_pruned +|= 1;
                 continue;
             }
+            seg.beginAccess();
+            defer seg.endAccess();
             const inv_reader = (try seg.reader.invertedIndex(field)) orelse {
                 continue;
             };
@@ -624,11 +670,13 @@ pub const IndexSnapshot = struct {
     /// Get a stored document by global doc ID.
     pub fn storedDoc(self: *const IndexSnapshot, global_id: u32) ?segment_mod.SegmentReader.StoredDocRef {
         const resolved = self.resolveDocId(global_id) orelse return null;
+        self.segments[resolved.seg_idx].noteAccess();
         return self.segments[resolved.seg_idx].reader.storedDoc(resolved.local_id);
     }
 
     pub fn docOrdinal(self: *const IndexSnapshot, global_id: u32) !?u32 {
         const resolved = self.resolveDocId(global_id) orelse return null;
+        self.segments[resolved.seg_idx].noteAccess();
         return try self.segments[resolved.seg_idx].reader.docOrdinal(resolved.local_id);
     }
 
@@ -638,6 +686,7 @@ pub const IndexSnapshot = struct {
 
     pub fn storedDocDecompressed(self: *const IndexSnapshot, alloc: Allocator, global_id: u32) !?DecompressedDoc {
         const resolved = self.resolveDocId(global_id) orelse return null;
+        self.segments[resolved.seg_idx].noteAccess();
         const result = (try self.segments[resolved.seg_idx].reader.storedDocDecompressed(alloc, resolved.local_id)) orelse return null;
         return DecompressedDoc{ .id = result.id, .data = result.data };
     }
@@ -861,6 +910,11 @@ pub const IndexWriter = struct {
     next_segment_id: u64,
     next_epoch: u64,
     retired_segment_cleanup: ?RetiredSegmentCleanup = null,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    mapped_residency_mu: std.atomic.Mutex,
+    mapped_residency_accounted_bytes: u64,
+    mapped_residency_next_check_ns: std.atomic.Value(u64),
+    mapped_residency_evictions: u64,
 
     pub fn lockMutex(self: *IndexWriter) void {
         while (!self.mu.tryLock()) {
@@ -905,7 +959,23 @@ pub const IndexWriter = struct {
             .next_segment_id = 1,
             .next_epoch = 1,
             .retired_segment_cleanup = null,
+            .resource_manager = null,
+            .mapped_residency_mu = .unlocked,
+            .mapped_residency_accounted_bytes = 0,
+            .mapped_residency_next_check_ns = .init(0),
+            .mapped_residency_evictions = 0,
         };
+    }
+
+    pub fn attachResourceManager(self: *IndexWriter, manager: *resource_manager_mod.ResourceManager) void {
+        self.lockMappedResidencyMutex();
+        self.resource_manager = manager;
+        self.mapped_residency_next_check_ns.store(0, .release);
+        self.mapped_residency_mu.unlock();
+
+        const snap = self.acquireSnapshotRaw();
+        defer snap.release();
+        self.maybeMaintainMappedResidency(snap, platform_time.monotonicNs());
     }
 
     pub fn setRetiredSegmentCleanup(self: *IndexWriter, cleanup: ?RetiredSegmentCleanup) void {
@@ -913,6 +983,17 @@ pub const IndexWriter = struct {
     }
 
     pub fn deinit(self: *IndexWriter) void {
+        self.lockMappedResidencyMutex();
+        if (self.resource_manager) |manager| {
+            manager.observeUsage(
+                .full_text_segment_residency,
+                &self.mapped_residency_accounted_bytes,
+                0,
+            );
+        }
+        self.resource_manager = null;
+        self.mapped_residency_mu.unlock();
+
         // Releases the writer's reference; with no outstanding readers this
         // frees the snapshot and drops the final reference on every live
         // segment (whose cells carry no retired cleanup, so closing an index
@@ -933,9 +1014,138 @@ pub const IndexWriter = struct {
     /// Load+retain happens under snapshot_mu so a concurrent publish cannot
     /// release the loaded snapshot to zero before we retain it.
     pub fn acquireSnapshot(self: *IndexWriter) *IndexSnapshot {
+        const snap = self.acquireSnapshotRaw();
+        self.maybeMaintainMappedResidency(snap, platform_time.monotonicNs());
+        return snap;
+    }
+
+    fn acquireSnapshotRaw(self: *IndexWriter) *IndexSnapshot {
         self.lockSnapshotMutex();
         defer self.snapshot_mu.unlock();
         return @atomicLoad(*IndexSnapshot, &self.current, .acquire).retain();
+    }
+
+    fn lockMappedResidencyMutex(self: *IndexWriter) void {
+        while (!self.mapped_residency_mu.tryLock()) spinOrYield();
+    }
+
+    pub const MappedResidencyStats = struct {
+        virtual_mapped_bytes: u64 = 0,
+        estimated_resident_bytes: u64 = 0,
+        recently_touched_bytes: u64 = 0,
+        cold_mapped_bytes: u64 = 0,
+        eviction_count: u64 = 0,
+    };
+
+    fn mappedResidencyStatsForSnapshot(self: *const IndexWriter, snap: *const IndexSnapshot, now_ns: u64) MappedResidencyStats {
+        var stats = MappedResidencyStats{ .eviction_count = self.mapped_residency_evictions };
+        for (snap.segments) |*seg| {
+            if (!seg.data.isFileBacked()) continue;
+            const bytes: u64 = @intCast(seg.data.bytes().len);
+            stats.virtual_mapped_bytes +|= bytes;
+            if (seg.shared.mapped_residency_state.load(.acquire) != mapped_residency_cold) {
+                stats.estimated_resident_bytes +|= bytes;
+            } else {
+                stats.cold_mapped_bytes +|= bytes;
+            }
+            const last_access_ns = seg.shared.last_mapped_access_ns.load(.acquire);
+            if (last_access_ns != 0 and now_ns -| last_access_ns <= mapped_residency_recent_ns) {
+                stats.recently_touched_bytes +|= bytes;
+            }
+        }
+        return stats;
+    }
+
+    pub fn mappedResidencyStats(self: *IndexWriter) MappedResidencyStats {
+        const snap = self.acquireSnapshotRaw();
+        defer snap.release();
+        self.lockMappedResidencyMutex();
+        defer self.mapped_residency_mu.unlock();
+        return self.mappedResidencyStatsForSnapshot(snap, platform_time.monotonicNs());
+    }
+
+    fn maybeMaintainMappedResidency(self: *IndexWriter, snap: *IndexSnapshot, now_ns: u64) void {
+        const scheduled_ns = self.mapped_residency_next_check_ns.load(.acquire);
+        if (scheduled_ns != 0 and now_ns < scheduled_ns) return;
+        if (self.mapped_residency_next_check_ns.cmpxchgStrong(
+            scheduled_ns,
+            now_ns +| mapped_residency_check_interval_ns,
+            .acq_rel,
+            .acquire,
+        ) != null) return;
+        self.maintainMappedResidencyAt(snap, now_ns);
+    }
+
+    fn maintainMappedResidencyAt(self: *IndexWriter, snap: *IndexSnapshot, now_ns: u64) void {
+        self.lockMappedResidencyMutex();
+        defer self.mapped_residency_mu.unlock();
+
+        const manager = self.resource_manager orelse return;
+        var stats = self.mappedResidencyStatsForSnapshot(snap, now_ns);
+        manager.observeUsage(
+            .full_text_segment_residency,
+            &self.mapped_residency_accounted_bytes,
+            stats.estimated_resident_bytes,
+        );
+
+        var decision = manager.pressureDecision(.full_text_segment_residency);
+        if (decision.action != .shrink_cache or decision.pressure == .normal) return;
+        const min_age_ns = if (decision.pressure == .hard)
+            mapped_residency_hard_min_age_ns
+        else
+            mapped_residency_recent_ns;
+
+        // The manager only returns a decision. The index owner selects and
+        // advises its own clean mappings after the manager mutex is released.
+        // Re-evaluate aggregate pressure after each segment so one index does
+        // not evict more than is needed when several writers share a manager.
+        while (decision.action == .shrink_cache and decision.pressure != .normal) {
+            var candidate: ?*SegmentEntry = null;
+            var candidate_access_ns: u64 = std.math.maxInt(u64);
+            for (snap.segments) |*seg| {
+                if (!seg.data.isFileBacked()) continue;
+                if (seg.shared.mapped_residency_state.load(.acquire) != mapped_residency_resident) continue;
+                if (seg.shared.active_mapped_readers.load(.acquire) != 0) continue;
+                const last_access_ns = seg.shared.last_mapped_access_ns.load(.acquire);
+                if (last_access_ns != 0 and now_ns -| last_access_ns < min_age_ns) continue;
+                if (candidate == null or last_access_ns < candidate_access_ns) {
+                    candidate = seg;
+                    candidate_access_ns = last_access_ns;
+                }
+            }
+            const coldest = candidate orelse break;
+            if (coldest.shared.mapped_residency_state.cmpxchgStrong(
+                mapped_residency_resident,
+                mapped_residency_evicting,
+                .acq_rel,
+                .acquire,
+            ) != null) continue;
+
+            coldest.data.madviseDiscardCleanPages();
+            if (coldest.shared.last_mapped_access_ns.load(.acquire) == candidate_access_ns) {
+                _ = coldest.shared.mapped_residency_state.cmpxchgStrong(
+                    mapped_residency_evicting,
+                    mapped_residency_cold,
+                    .acq_rel,
+                    .acquire,
+                );
+            } else {
+                _ = coldest.shared.mapped_residency_state.cmpxchgStrong(
+                    mapped_residency_evicting,
+                    mapped_residency_resident,
+                    .acq_rel,
+                    .acquire,
+                );
+            }
+            self.mapped_residency_evictions +|= 1;
+            stats = self.mappedResidencyStatsForSnapshot(snap, now_ns);
+            manager.observeUsage(
+                .full_text_segment_residency,
+                &self.mapped_residency_accounted_bytes,
+                stats.estimated_resident_bytes,
+            );
+            decision = manager.pressureDecision(.full_text_segment_residency);
+        }
     }
 
     /// Add a pre-built segment to the index.
@@ -960,7 +1170,7 @@ pub const IndexWriter = struct {
         errdefer self.alloc.free(new_segments);
         @memcpy(new_segments[0..old.segments.len], old.segments);
         const shared = try self.alloc.create(SegmentShared);
-        shared.* = .{ .ref_count = 1 };
+        SegmentEntry.initShared(shared, data);
         errdefer self.alloc.destroy(shared);
         new_segments[old.segments.len] = .{
             .id = seg_id,
@@ -1129,7 +1339,7 @@ pub const IndexWriter = struct {
         errdefer self.alloc.free(new_segments);
         @memcpy(new_segments[0..old.segments.len], old.segments);
         const shared = try self.alloc.create(SegmentShared);
-        shared.* = .{ .ref_count = 1 };
+        SegmentEntry.initShared(shared, owned.?);
         errdefer self.alloc.destroy(shared);
         new_segments[old.segments.len] = .{
             .id = seg_id,
@@ -1265,7 +1475,7 @@ pub const IndexWriter = struct {
         errdefer for (new_segments[keep_count .. keep_count + cells_created]) |*seg| self.alloc.destroy(seg.shared);
         for (replacements, 0..) |replacement, i| {
             const shared = try self.alloc.create(SegmentShared);
-            shared.* = .{ .ref_count = 1 };
+            SegmentEntry.initShared(shared, replacement.data);
             new_segments[idx] = .{
                 .id = replacement.id,
                 .data = replacement.data,
@@ -1493,6 +1703,88 @@ fn buildTestSegment(alloc: Allocator, docs: []const struct { terms: []const inve
     }
 
     return seg_writer.build();
+}
+
+fn mapTestSegment(segment_bytes: []const u8) !SegmentData {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const mapped = try std.heap.page_allocator.alignedAlloc(
+        u8,
+        std.mem.Alignment.fromByteUnits(std.heap.page_size_min),
+        segment_bytes.len,
+    );
+    @memcpy(mapped, segment_bytes);
+    return SegmentData.fromMapped(mapped);
+}
+
+test "resource-managed mapped residency evicts cold segments and preserves hot mappings" {
+    const alloc = std.testing.allocator;
+    const seg_bytes = try buildTestSegment(alloc, &.{
+        .{ .terms = &.{.{ .term = "resident", .freq = 1, .norm = 8 }} },
+    });
+    defer alloc.free(seg_bytes);
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.full_text_segment_residency)] = .{
+        .soft_limit_bytes = @intCast(seg_bytes.len),
+        .hard_limit_bytes = @intCast(seg_bytes.len * 8),
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var writer = try IndexWriter.init(alloc);
+    var writer_live = true;
+    defer if (writer_live) writer.deinit();
+
+    try writer.addSegmentWithIdData(1, try mapTestSegment(seg_bytes));
+    try writer.addSegmentWithIdData(2, try mapTestSegment(seg_bytes));
+    writer.snapshot().segments[1].noteAccess();
+    writer.attachResourceManager(&manager);
+
+    var stats = writer.mappedResidencyStats();
+    try std.testing.expectEqual(@as(u64, @intCast(seg_bytes.len * 2)), stats.virtual_mapped_bytes);
+    try std.testing.expectEqual(@as(u64, @intCast(seg_bytes.len)), stats.estimated_resident_bytes);
+    try std.testing.expectEqual(@as(u64, @intCast(seg_bytes.len)), stats.recently_touched_bytes);
+    try std.testing.expectEqual(@as(u64, @intCast(seg_bytes.len)), stats.cold_mapped_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.eviction_count);
+    try std.testing.expectEqual(
+        @as(u64, @intCast(seg_bytes.len)),
+        manager.sliceStats(.full_text_segment_residency).used_bytes,
+    );
+
+    // A query faults the cold mapping back into the conservative estimate.
+    // Both mappings are then inside the soft-pressure recent-access window,
+    // so the controller reports pressure but does not churn either mapping.
+    writer.snapshot().segments[0].noteAccess();
+    const now_ns = platform_time.monotonicNs();
+    writer.maintainMappedResidencyAt(writer.snapshot(), now_ns);
+    stats = writer.mappedResidencyStats();
+    try std.testing.expectEqual(@as(u64, @intCast(seg_bytes.len * 2)), stats.estimated_resident_bytes);
+    try std.testing.expectEqual(resource_manager_mod.Pressure.soft, manager.sliceStats(.full_text_segment_residency).pressure);
+
+    // Once the older mapping ages beyond the hysteresis window, it is the
+    // sole eviction candidate. An active reader still pins it until that
+    // access completes, even under pressure.
+    const old_segment = &writer.snapshot().segments[0];
+    old_segment.beginAccess();
+    old_segment.shared.last_mapped_access_ns.store(1, .release);
+    const aged_now_ns = @max(now_ns, mapped_residency_recent_ns + std.time.ns_per_s);
+    writer.maintainMappedResidencyAt(writer.snapshot(), aged_now_ns);
+    stats = writer.mappedResidencyStats();
+    try std.testing.expectEqual(@as(u64, @intCast(seg_bytes.len * 2)), stats.estimated_resident_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.eviction_count);
+
+    old_segment.endAccess();
+    writer.maintainMappedResidencyAt(writer.snapshot(), aged_now_ns);
+    stats = writer.mappedResidencyStats();
+    try std.testing.expectEqual(@as(u64, @intCast(seg_bytes.len)), stats.estimated_resident_bytes);
+    try std.testing.expectEqual(@as(u64, 2), stats.eviction_count);
+
+    writer.deinit();
+    writer_live = false;
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        manager.sliceStats(.full_text_segment_residency).used_bytes,
+    );
 }
 
 test "single segment search" {

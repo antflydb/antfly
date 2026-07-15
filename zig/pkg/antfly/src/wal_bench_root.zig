@@ -22,4 +22,4 @@ pub const BatchAppendResult = wal.BatchAppendResult;
 pub const WalStats = wal.WalStats;
 pub const FullStats = wal.FullStats;
 pub const WAL = wal.WAL;
-pub const platform_time = @import("platform/time.zig");
+pub const platform_time = @import("antfly_platform").time;

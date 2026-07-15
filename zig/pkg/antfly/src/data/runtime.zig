@@ -26,9 +26,9 @@ const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
 const data_raft_batch = @import("raft_batch.zig");
-const platform_clock = @import("../platform/clock.zig");
-const process_memory_mod = @import("../platform/process_memory.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_clock = @import("antfly_platform").clock;
+const process_memory_mod = @import("antfly_platform").process_memory;
+const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const raft_engine = @import("raft_engine");
 
@@ -1081,6 +1081,7 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.derived_replay_window,
         resource_manager_mod.Slice.full_text_pending_segments,
         resource_manager_mod.Slice.full_text_build_working_set,
+        resource_manager_mod.Slice.full_text_segment_residency,
         resource_manager_mod.Slice.derived_backlog,
         resource_manager_mod.Slice.text_merge_buffers,
         resource_manager_mod.Slice.algebraic_tensor_accumulators,
@@ -15952,6 +15953,7 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     const resource_output = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, resource_output, "# HELP antfly_resource_used_bytes") != null);
     try std.testing.expect(std.mem.indexOf(u8, resource_output, "antfly_resource_used_bytes{slice=\"lsm.block_table_cache\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resource_output, "antfly_resource_used_bytes{slice=\"full_text.segment_residency\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, resource_output, "antfly_resource_pressure{slice=\"text_merge.buffers\"}") != null);
 
     var cache = lsm_backend_mod.Cache.init(std.testing.allocator, 1024 * 1024);

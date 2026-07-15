@@ -1,0 +1,14 @@
+{
+  "method": "POST",
+  "path": "/tables/antfly-benchmark/query",
+  "body": {
+    "count": false,
+    "fields": [],
+    "full_text_search": {
+      "field": "body",
+      "match": "{marker}"
+    },
+    "limit": 10
+  },
+  "expect_contains": "{marker}"
+}

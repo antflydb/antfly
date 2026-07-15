@@ -21,7 +21,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const graph_mod = @import("graph.zig");
 const Edge = graph_mod.Edge;
 const EdgeDirection = graph_mod.EdgeDirection;

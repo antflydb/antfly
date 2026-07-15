@@ -62,7 +62,7 @@ const asset_producer_mod = @import("../storage/db/enrichment/asset_producer.zig"
 const distributed_txn = @import("distributed_txn.zig");
 const build_options = @import("build_options");
 const tracing = @import("../tracing/mod.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const Io = std.Io;
 
 var txn_id_nonce: std.atomic.Value(u64) = .init(0);

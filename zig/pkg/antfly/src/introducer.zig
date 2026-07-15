@@ -26,8 +26,8 @@ const inverted = @import("section/inverted.zig");
 const typed_dv = @import("section/typed_doc_values.zig");
 const analysis_mod = @import("search/analysis.zig");
 const geo_mod = @import("search/geo.zig");
-const platform_time = @import("platform/time.zig");
-const process_memory = @import("platform/process_memory.zig");
+const platform_time = @import("antfly_platform").time;
+const process_memory = @import("antfly_platform").process_memory;
 const resource_manager_mod = @import("storage/resource_manager.zig");
 
 /// A batch of documents to index.

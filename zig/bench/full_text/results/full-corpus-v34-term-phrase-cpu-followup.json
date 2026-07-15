@@ -338,7 +338,7 @@
     "phrase_matches": 525
   },
   "next_implementation_order": [
-    "develop_sparse_impact_metadata_without_losing_v35_document_local_pruning",
-    "evaluate_sparse_position_group_offsets_only_if_profiles_still_require_them"
+    "evaluate_sparse_position_group_offsets_only_if_profiles_still_require_them",
+    "complete_resource_managed_full_text_residency_hysteresis_and_eviction_validation"
   ]
 }

@@ -17,8 +17,8 @@ const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../../common/fs_paths.zig");
-const process_memory = @import("../../../platform/process_memory.zig");
-const platform_time = @import("../../../platform/time.zig");
+const process_memory = @import("antfly_platform").process_memory;
+const platform_time = @import("antfly_platform").time;
 const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
 const backend_types = @import("../../backend_types.zig");
 const backend_erased = @import("../../backend_erased.zig");
@@ -327,6 +327,10 @@ pub const TextMemoryAttributionStats = struct {
     section_index_bytes: u64 = 0,
     configured_lmdb_main_map_bytes: u64 = 0,
     configured_lmdb_wal_map_bytes: u64 = 0,
+    text_segment_estimated_resident_bytes: u64 = 0,
+    text_segment_recently_touched_bytes: u64 = 0,
+    text_segment_cold_mapped_bytes: u64 = 0,
+    text_segment_residency_evictions: u64 = 0,
 };
 
 const TextBatchMutationStats = struct {
@@ -2418,6 +2422,10 @@ pub const IndexManager = struct {
             const persistent_memory = entry.persistent.memoryStatsSnapshot();
             stats.configured_lmdb_main_map_bytes +|= persistent_memory.configured_lmdb_main_map_bytes;
             stats.configured_lmdb_wal_map_bytes +|= persistent_memory.configured_lmdb_wal_map_bytes;
+            stats.text_segment_estimated_resident_bytes +|= persistent_memory.segment_estimated_resident_bytes;
+            stats.text_segment_recently_touched_bytes +|= persistent_memory.segment_recently_touched_bytes;
+            stats.text_segment_cold_mapped_bytes +|= persistent_memory.segment_cold_mapped_bytes;
+            stats.text_segment_residency_evictions +|= persistent_memory.segment_residency_evictions;
 
             const snap = entry.persistent.acquireSnapshot();
             defer snap.release();
@@ -2481,6 +2489,8 @@ pub const IndexManager = struct {
         var ft_pending_peak: u64 = 0;
         var ft_build_used: u64 = 0;
         var ft_build_peak: u64 = 0;
+        var ft_residency_used: u64 = 0;
+        var ft_residency_peak: u64 = 0;
         var text_merge_used: u64 = 0;
         var text_merge_peak: u64 = 0;
         var lsm_cache_used: u64 = 0;
@@ -2503,6 +2513,7 @@ pub const IndexManager = struct {
             const resource_stats = manager.snapshot();
             const ft_pending = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)];
             const ft_build = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)];
+            const ft_residency = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_segment_residency)];
             const text_merge = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)];
             const lsm_cache = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
             const lsm_compaction = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)];
@@ -2516,6 +2527,8 @@ pub const IndexManager = struct {
             ft_pending_peak = ft_pending.peak_bytes;
             ft_build_used = ft_build.used_bytes;
             ft_build_peak = ft_build.peak_bytes;
+            ft_residency_used = ft_residency.used_bytes;
+            ft_residency_peak = ft_residency.peak_bytes;
             text_merge_used = text_merge.used_bytes;
             text_merge_peak = text_merge.peak_bytes;
             lsm_cache_used = lsm_cache.used_bytes;
@@ -2544,7 +2557,7 @@ pub const IndexManager = struct {
         const footprint_after_lsm_resource_gap = memory.footprint_bytes -| lsm_resource_used;
 
         std.log.info(
-            "antfly_bench_memory_attribution label={s} source_docs={d} projection_docs={d} batch_segments={d} rss_bytes={d} footprint_bytes={d} peak_footprint_bytes={d} malloc_available={any} malloc_allocated_bytes={d} malloc_zone_bytes={d} text_indexes={d} text_segments={d} text_segment_bytes={d} mapped_segment_bytes={d} text_mmap_segment_bytes={d} text_heap_segment_bytes={d} text_max_segment_bytes={d} configured_lmdb_main_map_bytes={d} configured_lmdb_wal_map_bytes={d}",
+            "antfly_bench_memory_attribution label={s} source_docs={d} projection_docs={d} batch_segments={d} rss_bytes={d} footprint_bytes={d} peak_footprint_bytes={d} malloc_available={any} malloc_allocated_bytes={d} malloc_zone_bytes={d} text_indexes={d} text_segments={d} text_segment_bytes={d} mapped_segment_bytes={d} text_mmap_segment_bytes={d} text_heap_segment_bytes={d} text_max_segment_bytes={d} text_segment_estimated_resident_bytes={d} text_segment_recently_touched_bytes={d} text_segment_cold_mapped_bytes={d} text_segment_residency_evictions={d} configured_lmdb_main_map_bytes={d} configured_lmdb_wal_map_bytes={d}",
             .{
                 label,
                 source_docs,
@@ -2563,6 +2576,10 @@ pub const IndexManager = struct {
                 text_stats.text_mmap_segment_bytes,
                 text_stats.text_heap_segment_bytes,
                 text_stats.text_max_segment_bytes,
+                text_stats.text_segment_estimated_resident_bytes,
+                text_stats.text_segment_recently_touched_bytes,
+                text_stats.text_segment_cold_mapped_bytes,
+                text_stats.text_segment_residency_evictions,
                 text_stats.configured_lmdb_main_map_bytes,
                 text_stats.configured_lmdb_wal_map_bytes,
             },
@@ -2595,13 +2612,15 @@ pub const IndexManager = struct {
             },
         );
         std.log.info(
-            "antfly_bench_memory_resources label={s} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} text_merge_used_bytes={d} text_merge_peak_bytes={d} derived_backlog_used_bytes={d} derived_backlog_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_table_builder_used_bytes={d} lsm_table_builder_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_wal_write_used_bytes={d} lsm_wal_write_peak_bytes={d} lsm_wal_retention_disk_bytes={d} lsm_wal_retention_peak_disk_bytes={d} lsm_recovery_used_bytes={d} lsm_recovery_peak_bytes={d} lsm_resource_used_bytes={d} lsm_resource_peak_bytes={d} rss_after_lsm_resource_gap_bytes={d} footprint_after_lsm_resource_gap_bytes={d}",
+            "antfly_bench_memory_resources label={s} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} full_text_residency_used_bytes={d} full_text_residency_peak_bytes={d} text_merge_used_bytes={d} text_merge_peak_bytes={d} derived_backlog_used_bytes={d} derived_backlog_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_table_builder_used_bytes={d} lsm_table_builder_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_wal_write_used_bytes={d} lsm_wal_write_peak_bytes={d} lsm_wal_retention_disk_bytes={d} lsm_wal_retention_peak_disk_bytes={d} lsm_recovery_used_bytes={d} lsm_recovery_peak_bytes={d} lsm_resource_used_bytes={d} lsm_resource_peak_bytes={d} rss_after_lsm_resource_gap_bytes={d} footprint_after_lsm_resource_gap_bytes={d}",
             .{
                 label,
                 ft_pending_used,
                 ft_pending_peak,
                 ft_build_used,
                 ft_build_peak,
+                ft_residency_used,
+                ft_residency_peak,
                 text_merge_used,
                 text_merge_peak,
                 derived_backlog_used,
@@ -7501,6 +7520,7 @@ pub const IndexManager = struct {
                     });
                     return err;
                 };
+                if (self.resource_manager) |manager| persistent.attachResourceManager(manager);
                 var persistent_moved = false;
                 errdefer if (!persistent_moved) persistent.close();
                 const runtime_schema = loadRuntimeSchemaForTextIndex(self.alloc, store, cfg.name) catch |err| {

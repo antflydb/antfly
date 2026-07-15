@@ -18,9 +18,20 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--corpus", required=True, type=Path)
     parser.add_argument("--base-url", default="http://127.0.0.1:8080")
     parser.add_argument("--table", default="antfly-benchmark")
+    parser.add_argument(
+        "--ensure-table",
+        action="store_true",
+        help="create the table with its default full-text index if it is absent",
+    )
     parser.add_argument("--batch-bytes", type=int, default=4 * 1024 * 1024)
     parser.add_argument("--timeout-seconds", type=float, default=300)
     parser.add_argument("--max-documents", type=int)
+    parser.add_argument(
+        "--start-document",
+        type=int,
+        default=0,
+        help="resume at this zero-based corpus ordinal; deterministic keys make replay idempotent",
+    )
     parser.add_argument("--progress-every-batches", type=int, default=25)
     args = parser.parse_args()
     if args.batch_bytes <= 0:
@@ -48,7 +59,12 @@ def encode_entry(raw_line: bytes, ordinal: int) -> bytes:
     ).encode("utf-8")
 
 
-def batches(stream: BinaryIO, target_bytes: int, max_documents: int | None = None) -> Iterator[tuple[bytes, int]]:
+def batches(
+    stream: BinaryIO,
+    target_bytes: int,
+    max_documents: int | None = None,
+    start_document: int = 0,
+) -> Iterator[tuple[bytes, int]]:
     entries: list[bytes] = []
     size = len(b'{"inserts":{},"sync_level":"full_index"}')
     documents = 0
@@ -57,7 +73,11 @@ def batches(stream: BinaryIO, target_bytes: int, max_documents: int | None = Non
             continue
         if max_documents is not None and documents >= max_documents:
             break
-        encoded = encode_entry(raw_line, documents)
+        ordinal = documents
+        if ordinal < start_document:
+            documents += 1
+            continue
+        encoded = encode_entry(raw_line, ordinal)
         additional = len(encoded) + (1 if entries else 0)
         if entries and size + additional > target_bytes:
             yield b",".join(entries), documents
@@ -80,7 +100,18 @@ class AntflyClient:
         if parsed.scheme != "http" or not parsed.hostname:
             raise ValueError("loader currently requires an http base URL")
         self.connection = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=timeout)
+        self.base_path = parsed.path.rstrip("/")
+        self.table = table
         self.path = f"{parsed.path.rstrip('/')}/tables/{quote(table, safe='')}/batch"
+
+    def ensure_table(self) -> None:
+        path = f"{self.base_path}/tables/{quote(self.table, safe='')}"
+        payload = b'{"num_shards":1}'
+        self.connection.request("POST", path, body=payload, headers={"Content-Type": "application/json"})
+        response = self.connection.getresponse()
+        body = response.read()
+        if not 200 <= response.status < 300 and response.status != 409:
+            raise RuntimeError(f"Antfly table creation failed with HTTP {response.status}: {body[:1000]!r}")
 
     def ingest(self, entries: bytes, sync_level: str) -> int:
         payload = batch_payload(entries, sync_level)
@@ -100,14 +131,16 @@ def main() -> int:
     args = arguments()
     started = time.perf_counter()
     with args.corpus.open("rb") as corpus:
-        prepared = batches(corpus, args.batch_bytes, args.max_documents)
+        prepared = batches(corpus, args.batch_bytes, args.max_documents, args.start_document)
         pending = next(prepared, None)
         if pending is None:
             raise ValueError("corpus contains no documents")
         client = AntflyClient(args.base_url, args.table, args.timeout_seconds)
-        submitted = 0
+        submitted = args.start_document
         batch_count = 0
         try:
+            if args.ensure_table:
+                client.ensure_table()
             for following in prepared:
                 entries, cumulative_documents = pending
                 expected = cumulative_documents - submitted

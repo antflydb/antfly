@@ -1725,6 +1725,43 @@ Tantivy and Quickwit artifacts are reused, not recollected. Exact rejected
 prototype evidence is summarized in
 `bench/full_text/results/full-corpus-v34-term-phrase-cpu-followup.json`.
 
+### v38 compact postings headers
+
+The next persisted-size pass measured the remaining structure before changing
+it. Across the settled v35 index, exact per-term range packing of the five-bit
+frequency and eight-bit norm columns would reduce 141,577,404 impact bytes by
+only 18,296,976 bytes. Only 259,540 terms selected the adaptive form while
+4,521,636 retained the raw columns. That potential 0.54 percent total-index
+saving does not justify another bound-decoder branch after v37 already showed
+the sensitivity of this hot path, so the projection is retained as evidence
+rather than promoted to a wire format.
+
+The larger safe redundancy was in every non-inline postings header. Fixed-count
+blocks derive their count from document frequency, the two compact-metadata
+width bytes determine the metadata length, and the fixed checkpoint stride
+determines skip length. v38 omits all three fields. Terms contained in one
+posting block also omit the known impact count of one and range-ID length of
+zero. Payloads, positions, exact differentiated 1,024-document impact bounds,
+and range IDs are byte-for-byte unchanged. The reader accepts only origin/main
+v23 and current v38; branch-only v24-v37 remain outside the release contract.
+
+The deterministic 120K matched A/B reduced the index from 3,238,044 to
+3,027,962 bytes, passed all five queries strictly, and moved sustained CPU by
+less than one percent in every class. On the 5,032,105-document corpus, v38 is
+3,385,816,859 bytes, 23,552,230 bytes below v35. Postings headers fall from
+78,864,502 to 55,444,699 bytes. The remaining gap to Tantivy is 134,322,716
+bytes, or a 1.0413x ratio.
+
+The full v38 build completed in 421.345 wall seconds and 407.516 CPU seconds,
+improving 5.64 and 5.35 percent versus v35. Peak RSS was 1.925 GB versus v35's
+1.658 GB, within the already measured merge-residency variance and still 31.5
+percent below Tantivy's 2.810 GB; it is not presented as an RSS improvement.
+Three v38 query passes averaged 48.981/193.827/165.261/441.923 us CPU for
+term/union/intersection/phrase. Against an adjacent v35 control they moved
++0.43/-3.85/-6.45/-3.31 percent. Every pass strictly matched all five archived
+Tantivy queries and preserved the phrase work counts. Exact evidence is in
+`bench/full_text/results/full-corpus-v38-compact-postings-header-qualification.json`.
+
 ### Public product storage, source, and ingestion amplification
 
 The public server comparison now stores document source exactly once. Text
@@ -2149,19 +2186,38 @@ component performs the actual operation. Native LSM run files are range-read,
 not mmap-backed, so text-segment `madvise` cannot reclaim allocator-backed LSM
 generations. OS-specific mmap eviction or allocator pressure relief therefore
 cannot substitute for complete accounting or correct per-generation ownership.
-The future full-text residency slice must publish resident or recently touched
-page bytes, not total mapped segment length: mapped virtual bytes can exceed the
-memory budget while remaining cold and non-resident. A low-frequency,
-platform-specific residency sampler (or conservative access-window estimator)
-should feed the slice; ResourceManager returns `shrink_cache`, and the index
-owner applies hysteretic, rate-limited `madvise(DONTNEED)` to the coldest clean
-segments without changing snapshot pins. ResourceManager must not call owner
-callbacks while holding its mutex. Retired mappings are reclaimed first; live
-hot mappings are the last resort because eviction converts memory pressure into
-query page faults.
-The validated 650K release load accepts this LSM process-memory gate; subsequent
-work should optimize the separately measured full-text residency and merge
-allocation peaks without weakening LSM ownership correctness.
+The full-text residency controller now follows that boundary. Every persistent
+text writer publishes a conservative resident estimate to the separate
+`full_text.segment_residency` slice while also exposing virtual mapped,
+recently touched, cold mapped, and eviction counters in memory attribution.
+Virtual mapping length is not charged after clean pages are advised cold. Query
+and filter entry points mark the segment resident and maintain an active-reader
+pin; the estimator is refreshed at most once per second from normal snapshot
+acquisition.
+
+`ResourceManager` returns `shrink_cache` at both limits but never invokes owner
+code under its mutex. The writer responds after the decision by selecting the
+coldest clean live mapping. Soft pressure preserves every segment touched in
+the previous 30 seconds; hard pressure lowers that threshold to five seconds,
+and active readers are never selected. Eviction is race-safe: an evicting state
+prevents a concurrent touch from being overwritten after `madvise(DONTNEED)`.
+The virtual mapping and snapshot pins remain intact, so a later access faults
+pages back normally and restores conservative accounting. Retired mappings
+retain the existing immediate advice-before-release path and therefore remain
+the first reclamation tier.
+
+Default residency limits are 512 MiB soft and 768 MiB hard. Provisioned storage
+scales the hard limit to one eighth of detected memory, clamped between 256 MiB
+and 2 GiB, with a 75 percent soft watermark. Multiple indexes aggregate through
+the shared manager while retaining per-writer ownership of selection and
+advice. Closing or replacing a writer releases its contribution. The focused
+ReleaseFast resource gate covers coldest-first eviction, soft-window
+hysteresis, active-reader protection, rewarming, aggregate accounting, and
+accounting release; it passes 19/19 without leaks.
+
+The validated 650K release load accepts the LSM process-memory gate. The next
+production load must quantify the new text-residency counters and final RSS;
+merge allocator retention remains a separately measured optimization target.
 
 ## Result Artifact
 
@@ -2257,7 +2313,7 @@ Postings and block-max changes affect persistent compatibility. All experiments
 must retain version dispatch for formats that have actually shipped. At the
 start of this work, `origin/main` both writes and accepts exactly inverted-index
 wire format v23. The production upgrade contract is therefore v23 to the
-accepted v35 layout. Intermediate v24-v34 plus rejected v36-v37 formats created only during this
+accepted v38 layout. Intermediate v24-v37 formats created only during this
 branch's experiments are not release contracts: the production reader rejects
 them rather than carrying their codecs indefinitely. Benchmark artifacts that
 use those formats may be inspected with the corresponding historical binary or

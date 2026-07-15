@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const cache_budget = @import("../common/cache_budget.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 pub const Key = [32]u8;
 

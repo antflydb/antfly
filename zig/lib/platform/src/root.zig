@@ -14,7 +14,9 @@
 
 pub const allocator = @import("allocator.zig");
 pub const atomic = @import("atomic.zig");
+pub const clock = @import("clock.zig");
 pub const env = @import("env.zig");
 pub const process = @import("process.zig");
+pub const process_memory = @import("process_memory.zig");
 pub const sync = @import("sync.zig");
 pub const time = @import("time.zig");

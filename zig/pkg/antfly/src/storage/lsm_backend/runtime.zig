@@ -26,7 +26,7 @@ const cache_mod = @import("cache.zig");
 const repository_mod = @import("repository.zig");
 const state_mod = @import("state.zig");
 const storage_io = @import("storage_io.zig");
-const platform_time = @import("../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 const Run = repository_mod.Run;
 const State = state_mod.State;

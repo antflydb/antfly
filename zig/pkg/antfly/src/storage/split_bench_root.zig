@@ -15,7 +15,7 @@
 const docstore = @import("docstore.zig");
 const shard = @import("shard.zig");
 
-pub const platform_time = @import("../platform/time.zig");
+pub const platform_time = @import("antfly_platform").time;
 pub const DocStore = docstore.DocStore;
 pub const DocStoreOptions = docstore.DocStoreOptions;
 pub const KVPair = docstore.KVPair;

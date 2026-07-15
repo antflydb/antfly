@@ -18,6 +18,12 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--pid-file", required=True, type=Path)
     parser.add_argument("--log-file", required=True, type=Path)
     parser.add_argument("--binary", required=True, type=Path)
+    parser.add_argument(
+        "--server-subcommand",
+        choices=("standalone", "swarm"),
+        default="standalone",
+        help="server entry point exposed by the selected Antfly binary",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", required=True, type=int)
     parser.add_argument("--health-port", required=True, type=int)
@@ -71,7 +77,7 @@ def start(args: argparse.Namespace) -> int:
     args.log_file.parent.mkdir(parents=True, exist_ok=True)
     command = [
         str(args.binary),
-        "swarm",
+        args.server_subcommand,
         "--host",
         args.host,
         "--port",

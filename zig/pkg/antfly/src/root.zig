@@ -133,8 +133,8 @@ pub const synthesizing = @import("antfly_synthesizing");
 pub const asset_producer_runtime = @import("asset_producer_runtime.zig");
 
 // Storage backends
-pub const platform_clock = @import("platform/clock.zig");
-pub const platform_time = @import("platform/time.zig");
+pub const platform_clock = @import("antfly_platform").clock;
+pub const platform_time = @import("antfly_platform").time;
 pub const storage_backend = @import("storage/backend_types.zig");
 pub const storage_backend_erased = @import("storage/backend_erased.zig");
 pub const storage_maintenance = @import("storage/maintenance.zig");

@@ -14,7 +14,7 @@
 
 const derived_log = @import("db/derived/derived_log.zig");
 
-pub const platform_time = @import("../platform/time.zig");
+pub const platform_time = @import("antfly_platform").time;
 pub const DerivedLog = derived_log.DerivedLog;
 pub const FullStats = derived_log.FullStats;
 pub const OpenOptions = derived_log.OpenOptions;

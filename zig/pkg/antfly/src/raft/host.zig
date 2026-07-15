@@ -15,7 +15,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const raft_engine = @import("raft_engine");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const tracing = @import("../tracing/mod.zig");
 pub const catalog = @import("catalog.zig");
 const backup_restore = @import("storage/backup_restore.zig");

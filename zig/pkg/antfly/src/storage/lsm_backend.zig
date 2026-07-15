@@ -36,7 +36,7 @@ const cache_mod = @import("lsm_backend/cache.zig");
 const wal_mod = @import("lsm_backend/wal.zig");
 const internal_keys = @import("internal_keys.zig");
 const resource_manager_mod = @import("resource_manager.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 const State = state_mod.State;
 const ActiveMemTable = state_mod.ActiveMemTable;

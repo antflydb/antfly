@@ -31,7 +31,7 @@ const change_journal_mod = @import("db/derived/change_journal.zig");
 const internal_keys = @import("internal_keys.zig");
 const lsm_backend = @import("lsm_backend.zig");
 const mem_backend = @import("mem_backend.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const supports_lmdb = builtin.os.tag != .freestanding;
 const backend_lmdb_adapter = if (supports_lmdb) @import("backend_lmdb_adapter.zig") else struct {
     pub const Cursor = struct {

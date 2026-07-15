@@ -77,7 +77,7 @@ const lmdb_backend = if (supports_main_lmdb) @import("lmdb_backend.zig") else st
 const mem_backend = @import("mem_backend.zig");
 const lsm_backend = @import("lsm_backend/mod.zig");
 const storage_io = lsm_backend.storage_io;
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const wal_mod = if (builtin.os.tag == .freestanding) @import("portable_wal.zig") else @import("wal.zig");
 const storage_sim = @import("sim_runtime.zig");
 const sim_fixture = @import("sim_fixture.zig");
@@ -88,6 +88,7 @@ const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
     pub const sim = struct {};
 };
 const index_mod = @import("../index.zig");
+const resource_manager_mod = @import("resource_manager.zig");
 const segment_mod = @import("../segment.zig");
 const inverted_mod = @import("../section/inverted.zig");
 const introducer_mod = @import("../introducer.zig");
@@ -243,6 +244,11 @@ pub const PersistentIndexStats = struct {
 pub const PersistentIndexMemoryStats = struct {
     configured_lmdb_main_map_bytes: u64 = 0,
     configured_lmdb_wal_map_bytes: u64 = 0,
+    segment_virtual_mapped_bytes: u64 = 0,
+    segment_estimated_resident_bytes: u64 = 0,
+    segment_recently_touched_bytes: u64 = 0,
+    segment_cold_mapped_bytes: u64 = 0,
+    segment_residency_evictions: u64 = 0,
 };
 
 const SegmentFileStore = struct {
@@ -713,6 +719,10 @@ pub const PersistentIndex = struct {
         return store.storage_owner != null;
     }
 
+    pub fn attachResourceManager(self: *PersistentIndex, manager: *resource_manager_mod.ResourceManager) void {
+        self.writer.attachResourceManager(manager);
+    }
+
     const MainTxn = struct {
         read: ?backend_erased.NamespaceReadTxn = null,
         write: ?backend_erased.NamespaceWriteTxn = null,
@@ -1119,10 +1129,12 @@ pub const PersistentIndex = struct {
         if (self.read_only) return error.ReadOnly;
 
         const retired_cleanup = self.writer.retired_segment_cleanup;
+        const resource_manager = self.writer.resource_manager;
         var replacement_writer = try index_mod.IndexWriter.init(self.alloc);
         var replacement_writer_moved = false;
         defer if (!replacement_writer_moved) replacement_writer.deinit();
         replacement_writer.setRetiredSegmentCleanup(retired_cleanup);
+        if (resource_manager) |manager| replacement_writer.attachResourceManager(manager);
 
         self.lockStorage();
         defer self.unlockStorage();
@@ -1510,10 +1522,16 @@ pub const PersistentIndex = struct {
         };
     }
 
-    pub fn memoryStatsSnapshot(self: *const PersistentIndex) PersistentIndexMemoryStats {
+    pub fn memoryStatsSnapshot(self: *PersistentIndex) PersistentIndexMemoryStats {
+        const residency = self.writer.mappedResidencyStats();
         return .{
             .configured_lmdb_main_map_bytes = if (self.main_backend == .lmdb) @intCast(self.main_map_size) else 0,
             .configured_lmdb_wal_map_bytes = if (self.wal_backend == .lmdb) @intCast(self.wal_map_size) else 0,
+            .segment_virtual_mapped_bytes = residency.virtual_mapped_bytes,
+            .segment_estimated_resident_bytes = residency.estimated_resident_bytes,
+            .segment_recently_touched_bytes = residency.recently_touched_bytes,
+            .segment_cold_mapped_bytes = residency.cold_mapped_bytes,
+            .segment_residency_evictions = residency.eviction_count,
         };
     }
 

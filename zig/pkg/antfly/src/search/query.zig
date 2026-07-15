@@ -78,6 +78,8 @@ pub const Filter = union(enum) {
 
     /// Execute this filter against a single segment, returning matching doc IDs.
     pub fn execute(self: Filter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
+        seg.beginAccess();
+        defer seg.endAccess();
         return switch (self) {
             .term => |f| f.execute(alloc, seg),
             .bool_filter => |f| f.execute(alloc, seg),
