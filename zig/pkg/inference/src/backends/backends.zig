@@ -248,10 +248,38 @@ pub const SessionManager = struct {
 
 fn configuredPreferredBackends() []const BackendType {
     if (build_options.enable_wasm) return &.{.wasm};
+    if (requiredBackendOrder()) |backends| return backends;
     if (preferredBackendOverride()) |backend| {
         return preferredBackendsForOverride(backend);
     }
     return &.{ .metal, .native };
+}
+
+fn requiredBackend(backend: BackendType) []const BackendType {
+    return switch (backend) {
+        .onnx => &.{.onnx},
+        .metal => &.{.metal},
+        .cuda => &.{.cuda},
+        .pjrt => &.{.pjrt},
+        .native => &.{.native},
+        .wasm => &.{.wasm},
+    };
+}
+
+/// Fail before serving when an operator-required backend is not compiled into
+/// this binary or cannot create direct inference sessions.
+pub fn validateRequiredBackend() !void {
+    const order = requiredBackendOrder() orelse return;
+    return validateRequiredBackendOrder(order);
+}
+
+fn validateRequiredBackendOrder(order: []const BackendType) !void {
+    if (order.len != 1) return error.InvalidRequiredBackend;
+    const backend = order[0];
+    if (!backend.available() or !backend.supportsDirectSessionLoad()) {
+        std.log.err("required inference backend {s} is unavailable in this build", .{@tagName(backend)});
+        return error.RequiredBackendUnavailable;
+    }
 }
 
 fn preferredBackendsForOverride(backend: BackendType) []const BackendType {
@@ -295,6 +323,21 @@ test "preferred backend override keeps fallback backends" {
     try std.testing.expectEqualSlices(BackendType, &.{ .native, .onnx, .metal }, preferredBackendsForOverride(.native));
 }
 
+test "required backend override is strict" {
+    try std.testing.expectEqualSlices(BackendType, &.{.cuda}, requiredBackend(.cuda));
+    try std.testing.expectEqual(BackendType.cuda, parseBackendOverride("CUDA").?);
+    try std.testing.expect(parseBackendOverride("unknown") == null);
+}
+
+test "required backend validation rejects unavailable builds" {
+    try std.testing.expectError(error.InvalidRequiredBackend, validateRequiredBackendOrder(&.{}));
+    if (build_options.enable_cuda)
+        try validateRequiredBackendOrder(&.{.cuda})
+    else
+        try std.testing.expectError(error.RequiredBackendUnavailable, validateRequiredBackendOrder(&.{.cuda}));
+    try std.testing.expectError(error.RequiredBackendUnavailable, validateRequiredBackendOrder(&.{.pjrt}));
+}
+
 test "session manager normalizes provider pool size" {
     var manager = SessionManager.init(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), manager.pool_size);
@@ -327,7 +370,17 @@ fn preferredBackendOverride() ?BackendType {
     const value = std.c.getenv("ANTFLY_INFERENCE_PREFERRED_BACKEND") orelse
         std.c.getenv("TERMITE_PREFERRED_BACKEND") orelse
         return null;
-    const slice = std.mem.span(value);
+    return parseBackendOverride(std.mem.span(value));
+}
+
+fn requiredBackendOrder() ?[]const BackendType {
+    if (build_options.enable_wasm or !build_options.link_libc) return null;
+    const value = std.c.getenv("ANTFLY_INFERENCE_REQUIRED_BACKEND") orelse return null;
+    const backend = parseBackendOverride(std.mem.span(value)) orelse return &.{};
+    return requiredBackend(backend);
+}
+
+fn parseBackendOverride(slice: []const u8) ?BackendType {
     if (std.ascii.eqlIgnoreCase(slice, "auto")) return null;
     if (std.ascii.eqlIgnoreCase(slice, "onnx")) return .onnx;
     if (std.ascii.eqlIgnoreCase(slice, "metal")) return .metal;

@@ -755,6 +755,7 @@ pub const LoadedModel = struct {
     manager_lru_tick: u64 = 0,
     manager_active_protections: usize = 0,
     manager_active_uses: usize = 0,
+    prompt_cache_pending_config: ?runtime.kv.prompt_cache.Config = null,
 
     pub fn getTokenizer(self: *LoadedModel) tokenizer_mod.Tokenizer {
         if (self.hf_tok) |ht| return ht.tokenizer();
@@ -1125,6 +1126,7 @@ pub const ModelManager = struct {
     const RequestModel = struct {
         model: *LoadedModel,
         used: bool,
+        deferred_prompt_cache_config: ?runtime.kv.prompt_cache.Config = null,
     };
 
     const ActiveRequest = struct {
@@ -1309,21 +1311,66 @@ pub const ModelManager = struct {
 
     pub fn endRequest(self: *ModelManager, request_id: u64, now_ms: u64) void {
         self.lockState();
+
+        // Most requests never have deferred prompt-cache work. Coordinate with
+        // rebalances only when this request would release the last active use.
+        var coordinate_prompt_cache = false;
+        const active_request = self.active_requests.getPtr(request_id).?;
+        for (active_request.models.items) |entry| {
+            if (entry.used and
+                entry.model.manager_active_uses == 1 and
+                entry.model.prompt_cache_pending_config != null)
+            {
+                coordinate_prompt_cache = true;
+                break;
+            }
+        }
+        var rebalance_io: ?std.Io = null;
+        if (coordinate_prompt_cache) {
+            self.unlockState();
+            rebalance_io = lockIoMutexWithoutIo(&self.prompt_cache_rebalance_lock);
+            self.lockState();
+        }
+        defer if (rebalance_io) |io| self.prompt_cache_rebalance_lock.unlock(io);
+
         self.observeNowLocked(now_ms);
         var request = self.active_requests.fetchRemove(request_id).?.value;
         std.debug.assert(request.transient_leases == 0);
-        for (request.models.items) |entry| {
+        for (request.models.items) |*entry| {
             const model = entry.model;
             std.debug.assert(model.manager_active_protections > 0);
-            model.manager_active_protections -= 1;
             if (entry.used) {
                 std.debug.assert(model.manager_active_uses > 0);
                 model.manager_active_uses -= 1;
-                if (model.manager_active_uses == 0) model.manager_last_used_ms = self.latest_now_ms;
+                if (model.manager_active_uses == 0) {
+                    model.manager_last_used_ms = self.latest_now_ms;
+                    if (model.prompt_cache_pending_config) |config| {
+                        model.prompt_cache_pending_config = null;
+                        entry.deferred_prompt_cache_config = config;
+                        continue;
+                    }
+                }
+            }
+            model.manager_active_protections -= 1;
+        }
+        self.unlockState();
+
+        // The request protection pins each deferred model while cache-local
+        // eviction runs without blocking unrelated model lifecycle work.
+        for (request.models.items) |entry| {
+            if (entry.deferred_prompt_cache_config) |config| {
+                entry.model.prompt_prefix_cache.configure(config);
             }
         }
-        request.models.deinit(self.allocator);
+        self.lockState();
+        for (request.models.items) |entry| {
+            if (entry.deferred_prompt_cache_config != null) {
+                std.debug.assert(entry.model.manager_active_protections > 0);
+                entry.model.manager_active_protections -= 1;
+            }
+        }
         self.unlockState();
+        request.models.deinit(self.allocator);
         self.sweepModels();
     }
 
@@ -1704,8 +1751,8 @@ pub const ModelManager = struct {
     }
 
     /// Apply one node-wide prompt-cache target to the cache being activated and
-    /// every participating cache. configure() synchronously evicts
-    /// entries against their estimated logical cache bytes.
+    /// every participating cache. The caller serializes `include` generation;
+    /// active peers defer eviction until their last request ends.
     pub fn rebalancePromptCaches(
         self: *ModelManager,
         include: *LoadedModel,
@@ -1745,7 +1792,9 @@ pub const ModelManager = struct {
         while (it.next()) |entry| {
             const model = entry.value_ptr.*;
             if (model != include and model.prompt_prefix_cache.participatesInBudget()) {
-                targets.appendAssumeCapacity(model);
+                if (model.manager_active_uses == 0) {
+                    targets.appendAssumeCapacity(model);
+                }
             }
         }
         for (targets.items) |model| {
@@ -1755,7 +1804,20 @@ pub const ModelManager = struct {
                 return;
             }
         }
-        for (targets.items) |model| model.manager_active_protections += 1;
+        for (targets.items) |model| {
+            model.manager_active_protections += 1;
+            model.prompt_cache_pending_config = null;
+        }
+        it = self.loaded.iterator();
+        while (it.next()) |entry| {
+            const model = entry.value_ptr.*;
+            if (model != include and
+                model.manager_active_uses > 0 and
+                model.prompt_prefix_cache.participatesInBudget())
+            {
+                model.prompt_cache_pending_config = per_cache;
+            }
+        }
         self.unlockState();
         defer {
             self.lockState();
@@ -1766,8 +1828,6 @@ pub const ModelManager = struct {
             self.unlockState();
         }
 
-        // configure() owns its cache-local mutex and may synchronously evict;
-        // never do that work while blocking unrelated model lookups/lifecycle.
         for (targets.items) |model| model.prompt_prefix_cache.configure(per_cache);
     }
 
@@ -2043,16 +2103,6 @@ pub const ModelManager = struct {
         errdefer {
             model.deinit();
             self.allocator.destroy(model);
-        }
-
-        if (build_options.enable_metal and shouldUseMetalWholeModelExecutor(session)) {
-            if (session_factory.getGptConfig(session)) |gpt_config| {
-                if (graph_mod.metal_executor.supportsSession(session)) {
-                    _ = graph_mod.metal_executor.prewarmSharedDecoderRuntime(self.allocator, session, gpt_config) catch |err| {
-                        std.log.warn("metal decoder-runtime prewarm failed for {s}: {s}", .{ model_dir, @errorName(err) });
-                    };
-                }
-            }
         }
 
         // Publish by actual loaded session backend. Cold I/O stays outside the
@@ -2344,6 +2394,7 @@ test "model manager failed transient activation holds capacity until cleanup" {
     cached.manager_lru_tick = 0;
     cached.manager_active_protections = 0;
     cached.manager_active_uses = 0;
+    cached.prompt_cache_pending_config = null;
     try manager.loaded.put(std.testing.allocator, "cached", &cached);
     defer _ = manager.loaded.remove("cached");
 
@@ -2498,11 +2549,13 @@ test "model manager evicts a completed request model while an older request rema
     first_model.manager_lru_tick = 0;
     first_model.manager_active_protections = 0;
     first_model.manager_active_uses = 0;
+    first_model.prompt_cache_pending_config = null;
     var second_model: LoadedModel = undefined;
     second_model.manager_last_used_ms = 0;
     second_model.manager_lru_tick = 0;
     second_model.manager_active_protections = 0;
     second_model.manager_active_uses = 0;
+    second_model.prompt_cache_pending_config = null;
     try manager.loaded.put(std.testing.allocator, "first", &first_model);
     defer _ = manager.loaded.remove("first");
     try manager.loaded.put(std.testing.allocator, "second", &second_model);
@@ -2537,6 +2590,7 @@ test "model manager outer request protects a configured preload batch" {
     model.manager_lru_tick = 0;
     model.manager_active_protections = 0;
     model.manager_active_uses = 0;
+    model.prompt_cache_pending_config = null;
     try manager.loaded.put(std.testing.allocator, "first", &model);
     defer _ = manager.loaded.remove("first");
 
@@ -2595,6 +2649,7 @@ test "model manager snapshots protect pointers without refreshing model use" {
     model.manager_lru_tick = 0;
     model.manager_active_protections = 0;
     model.manager_active_uses = 0;
+    model.prompt_cache_pending_config = null;
     try manager.loaded.put(std.testing.allocator, "model", &model);
     defer _ = manager.loaded.remove("model");
 
@@ -2608,6 +2663,74 @@ test "model manager snapshots protect pointers without refreshing model use" {
     try std.testing.expectEqual(@as(usize, 0), model.manager_active_uses);
     manager.endRequest(request_id, 11);
     try std.testing.expectEqual(@as(u64, 7), model.manager_last_used_ms);
+}
+
+const PromptCacheStateLockObserver = struct {
+    manager: *ModelManager,
+    calls: usize = 0,
+    saw_locked_state: bool = false,
+
+    fn update(context: *anyopaque, current: *u64, next: u64) void {
+        const self: *PromptCacheStateLockObserver = @ptrCast(@alignCast(context));
+        current.* = next;
+        if (self.manager.state_lock.tryLock()) {
+            self.manager.state_lock.unlock();
+        } else {
+            self.saw_locked_state = true;
+        }
+        self.calls += 1;
+    }
+};
+
+test "model manager defers active peer prompt cache rebalance outside state lock" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer manager.deinit();
+
+    var include: LoadedModel = undefined;
+    include.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    include.manager_active_protections = 0;
+    include.manager_active_uses = 0;
+    include.prompt_cache_pending_config = null;
+    defer include.prompt_prefix_cache.deinit();
+    var active_peer: LoadedModel = undefined;
+    active_peer.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    active_peer.manager_active_protections = 0;
+    active_peer.manager_active_uses = 0;
+    active_peer.prompt_cache_pending_config = null;
+    defer active_peer.prompt_prefix_cache.deinit();
+    try manager.loaded.put(allocator, "include", &include);
+    defer _ = manager.loaded.remove("include");
+    try manager.loaded.put(allocator, "active", &active_peer);
+    defer _ = manager.loaded.remove("active");
+
+    const initial: runtime.kv.prompt_cache.Config = .{ .enabled = true, .max_bytes = 100 };
+    include.prompt_prefix_cache.configure(initial);
+    active_peer.prompt_prefix_cache.configure(initial);
+    const request_id = try manager.beginRequest(1);
+    _ = (try manager.lookupAndTouch("active", request_id)).?;
+
+    var observer = PromptCacheStateLockObserver{ .manager = &manager };
+    manager.rebalancePromptCaches(&include, .{
+        .enabled = true,
+        .max_bytes = 20,
+        .resource_usage_observer = .{
+            .context = &observer,
+            .update = PromptCacheStateLockObserver.update,
+        },
+    });
+
+    try std.testing.expectEqual(@as(usize, 10), include.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expectEqual(@as(usize, 100), active_peer.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expectEqual(@as(usize, 10), active_peer.prompt_cache_pending_config.?.max_bytes);
+    try std.testing.expectEqual(@as(usize, 1), observer.calls);
+    try std.testing.expect(!observer.saw_locked_state);
+
+    manager.endRequest(request_id, 2);
+    try std.testing.expectEqual(@as(usize, 10), active_peer.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expectEqual(@as(?runtime.kv.prompt_cache.Config, null), active_peer.prompt_cache_pending_config);
+    try std.testing.expectEqual(@as(usize, 2), observer.calls);
+    try std.testing.expect(!observer.saw_locked_state);
 }
 
 test "model manager coalesces an in-flight load result for waiters" {

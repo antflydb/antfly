@@ -160,6 +160,19 @@ pub const Config = struct {
     };
 
     pub const InferenceConfig = struct {
+        pub const PromptCacheMode = enum {
+            simple,
+            block_hash,
+        };
+
+        pub const PromptCacheConfig = struct {
+            enabled: bool = false,
+            mode: PromptCacheMode = .block_hash,
+            max_bytes_mb: usize = 512,
+            min_tokens: usize = 64,
+            ttl_ms: u64 = 300_000,
+        };
+
         pub const QueryEmbeddingCacheConfig = struct {
             enabled: bool = true,
             max_bytes_mb: usize = 64,
@@ -191,6 +204,7 @@ pub const Config = struct {
         content_security: ?ContentSecurityConfig = null,
         s3_credentials: ?S3CredentialsConfig = null,
         preload: []WarmModelConfig = &.{},
+        prompt_cache: PromptCacheConfig = .{},
         query_embedding_cache: QueryEmbeddingCacheConfig = .{},
         keep_alive_ms: u64 = 300_000,
         max_loaded_models: usize = 10,
@@ -583,6 +597,10 @@ pub const Config = struct {
             try queryEmbeddingCacheFromOpenApi(inference.query_embedding_cache)
         else
             Config.InferenceConfig.QueryEmbeddingCacheConfig{};
+        const prompt_cache = if (validated.value.inference) |inference|
+            try promptCacheFromOpenApi(inference.prompt_cache)
+        else
+            Config.InferenceConfig.PromptCacheConfig{};
         const inference_keep_alive_ms = if (validated.value.inference) |inference|
             try parseGoDurationMs(inference.keep_alive orelse "5m")
         else
@@ -632,6 +650,7 @@ pub const Config = struct {
                 .content_security = if (inference.content_security) |security| try contentSecurityFromOpenApi(alloc, security) else null,
                 .s3_credentials = try parseRawInferenceS3Credentials(alloc, raw_root, inference.s3_credentials),
                 .preload = try parseInferencePreloadModels(alloc, raw_root.get("inference")),
+                .prompt_cache = prompt_cache,
                 .query_embedding_cache = query_embedding_cache,
                 .keep_alive_ms = inference_keep_alive_ms,
                 .max_loaded_models = inference_max_loaded_models,
@@ -1848,6 +1867,32 @@ fn queryEmbeddingCacheFromOpenApi(
     };
 }
 
+fn promptCacheFromOpenApi(
+    value: ?inference_config_openapi.PromptCacheConfig,
+) !Config.InferenceConfig.PromptCacheConfig {
+    const config = value orelse return .{};
+    const max_bytes_mb = try nonNegativeUsize(config.max_bytes_mb orelse 512);
+    if (max_bytes_mb > std.math.maxInt(usize) / (1024 * 1024)) return error.InvalidConfig;
+    const min_tokens = try nonNegativeUsize(config.min_tokens orelse 64);
+    const ttl_ms_raw = config.ttl_ms orelse 300_000;
+    if (ttl_ms_raw < 0) return error.InvalidConfig;
+    const ttl_ms = std.math.cast(u64, ttl_ms_raw) orelse return error.InvalidConfig;
+    const mode_raw = config.mode orelse "block_hash";
+    const mode: Config.InferenceConfig.PromptCacheMode = if (std.mem.eql(u8, mode_raw, "block_hash"))
+        .block_hash
+    else if (std.mem.eql(u8, mode_raw, "simple"))
+        .simple
+    else
+        return error.InvalidConfig;
+    return .{
+        .enabled = config.enabled orelse false,
+        .mode = mode,
+        .max_bytes_mb = max_bytes_mb,
+        .min_tokens = min_tokens,
+        .ttl_ms = ttl_ms,
+    };
+}
+
 fn nonNegativeUsize(value: i64) !usize {
     if (value < 0) return error.InvalidConfig;
     return std.math.cast(usize, value) orelse error.InvalidConfig;
@@ -2161,6 +2206,13 @@ test "common config extracts antfly settings" {
         \\    "max_loaded_models": 3,
         \\    "max_concurrent_requests": 4,
         \\    "pool_size": 2,
+        \\    "prompt_cache": {
+        \\      "enabled": true,
+        \\      "mode": "simple",
+        \\      "max_bytes_mb": 256,
+        \\      "min_tokens": 32,
+        \\      "ttl_ms": 60000
+        \\    },
         \\    "query_embedding_cache": {
         \\      "enabled": false,
         \\      "max_bytes_mb": 128,
@@ -2196,6 +2248,11 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqual(@as(usize, 3), cfg.inference.max_loaded_models);
     try std.testing.expectEqual(@as(usize, 4), cfg.inference.max_concurrent_requests);
     try std.testing.expectEqual(@as(usize, 2), cfg.inference.pool_size);
+    try std.testing.expect(cfg.inference.prompt_cache.enabled);
+    try std.testing.expectEqual(Config.InferenceConfig.PromptCacheMode.simple, cfg.inference.prompt_cache.mode);
+    try std.testing.expectEqual(@as(usize, 256), cfg.inference.prompt_cache.max_bytes_mb);
+    try std.testing.expectEqual(@as(usize, 32), cfg.inference.prompt_cache.min_tokens);
+    try std.testing.expectEqual(@as(u64, 60_000), cfg.inference.prompt_cache.ttl_ms);
     try std.testing.expect(!cfg.inference.query_embedding_cache.enabled);
     try std.testing.expectEqual(@as(usize, 128), cfg.inference.query_embedding_cache.max_bytes_mb);
     try std.testing.expectEqual(@as(u64, 45_000), cfg.inference.query_embedding_cache.ttl_ms);
@@ -2276,6 +2333,30 @@ test "common config rejects out of range query embedding cache policy" {
         \\  }
         \\}
     ));
+}
+
+test "common config accepts zero and rejects invalid prompt cache policy" {
+    const alloc = std.testing.allocator;
+    const zero_raw =
+        \\{"inference":{"api_url":"http://127.0.0.1:8090","prompt_cache":{"max_bytes_mb":0,"min_tokens":0,"ttl_ms":0}}}
+    ;
+    var zero = try Config.parseFromSlice(alloc, zero_raw);
+    defer zero.deinit();
+    try std.testing.expectEqual(@as(usize, 0), zero.inference.prompt_cache.max_bytes_mb);
+    try std.testing.expectEqual(@as(usize, 0), zero.inference.prompt_cache.min_tokens);
+    try std.testing.expectEqual(@as(u64, 0), zero.inference.prompt_cache.ttl_ms);
+
+    inline for (.{
+        \\{"inference":{"api_url":"http://127.0.0.1:8090","prompt_cache":{"mode":"unknown"}}}
+        ,
+        \\{"inference":{"api_url":"http://127.0.0.1:8090","prompt_cache":{"max_bytes_mb":-1}}}
+        ,
+        \\{"inference":{"api_url":"http://127.0.0.1:8090","prompt_cache":{"min_tokens":-1}}}
+        ,
+        \\{"inference":{"api_url":"http://127.0.0.1:8090","prompt_cache":{"ttl_ms":-1}}}
+    }) |raw| {
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, raw));
+    }
 }
 
 test "common config defaults shard scalar fields" {

@@ -492,20 +492,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return error.DeepSeekV4CompressedGraphModeNotSupported;
     }
 
-    if (build_options.enable_metal and
-        graph_mode and
-        explicit_partition_backend == .metal and
-        compiled_attachment_target == .whole_model and
-        effective_draft_model == null and
-        opts.image_count == 0 and
-        opts.audio_count == 0 and
-        graph_mod.metal_executor.supportsSession(model.session))
-    {
-        _ = graph_mod.metal_executor.prewarmSharedDecoderRuntime(allocator, model.session, gpt_config) catch |err| {
-            std.log.warn("metal decoder-runtime prewarm failed for {s}: {s}", .{ opts.model_dir, @errorName(err) });
-        };
-    }
-
     debugGenerateSetup("live whole-model executor probe begin", .{});
     if (try tryRunLiveWholeModelExecutorGenerate(
         allocator,
@@ -571,6 +557,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (opts.print_timing and kv_dtype != requested_kv_dtype) {
         print("cache_dtype_effective: requested={s} effective={s}\n", .{ @tagName(requested_kv_dtype), @tagName(kv_dtype) });
     }
+    var graph_cache = graph_mod.cache.GraphCache.init(allocator);
+    defer graph_cache.deinit();
     const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
         .native => .cpu,
         else => .gpu,
@@ -630,6 +618,25 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 return err;
             };
         }
+    }
+    if (build_options.enable_metal and
+        graph_mode and
+        explicit_partition_backend == .metal and
+        compiled_attachment_target == .whole_model and
+        effective_draft_model == null and
+        opts.image_count == 0 and
+        opts.audio_count == 0 and
+        graph_mod.metal_executor.supportsSession(model.session))
+    {
+        _ = graph_mod.metal_executor.prewarmCompiledDecoderRuntime(
+            model.session,
+            gpt_config,
+            kv_dtype,
+            model.shared_moe_cache,
+            &graph_cache,
+        ) catch |err| {
+            std.log.warn("metal decoder-runtime prewarm failed for {s}: {s}", .{ opts.model_dir, @errorName(err) });
+        };
     }
     debugGenerateSetup("compute backend begin", .{});
     var cb = session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget) catch |err| {
@@ -754,8 +761,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     }
 
     const use_scheduler = !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and !graph_mode and !decoder_runtime_scheduler_override and nativeGenerateSchedulerEnabled();
-    var graph_cache = graph_mod.cache.GraphCache.init(allocator);
-    defer graph_cache.deinit();
     var pjrt_client: ?pjrt_lib.pjrt.Client = null;
     defer if (pjrt_client) |*client| client.deinit();
     var pjrt_plugin_path: ?[:0]u8 = null;

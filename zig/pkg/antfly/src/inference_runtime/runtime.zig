@@ -201,24 +201,74 @@ pub fn runFromIterator(
     }
 }
 
+fn parseInferenceFileConfig(alloc: std.mem.Allocator, raw: []const u8) !common_config.Config {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    const source = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidConfig,
+    };
+    for (.{ "backend_priority", "model_strategies", "embedder_models_dir", "chunker_models_dir", "reranker_models_dir" }) |key| {
+        if (source.contains(key)) return error.InvalidConfig;
+    }
+
+    var inference_object = std.json.ObjectMap.empty;
+    defer inference_object.deinit(alloc);
+    try inference_object.put(alloc, "api_url", .{ .string = "http://127.0.0.1" });
+    var entries = source.iterator();
+    while (entries.next()) |entry| try inference_object.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
+
+    var root = std.json.ObjectMap.empty;
+    defer root.deinit(alloc);
+    try root.put(alloc, "inference", .{ .object = inference_object });
+    const normalized = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = root }, .{});
+    defer alloc.free(normalized);
+    return common_config.Config.parseFromSlice(alloc, normalized);
+}
+
+fn appendConfiguredPreloads(
+    alloc: std.mem.Allocator,
+    destination: *std.ArrayListUnmanaged(inference.server.WarmModel),
+    configured: []const common_config.Config.InferenceConfig.WarmModelConfig,
+) !void {
+    try destination.ensureUnusedCapacity(alloc, configured.len);
+    for (configured) |model| {
+        if (model.format != null or model.quantization != null) return error.InvalidConfig;
+        destination.appendAssumeCapacity(.{
+            .kind = parsePreloadModelKind(model.kind) orelse return error.InvalidConfig,
+            .name = model.name,
+            .backend = parseOptionalBackendType(model.backend) catch return error.InvalidConfig,
+            .format = model.format,
+            .quantization = model.quantization,
+        });
+    }
+}
+
 fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     var host: []const u8 = "127.0.0.1";
     var port: u16 = 8090;
     var models_dir: []const u8 = defaultModelsDir(alloc);
     var ml_dir: []const u8 = defaultMlDir(alloc);
+    var models_dir_set = false;
+    var ml_dir_set = false;
+    var config_path: ?[]const u8 = null;
     var budget_overrides_mb = BudgetOverridesMb{};
     var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
     defer preload_models.deinit(alloc);
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--host")) {
-            host = args.next() orelse host;
+            host = args.next() orelse return error.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--port")) {
-            if (args.next()) |p| port = std.fmt.parseInt(u16, p, 10) catch 8090;
+            port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
         } else if (std.mem.eql(u8, arg, "--models-dir")) {
-            models_dir = args.next() orelse models_dir;
+            models_dir = args.next() orelse return error.InvalidArguments;
+            models_dir_set = true;
         } else if (std.mem.eql(u8, arg, "--ml-dir")) {
-            ml_dir = args.next() orelse ml_dir;
+            ml_dir = args.next() orelse return error.InvalidArguments;
+            ml_dir_set = true;
+        } else if (std.mem.eql(u8, arg, "--config")) {
+            config_path = args.next() orelse return error.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--host-budget-mb")) {
             budget_overrides_mb.host_budget_mb = try parseBudgetMbArg(args);
         } else if (std.mem.eql(u8, arg, "--backend-budget-mb")) {
@@ -231,19 +281,56 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             budget_overrides_mb.scratch_budget_mb = try parseBudgetMbArg(args);
         } else if (std.mem.eql(u8, arg, "--preload-model")) {
             try preload_models.append(alloc, try parsePreloadModelFlag(args.next() orelse return error.InvalidArguments));
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            printUsage();
+            return;
+        } else {
+            std.debug.print("unknown inference run flag: {s}\n", .{arg});
+            return error.InvalidArguments;
         }
+    }
+
+    var loaded_config: ?common_config.Config = null;
+    defer if (loaded_config) |*config| config.deinit();
+    if (config_path) |path| {
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024 * 1024));
+        defer alloc.free(raw);
+        loaded_config = try parseInferenceFileConfig(alloc, raw);
+        if (!models_dir_set) models_dir = loaded_config.?.inference.models_dir orelse models_dir;
+        if (!ml_dir_set) ml_dir = loaded_config.?.inference.ml_dir orelse ml_dir;
+        try appendConfiguredPreloads(alloc, &preload_models, loaded_config.?.inference.preload);
     }
 
     std.debug.print("antfly inference\n", .{});
     std.debug.print("ai models: {s}\n", .{models_dir});
     std.debug.print("ml models: {s}\n", .{ml_dir});
 
-    var node = try inference.server.Node.init(alloc, .{
+    var node_config = inference.server.NodeConfig{
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
         .preload = preload_models.items,
-    });
+    };
+    if (loaded_config) |*config| {
+        if (config.inference.content_security) |security| node_config.content_security = security;
+        if (config.inference.s3_credentials) |credentials| node_config.s3_credentials = credentials;
+        node_config.keep_alive_ms = config.inference.keep_alive_ms;
+        node_config.max_loaded_models = config.inference.max_loaded_models;
+        node_config.max_concurrent_requests = config.inference.max_concurrent_requests;
+        node_config.pool_size = config.inference.pool_size;
+        node_config.prompt_cache = .{
+            .enabled = config.inference.prompt_cache.enabled,
+            .mode = switch (config.inference.prompt_cache.mode) {
+                .simple => .simple,
+                .block_hash => .block_hash,
+            },
+            .max_bytes_mb = config.inference.prompt_cache.max_bytes_mb,
+            .min_tokens = config.inference.prompt_cache.min_tokens,
+            .ttl_ms = config.inference.prompt_cache.ttl_ms,
+        };
+    }
+
+    var node = try inference.server.Node.init(alloc, node_config);
     defer node.deinit();
 
     try node.warmConfiguredGeneratorsWithIo(alloc, io);
@@ -567,6 +654,7 @@ fn printUsage() void {
         \\  convert     Convert a native ML model (XGBoost/LightGBM/ONNX) to the antfly tabular IR
         \\
         \\Run options:
+        \\  --config <path>  Inference JSON config file
         \\  --host <addr>    Listen address (default: 127.0.0.1)
         \\  --port <port>    Listen port (default: 8090)
         \\  --models-dir <dir> AI models directory (default: ~/.antfly/inference/models)
@@ -594,6 +682,65 @@ test "inference runtime module compiles" {
     _ = run;
     _ = runFromIterator;
     _ = spawnServerProcess;
+}
+
+test "inference run parses operator config" {
+    const raw =
+        \\{
+        \\  "keep_alive": "1h30m",
+        \\  "max_loaded_models": 3,
+        \\  "max_concurrent_requests": 4,
+        \\  "pool_size": 2,
+        \\  "prompt_cache": {"enabled":true,"mode":"simple","max_bytes_mb":256,"min_tokens":32,"ttl_ms":60000},
+        \\  "preload": [{"kind":"embedder","name":"antflydb/clipclap","backend":"metal"}]
+        \\}
+    ;
+    var config = try parseInferenceFileConfig(std.testing.allocator, raw);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(u64, 5_400_000), config.inference.keep_alive_ms);
+    try std.testing.expectEqual(@as(usize, 3), config.inference.max_loaded_models);
+    try std.testing.expectEqual(@as(usize, 4), config.inference.max_concurrent_requests);
+    try std.testing.expectEqual(@as(usize, 2), config.inference.pool_size);
+    try std.testing.expect(config.inference.prompt_cache.enabled);
+    try std.testing.expectEqual(common_config.Config.InferenceConfig.PromptCacheMode.simple, config.inference.prompt_cache.mode);
+    try std.testing.expectEqual(@as(usize, 256), config.inference.prompt_cache.max_bytes_mb);
+
+    var preload = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
+    defer preload.deinit(std.testing.allocator);
+    try appendConfiguredPreloads(std.testing.allocator, &preload, config.inference.preload);
+    try std.testing.expectEqual(@as(usize, 1), preload.items.len);
+    try std.testing.expectEqual(inference.server.WarmModelKind.embedder, preload.items[0].kind);
+    try std.testing.expectEqualStrings("antflydb/clipclap", preload.items[0].name);
+    try std.testing.expectEqual(inference.backends.BackendType.metal, preload.items[0].backend.?);
+}
+
+test "inference run rejects unsupported preload selectors" {
+    const raw =
+        \\{"preload":[{"kind":"generator","name":"antflydb/gemma-e2b","format":"gguf"}]}
+    ;
+    var config = try parseInferenceFileConfig(std.testing.allocator, raw);
+    defer config.deinit();
+    var preload = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
+    defer preload.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.InvalidConfig,
+        appendConfiguredPreloads(std.testing.allocator, &preload, config.inference.preload),
+    );
+}
+
+test "inference run rejects unsupported config fields" {
+    inline for (.{ "backend_priority", "model_strategies", "embedder_models_dir", "chunker_models_dir", "reranker_models_dir" }) |key| {
+        const raw = try std.fmt.allocPrint(std.testing.allocator, "{{\"{s}\":{{}}}}", .{key});
+        defer std.testing.allocator.free(raw);
+        try std.testing.expectError(error.InvalidConfig, parseInferenceFileConfig(std.testing.allocator, raw));
+    }
+}
+
+test "inference run rejects unknown flags" {
+    var argv = [_][*:0]const u8{"--not-a-real-flag"};
+    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try std.testing.expectError(error.InvalidArguments, runServer(std.heap.page_allocator, std.testing.io, &args));
 }
 
 test "inference pull recognizes help before model resolution" {

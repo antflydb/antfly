@@ -684,6 +684,7 @@ pub const Node = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: NodeConfig) !Node {
         if (config.pool_size == 0) return error.InvalidPoolSize;
+        try backends_mod.validateRequiredBackend();
         var node: Node = .{
             .config = config,
             .allocator = allocator,
@@ -698,7 +699,6 @@ pub const Node = struct {
         node.session_manager.setPoolSize(config.pool_size);
         node.model_manager.session_manager.setPoolSize(config.pool_size);
         node.model_manager.configureModelLifetime(config.max_loaded_models, config.keep_alive_ms);
-        node.updateQueueMetrics();
         return node;
     }
 
@@ -949,6 +949,22 @@ pub const Node = struct {
             return err;
         };
 
+        const use_metal_whole_model = build_options.enable_metal and
+            model.session.backend() == .metal and
+            graph_mod.metal_executor.supportsSession(model.session) and
+            !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config);
+        if (use_metal_whole_model) {
+            _ = graph_mod.metal_executor.prewarmCompiledDecoderRuntime(
+                model.session,
+                gpt_config,
+                kv_dtype,
+                model.shared_moe_cache,
+                &model.native_generation_graph_cache,
+            ) catch |err| {
+                std.log.warn("metal decoder-runtime prewarm failed for {s}: {s}", .{ model_path, @errorName(err) });
+            };
+        }
+
         var kv_manager = runtime.kv.manager.KvManager.init(allocator);
         defer kv_manager.deinit();
         var cb = session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget) catch |err| {
@@ -994,11 +1010,6 @@ pub const Node = struct {
         var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
         decode_state.kv_storage = &kv_storage;
         defer decode_state.deinit();
-
-        const use_metal_whole_model = build_options.enable_metal and
-            model.session.backend() == .metal and
-            graph_mod.metal_executor.supportsSession(model.session) and
-            !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config);
 
         var pipeline = generation.NativeGenerationPipeline{
             .allocator = allocator,
@@ -1270,8 +1281,6 @@ pub const Node = struct {
         defer io_impl.deinit();
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "readers");
-        var reader = try readers_mod.LoadedReader.loadFromDir(allocator, model_path, &self.session_manager, &self.model_manager, request_id);
-        defer reader.deinit();
 
         const out = try allocator.alloc(readers_api.Result, request.images.len);
         var initialized: usize = 0;
@@ -1299,6 +1308,9 @@ pub const Node = struct {
             downloaded_count += 1;
             image_datas[i] = downloaded[i].data;
         }
+
+        var reader = try readers_mod.LoadedReader.loadFromDir(allocator, model_path, &self.session_manager, &self.model_manager, request_id);
+        defer reader.deinit();
 
         const results = try reader.readBatch(image_datas, .{
             .prompt = request.prompt,
@@ -1413,10 +1425,8 @@ pub const Node = struct {
         if (required_units > queue_units) {
             self.request_queue.releaseUnits(queue_units);
             queue_units = 0;
-            self.updateQueueMetrics();
             try self.request_queue.acquireUnits(required_units);
             queue_units = required_units;
-            self.updateQueueMetrics();
         }
 
         var io_impl = std.Io.Threaded.init(allocator, .{});
@@ -1638,7 +1648,6 @@ pub const Node = struct {
         self.request_queue.acquireUnits(units) catch {
             self.metrics.incError();
             self.metrics.recordQueueRejection(requested_units);
-            self.updateQueueMetrics();
             try ctx.setHeader("Retry-After", "1");
             const resp = try ctx.status(503).json(.{
                 .@"error" = "SERVICE_UNAVAILABLE",
@@ -1648,10 +1657,8 @@ pub const Node = struct {
         };
         request_id.* = self.model_manager.beginRequest(modelLifecycleNowMs()) catch |err| {
             self.request_queue.releaseUnits(units);
-            self.updateQueueMetrics();
             return err;
         };
-        self.updateQueueMetrics();
         return null;
     }
 
@@ -1663,10 +1670,8 @@ pub const Node = struct {
         try self.request_queue.acquireUnits(units);
         const request_id = self.model_manager.beginRequest(modelLifecycleNowMs()) catch |err| {
             self.request_queue.releaseUnits(units);
-            self.updateQueueMetrics();
             return err;
         };
-        self.updateQueueMetrics();
         return request_id;
     }
 
@@ -1677,16 +1682,6 @@ pub const Node = struct {
     fn releaseSlotUnits(self: *Node, request_id: u64, units: usize) void {
         self.model_manager.endRequest(request_id, modelLifecycleNowMs());
         self.request_queue.releaseUnits(units);
-        self.updateQueueMetrics();
-    }
-
-    fn updateQueueMetrics(self: *Node) void {
-        const queue = self.request_queue.snapshot();
-        self.metrics.setQueueState(
-            queue.active_units,
-            queue.capacity,
-            queue.active_requests,
-        );
     }
 
     fn estimateHttpRequestQueueUnits(self: *Node, ctx: *httpx.Context) usize {
@@ -2100,9 +2095,6 @@ pub const Node = struct {
                 .message = "model not found; specify 'model' as a path or owner/name",
             });
 
-        const model = self.model_manager.loadFromDirForRequest(request_id, model_path) catch |err|
-            return modelLoadFailure(ctx, err);
-
         var parsed_docs = std.ArrayListUnmanaged(ParsedMultimodalRerankDocument).empty;
         defer {
             for (parsed_docs.items) |*doc| doc.deinit();
@@ -2120,6 +2112,11 @@ pub const Node = struct {
             if (parsed.images.len > 0) has_images = true;
             try parsed_docs.append(ctx.allocator, parsed);
         }
+
+        // Validate request-owned media before model admission. A rejected URL
+        // must not evict a healthy resident model at the configured capacity.
+        const model = self.model_manager.loadFromDirForRequest(request_id, model_path) catch |err|
+            return modelLoadFailure(ctx, err);
 
         if (!has_images) {
             const flat_texts = try ctx.allocator.alloc([]const u8, parsed_docs.items.len);
@@ -2871,6 +2868,64 @@ pub const Node = struct {
             }
         }
 
+        const prompt_cache_requested = config.prompt_cache_enabled and
+            (backend_kind == .native or backend_kind == .metal or backend_kind == .cuda) and
+            !backend_selection.graph_mode_requested and
+            backend_selection.compiled_partition_backend == null and
+            effective_draft_model_name == null and
+            config.cache_compaction_ratio == null;
+        const auto_metal_whole_model = shouldAutoUseMetalWholeModelGenerate(
+            model.session.backend(),
+            graph_mod.metal_executor.supportsSession(model.session),
+            generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config),
+            prompt_cache_requested,
+            backend_selection,
+        );
+        const effective_compiled_partition_backend: ?ops.BackendKind = if (auto_metal_whole_model)
+            .metal
+        else
+            backend_selection.compiled_partition_backend;
+        const effective_compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = if (auto_metal_whole_model)
+            .whole_model
+        else
+            backend_selection.compiled_attachment_target;
+        const graph_mode = backend_selection.graph_mode_requested or
+            effective_compiled_partition_backend != null or
+            graphModeEnabled();
+        const use_model_graph_cache = graph_mode and
+            build_options.enable_metal and
+            model.session.backend() == .metal and
+            effective_compiled_partition_backend == .metal and
+            effective_compiled_attachment_target == .whole_model and
+            graph_mod.metal_executor.supportsSession(model.session) and
+            !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config);
+
+        // Release a cached whole-model lease before an eager/partitioned
+        // request so that request reuses slot 0 instead of preparing slot 1.
+        // A request-specific KV dtype likewise must not replace the model's
+        // default persistent runtime. The native-generation lock makes these
+        // transitions exclusive for the model.
+        const reset_custom_graph_runtime = use_model_graph_cache and config.cache_dtype != null;
+        if (!use_model_graph_cache or reset_custom_graph_runtime) {
+            model.native_generation_graph_cache.resetSessionCompiledModelRuntime();
+        }
+        defer if (reset_custom_graph_runtime) model.native_generation_graph_cache.resetSessionCompiledModelRuntime();
+
+        // Warm the runtime that the pipeline will actually use before leasing
+        // the request compute backend. This keeps the prepared model on the
+        // persistent provider instead of preparing a second temporary slot.
+        if (use_model_graph_cache) {
+            _ = graph_mod.metal_executor.prewarmCompiledDecoderRuntime(
+                model.session,
+                gpt_config,
+                kv_dtype,
+                model.shared_moe_cache,
+                &model.native_generation_graph_cache,
+            ) catch |err| {
+                std.log.warn("metal decoder-runtime prewarm failed for {s}: {s}", .{ model_path, @errorName(err) });
+            };
+        }
+
         var kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
         defer kv_manager.deinit();
         var draft_kv_manager: ?runtime.kv.manager.KvManager = null;
@@ -2908,12 +2963,7 @@ pub const Node = struct {
         var active_kv_manager: *runtime.kv.manager.KvManager = &kv_manager;
         var active_kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null;
         var pool_id: runtime.kv.block.KvPoolId = undefined;
-        if (config.prompt_cache_enabled and (backend_kind == .native or backend_kind == .metal or backend_kind == .cuda) and
-            !backend_selection.graph_mode_requested and
-            backend_selection.compiled_partition_backend == null and
-            effective_draft_model_name == null and
-            config.cache_compaction_ratio == null)
-        {
+        if (prompt_cache_requested) {
             self.model_manager.rebalancePromptCachesWithIo(
                 ctx.io,
                 model,
@@ -2999,33 +3049,7 @@ pub const Node = struct {
             }
         }
 
-        const auto_metal_whole_model = shouldAutoUseMetalWholeModelGenerate(
-            model.session.backend(),
-            graph_mod.metal_executor.supportsSession(model.session),
-            generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config),
-            prompt_cache != null,
-            backend_selection,
-        );
-        const effective_compiled_partition_backend: ?ops.BackendKind = if (auto_metal_whole_model)
-            .metal
-        else
-            backend_selection.compiled_partition_backend;
-        const effective_compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = if (auto_metal_whole_model)
-            .whole_model
-        else
-            backend_selection.compiled_attachment_target;
-
-        const graph_mode = backend_selection.graph_mode_requested or
-            effective_compiled_partition_backend != null or
-            graphModeEnabled();
         const use_scheduler = !graph_mode;
-        const use_model_graph_cache = graph_mode and
-            build_options.enable_metal and
-            model.session.backend() == .metal and
-            effective_compiled_partition_backend == .metal and
-            effective_compiled_attachment_target == .whole_model and
-            graph_mod.metal_executor.supportsSession(model.session) and
-            !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config);
         var request_graph_cache: ?graph_mod.cache.GraphCache = if (graph_mode and !use_model_graph_cache)
             graph_mod.cache.GraphCache.init(ctx.allocator)
         else
@@ -3459,7 +3483,6 @@ pub const Node = struct {
         self.model_manager.endRequest(request_id, modelLifecycleNowMs());
         defer {
             self.request_queue.releaseUnits(queue_units);
-            self.updateQueueMetrics();
         }
         self.metrics.incRequest("generate_batch");
         defer self.metrics.decActive();
@@ -3606,6 +3629,10 @@ pub const Node = struct {
                     };
                 }
 
+                // Batch generation is eager. Release any persistent
+                // whole-model lease so this backend reuses provider slot 0
+                // instead of preparing an independent slot.
+                model.native_generation_graph_cache.resetSessionCompiledModelRuntime();
                 var cb = session_factory.getComputeBackendWithBudget(model.session, ctx.allocator, &run_budget) catch |err| {
                     for (group_indices.items) |idx| {
                         if (!pending[idx]) continue;
@@ -5146,30 +5173,6 @@ pub const Node = struct {
         const model_path = self.resolveModelPath(ctx.io, model_name, "readers") catch
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
 
-        var reader = readers_mod.LoadedReader.loadFromDir(
-            ctx.allocator,
-            model_path,
-            &self.session_manager,
-            &self.model_manager,
-            request_id,
-        ) catch |err| switch (err) {
-            error.ModelCapacityReached => return modelLoadFailure(ctx, err),
-            error.InvalidModelForReading => return ctx.status(400).json(.{
-                .@"error" = "INVALID_MODEL",
-                .message = "model does not support reading (missing encoder/decoder model files)",
-            }),
-            error.NativePix2StructNotYetSupported => return ctx.status(400).json(.{
-                .@"error" = "INVALID_MODEL",
-                .message = "native Pix2Struct reader checkpoints are not supported yet",
-            }),
-            error.MultiStageReaderNotYetSupported => return ctx.status(400).json(.{
-                .@"error" = "INVALID_MODEL",
-                .message = "multi-stage OCR model uses unsupported stages or configuration",
-            }),
-            else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) }),
-        };
-        defer reader.deinit();
-
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
         const alloc = arena.allocator();
@@ -5207,17 +5210,45 @@ pub const Node = struct {
                     .message = "failed to download image content",
                 }),
             };
-            errdefer item.deinit(ctx.allocator);
             batch_bytes = addReadBatchDownloadedBytes(batch_bytes, item, batch_byte_cap) catch |err| switch (err) {
-                error.ReadBatchTooLarge => return ctx.status(413).json(.{
-                    .@"error" = "BATCH_TOO_LARGE",
-                    .message = try std.fmt.allocPrint(ctx.allocator, "total downloaded image bytes must be at most {d}", .{batch_byte_cap}),
-                }),
+                error.ReadBatchTooLarge => {
+                    item.deinit(ctx.allocator);
+                    return ctx.status(413).json(.{
+                        .@"error" = "BATCH_TOO_LARGE",
+                        .message = try std.fmt.allocPrint(ctx.allocator, "total downloaded image bytes must be at most {d}", .{batch_byte_cap}),
+                    });
+                },
             };
             downloaded[i] = item;
             downloaded_count += 1;
             image_datas[i] = downloaded[i].data;
         }
+
+        // Download and validate the whole request before model admission so
+        // client errors cannot churn the resident model set.
+        var reader = readers_mod.LoadedReader.loadFromDir(
+            ctx.allocator,
+            model_path,
+            &self.session_manager,
+            &self.model_manager,
+            request_id,
+        ) catch |err| switch (err) {
+            error.ModelCapacityReached => return modelLoadFailure(ctx, err),
+            error.InvalidModelForReading => return ctx.status(400).json(.{
+                .@"error" = "INVALID_MODEL",
+                .message = "model does not support reading (missing encoder/decoder model files)",
+            }),
+            error.NativePix2StructNotYetSupported => return ctx.status(400).json(.{
+                .@"error" = "INVALID_MODEL",
+                .message = "native Pix2Struct reader checkpoints are not supported yet",
+            }),
+            error.MultiStageReaderNotYetSupported => return ctx.status(400).json(.{
+                .@"error" = "INVALID_MODEL",
+                .message = "multi-stage OCR model uses unsupported stages or configuration",
+            }),
+            else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) }),
+        };
+        defer reader.deinit();
 
         const results = reader.readBatch(image_datas, .{
             .prompt = body.prompt,
@@ -5883,6 +5914,16 @@ pub const Node = struct {
         // Core metrics via prometheus lib
         @constCast(&node.metrics).setModelsLoaded(node.model_manager.residentModelCount());
         try @constCast(&node.metrics).render(&writer.writer);
+
+        // Queue gauges are derived state. Render one coherent snapshot instead
+        // of publishing mutable copies from concurrent request transitions.
+        const queue = node.request_queue.snapshot();
+        const queue_capacity: i64 = if (queue.capacity == 0) -1 else @intCast(queue.capacity);
+        const queue_available: i64 = if (queue.capacity == 0) -1 else @intCast(queue.available);
+        try appendPromMetric(&writer.writer, "antfly_inference_request_queue_depth", "gauge", "Current weighted admission units", queue.active_units);
+        try appendPromSignedMetric(&writer.writer, "antfly_inference_request_queue_capacity", "gauge", "Configured weighted admission capacity (-1 means unlimited)", queue_capacity);
+        try appendPromSignedMetric(&writer.writer, "antfly_inference_request_queue_available", "gauge", "Available weighted admission capacity (-1 means unlimited)", queue_available);
+        try appendPromMetric(&writer.writer, "antfly_inference_request_queue_active_requests", "gauge", "Currently admitted requests", queue.active_requests);
 
         const lifetime_stats = node.model_manager.lifetimeStats();
         try appendPromMetric(&writer.writer, "antfly_inference_model_evictions_total", "counter", "Loaded model evictions", lifetime_stats.evictions);
@@ -6601,6 +6642,10 @@ fn freeEntityBatches(allocator: std.mem.Allocator, all_entities: []const []@impo
 }
 
 fn appendPromMetric(writer: *std.Io.Writer, name: []const u8, metric_type: []const u8, help: []const u8, value: u64) !void {
+    try writer.print("# HELP {s} {s}\n# TYPE {s} {s}\n{s} {d}\n", .{ name, help, name, metric_type, name, value });
+}
+
+fn appendPromSignedMetric(writer: *std.Io.Writer, name: []const u8, metric_type: []const u8, help: []const u8, value: i64) !void {
     try writer.print("# HELP {s} {s}\n# TYPE {s} {s}\n{s} {d}\n", .{ name, help, name, metric_type, name, value });
 }
 
