@@ -17075,9 +17075,11 @@ const TestHASeedSnapshotProvider = struct {
 test "data server wires configured HA executors into API server" {
     const alloc = std.testing.allocator;
     const FakeStatus = struct {
-        fn iface() antfly.public_api.http_server.StatusSource {
+        include_extension: bool = false,
+
+        fn iface(self: *@This()) antfly.public_api.http_server.StatusSource {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .status = status,
                     .admin_snapshot = adminSnapshot,
@@ -17090,7 +17092,8 @@ test "data server wires configured HA executors into API server" {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
 
-        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+        fn adminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
             return .{
                 .status = .{ .metadata_group_id = 1, .metadata_epoch = 7, .metrics = .{} },
                 .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
@@ -17109,6 +17112,15 @@ test "data server wires configured HA executors into API server" {
                 }})[0..]),
                 .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .extension_packages = if (self.include_extension)
+                    @constCast((&[_]antfly.extensions.PackageManifest{.{
+                        .name = "memoryaf",
+                        .version = "1.0.0",
+                        .digest = "sha256:fixture",
+                        .install = .{ .scopes_supported = &.{.cluster} },
+                    }})[0..])
+                else
+                    @constCast((&[_]antfly.extensions.PackageManifest{})[0..]),
                 .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
                 .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
             };
@@ -17118,9 +17130,11 @@ test "data server wires configured HA executors into API server" {
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        status: *FakeStatus,
+
+        fn iface(self: *@This()) antfly.public_api.table_catalog.CatalogSource {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
@@ -17128,8 +17142,9 @@ test "data server wires configured HA executors into API server" {
             };
         }
 
-        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
-            return try FakeStatus.adminSnapshot(undefined);
+        fn adminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try FakeStatus.adminSnapshot(self.status);
         }
 
         fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
@@ -17165,6 +17180,12 @@ test "data server wires configured HA executors into API server" {
     defer alloc.free(replica_catalog_path);
     const seed_capture_root = try std.fs.path.join(alloc, &.{ capture_fixture_root, "seed-captures" });
     defer alloc.free(seed_capture_root);
+    const extension_store_root = try std.fs.path.join(alloc, &.{ capture_fixture_root, "extensions" });
+    defer alloc.free(extension_store_root);
+    const extension_manifest_path = try std.fs.path.join(alloc, &.{ extension_store_root, "memoryaf/extension.json" });
+    defer alloc.free(extension_manifest_path);
+    const extension_runtime_path = try std.fs.path.join(alloc, &.{ extension_store_root, "memoryaf/runtime.wasm" });
+    defer alloc.free(extension_runtime_path);
     const capture_binding = antfly.ha.seed_artifact.LifecycleBinding{
         .topology_id = "topology-a",
         .topology_generation = 7,
@@ -17222,6 +17243,19 @@ test "data server wires configured HA executors into API server" {
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), restore_jobs_path) catch {};
 
+    try fs_paths.createDirPathPortable(io_impl.io(), std.fs.path.dirname(extension_manifest_path).?);
+    var extension_manifest_file = try std.Io.Dir.cwd().createFile(io_impl.io(), extension_manifest_path, .{ .truncate = true });
+    try extension_manifest_file.writeStreamingAll(io_impl.io(),
+        \\{"manifest_api_version":"extensions/v1","name":"memoryaf","version":"1.0.0","kind":"extension","digest":"sha256:fixture","install":{"scopes_supported":["cluster"]}}
+    );
+    try extension_manifest_file.sync(io_impl.io());
+    extension_manifest_file.close(io_impl.io());
+    var extension_runtime_file = try std.Io.Dir.cwd().createFile(io_impl.io(), extension_runtime_path, .{ .truncate = true });
+    try extension_runtime_file.writeStreamingAll(io_impl.io(), "portable-extension-runtime");
+    try extension_runtime_file.sync(io_impl.io());
+    extension_runtime_file.close(io_impl.io());
+    try fs_paths.syncDirPortable(io_impl.io(), std.fs.path.dirname(extension_manifest_path).?);
+
     var primary = try antfly.ha.primary.Primary.open(alloc, primary_log.ptr, primary_slots.ptr, .{
         .cluster_id = 100,
         .shard_id = 10,
@@ -17237,11 +17271,16 @@ test "data server wires configured HA executors into API server" {
     // the one unhealthy streaming standby whose reseed signal we exercise.
     try primary.markSlotReseedRequired("standby-a");
 
+    var fake_status = FakeStatus{};
+    var fake_catalog = FakeCatalog{ .status = &fake_status };
     var seed_snapshot_provider = TestHASeedSnapshotProvider{ .db_path = replica_db_path };
     var server = DataServer.initFromLocalMetadataSources(alloc, .{
         .replica_root_dir = replica_root,
         .replica_catalog_path = replica_catalog_path,
-        .api_server_cfg = .{ .restore_job_store_path = restore_jobs_path },
+        .api_server_cfg = .{
+            .restore_job_store_path = restore_jobs_path,
+            .extension_package_store_dir = extension_store_root,
+        },
         .ha = .{
             .admin_context = .{
                 .primary = &primary,
@@ -17253,7 +17292,7 @@ test "data server wires configured HA executors into API server" {
             .seed_snapshot_provider = seed_snapshot_provider.iface(),
             .primary_retention_policy = .{},
         },
-    }, FakeCatalog.iface(), FakeStatus.iface());
+    }, fake_catalog.iface(), fake_status.iface());
     defer server.deinit();
     try server.initApiServer();
 
@@ -17427,6 +17466,7 @@ test "data server wires configured HA executors into API server" {
     try std.testing.expectEqualStrings(capture_response.value.capture_receipt_sha256, capture_retry_response.value.capture_receipt_sha256);
 
     server.ha_cfg.seed_snapshot_provider = null;
+    fake_status.include_extension = true;
     var default_capture = try DataServer.captureHASeedCallback(
         &server,
         alloc,
@@ -17438,12 +17478,58 @@ test "data server wires configured HA executors into API server" {
     const default_topology_path = try std.fs.path.join(alloc, &.{ default_capture.capture.content_root, "TOPOLOGY.json" });
     defer alloc.free(default_topology_path);
     try std.Io.Dir.accessAbsolute(io_impl.io(), default_topology_path, .{});
+    const default_topology_json = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), default_topology_path, alloc, .limited(1024 * 1024));
+    defer alloc.free(default_topology_json);
+    var default_topology = try std.json.parseFromSlice(
+        antfly.ha.seed_materialization.Topology,
+        alloc,
+        default_topology_json,
+        .{ .ignore_unknown_fields = false },
+    );
+    defer default_topology.deinit();
+    try std.testing.expectEqual(@as(usize, 1), default_topology.value.catalog.extension_packages.len);
+    try std.testing.expectEqual(@as(usize, 2), default_topology.value.extension_artifacts.len);
+    for (default_topology.value.extension_artifacts) |artifact| {
+        const captured_extension_path = try std.fs.path.join(alloc, &.{ default_capture.capture.content_root, artifact.path });
+        defer alloc.free(captured_extension_path);
+        const source_extension_path = try std.fs.path.join(alloc, &.{ extension_store_root, artifact.path["extensions/".len..] });
+        defer alloc.free(source_extension_path);
+        const captured_extension = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), captured_extension_path, alloc, .limited(1024 * 1024));
+        defer alloc.free(captured_extension);
+        const source_extension = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), source_extension_path, alloc, .limited(1024 * 1024));
+        defer alloc.free(source_extension);
+        try std.testing.expectEqualStrings(source_extension, captured_extension);
+    }
     const default_raft_wal = try std.fs.path.join(alloc, &.{ default_capture.capture.content_root, "replicas/group-1/raft/wal-000001" });
     defer alloc.free(default_raft_wal);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io_impl.io(), default_raft_wal, .{}));
     const default_captured_slot = primary.slot("standby-default-provider") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(antfly.ha.slot_store.SlotLifecycle.seeding, default_captured_slot.lifecycle);
     try std.testing.expect(!default_captured_slot.reseed_required);
+
+    // A store package absent from the catalog must not ride along in a seed.
+    fake_status.include_extension = false;
+    try std.testing.expectError(error.HASeedExtensionCatalogMismatch, DataServer.captureHASeedCallback(
+        &server,
+        alloc,
+        "standby-unregistered-extension",
+        "seed-standby-unregistered-extension-5",
+        capture_binding,
+    ));
+    try std.testing.expect(primary.slot("standby-unregistered-extension") == null);
+    fake_status.include_extension = true;
+
+    // Conversely, every catalog package must have an exact package-store
+    // image. Missing binaries cannot yield a standby that only looks healthy.
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), extension_store_root) catch {};
+    try std.testing.expectError(error.HASeedExtensionCatalogMismatch, DataServer.captureHASeedCallback(
+        &server,
+        alloc,
+        "standby-missing-extension",
+        "seed-standby-missing-extension-6",
+        capture_binding,
+    ));
+    try std.testing.expect(primary.slot("standby-missing-extension") == null);
 
     // Auth state has no portable snapshot/restore contract yet. A production
     // seed must reject capture before backup_start instead of silently
