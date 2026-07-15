@@ -43,6 +43,11 @@ pub const PruneRequest = struct {
     retain_generations: usize = 2,
     max_entries: usize = 10_000,
     max_marker_bytes: usize = 1024 * 1024,
+    /// Optional sibling generation tree that must be deleted before its raw
+    /// generation. Target activation uses this for mutable live-generations.
+    /// Deleting the mutable side first guarantees a crash can leave only a raw
+    /// orphan that remains eligible and retryable, never an unowned live tree.
+    paired_generations_dir_name: ?[]const u8 = null,
 };
 
 pub const PruneResult = struct {
@@ -61,6 +66,9 @@ pub const PruneResult = struct {
 const PruneOptions = struct {
     /// Test-only crash boundary after the durable rename and before deletion.
     fail_after_tombstones: ?usize = null,
+    /// Test-only crash boundary after durable paired-tree deletion and before
+    /// the raw generation is renamed to its tombstone.
+    fail_after_paired_deletions: ?usize = null,
 };
 
 const EligibilityMarker = struct {
@@ -170,6 +178,10 @@ fn pruneWithOptions(alloc: Allocator, request: PruneRequest, options: PruneOptio
     try validateRootAndIdentity(request.root, request.slot_name, request.current_generation);
     if (request.retain_generations == 0) return error.InvalidLocalGCRetention;
     if (request.max_entries == 0 or request.max_marker_bytes == 0) return error.InvalidLocalGCLimit;
+    if (request.paired_generations_dir_name) |dir_name| {
+        if (request.scope != .target_activation or !validation.isIdentifier(dir_name) or
+            std.mem.eql(u8, dir_name, generations_dir_name)) return error.InvalidPairedLocalGCRoot;
+    }
     if (request.protected_generations.len > request.max_entries) return error.TooManyLocalGCEntries;
     for (request.protected_generations, 0..) |generation, index| {
         if (!validation.isIdentifier(generation)) return error.InvalidSeedGeneration;
@@ -183,6 +195,19 @@ fn pruneWithOptions(alloc: Allocator, request: PruneRequest, options: PruneOptio
     const io = io_impl.io();
     const generations_root = try std.fs.path.join(alloc, &.{ request.root, generations_dir_name });
     defer alloc.free(generations_root);
+    const paired_generations_root = if (request.paired_generations_dir_name) |dir_name|
+        try std.fs.path.join(alloc, &.{ request.root, dir_name })
+    else
+        null;
+    defer if (paired_generations_root) |root| alloc.free(root);
+
+    if (paired_generations_root) |root| {
+        const paired_stat = std.Io.Dir.cwd().statFile(io, root, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return error.PairedLocalGCRootMissing,
+            else => return err,
+        };
+        if (paired_stat.kind != .directory) return error.InvalidPairedLocalGCRoot;
+    }
 
     var dir = std.Io.Dir.cwd().openDir(io, generations_root, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return error.CurrentGenerationNotEligible,
@@ -261,6 +286,10 @@ fn pruneWithOptions(alloc: Allocator, request: PruneRequest, options: PruneOptio
 
     var resumed_tombstones: usize = 0;
     for (tombstones.items) |tombstone| {
+        if (paired_generations_root) |paired_root| {
+            const generation = tombstone.name[tombstone_prefix.len..];
+            _ = try deletePairedGenerationIfPresent(alloc, io, paired_root, generation);
+        }
         const path = try std.fs.path.join(alloc, &.{ generations_root, tombstone.name });
         defer alloc.free(path);
         try std.Io.Dir.cwd().deleteTree(io, path);
@@ -270,6 +299,7 @@ fn pruneWithOptions(alloc: Allocator, request: PruneRequest, options: PruneOptio
 
     var deleted_generations: usize = 0;
     var tombstones_created: usize = 0;
+    var paired_deletions: usize = 0;
     for (candidates.items, 0..) |candidate, index| {
         if (index < request.retain_generations or
             std.mem.eql(u8, candidate.generation, request.current_generation) or
@@ -284,6 +314,15 @@ fn pruneWithOptions(alloc: Allocator, request: PruneRequest, options: PruneOptio
         defer alloc.free(tombstone_name);
         const tombstone_path = try std.fs.path.join(alloc, &.{ generations_root, tombstone_name });
         defer alloc.free(tombstone_path);
+
+        if (paired_generations_root) |paired_root| {
+            if (try deletePairedGenerationIfPresent(alloc, io, paired_root, candidate.generation)) {
+                paired_deletions += 1;
+                if (options.fail_after_paired_deletions) |limit| {
+                    if (paired_deletions >= limit) return error.InjectedPairedLocalGCFailure;
+                }
+            }
+        }
 
         std.Io.Dir.rename(std.Io.Dir.cwd(), source_path, std.Io.Dir.cwd(), tombstone_path, io) catch |err| switch (err) {
             error.FileNotFound => return error.LocalGCConcurrentMutation,
@@ -323,6 +362,24 @@ fn pruneWithOptions(alloc: Allocator, request: PruneRequest, options: PruneOptio
         .resumed_tombstones = resumed_tombstones,
         .skipped_ineligible = skipped_ineligible,
     };
+}
+
+fn deletePairedGenerationIfPresent(
+    alloc: Allocator,
+    io: std.Io,
+    paired_root: []const u8,
+    generation: []const u8,
+) !bool {
+    const path = try std.fs.path.join(alloc, &.{ paired_root, generation });
+    defer alloc.free(path);
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    if (stat.kind != .directory) return error.UnsafePairedLocalGCGeneration;
+    try std.Io.Dir.cwd().deleteTree(io, path);
+    try fs_paths.syncDirPortable(io, paired_root);
+    return true;
 }
 
 fn validateRootAndIdentity(root: []const u8, slot_name: []const u8, generation: []const u8) !void {
@@ -433,6 +490,10 @@ fn expectPathMissing(path: []const u8) !void {
 
 fn generationPath(alloc: std.mem.Allocator, root: []const u8, generation: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ root, "generations", generation });
+}
+
+fn pairedGenerationPath(alloc: std.mem.Allocator, root: []const u8, generation: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{ root, "live-generations", generation });
 }
 
 fn prepareGeneration(alloc: std.mem.Allocator, root: []const u8, generation: []const u8) ![]u8 {
@@ -562,6 +623,69 @@ test "storage.ha local generation gc resumes an interrupted tombstone deletion" 
     defer recovered.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), recovered.resumed_tombstones);
     try expectPathMissing(tombstone);
+}
+
+test "storage.ha local generation gc crash between paired and raw deletion resumes without live orphan" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+
+    for (1..3) |index| {
+        const generation = try std.fmt.allocPrint(alloc, "gen-{d}", .{index});
+        defer alloc.free(generation);
+        const raw_path = try prepareGeneration(alloc, root, generation);
+        defer alloc.free(raw_path);
+        const live_path = try pairedGenerationPath(alloc, root, generation);
+        defer alloc.free(live_path);
+        const live_payload = try std.fs.path.join(alloc, &.{ live_path, "runtime/payload" });
+        defer alloc.free(live_payload);
+        try writeTestFile(live_payload, generation);
+        try markEligible(alloc, .{
+            .root = root,
+            .scope = .target_activation,
+            .generation = generation,
+            .slot_name = "standby-a",
+            .checkpoint_lsn = index,
+            .checkpoint_bytes = generation,
+        });
+    }
+
+    try std.testing.expectError(error.InjectedPairedLocalGCFailure, pruneWithOptions(alloc, .{
+        .root = root,
+        .scope = .target_activation,
+        .slot_name = "standby-a",
+        .current_generation = "gen-2",
+        .retain_generations = 1,
+        .paired_generations_dir_name = "live-generations",
+    }, .{ .fail_after_paired_deletions = 1 }));
+    const old_raw = try generationPath(alloc, root, "gen-1");
+    defer alloc.free(old_raw);
+    const old_live = try pairedGenerationPath(alloc, root, "gen-1");
+    defer alloc.free(old_live);
+    try expectPathExists(old_raw);
+    try expectPathMissing(old_live);
+
+    var recovered = try prune(alloc, .{
+        .root = root,
+        .scope = .target_activation,
+        .slot_name = "standby-a",
+        .current_generation = "gen-2",
+        .retain_generations = 1,
+        .paired_generations_dir_name = "live-generations",
+    });
+    defer recovered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), recovered.deleted_generations);
+    try expectPathMissing(old_raw);
+    try expectPathMissing(old_live);
+
+    const current_raw = try generationPath(alloc, root, "gen-2");
+    defer alloc.free(current_raw);
+    const current_live = try pairedGenerationPath(alloc, root, "gen-2");
+    defer alloc.free(current_live);
+    try expectPathExists(current_raw);
+    try expectPathExists(current_live);
 }
 
 test "storage.ha local generation gc fails closed without current durable eligibility" {

@@ -240,8 +240,6 @@ pub fn pruneActivatedGenerations(
     try validateActiveForGC(alloc, active.value);
     try validateActivationCheckpoint(alloc, checkpoint.value, active.value);
 
-    const generation_path = try std.fs.path.join(alloc, &.{ request.target_root, active.value.generation_path });
-    defer alloc.free(generation_path);
     const active_binding = ActivationBinding{
         .topology_id = active.value.topology_id,
         .topology_generation = active.value.topology_generation,
@@ -249,7 +247,7 @@ pub fn pruneActivatedGenerations(
         .target_pvc_name = active.value.target_pvc_name,
         .target_pvc_uid = active.value.target_pvc_uid,
     };
-    try validatePublishedGeneration(alloc, generation_path, .{
+    const active_request = ActivateRequest{
         .staging_root = "/unused",
         .target_root = request.target_root,
         .expected = .{
@@ -261,8 +259,32 @@ pub fn pruneActivatedGenerations(
             .capture_receipt_sha256 = active.value.capture_receipt_sha256,
         },
         .binding = active_binding,
+        .materialization = if (active.value.format_version == format_version) .{
+            .target_local_node_id = active.value.target_local_node_id,
+            .target_replica_id = active.value.target_replica_id,
+        } else null,
         .limits = request.limits,
-    }, active_json);
+    };
+    if (active.value.format_version == format_version) {
+        const raw_root = try std.fs.path.join(alloc, &.{ request.target_root, active.value.raw_generation_path });
+        defer alloc.free(raw_root);
+        const live_root = try std.fs.path.join(alloc, &.{ request.target_root, active.value.generation_path });
+        defer alloc.free(live_root);
+        const raw_marker = try rawMarkerForActiveAlloc(alloc, active.value);
+        defer alloc.free(raw_marker);
+        try validatePublishedRawGeneration(alloc, raw_root, active_request, raw_marker);
+        try seed_materialization.validateRuntimeIdentity(
+            alloc,
+            raw_root,
+            live_root,
+            active.value.generation,
+            active.value.materialized_receipt_sha256,
+        );
+    } else {
+        const generation_path = try std.fs.path.join(alloc, &.{ request.target_root, active.value.generation_path });
+        defer alloc.free(generation_path);
+        try validatePublishedGeneration(alloc, generation_path, active_request, active_json);
+    }
 
     try local_generation_gc.markEligible(alloc, .{
         .root = request.target_root,
@@ -281,6 +303,7 @@ pub fn pruneActivatedGenerations(
         .protected_generations = request.protected_generations,
         .retain_generations = request.retain_generations,
         .max_entries = request.max_local_generations,
+        .paired_generations_dir_name = if (active.value.format_version == format_version) live_generations_dir_name else null,
     });
 }
 
@@ -297,9 +320,27 @@ fn validateActiveForGC(alloc: Allocator, receipt: ActivationReceipt) !void {
         !isCanonicalSha256(receipt.aggregate_sha256))
         return error.InvalidActiveReceipt;
     try standby_mod.validateIdentity(receipt.identity());
-    const expected_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ generations_dir_name, receipt.generation });
-    defer alloc.free(expected_path);
-    if (!std.mem.eql(u8, receipt.generation_path, expected_path)) return error.InvalidActiveReceipt;
+    const raw_expected_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ generations_dir_name, receipt.generation });
+    defer alloc.free(raw_expected_path);
+    if (receipt.format_version == format_version) {
+        const live_expected_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ live_generations_dir_name, receipt.generation });
+        defer alloc.free(live_expected_path);
+        if (!std.mem.eql(u8, receipt.raw_generation_path, raw_expected_path) or
+            !std.mem.eql(u8, receipt.generation_path, live_expected_path) or
+            !isCanonicalSha256(receipt.materialized_receipt_sha256) or
+            !isCanonicalSha256(receipt.materialized_aggregate_sha256) or
+            receipt.target_local_node_id == 0 or receipt.target_replica_id == 0)
+            return error.InvalidActiveReceipt;
+        try validateBinding(.{
+            .topology_id = receipt.topology_id,
+            .topology_generation = receipt.topology_generation,
+            .node_id = receipt.node_id,
+            .target_pvc_name = receipt.target_pvc_name,
+            .target_pvc_uid = receipt.target_pvc_uid,
+        });
+    } else if (!std.mem.eql(u8, receipt.generation_path, raw_expected_path)) {
+        return error.InvalidActiveReceipt;
+    }
 }
 
 fn validateActivationCheckpoint(
