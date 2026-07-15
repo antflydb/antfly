@@ -13,8 +13,8 @@ const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const data_format = @import("../../common/data_format.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
+const topology_records = @import("../../common/topology_records.zig");
 const extensions = @import("../../extensions/mod.zig");
-const table_manager = @import("../../metadata/table_manager.zig");
 const raft_catalog = @import("../../raft/storage/catalog.zig");
 const db_mod = @import("../db/db.zig");
 const generation_lifecycle = @import("../db/generation_lifecycle.zig");
@@ -30,8 +30,8 @@ pub const max_file_bytes: u64 = 64 * 1024 * 1024 * 1024;
 
 pub const LogicalCatalog = struct {
     epoch: u64,
-    tables: []const table_manager.TableRecord,
-    ranges: []const table_manager.RangeRecord,
+    tables: []const topology_records.TableRecord,
+    ranges: []const topology_records.RangeRecord,
     extension_packages: []const extensions.PackageManifest = &.{},
     installed_extensions: []const extensions.InstalledExtension = &.{},
     extension_members: []const extensions.ExtensionMember = &.{},
@@ -472,12 +472,12 @@ fn validateJson(raw: []const u8, allow_empty: bool) !void {
     parsed.deinit();
 }
 
-fn findTable(tables: []const table_manager.TableRecord, table_id: u64) ?table_manager.TableRecord {
+fn findTable(tables: []const topology_records.TableRecord, table_id: u64) ?topology_records.TableRecord {
     for (tables) |table| if (table.table_id == table_id) return table;
     return null;
 }
 
-fn findRange(ranges: []const table_manager.RangeRecord, group_id: u64) ?table_manager.RangeRecord {
+fn findRange(ranges: []const topology_records.RangeRecord, group_id: u64) ?topology_records.RangeRecord {
     for (ranges) |range| if (range.group_id == group_id) return range;
     return null;
 }
