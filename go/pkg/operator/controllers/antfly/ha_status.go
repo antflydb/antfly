@@ -154,12 +154,16 @@ type haPlannedAction struct {
 	SeedArtifactGeneration           string
 	SeedArtifactRetention            int32
 	SeedArtifactCaptureRoot          string
+	SeedCaptureReceiptPath           string
+	SeedCaptureReceiptSHA256         string
 	SeedArtifactProtectedGenerations []string
 	TopologyID                       string
 	TopologyGeneration               int64
 	TopologyNodeID                   string
 	TargetPVCName                    string
 	TargetPVCUID                     string
+	TargetLocalNodeID                uint64
+	TargetReplicaID                  uint64
 	Reason                           string
 }
 
@@ -986,6 +990,14 @@ func applyHAPlanStatus(cluster *antflyv1.AntflyCluster, plan haPlan) {
 	cluster.Status.HAStatus.ReadSafeStandbyCount = plan.ReadSafeStandbyCount
 	cluster.Status.HAStatus.ReseedRequiredCount = plan.ReseedRequiredCount
 	cluster.Status.HAStatus.AutomaticPromotionAllowed = plan.AutomaticPromotionAllowed
+	for i := range plan.Actions {
+		if plan.Actions[i].Kind != haActionActivateSeedArtifact || cluster.Spec.Standalone == nil ||
+			cluster.Spec.Standalone.NodeID <= 0 || cluster.Spec.Standalone.Replicas != 1 {
+			continue
+		}
+		plan.Actions[i].TargetLocalNodeID = uint64(cluster.Spec.Standalone.NodeID)
+		plan.Actions[i].TargetReplicaID = 1
+	}
 	cluster.Status.HAStatus.PlannedActions = haPlannedActionStatuses(plan.Actions, ha, cluster.Status.HAStatus)
 	cluster.Status.HAStatus.PrimaryRoute = haPrimaryRouteStatus(plan.PrimaryRoute)
 	cluster.Status.HAStatus.Sync = haSyncStatus(plan.SyncPolicy)
@@ -1066,12 +1078,16 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 			SeedArtifactGeneration:           action.SeedArtifactGeneration,
 			SeedArtifactRetainGenerations:    action.SeedArtifactRetention,
 			SeedArtifactCaptureRoot:          action.SeedArtifactCaptureRoot,
+			SeedCaptureReceiptPath:           action.SeedCaptureReceiptPath,
+			SeedCaptureReceiptSHA256:         action.SeedCaptureReceiptSHA256,
 			SeedArtifactProtectedGenerations: append([]string(nil), action.SeedArtifactProtectedGenerations...),
 			TopologyID:                       action.TopologyID,
 			TopologyGeneration:               action.TopologyGeneration,
 			TopologyNodeID:                   action.TopologyNodeID,
 			TargetPVCName:                    action.TargetPVCName,
 			TargetPVCUID:                     action.TargetPVCUID,
+			TargetLocalNodeID:                action.TargetLocalNodeID,
+			TargetReplicaID:                  action.TargetReplicaID,
 			AdminCommand:                     haAdminCommand(action, haReplicationIdentity(ha), status),
 			AdminURL:                         haAdminURL(action, ha, status),
 			AdminNodeID:                      haAdminNodeID(action, ha, status),
@@ -1108,7 +1124,8 @@ func haBindSeedTopology(action *haPlannedAction, ha *antflyv1.HighAvailabilitySp
 
 func haBindSeedCaptureResult(action *haPlannedAction, status *antflyv1.HAStatus) {
 	if action == nil || status == nil ||
-		(action.Kind != haActionPublishSeedArtifact && action.Kind != haActionGCSourceSeedGenerations) {
+		(action.Kind != haActionPublishSeedArtifact && action.Kind != haActionGCSourceSeedGenerations &&
+			action.Kind != haActionRestoreSeedArtifact && action.Kind != haActionActivateSeedArtifact) {
 		return
 	}
 	for i := range status.PlannedActions {
@@ -1121,14 +1138,29 @@ func haBindSeedCaptureResult(action *haPlannedAction, status *antflyv1.HAStatus)
 			continue
 		}
 		result := capture.AdminResult
+		if action.Kind == haActionGCSourceSeedGenerations {
+			action.SeedArtifactCaptureRoot = haSeedCaptureRoot(result.SeedGenerationRoot, action.SeedArtifactGeneration)
+			return
+		}
+		receiptPath := haSeedCaptureReceiptPath(result.SeedGenerationRoot, action.SeedArtifactGeneration)
+		if receiptPath == "" || !isLowerHexDigest(result.CaptureReceiptSHA256) {
+			return
+		}
+		action.SeedCaptureReceiptPath = receiptPath
+		action.SeedCaptureReceiptSHA256 = strings.TrimSpace(result.CaptureReceiptSHA256)
 		if action.Kind == haActionPublishSeedArtifact {
 			action.SeedManifestPath = result.SeedManifestPath
 			action.SeedContentRoot = result.SeedContentRoot
-		} else {
-			action.SeedArtifactCaptureRoot = haSeedCaptureRoot(result.SeedGenerationRoot, action.SeedArtifactGeneration)
 		}
 		return
 	}
+}
+
+func haSeedCaptureReceiptPath(generationRoot, generation string) string {
+	if haSeedCaptureRoot(generationRoot, generation) == "" {
+		return ""
+	}
+	return path.Join(path.Clean(strings.TrimSpace(generationRoot)), "COMPLETE.json")
 }
 
 func haSeedCaptureRoot(generationRoot, generation string) string {
@@ -1314,7 +1346,9 @@ func haPlannedActionExecutionStarted(action antflyv1.HAPlannedActionStatus) bool
 func haPlannedActionOperationID(action antflyv1.HAPlannedActionStatus) string {
 	if strings.TrimSpace(action.SeedArtifactCaptureRoot) == "" && strings.TrimSpace(action.TopologyID) == "" &&
 		action.TopologyGeneration == 0 && strings.TrimSpace(action.TopologyNodeID) == "" &&
-		strings.TrimSpace(action.TargetPVCName) == "" && strings.TrimSpace(action.TargetPVCUID) == "" {
+		strings.TrimSpace(action.TargetPVCName) == "" && strings.TrimSpace(action.TargetPVCUID) == "" &&
+		strings.TrimSpace(action.SeedCaptureReceiptPath) == "" && strings.TrimSpace(action.SeedCaptureReceiptSHA256) == "" &&
+		action.TargetLocalNodeID == 0 && action.TargetReplicaID == 0 {
 		return haLegacyPlannedActionOperationID(action)
 	}
 	identity := struct {
@@ -1339,11 +1373,15 @@ func haPlannedActionOperationID(action antflyv1.HAPlannedActionStatus) string {
 		SeedArtifactGeneration        string `json:"seed_artifact_generation"`
 		SeedArtifactRetainGenerations int32  `json:"seed_artifact_retain_generations"`
 		SeedArtifactCaptureRoot       string `json:"seed_artifact_capture_root"`
+		SeedCaptureReceiptPath        string `json:"seed_capture_receipt_path"`
+		SeedCaptureReceiptSHA256      string `json:"seed_capture_receipt_sha256"`
 		TopologyID                    string `json:"topology_id"`
 		TopologyGeneration            int64  `json:"topology_generation"`
 		TopologyNodeID                string `json:"topology_node_id"`
 		TargetPVCName                 string `json:"target_pvc_name"`
 		TargetPVCUID                  string `json:"target_pvc_uid"`
+		TargetLocalNodeID             uint64 `json:"target_local_node_id"`
+		TargetReplicaID               uint64 `json:"target_replica_id"`
 		RetryGeneration               int64  `json:"retry_generation"`
 	}{
 		Version:                       2,
@@ -1367,11 +1405,15 @@ func haPlannedActionOperationID(action antflyv1.HAPlannedActionStatus) string {
 		SeedArtifactGeneration:        strings.TrimSpace(action.SeedArtifactGeneration),
 		SeedArtifactRetainGenerations: action.SeedArtifactRetainGenerations,
 		SeedArtifactCaptureRoot:       strings.TrimSpace(action.SeedArtifactCaptureRoot),
+		SeedCaptureReceiptPath:        strings.TrimSpace(action.SeedCaptureReceiptPath),
+		SeedCaptureReceiptSHA256:      strings.TrimSpace(action.SeedCaptureReceiptSHA256),
 		TopologyID:                    strings.TrimSpace(action.TopologyID),
 		TopologyGeneration:            action.TopologyGeneration,
 		TopologyNodeID:                strings.TrimSpace(action.TopologyNodeID),
 		TargetPVCName:                 strings.TrimSpace(action.TargetPVCName),
 		TargetPVCUID:                  strings.TrimSpace(action.TargetPVCUID),
+		TargetLocalNodeID:             action.TargetLocalNodeID,
+		TargetReplicaID:               action.TargetReplicaID,
 		RetryGeneration:               action.RetryGeneration,
 	}
 	payload, err := json.Marshal(identity)
@@ -1490,12 +1532,16 @@ func haSamePlannedActionOperation(a antflyv1.HAPlannedActionStatus, b antflyv1.H
 		a.SeedArtifactGeneration == b.SeedArtifactGeneration &&
 		a.SeedArtifactRetainGenerations == b.SeedArtifactRetainGenerations &&
 		a.SeedArtifactCaptureRoot == b.SeedArtifactCaptureRoot &&
+		a.SeedCaptureReceiptPath == b.SeedCaptureReceiptPath &&
+		a.SeedCaptureReceiptSHA256 == b.SeedCaptureReceiptSHA256 &&
 		slices.Equal(a.SeedArtifactProtectedGenerations, b.SeedArtifactProtectedGenerations) &&
 		a.TopologyID == b.TopologyID &&
 		a.TopologyGeneration == b.TopologyGeneration &&
 		a.TopologyNodeID == b.TopologyNodeID &&
 		a.TargetPVCName == b.TargetPVCName &&
 		a.TargetPVCUID == b.TargetPVCUID &&
+		a.TargetLocalNodeID == b.TargetLocalNodeID &&
+		a.TargetReplicaID == b.TargetReplicaID &&
 		a.Reason == b.Reason &&
 		haSameAdminCommandHint(a, b)
 }
@@ -1778,7 +1824,8 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 		return []string{"seed", "finish", "--manifest", action.SeedManifestPath}
 	case haActionPublishSeedArtifact:
 		if action.SeedArtifactLocation == "" || action.SeedArtifactGeneration == "" ||
-			action.SeedManifestPath == "" || action.SeedContentRoot == "" || action.SlotName == "" {
+			action.SeedManifestPath == "" || action.SeedContentRoot == "" || action.SlotName == "" ||
+			action.SeedCaptureReceiptPath == "" || !isLowerHexDigest(action.SeedCaptureReceiptSHA256) {
 			return nil
 		}
 		command := []string{
@@ -1788,6 +1835,8 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 			"--slot", action.SlotName,
 			"--manifest", action.SeedManifestPath,
 			"--content-root", action.SeedContentRoot,
+			"--capture-receipt", action.SeedCaptureReceiptPath,
+			"--capture-receipt-sha256", action.SeedCaptureReceiptSHA256,
 		}
 		return haAppendArtifactTopologyBinding(command, action)
 	case haActionGCSourceSeedGenerations:
@@ -1809,7 +1858,8 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 		return command
 	case haActionRestoreSeedArtifact:
 		if identity == nil || action.SeedArtifactLocation == "" || action.SeedArtifactGeneration == "" ||
-			action.SeedContentRoot == "" || action.SlotName == "" {
+			action.SeedContentRoot == "" || action.SlotName == "" ||
+			!isLowerHexDigest(action.SeedCaptureReceiptSHA256) {
 			return nil
 		}
 		command := []string{
@@ -1824,14 +1874,17 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 			"--ha-timeline-id", strconv.FormatUint(identity.TimelineID, 10),
 			"--ha-epoch", strconv.FormatUint(identity.Epoch, 10),
 			"--minimum-checkpoint-lsn", strconv.FormatUint(action.TargetLSN, 10),
+			"--capture-receipt-sha256", action.SeedCaptureReceiptSHA256,
 		}
 		return haAppendArtifactTopologyBinding(command, action)
 	case haActionActivateSeedArtifact:
 		if identity == nil || action.SeedArtifactGeneration == "" || action.SeedContentRoot == "" ||
-			action.SeedArtifactTargetRoot == "" || action.SlotName == "" {
+			action.SeedArtifactTargetRoot == "" || action.SlotName == "" ||
+			!isLowerHexDigest(action.SeedCaptureReceiptSHA256) ||
+			action.TargetLocalNodeID == 0 || action.TargetReplicaID == 0 {
 			return nil
 		}
-		return []string{
+		command := []string{
 			"artifact", "activate",
 			"--generation", action.SeedArtifactGeneration,
 			"--slot", action.SlotName,
@@ -1843,7 +1896,16 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 			"--ha-timeline-id", strconv.FormatUint(identity.TimelineID, 10),
 			"--ha-epoch", strconv.FormatUint(identity.Epoch, 10),
 			"--minimum-checkpoint-lsn", strconv.FormatUint(action.TargetLSN, 10),
+			"--capture-receipt-sha256", action.SeedCaptureReceiptSHA256,
 		}
+		command = haAppendArtifactTopologyBinding(command, action)
+		if command == nil {
+			return nil
+		}
+		return append(command,
+			"--target-local-node-id", strconv.FormatUint(action.TargetLocalNodeID, 10),
+			"--target-replica-id", strconv.FormatUint(action.TargetReplicaID, 10),
+		)
 	case haActionGCTargetSeedGenerations:
 		if action.SeedArtifactGeneration == "" || action.SeedArtifactTargetRoot == "" ||
 			action.SlotName == "" || action.SeedArtifactRetention <= 0 {

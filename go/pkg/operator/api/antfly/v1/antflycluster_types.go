@@ -864,6 +864,16 @@ type HARequiredSeedActivationReceipt struct {
 	// +optional
 	SeedReceiptSHA256 string `json:"seedReceiptSHA256,omitempty"`
 	// +optional
+	CaptureReceiptSHA256 string `json:"captureReceiptSHA256,omitempty"`
+	// +optional
+	MaterializedReceiptSHA256 string `json:"materializedReceiptSHA256,omitempty"`
+	// +optional
+	MaterializedAggregateSHA256 string `json:"materializedAggregateSHA256,omitempty"`
+	// +optional
+	TargetLocalNodeID uint64 `json:"targetLocalNodeID,omitempty"`
+	// +optional
+	TargetReplicaID uint64 `json:"targetReplicaID,omitempty"`
+	// +optional
 	TargetPVCUID string `json:"targetPVCUID,omitempty"`
 }
 
@@ -1854,25 +1864,31 @@ type HAStartupGateStatus struct {
 // HASeedActivationReceiptStatus is operator-observed evidence from the
 // activation Job and the Kubernetes PVC object it wrote.
 type HASeedActivationReceiptStatus struct {
-	TopologyID         string `json:"topologyID"`
-	TopologyGeneration int64  `json:"topologyGeneration,omitempty"`
-	NodeID             string `json:"nodeID"`
-	SlotName           string `json:"slotName"`
-	Generation         string `json:"generation"`
-	TargetPVCName      string `json:"targetPVCName"`
-	TargetPVCUID       string `json:"targetPVCUID,omitempty"`
-	ClusterID          uint64 `json:"clusterID,omitempty"`
-	ShardID            uint64 `json:"shardID,omitempty"`
-	TableID            uint64 `json:"tableID,omitempty"`
-	TimelineID         uint64 `json:"timelineID,omitempty"`
-	Epoch              uint64 `json:"epoch,omitempty"`
-	BackupLSN          uint64 `json:"backupLSN,omitempty"`
-	CheckpointLSN      uint64 `json:"checkpointLSN,omitempty"`
-	ManifestID         string `json:"manifestID,omitempty"`
-	ManifestSHA256     string `json:"manifestSHA256,omitempty"`
-	AggregateSHA256    string `json:"aggregateSHA256,omitempty"`
-	SeedReceiptSHA256  string `json:"seedReceiptSHA256,omitempty"`
-	GenerationPath     string `json:"generationPath,omitempty"`
+	TopologyID                  string `json:"topologyID"`
+	TopologyGeneration          int64  `json:"topologyGeneration,omitempty"`
+	NodeID                      string `json:"nodeID"`
+	SlotName                    string `json:"slotName"`
+	Generation                  string `json:"generation"`
+	TargetPVCName               string `json:"targetPVCName"`
+	TargetPVCUID                string `json:"targetPVCUID,omitempty"`
+	ClusterID                   uint64 `json:"clusterID,omitempty"`
+	ShardID                     uint64 `json:"shardID,omitempty"`
+	TableID                     uint64 `json:"tableID,omitempty"`
+	TimelineID                  uint64 `json:"timelineID,omitempty"`
+	Epoch                       uint64 `json:"epoch,omitempty"`
+	BackupLSN                   uint64 `json:"backupLSN,omitempty"`
+	CheckpointLSN               uint64 `json:"checkpointLSN,omitempty"`
+	ManifestID                  string `json:"manifestID,omitempty"`
+	ManifestSHA256              string `json:"manifestSHA256,omitempty"`
+	AggregateSHA256             string `json:"aggregateSHA256,omitempty"`
+	SeedReceiptSHA256           string `json:"seedReceiptSHA256,omitempty"`
+	CaptureReceiptSHA256        string `json:"captureReceiptSHA256,omitempty"`
+	MaterializedReceiptSHA256   string `json:"materializedReceiptSHA256,omitempty"`
+	MaterializedAggregateSHA256 string `json:"materializedAggregateSHA256,omitempty"`
+	TargetLocalNodeID           uint64 `json:"targetLocalNodeID,omitempty"`
+	TargetReplicaID             uint64 `json:"targetReplicaID,omitempty"`
+	GenerationPath              string `json:"generationPath,omitempty"`
+	RawGenerationPath           string `json:"rawGenerationPath,omitempty"`
 }
 
 // HAStandbyStatus reports one hot standby slot.
@@ -2060,6 +2076,14 @@ type HAPlannedActionStatus struct {
 	// +optional
 	SeedArtifactCaptureRoot string `json:"seedArtifactCaptureRoot,omitempty"`
 
+	// SeedCaptureReceiptPath and SeedCaptureReceiptSHA256 bind portable
+	// publication, restore, and activation to the exact immutable runtime-owned
+	// capture COMPLETE receipt.
+	// +optional
+	SeedCaptureReceiptPath string `json:"seedCaptureReceiptPath,omitempty"`
+	// +optional
+	SeedCaptureReceiptSHA256 string `json:"seedCaptureReceiptSHA256,omitempty"`
+
 	// SeedArtifactProtectedGenerations freezes the current, in-flight and rollback
 	// generations that a local GC operation must preserve.
 	// +optional
@@ -2078,6 +2102,10 @@ type HAPlannedActionStatus struct {
 	TargetPVCName string `json:"targetPVCName,omitempty"`
 	// +optional
 	TargetPVCUID string `json:"targetPVCUID,omitempty"`
+	// +optional
+	TargetLocalNodeID uint64 `json:"targetLocalNodeID,omitempty"`
+	// +optional
+	TargetReplicaID uint64 `json:"targetReplicaID,omitempty"`
 	// +optional
 	SourcePVCName string `json:"sourcePVCName,omitempty"`
 	// +optional
@@ -2180,36 +2208,42 @@ type HAPlannedActionStatus struct {
 
 // HASeedArtifactReceiptStatus summarizes a durable portable seed receipt.
 type HASeedArtifactReceiptStatus struct {
-	ActionKind             string `json:"actionKind,omitempty"`
-	Scope                  string `json:"scope,omitempty"`
-	FormatVersion          int32  `json:"formatVersion"`
-	Generation             string `json:"generation"`
-	SlotName               string `json:"slotName"`
-	ClusterID              uint64 `json:"clusterID,omitempty"`
-	ShardID                uint64 `json:"shardID,omitempty"`
-	TableID                uint64 `json:"tableID,omitempty"`
-	TimelineID             uint64 `json:"timelineID,omitempty"`
-	Epoch                  uint64 `json:"epoch,omitempty"`
-	ManifestID             string `json:"manifestID,omitempty"`
-	BackupLSN              uint64 `json:"backupLSN,omitempty"`
-	CheckpointLSN          uint64 `json:"checkpointLSN,omitempty"`
-	ManifestSHA256         string `json:"manifestSHA256,omitempty"`
-	AggregateSHA256        string `json:"aggregateSHA256,omitempty"`
-	SeedReceiptSHA256      string `json:"seedReceiptSHA256,omitempty"`
-	GenerationPath         string `json:"generationPath,omitempty"`
-	TotalBytes             uint64 `json:"totalBytes,omitempty"`
-	FileCount              int32  `json:"fileCount,omitempty"`
-	RetainedCount          int32  `json:"retainedCount,omitempty"`
-	DeletedCount           int32  `json:"deletedCount,omitempty"`
-	ProtectedCount         int32  `json:"protectedCount,omitempty"`
-	ResumedTombstoneCount  int32  `json:"resumedTombstoneCount,omitempty"`
-	SkippedIneligibleCount int32  `json:"skippedIneligibleCount,omitempty"`
-	CheckpointSHA256       string `json:"checkpointSHA256,omitempty"`
-	TopologyID             string `json:"topologyID,omitempty"`
-	TopologyGeneration     int64  `json:"topologyGeneration,omitempty"`
-	NodeID                 string `json:"nodeID,omitempty"`
-	TargetPVCName          string `json:"targetPVCName,omitempty"`
-	TargetPVCUID           string `json:"targetPVCUID,omitempty"`
+	ActionKind                  string `json:"actionKind,omitempty"`
+	Scope                       string `json:"scope,omitempty"`
+	FormatVersion               int32  `json:"formatVersion"`
+	Generation                  string `json:"generation"`
+	SlotName                    string `json:"slotName"`
+	ClusterID                   uint64 `json:"clusterID,omitempty"`
+	ShardID                     uint64 `json:"shardID,omitempty"`
+	TableID                     uint64 `json:"tableID,omitempty"`
+	TimelineID                  uint64 `json:"timelineID,omitempty"`
+	Epoch                       uint64 `json:"epoch,omitempty"`
+	ManifestID                  string `json:"manifestID,omitempty"`
+	BackupLSN                   uint64 `json:"backupLSN,omitempty"`
+	CheckpointLSN               uint64 `json:"checkpointLSN,omitempty"`
+	ManifestSHA256              string `json:"manifestSHA256,omitempty"`
+	AggregateSHA256             string `json:"aggregateSHA256,omitempty"`
+	SeedReceiptSHA256           string `json:"seedReceiptSHA256,omitempty"`
+	CaptureReceiptSHA256        string `json:"captureReceiptSHA256,omitempty"`
+	GenerationPath              string `json:"generationPath,omitempty"`
+	RawGenerationPath           string `json:"rawGenerationPath,omitempty"`
+	MaterializedReceiptSHA256   string `json:"materializedReceiptSHA256,omitempty"`
+	MaterializedAggregateSHA256 string `json:"materializedAggregateSHA256,omitempty"`
+	TargetLocalNodeID           uint64 `json:"targetLocalNodeID,omitempty"`
+	TargetReplicaID             uint64 `json:"targetReplicaID,omitempty"`
+	TotalBytes                  uint64 `json:"totalBytes,omitempty"`
+	FileCount                   int32  `json:"fileCount,omitempty"`
+	RetainedCount               int32  `json:"retainedCount,omitempty"`
+	DeletedCount                int32  `json:"deletedCount,omitempty"`
+	ProtectedCount              int32  `json:"protectedCount,omitempty"`
+	ResumedTombstoneCount       int32  `json:"resumedTombstoneCount,omitempty"`
+	SkippedIneligibleCount      int32  `json:"skippedIneligibleCount,omitempty"`
+	CheckpointSHA256            string `json:"checkpointSHA256,omitempty"`
+	TopologyID                  string `json:"topologyID,omitempty"`
+	TopologyGeneration          int64  `json:"topologyGeneration,omitempty"`
+	NodeID                      string `json:"nodeID,omitempty"`
+	TargetPVCName               string `json:"targetPVCName,omitempty"`
+	TargetPVCUID                string `json:"targetPVCUID,omitempty"`
 }
 
 // HAAdminActionResultStatus records correlation fields from a typed HA admin action response.
@@ -2285,6 +2319,11 @@ type HAAdminActionResultStatus struct {
 	ManifestSHA256 string `json:"manifestSHA256,omitempty"`
 	// +optional
 	AggregateSHA256 string `json:"aggregateSHA256,omitempty"`
+
+	// CaptureReceiptSHA256 is the digest of the exact immutable runtime capture
+	// COMPLETE bytes that authorized every downstream portable seed action.
+	// +optional
+	CaptureReceiptSHA256 string `json:"captureReceiptSHA256,omitempty"`
 
 	// Runtime-owned seed capture evidence and the primary-PVC paths consumed by
 	// the dependent publish action.

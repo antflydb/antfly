@@ -4387,7 +4387,8 @@ func TestBuildHAAdminJobFreezesExactSeedIdentityOnEveryPortableWorkload(t *testi
 		ActionTarget: "seed-standby-a-10", ActionState: "applied", ActionNodeID: "primary-a",
 		SlotName: "standby-a", ManifestID: "manifest-standby-a-10", BackupLSN: 10, CheckpointLSN: 12, EndRecordLSN: 13,
 		SeedArtifactGeneration: "seed-standby-a-10", ManifestSHA256: digest,
-		SeedClusterID: 100, SeedTimelineID: 4, SeedEpoch: 6, SeedSourcePlanSHA256: digest, SeedFileCount: 2,
+		CaptureReceiptSHA256: digest,
+		SeedClusterID:        100, SeedTimelineID: 4, SeedEpoch: 6, SeedSourcePlanSHA256: digest, SeedFileCount: 2,
 		SeedGenerationRoot: "/antflydb/ha/seed-captures/generations/seed-standby-a-10",
 		SeedContentRoot:    "/antflydb/ha/seed-captures/generations/seed-standby-a-10/content",
 		SeedManifestPath:   "/antflydb/ha/seed-captures/generations/seed-standby-a-10/manifest.afha",
@@ -4578,7 +4579,7 @@ func TestReconcileHATargetGCCopiesExactDurableSlotActivationReceiptIdempotently(
 	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
 	g.Expect(corev1.AddToScheme(s)).To(Succeed())
 
-	rawReceipt := `{"schema_version":1,"action":{"action_id":"seeded_slot_activate:seed-standby-a-10","action_kind":"seeded_slot_activate","target":"seed-standby-a-10","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","generation":"seed-standby-a-10","manifest_id":"seed-standby-a-10","timeline_id":4,"checkpoint_lsn":10,"seed_receipt_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","manifest_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","aggregate_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}`
+	rawReceipt := `{"schema_version":1,"action":{"action_id":"seeded_slot_activate:seed-standby-a-10","action_kind":"seeded_slot_activate","target":"seed-standby-a-10","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","generation":"seed-standby-a-10","manifest_id":"seed-standby-a-10","timeline_id":4,"checkpoint_lsn":10,"seed_receipt_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","capture_receipt_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","manifest_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","aggregate_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}`
 	encodedResult, err := json.Marshal(map[string]any{
 		"schemaVersion": 1, "actionID": "seeded_slot_activate:seed-standby-a-10",
 		"actionKind": "seeded_slot_activate", "actionTarget": "seed-standby-a-10",
@@ -4586,7 +4587,8 @@ func TestReconcileHATargetGCCopiesExactDurableSlotActivationReceiptIdempotently(
 		"manifestID": "seed-standby-a-10", "checkpointLSN": 10,
 		"seedArtifactGeneration": "seed-standby-a-10", "seedTimelineID": 4,
 		"seedReceiptSHA256": strings.Repeat("a", 64), "manifestSHA256": strings.Repeat("b", 64),
-		"aggregateSHA256": strings.Repeat("c", 64), "rawReceiptJSON": rawReceipt,
+		"captureReceiptSHA256": strings.Repeat("d", 64),
+		"aggregateSHA256":      strings.Repeat("c", 64), "rawReceiptJSON": rawReceipt,
 	})
 	g.Expect(err).NotTo(HaveOccurred())
 	activationResult := &antflyv1.HAAdminActionResultStatus{}
@@ -5214,20 +5216,20 @@ func TestActivationJobBindsReceiptToObservedTargetPVCInstance(t *testing.T) {
 		Kind: string(haActionActivateSeedArtifact), SlotName: "standby-a",
 		SeedArtifactGeneration: "prod-standby-a-10",
 		TopologyID:             "test-standalone", TopologyGeneration: 3, TopologyNodeID: "standby-a",
-		TargetPVCName: "standby-a-data", TargetPVCUID: "pvc-uid-1",
-		AdminCommand: []string{"artifact", "activate", "--generation", "prod-standby-a-10"},
+		TargetPVCName: "standby-a-data", TargetPVCUID: "pvc-uid-1", TargetLocalNodeID: 1, TargetReplicaID: 1,
+		AdminCommand: []string{
+			"artifact", "activate", "--generation", "prod-standby-a-10",
+			"--topology-id", "test-standalone", "--topology-generation", "3",
+			"--node-id", "standby-a", "--target-pvc-name", "standby-a-data", "--target-pvc-uid", "pvc-uid-1",
+			"--target-local-node-id", "1", "--target-replica-id", "1",
+		},
 	}
 
 	bound, ready, err := reconciler.haActivationJobAction(context.Background(), cluster, action)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(ready).To(BeTrue())
-	g.Expect(action.AdminCommand).NotTo(ContainElement("--target-pvc-uid"))
-	g.Expect(bound.AdminCommand).To(ContainElements(
-		"--topology-id", "test-standalone", "--topology-generation", "3",
-		"--node-id", "standby-a", "--target-pvc-name", "standby-a-data",
-		"--target-pvc-uid", "pvc-uid-1",
-	))
-	g.Expect(haAdminActionHash(bound)).NotTo(Equal(haAdminActionHash(action)))
+	g.Expect(bound.AdminCommand).To(Equal(action.AdminCommand), "PVC preflight must validate, never mutate, the frozen activation request")
+	g.Expect(haAdminActionHash(bound)).To(Equal(haAdminActionHash(action)))
 
 	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.TargetPVCUID = "replacement-pvc"
 	_, ready, err = reconciler.haActivationJobAction(context.Background(), cluster, action)
@@ -5252,10 +5254,15 @@ func TestActivationReceiptCurrentTargetRejectsReplacementPVCAndTopologyGeneratio
 	action := antflyv1.HAPlannedActionStatus{
 		Kind: string(haActionActivateSeedArtifact), SlotName: "standby-a",
 		SeedArtifactGeneration: "prod-standby-a-10", AdminJobPhase: haAdminJobPhaseSucceeded,
+		SeedCaptureReceiptSHA256: strings.Repeat("d", 64), TargetLocalNodeID: 1, TargetReplicaID: 1,
 		SeedArtifactReceipt: &antflyv1.HASeedArtifactReceiptStatus{
-			TopologyID: "test-standalone", TopologyGeneration: 3, NodeID: "standby-a", SlotName: "standby-a",
+			FormatVersion: 2,
+			TopologyID:    "test-standalone", TopologyGeneration: 3, NodeID: "standby-a", SlotName: "standby-a",
 			Generation: "prod-standby-a-10", TargetPVCName: "standby-a-data", TargetPVCUID: "pvc-uid-2",
-			ManifestSHA256: digest, GenerationPath: "generations/prod-standby-a-10",
+			ManifestSHA256: digest, CaptureReceiptSHA256: strings.Repeat("d", 64),
+			MaterializedReceiptSHA256: strings.Repeat("e", 64), MaterializedAggregateSHA256: strings.Repeat("f", 64),
+			TargetLocalNodeID: 1, TargetReplicaID: 1,
+			GenerationPath: "live-generations/prod-standby-a-10", RawGenerationPath: "generations/prod-standby-a-10",
 		},
 	}
 
@@ -5278,27 +5285,36 @@ func TestExecuteActivateSeededSlotUsesExactTargetActivationReceipt(t *testing.T)
 	g := NewWithT(t)
 	digest := strings.Repeat("a", 64)
 	dependency := antflyv1.HAPlannedActionStatus{
-		Kind:                   string(haActionActivateSeedArtifact),
-		Executor:               string(haActionExecutorCLIJob),
-		SlotName:               "standby-a",
-		TargetLSN:              10,
-		SeedArtifactGeneration: "seed-standby-a-10",
-		AdminJobName:           "activation-job",
-		AdminJobPhase:          haAdminJobPhaseSucceeded,
+		Kind:                     string(haActionActivateSeedArtifact),
+		Executor:                 string(haActionExecutorCLIJob),
+		SlotName:                 "standby-a",
+		TargetLSN:                10,
+		SeedArtifactGeneration:   "seed-standby-a-10",
+		SeedCaptureReceiptSHA256: digest,
+		TargetLocalNodeID:        1,
+		TargetReplicaID:          1,
+		AdminJobName:             "activation-job",
+		AdminJobPhase:            haAdminJobPhaseSucceeded,
 		SeedArtifactReceipt: &antflyv1.HASeedArtifactReceiptStatus{
-			FormatVersion:     1,
-			Generation:        "seed-standby-a-10",
-			SlotName:          "standby-a",
-			ClusterID:         100,
-			TimelineID:        4,
-			Epoch:             6,
-			ManifestID:        "base-standby-a-10",
-			BackupLSN:         10,
-			CheckpointLSN:     12,
-			SeedReceiptSHA256: digest,
-			ManifestSHA256:    digest,
-			AggregateSHA256:   digest,
-			GenerationPath:    "generations/seed-standby-a-10",
+			FormatVersion:               2,
+			Generation:                  "seed-standby-a-10",
+			SlotName:                    "standby-a",
+			ClusterID:                   100,
+			TimelineID:                  4,
+			Epoch:                       6,
+			ManifestID:                  "base-standby-a-10",
+			BackupLSN:                   10,
+			CheckpointLSN:               12,
+			SeedReceiptSHA256:           digest,
+			CaptureReceiptSHA256:        digest,
+			ManifestSHA256:              digest,
+			AggregateSHA256:             digest,
+			MaterializedReceiptSHA256:   digest,
+			MaterializedAggregateSHA256: digest,
+			TargetLocalNodeID:           1,
+			TargetReplicaID:             1,
+			GenerationPath:              "live-generations/seed-standby-a-10",
+			RawGenerationPath:           "generations/seed-standby-a-10",
 		},
 	}
 	action := antflyv1.HAPlannedActionStatus{
@@ -5332,12 +5348,13 @@ func TestExecuteActivateSeededSlotUsesExactTargetActivationReceipt(t *testing.T)
 		g.Expect(body.TimelineId).To(Equal(uint64(4)))
 		g.Expect(body.CheckpointLsn).To(Equal(uint64(12)))
 		g.Expect(body.SeedReceiptSha256).To(Equal(digest))
+		g.Expect(body.CaptureReceiptSha256).To(Equal(digest))
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": []string{"application/json"}},
 			Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
-				`{"schema_version":1,"action":{"action_id":"seeded_slot_activate:seed-standby-a-10","action_kind":"seeded_slot_activate","target":"seed-standby-a-10","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","generation":"seed-standby-a-10","manifest_id":"base-standby-a-10","timeline_id":4,"checkpoint_lsn":12,"seed_receipt_sha256":"%s","manifest_sha256":"%s","aggregate_sha256":"%s"}`,
-				digest, digest, digest,
+				`{"schema_version":1,"action":{"action_id":"seeded_slot_activate:seed-standby-a-10","action_kind":"seeded_slot_activate","target":"seed-standby-a-10","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","generation":"seed-standby-a-10","manifest_id":"base-standby-a-10","timeline_id":4,"checkpoint_lsn":12,"seed_receipt_sha256":"%s","capture_receipt_sha256":"%s","manifest_sha256":"%s","aggregate_sha256":"%s"}`,
+				digest, digest, digest, digest,
 			))),
 		}, nil
 	})}}
@@ -5415,8 +5432,8 @@ func TestExecuteCaptureSeedArtifactUsesRuntimeOwnedTypedEndpoint(t *testing.T) {
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": []string{"application/json"}},
 			Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
-				`{"schema_version":1,"action":{"action_id":"seed_capture:seed-standby-a-10","action_kind":"seed_capture","target":"seed-standby-a-10","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","generation":"seed-standby-a-10","cluster_id":100,"shard_id":2,"table_id":3,"timeline_id":%d,"epoch":6,"manifest_id":"seed-standby-a-10","source_plan_sha256":"%s","backup_lsn":10,"checkpoint_lsn":10,"end_record_lsn":11,"manifest_sha256":"%s","file_count":2,"total_bytes":20,"generation_root":"/antflydb/ha/seed-captures/generations/seed-standby-a-10","content_root":"/antflydb/ha/seed-captures/generations/seed-standby-a-10/content","manifest_path":"/antflydb/ha/seed-captures/generations/seed-standby-a-10/manifest.afha","already_captured":false,"topology_id":"topology-a","topology_generation":7,"node_id":"standby-a","target_pvc_name":"standby-data","target_pvc_uid":"target-pvc-uid"}`,
-				timeline, digest, digest,
+				`{"schema_version":1,"action":{"action_id":"seed_capture:seed-standby-a-10","action_kind":"seed_capture","target":"seed-standby-a-10","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","generation":"seed-standby-a-10","cluster_id":100,"shard_id":2,"table_id":3,"timeline_id":%d,"epoch":6,"manifest_id":"seed-standby-a-10","source_plan_sha256":"%s","backup_lsn":10,"checkpoint_lsn":10,"end_record_lsn":11,"manifest_sha256":"%s","capture_receipt_sha256":"%s","file_count":2,"total_bytes":20,"generation_root":"/antflydb/ha/seed-captures/generations/seed-standby-a-10","content_root":"/antflydb/ha/seed-captures/generations/seed-standby-a-10/content","manifest_path":"/antflydb/ha/seed-captures/generations/seed-standby-a-10/manifest.afha","already_captured":false,"topology_id":"topology-a","topology_generation":7,"node_id":"standby-a","target_pvc_name":"standby-data","target_pvc_uid":"target-pvc-uid"}`,
+				timeline, digest, digest, digest,
 			))),
 		}, nil
 	})}}
@@ -5428,6 +5445,7 @@ func TestExecuteCaptureSeedArtifactUsesRuntimeOwnedTypedEndpoint(t *testing.T) {
 	g.Expect(action.AdminResult).NotTo(BeNil())
 	g.Expect(action.AdminResult.SeedManifestPath).To(Equal("/antflydb/ha/seed-captures/generations/seed-standby-a-10/manifest.afha"))
 	g.Expect(action.AdminResult.SeedContentRoot).To(Equal("/antflydb/ha/seed-captures/generations/seed-standby-a-10/content"))
+	g.Expect(action.AdminResult.CaptureReceiptSHA256).To(Equal(digest))
 
 	timeline = 5
 	action.AdminResult = nil
@@ -7178,16 +7196,17 @@ func TestHAAdminSDKActionResultsSatisfyOperatorEvidenceGates(t *testing.T) {
 	activateAction := directPrimaryAction(haActionActivateSeededSlot)
 	activateAction.SeedArtifactGeneration = "seed-standby-a-5"
 	activation := haAdminActionResultFromSeededSlotActivateSDK(adminsdk.HASeededSlotActivateResponse{
-		SchemaVersion:     1,
-		Action:            receipt(adminsdk.HAActionKindSeededSlotActivate, "seed-standby-a-5", string(adminsdk.HAActionStateApplied), "primary-a"),
-		SlotName:          "standby-a",
-		Generation:        "seed-standby-a-5",
-		ManifestId:        "base-standby-a-5",
-		TimelineId:        4,
-		CheckpointLsn:     7,
-		SeedReceiptSha256: digest,
-		ManifestSha256:    digest,
-		AggregateSha256:   digest,
+		SchemaVersion:        1,
+		Action:               receipt(adminsdk.HAActionKindSeededSlotActivate, "seed-standby-a-5", string(adminsdk.HAActionStateApplied), "primary-a"),
+		SlotName:             "standby-a",
+		Generation:           "seed-standby-a-5",
+		ManifestId:           "base-standby-a-5",
+		TimelineId:           4,
+		CheckpointLsn:        7,
+		SeedReceiptSha256:    digest,
+		CaptureReceiptSha256: digest,
+		ManifestSha256:       digest,
+		AggregateSha256:      digest,
 	})
 	g.Expect(requireHADirectAdminActionResultStatus(&activateAction, activation)).To(Succeed())
 	g.Expect(activateAction.AdminResult.CheckpointLSN).To(Equal(uint64(7)))
@@ -7827,11 +7846,14 @@ func TestParseHASeedArtifactReceiptRequiresMatchingTypedEvidence(t *testing.T) {
 	g.Expect(haAdminActionSucceededWithEvidence(pruneAction)).To(BeTrue())
 
 	activateAction := antflyv1.HAPlannedActionStatus{
-		Kind:                   "ActivateSeedArtifact",
-		SlotName:               "standby-a",
-		TargetLSN:              10,
-		SeedArtifactGeneration: "seed-standby-a-10",
-		AdminJobPhase:          haAdminJobPhaseSucceeded,
+		Kind:                     "ActivateSeedArtifact",
+		SlotName:                 "standby-a",
+		TargetLSN:                10,
+		SeedArtifactGeneration:   "seed-standby-a-10",
+		SeedCaptureReceiptSHA256: strings.Repeat("d", 64),
+		TargetLocalNodeID:        7,
+		TargetReplicaID:          1,
+		AdminJobPhase:            haAdminJobPhaseSucceeded,
 	}
 	activation := fmt.Sprintf(`{"format_version":2,"generation":"seed-standby-a-10","slot_name":"standby-a","cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":4,"epoch":6,"manifest_id":"base-standby-a-10","backup_lsn":10,"checkpoint_lsn":12,"seed_receipt_sha256":"%s","capture_receipt_sha256":"%s","manifest_sha256":"%s","aggregate_sha256":"%s","generation_path":"live-generations/seed-standby-a-10","raw_generation_path":"generations/seed-standby-a-10","materialized_receipt_sha256":"%s","materialized_aggregate_sha256":"%s","target_local_node_id":7,"target_replica_id":1,"topology_id":"test-standalone","topology_generation":3,"node_id":"standby-a","target_pvc_name":"standby-a-data","target_pvc_uid":"pvc-uid-1"}`, strings.Repeat("c", 64), strings.Repeat("d", 64), strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("e", 64), strings.Repeat("f", 64))
 	activationReceipt := parseHASeedArtifactReceipt(activation, activateAction)
@@ -7855,11 +7877,16 @@ func TestParseHASeedArtifactReceiptVersionContracts(t *testing.T) {
 	manifestDigest := strings.Repeat("a", 64)
 	aggregateDigest := strings.Repeat("b", 64)
 	seedDigest := strings.Repeat("c", 64)
+	captureDigest := strings.Repeat("d", 64)
 	body := func(version int) string {
-		return fmt.Sprintf(`{"format_version":%d,"generation":"seed-standby-a-10","slot_name":"standby-a","cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6,"manifest_id":"base-standby-a-10","backup_lsn":10,"checkpoint_lsn":12,"manifest_sha256":"%s","aggregate_sha256":"%s","seed_receipt_sha256":"%s","generation_path":"generations/seed-standby-a-10","topology_id":"test-standalone","topology_generation":3,"node_id":"standby-a","target_pvc_name":"standby-a-data","target_pvc_uid":"pvc-uid-1","total_bytes":42,"files":[{"path":"catalog/manifest"}]}`, version, manifestDigest, aggregateDigest, seedDigest)
+		captureField := ""
+		if version == 4 {
+			captureField = fmt.Sprintf(`,"capture_receipt_sha256":"%s"`, captureDigest)
+		}
+		return fmt.Sprintf(`{"format_version":%d,"generation":"seed-standby-a-10","slot_name":"standby-a","cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6,"manifest_id":"base-standby-a-10","backup_lsn":10,"checkpoint_lsn":12,"manifest_sha256":"%s","aggregate_sha256":"%s","seed_receipt_sha256":"%s"%s,"generation_path":"generations/seed-standby-a-10","topology_id":"test-standalone","topology_generation":3,"node_id":"standby-a","target_pvc_name":"standby-a-data","target_pvc_uid":"pvc-uid-1","total_bytes":42,"files":[{"path":"catalog/manifest"}]}`, version, manifestDigest, aggregateDigest, seedDigest, captureField)
 	}
 	for _, kind := range []haActionKind{haActionPublishSeedArtifact, haActionRestoreSeedArtifact} {
-		for _, version := range []int{1, 2, 3} {
+		for _, version := range []int{1, 2, 3, 4} {
 			action := antflyv1.HAPlannedActionStatus{
 				Kind: string(kind), SlotName: "standby-a", TargetLSN: 10,
 				SeedArtifactGeneration: "seed-standby-a-10", AdminJobPhase: haAdminJobPhaseSucceeded,
@@ -7891,7 +7918,7 @@ func TestParseHASeedArtifactReceiptVersionContracts(t *testing.T) {
 			action.SeedArtifactReceipt = receipt
 			g.Expect(haAdminActionSucceededWithEvidence(action)).To(BeTrue())
 		}
-		for _, unsupported := range []int{0, 4} {
+		for _, unsupported := range []int{0, 5} {
 			action := antflyv1.HAPlannedActionStatus{
 				Kind: string(kind), SlotName: "standby-a", TargetLSN: 10,
 				SeedArtifactGeneration: "seed-standby-a-10", AdminJobPhase: haAdminJobPhaseSucceeded,
@@ -7901,15 +7928,16 @@ func TestParseHASeedArtifactReceiptVersionContracts(t *testing.T) {
 		bound := antflyv1.HAPlannedActionStatus{
 			Kind: string(kind), SlotName: "standby-a", TargetLSN: 10, SeedArtifactGeneration: "seed-standby-a-10",
 			TopologyID: "test-standalone", TopologyGeneration: 3, TopologyNodeID: "standby-a",
-			TargetPVCName: "standby-a-data", TargetPVCUID: "pvc-uid-1",
+			TargetPVCName: "standby-a-data", TargetPVCUID: "pvc-uid-1", SeedCaptureReceiptSHA256: captureDigest,
 		}
-		g.Expect(parseHASeedArtifactReceipt(body(3), bound)).NotTo(BeNil())
-		g.Expect(parseHASeedArtifactReceipt(body(2), bound)).To(BeNil(), "topology-bound transport requires COMPLETE v3")
+		g.Expect(parseHASeedArtifactReceipt(body(4), bound)).NotTo(BeNil())
+		g.Expect(parseHASeedArtifactReceipt(body(3), bound)).To(BeNil(), "capture-bound topology transport requires COMPLETE v4")
 	}
 
 	activation := antflyv1.HAPlannedActionStatus{
 		Kind: string(haActionActivateSeedArtifact), SlotName: "standby-a", TargetLSN: 10,
 		SeedArtifactGeneration: "seed-standby-a-10", AdminJobPhase: haAdminJobPhaseSucceeded,
+		SeedCaptureReceiptSHA256: captureDigest, TargetLocalNodeID: 7, TargetReplicaID: 1,
 	}
 	activationBody := func(version int) string {
 		return fmt.Sprintf(`{"format_version":%d,"generation":"seed-standby-a-10","slot_name":"standby-a","manifest_id":"base-standby-a-10","backup_lsn":10,"checkpoint_lsn":12,"manifest_sha256":"%s","aggregate_sha256":"%s","seed_receipt_sha256":"%s","capture_receipt_sha256":"%s","generation_path":"live-generations/seed-standby-a-10","raw_generation_path":"generations/seed-standby-a-10","materialized_receipt_sha256":"%s","materialized_aggregate_sha256":"%s","target_local_node_id":7,"target_replica_id":1}`, version, manifestDigest, aggregateDigest, seedDigest, strings.Repeat("d", 64), strings.Repeat("e", 64), strings.Repeat("f", 64))
@@ -12586,12 +12614,16 @@ func TestUpdateHAStartupGateStatusUsesOnlyObservedActivationJobAndPVC(t *testing
 	cluster.Status.HAStatus = &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{{
 		Kind: string(haActionActivateSeedArtifact), StandbyName: "standby-a", SlotName: "standby-a",
 		TargetLSN: 10, SeedArtifactGeneration: "prod-standby-a-10", AdminJobName: "activation-job", AdminJobPhase: haAdminJobPhaseSucceeded,
+		SeedCaptureReceiptSHA256: strings.Repeat("d", 64), TargetLocalNodeID: 1, TargetReplicaID: 1,
 		SeedArtifactReceipt: &antflyv1.HASeedArtifactReceiptStatus{
-			FormatVersion: 1, Generation: "prod-standby-a-10", SlotName: "standby-a",
+			FormatVersion: 2, Generation: "prod-standby-a-10", SlotName: "standby-a",
 			TopologyID: "test-standalone", TopologyGeneration: 3, NodeID: "standby-a", TargetPVCName: "standby-a-data", TargetPVCUID: "pvc-uid-1",
 			ClusterID: 100, TimelineID: 1, Epoch: 1, ManifestID: "prod-standby-a-10",
 			BackupLSN: 10, CheckpointLSN: 10, ManifestSHA256: digest, AggregateSHA256: strings.Repeat("b", 64),
-			SeedReceiptSHA256: strings.Repeat("c", 64), GenerationPath: "generations/prod-standby-a-10",
+			SeedReceiptSHA256: strings.Repeat("c", 64), CaptureReceiptSHA256: strings.Repeat("d", 64),
+			MaterializedReceiptSHA256: strings.Repeat("e", 64), MaterializedAggregateSHA256: strings.Repeat("f", 64),
+			TargetLocalNodeID: 1, TargetReplicaID: 1,
+			GenerationPath: "live-generations/prod-standby-a-10", RawGenerationPath: "generations/prod-standby-a-10",
 		},
 	}, {
 		Kind: string(haActionGCTargetSeedGenerations), StandbyName: "standby-a", SlotName: "standby-a",

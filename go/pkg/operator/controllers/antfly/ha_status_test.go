@@ -1106,7 +1106,7 @@ func TestPlanHAPlansSeedFinishAndBootstrapWhenManifestPathConfigured(t *testing.
 	}
 }
 
-func TestPlanHAPlansPortablePublishRestoreAndVerifiedBootstrap(t *testing.T) {
+func TestPlanHARejectsPrebuiltPortableSeedWithoutRuntimeCaptureAuthority(t *testing.T) {
 	initial := uint64(5)
 	cluster := haCluster()
 	cluster.Status.HAStatus = &antflyv1.HAStatus{PrimaryLSN: 9}
@@ -1145,82 +1145,9 @@ func TestPlanHAPlansPortablePublishRestoreAndVerifiedBootstrap(t *testing.T) {
 		t.Fatalf("expected create, begin, finish, publish, restore, activate artifact, activate slot, target GC, prune actions, got %#v", actions)
 	}
 	publish := actions[3]
-	if publish.Kind != string(haActionPublishSeedArtifact) ||
-		publish.DependsOn != string(haActionFinishStandbySeed) ||
-		publish.Phase != string(haActionPhaseSeed) ||
-		publish.Executor != string(haActionExecutorCLIJob) ||
-		publish.AdminURL != "" ||
-		publish.SeedArtifactGeneration != "base-standby-a-10" ||
-		publish.SeedArtifactLocation != "s3://ha-seeds/cluster-a" ||
-		!reflect.DeepEqual(publish.AdminCommand, []string{
-			"artifact", "publish",
-			"--location", "s3://ha-seeds/cluster-a",
-			"--generation", "base-standby-a-10",
-			"--slot", "standby-a",
-			"--manifest", "/source/seed/manifest.afha",
-			"--content-root", "/source/seed/content",
-			"--topology-id", "topology-a",
-			"--topology-generation", "7",
-			"--node-id", "standby-a",
-			"--target-pvc-name", "standby-a-data",
-			"--target-pvc-uid", "pvc-uid-1",
-		}) {
-		t.Fatalf("unexpected portable publish action: %#v", publish)
-	}
-	restore := actions[4]
-	if restore.Kind != string(haActionRestoreSeedArtifact) ||
-		restore.DependsOn != string(haActionPublishSeedArtifact) ||
-		restore.Executor != string(haActionExecutorCLIJob) ||
-		restore.AdminURL != "" ||
-		restore.SeedContentRoot != "/target/seed/staging" ||
-		!strings.Contains(strings.Join(restore.AdminCommand, " "), "--minimum-checkpoint-lsn 10") {
-		t.Fatalf("unexpected portable restore action: %#v", restore)
-	}
-	activate := actions[5]
-	if activate.Kind != "ActivateSeedArtifact" ||
-		activate.DependsOn != string(haActionRestoreSeedArtifact) ||
-		activate.Executor != string(haActionExecutorCLIJob) ||
-		!reflect.DeepEqual(activate.AdminCommand, []string{
-			"artifact", "activate",
-			"--generation", "base-standby-a-10",
-			"--slot", "standby-a",
-			"--staging-root", "/target/seed/staging",
-			"--target-root", "/target/.antfly-ha/active",
-			"--ha-cluster-id", "100",
-			"--ha-shard-id", "0",
-			"--ha-table-id", "0",
-			"--ha-timeline-id", "4",
-			"--ha-epoch", "6",
-			"--minimum-checkpoint-lsn", "10",
-		}) {
-		t.Fatalf("activation must durably publish the verified generation on the target PVC: %#v", activate)
-	}
-	activateSlot := actions[6]
-	if activateSlot.Kind != "ActivateSeededSlot" ||
-		activateSlot.DependsOn != "ActivateSeedArtifact" ||
-		activateSlot.Executor != string(haActionExecutorAdminAPI) ||
-		activateSlot.AdminURL != "http://primary-ha.default.svc:8081" ||
-		activateSlot.AdminMethod != "POST" ||
-		activateSlot.AdminPath != "/admin/v1/ha/base-backups/activate" {
-		t.Fatalf("slot must remain non-streamable until durable target activation evidence exists: %#v", activateSlot)
-	}
-	targetGC := actions[7]
-	if targetGC.Kind != string(haActionGCTargetSeedGenerations) ||
-		targetGC.DependsOn != string(haActionActivateSeededSlot) {
-		t.Fatalf("target GC must run after durable slot activation: %#v", targetGC)
-	}
-	prune := actions[8]
-	if prune.Kind != string(haActionPruneSeedArtifacts) ||
-		prune.DependsOn != string(haActionGCTargetSeedGenerations) ||
-		prune.SeedArtifactRetainGenerations != 2 ||
-		!reflect.DeepEqual(prune.AdminCommand, []string{
-			"artifact", "prune",
-			"--location", "s3://ha-seeds/cluster-a",
-			"--generation", "base-standby-a-10",
-			"--slot", "standby-a",
-			"--retain-generations", "2",
-		}) {
-		t.Fatalf("unexpected post-bootstrap prune action: %#v", prune)
+	if publish.Kind != string(haActionPublishSeedArtifact) || publish.AdminCommand != nil ||
+		actions[4].AdminCommand != nil || actions[5].AdminCommand != nil {
+		t.Fatalf("caller-provided files must not bypass runtime capture authority: publish=%#v restore=%#v activate=%#v", publish, actions[4], actions[5])
 	}
 }
 

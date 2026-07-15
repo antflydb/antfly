@@ -358,7 +358,12 @@ func haStartupGateRuntimeEligible(cluster *antflyv1.AntflyCluster, pvc *corev1.P
 	if receipt.TopologyID != required.TopologyID || receipt.NodeID != required.NodeID ||
 		receipt.SlotName != required.SlotName || receipt.Generation != required.Generation ||
 		receipt.TargetPVCName != required.TargetPVCName || receipt.TargetPVCUID != string(pvc.UID) ||
-		receipt.GenerationPath != path.Join("generations", required.Generation) {
+		receipt.GenerationPath != path.Join("live-generations", required.Generation) ||
+		receipt.RawGenerationPath != path.Join("generations", required.Generation) ||
+		receipt.TargetLocalNodeID == 0 || receipt.TargetReplicaID == 0 ||
+		!isLowerHexDigest(receipt.CaptureReceiptSHA256) ||
+		!isLowerHexDigest(receipt.MaterializedReceiptSHA256) ||
+		!isLowerHexDigest(receipt.MaterializedAggregateSHA256) {
 		return false, "ActivationReceiptIdentityMismatch"
 	}
 	if required.TopologyGeneration != 0 && receipt.TopologyGeneration != required.TopologyGeneration {
@@ -369,7 +374,12 @@ func haStartupGateRuntimeEligible(cluster *antflyv1.AntflyCluster, pvc *corev1.P
 	}
 	if (required.ManifestSHA256 != "" && receipt.ManifestSHA256 != required.ManifestSHA256) ||
 		(required.AggregateSHA256 != "" && receipt.AggregateSHA256 != required.AggregateSHA256) ||
-		(required.SeedReceiptSHA256 != "" && receipt.SeedReceiptSHA256 != required.SeedReceiptSHA256) {
+		(required.SeedReceiptSHA256 != "" && receipt.SeedReceiptSHA256 != required.SeedReceiptSHA256) ||
+		(required.CaptureReceiptSHA256 != "" && receipt.CaptureReceiptSHA256 != required.CaptureReceiptSHA256) ||
+		(required.MaterializedReceiptSHA256 != "" && receipt.MaterializedReceiptSHA256 != required.MaterializedReceiptSHA256) ||
+		(required.MaterializedAggregateSHA256 != "" && receipt.MaterializedAggregateSHA256 != required.MaterializedAggregateSHA256) ||
+		(required.TargetLocalNodeID != 0 && receipt.TargetLocalNodeID != required.TargetLocalNodeID) ||
+		(required.TargetReplicaID != 0 && receipt.TargetReplicaID != required.TargetReplicaID) {
 		return false, "ActivationReceiptDigestMismatch"
 	}
 	return true, "ExactActivationReceiptMatched"
@@ -555,6 +565,11 @@ func standaloneHAStartupArgs(cluster *antflyv1.AntflyCluster) string {
 	if receipt.SeedReceiptSHA256 != "" {
 		appendArg("--ha-startup-seed-receipt-sha256", receipt.SeedReceiptSHA256)
 	}
+	appendArg("--ha-startup-capture-receipt-sha256", receipt.CaptureReceiptSHA256)
+	appendArg("--ha-startup-materialized-receipt-sha256", receipt.MaterializedReceiptSHA256)
+	appendArg("--ha-startup-materialized-aggregate-sha256", receipt.MaterializedAggregateSHA256)
+	appendArg("--ha-startup-target-local-node-id", strconv.FormatUint(receipt.TargetLocalNodeID, 10))
+	appendArg("--ha-startup-target-replica-id", strconv.FormatUint(receipt.TargetReplicaID, 10))
 	return args.String()
 }
 
@@ -3123,7 +3138,7 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 			)
 			volumeMounts = append(volumeMounts, corev1.VolumeMount{
 				Name: haSeedGenerationVolumeName, MountPath: haSeedLiveDataPath,
-				SubPath: path.Join(haSeedActivationRelativeRoot, "generations", required.Generation),
+				SubPath: path.Join(haSeedActivationRelativeRoot, "live-generations", required.Generation),
 			})
 		}
 		statefulSet.Spec.Template = corev1.PodTemplateSpec{
@@ -4470,25 +4485,31 @@ func (r *AntflyClusterReconciler) updateHAStartupGateStatus(ctx context.Context,
 			return
 		}
 		status.ActivationReceipt = &antflyv1.HASeedActivationReceiptStatus{
-			TopologyID:         receipt.TopologyID,
-			TopologyGeneration: receipt.TopologyGeneration,
-			NodeID:             receipt.NodeID,
-			SlotName:           receipt.SlotName,
-			Generation:         receipt.Generation,
-			TargetPVCName:      receipt.TargetPVCName,
-			TargetPVCUID:       receipt.TargetPVCUID,
-			ClusterID:          receipt.ClusterID,
-			ShardID:            receipt.ShardID,
-			TableID:            receipt.TableID,
-			TimelineID:         receipt.TimelineID,
-			Epoch:              receipt.Epoch,
-			BackupLSN:          receipt.BackupLSN,
-			CheckpointLSN:      receipt.CheckpointLSN,
-			ManifestID:         receipt.ManifestID,
-			ManifestSHA256:     receipt.ManifestSHA256,
-			AggregateSHA256:    receipt.AggregateSHA256,
-			SeedReceiptSHA256:  receipt.SeedReceiptSHA256,
-			GenerationPath:     receipt.GenerationPath,
+			TopologyID:                  receipt.TopologyID,
+			TopologyGeneration:          receipt.TopologyGeneration,
+			NodeID:                      receipt.NodeID,
+			SlotName:                    receipt.SlotName,
+			Generation:                  receipt.Generation,
+			TargetPVCName:               receipt.TargetPVCName,
+			TargetPVCUID:                receipt.TargetPVCUID,
+			ClusterID:                   receipt.ClusterID,
+			ShardID:                     receipt.ShardID,
+			TableID:                     receipt.TableID,
+			TimelineID:                  receipt.TimelineID,
+			Epoch:                       receipt.Epoch,
+			BackupLSN:                   receipt.BackupLSN,
+			CheckpointLSN:               receipt.CheckpointLSN,
+			ManifestID:                  receipt.ManifestID,
+			ManifestSHA256:              receipt.ManifestSHA256,
+			AggregateSHA256:             receipt.AggregateSHA256,
+			SeedReceiptSHA256:           receipt.SeedReceiptSHA256,
+			CaptureReceiptSHA256:        receipt.CaptureReceiptSHA256,
+			MaterializedReceiptSHA256:   receipt.MaterializedReceiptSHA256,
+			MaterializedAggregateSHA256: receipt.MaterializedAggregateSHA256,
+			TargetLocalNodeID:           receipt.TargetLocalNodeID,
+			TargetReplicaID:             receipt.TargetReplicaID,
+			GenerationPath:              receipt.GenerationPath,
+			RawGenerationPath:           receipt.RawGenerationPath,
 		}
 		for j := range cluster.Status.HAStatus.PlannedActions {
 			gc := cluster.Status.HAStatus.PlannedActions[j]
@@ -5210,7 +5231,8 @@ func haSeededSlotActivationReceiptForGC(cluster *antflyv1.AntflyCluster, action 
 			SlotName: result.SlotName, Generation: result.SeedArtifactGeneration,
 			ManifestId: result.ManifestID, TimelineId: result.SeedTimelineID,
 			CheckpointLsn: result.CheckpointLSN, SeedReceiptSha256: result.SeedReceiptSHA256,
-			ManifestSha256: result.ManifestSHA256, AggregateSha256: result.AggregateSHA256,
+			CaptureReceiptSha256: result.CaptureReceiptSHA256,
+			ManifestSha256:       result.ManifestSHA256, AggregateSha256: result.AggregateSHA256,
 		}
 		raw, err := haExactSeededSlotActivationReceipt([]byte(result.RawReceiptJSON), request)
 		if err != nil {
@@ -5295,8 +5317,12 @@ func (r *AntflyClusterReconciler) haActivationJobAction(ctx context.Context, clu
 	}
 	if strings.TrimSpace(action.TopologyID) == "" || action.TopologyGeneration <= 0 ||
 		strings.TrimSpace(action.TopologyNodeID) == "" || strings.TrimSpace(action.TargetPVCName) == "" ||
-		strings.TrimSpace(action.TargetPVCUID) == "" {
+		strings.TrimSpace(action.TargetPVCUID) == "" || action.TargetLocalNodeID == 0 || action.TargetReplicaID == 0 {
 		return action, false, fmt.Errorf("HA target activation requires an exact persisted topology and PVC identity")
+	}
+	if cluster.Spec.Standalone == nil || cluster.Spec.Standalone.NodeID <= 0 || cluster.Spec.Standalone.Replicas != 1 ||
+		action.TargetLocalNodeID != uint64(cluster.Spec.Standalone.NodeID) || action.TargetReplicaID != 1 {
+		return action, false, fmt.Errorf("HA target activation runtime materialization identity does not match standalone topology")
 	}
 	if gate := haRuntimeStartupGate(cluster); gate != nil {
 		if gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed ||
@@ -5324,13 +5350,6 @@ func (r *AntflyClusterReconciler) haActivationJobAction(ctx context.Context, clu
 	if pvcUID == "" || action.TargetPVCUID != pvcUID {
 		return action, false, nil
 	}
-	action.AdminCommand = append(append([]string{}, action.AdminCommand...),
-		"--topology-id", action.TopologyID,
-		"--topology-generation", strconv.FormatInt(action.TopologyGeneration, 10),
-		"--node-id", action.TopologyNodeID,
-		"--target-pvc-name", action.TargetPVCName,
-		"--target-pvc-uid", pvcUID,
-	)
 	return action, true, nil
 }
 
@@ -5356,7 +5375,12 @@ func (r *AntflyClusterReconciler) haActivationReceiptMatchesCurrentTarget(ctx co
 		receipt.TopologyID != required.TopologyID || receipt.NodeID != required.NodeID ||
 		receipt.SlotName != required.SlotName || receipt.Generation != required.Generation ||
 		receipt.TargetPVCName != required.TargetPVCName || receipt.TargetPVCUID != string(pvc.UID) ||
-		receipt.GenerationPath != path.Join("generations", required.Generation) {
+		receipt.GenerationPath != path.Join("live-generations", required.Generation) ||
+		receipt.RawGenerationPath != path.Join("generations", required.Generation) ||
+		receipt.TargetLocalNodeID == 0 || receipt.TargetReplicaID == 0 ||
+		!isLowerHexDigest(receipt.CaptureReceiptSHA256) ||
+		!isLowerHexDigest(receipt.MaterializedReceiptSHA256) ||
+		!isLowerHexDigest(receipt.MaterializedAggregateSHA256) {
 		return false, nil
 	}
 	if required.TopologyGeneration != 0 && receipt.TopologyGeneration != required.TopologyGeneration {
@@ -5367,7 +5391,12 @@ func (r *AntflyClusterReconciler) haActivationReceiptMatchesCurrentTarget(ctx co
 	}
 	if (required.ManifestSHA256 != "" && receipt.ManifestSHA256 != required.ManifestSHA256) ||
 		(required.AggregateSHA256 != "" && receipt.AggregateSHA256 != required.AggregateSHA256) ||
-		(required.SeedReceiptSHA256 != "" && receipt.SeedReceiptSHA256 != required.SeedReceiptSHA256) {
+		(required.SeedReceiptSHA256 != "" && receipt.SeedReceiptSHA256 != required.SeedReceiptSHA256) ||
+		(required.CaptureReceiptSHA256 != "" && receipt.CaptureReceiptSHA256 != required.CaptureReceiptSHA256) ||
+		(required.MaterializedReceiptSHA256 != "" && receipt.MaterializedReceiptSHA256 != required.MaterializedReceiptSHA256) ||
+		(required.MaterializedAggregateSHA256 != "" && receipt.MaterializedAggregateSHA256 != required.MaterializedAggregateSHA256) ||
+		(required.TargetLocalNodeID != 0 && receipt.TargetLocalNodeID != required.TargetLocalNodeID) ||
+		(required.TargetReplicaID != 0 && receipt.TargetReplicaID != required.TargetReplicaID) {
 		return false, nil
 	}
 	return true, nil
@@ -5585,14 +5614,15 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 			return true, err
 		}
 		body := adminsdk.SeededSlotActivateRequest{
-			SlotName:          action.SlotName,
-			Generation:        receipt.Generation,
-			ManifestId:        receipt.ManifestID,
-			TimelineId:        receipt.TimelineID,
-			CheckpointLsn:     receipt.CheckpointLSN,
-			SeedReceiptSha256: receipt.SeedReceiptSHA256,
-			ManifestSha256:    receipt.ManifestSHA256,
-			AggregateSha256:   receipt.AggregateSHA256,
+			SlotName:             action.SlotName,
+			Generation:           receipt.Generation,
+			ManifestId:           receipt.ManifestID,
+			TimelineId:           receipt.TimelineID,
+			CheckpointLsn:        receipt.CheckpointLSN,
+			SeedReceiptSha256:    receipt.SeedReceiptSHA256,
+			CaptureReceiptSha256: receipt.CaptureReceiptSHA256,
+			ManifestSha256:       receipt.ManifestSHA256,
+			AggregateSha256:      receipt.AggregateSHA256,
 		}
 		result, err := adminClient.ActivateSeededSlotResponse(ctx, body)
 		value, err := haAdminSDKResponseValue(result, err)
@@ -5843,6 +5873,7 @@ func haAdminActionResultFromSeedCaptureSDK(response adminsdk.HASeedArtifactCaptu
 	result.EndRecordLSN = response.EndRecordLsn
 	result.SeedArtifactGeneration = strings.TrimSpace(response.Generation)
 	result.ManifestSHA256 = strings.TrimSpace(response.ManifestSha256)
+	result.CaptureReceiptSHA256 = strings.TrimSpace(response.CaptureReceiptSha256)
 	result.SeedClusterID = response.ClusterId
 	result.SeedShardID = response.ShardId
 	result.SeedTableID = response.TableId
@@ -5869,6 +5900,7 @@ func haSeedCaptureResponseMatchesAction(cluster *antflyv1.AntflyCluster, action 
 		response.TableId == identity.TableID &&
 		response.TimelineId == identity.TimelineID &&
 		response.Epoch == identity.Epoch &&
+		isLowerHexDigest(response.CaptureReceiptSha256) &&
 		response.BackupLsn >= action.TargetLSN &&
 		response.CheckpointLsn >= response.BackupLsn &&
 		response.EndRecordLsn >= response.CheckpointLsn
@@ -5881,6 +5913,7 @@ func haAdminActionResultFromSeededSlotActivateSDK(response adminsdk.HASeededSlot
 	result.CheckpointLSN = response.CheckpointLsn
 	result.SeedArtifactGeneration = strings.TrimSpace(response.Generation)
 	result.SeedReceiptSHA256 = strings.TrimSpace(response.SeedReceiptSha256)
+	result.CaptureReceiptSHA256 = strings.TrimSpace(response.CaptureReceiptSha256)
 	result.ManifestSHA256 = strings.TrimSpace(response.ManifestSha256)
 	result.AggregateSHA256 = strings.TrimSpace(response.AggregateSha256)
 	result.SeedTimelineID = response.TimelineId
@@ -5917,6 +5950,7 @@ func haSeededSlotActivationResponseMatchesRequest(response adminsdk.HASeededSlot
 		response.TimelineId == request.TimelineId &&
 		response.CheckpointLsn == request.CheckpointLsn &&
 		strings.TrimSpace(response.SeedReceiptSha256) == strings.TrimSpace(request.SeedReceiptSha256) &&
+		strings.TrimSpace(response.CaptureReceiptSha256) == strings.TrimSpace(request.CaptureReceiptSha256) &&
 		strings.TrimSpace(response.ManifestSha256) == strings.TrimSpace(request.ManifestSha256) &&
 		strings.TrimSpace(response.AggregateSha256) == strings.TrimSpace(request.AggregateSha256)
 }
@@ -6854,28 +6888,34 @@ func parseHASeedArtifactReceipt(body string, action antflyv1.HAPlannedActionStat
 		Path string `json:"path"`
 	}
 	type artifactReceipt struct {
-		FormatVersion      int32         `json:"format_version"`
-		Generation         string        `json:"generation"`
-		SlotName           string        `json:"slot_name"`
-		ClusterID          uint64        `json:"cluster_id"`
-		ShardID            uint64        `json:"shard_id"`
-		TableID            uint64        `json:"table_id"`
-		TimelineID         uint64        `json:"timeline_id"`
-		Epoch              uint64        `json:"epoch"`
-		ManifestID         string        `json:"manifest_id"`
-		BackupLSN          uint64        `json:"backup_lsn"`
-		CheckpointLSN      uint64        `json:"checkpoint_lsn"`
-		ManifestSHA256     string        `json:"manifest_sha256"`
-		AggregateSHA256    string        `json:"aggregate_sha256"`
-		SeedReceiptSHA256  string        `json:"seed_receipt_sha256"`
-		GenerationPath     string        `json:"generation_path"`
-		TopologyID         string        `json:"topology_id"`
-		TopologyGeneration int64         `json:"topology_generation"`
-		NodeID             string        `json:"node_id"`
-		TargetPVCName      string        `json:"target_pvc_name"`
-		TargetPVCUID       string        `json:"target_pvc_uid"`
-		TotalBytes         uint64        `json:"total_bytes"`
-		Files              []fileReceipt `json:"files"`
+		FormatVersion               int32         `json:"format_version"`
+		Generation                  string        `json:"generation"`
+		SlotName                    string        `json:"slot_name"`
+		ClusterID                   uint64        `json:"cluster_id"`
+		ShardID                     uint64        `json:"shard_id"`
+		TableID                     uint64        `json:"table_id"`
+		TimelineID                  uint64        `json:"timeline_id"`
+		Epoch                       uint64        `json:"epoch"`
+		ManifestID                  string        `json:"manifest_id"`
+		BackupLSN                   uint64        `json:"backup_lsn"`
+		CheckpointLSN               uint64        `json:"checkpoint_lsn"`
+		ManifestSHA256              string        `json:"manifest_sha256"`
+		AggregateSHA256             string        `json:"aggregate_sha256"`
+		SeedReceiptSHA256           string        `json:"seed_receipt_sha256"`
+		CaptureReceiptSHA256        string        `json:"capture_receipt_sha256"`
+		GenerationPath              string        `json:"generation_path"`
+		RawGenerationPath           string        `json:"raw_generation_path"`
+		MaterializedReceiptSHA256   string        `json:"materialized_receipt_sha256"`
+		MaterializedAggregateSHA256 string        `json:"materialized_aggregate_sha256"`
+		TargetLocalNodeID           uint64        `json:"target_local_node_id"`
+		TargetReplicaID             uint64        `json:"target_replica_id"`
+		TopologyID                  string        `json:"topology_id"`
+		TopologyGeneration          int64         `json:"topology_generation"`
+		NodeID                      string        `json:"node_id"`
+		TargetPVCName               string        `json:"target_pvc_name"`
+		TargetPVCUID                string        `json:"target_pvc_uid"`
+		TotalBytes                  uint64        `json:"total_bytes"`
+		Files                       []fileReceipt `json:"files"`
 	}
 	type pruneReceipt struct {
 		FormatVersion      int32  `json:"format_version"`
@@ -6943,35 +6983,47 @@ func parseHASeedArtifactReceipt(body string, action antflyv1.HAPlannedActionStat
 	}
 
 	var receipt artifactReceipt
-	if err := json.Unmarshal([]byte(strings.TrimSpace(body)), &receipt); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(strings.TrimSpace(body)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&receipt); err != nil {
+		return nil
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
 		return nil
 	}
 	if len(receipt.Files) > math.MaxInt32 {
 		return nil
 	}
 	result := &antflyv1.HASeedArtifactReceiptStatus{
-		FormatVersion:      receipt.FormatVersion,
-		Generation:         strings.TrimSpace(receipt.Generation),
-		SlotName:           strings.TrimSpace(receipt.SlotName),
-		ClusterID:          receipt.ClusterID,
-		ShardID:            receipt.ShardID,
-		TableID:            receipt.TableID,
-		TimelineID:         receipt.TimelineID,
-		Epoch:              receipt.Epoch,
-		ManifestID:         strings.TrimSpace(receipt.ManifestID),
-		BackupLSN:          receipt.BackupLSN,
-		CheckpointLSN:      receipt.CheckpointLSN,
-		ManifestSHA256:     strings.TrimSpace(receipt.ManifestSHA256),
-		AggregateSHA256:    strings.TrimSpace(receipt.AggregateSHA256),
-		SeedReceiptSHA256:  strings.TrimSpace(receipt.SeedReceiptSHA256),
-		GenerationPath:     strings.TrimSpace(receipt.GenerationPath),
-		TopologyID:         strings.TrimSpace(receipt.TopologyID),
-		TopologyGeneration: receipt.TopologyGeneration,
-		NodeID:             strings.TrimSpace(receipt.NodeID),
-		TargetPVCName:      strings.TrimSpace(receipt.TargetPVCName),
-		TargetPVCUID:       strings.TrimSpace(receipt.TargetPVCUID),
-		TotalBytes:         receipt.TotalBytes,
-		FileCount:          int32(len(receipt.Files)), // #nosec G115 -- bounded by math.MaxInt32 above
+		FormatVersion:               receipt.FormatVersion,
+		Generation:                  strings.TrimSpace(receipt.Generation),
+		SlotName:                    strings.TrimSpace(receipt.SlotName),
+		ClusterID:                   receipt.ClusterID,
+		ShardID:                     receipt.ShardID,
+		TableID:                     receipt.TableID,
+		TimelineID:                  receipt.TimelineID,
+		Epoch:                       receipt.Epoch,
+		ManifestID:                  strings.TrimSpace(receipt.ManifestID),
+		BackupLSN:                   receipt.BackupLSN,
+		CheckpointLSN:               receipt.CheckpointLSN,
+		ManifestSHA256:              strings.TrimSpace(receipt.ManifestSHA256),
+		AggregateSHA256:             strings.TrimSpace(receipt.AggregateSHA256),
+		SeedReceiptSHA256:           strings.TrimSpace(receipt.SeedReceiptSHA256),
+		CaptureReceiptSHA256:        strings.TrimSpace(receipt.CaptureReceiptSHA256),
+		GenerationPath:              strings.TrimSpace(receipt.GenerationPath),
+		RawGenerationPath:           strings.TrimSpace(receipt.RawGenerationPath),
+		MaterializedReceiptSHA256:   strings.TrimSpace(receipt.MaterializedReceiptSHA256),
+		MaterializedAggregateSHA256: strings.TrimSpace(receipt.MaterializedAggregateSHA256),
+		TargetLocalNodeID:           receipt.TargetLocalNodeID,
+		TargetReplicaID:             receipt.TargetReplicaID,
+		TopologyID:                  strings.TrimSpace(receipt.TopologyID),
+		TopologyGeneration:          receipt.TopologyGeneration,
+		NodeID:                      strings.TrimSpace(receipt.NodeID),
+		TargetPVCName:               strings.TrimSpace(receipt.TargetPVCName),
+		TargetPVCUID:                strings.TrimSpace(receipt.TargetPVCUID),
+		TotalBytes:                  receipt.TotalBytes,
+		FileCount:                   int32(len(receipt.Files)), // #nosec G115 -- bounded by math.MaxInt32 above
 	}
 	if !haSeedArtifactReceiptMatchesStatus(action, result) {
 		return nil
@@ -9442,12 +9494,16 @@ func haSeedArtifactReceiptMatchesStatus(action antflyv1.HAPlannedActionStatus, r
 	}
 	switch kind {
 	case haActionPublishSeedArtifact, haActionRestoreSeedArtifact:
-		if receipt.FormatVersion != 1 && receipt.FormatVersion != 2 && receipt.FormatVersion != 3 {
+		if receipt.FormatVersion != 1 && receipt.FormatVersion != 2 && receipt.FormatVersion != 3 && receipt.FormatVersion != 4 {
+			return false
+		}
+	case haActionActivateSeedArtifact:
+		if receipt.FormatVersion != 2 {
 			return false
 		}
 	default:
-		// Activation and prune receipts have distinct v1 schemas. A transport
-		// artifact v2 must never silently widen those evidence contracts.
+		// Prune receipts have a distinct v1 schema. Transport and activation
+		// versions must never silently widen that evidence contract.
 		if receipt.FormatVersion != 1 {
 			return false
 		}
@@ -9468,9 +9524,16 @@ func haSeedArtifactReceiptMatchesStatus(action antflyv1.HAPlannedActionStatus, r
 			receipt.CheckpointLSN >= receipt.BackupLSN &&
 			receipt.CheckpointLSN >= action.TargetLSN &&
 			isLowerHexDigest(receipt.SeedReceiptSHA256) &&
+			isLowerHexDigest(receipt.CaptureReceiptSHA256) &&
+			receipt.CaptureReceiptSHA256 == strings.TrimSpace(action.SeedCaptureReceiptSHA256) &&
 			isLowerHexDigest(receipt.ManifestSHA256) &&
 			isLowerHexDigest(receipt.AggregateSHA256) &&
-			strings.TrimSpace(receipt.GenerationPath) == "generations/"+strings.TrimSpace(action.SeedArtifactGeneration)
+			isLowerHexDigest(receipt.MaterializedReceiptSHA256) &&
+			isLowerHexDigest(receipt.MaterializedAggregateSHA256) &&
+			receipt.TargetLocalNodeID == action.TargetLocalNodeID &&
+			receipt.TargetReplicaID == action.TargetReplicaID &&
+			strings.TrimSpace(receipt.GenerationPath) == "live-generations/"+strings.TrimSpace(action.SeedArtifactGeneration) &&
+			strings.TrimSpace(receipt.RawGenerationPath) == "generations/"+strings.TrimSpace(action.SeedArtifactGeneration)
 	}
 	return receipt.FileCount > 0 &&
 		strings.TrimSpace(receipt.ManifestID) != "" &&
@@ -9478,7 +9541,9 @@ func haSeedArtifactReceiptMatchesStatus(action antflyv1.HAPlannedActionStatus, r
 		receipt.CheckpointLSN >= receipt.BackupLSN &&
 		receipt.CheckpointLSN >= action.TargetLSN &&
 		isLowerHexDigest(receipt.ManifestSHA256) &&
-		isLowerHexDigest(receipt.AggregateSHA256)
+		isLowerHexDigest(receipt.AggregateSHA256) &&
+		(strings.TrimSpace(action.SeedCaptureReceiptSHA256) == "" ||
+			(receipt.CaptureReceiptSHA256 == strings.TrimSpace(action.SeedCaptureReceiptSHA256) && isLowerHexDigest(receipt.CaptureReceiptSHA256)))
 }
 
 func haSeedArtifactTopologyReceiptMatchesAction(action antflyv1.HAPlannedActionStatus, receipt *antflyv1.HASeedArtifactReceiptStatus) bool {
@@ -9493,7 +9558,7 @@ func haSeedArtifactTopologyReceiptMatchesAction(action antflyv1.HAPlannedActionS
 		receipt.TargetPVCName != strings.TrimSpace(action.TargetPVCName) || receipt.TargetPVCUID != strings.TrimSpace(action.TargetPVCUID) {
 		return false
 	}
-	if (haActionKind(action.Kind) == haActionPublishSeedArtifact || haActionKind(action.Kind) == haActionRestoreSeedArtifact) && receipt.FormatVersion != 3 {
+	if (haActionKind(action.Kind) == haActionPublishSeedArtifact || haActionKind(action.Kind) == haActionRestoreSeedArtifact) && receipt.FormatVersion != 4 {
 		return false
 	}
 	return true
@@ -9591,6 +9656,7 @@ func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool 
 			result.EndRecordLSN >= result.CheckpointLSN && result.SeedClusterID > 0 &&
 			result.SeedTimelineID > 0 && result.SeedEpoch > 0 && result.SeedFileCount > 0 &&
 			isLowerHexDigest(result.SeedSourcePlanSHA256) && isLowerHexDigest(result.ManifestSHA256) &&
+			isLowerHexDigest(result.CaptureReceiptSHA256) &&
 			path.IsAbs(result.SeedGenerationRoot) && path.IsAbs(result.SeedContentRoot) && path.IsAbs(result.SeedManifestPath)
 	case haActionActivateSeededSlot:
 		return haResultSlotNameMatches(result.SlotName, expectedSlotName) &&
@@ -9598,6 +9664,7 @@ func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool 
 			result.CheckpointLSN >= action.TargetLSN &&
 			strings.TrimSpace(result.SeedArtifactGeneration) == strings.TrimSpace(action.SeedArtifactGeneration) &&
 			isLowerHexDigest(result.SeedReceiptSHA256) &&
+			isLowerHexDigest(result.CaptureReceiptSHA256) &&
 			isLowerHexDigest(result.ManifestSHA256) &&
 			isLowerHexDigest(result.AggregateSHA256)
 	case haActionBootstrapStandbySeed:
