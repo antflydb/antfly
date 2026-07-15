@@ -12,6 +12,15 @@ Implemented in the current tree:
   bulk-publication state
 - `IncompleteBulkPublish` is quarantined and repaired through a durable,
   restart-resumable shadow-generation state machine
+- a counterless legacy artifact projection bootstraps its authoritative target
+  count from a stable snapshot plus a signed concurrent-write delta; only the
+  two short marker/finalization boundaries hold the apply lock, and restart
+  safely repeats the scan under the existing durable repair intent. A random
+  per-attempt nonce prevents a stale concurrent scanner from finalizing another
+  attempt's delta. Counter routing is derived from the complete index catalog,
+  including quarantined status-only configs, so writes remain accounted while
+  the affected runtime index is absent. Document-only commits bypass catalog
+  construction entirely
 - explicit generation rebuilds for dense, sparse, graph, and full-text indexes
   use the same durable intent and post-pointer restart reconciliation
 - startup repair is ownership-fenced, resource-admitted, and driven by a
@@ -23,6 +32,11 @@ Implemented in the current tree:
 - repair execution is owned by a dedicated `BackendRuntime` maintenance owner;
   shutdown cooperatively cancels at durable boundaries and drains that owner,
   leaving the candidate resumable instead of waiting for a full rebuild
+- dense repair snapshot batches are sized from vector dimensions and the
+  currently available `ResourceManager` repair budget. Background planning
+  stays within the soft budget and retains the hard budget as an authoritative
+  race/safety fence. The legacy counter-bootstrap scan is admitted from the
+  same repair slice before it publishes a marker or opens its stable snapshot
 - temporarily unknown leadership retains queued debt with retry semantics;
   only an authoritative non-local ownership decision removes local queue state
 - provisioned operator rebuild requests only persist/attach to the durable
@@ -1429,13 +1443,18 @@ The minimum deterministic test matrix is:
 
 1. Create an external dense index, persist vectors, leave
    `__bulk_publish_state`, run managed startup catch-up, and verify the index is
-   automatically searchable without an API repair request.
+   automatically searchable without an API repair request. Repeat with the
+   durable artifact target counter removed to exercise legacy snapshot-plus-
+   delta bootstrap.
 2. Stop after intent persistence and before candidate creation; restart must
    retain the quarantined root and resume.
 3. Stop during snapshot construction; restart must either resume a validated
    checkpoint or discard only the candidate and rebuild it.
 4. Write documents after the snapshot floor while the shadow is building;
    replay truncation must remain pinned and the final index must include them.
+   For a counterless quarantined dense index, perform artifact insert,
+   replacement, and deletion while the bootstrap snapshot is open; verify the
+   signed delta, durable target count, and repaired search result.
 5. Stop after candidate readiness but before pointer swap; restart must validate
    and activate the identified candidate without rebuilding it.
 6. Stop after pointer swap but before replacement validation, checkpoint
@@ -1489,6 +1508,10 @@ The minimum deterministic test matrix is:
     `Retry-After`, hysteretic recovery, and absence of filesystem exhaustion.
 24. Queue differently sized repairs long enough to exercise size-aware
     selection and aging. Assert bounded oldest-intent age and no starvation.
+25. Hold enough dense-repair working-set capacity to cross the soft background
+    budget without reaching the hard limit. Counter bootstrap and shadow batch
+    planning must defer without consuming additional bytes or recording a hard
+    rejection.
 
 This track prevents wipe/re-ingest and does not require changing the successful
 normal-ingest path. The streaming-session track separately prevents ordinary
@@ -1744,8 +1767,13 @@ Acceptance:
 
 ## Rollout
 
-The session-kind change should be guarded initially so both paths can be tested
-against the same workloads. Emit counters for:
+Streaming replay is the ordinary-write correctness path, not a user-selectable
+index behavior. It is enabled unconditionally and has no public or
+resource-configuration toggle. Production rollout uses the normal staged binary
+deployment and canary process; rollback means deploying the prior binary rather
+than retaining the unsafe ordinary-replay bulk-publication path in the runtime.
+
+Emit counters for:
 
 - streaming sessions opened, finished, and aborted
 - bulk publication sessions opened, finished, and aborted
@@ -1766,10 +1794,10 @@ against the same workloads. Emit counters for:
 Rollout order:
 
 1. tests and local benchmarks
-2. opt-in streaming mode in benchmark and canary environments
-3. fault-injection canary with forced process termination
-4. default streaming mode for ordinary dense replay
-5. removal of the legacy ordinary-replay bulk-session path after qualification
+2. fault-injection deployment canary with forced process termination
+3. staged binary rollout with ordinary dense replay using streaming sessions
+4. removal of any unreachable legacy ordinary-replay bulk-session plumbing
+   after qualification
 
 Automatic repair rolls out separately:
 

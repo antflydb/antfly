@@ -8074,6 +8074,178 @@ pub const DB = struct {
         return repair_id;
     }
 
+    const DenseArtifactCounterBootstrapSnapshot = struct {
+        txn: docstore_mod.DocStore.Txn,
+        attempt_id: u128,
+
+        fn deinit(self: *@This()) void {
+            self.txn.abort();
+            self.* = undefined;
+        }
+    };
+
+    fn beginDenseArtifactCounterBootstrapSnapshot(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        repair_id: u128,
+    ) !DenseArtifactCounterBootstrapSnapshot {
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        if (try loadDenseArtifactTargetCounter(alloc, self.core.store, index_name) != null) {
+            return error.DenseArtifactCounterAlreadyInitialized;
+        }
+        const attempt_id = try index_repair_state.newRepairId(alloc);
+        const marker_key = try denseArtifactCounterBootstrapKeyAlloc(alloc, index_name);
+        defer alloc.free(marker_key);
+        var marker_value: [dense_artifact_counter_bootstrap_encoded_len]u8 = undefined;
+        encodeDenseArtifactCounterBootstrap(.{
+            .repair_id = repair_id,
+            .attempt_id = attempt_id,
+        }, &marker_value);
+        try self.core.store.putBatch(&.{.{ .key = marker_key, .value = &marker_value }}, &.{});
+
+        // The apply lock orders marker publication before this snapshot and
+        // before every later artifact mutation. Once it is released, those
+        // mutations update the marker's signed delta in their own atomic store
+        // batch while this stable snapshot is counted without blocking writes.
+        return .{
+            .txn = try self.core.store.beginReadTxn(),
+            .attempt_id = attempt_id,
+        };
+    }
+
+    fn finishDenseArtifactCounterBootstrap(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        repair_id: u128,
+        attempt_id: u128,
+        snapshot_count: u64,
+    ) !void {
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        if (try loadDenseArtifactTargetCounter(alloc, self.core.store, index_name) != null) return;
+        const marker = (try loadDenseArtifactCounterBootstrap(alloc, self.core.store, index_name)) orelse
+            return error.DenseArtifactCounterBootstrapMissing;
+        if (marker.repair_id != repair_id or marker.attempt_id != attempt_id) {
+            return error.StaleDenseArtifactCounterBootstrap;
+        }
+
+        const final_count_i128 = @as(i128, @intCast(snapshot_count)) + @as(i128, marker.delta);
+        if (final_count_i128 < 0 or final_count_i128 > std.math.maxInt(u64)) {
+            return error.InvalidDenseArtifactCounterBootstrapDelta;
+        }
+        const counter_key = try denseArtifactTargetCounterKeyAlloc(alloc, index_name);
+        defer alloc.free(counter_key);
+        const marker_key = try denseArtifactCounterBootstrapKeyAlloc(alloc, index_name);
+        defer alloc.free(marker_key);
+        var counter_value: [8]u8 = undefined;
+        std.mem.writeInt(u64, &counter_value, @intCast(final_count_i128), .little);
+        try self.core.store.putBatch(
+            &.{.{ .key = counter_key, .value = &counter_value }},
+            &.{marker_key},
+        );
+    }
+
+    fn countDenseArtifactsForConfigFromReadTxn(
+        self: *DB,
+        alloc: Allocator,
+        cfg: types.IndexConfig,
+        read_txn: *docstore_mod.DocStore.Txn,
+        cancel_check: ?types.RepairCancelCheck,
+    ) !u64 {
+        const artifact_name = try index_manager_mod.denseConfigArtifactNameAlloc(alloc, cfg);
+        defer alloc.free(artifact_name);
+        const dims = try index_manager_mod.denseConfigDimensions(alloc, cfg);
+        const lower = try self.core.documentRangeLowerAlloc("");
+        defer self.core.alloc.free(lower);
+
+        const ScanState = struct {
+            alloc: Allocator,
+            artifact_name: []const u8,
+            dims: u32,
+            cancel_check: ?types.RepairCancelCheck,
+            scanned: usize = 0,
+            count: u64 = 0,
+
+            fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                state.scanned +|= 1;
+                if ((state.scanned & 1023) == 0) {
+                    if (state.cancel_check) |check| if (check.requested()) return error.Canceled;
+                }
+                if (!internal_keys.isInternalUserKey(key)) return .@"continue";
+                var artifact_ref = (try decodeArtifactRefIfKnownAlloc(state.alloc, key)) orelse return .@"continue";
+                defer artifact_ref.deinit(state.alloc);
+                if (artifact_ref.kind != .embedding or
+                    !std.mem.eql(u8, artifact_ref.name, state.artifact_name))
+                {
+                    return .@"continue";
+                }
+                const artifact_dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(value) catch |err| {
+                    if (isRecoverableEmbeddingArtifactError(err)) return .@"continue";
+                    return err;
+                };
+                if (artifact_dims == state.dims) state.count +|= 1;
+                return .@"continue";
+            }
+        };
+
+        var scan_state = ScanState{
+            .alloc = alloc,
+            .artifact_name = artifact_name,
+            .dims = dims,
+            .cancel_check = cancel_check,
+        };
+        try self.core.store.scanReadTxnWithContext(read_txn, lower, "", .{}, &scan_state, ScanState.scanEntry);
+        return scan_state.count;
+    }
+
+    fn ensureDenseArtifactTargetCounterForRepair(
+        self: *DB,
+        alloc: Allocator,
+        cfg: types.IndexConfig,
+        repair_id: u128,
+        cancel_check: ?types.RepairCancelCheck,
+    ) !void {
+        if (!try index_manager_mod.denseConfigRequiresArtifactCoverage(alloc, cfg)) return;
+        if (try loadDenseArtifactTargetCounter(alloc, self.core.store, cfg.name) != null) return;
+
+        // Legacy bootstrap is a background repair phase in its own right. It
+        // can hold a stable store snapshot for a full artifact scan, so admit
+        // it before publishing the marker rather than doing unaccounted work
+        // that a later shadow-build admission would reject.
+        var bootstrap_admission: ?resource_manager_mod.Reservation = if (self.core.index_manager.resource_manager) |manager|
+            try reserveDenseCounterBootstrapWorkingSet(manager)
+        else
+            null;
+        defer if (bootstrap_admission) |*reservation| reservation.release();
+
+        var bootstrap_snapshot = self.beginDenseArtifactCounterBootstrapSnapshot(alloc, cfg.name, repair_id) catch |err| switch (err) {
+            error.DenseArtifactCounterAlreadyInitialized => return,
+            else => return err,
+        };
+        defer bootstrap_snapshot.deinit();
+
+        const snapshot_count = try self.countDenseArtifactsForConfigFromReadTxn(
+            alloc,
+            cfg,
+            &bootstrap_snapshot.txn,
+            cancel_check,
+        );
+        if (cancel_check) |check| if (check.requested()) return error.Canceled;
+        try self.finishDenseArtifactCounterBootstrap(
+            alloc,
+            cfg.name,
+            repair_id,
+            bootstrap_snapshot.attempt_id,
+            snapshot_count,
+        );
+    }
+
     fn validateIndexRepairSourcePreflight(self: *DB, alloc: Allocator, cfg: types.IndexConfig) !void {
         if (!try index_manager_mod.denseConfigRequiresArtifactCoverage(alloc, cfg)) return;
         const target_count = try loadDenseArtifactTargetCounter(alloc, self.core.store, cfg.name);
@@ -8532,6 +8704,87 @@ pub const DB = struct {
         return std.math.mul(u64, logical, 2) catch std.math.maxInt(u64);
     }
 
+    const RepairWorkingSetPlan = struct {
+        reservation_bytes: u64,
+        dense_rebuild_batch_items: usize = 2048,
+    };
+
+    const dense_counter_bootstrap_working_set_bytes: u64 = 8 * 1024 * 1024;
+
+    fn reserveDenseCounterBootstrapWorkingSet(
+        manager: *resource_manager_mod.ResourceManager,
+    ) !resource_manager_mod.Reservation {
+        const slice_stats = manager.sliceStats(.dense_repair_working_set);
+        const hard_available = if (slice_stats.hard_limit_bytes == 0)
+            std.math.maxInt(u64)
+        else
+            slice_stats.hard_limit_bytes -| slice_stats.used_bytes;
+        // Let ResourceManager perform an authoritative hard rejection so the
+        // shared rejection metric remains accurate under pressure and races.
+        if (hard_available < dense_counter_bootstrap_working_set_bytes) {
+            return manager.reserve(.dense_repair_working_set, dense_counter_bootstrap_working_set_bytes) catch
+                return error.RepairResourceUnavailable;
+        }
+        const soft_available = if (slice_stats.soft_limit_bytes == 0)
+            hard_available
+        else
+            slice_stats.soft_limit_bytes -| slice_stats.used_bytes;
+        if (soft_available < dense_counter_bootstrap_working_set_bytes) {
+            return error.RepairResourceUnavailable;
+        }
+        return manager.reserve(.dense_repair_working_set, dense_counter_bootstrap_working_set_bytes) catch
+            return error.RepairResourceUnavailable;
+    }
+
+    fn repairWorkingSetPlan(
+        alloc: Allocator,
+        manager: *resource_manager_mod.ResourceManager,
+        cfg: types.IndexConfig,
+    ) !RepairWorkingSetPlan {
+        const base_bytes: u64 = 8 * 1024 * 1024;
+        if (cfg.kind != .dense_vector) return .{ .reservation_bytes = base_bytes };
+
+        const dims = try index_manager_mod.denseConfigDimensions(alloc, cfg);
+        // The snapshot scanner owns one decoded vector while the mapper/HBC
+        // boundary may transiently own a second copy. Include keys, artifact
+        // identity, list capacity, and allocator overhead per item. HBC/LSM
+        // caches and routing work remain independently accounted by their own
+        // ResourceManager slices.
+        const raw_vector_bytes = std.math.mul(u64, dims, @sizeOf(f32)) catch std.math.maxInt(u64);
+        const per_item_bytes = (std.math.mul(u64, raw_vector_bytes, 2) catch std.math.maxInt(u64)) +| 2048;
+        const desired_items: u64 = 2048;
+        const slice_stats = manager.sliceStats(.dense_repair_working_set);
+        const hard_available = if (slice_stats.hard_limit_bytes == 0)
+            std.math.maxInt(u64)
+        else
+            slice_stats.hard_limit_bytes -| slice_stats.used_bytes;
+        const minimum_reservation = base_bytes +| per_item_bytes;
+        // Preserve ResourceManager's authoritative hard-limit rejection and
+        // metric. For admissible work, however, size background batches to the
+        // soft budget: reaching the hard limit is a safety failure, not a
+        // throughput target.
+        if (hard_available < minimum_reservation) {
+            return .{
+                .reservation_bytes = minimum_reservation,
+                .dense_rebuild_batch_items = 1,
+            };
+        }
+        const available = if (slice_stats.soft_limit_bytes == 0)
+            hard_available
+        else
+            slice_stats.soft_limit_bytes -| slice_stats.used_bytes;
+        if (available < minimum_reservation) return error.RepairResourceUnavailable;
+        const fitting_items = if (available <= base_bytes)
+            0
+        else
+            (available - base_bytes) / @max(@as(u64, 1), per_item_bytes);
+        const batch_items = @min(desired_items, fitting_items);
+        return .{
+            .reservation_bytes = base_bytes +| (per_item_bytes *| batch_items),
+            .dense_rebuild_batch_items = @intCast(batch_items),
+        };
+    }
+
     pub fn advanceIndexRepairIntent(
         self: *DB,
         alloc: Allocator,
@@ -8593,11 +8846,41 @@ pub const DB = struct {
             return result;
         }
 
+        // Counterless legacy replicas bootstrap coverage from a stable primary
+        // snapshot plus an atomically maintained concurrent-write delta. The
+        // durable repair intent authorizes retry after cancellation or restart;
+        // no candidate directory is created until authoritative coverage exists.
+        self.ensureDenseArtifactTargetCounterForRepair(
+            alloc,
+            cfg_ptr.*,
+            repair_id,
+            effective_options.cancel_check,
+        ) catch |err| switch (err) {
+            error.Canceled, error.StaleDenseArtifactCounterBootstrap => {
+                result.attempted = true;
+                result.deferred = true;
+                return result;
+            },
+            error.RepairResourceUnavailable => {
+                const attempt_count = entry.intent.attempt_count +| 1;
+                const next_retry_at_ms = now_ms +| indexRepairRetryDelayMs(repair_id, attempt_count);
+                try self.updateIndexRepairIntent(alloc, repair_id, .{
+                    .attempt_count = attempt_count,
+                    .next_retry_at_ms = next_retry_at_ms,
+                    .last_error = "RepairResourceUnavailable",
+                    .replace_last_error = true,
+                });
+                result.attempted = true;
+                result.deferred = true;
+                result.next_retry_at_ms = next_retry_at_ms;
+                return result;
+            },
+            else => return err,
+        };
+
         // Automatic reconstruction is destructive only at pointer activation,
         // but creating an apparently valid empty candidate from missing source
-        // metadata is still unsafe. Artifact-backed dense indexes require the
-        // durable target counter before any candidate directory or admission
-        // reservation is created. Full per-artifact validation remains part
+        // metadata is still unsafe. Full per-artifact validation remains part
         // of the shadow build.
         self.validateIndexRepairSourcePreflight(alloc, cfg_ptr.*) catch |err| {
             const err_name = if (err == error.RepairSourceCoverageIncomplete)
@@ -9188,6 +9471,20 @@ pub const DB = struct {
                     .replace_last_error = true,
                 });
             }
+            self.ensureDenseArtifactTargetCounterForRepair(
+                alloc,
+                cfg,
+                repair_id,
+                options.cancel_check,
+            ) catch |err| switch (err) {
+                error.Canceled, error.StaleDenseArtifactCounterBootstrap => {
+                    result.in_progress += 1;
+                    result.unresolved += 1;
+                    result.debt_remaining = true;
+                    return result;
+                },
+                else => return err,
+            };
             self.validateIndexRepairSourcePreflight(alloc, cfg) catch |err| {
                 const err_name = if (err == error.RepairSourceCoverageIncomplete)
                     "dense_artifact_coverage_missing"
@@ -9272,8 +9569,13 @@ pub const DB = struct {
         durable_repair_id: ?u128,
     ) !ShadowIndexReplacementResult {
         try checkArtifactRepairCancelled(options);
+        const working_set_plan = if (self.core.index_manager.resource_manager) |manager|
+            try repairWorkingSetPlan(alloc, manager, cfg)
+        else
+            RepairWorkingSetPlan{ .reservation_bytes = 0 };
         var repair_admission: ?resource_manager_mod.Reservation = if (self.core.index_manager.resource_manager) |manager|
-            manager.reserve(.dense_repair_working_set, 64 * 1024 * 1024) catch return error.RepairResourceUnavailable
+            manager.reserve(.dense_repair_working_set, working_set_plan.reservation_bytes) catch
+                return error.RepairResourceUnavailable
         else
             null;
         defer if (repair_admission) |*reservation| reservation.release();
@@ -9421,7 +9723,11 @@ pub const DB = struct {
                 defer shadow_ctx.snapshot_read_txn = null;
                 const count: u64 = switch (cfg.kind) {
                     .dense_vector => count_blk: {
-                        const count: u64 = @intCast(try rebuildDenseIndexForTargetCoverageContext(&shadow_ctx, cfg.name, 2048));
+                        const count: u64 = @intCast(try rebuildDenseIndexForTargetCoverageContext(
+                            &shadow_ctx,
+                            cfg.name,
+                            working_set_plan.dense_rebuild_batch_items,
+                        ));
                         expected_snapshot_coverage = try denseTargetCountForIndexContext(&shadow_ctx, cfg.name);
                         break :count_blk count;
                     },
@@ -11188,6 +11494,7 @@ pub const DB = struct {
         lockApply(self);
         defer self.core.unlockApply();
         const applied = try self.core.addIndex(cfg);
+        try self.initializeDenseArtifactTargetCounterIfNeeded(cfg);
         try saveIndexStatusSnapshots(self.alloc, self.core.store, self.core.index_manager, &[_]apply_state.AppliedSequenceUpdate{.{
             .index_name = cfg.name,
             .sequence = applied,
@@ -12279,7 +12586,10 @@ pub const DB = struct {
         defer self.core.unlockApply();
         try self.abandonIndexRepairForDeletion(self.alloc, name);
         const removed = try self.core.deleteIndex(name);
-        if (removed) try self.deleteDerivedCoverageForIndex(name);
+        if (removed) {
+            try self.deleteDerivedCoverageForIndex(name);
+            try self.deleteDenseArtifactCounterMetadata(name);
+        }
         return removed;
     }
 
@@ -13008,6 +13318,15 @@ pub const DB = struct {
     };
 
     const dense_artifact_target_counter_prefix = "\x00\x00__metadata__:dense_artifact_target_count:";
+    const dense_artifact_counter_bootstrap_prefix = "\x00\x00__metadata__:dense_artifact_counter_bootstrap:";
+    const dense_artifact_counter_bootstrap_magic = "AFDCB001";
+    const dense_artifact_counter_bootstrap_encoded_len = dense_artifact_counter_bootstrap_magic.len + 2 * @sizeOf(u128) + @sizeOf(i64);
+
+    const DenseArtifactCounterBootstrap = struct {
+        repair_id: u128,
+        attempt_id: u128,
+        delta: i64 = 0,
+    };
 
     fn denseIndexRebuildStatePathAlloc(self: *DB, alloc: Allocator, index_name: []const u8) ![]u8 {
         return try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ self.core.path, index_name });
@@ -13058,8 +13377,191 @@ pub const DB = struct {
         }
     };
 
+    const DenseArtifactCounterTarget = struct {
+        index_name: []u8,
+        artifact_name: []u8,
+        dims: u32,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            alloc.free(self.index_name);
+            alloc.free(self.artifact_name);
+            self.* = undefined;
+        }
+    };
+
+    /// Per-commit routing table for authoritative dense-artifact counters.
+    /// Unlike the runtime dense-index list, this includes status-only configs:
+    /// a quarantined index is exactly the index whose bootstrap marker must
+    /// continue observing concurrent artifact mutations.
+    const DenseArtifactCounterCatalog = struct {
+        targets: std.ArrayListUnmanaged(DenseArtifactCounterTarget) = .empty,
+        by_artifact: std.HashMapUnmanaged(DenseArtifactTargetKey, std.ArrayListUnmanaged(usize), DenseArtifactTargetKeyContext, 80) = .empty,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            var values = self.by_artifact.valueIterator();
+            while (values.next()) |indices| indices.deinit(alloc);
+            self.by_artifact.deinit(alloc);
+            for (self.targets.items) |*target| target.deinit(alloc);
+            self.targets.deinit(alloc);
+            self.* = .{};
+        }
+
+        fn containsIndex(self: *const @This(), index_name: []const u8) bool {
+            for (self.targets.items) |target| {
+                if (std.mem.eql(u8, target.index_name, index_name)) return true;
+            }
+            return false;
+        }
+
+        fn add(
+            self: *@This(),
+            alloc: Allocator,
+            index_name: []const u8,
+            artifact_name: []const u8,
+            dims: u32,
+        ) !void {
+            if (self.containsIndex(index_name)) return;
+            var owned_index_name: ?[]u8 = try alloc.dupe(u8, index_name);
+            errdefer if (owned_index_name) |value| alloc.free(value);
+            var owned_artifact_name: ?[]u8 = try alloc.dupe(u8, artifact_name);
+            errdefer if (owned_artifact_name) |value| alloc.free(value);
+            try self.targets.append(alloc, .{
+                .index_name = owned_index_name.?,
+                .artifact_name = owned_artifact_name.?,
+                .dims = dims,
+            });
+            owned_index_name = null;
+            owned_artifact_name = null;
+            var keep_target = false;
+            errdefer if (!keep_target) {
+                var removed = self.targets.pop().?;
+                removed.deinit(alloc);
+            };
+
+            const target_idx = self.targets.items.len - 1;
+            const target = &self.targets.items[target_idx];
+            const key: DenseArtifactTargetKey = .{
+                .artifact_name = target.artifact_name,
+                .dims = target.dims,
+            };
+            var entry = try self.by_artifact.getOrPut(alloc, key);
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            errdefer if (!entry.found_existing) {
+                entry.value_ptr.deinit(alloc);
+                _ = self.by_artifact.remove(key);
+            };
+            try entry.value_ptr.append(alloc, target_idx);
+            keep_target = true;
+        }
+
+        fn init(
+            alloc: Allocator,
+            index_manager: *const index_manager_mod.IndexManager,
+        ) !DenseArtifactCounterCatalog {
+            var catalog: DenseArtifactCounterCatalog = .{};
+            errdefer catalog.deinit(alloc);
+
+            for (index_manager.dense_indexes.items) |*entry| {
+                const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null;
+                if (!artifact_backed) continue;
+                try catalog.add(
+                    alloc,
+                    entry.config.name,
+                    denseArtifactNameForEntry(entry),
+                    entry.dims,
+                );
+            }
+            for (index_manager.status_only_index_configs) |cfg| {
+                if (cfg.kind != .dense_vector or catalog.containsIndex(cfg.name)) continue;
+                const requires_coverage = index_manager_mod.denseConfigRequiresArtifactCoverage(alloc, cfg) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    // Invalid/unsupported quarantined configs are deliberately
+                    // isolated from healthy indexes. They cannot have a valid
+                    // counter target and must not make unrelated writes fail.
+                    else => continue,
+                };
+                if (!requires_coverage) continue;
+                const artifact_name = index_manager_mod.denseConfigArtifactNameAlloc(alloc, cfg) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => continue,
+                };
+                defer alloc.free(artifact_name);
+                const dims = index_manager_mod.denseConfigDimensions(alloc, cfg) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => continue,
+                };
+                try catalog.add(
+                    alloc,
+                    cfg.name,
+                    artifact_name,
+                    dims,
+                );
+            }
+            return catalog;
+        }
+
+        fn targetsFor(
+            self: *const @This(),
+            artifact_name: []const u8,
+            dims: u32,
+        ) []const usize {
+            const indices = self.by_artifact.get(.{
+                .artifact_name = artifact_name,
+                .dims = dims,
+            }) orelse return &.{};
+            return indices.items;
+        }
+    };
+
     fn denseArtifactTargetCounterKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
         return try std.fmt.allocPrint(alloc, "{s}{s}", .{ dense_artifact_target_counter_prefix, index_name });
+    }
+
+    fn denseArtifactCounterBootstrapKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+        return try std.fmt.allocPrint(alloc, "{s}{s}", .{ dense_artifact_counter_bootstrap_prefix, index_name });
+    }
+
+    fn encodeDenseArtifactCounterBootstrap(value: DenseArtifactCounterBootstrap, out: *[dense_artifact_counter_bootstrap_encoded_len]u8) void {
+        @memcpy(out[0..dense_artifact_counter_bootstrap_magic.len], dense_artifact_counter_bootstrap_magic);
+        var offset = dense_artifact_counter_bootstrap_magic.len;
+        std.mem.writeInt(u128, out[offset..][0..@sizeOf(u128)], value.repair_id, .little);
+        offset += @sizeOf(u128);
+        std.mem.writeInt(u128, out[offset..][0..@sizeOf(u128)], value.attempt_id, .little);
+        offset += @sizeOf(u128);
+        std.mem.writeInt(i64, out[offset..][0..@sizeOf(i64)], value.delta, .little);
+    }
+
+    fn decodeDenseArtifactCounterBootstrap(raw: []const u8) !DenseArtifactCounterBootstrap {
+        if (raw.len != dense_artifact_counter_bootstrap_encoded_len or
+            !std.mem.eql(u8, raw[0..dense_artifact_counter_bootstrap_magic.len], dense_artifact_counter_bootstrap_magic))
+        {
+            return error.InvalidDenseArtifactCounterBootstrap;
+        }
+        var offset = dense_artifact_counter_bootstrap_magic.len;
+        const repair_id = std.mem.readInt(u128, raw[offset..][0..@sizeOf(u128)], .little);
+        offset += @sizeOf(u128);
+        const attempt_id = std.mem.readInt(u128, raw[offset..][0..@sizeOf(u128)], .little);
+        offset += @sizeOf(u128);
+        return .{
+            .repair_id = repair_id,
+            .attempt_id = attempt_id,
+            .delta = std.mem.readInt(i64, raw[offset..][0..@sizeOf(i64)], .little),
+        };
+    }
+
+    fn loadDenseArtifactCounterBootstrap(
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+    ) !?DenseArtifactCounterBootstrap {
+        const key = try denseArtifactCounterBootstrapKeyAlloc(alloc, index_name);
+        defer alloc.free(key);
+        const raw = store.get(alloc, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(raw);
+        return try decodeDenseArtifactCounterBootstrap(raw);
     }
 
     fn loadDenseArtifactTargetCounter(alloc: Allocator, store: *docstore_mod.DocStore, index_name: []const u8) !?u64 {
@@ -13072,6 +13574,25 @@ pub const DB = struct {
         defer alloc.free(raw);
         if (raw.len != 8) return error.InvalidDenseArtifactTargetCounter;
         return std.mem.readInt(u64, raw[0..8], .little);
+    }
+
+    fn initializeDenseArtifactTargetCounterIfNeeded(self: *DB, cfg: types.IndexConfig) !void {
+        if (!try index_manager_mod.denseConfigRequiresArtifactCoverage(self.alloc, cfg)) return;
+        if (try loadDenseArtifactTargetCounter(self.alloc, self.core.store, cfg.name) != null) return;
+
+        const key = try denseArtifactTargetCounterKeyAlloc(self.alloc, cfg.name);
+        defer self.alloc.free(key);
+        var value: [8]u8 = undefined;
+        std.mem.writeInt(u64, &value, 0, .little);
+        try self.core.store.putBatch(&.{.{ .key = key, .value = &value }}, &.{});
+    }
+
+    fn deleteDenseArtifactCounterMetadata(self: *DB, index_name: []const u8) !void {
+        const counter_key = try denseArtifactTargetCounterKeyAlloc(self.alloc, index_name);
+        defer self.alloc.free(counter_key);
+        const bootstrap_key = try denseArtifactCounterBootstrapKeyAlloc(self.alloc, index_name);
+        defer self.alloc.free(bootstrap_key);
+        try self.core.store.putBatch(&.{}, &.{ counter_key, bootstrap_key });
     }
 
     fn appendDenseArtifactTargetCounterWrite(
@@ -13095,30 +13616,35 @@ pub const DB = struct {
         });
     }
 
-    fn denseArtifactTargetsForArtifact(
-        index_manager: *const index_manager_mod.IndexManager,
-        artifact_name: []const u8,
-        dims: u32,
-        out: *std.ArrayListUnmanaged(usize),
+    fn appendDenseArtifactCounterBootstrapWrite(
         alloc: Allocator,
+        store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+        owned_values: *std.ArrayListUnmanaged([]u8),
+        index_name: []const u8,
+        bootstrap: DenseArtifactCounterBootstrap,
     ) !void {
-        for (index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
-            const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null;
-            if (!artifact_backed) continue;
-            if (entry.dims != dims) continue;
-            if (std.mem.eql(u8, entry.config.name, artifact_name) or
-                (entry.embedding_name != null and std.mem.eql(u8, entry.embedding_name.?, artifact_name)))
-            {
-                try out.append(alloc, dense_index_idx);
-            }
-        }
+        const key = try denseArtifactCounterBootstrapKeyAlloc(alloc, index_name);
+        errdefer alloc.free(key);
+        const value = try alloc.alloc(u8, dense_artifact_counter_bootstrap_encoded_len);
+        errdefer alloc.free(value);
+        encodeDenseArtifactCounterBootstrap(bootstrap, value[0..dense_artifact_counter_bootstrap_encoded_len]);
+        try owned_keys.append(alloc, key);
+        try owned_values.append(alloc, value);
+        try store_writes.append(alloc, .{ .key = key, .value = value });
     }
+
+    const PendingDenseArtifactCounterMutation = union(enum) {
+        counter: u64,
+        bootstrap: DenseArtifactCounterBootstrap,
+        unavailable,
+    };
 
     fn applyDenseArtifactCounterDelta(
         alloc: Allocator,
         store: *docstore_mod.DocStore,
-        index_manager: *const index_manager_mod.IndexManager,
-        counts: *std.AutoHashMapUnmanaged(usize, u64),
+        catalog: *const DenseArtifactCounterCatalog,
+        mutations: *std.AutoHashMapUnmanaged(usize, PendingDenseArtifactCounterMutation),
         artifact_key: []const u8,
         artifact_value: ?[]const u8,
         delta: i64,
@@ -13133,19 +13659,35 @@ pub const DB = struct {
         const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(value) catch return;
         if (dims == 0) return;
 
-        var targets = std.ArrayListUnmanaged(usize).empty;
-        defer targets.deinit(alloc);
-        try denseArtifactTargetsForArtifact(index_manager, identity.embedding_name, dims, &targets, alloc);
-        for (targets.items) |dense_index_idx| {
-            const entry = &index_manager.dense_indexes.items[dense_index_idx];
-            const gop = try counts.getOrPut(alloc, dense_index_idx);
+        for (catalog.targetsFor(identity.embedding_name, dims)) |target_idx| {
+            const target = &catalog.targets.items[target_idx];
+            const gop = try mutations.getOrPut(alloc, target_idx);
             if (!gop.found_existing) {
-                gop.value_ptr.* = (try loadDenseArtifactTargetCounter(alloc, store, entry.config.name)) orelse 0;
+                if (try loadDenseArtifactTargetCounter(alloc, store, target.index_name)) |count| {
+                    gop.value_ptr.* = .{ .counter = count };
+                } else if (try loadDenseArtifactCounterBootstrap(alloc, store, target.index_name)) |bootstrap| {
+                    gop.value_ptr.* = .{ .bootstrap = bootstrap };
+                } else {
+                    // A missing counter without an active bootstrap is legacy
+                    // state. Do not manufacture a partial counter from the
+                    // next mutation; repair will establish an authoritative
+                    // snapshot plus concurrent signed delta.
+                    gop.value_ptr.* = .unavailable;
+                }
             }
-            if (delta > 0) {
-                gop.value_ptr.* +|= @as(u64, @intCast(delta));
-            } else {
-                gop.value_ptr.* -|= @as(u64, @intCast(-delta));
+            switch (gop.value_ptr.*) {
+                .counter => |*count| {
+                    if (delta > 0) {
+                        count.* +|= @as(u64, @intCast(delta));
+                    } else {
+                        count.* -|= @as(u64, @intCast(-delta));
+                    }
+                },
+                .bootstrap => |*bootstrap| {
+                    bootstrap.delta = std.math.add(i64, bootstrap.delta, delta) catch
+                        return error.DenseArtifactCounterBootstrapOverflow;
+                },
+                .unavailable => {},
             }
         }
     }
@@ -13159,9 +13701,31 @@ pub const DB = struct {
         owned_keys: *std.ArrayListUnmanaged([]u8),
         owned_values: *std.ArrayListUnmanaged([]u8),
     ) !void {
-        if (index_manager.dense_indexes.items.len == 0) return;
-        var counts = std.AutoHashMapUnmanaged(usize, u64){};
-        defer counts.deinit(alloc);
+        var may_mutate_embedding_artifact = false;
+        for (delete_keys) |key| {
+            if (internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key)) {
+                may_mutate_embedding_artifact = true;
+                break;
+            }
+        }
+        if (!may_mutate_embedding_artifact) {
+            for (store_writes.items) |write| {
+                if (internal_keys.isEmbeddingArtifactKey(write.key) or internal_keys.isDerivedEmbeddingArtifactKey(write.key)) {
+                    may_mutate_embedding_artifact = true;
+                    break;
+                }
+            }
+        }
+        // Ordinary document-only writes stay allocation-free in counter
+        // routing. Build the catalog lookup only for commits that can actually
+        // change embedding-artifact coverage.
+        if (!may_mutate_embedding_artifact) return;
+
+        var catalog = try DenseArtifactCounterCatalog.init(alloc, index_manager);
+        defer catalog.deinit(alloc);
+        if (catalog.targets.items.len == 0) return;
+        var mutations = std.AutoHashMapUnmanaged(usize, PendingDenseArtifactCounterMutation){};
+        defer mutations.deinit(alloc);
 
         for (delete_keys) |key| {
             const old_value = store.get(alloc, key) catch |err| switch (err) {
@@ -13169,7 +13733,7 @@ pub const DB = struct {
                 else => return err,
             };
             defer alloc.free(old_value);
-            try applyDenseArtifactCounterDelta(alloc, store, index_manager, &counts, key, old_value, -1);
+            try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, key, old_value, -1);
         }
 
         for (store_writes.items) |write| {
@@ -13179,15 +13743,33 @@ pub const DB = struct {
             };
             defer if (old_value) |value| alloc.free(value);
             if (old_value) |value| {
-                try applyDenseArtifactCounterDelta(alloc, store, index_manager, &counts, write.key, value, -1);
+                try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, write.key, value, -1);
             }
-            try applyDenseArtifactCounterDelta(alloc, store, index_manager, &counts, write.key, write.value, 1);
+            try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, write.key, write.value, 1);
         }
 
-        var it = counts.iterator();
+        var it = mutations.iterator();
         while (it.next()) |entry| {
-            const dense_entry = &index_manager.dense_indexes.items[entry.key_ptr.*];
-            try appendDenseArtifactTargetCounterWrite(alloc, store_writes, owned_keys, owned_values, dense_entry.config.name, entry.value_ptr.*);
+            const target = &catalog.targets.items[entry.key_ptr.*];
+            switch (entry.value_ptr.*) {
+                .counter => |count| try appendDenseArtifactTargetCounterWrite(
+                    alloc,
+                    store_writes,
+                    owned_keys,
+                    owned_values,
+                    target.index_name,
+                    count,
+                ),
+                .bootstrap => |bootstrap| try appendDenseArtifactCounterBootstrapWrite(
+                    alloc,
+                    store_writes,
+                    owned_keys,
+                    owned_values,
+                    target.index_name,
+                    bootstrap,
+                ),
+                .unavailable => {},
+            }
         }
     }
 
@@ -32793,6 +33375,34 @@ fn putDenseEmbeddingArtifactWithCounterForTest(db: *DB, alloc: Allocator, artifa
     try markArtifactPresenceForTest(db);
 }
 
+fn deleteDenseEmbeddingArtifactWithCounterForTest(db: *DB, alloc: Allocator, artifact_key: []const u8) !void {
+    lockApply(db);
+    defer db.core.unlockApply();
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+    try DB.appendDenseArtifactCounterMutations(
+        alloc,
+        db.core.store,
+        db.core.index_manager,
+        &writes,
+        &.{artifact_key},
+        &owned_keys,
+        &owned_values,
+    );
+    try db.core.store.putBatch(writes.items, &.{artifact_key});
+}
+
 fn writeRawProjectionCheckpointSidecarForTest(path: []const u8, raw: []const u8) !void {
     if (std.fs.path.dirname(path)) |parent| {
         var io_parent = threadedIo();
@@ -52258,6 +52868,9 @@ test "db catch-up defers artifact dense target advance without durable counter" 
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
     });
+    const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, "dv_v1");
+    defer alloc.free(counter_key);
+    try db.core.store.putBatch(&.{}, &.{counter_key});
 
     const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
     defer alloc.free(stored_key);
@@ -55376,7 +55989,7 @@ test "db repair activation admission is time and sequence bounded" {
     );
 }
 
-test "db automatic dense repair fails closed before candidate creation when coverage metadata is missing" {
+test "db automatic dense repair bootstraps missing legacy coverage metadata" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -55394,7 +56007,7 @@ test "db automatic dense repair fails closed before candidate creation when cove
             .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
         });
         try db.batch(.{
-            .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
             .sync_level = .full_index,
         });
         const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, "dense_idx");
@@ -55425,18 +56038,134 @@ test "db automatic dense repair fails closed before candidate creation when cove
     const repair_id = (try reopened.indexRepairIdForIndex(alloc, "dense_idx")) orelse return error.TestUnexpectedResult;
     const result = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
     try std.testing.expect(result.attempted);
-    try std.testing.expect(result.terminal);
-    try std.testing.expect(!result.repaired);
+    try std.testing.expect(!result.terminal);
+    try std.testing.expect(result.repaired);
+    try std.testing.expect(!try reopened.hasPendingIndexRepairIntents(alloc));
+    try std.testing.expectEqual(
+        @as(?u64, 1),
+        try DB.loadDenseArtifactTargetCounter(alloc, reopened.core.store, "dense_idx"),
+    );
+    try std.testing.expect(try DB.loadDenseArtifactCounterBootstrap(alloc, reopened.core.store, "dense_idx") == null);
 
-    var entry = try reopened.loadIndexRepairEntryById(alloc, repair_id);
-    defer entry.deinit(alloc);
-    try std.testing.expectEqual(index_repair_state.Phase.terminal, entry.intent.phase);
-    try std.testing.expectEqualStrings("dense_artifact_coverage_missing", entry.intent.last_error.?);
-    try std.testing.expect(entry.intent.candidate_relative_path == null);
-    try std.testing.expectError(error.IncompleteBulkPublish, hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
-        .dims = 2,
-        .storage_backend = .lsm,
-    }, .{}));
+    try std.testing.expect(reopened.core.index_manager.loadFailure("dense_idx") == null);
+
+    var search_result = try reopened.search(alloc, .{
+        .index_name = "dense_idx",
+        .query = .{ .dense_knn = .{ .vector = &.{ 1, 0 }, .k = 1 } },
+        .limit = 1,
+    });
+    defer search_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), search_result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", search_result.hits[0].id);
+}
+
+test "db quarantined dense bootstrap tracks concurrent insert update and delete" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    const cfg: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(cfg);
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" }},
+            .sync_level = .full_index,
+        });
+        const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, cfg.name);
+        defer alloc.free(counter_key);
+        try db.core.store.delete(counter_key);
+    }
+
+    const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ std.mem.span(path), cfg.name });
+    defer alloc.free(dense_path);
+    const dense_path_z = try alloc.dupeZ(u8, dense_path);
+    defer alloc.free(dense_path_z);
+    {
+        var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
+            .dims = 3,
+            .storage_backend = .lsm,
+        }, .{});
+        try hbc.beginBulkIngestSession();
+        hbc.close();
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+    try std.testing.expectEqualStrings("IncompleteBulkPublish", reopened.core.index_manager.loadFailure(cfg.name).?);
+    try std.testing.expect(reopened.core.index_manager.denseIndex(cfg.name) == null);
+    _ = try reopened.discoverRecoverableStartupIndexFailures(alloc, 1);
+    const repair_id = (try reopened.indexRepairIdForIndex(alloc, cfg.name)) orelse return error.TestUnexpectedResult;
+
+    var bootstrap_snapshot = try reopened.beginDenseArtifactCounterBootstrapSnapshot(alloc, cfg.name, repair_id);
+    defer bootstrap_snapshot.deinit();
+
+    try reopened.batch(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}" }},
+        .sync_level = .write,
+    });
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        (try DB.loadDenseArtifactCounterBootstrap(alloc, reopened.core.store, cfg.name)).?.delta,
+    );
+    try reopened.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha-2\",\"_embeddings\":{\"dense_idx\":[0,0,1]}}" }},
+        .sync_level = .write,
+    });
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        (try DB.loadDenseArtifactCounterBootstrap(alloc, reopened.core.store, cfg.name)).?.delta,
+    );
+    const artifact_a = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", cfg.name);
+    defer alloc.free(artifact_a);
+    try deleteDenseEmbeddingArtifactWithCounterForTest(&reopened, alloc, artifact_a);
+    try std.testing.expectEqual(
+        @as(i64, 0),
+        (try DB.loadDenseArtifactCounterBootstrap(alloc, reopened.core.store, cfg.name)).?.delta,
+    );
+
+    const snapshot_count = try reopened.countDenseArtifactsForConfigFromReadTxn(
+        alloc,
+        cfg,
+        &bootstrap_snapshot.txn,
+        null,
+    );
+    try std.testing.expectEqual(@as(u64, 1), snapshot_count);
+    try reopened.finishDenseArtifactCounterBootstrap(
+        alloc,
+        cfg.name,
+        repair_id,
+        bootstrap_snapshot.attempt_id,
+        snapshot_count,
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 1),
+        try DB.loadDenseArtifactTargetCounter(alloc, reopened.core.store, cfg.name),
+    );
+
+    const repaired = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+    try std.testing.expect(repaired.repaired);
+    var result = try reopened.search(alloc, .{
+        .index_name = cfg.name,
+        .query = .{ .dense_knn = .{ .vector = &.{ 0, 1, 0 }, .k = 2 } },
+        .limit = 2,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
 }
 
 test "db corrupt repair checkpoint preserves primary availability and fails indexes closed" {
@@ -56122,8 +56851,8 @@ test "db dense repair defers before candidate creation when node admission is ex
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@intFromEnum(resource_manager_mod.Slice.dense_repair_working_set)] = .{
-        .soft_limit_bytes = 16 * 1024 * 1024,
-        .hard_limit_bytes = 32 * 1024 * 1024,
+        .soft_limit_bytes = 2 * 1024 * 1024,
+        .hard_limit_bytes = 4 * 1024 * 1024,
     };
     var resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer resources.deinit(alloc);
@@ -57293,6 +58022,9 @@ test "db dense artifact rebuild does not recount counterless artifacts during st
         defer db.close();
 
         try db.addIndex(dense_cfg);
+        const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, "dense_idx");
+        defer alloc.free(counter_key);
+        try db.core.store.putBatch(&.{}, &.{counter_key});
         const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
         defer alloc.free(stored_key);
         try db.core.store.putBatch(&.{
@@ -57326,6 +58058,276 @@ test "db dense artifact rebuild does not recount counterless artifacts during st
 
     try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
     try std.testing.expectEqual(@as(usize, 0), try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+}
+
+test "db dense artifact counter bootstrap combines snapshot with concurrent write delta" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
+    });
+    const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, "dense_idx");
+    defer alloc.free(counter_key);
+    try db.core.store.putBatch(&.{}, &.{counter_key});
+
+    const artifact_a = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dense_idx");
+    defer alloc.free(artifact_a);
+    try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_a, null, &[_]f32{ 1, 0, 0 });
+
+    const repair_id: u128 = 0x1234;
+    var bootstrap_snapshot = try db.beginDenseArtifactCounterBootstrapSnapshot(alloc, "dense_idx", repair_id);
+    defer bootstrap_snapshot.deinit();
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:b",
+            .value = "{\"title\":\"beta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}",
+        }},
+        .sync_level = .write,
+    });
+    const marker = (try DB.loadDenseArtifactCounterBootstrap(alloc, db.core.store, "dense_idx")).?;
+    try std.testing.expectEqual(repair_id, marker.repair_id);
+    try std.testing.expectEqual(@as(i64, 1), marker.delta);
+
+    const snapshot_count = try db.countDenseArtifactsForConfigFromReadTxn(
+        alloc,
+        .{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
+        },
+        &bootstrap_snapshot.txn,
+        null,
+    );
+    try std.testing.expectEqual(@as(u64, 1), snapshot_count);
+    try db.finishDenseArtifactCounterBootstrap(
+        alloc,
+        "dense_idx",
+        repair_id,
+        bootstrap_snapshot.attempt_id,
+        snapshot_count,
+    );
+
+    try std.testing.expectEqual(
+        @as(?u64, 2),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "dense_idx"),
+    );
+    try std.testing.expectEqual(
+        @as(?DB.DenseArtifactCounterBootstrap, null),
+        try DB.loadDenseArtifactCounterBootstrap(alloc, db.core.store, "dense_idx"),
+    );
+}
+
+test "db dense artifact counter bootstrap restarts from a fresh snapshot" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    const cfg: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
+    };
+    const repair_id: u128 = 0x5678;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(cfg);
+        const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, cfg.name);
+        defer alloc.free(counter_key);
+        try db.core.store.putBatch(&.{}, &.{counter_key});
+
+        const artifact_a = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", cfg.name);
+        defer alloc.free(artifact_a);
+        try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_a, null, &[_]f32{ 1, 0, 0 });
+        var abandoned_snapshot = try db.beginDenseArtifactCounterBootstrapSnapshot(alloc, cfg.name, repair_id);
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:b",
+                .value = "{\"title\":\"beta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}",
+            }},
+            .sync_level = .write,
+        });
+        abandoned_snapshot.deinit();
+        try db.core.syncStore(true);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reopened.close();
+        var fresh_snapshot = try reopened.beginDenseArtifactCounterBootstrapSnapshot(alloc, cfg.name, repair_id);
+        defer fresh_snapshot.deinit();
+        const count = try reopened.countDenseArtifactsForConfigFromReadTxn(
+            alloc,
+            cfg,
+            &fresh_snapshot.txn,
+            null,
+        );
+        try std.testing.expectEqual(@as(u64, 2), count);
+        try reopened.finishDenseArtifactCounterBootstrap(
+            alloc,
+            cfg.name,
+            repair_id,
+            fresh_snapshot.attempt_id,
+            count,
+        );
+        try std.testing.expectEqual(
+            @as(?u64, 2),
+            try DB.loadDenseArtifactTargetCounter(alloc, reopened.core.store, cfg.name),
+        );
+        try std.testing.expect(try DB.loadDenseArtifactCounterBootstrap(alloc, reopened.core.store, cfg.name) == null);
+    }
+}
+
+test "db dense artifact counter bootstrap fences stale concurrent attempt" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
+    });
+    const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, "dense_idx");
+    defer alloc.free(counter_key);
+    try db.core.store.putBatch(&.{}, &.{counter_key});
+
+    const repair_id: u128 = 0x9abc;
+    var stale_snapshot = try db.beginDenseArtifactCounterBootstrapSnapshot(alloc, "dense_idx", repair_id);
+    defer stale_snapshot.deinit();
+    var current_snapshot = try db.beginDenseArtifactCounterBootstrapSnapshot(alloc, "dense_idx", repair_id);
+    defer current_snapshot.deinit();
+    try std.testing.expect(stale_snapshot.attempt_id != current_snapshot.attempt_id);
+    try std.testing.expectError(
+        error.StaleDenseArtifactCounterBootstrap,
+        db.finishDenseArtifactCounterBootstrap(
+            alloc,
+            "dense_idx",
+            repair_id,
+            stale_snapshot.attempt_id,
+            0,
+        ),
+    );
+    try db.finishDenseArtifactCounterBootstrap(
+        alloc,
+        "dense_idx",
+        repair_id,
+        current_snapshot.attempt_id,
+        0,
+    );
+}
+
+test "db malformed quarantined dense config does not block healthy artifact counters" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
+    });
+
+    const quarantined = try alloc.alloc(types.IndexConfig, 1);
+    quarantined[0] = .{
+        .name = try alloc.dupe(u8, "bad_dense"),
+        .kind = .dense_vector,
+        .config_json = try alloc.dupe(u8, "{"),
+    };
+    db.core.index_manager.status_only_index_configs = quarantined;
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1,0,0]}}" }},
+        .sync_level = .write,
+    });
+    try std.testing.expectEqual(
+        @as(?u64, 1),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "dense_idx"),
+    );
+}
+
+test "db dense repair working set scales batch to resource budget" {
+    const alloc = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.dense_repair_working_set)] = .{
+        .soft_limit_bytes = 12 * 1024 * 1024,
+        .hard_limit_bytes = 16 * 1024 * 1024,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+
+    const cfg: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3072,\"external\":true}",
+    };
+    const plan = try DB.repairWorkingSetPlan(alloc, &manager, cfg);
+    try std.testing.expect(plan.dense_rebuild_batch_items > 0);
+    try std.testing.expect(plan.dense_rebuild_batch_items < 2048);
+    try std.testing.expect(plan.reservation_bytes <= 12 * 1024 * 1024);
+    var reservation = try manager.reserve(.dense_repair_working_set, plan.reservation_bytes);
+    defer reservation.release();
+}
+
+test "db dense counter bootstrap admission respects soft background budget" {
+    const alloc = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.dense_repair_working_set)] = .{
+        .soft_limit_bytes = 12 * 1024 * 1024,
+        .hard_limit_bytes = 16 * 1024 * 1024,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+
+    var existing = try manager.reserve(.dense_repair_working_set, 5 * 1024 * 1024);
+    defer existing.release();
+    try std.testing.expectError(
+        error.RepairResourceUnavailable,
+        DB.reserveDenseCounterBootstrapWorkingSet(&manager),
+    );
+    const under_soft_pressure = manager.sliceStats(.dense_repair_working_set);
+    try std.testing.expectEqual(@as(u64, 5 * 1024 * 1024), under_soft_pressure.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), under_soft_pressure.hard_limit_rejections);
+
+    existing.release();
+    var admitted = try DB.reserveDenseCounterBootstrapWorkingSet(&manager);
+    defer admitted.release();
+    try std.testing.expectEqual(
+        @as(u64, DB.dense_counter_bootstrap_working_set_bytes),
+        manager.sliceStats(.dense_repair_working_set).used_bytes,
+    );
 }
 
 test "db dense artifact rebuild uses durable artifact counters instead of recount" {

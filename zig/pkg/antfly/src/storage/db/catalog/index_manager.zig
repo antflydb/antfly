@@ -13872,7 +13872,9 @@ pub fn denseConfigRequiresArtifactCoverage(alloc: Allocator, cfg: types.IndexCon
     if (cfg.kind != .dense_vector) return false;
     const dense_cfg = try parseDenseConfig(alloc, cfg.config_json);
     defer dense_cfg.deinit(alloc);
-    return dense_cfg.external or dense_cfg.embedding_name != null;
+    const generator = try parseDenseGeneratorConfig(alloc, cfg.config_json);
+    defer if (generator) |value| value.deinit(alloc);
+    return dense_cfg.external or dense_cfg.embedding_name != null or generator != null;
 }
 
 pub fn denseConfigDimensions(alloc: Allocator, cfg: types.IndexConfig) !u32 {
@@ -13880,6 +13882,16 @@ pub fn denseConfigDimensions(alloc: Allocator, cfg: types.IndexConfig) !u32 {
     const dense_cfg = try parseDenseConfig(alloc, cfg.config_json);
     defer dense_cfg.deinit(alloc);
     return dense_cfg.dims;
+}
+
+pub fn denseConfigArtifactNameAlloc(alloc: Allocator, cfg: types.IndexConfig) ![]u8 {
+    if (cfg.kind != .dense_vector) return error.InvalidIndexConfiguration;
+    const dense_cfg = try parseDenseConfig(alloc, cfg.config_json);
+    defer dense_cfg.deinit(alloc);
+    const generator = try parseDenseGeneratorConfig(alloc, cfg.config_json);
+    defer if (generator) |value| value.deinit(alloc);
+    if (generator) |value| return try alloc.dupe(u8, value.embedding_name orelse cfg.name);
+    return try alloc.dupe(u8, dense_cfg.embedding_name orelse cfg.name);
 }
 
 const TextConfig = struct {
