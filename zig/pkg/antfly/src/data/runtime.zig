@@ -73,11 +73,21 @@ const ReplicatedSplitTransitionPlan = enum { propose, idempotent };
 
 fn planReplicatedSplitTransition(
     state: ?antfly.data.storage.shard_state_store.AppliedSplitState,
+    terminal: ?antfly.data.storage.shard_state_store.AppliedSplitTerminal,
     transition_id: u64,
     destination_group_id: u64,
     kind: antfly.db.types.SplitTransitionMutation.Kind,
     split_key: []const u8,
 ) !ReplicatedSplitTransitionPlan {
+    if (terminal) |completed| {
+        if (completed.transition_id != transition_id) return error.ConflictingSplitTransition;
+        try antfly.data.storage.shard_state_store.validateSplitTerminalIdentity(completed, destination_group_id, split_key);
+        return switch (kind) {
+            .prepare, .start => .idempotent,
+            .finalize => if (completed.outcome == .finalized) .idempotent else error.ConflictingSplitTransition,
+            .rollback => if (completed.outcome == .rolled_back) .idempotent else error.ConflictingSplitTransition,
+        };
+    }
     const current = state orelse return switch (kind) {
         .prepare => .propose,
         .start => error.SplitInProgress,
@@ -150,35 +160,45 @@ test "data runtime replicated split policy is identity and phase aware" {
         .original_range_end = "doc:z",
     };
 
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(null, 41, 42, .prepare, "doc:m"));
-    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(null, 41, 42, .start, "doc:m"));
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(null, 41, 42, .finalize, ""));
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(null, 41, 42, .rollback, ""));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(null, null, 41, 42, .prepare, "doc:m"));
+    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(null, null, 41, 42, .start, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(null, null, 41, 42, .finalize, ""));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(null, null, 41, 42, .rollback, ""));
 
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(state, 41, 42, .prepare, "doc:m"));
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 41, 42, .start, "doc:m"));
-    try std.testing.expectError(error.ConflictingSplitTransition, planReplicatedSplitTransition(state, 40, 42, .start, "doc:m"));
-    try std.testing.expectError(error.ConflictingSplitTransition, planReplicatedSplitTransition(state, 41, 43, .start, "doc:m"));
-    try std.testing.expectError(error.ConflictingSplitTransition, planReplicatedSplitTransition(state, 41, 42, .start, "doc:n"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(state, null, 41, 42, .prepare, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, null, 41, 42, .start, "doc:m"));
+    try std.testing.expectError(error.ConflictingSplitTransition, planReplicatedSplitTransition(state, null, 40, 42, .start, "doc:m"));
+    try std.testing.expectError(error.ConflictingSplitTransition, planReplicatedSplitTransition(state, null, 41, 43, .start, "doc:m"));
+    try std.testing.expectError(error.ConflictingSplitTransition, planReplicatedSplitTransition(state, null, 41, 42, .start, "doc:n"));
 
     state.phase = .splitting;
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(state, 41, 42, .start, "doc:m"));
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 41, 42, .finalize, "doc:m"));
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 41, 42, .rollback, "doc:m"));
-    try std.testing.expectError(error.ConflictingSplitTransition, planReplicatedSplitTransition(state, 41, 43, .finalize, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(state, null, 41, 42, .start, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, null, 41, 42, .finalize, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, null, 41, 42, .rollback, "doc:m"));
+    try std.testing.expectError(error.ConflictingSplitTransition, planReplicatedSplitTransition(state, null, 41, 43, .finalize, "doc:m"));
     try validateReplicatedSplitTransfer(state, 41, 42);
     try std.testing.expectError(error.ConflictingSplitTransition, validateReplicatedSplitTransfer(state, 40, 42));
 
     state.phase = .none;
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 42, 43, .prepare, "doc:n"));
-    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(state, 41, 42, .start, "doc:m"));
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(state, 41, 42, .rollback, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, null, 42, 43, .prepare, "doc:n"));
+    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(state, null, 41, 42, .start, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(state, null, 41, 42, .rollback, "doc:m"));
     try std.testing.expectError(error.SplitInProgress, validateReplicatedSplitTransfer(state, 41, 42));
 
     state.phase = .rolling_back;
-    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(state, 41, 42, .prepare, "doc:m"));
-    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(state, 41, 42, .start, "doc:m"));
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 41, 42, .rollback, "doc:m"));
+    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(state, null, 41, 42, .prepare, "doc:m"));
+    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(state, null, 41, 42, .start, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, null, 41, 42, .rollback, "doc:m"));
+
+    const terminal = antfly.data.storage.shard_state_store.AppliedSplitTerminal{
+        .transition_id = 41,
+        .destination_group_id = 42,
+        .split_key = "doc:m",
+        .outcome = .finalized,
+    };
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(null, terminal, 41, 42, .prepare, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(null, terminal, 41, 42, .finalize, "doc:m"));
+    try std.testing.expectError(error.ConflictingSplitTransition, planReplicatedSplitTransition(null, terminal, 41, 42, .rollback, "doc:m"));
 }
 
 const CliConfig = struct {
@@ -465,7 +485,17 @@ const RaftTableApplyStateMachine = struct {
 };
 
 fn batchRequiresDocumentDbApply(req: antfly.db.types.BatchRequest) bool {
-    return req.split_transition == null;
+    if (req.split_transition != null) return false;
+    if (req.split_checkpoint) |checkpoint| {
+        if (checkpoint.kind == .source_ack and
+            req.writes.len == 0 and req.deletes.len == 0 and req.transforms.len == 0 and
+            req.graph_writes.len == 0 and req.graph_deletes.len == 0 and req.predicates.len == 0 and
+            req.split_replication == null)
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 /// Backs the standalone data server's health/metrics endpoints. Readiness is
@@ -4666,12 +4696,14 @@ pub const DataServer = struct {
         const source_store = self.localTransitionApplyStore() orelse return error.MissingSplitSourceStore;
         const source_state = try source_store.currentSplitState(self.alloc, source_group_id);
         defer if (source_state) |state| antfly.data.storage.shard_state_store.freeSplitState(self.alloc, state);
+        const source_terminal = try source_store.currentSplitTerminal(self.alloc, source_group_id, transition_id);
+        defer if (source_terminal) |terminal| antfly.data.storage.shard_state_store.freeSplitTerminal(self.alloc, terminal);
 
-        const effective_split_key = if (kind != .prepare and split_key.len == 0 and source_state != null)
-            source_state.?.split_key
+        const effective_split_key = if (kind != .prepare and split_key.len == 0)
+            if (source_state) |state| state.split_key else if (source_terminal) |terminal| terminal.split_key else split_key
         else
             split_key;
-        if (try planReplicatedSplitTransition(source_state, transition_id, destination_group_id, kind, effective_split_key) == .idempotent) return;
+        if (try planReplicatedSplitTransition(source_state, source_terminal, transition_id, destination_group_id, kind, effective_split_key) == .idempotent) return;
 
         const table_name = (try self.tableNameForLocalGroupAlloc(source_group_id)) orelse return error.UnknownGroup;
         defer self.alloc.free(table_name);
@@ -4914,14 +4946,14 @@ pub const DataServer = struct {
     }
 
     fn splitProgressForSource(self: *DataServer, transition_id: u64, source_group_id: u64, destination_group_id: u64) !?u64 {
-        const namespace = try self.identityNamespaceForLocalGroup(source_group_id);
-        const lease = (try self.leaseTransitionDbForTableGroup(source_group_id, source_group_id, namespace)) orelse return null;
-        defer lease.release();
-        const marker = (try lease.db.getSplitBootstrapMarker(self.alloc)) orelse return null;
-        if (marker.transition_id != transition_id or marker.source_group_id != source_group_id or marker.destination_group_id != destination_group_id)
+        const source_store = self.localTransitionApplyStore() orelse return error.MissingSplitSourceStore;
+        const acknowledgement = (try source_store.currentSplitAcknowledgement(self.alloc, source_group_id)) orelse return null;
+        if (acknowledgement.transition_id != transition_id or
+            acknowledgement.destination_group_id != destination_group_id)
+        {
             return null;
-        if (!marker.bootstrap_complete) return null;
-        return try lease.db.getSplitDeltaFinalSeq(self.alloc);
+        }
+        return acknowledgement.delta_sequence;
     }
 
     fn initLocalMergeRuntime(self: *DataServer, donor_group_id: u64, receiver_group_id: u64) !antfly.raft.MergeCoordinatorRuntime {
@@ -10552,7 +10584,17 @@ test "data raft source split lifecycle commands bypass document db apply" {
             .split_key = "doc:m",
         },
     }));
+    try std.testing.expect(!batchRequiresDocumentDbApply(.{
+        .split_checkpoint = .{
+            .kind = .source_ack,
+            .transition_id = 7001,
+            .source_group_id = 7001,
+            .destination_group_id = 7002,
+            .delta_sequence = 1,
+        },
+    }));
     try std.testing.expect(batchRequiresDocumentDbApply(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{}" }},
         .split_checkpoint = .{
             .kind = .source_ack,
             .transition_id = 7001,

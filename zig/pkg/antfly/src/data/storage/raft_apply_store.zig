@@ -227,6 +227,10 @@ pub const RaftApplyStore = struct {
         return try shard_state_store.currentSplitAcknowledgement(&self.store, alloc, group_id);
     }
 
+    pub fn currentSplitTerminal(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, transition_id: u64) !?shard_state_store.AppliedSplitTerminal {
+        return try shard_state_store.currentSplitTerminal(&self.store, alloc, group_id, transition_id);
+    }
+
     pub fn captureSplitHandoff(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !SplitHandoff {
         return try shard_state_store.captureSplitHandoff(&self.store, alloc, group_id);
     }
@@ -1133,14 +1137,25 @@ test "data raft apply store persists split destination acknowledgements" {
         },
     });
     defer std.testing.allocator.free(batch);
+    const stale_batch = try data_raft_batch.encode(std.testing.allocator, "docs", .{
+        .split_checkpoint = .{
+            .kind = .source_ack,
+            .transition_id = 201,
+            .source_group_id = 201,
+            .destination_group_id = 202,
+            .delta_sequence = 0,
+        },
+    });
+    defer std.testing.allocator.free(stale_batch);
     const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 6, .entry_type = .normal, .data = batch },
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = stale_batch },
     });
     defer std.testing.allocator.free(entries);
 
     try store.snapshotBuilder().applyBatch(.{
         .group_id = 201,
-        .commit_index = 6,
+        .commit_index = 7,
         .entries_bytes = entries,
     });
     const acknowledgement = (try store.currentSplitAcknowledgement(std.testing.allocator, 201)) orelse

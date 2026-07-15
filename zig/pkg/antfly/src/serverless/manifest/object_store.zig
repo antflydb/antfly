@@ -158,9 +158,10 @@ pub const ObjectStore = struct {
 
         const current = self.tryReadHead(self.alloc, head_key) catch |err| switch (err) {
             error.FileNotFound => null,
+            error.PreconditionFailed => return false,
             else => return err,
         };
-        defer if (current) |*value| if (value.etag) |etag| self.alloc.free(etag);
+        defer if (current) |*value| self.alloc.free(value.etag);
 
         if ((if (current) |value| value.version else null) != expected) return false;
 
@@ -233,15 +234,27 @@ pub const ObjectStore = struct {
 
     const HeadValue = struct {
         version: u64,
-        etag: ?[]u8,
+        etag: []u8,
     };
 
     fn tryReadHead(self: *ObjectStore, alloc: std.mem.Allocator, key: []const u8) !HeadValue {
         var result = try self.opened.client.getObject(self.opened.bucket, key, .{});
         defer result.deinit(alloc);
+        if (result.metadata.etag) |etag| {
+            return .{
+                .version = try std.fmt.parseInt(u64, std.mem.trim(u8, result.body, " \t\r\n"), 10),
+                .etag = try alloc.dupe(u8, etag),
+            };
+        }
+
+        var metadata = try self.opened.client.statObject(self.opened.bucket, key);
+        defer metadata.deinit(alloc);
+        const stat_etag = metadata.etag orelse return error.MissingObjectEtag;
+        var verified = try self.opened.client.getObject(self.opened.bucket, key, .{ .if_match_etag = stat_etag });
+        defer verified.deinit(alloc);
         return .{
-            .version = try std.fmt.parseInt(u64, std.mem.trim(u8, result.body, " \t\r\n"), 10),
-            .etag = if (result.metadata.etag) |value| try alloc.dupe(u8, value) else null,
+            .version = try std.fmt.parseInt(u64, std.mem.trim(u8, verified.body, " \t\r\n"), 10),
+            .etag = try alloc.dupe(u8, stat_etag),
         };
     }
 
@@ -347,6 +360,8 @@ const ConditionalCreateRaceClient = struct {
     winner_body: []const u8,
     injected: bool = false,
     hidden_reads_after_publish: usize = 0,
+    omit_get_etag: bool = false,
+    omit_stat_etag: bool = false,
 
     fn client(self: *@This()) object_storage.ObjectStorage {
         return .{
@@ -408,7 +423,12 @@ const ConditionalCreateRaceClient = struct {
             return error.FileNotFound;
         }
         var client_impl = self.backingClient(alloc);
-        return try client_impl.getObject(bucket, key, opts);
+        var result = try client_impl.getObject(bucket, key, opts);
+        if (self.omit_get_etag) {
+            if (result.metadata.etag) |etag| alloc.free(etag);
+            result.metadata.etag = null;
+        }
+        return result;
     }
 
     fn getObjectAttributes(ptr: *anyopaque, alloc: std.mem.Allocator, bucket: []const u8, key: []const u8) !object_storage.ObjectAttributes {
@@ -420,7 +440,12 @@ const ConditionalCreateRaceClient = struct {
     fn statObject(ptr: *anyopaque, alloc: std.mem.Allocator, bucket: []const u8, key: []const u8) !object_storage.ObjectMetadata {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var client_impl = self.backingClient(alloc);
-        return try client_impl.statObject(bucket, key);
+        var metadata = try client_impl.statObject(bucket, key);
+        if (self.omit_stat_etag) {
+            if (metadata.etag) |etag| alloc.free(etag);
+            metadata.etag = null;
+        }
+        return metadata;
     }
 
     fn deleteObject(ptr: *anyopaque, bucket: []const u8, key: []const u8, opts: object_storage.DeleteOptions) !void {
@@ -484,6 +509,42 @@ test "objectstore-backed manifest store supports publish and list" {
     const versions = try impl.listVersionsAllocWithPageSize(std.testing.allocator, "docs", 2);
     defer std.testing.allocator.free(versions);
     try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, versions);
+}
+
+test "manifest head CAS verifies a stat ETag when GET omits it" {
+    var backing = object_storage.MemoryObjectStorage.init(std.testing.allocator);
+    defer backing.deinit();
+    var adapter = ConditionalCreateRaceClient{
+        .backing = &backing,
+        .winner_body = "",
+        .injected = true,
+        .omit_get_etag = true,
+    };
+    var store = try ObjectStore.initWithClient(std.testing.allocator, adapter.client(), "manifests", "");
+    defer store.deinit();
+
+    var manifest = manifest_types.Manifest{
+        .namespace = try std.testing.allocator.dupe(u8, "docs"),
+        .version = 1,
+        .built_at_ns = 10,
+        .wal_start_lsn = 1,
+        .wal_end_lsn = 1,
+        .stats = .{},
+        .artifacts = try std.testing.allocator.alloc(manifest_types.ArtifactRef, 0),
+    };
+    defer manifest.deinit(std.testing.allocator);
+
+    try store.put(manifest);
+    try store.setHead("docs", 1);
+    manifest.version = 2;
+    try store.put(manifest);
+    try std.testing.expect(try store.compareAndSwapHead("docs", 1, 2));
+
+    manifest.version = 3;
+    try store.put(manifest);
+    adapter.omit_stat_etag = true;
+    try std.testing.expectError(error.MissingObjectEtag, store.compareAndSwapHead("docs", 2, 3));
+    try std.testing.expectEqual(@as(u64, 2), try store.getHead("docs"));
 }
 
 test "objectstore-backed manifest store resolves conditional create races by content" {

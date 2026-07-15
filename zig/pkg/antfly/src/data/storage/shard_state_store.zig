@@ -71,11 +71,33 @@ pub const SplitAcknowledgement = struct {
     delta_sequence: u64,
 };
 
+pub const SplitTerminalOutcome = enum(u8) {
+    finalized = 1,
+    rolled_back = 2,
+};
+
+/// Durable idempotency fence for a completed source split. Transition IDs are
+/// identities, not ordered epochs, so completed records are keyed individually.
+pub const AppliedSplitTerminal = struct {
+    transition_id: u64,
+    destination_group_id: u64,
+    split_key: []const u8,
+    outcome: SplitTerminalOutcome,
+};
+
 pub fn validateSplitIdentity(state: AppliedSplitState, transition_id: u64, destination_group_id: u64, split_key: ?[]const u8) !void {
     if (state.transition_id != transition_id or state.new_shard_id != destination_group_id)
         return error.ConflictingSplitTransition;
     if (split_key) |expected| {
         if (!std.mem.eql(u8, state.split_key, expected)) return error.ConflictingSplitTransition;
+    }
+}
+
+pub fn validateSplitTerminalIdentity(terminal: AppliedSplitTerminal, destination_group_id: u64, split_key: ?[]const u8) !void {
+    if (terminal.destination_group_id != destination_group_id)
+        return error.ConflictingSplitTransition;
+    if (split_key) |expected| {
+        if (!std.mem.eql(u8, terminal.split_key, expected)) return error.ConflictingSplitTransition;
     }
 }
 
@@ -227,6 +249,21 @@ pub fn currentSplitAcknowledgement(store: *docstore.DocStore, alloc: std.mem.All
         .destination_group_id = std.mem.readInt(u64, raw[8..16], .little),
         .delta_sequence = std.mem.readInt(u64, raw[16..24], .little),
     };
+}
+
+pub fn currentSplitTerminal(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64, transition_id: u64) !?AppliedSplitTerminal {
+    const key = try groupSplitTerminalKeyAlloc(alloc, group_id, transition_id);
+    defer alloc.free(key);
+    const raw = store.get(alloc, key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    return try decodeSplitTerminalAlloc(alloc, transition_id, raw);
+}
+
+pub fn freeSplitTerminal(alloc: std.mem.Allocator, terminal: AppliedSplitTerminal) void {
+    if (terminal.split_key.len > 0) alloc.free(@constCast(terminal.split_key));
 }
 
 pub fn captureSplitHandoff(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64) !SplitHandoff {
@@ -478,6 +515,37 @@ pub fn appendOperationEffects(
     defer range_state.freeRange(alloc, byte_range);
     var split_state = try currentSplitState(store, alloc, group_id);
     defer if (split_state) |state| freeSplitState(alloc, state);
+    var needs_split_ack = false;
+    for (operations) |op| switch (op) {
+        .acknowledge_split => needs_split_ack = true,
+        else => {},
+    };
+    var split_acknowledgement = if (needs_split_ack)
+        try currentSplitAcknowledgement(store, alloc, group_id)
+    else
+        null;
+    const source_delta_sequence = if (needs_split_ack)
+        try currentSplitDeltaSequence(store, alloc, group_id)
+    else
+        0;
+    var split_terminals = std.ArrayListUnmanaged(AppliedSplitTerminal).empty;
+    defer {
+        for (split_terminals.items) |terminal| freeSplitTerminal(alloc, terminal);
+        split_terminals.deinit(alloc);
+    }
+    for (operations) |op| {
+        const transition_id: ?u64 = switch (op) {
+            .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| transition.transition_id,
+            else => null,
+        };
+        if (transition_id) |id| {
+            if (findSplitTerminal(split_terminals.items, id) != null) continue;
+            if (try currentSplitTerminal(store, alloc, group_id, id)) |terminal| {
+                errdefer freeSplitTerminal(alloc, terminal);
+                try split_terminals.append(alloc, terminal);
+            }
+        }
+    }
     var delta_writes = std.ArrayListUnmanaged(docstore.OwnedKVPair).empty;
     defer {
         for (delta_writes.items) |write| {
@@ -555,6 +623,10 @@ pub fn appendOperationEffects(
             try writes.append(alloc, .{ .key = range_key, .value = range_value });
         },
         .prepare_split => |prepare| {
+            if (findSplitTerminal(split_terminals.items, prepare.transition_id)) |terminal| {
+                try validateSplitTerminalIdentity(terminal, prepare.new_shard_id, prepare.split_key);
+                continue;
+            }
             if (split_state) |state| {
                 const already_prepared = switch (state.phase) {
                     .prepare, .splitting, .finalizing => state.transition_id == prepare.transition_id and
@@ -606,8 +678,13 @@ pub fn appendOperationEffects(
             removeOwnedWriteByKey(alloc, writes, acknowledgement_key);
             removeDeleteByKey(alloc, deletes, acknowledgement_key);
             try deletes.append(alloc, try alloc.dupe(u8, acknowledgement_key));
+            split_acknowledgement = null;
         },
         .start_split => |start| {
+            if (findSplitTerminal(split_terminals.items, start.transition_id)) |terminal| {
+                try validateSplitTerminalIdentity(terminal, start.new_shard_id, start.split_key);
+                continue;
+            }
             if (split_state) |state| {
                 const already_started = switch (state.phase) {
                     .splitting, .finalizing => state.transition_id == start.transition_id and
@@ -673,13 +750,12 @@ pub fn appendOperationEffects(
             const state = split_state orelse return error.SplitInProgress;
             try validateSplitIdentity(state, acknowledgement.transition_id, acknowledgement.destination_group_id, null);
             if (state.phase != .splitting and state.phase != .finalizing) return error.SplitInProgress;
-            if (try currentSplitAcknowledgement(store, alloc, group_id)) |current| {
+            if (split_acknowledgement) |current| {
                 if (current.transition_id != acknowledgement.transition_id or
                     current.destination_group_id != acknowledgement.destination_group_id)
                     return error.ConflictingSplitTransition;
                 if (acknowledgement.delta_sequence <= current.delta_sequence) continue;
             }
-            const source_delta_sequence = try currentSplitDeltaSequence(store, alloc, group_id);
             if (acknowledgement.delta_sequence > source_delta_sequence)
                 return error.SplitAcknowledgementAheadOfSource;
             const acknowledgement_key = try groupSplitAcknowledgementKeyAlloc(alloc, group_id);
@@ -692,8 +768,14 @@ pub fn appendOperationEffects(
             std.mem.writeInt(u64, value[8..16], acknowledgement.destination_group_id, .little);
             std.mem.writeInt(u64, value[16..24], acknowledgement.delta_sequence, .little);
             try writes.append(alloc, .{ .key = acknowledgement_key, .value = value });
+            split_acknowledgement = acknowledgement;
         },
         .finalize_split => |finalize| {
+            if (findSplitTerminal(split_terminals.items, finalize.transition_id)) |terminal| {
+                try validateSplitTerminalIdentity(terminal, finalize.new_shard_id, finalize.split_key);
+                if (terminal.outcome != .finalized) return error.ConflictingSplitTransition;
+                continue;
+            }
             if (split_state) |state| try validateSplitIdentity(state, finalize.transition_id, finalize.new_shard_id, finalize.split_key);
             const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
                 .phase = state.phase,
@@ -716,10 +798,28 @@ pub fn appendOperationEffects(
             defer alloc.free(split_delta_seq_key);
             removeOwnedWriteByKey(alloc, writes, split_delta_seq_key);
             removeDeleteByKey(alloc, deletes, split_delta_seq_key);
+            try appendSplitTerminal(
+                alloc,
+                group_id,
+                .{
+                    .transition_id = finalize.transition_id,
+                    .destination_group_id = finalize.new_shard_id,
+                    .split_key = finalize.split_key,
+                    .outcome = .finalized,
+                },
+                &split_terminals,
+                writes,
+                deletes,
+            );
             freeSplitState(alloc, split_state.?);
             split_state = null;
         },
         .rollback_split => |rollback| {
+            if (findSplitTerminal(split_terminals.items, rollback.transition_id)) |terminal| {
+                try validateSplitTerminalIdentity(terminal, rollback.new_shard_id, rollback.split_key);
+                if (terminal.outcome != .rolled_back) return error.ConflictingSplitTransition;
+                continue;
+            }
             if (split_state) |state| try validateSplitIdentity(state, rollback.transition_id, rollback.new_shard_id, rollback.split_key);
             const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
                 .phase = state.phase,
@@ -763,6 +863,20 @@ pub fn appendOperationEffects(
             removeOwnedWriteByKey(alloc, writes, acknowledgement_key);
             removeDeleteByKey(alloc, deletes, acknowledgement_key);
             try deletes.append(alloc, try alloc.dupe(u8, acknowledgement_key));
+            split_acknowledgement = null;
+            try appendSplitTerminal(
+                alloc,
+                group_id,
+                .{
+                    .transition_id = rollback.transition_id,
+                    .destination_group_id = rollback.new_shard_id,
+                    .split_key = rollback.split_key,
+                    .outcome = .rolled_back,
+                },
+                &split_terminals,
+                writes,
+                deletes,
+            );
             freeSplitState(alloc, split_state.?);
             split_state = null;
         },
@@ -895,6 +1009,44 @@ fn removeDeletesWithPrefix(
     }
 }
 
+fn findSplitTerminal(terminals: []const AppliedSplitTerminal, transition_id: u64) ?AppliedSplitTerminal {
+    for (terminals) |terminal| {
+        if (terminal.transition_id == transition_id) return terminal;
+    }
+    return null;
+}
+
+fn appendSplitTerminal(
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    terminal: AppliedSplitTerminal,
+    terminals: *std.ArrayListUnmanaged(AppliedSplitTerminal),
+    writes: *std.ArrayListUnmanaged(docstore.OwnedKVPair),
+    deletes: *std.ArrayListUnmanaged([]u8),
+) !void {
+    const key = try groupSplitTerminalKeyAlloc(alloc, group_id, terminal.transition_id);
+    defer alloc.free(key);
+    removeOwnedWriteByKey(alloc, writes, key);
+    removeDeleteByKey(alloc, deletes, key);
+    {
+        const owned_key = try alloc.dupe(u8, key);
+        errdefer alloc.free(owned_key);
+        const value = try encodeSplitTerminalAlloc(alloc, terminal);
+        errdefer alloc.free(value);
+        try writes.append(alloc, .{ .key = owned_key, .value = value });
+    }
+    {
+        const owned_split_key = try alloc.dupe(u8, terminal.split_key);
+        errdefer alloc.free(owned_split_key);
+        try terminals.append(alloc, .{
+            .transition_id = terminal.transition_id,
+            .destination_group_id = terminal.destination_group_id,
+            .split_key = owned_split_key,
+            .outcome = terminal.outcome,
+        });
+    }
+}
+
 fn groupDocumentLogicalKeyAlloc(alloc: std.mem.Allocator, group_id: u64, key: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "g:{d}:{s}", .{ group_id, key });
 }
@@ -919,6 +1071,10 @@ fn groupSplitDeltaSeqKeyAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
 
 fn groupSplitAcknowledgementKeyAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
     return try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:data_group_split_ack:{d}", .{group_id});
+}
+
+fn groupSplitTerminalKeyAlloc(alloc: std.mem.Allocator, group_id: u64, transition_id: u64) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:data_group_split_terminal:{d}:{d}", .{ group_id, transition_id });
 }
 
 fn groupSplitDeltaPrefixAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
@@ -1051,6 +1207,32 @@ fn decodeSplitStateAlloc(alloc: std.mem.Allocator, encoded: []const u8) !Applied
         .split_key = split_key,
         .new_shard_id = new_shard_id,
         .original_range_end = original_range_end,
+    };
+}
+
+const split_terminal_format_version: u8 = 1;
+
+fn encodeSplitTerminalAlloc(alloc: std.mem.Allocator, terminal: AppliedSplitTerminal) ![]u8 {
+    const header_len = 1 + 1 + 8 + 4;
+    const encoded = try alloc.alloc(u8, header_len + terminal.split_key.len);
+    encoded[0] = split_terminal_format_version;
+    encoded[1] = @intFromEnum(terminal.outcome);
+    std.mem.writeInt(u64, encoded[2..10], terminal.destination_group_id, .little);
+    std.mem.writeInt(u32, encoded[10..14], @intCast(terminal.split_key.len), .little);
+    @memcpy(encoded[14..], terminal.split_key);
+    return encoded;
+}
+
+fn decodeSplitTerminalAlloc(alloc: std.mem.Allocator, transition_id: u64, encoded: []const u8) !AppliedSplitTerminal {
+    if (encoded.len < 14 or encoded[0] != split_terminal_format_version) return error.InvalidSplitTerminal;
+    const outcome = std.enums.fromInt(SplitTerminalOutcome, encoded[1]) orelse return error.InvalidSplitTerminal;
+    const split_key_len = std.mem.readInt(u32, encoded[10..14], .little);
+    if (encoded.len != 14 + split_key_len) return error.InvalidSplitTerminal;
+    return .{
+        .transition_id = transition_id,
+        .destination_group_id = std.mem.readInt(u64, encoded[2..10], .little),
+        .split_key = try alloc.dupe(u8, encoded[14..]),
+        .outcome = outcome,
     };
 }
 
@@ -1281,8 +1463,10 @@ test "shard state store persists split lifecycle and ownership" {
 
     const advanced_acknowledgement = [_]DataOperation{
         .{ .acknowledge_split = .{ .transition_id = 41, .destination_group_id = 42, .delta_sequence = 2 } },
+        .{ .acknowledge_split = .{ .transition_id = 41, .destination_group_id = 42, .delta_sequence = 1 } },
     };
     try appendOperationEffects(&store, std.testing.allocator, 23, &advanced_acknowledgement, &writes, &deletes);
+    try std.testing.expectEqual(@as(usize, 1), writes.items.len);
     try putOwnedBatch(&store, std.testing.allocator, writes.items, deletes.items);
     freeOwnedWrites(std.testing.allocator, &writes);
     writes = .empty;
@@ -1340,6 +1524,19 @@ test "shard state store persists split lifecycle and ownership" {
     try std.testing.expectEqualStrings("doc:z", restored_range.end);
     try std.testing.expect((try currentSplitState(&store, std.testing.allocator, 23)) == null);
     try std.testing.expect((try currentSplitAcknowledgement(&store, std.testing.allocator, 23)) == null);
+    const rolled_back = (try currentSplitTerminal(&store, std.testing.allocator, 23, 41)) orelse
+        return error.MissingSplitTerminal;
+    defer freeSplitTerminal(std.testing.allocator, rolled_back);
+    try std.testing.expectEqual(SplitTerminalOutcome.rolled_back, rolled_back.outcome);
+
+    try appendOperationEffects(&store, std.testing.allocator, 23, &prepare_ops, &writes, &deletes);
+    try std.testing.expectEqual(@as(usize, 0), writes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), deletes.items.len);
+    const next_prepare = [_]DataOperation{
+        .{ .prepare_split = .{ .transition_id = 42, .new_shard_id = 43, .split_key = @constCast("doc:n") } },
+    };
+    try appendOperationEffects(&store, std.testing.allocator, 23, &next_prepare, &writes, &deletes);
+    try std.testing.expect(writes.items.len > 0);
 }
 
 test "shard state store finalize split reclaims right-hand document range" {
@@ -1378,6 +1575,7 @@ test "shard state store finalize split reclaims right-hand document range" {
         .{ .prepare_split = .{ .transition_id = 76, .new_shard_id = 77, .split_key = @constCast("doc:m") } },
         .{ .start_split = .{ .transition_id = 76, .new_shard_id = 77, .split_key = @constCast("doc:m") } },
         .{ .finalize_split = .{ .transition_id = 76, .new_shard_id = 77, .split_key = @constCast("doc:m") } },
+        .{ .prepare_split = .{ .transition_id = 76, .new_shard_id = 77, .split_key = @constCast("doc:m") } },
     };
     try appendOperationEffects(&store, std.testing.allocator, 31, &split_ops, &writes, &deletes);
     try putOwnedBatch(&store, std.testing.allocator, writes.items, deletes.items);
@@ -1394,6 +1592,10 @@ test "shard state store finalize split reclaims right-hand document range" {
     try std.testing.expectEqualStrings("doc:c", state[0].key);
     try std.testing.expectEqualStrings("left", state[0].value);
     try std.testing.expect((try currentSplitState(&store, std.testing.allocator, 31)) == null);
+    const finalized = (try currentSplitTerminal(&store, std.testing.allocator, 31, 76)) orelse
+        return error.MissingSplitTerminal;
+    defer freeSplitTerminal(std.testing.allocator, finalized);
+    try std.testing.expectEqual(SplitTerminalOutcome.finalized, finalized.outcome);
 }
 
 test "shard state store records and replays split deltas" {

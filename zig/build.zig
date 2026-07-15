@@ -3363,6 +3363,7 @@ pub fn build(b: *std.Build) void {
         .root_module = serverless_manifest_test_mod,
         .filters = &.{
             "objectstore-backed manifest store supports publish and list",
+            "manifest head CAS verifies a stat ETag when GET omits it",
             "objectstore-backed manifest store resolves conditional create races by content",
         },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
@@ -3450,6 +3451,7 @@ pub fn build(b: *std.Build) void {
         "split bootstrap marker distinguishes reservation from completion",
         "group state range scan is allocation-failure safe",
         "shard state store persists split lifecycle and ownership",
+        "shard state store finalize split reclaims right-hand document range",
         "db merge coordinator opt-in applies configured receiver identity namespace",
         "db merge coordinator reapplies target namespace for persisted reassignment opt-in",
         "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",
@@ -4459,6 +4461,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source rejects stale doc identity namespace before write",
             "replicated split destination seeds inherited doc identity before range publication",
             "internal batch parser rejects mixed split transition commands",
+            "internal batch parser requires source acknowledgements to be metadata-only",
             "internal batch split identity round trips the full u64 id space",
             "api http client preserves group doc identity conflicts",
             "bound table write source backs up and restores a local table",

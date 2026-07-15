@@ -10197,13 +10197,15 @@ pub const ProvisionedTableWriteSource = struct {
             }
             try cached.db.batchReplicatedApply(apply_req);
             if (apply_req.split_checkpoint) |checkpoint| {
-                try cached.db.setSplitDeltaFinalSeq(checkpoint.delta_sequence);
-                try cached.db.setSplitBootstrapMarker(.{
-                    .transition_id = checkpoint.transition_id,
-                    .source_group_id = checkpoint.source_group_id,
-                    .destination_group_id = checkpoint.destination_group_id,
-                    .bootstrap_complete = true,
-                });
+                if (checkpoint.kind == .destination) {
+                    try cached.db.setSplitDeltaFinalSeq(checkpoint.delta_sequence);
+                    try cached.db.setSplitBootstrapMarker(.{
+                        .transition_id = checkpoint.transition_id,
+                        .source_group_id = checkpoint.source_group_id,
+                        .destination_group_id = checkpoint.destination_group_id,
+                        .bootstrap_complete = true,
+                    });
+                }
             }
             cache.publishCachedLeaseGeneration(&cached, target_generation);
             {
@@ -10242,13 +10244,15 @@ pub const ProvisionedTableWriteSource = struct {
             }
             try db.batchReplicatedApply(apply_req);
             if (apply_req.split_checkpoint) |checkpoint| {
-                try db.setSplitDeltaFinalSeq(checkpoint.delta_sequence);
-                try db.setSplitBootstrapMarker(.{
-                    .transition_id = checkpoint.transition_id,
-                    .source_group_id = checkpoint.source_group_id,
-                    .destination_group_id = checkpoint.destination_group_id,
-                    .bootstrap_complete = true,
-                });
+                if (checkpoint.kind == .destination) {
+                    try db.setSplitDeltaFinalSeq(checkpoint.delta_sequence);
+                    try db.setSplitBootstrapMarker(.{
+                        .transition_id = checkpoint.transition_id,
+                        .source_group_id = checkpoint.source_group_id,
+                        .destination_group_id = checkpoint.destination_group_id,
+                        .bootstrap_complete = true,
+                    });
+                }
             }
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
             lockAtomic(&self.local_db_mutex);

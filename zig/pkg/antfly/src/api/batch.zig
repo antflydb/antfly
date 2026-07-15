@@ -244,6 +244,12 @@ fn parseBatchRequestWithOptions(
     {
         return error.InvalidBatchRequest;
     }
+    if (split_checkpoint != null and split_checkpoint.?.kind == .source_ack and
+        (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or
+            split_replication != null))
+    {
+        return error.InvalidBatchRequest;
+    }
 
     return .{
         .writes = writes,
@@ -279,6 +285,13 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
     if (req.split_transition != null and
         (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
             req.split_checkpoint != null or req.split_replication != null))
+    {
+        return error.InvalidBatchRequest;
+    }
+    if (req.split_checkpoint != null and req.split_checkpoint.?.kind == .source_ack and
+        (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
+            req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.predicates.len != 0 or
+            req.split_replication != null))
     {
         return error.InvalidBatchRequest;
     }
@@ -581,6 +594,23 @@ test "internal batch parser owns and round trips split checkpoint" {
     var reparsed = try parseInternalBatchRequest(std.testing.allocator, encoded);
     defer reparsed.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 7), reparsed.req.split_checkpoint.?.delta_sequence);
+}
+
+test "internal batch parser requires source acknowledgements to be metadata-only" {
+    const mixed =
+        \\{"inserts":{"doc:m":{}},"_split_checkpoint":{"kind":"source_ack","transition_id":40,"source_group_id":41,"destination_group_id":42,"delta_sequence":7}}
+    ;
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(std.testing.allocator, mixed));
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(std.testing.allocator, .{
+        .writes = &.{.{ .key = "doc:m", .value = "{}" }},
+        .split_checkpoint = .{
+            .kind = .source_ack,
+            .transition_id = 40,
+            .source_group_id = 41,
+            .destination_group_id = 42,
+            .delta_sequence = 7,
+        },
+    }));
 }
 
 test "internal batch parser rejects public split replication identity" {
