@@ -1744,6 +1744,15 @@ pub fn build(b: *std.Build) void {
     usermgr_storage_test_mod.addImport("antfly_platform", platform_mod);
     lib_test_mod.addImport("usermgr_storage", usermgr_storage_test_mod);
 
+    const usermgr_storage_data_runtime_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    usermgr_storage_data_runtime_test_mod.addImport("antfly_root", data_runtime_test_mod);
+    usermgr_storage_data_runtime_test_mod.addImport("antfly_platform", platform_mod);
+    data_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_data_runtime_test_mod);
+
     const embedded_deps = .{
         build_options,
         lmdb_engine_mod,

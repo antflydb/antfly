@@ -34,6 +34,9 @@ pub const UserManager = user_manager.UserManager;
 pub const UserStore = user_manager.UserStore;
 pub const StorageCasbinAdapter = storage_adapter.StorageCasbinAdapter;
 pub const StorageUserStore = storage_adapter.StorageUserStore;
+pub const materializePortableSeedToPath = storage_adapter.materializePortableSeedToPath;
+pub const PortableSeed = storage_adapter.PortableSeed;
+pub const portable_seed_format_version = storage_adapter.portable_seed_format_version;
 
 test {
     _ = storage_adapter;

@@ -1555,6 +1555,7 @@ pub const DataServerHAConfig = struct {
 pub const HASeedSnapshotRequest = struct {
     capture_root: []const u8,
     generation: []const u8,
+    auth_artifact_json: ?[]const u8 = null,
 };
 
 pub const HASeedPreparedSnapshot = struct {
@@ -1590,6 +1591,7 @@ const ha_seed_snapshot_max_store_bytes: u64 = 64 * 1024 * 1024 * 1024;
 
 const HASeedSnapshotTopologyReplica = antfly.ha.seed_materialization.ReplicaSnapshot;
 const HASeedSnapshotExtensionArtifact = antfly.ha.seed_materialization.ExtensionArtifact;
+const HASeedSnapshotAuthArtifact = antfly.ha.seed_materialization.AuthArtifact;
 const HASeedSnapshotTopology = antfly.ha.seed_materialization.Topology;
 
 const HASeedExtensionCaptureProbe = struct {
@@ -3331,6 +3333,29 @@ pub const DataServer = struct {
             null,
         );
 
+        var topology_auth_artifact: ?HASeedSnapshotAuthArtifact = null;
+        var auth_digest_owned: ?[]u8 = null;
+        defer if (auth_digest_owned) |digest| alloc.free(digest);
+        if (request.auth_artifact_json) |auth_json| {
+            const auth_path = try std.fs.path.join(alloc, &.{ building_root, "auth/auth-seed.json" });
+            defer alloc.free(auth_path);
+            const auth_parent = std.fs.path.dirname(auth_path) orelse return error.InvalidHASeedSnapshotRoot;
+            try fs_paths.createDirPathPortable(io, auth_parent);
+            {
+                var auth_file = try std.Io.Dir.cwd().createFile(io, auth_path, .{ .exclusive = true });
+                defer auth_file.close(io);
+                try auth_file.writeStreamingAll(io, auth_json);
+                try auth_file.sync(io);
+            }
+            try fs_paths.syncDirPortable(io, auth_parent);
+            auth_digest_owned = try haSeedSnapshotFileSha256HexAlloc(alloc, io, auth_path);
+            topology_auth_artifact = .{
+                .path = "auth/auth-seed.json",
+                .size_bytes = auth_json.len,
+                .sha256 = auth_digest_owned.?,
+            };
+        }
+
         const topology_json = try std.json.Stringify.valueAlloc(alloc, HASeedSnapshotTopology{
             .generation = request.generation,
             .catalog = .{
@@ -3344,6 +3369,8 @@ pub const DataServer = struct {
             },
             .replicas = topology_replicas.items,
             .extension_artifacts = topology_extension_artifacts.items,
+            .auth_enabled = request.auth_artifact_json != null,
+            .auth_artifact = topology_auth_artifact,
         }, .{});
         defer alloc.free(topology_json);
         if (topology_json.len > ha_seed_snapshot_max_topology_bytes) return error.HASeedSnapshotTopologyTooLarge;
@@ -3593,6 +3620,7 @@ pub const DataServer = struct {
         while (try walker.next(io)) |entry| {
             if (entry.kind == .directory) {
                 if (std.mem.eql(u8, entry.path, "replicas")) continue;
+                if (topology.auth_artifact != null and std.mem.eql(u8, entry.path, "auth")) continue;
                 for (topology.replicas) |replica| {
                     if (std.mem.eql(u8, entry.path, replica.snapshot_path)) break;
                 } else if (!haSeedExtensionArtifactDirectory(topology.extension_artifacts, entry.path)) {
@@ -3605,6 +3633,9 @@ pub const DataServer = struct {
             for (topology.extension_artifacts) |artifact| {
                 if (std.mem.eql(u8, entry.path, artifact.path)) break;
             } else {
+                if (topology.auth_artifact) |artifact| {
+                    if (std.mem.eql(u8, entry.path, artifact.path)) continue;
+                }
                 for (topology.replicas) |replica| {
                     const store_rel = try std.fs.path.join(alloc, &.{ replica.snapshot_path, "store.bin" });
                     defer alloc.free(store_rel);
@@ -3643,7 +3674,15 @@ pub const DataServer = struct {
         }
         const capture_root = self.ha_cfg.seed_capture_root orelse return error.HASeedCaptureRootMissing;
         const node_id = ctx.primary_node_id orelse return error.HAPrimaryNodeIdMissing;
-        if (self.api_server_cfg.auth_enabled) return error.HASeedCaptureAuthUnsupported;
+        var auth_lease: ?antfly.usermgr.UserManager.SeedCaptureLease = null;
+        defer if (auth_lease) |*auth_capture_lease| auth_capture_lease.release();
+        var auth_artifact_json: ?[]u8 = null;
+        defer if (auth_artifact_json) |body| alloc.free(body);
+        if (self.api_server_cfg.auth_enabled) {
+            const manager = self.api_server_cfg.user_manager orelse return error.HASeedCaptureAuthManagerMissing;
+            auth_lease = manager.acquireSeedCaptureLease();
+            auth_artifact_json = try manager.exportPortableSeedWithLease(alloc, generation, &auth_lease.?);
+        }
         if (self.lsm_maintenance_active.load(.acquire) or self.auto_bulk_finish_active.load(.acquire))
             return error.HASeedSnapshotRuntimeBusy;
         var activity_lease = try self.write_source.acquireHASeedCaptureActivityLease();
@@ -3652,6 +3691,7 @@ pub const DataServer = struct {
         var prepared = try provider.prepare(alloc, .{
             .capture_root = capture_root,
             .generation = generation,
+            .auth_artifact_json = auth_artifact_json,
         });
         defer prepared.deinit(alloc);
         try validateHASeedPreparedSnapshot(alloc, capture_root, generation, prepared.root);
@@ -17791,6 +17831,113 @@ test "data server wires configured HA executors into API server" {
     try std.testing.expectEqual(antfly.ha.slot_store.SlotLifecycle.seeding, default_captured_slot.lifecycle);
     try std.testing.expect(!default_captured_slot.reseed_required);
 
+    // Auth-enabled capture is generation-bound and materializes a complete
+    // standalone auth backend alongside the restored data replicas.
+    var auth_backend = antfly.lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1 });
+    defer auth_backend.close();
+    var auth_runtime = try auth_backend.runtimeNamespaceStore(alloc);
+    defer auth_runtime.deinit();
+    var auth_users = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime);
+    var auth_casbin = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime);
+    var auth_manager = try antfly.usermgr.UserManager.init(
+        alloc,
+        auth_users.iface(),
+        try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin.iface()),
+    );
+    defer auth_manager.deinit();
+    var auth_admin = try antfly.usermgr.Permission.initOwned(alloc, .@"*", "*", .admin);
+    defer auth_admin.deinit(alloc);
+    var auth_alice = try auth_manager.createUserWithMetadata("alice", "seed-secret", &.{auth_admin}, "{\"tenant_id\":\"acme\"}");
+    defer auth_alice.deinit(alloc);
+    var auth_reader = try antfly.usermgr.Permission.initOwned(alloc, .table, "docs", .read);
+    defer auth_reader.deinit(alloc);
+    try auth_manager.addPermissionToSubject("role:tenant-reader", auth_reader);
+    try auth_manager.addRoleToUser("alice", "role:tenant-reader");
+    try auth_manager.setSubjectRowFilter("role:tenant-reader", "docs", "{\"term\":{\"tenant_id\":\"acme\"}}");
+    var auth_key_filter = try antfly.usermgr.RowFilterEntry.initOwned(alloc, "docs", "{\"term\":{\"tier\":\"gold\"}}");
+    defer auth_key_filter.deinit(alloc);
+    var auth_key = try auth_manager.createApiKey("alice", "seed-ci", &.{auth_reader}, &.{auth_key_filter}, null);
+    defer auth_key.deinit(alloc);
+    server.api_server_cfg.auth_enabled = true;
+    server.api_server_cfg.user_manager = &auth_manager;
+    var auth_capture = try DataServer.captureHASeedCallback(
+        &server,
+        alloc,
+        "standby-auth-enabled",
+        "seed-standby-auth-enabled-5",
+        capture_binding,
+    );
+    defer auth_capture.deinit(alloc);
+    server.api_server_cfg.auth_enabled = false;
+    server.api_server_cfg.user_manager = null;
+    const auth_topology_path = try std.fs.path.join(alloc, &.{ auth_capture.capture.content_root, "TOPOLOGY.json" });
+    defer alloc.free(auth_topology_path);
+    const auth_topology_json = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), auth_topology_path, alloc, .limited(16 * 1024 * 1024));
+    defer alloc.free(auth_topology_json);
+    var auth_topology = try std.json.parseFromSlice(HASeedSnapshotTopology, alloc, auth_topology_json, .{ .ignore_unknown_fields = false });
+    defer auth_topology.deinit();
+    try std.testing.expect(auth_topology.value.auth_enabled);
+    try std.testing.expect(auth_topology.value.auth_artifact != null);
+    const auth_live_root = try std.fs.path.join(alloc, &.{ capture_fixture_root, "auth-materialized" });
+    defer alloc.free(auth_live_root);
+    var auth_materialized = try antfly.ha.seed_materialization.materialize(alloc, .{
+        .raw_generation_root = auth_capture.capture.content_root,
+        .live_installing_root = auth_live_root,
+        .generation = "seed-standby-auth-enabled-5",
+        .target_local_node_id = 22,
+        .seed_receipt_sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
+        .capture_receipt_sha256 = "1111111111111111111111111111111111111111111111111111111111111111",
+        .raw_manifest_sha256 = "2222222222222222222222222222222222222222222222222222222222222222",
+        .raw_aggregate_sha256 = "3333333333333333333333333333333333333333333333333333333333333333",
+    });
+    defer auth_materialized.deinit(alloc);
+    const restored_auth_root = try std.fs.path.join(alloc, &.{ auth_live_root, "metadata/auth" });
+    defer alloc.free(restored_auth_root);
+    {
+        var restored_auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, restored_auth_root, .{ .flush_threshold = 1 });
+        defer restored_auth_backend.close();
+        var restored_auth_runtime = try restored_auth_backend.backend.runtimeNamespaceStore(alloc);
+        defer restored_auth_runtime.deinit();
+        var restored_auth_users = antfly.usermgr.StorageUserStore.init(alloc, restored_auth_runtime);
+        var restored_auth_casbin = antfly.usermgr.StorageCasbinAdapter.init(alloc, restored_auth_runtime);
+        var restored_auth = try antfly.usermgr.UserManager.init(
+            alloc,
+            restored_auth_users.iface(),
+            try antfly.usermgr.initDefaultEnforcer(alloc, restored_auth_casbin.iface()),
+        );
+        defer restored_auth.deinit();
+        var restored_alice = try restored_auth.authenticateUser("alice", "seed-secret");
+        defer restored_alice.deinit(alloc);
+        try std.testing.expectEqualStrings("{\"tenant_id\":\"acme\"}", restored_alice.metadata_json);
+        try std.testing.expect(try restored_auth.enforce("alice", .table, "docs", .read));
+        var restored_key = try restored_auth.validateApiKey(auth_key.key.key_id, auth_key.key_secret);
+        defer restored_key.deinit(alloc);
+        try std.testing.expectEqualStrings("alice", restored_key.username);
+        try std.testing.expectEqual(@as(usize, 1), restored_key.roles.len);
+        try std.testing.expectEqualStrings("role:tenant-reader", restored_key.roles[0]);
+        try std.testing.expectEqual(@as(usize, 1), restored_key.row_filter.len);
+        try restored_auth.updatePassword("alice", "post-seed-secret");
+    }
+    // Materialization is a one-shot install. Subsequent auth mutations survive
+    // restart and are not replayed over by the immutable seed artifact.
+    {
+        var restarted_backend = try antfly.lsm_backend.BackendHandle.open(alloc, restored_auth_root, .{ .flush_threshold = 1 });
+        defer restarted_backend.close();
+        var restarted_runtime = try restarted_backend.backend.runtimeNamespaceStore(alloc);
+        defer restarted_runtime.deinit();
+        var restarted_users = antfly.usermgr.StorageUserStore.init(alloc, restarted_runtime);
+        var restarted_casbin = antfly.usermgr.StorageCasbinAdapter.init(alloc, restarted_runtime);
+        var restarted_auth = try antfly.usermgr.UserManager.init(
+            alloc,
+            restarted_users.iface(),
+            try antfly.usermgr.initDefaultEnforcer(alloc, restarted_casbin.iface()),
+        );
+        defer restarted_auth.deinit();
+        var restarted_alice = try restarted_auth.authenticateUser("alice", "post-seed-secret");
+        defer restarted_alice.deinit(alloc);
+        try std.testing.expectError(error.InvalidPassword, restarted_auth.authenticateUser("alice", "seed-secret"));
+    }
+
     // A store package absent from the catalog must not ride along in a seed.
     fake_status.include_extension = false;
     try std.testing.expectError(error.HASeedExtensionCatalogMismatch, DataServer.captureHASeedCallback(
@@ -17815,22 +17962,21 @@ test "data server wires configured HA executors into API server" {
     ));
     try std.testing.expect(primary.slot("standby-missing-extension") == null);
 
-    // Auth state has no portable snapshot/restore contract yet. A production
-    // seed must reject capture before backup_start instead of silently
-    // materializing a standby with a different authorization database.
+    // Auth-enabled capture without a concrete manager still fails before a
+    // slot is burned; it can never silently emit an empty auth artifact.
     server.api_server_cfg.auth_enabled = true;
     if (DataServer.captureHASeedCallback(
         &server,
         alloc,
-        "standby-auth-enabled",
-        "seed-standby-auth-enabled-5",
+        "standby-auth-missing-manager",
+        "seed-standby-auth-missing-manager-5",
         capture_binding,
     )) |unexpected_value| {
         var unexpected = unexpected_value;
         unexpected.deinit(alloc);
         return error.TestExpectedError;
-    } else |err| try std.testing.expectEqual(error.HASeedCaptureAuthUnsupported, err);
-    try std.testing.expect(primary.slot("standby-auth-enabled") == null);
+    } else |err| try std.testing.expectEqual(error.HASeedCaptureAuthManagerMissing, err);
+    try std.testing.expect(primary.slot("standby-auth-missing-manager") == null);
     server.api_server_cfg.auth_enabled = false;
 
     // Contract: maintenance, bulk/structural activity, or an unsupported

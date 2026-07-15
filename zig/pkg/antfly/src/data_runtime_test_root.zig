@@ -15,6 +15,12 @@
 const runtime = @import("data/runtime.zig");
 const runtime_status = @import("api/runtime_status.zig");
 
+// The auth storage adapter deliberately receives storage through an injected
+// module to avoid a production import cycle. Focused runtime tests expose the
+// same narrow surface as root.zig.
+pub const storage_backend_erased = @import("storage/backend_erased.zig");
+pub const lsm_backend = @import("storage/lsm_backend.zig");
+
 test {
     _ = runtime;
     _ = runtime_status;

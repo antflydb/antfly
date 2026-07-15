@@ -18,15 +18,31 @@ const extensions = @import("../../extensions/mod.zig");
 const raft_catalog = @import("../../raft/storage/catalog.zig");
 const db_mod = @import("../db/db.zig");
 const generation_lifecycle = @import("../db/generation_lifecycle.zig");
+const backend_types = @import("../backend_types.zig");
+const lsm_backend = @import("../lsm_backend.zig");
 const validation = @import("validation.zig");
 
-pub const topology_format_version: u16 = 2;
+pub const topology_format_version: u16 = 3;
 pub const topology_name = "TOPOLOGY.json";
 pub const materialized_receipt_name = ".antfly-ha-materialized.json";
 pub const max_topology_bytes: usize = 64 * 1024 * 1024;
 pub const max_materialized_receipt_bytes: usize = 64 * 1024 * 1024;
 pub const max_files: usize = 1_000_000;
 pub const max_file_bytes: u64 = 64 * 1024 * 1024 * 1024;
+const portable_auth_seed_format_version: u16 = 1;
+const auth_users_namespace: backend_types.Namespace = .{ .name = "usermgr_users" };
+const auth_casbin_namespace: backend_types.Namespace = .{ .name = "usermgr_casbin" };
+
+const PortableAuthSeedEntry = struct {
+    namespace: []const u8,
+    key_base64: []const u8,
+    value_base64: []const u8,
+};
+const PortableAuthSeed = struct {
+    format_version: u16,
+    generation: []const u8,
+    entries: []const PortableAuthSeedEntry,
+};
 
 pub const LogicalCatalog = struct {
     epoch: u64,
@@ -57,12 +73,20 @@ pub const ExtensionArtifact = struct {
     sha256: []const u8,
 };
 
+pub const AuthArtifact = struct {
+    path: []const u8,
+    size_bytes: u64,
+    sha256: []const u8,
+};
+
 pub const Topology = struct {
     format_version: u16 = topology_format_version,
     generation: []const u8,
     catalog: LogicalCatalog,
     replicas: []const ReplicaSnapshot,
     extension_artifacts: []const ExtensionArtifact = &.{},
+    auth_enabled: bool = false,
+    auth_artifact: ?AuthArtifact = null,
 };
 
 pub const MaterializeRequest = struct {
@@ -153,6 +177,16 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
     defer alloc.free(extension_root);
     try fs_paths.createDirPathPortable(io, replicas_root);
     try fs_paths.createDirPathPortable(io, metadata_root);
+
+    if (parsed.value.auth_artifact) |artifact| {
+        const source = try std.fs.path.join(alloc, &.{ request.raw_generation_root, artifact.path });
+        defer alloc.free(source);
+        const artifact_json = try readFileAlloc(io, alloc, source, @intCast(max_file_bytes));
+        defer alloc.free(artifact_json);
+        const auth_root = try std.fs.path.join(alloc, &.{ metadata_root, "auth" });
+        defer alloc.free(auth_root);
+        try materializePortableAuthSeedToPath(alloc, auth_root, request.generation, artifact_json);
+    }
 
     const local_catalog_path = try std.fs.path.join(alloc, &.{ metadata_root, "local-metadata.json" });
     defer alloc.free(local_catalog_path);
@@ -330,6 +364,13 @@ pub fn validateRuntimeIdentity(
     var topology = std.json.parseFromSlice(Topology, alloc, topology_json, .{ .ignore_unknown_fields = false }) catch
         return error.InvalidSeedTopology;
     defer topology.deinit();
+    if (topology.value.auth_enabled) {
+        const auth_root = try std.fs.path.join(alloc, &.{ live_root, "metadata/auth" });
+        defer alloc.free(auth_root);
+        var auth_dir = std.Io.Dir.cwd().openDir(io_impl.io(), auth_root, .{}) catch
+            return error.LiveAuthStoreMissing;
+        auth_dir.close(io_impl.io());
+    }
 
     const data_catalog_path = try std.fs.path.join(alloc, &.{ live_root, "data/catalog.txt" });
     defer alloc.free(data_catalog_path);
@@ -453,6 +494,120 @@ pub fn validateTopology(
         if (stat.kind != .file or stat.size != artifact.size_bytes) return error.ExtensionSeedArtifactMismatch;
         try expectFileSha256(io, alloc, path, artifact.sha256);
     }
+
+    if (topology.auth_enabled != (topology.auth_artifact != null)) return error.AuthSeedTopologyMismatch;
+    if (topology.auth_artifact) |artifact| {
+        if (!std.mem.eql(u8, artifact.path, "auth/auth-seed.json") or
+            artifact.size_bytes == 0 or artifact.size_bytes > max_file_bytes or
+            !isCanonicalSha256(artifact.sha256)) return error.InvalidAuthSeedArtifact;
+        const path = try std.fs.path.join(alloc, &.{ raw_root, artifact.path });
+        defer alloc.free(path);
+        const stat = try std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+        if (stat.kind != .file or stat.size != artifact.size_bytes) return error.AuthSeedArtifactMismatch;
+        try expectFileSha256(io, alloc, path, artifact.sha256);
+        const body = try readFileAlloc(io, alloc, path, @intCast(max_file_bytes));
+        defer alloc.free(body);
+        validatePortableAuthSeedBody(alloc, expected_generation, body) catch |err| switch (err) {
+            error.AuthSeedGenerationMismatch => return error.AuthSeedGenerationMismatch,
+            else => return error.InvalidAuthSeedArtifact,
+        };
+    }
+}
+
+fn materializePortableAuthSeedToPath(
+    alloc: Allocator,
+    target_root: []const u8,
+    expected_generation: []const u8,
+    artifact_json: []const u8,
+) !void {
+    try validatePortableAuthSeedBody(alloc, expected_generation, artifact_json);
+    var parsed = std.json.parseFromSlice(PortableAuthSeed, alloc, artifact_json, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    }) catch return error.InvalidPortableAuthSeed;
+    defer parsed.deinit();
+    var backend = try lsm_backend.BackendHandle.open(alloc, target_root, .{ .flush_threshold = 1 });
+    defer backend.close();
+    var store = try backend.backend.runtimeNamespaceStore(alloc);
+    defer store.deinit();
+    var batch = try store.beginBatch();
+    errdefer batch.abort();
+    for (parsed.value.entries) |entry| {
+        const namespace = if (std.mem.eql(u8, entry.namespace, auth_users_namespace.name.?))
+            auth_users_namespace
+        else if (std.mem.eql(u8, entry.namespace, auth_casbin_namespace.name.?))
+            auth_casbin_namespace
+        else
+            return error.InvalidPortableAuthSeed;
+        const key = decodeBase64Alloc(alloc, entry.key_base64) catch return error.InvalidPortableAuthSeed;
+        defer alloc.free(key);
+        const value = decodeBase64Alloc(alloc, entry.value_base64) catch return error.InvalidPortableAuthSeed;
+        defer alloc.free(value);
+        try batch.put(namespace, key, value);
+    }
+    try batch.commit();
+}
+
+fn validatePortableAuthSeedBody(alloc: Allocator, expected_generation: []const u8, artifact_json: []const u8) !void {
+    var parsed = std.json.parseFromSlice(PortableAuthSeed, alloc, artifact_json, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    }) catch return error.InvalidPortableAuthSeed;
+    defer parsed.deinit();
+    if (parsed.value.format_version != portable_auth_seed_format_version or parsed.value.entries.len == 0)
+        return error.InvalidPortableAuthSeed;
+    if (!std.mem.eql(u8, parsed.value.generation, expected_generation)) return error.AuthSeedGenerationMismatch;
+    var previous_namespace: []const u8 = "";
+    var previous_key: []const u8 = "";
+    var user_count: usize = 0;
+    for (parsed.value.entries) |entry| {
+        const namespace = if (std.mem.eql(u8, entry.namespace, auth_users_namespace.name.?))
+            auth_users_namespace
+        else if (std.mem.eql(u8, entry.namespace, auth_casbin_namespace.name.?))
+            auth_casbin_namespace
+        else
+            return error.InvalidPortableAuthSeed;
+        const order = std.mem.order(u8, previous_namespace, entry.namespace);
+        if (previous_namespace.len > 0 and (order == .gt or
+            (order == .eq and std.mem.order(u8, previous_key, entry.key_base64) != .lt)))
+            return error.NonCanonicalPortableAuthSeed;
+        const key = decodeBase64Alloc(alloc, entry.key_base64) catch return error.InvalidPortableAuthSeed;
+        defer alloc.free(key);
+        const value = decodeBase64Alloc(alloc, entry.value_base64) catch return error.InvalidPortableAuthSeed;
+        defer alloc.free(value);
+        if (key.len == 0 or !validPortableAuthSeedKey(namespace, key)) return error.InvalidPortableAuthSeed;
+        if (std.mem.startsWith(u8, key, "userpass:")) {
+            if (key.len == "userpass:".len or value.len == 0) return error.InvalidPortableAuthSeed;
+            user_count += 1;
+        }
+        if (std.mem.startsWith(u8, key, "usermeta:")) {
+            var metadata = std.json.parseFromSlice(std.json.Value, alloc, value, .{}) catch
+                return error.InvalidPortableAuthSeed;
+            metadata.deinit();
+        }
+        previous_namespace = entry.namespace;
+        previous_key = entry.key_base64;
+    }
+    if (user_count == 0) return error.InvalidPortableAuthSeed;
+}
+
+fn validPortableAuthSeedKey(namespace: backend_types.Namespace, key: []const u8) bool {
+    if (std.mem.eql(u8, namespace.name.?, auth_users_namespace.name.?)) {
+        return std.mem.startsWith(u8, key, "userpass:") or
+            std.mem.startsWith(u8, key, "usermeta:") or
+            std.mem.startsWith(u8, key, "apikey:");
+    }
+    return std.mem.startsWith(u8, key, "p::") or
+        std.mem.startsWith(u8, key, "p2::") or
+        std.mem.startsWith(u8, key, "g::");
+}
+
+fn decodeBase64Alloc(alloc: Allocator, raw: []const u8) ![]u8 {
+    const size = try std.base64.standard.Decoder.calcSizeForSlice(raw);
+    const out = try alloc.alloc(u8, size);
+    errdefer alloc.free(out);
+    try std.base64.standard.Decoder.decode(out, raw);
+    return out;
 }
 
 fn validateMaterializeRequest(request: MaterializeRequest) !void {
