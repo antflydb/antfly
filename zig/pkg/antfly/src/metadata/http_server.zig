@@ -18,6 +18,7 @@ const group_ids = @import("../common/group_ids.zig");
 const metadata_api = @import("api.zig");
 const metadata_admin = @import("admin.zig");
 const extension_domain = @import("../extensions/mod.zig");
+const extension_lifecycle = @import("../extensions/lifecycle.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
 const metadata_reconciler = @import("reconciler.zig");
@@ -642,7 +643,7 @@ pub const AdminSource = struct {
 
     fn metadataServiceInstallExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.InstallExtensionRequest) !extension_domain.InstalledExtension {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        var installed = try extension_domain.lifecycle.installOnService(svc, alloc, name, req);
+        var installed = try extension_lifecycle.installOnService(svc, alloc, name, req);
         errdefer installed.deinitOwned(alloc);
         if (!req.dry_run) try flushMetadataServiceMutation(svc);
         return installed;
@@ -650,7 +651,7 @@ pub const AdminSource = struct {
 
     fn metadataServiceUpdateExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.UpdateExtensionRequest) !extension_domain.InstalledExtension {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        var installed = try extension_domain.lifecycle.updateOnService(svc, alloc, name, req);
+        var installed = try extension_lifecycle.updateOnService(svc, alloc, name, req);
         errdefer installed.deinitOwned(alloc);
         if (!req.dry_run) try flushMetadataServiceMutation(svc);
         return installed;
@@ -658,13 +659,13 @@ pub const AdminSource = struct {
 
     fn metadataServiceDropExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.DropExtensionRequest) !void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        try extension_domain.lifecycle.dropOnService(svc, alloc, name, req);
+        try extension_lifecycle.dropOnService(svc, alloc, name, req);
         if (!req.dry_run) try flushMetadataServiceMutation(svc);
     }
 
     fn metadataServiceEnableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) !extension_domain.InstalledExtension {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        var installed = try extension_domain.lifecycle.enableOnService(svc, alloc, name);
+        var installed = try extension_lifecycle.enableOnService(svc, alloc, name);
         errdefer installed.deinitOwned(alloc);
         try flushMetadataServiceMutation(svc);
         return installed;
@@ -672,7 +673,7 @@ pub const AdminSource = struct {
 
     fn metadataServiceDisableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) !extension_domain.InstalledExtension {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        var installed = try extension_domain.lifecycle.disableOnService(svc, alloc, name);
+        var installed = try extension_lifecycle.disableOnService(svc, alloc, name);
         errdefer installed.deinitOwned(alloc);
         try flushMetadataServiceMutation(svc);
         return installed;
@@ -680,7 +681,7 @@ pub const AdminSource = struct {
 
     fn metadataServiceConfigureExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.ConfigureExtensionRequest) !extension_domain.InstalledExtension {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        var installed = try extension_domain.lifecycle.configureOnService(svc, alloc, name, req);
+        var installed = try extension_lifecycle.configureOnService(svc, alloc, name, req);
         errdefer installed.deinitOwned(alloc);
         try flushMetadataServiceMutation(svc);
         return installed;
@@ -694,7 +695,7 @@ pub const AdminSource = struct {
         dependencies: []const extension_domain.ExtensionDependency,
     ) !void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        try extension_domain.lifecycle.restoreOnService(svc, installed, members, dependencies);
+        try extension_lifecycle.restoreOnService(svc, installed, members, dependencies);
         try flushMetadataServiceMutation(svc);
     }
 
@@ -944,7 +945,7 @@ pub const AdminSource = struct {
 
     fn metadataHttpServiceInstallExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.InstallExtensionRequest) !extension_domain.InstalledExtension {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        var installed = try extension_domain.lifecycle.installOnService(svc, alloc, name, req);
+        var installed = try extension_lifecycle.installOnService(svc, alloc, name, req);
         errdefer installed.deinitOwned(alloc);
         if (!req.dry_run) try flushMetadataHttpServiceMutation(svc);
         return installed;
@@ -952,7 +953,7 @@ pub const AdminSource = struct {
 
     fn metadataHttpServiceUpdateExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.UpdateExtensionRequest) !extension_domain.InstalledExtension {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        var installed = try extension_domain.lifecycle.updateOnService(svc, alloc, name, req);
+        var installed = try extension_lifecycle.updateOnService(svc, alloc, name, req);
         errdefer installed.deinitOwned(alloc);
         if (!req.dry_run) try flushMetadataHttpServiceMutation(svc);
         return installed;
@@ -960,13 +961,13 @@ pub const AdminSource = struct {
 
     fn metadataHttpServiceDropExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.DropExtensionRequest) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        try extension_domain.lifecycle.dropOnService(svc, alloc, name, req);
+        try extension_lifecycle.dropOnService(svc, alloc, name, req);
         if (!req.dry_run) try flushMetadataHttpServiceMutation(svc);
     }
 
     fn metadataHttpServiceEnableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) !extension_domain.InstalledExtension {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        var installed = try extension_domain.lifecycle.enableOnService(svc, alloc, name);
+        var installed = try extension_lifecycle.enableOnService(svc, alloc, name);
         errdefer installed.deinitOwned(alloc);
         try flushMetadataHttpServiceMutation(svc);
         return installed;
@@ -974,7 +975,7 @@ pub const AdminSource = struct {
 
     fn metadataHttpServiceDisableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) !extension_domain.InstalledExtension {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        var installed = try extension_domain.lifecycle.disableOnService(svc, alloc, name);
+        var installed = try extension_lifecycle.disableOnService(svc, alloc, name);
         errdefer installed.deinitOwned(alloc);
         try flushMetadataHttpServiceMutation(svc);
         return installed;
@@ -982,7 +983,7 @@ pub const AdminSource = struct {
 
     fn metadataHttpServiceConfigureExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.ConfigureExtensionRequest) !extension_domain.InstalledExtension {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        var installed = try extension_domain.lifecycle.configureOnService(svc, alloc, name, req);
+        var installed = try extension_lifecycle.configureOnService(svc, alloc, name, req);
         errdefer installed.deinitOwned(alloc);
         try flushMetadataHttpServiceMutation(svc);
         return installed;
@@ -996,7 +997,7 @@ pub const AdminSource = struct {
         dependencies: []const extension_domain.ExtensionDependency,
     ) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        try extension_domain.lifecycle.restoreOnService(svc, installed, members, dependencies);
+        try extension_lifecycle.restoreOnService(svc, installed, members, dependencies);
         try flushMetadataHttpServiceMutation(svc);
     }
 
