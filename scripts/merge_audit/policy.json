@@ -1,0 +1,196 @@
+{
+  "moved_paths": {
+    "zig/pkg/antfly/src/api/tables.zig": [
+      "zig/pkg/antfly/src/metadata/catalog/table_ddl.zig"
+    ],
+    "zig/pkg/antfly/src/api/table_reads.zig": [
+      "zig/pkg/antfly/src/api/table_reads.zig",
+      "zig/pkg/antfly/src/api/table_reads/core.zig",
+      "zig/pkg/antfly/src/api/table_reads/document_sql.zig",
+      "zig/pkg/antfly/src/api/table_reads/remote_wire.zig",
+      "zig/pkg/antfly/src/api/table_reads/sources.zig"
+    ],
+    "zig/pkg/antfly/src/api/table_writes.zig": [
+      "zig/pkg/antfly/src/api/table_writes.zig",
+      "zig/pkg/antfly/src/api/table_writes/bulk_ingest.zig",
+      "zig/pkg/antfly/src/api/table_writes/cache.zig",
+      "zig/pkg/antfly/src/api/table_writes/core.zig",
+      "zig/pkg/antfly/src/api/table_writes/integrity.zig",
+      "zig/pkg/antfly/src/api/table_writes/managed_db.zig",
+      "zig/pkg/antfly/src/api/table_writes/sources.zig"
+    ],
+    "zig/pkg/antfly/src/storage/db/db.zig": [
+      "zig/pkg/antfly/src/storage/db/db.zig",
+      "zig/pkg/antfly/src/storage/db/artifact_repair.zig",
+      "zig/pkg/antfly/src/storage/db/artifact_replay.zig",
+      "zig/pkg/antfly/src/storage/db/catalog/index_manager.zig",
+      "zig/pkg/antfly/src/storage/db/core.zig",
+      "zig/pkg/antfly/src/storage/db/derived_async.zig",
+      "zig/pkg/antfly/src/storage/db/document_mapper.zig",
+      "zig/pkg/antfly/src/storage/db/enrichment/enrichment_runtime.zig",
+      "zig/pkg/antfly/src/storage/db/graph_runtime.zig",
+      "zig/pkg/antfly/src/storage/db/internal.zig",
+      "zig/pkg/antfly/src/storage/db/lifecycle.zig",
+      "zig/pkg/antfly/src/storage/db/query/graph_exec.zig",
+      "zig/pkg/antfly/src/storage/db/query/search_exec.zig",
+      "zig/pkg/antfly/src/storage/db/search_runtime.zig",
+      "zig/pkg/antfly/src/storage/db/split_restore.zig",
+      "zig/pkg/antfly/src/storage/db/types.zig",
+      "zig/pkg/antfly/src/storage/db/write_path.zig"
+    ]
+  },
+  "expected_incoming_only_integration_diffs": {
+    "docs/guides/document-engine.mdx": "trivial EOF blank-line normalization; content is otherwise identical to incoming main.",
+    "py/packages/sdk/src/antfly/client_generated/models/algebraic_index_stats.py": "regenerated from merged specs; adds planner_last_unsupported_reason from current schema.",
+    "py/packages/sdk/src/antfly/client_generated/models/embeddings_index_stats.py": "regenerated from merged specs; adds embeddings coverage from merged indexes schema.",
+    "zig/ENRICHMENTS.md": "incoming enrichment sync docs adjusted to branch public sync-level naming: query/full_index instead of stale full_text/embeddings aliases.",
+    "zig/pkg/antfly/src/api/distributed_candidate_source.zig": "merged scan-row identity contract: incoming candidate-source behavior adapted from legacy key field to branch `_id` scan rows via table_reads.appendScanLine.",
+    "zig/pkg/antfly/src/api_artifact_reprocess_jobs_test_root.zig": "test root wiring for merged table repair cancel callback coverage.",
+    "zig/pkg/antfly/src/inference/managed_embedder.zig": "incoming managed embedder changes are integrated with branch embedding_name alias lookup, collision validation, and owned slice transfer cleanup.",
+    "zig/pkg/antfly/src/public_test_helpers.zig": "generated OpenAPI total relation became an enum; helper must compare enum value.",
+    "zig/pkg/inference/src/native_generate.zig": "merged inference OpenAPI generation made request fields enums; client source converts CLI strings to generated enum values.",
+    "zig/pkg/inference/src/server/server.zig": "merged inference OpenAPI generation made request/response literals enums; server source converts generated enum values."
+  },
+  "expected_ours_only_resolutions": {
+    "docs/architecture.mdx": "branch sync-level naming uses query while still retaining main's aknn removal via full_index.",
+    "examples/epstein/main.go": "branch sync-level naming uses query/full_index and rejects stale full_text/embeddings aliases.",
+    "examples/epstein/main_test.go": "branch sync-level naming regression test rejects stale full_text/embeddings/aknn aliases.",
+    "go/e2e/backup_restore_test.go": "branch sync-level naming uses SyncLevelQuery for query visibility; main's SyncLevelAknn removal is already represented by SyncLevelFullIndex where needed.",
+    "py/packages/sdk/src/antfly/client_generated/models/batch_request.py": "generated from merged specs with branch query sync-level naming and no aknn enum.",
+    "py/packages/sdk/src/antfly/client_generated/models/linear_merge_request.py": "generated from merged specs with branch query sync-level naming and no aknn enum.",
+    "py/packages/sdk/src/antfly/client_generated/models/multi_batch_request.py": "generated from merged specs with branch query sync-level naming and no aknn enum.",
+    "py/packages/sdk/src/antfly/client_generated/models/sync_level.py": "generated enum intentionally keeps query naming and omits aknn.",
+    "py/packages/sdk/src/antfly/client_generated/models/transaction_begin_request.py": "generated from merged specs with branch query sync-level naming and no aknn enum.",
+    "py/packages/sdk/src/antfly/client_generated/models/transaction_commit_request.py": "generated from merged specs with branch query sync-level naming and no aknn enum.",
+    "zig/DOCID.md": "branch DOCID evidence text keeps query sync-level naming and has no aknn sync-level residue.",
+    "zig/pkg/antfly/src/api/tables.zig": "tables.zig is intentionally removed without a shim; split-aware table contract/schema symbol audits cover incoming changes.",
+    "zig/pkg/antfly/src/api/table_writes.zig": "split facade is authoritative on this branch; split-aware public symbol and vtable audits cover incoming monolith changes.",
+    "zig/pkg/antfly/src/api_table_reads_test_root.zig": "split test root stays decomposed on this branch; table_router is compiled through api/mod and api_rows roots.",
+    "zig/pkg/antfly/src/cmd/cli/data.zig": "CLI parser intentionally keeps branch query sync-level naming and rejects aknn."
+  },
+  "expected_main_only_resolutions": {
+    "go/pkg/antfly/src/metadata/api_document_artifacts.go": "main-only stub ordering is acceptable; all artifact enrichment handlers are present.",
+    "scripts/bench_gemma4_mtp.sh": "incoming bench helper is accepted exactly from main."
+  },
+  "expected_generated_without_spec_changes": {},
+  "manual_review_required_paths": {
+    "openapi.yaml": "top-level public OpenAPI join output must be reviewed with merged specs and generated clients.",
+    "specs/openapi/": "OpenAPI specs drive generated SDK/server surfaces and must be merged before regeneration.",
+    "go/pkg/antfly/lib/chunking/openapi.gen.go": "generated chunking API output requires spec provenance.",
+    "go/pkg/antfly/lib/schema/openapi.gen.go": "generated schema API output requires spec provenance.",
+    "go/pkg/antfly/src/metadata/api.gen.go": "generated metadata API output requires spec provenance.",
+    "go/pkg/antfly/src/store/db/indexes/openapi.gen.go": "generated index API output requires spec provenance.",
+    "go/pkg/operator/": "operator reconciliation, RBAC, CRD, and HA admin fallback behavior is operationally high-risk and must be reviewed.",
+    "go/pkg/sdk/admin/": "admin SDK HA/status parsing changes are operationally high-risk and must be reviewed.",
+    "go/pkg/sdk/oapi/client.gen.go": "generated Go SDK client requires OpenAPI provenance.",
+    "go/pkg/termite/api.gen.go": "generated Termite API client requires OpenAPI provenance.",
+    "py/packages/sdk/src/antfly/client_generated/": "generated Python SDK requires OpenAPI provenance.",
+    "ts/packages/sdk/src/public-api.d.ts": "generated or generated-adjacent TypeScript public API requires OpenAPI provenance.",
+    "ts/packages/sdk/src/types.ts": "generated or generated-adjacent TypeScript types require OpenAPI provenance.",
+    "zig/pkg/antfly/src/api/table_reads": "table_reads split is high-risk and must be semantically reviewed.",
+    "zig/pkg/antfly/src/api/table_writes": "table_writes split is high-risk and must be semantically reviewed.",
+    "zig/pkg/antfly/src/storage/db/": "db.zig split is high-risk and must be semantically reviewed.",
+    "zig/pkg/antfly/src/openapi/generated/": "generated Zig OpenAPI server/client code requires spec provenance."
+  },
+  "manual_review_acknowledgements": {
+    "openapi.yaml": "reviewed during current origin/main merge; specs were merged first and generated surfaces regenerated/checked.",
+    "specs/openapi/": "reviewed during current origin/main merge; generated outputs are intentionally derived from merged specs.",
+    "go/pkg/antfly/lib/chunking/openapi.gen.go": "reviewed generated output from merged OpenAPI specs.",
+    "go/pkg/antfly/lib/schema/openapi.gen.go": "reviewed generated output from merged OpenAPI specs.",
+    "go/pkg/antfly/src/metadata/api.gen.go": "reviewed generated output from merged OpenAPI specs.",
+    "go/pkg/antfly/src/store/db/indexes/openapi.gen.go": "reviewed generated output from merged OpenAPI specs.",
+    "go/pkg/sdk/oapi/client.gen.go": "reviewed generated output from merged OpenAPI specs.",
+    "go/pkg/termite/api.gen.go": "reviewed generated output from merged OpenAPI specs.",
+    "py/packages/sdk/src/antfly/client_generated/": "reviewed generated Python SDK output from merged OpenAPI specs.",
+    "ts/packages/sdk/src/public-api.d.ts": "reviewed TypeScript public API surface against merged OpenAPI changes.",
+    "ts/packages/sdk/src/types.ts": "reviewed TypeScript types against merged OpenAPI changes.",
+    "zig/pkg/antfly/src/api/table_reads": "reviewed table_reads split using public symbol, vtable, field, and behavior-specific audits.",
+    "zig/pkg/antfly/src/api/table_writes": "reviewed table_writes split using public symbol, vtable, repair-ledger, and hook-specific audits.",
+    "zig/pkg/antfly/src/storage/db/": "reviewed db.zig split using public symbol, helper-alias, repair, restore, runtime-status, and generated-artifact audits.",
+    "zig/pkg/antfly/src/openapi/generated/": "reviewed generated Zig OpenAPI output from merged specs."
+  },
+  "generated_file_provenance": {
+    "go/pkg/antfly/lib/chunking/openapi.gen.go": [
+      "specs/openapi/shared/chunking.yaml"
+    ],
+    "go/pkg/antfly/lib/schema/openapi.gen.go": [
+      "specs/openapi/antfly/schema.yaml"
+    ],
+    "go/pkg/antfly/src/metadata/api.gen.go": [
+      "specs/openapi/antfly/metadata.yaml"
+    ],
+    "go/pkg/antfly/src/store/db/indexes/openapi.gen.go": [
+      "specs/openapi/antfly/indexes.yaml"
+    ],
+    "go/pkg/sdk/oapi/client.gen.go": [
+      "openapi.yaml",
+      "specs/openapi/"
+    ],
+    "go/pkg/termite/api.gen.go": [
+      "specs/openapi/inference/",
+      "openapi.yaml"
+    ],
+    "py/packages/sdk/src/antfly/client_generated/": [
+      "openapi.yaml",
+      "specs/openapi/"
+    ],
+    "zig/pkg/antfly/src/openapi/generated/": [
+      "openapi.yaml",
+      "specs/openapi/"
+    ]
+  },
+  "same_path_const_false_positives": {
+    "zig/pkg/antfly/src/api/distributed_txn.zig": [
+      "group_participant_marker",
+      "table_participant_prefix"
+    ],
+    "zig/pkg/antfly/src/api/mod.zig": [
+      "tables"
+    ]
+  },
+  "same_path_const_aliases": {
+    "zig/pkg/antfly/src/openapi/generated/antfly_client_openapi/root.zig": {
+      "InferenceTextChunkOptions": [
+        "TextChunkOptions"
+      ],
+      "InferenceVADOptions": [
+        "VADOptions"
+      ]
+    },
+    "zig/pkg/antfly/src/openapi/generated/antfly_client_openapi/types.zig": {
+      "InferenceTextChunkOptions": [
+        "TextChunkOptions"
+      ],
+      "InferenceVADOptions": [
+        "VADOptions"
+      ]
+    },
+    "zig/pkg/antfly/src/storage/db/enrichment/enrichment_runtime.zig": {
+      "DerivedRecordWriter": [
+        "GeneratedRecordWriter"
+      ]
+    }
+  },
+  "test_name_aliases": {
+    "generated SQL parser reports malformed unsupported trigger diagnostics": [
+      "generated SQL parser reports bounded diagnostics for malformed corpus"
+    ],
+    "public api e2e restores managed sparse embeddings from table backup": [
+      "public api e2e restores sparse embeddings from table backup"
+    ],
+    "public api e2e supports template chunked remote text enrichment and query helper failures": [
+      "public api e2e supports template chunked enrichment and remote text query helper failures"
+    ],
+    "query encoder omits _source for key-only hits": [
+      "query encoder emits null _source for key-only hits"
+    ],
+    "query parser defaults to key-only when fields are omitted": [
+      "query parser includes stored source when fields are omitted"
+    ]
+  },
+  "generated_workflows": [
+    "merge specs first, then run make generate",
+    "regenerate Zig OpenAPI with zig/Makefile generated-check",
+    "regenerate Go/Python/TypeScript SDKs from merged OpenAPI outputs"
+  ]
+}

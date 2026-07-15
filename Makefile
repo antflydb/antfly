@@ -2,6 +2,14 @@ SHELL := /bin/bash
 ZIG_MAKE := $(MAKE) -C ./zig
 ZIG_BUILD_FLAGS ?=
 SCRIPTS_PY ?= uv run --project scripts --locked python
+MERGE_AUDIT_PY ?= python3
+MERGE_AUDIT_INCOMING ?= origin/main
+MERGE_AUDIT_PREVIOUS_MAIN_MERGE ?= $(shell git log --merges --grep='origin/main' --format=%H -1 HEAD^1 2>/dev/null || git log --merges --grep='origin/main' --format=%H -1)
+MERGE_AUDIT_BASE ?= $(shell git rev-parse "$(MERGE_AUDIT_PREVIOUS_MAIN_MERGE)^2" 2>/dev/null)
+MERGE_AUDIT_SNAPSHOT ?= /tmp/antfly-main-merge-snapshot.json
+MERGE_AUDIT_JSON ?= /tmp/antfly-main-merge-audit.json
+MERGE_AUDIT_REPORT ?= /tmp/antfly-main-merge-audit.md
+MERGE_AUDIT_ZIG_REPORT ?= /tmp/antfly-zig-split-merge-audit.md
 # ====================================================================================
 # Go Version Configuration
 # ====================================================================================
@@ -86,6 +94,10 @@ help:
 	@echo "  build-docs         Join OpenAPI specifications"
 	@echo "  generate           Generate Zig OpenAPI modules, Go code, client SDKs, and website documentation"
 	@echo "  generated-check    Verify checked-in generated sources are current"
+	@echo "  merge-audit-snapshot  Snapshot incoming main before a conflict-heavy merge"
+	@echo "  merge-audit-check-snapshot  Fail if the snapshot incoming ref moved"
+	@echo "  merge-audit        Run merge audits after resolving conflicts"
+	@echo "  merge-audit-post-commit  Run merge audits against HEAD^1/HEAD^2 after commit"
 	@echo "  lint               Run golangci-lint with auto-fix"
 	@echo "  tidy               Run go mod tidy across root and Go submodules"
 	@echo "  tidy-check         Verify go.mod/go.sum are tidy across root and Go submodules"
@@ -137,6 +149,7 @@ help:
 # ====================================================================================
 
 .PHONY: build build-go build-docs generate generated-check go-generated-check ts-generated-check py-generated-check lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm sim-validate sim-validate-repo sim-soak
+.PHONY: merge-audit-snapshot merge-audit-check-snapshot merge-audit merge-audit-post-commit
 .PHONY: zig-build zig-test zig-unit-test zig-sql-api-parity-test zig-db-temporal-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
 
 build-antfarm: build-antfarm-main
@@ -169,6 +182,38 @@ generate: build-docs tidy
 	$(MAKE) -C ./py/packages/sdk generate
 
 generated-check: zig-generated-check go-generated-check ts-generated-check py-generated-check
+
+merge-audit-snapshot:
+	$(MERGE_AUDIT_PY) scripts/merge_audit/audit_main_capture.py \
+		--incoming-ref $(MERGE_AUDIT_INCOMING) \
+		--previous-main-merge $(MERGE_AUDIT_PREVIOUS_MAIN_MERGE) \
+		--write-snapshot $(MERGE_AUDIT_SNAPSHOT)
+
+merge-audit-check-snapshot:
+	$(MERGE_AUDIT_PY) scripts/merge_audit/audit_main_capture.py \
+		--snapshot $(MERGE_AUDIT_SNAPSHOT) \
+		--check-snapshot-ref
+
+merge-audit:
+	$(MERGE_AUDIT_PY) scripts/merge_audit/audit_main_capture.py \
+		--snapshot $(MERGE_AUDIT_SNAPSHOT) \
+		--strict-snapshot-ref \
+		--json-out $(MERGE_AUDIT_JSON) \
+		--write-report $(MERGE_AUDIT_REPORT)
+	$(MERGE_AUDIT_PY) scripts/merge_audit/audit_zig_split_merge.py \
+		--write-report $(MERGE_AUDIT_ZIG_REPORT)
+
+merge-audit-post-commit:
+	$(MERGE_AUDIT_PY) scripts/merge_audit/audit_main_capture.py \
+		--incoming-ref HEAD^2 \
+		--ours-ref HEAD^1 \
+		--previous-main-merge $(MERGE_AUDIT_PREVIOUS_MAIN_MERGE) \
+		--json-out $(MERGE_AUDIT_JSON) \
+		--write-report $(MERGE_AUDIT_REPORT)
+	$(MERGE_AUDIT_PY) scripts/merge_audit/audit_zig_split_merge.py \
+		--origin HEAD^2 \
+		--base $(MERGE_AUDIT_BASE) \
+		--write-report $(MERGE_AUDIT_ZIG_REPORT)
 
 go-generated-check: build-docs
 	(cd $(ANTFLY_GO_MODULE) && $(GO) generate ./...)
