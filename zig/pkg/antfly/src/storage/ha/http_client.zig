@@ -1095,6 +1095,13 @@ fn validateRejoinResponse(
     if (!std.mem.eql(u8, assessment.former_node_id, request.node_id)) {
         return error.AdminRejoinResponseMismatch;
     }
+    if (assessment.target_timeline_id <= 0 or assessment.target_epoch <= 0 or
+        assessment.parent_cluster_id <= 0 or assessment.parent_shard_id < 0 or assessment.parent_table_id < 0 or
+        assessment.parent_timeline_id <= 0 or assessment.parent_epoch <= 0 or
+        assessment.fork_lsn < 0 or assessment.former_last_lsn < 0 or assessment.retained_from_lsn < 0)
+    {
+        return error.AdminRejoinResponseMismatch;
+    }
     // last_lsn in the request is a controller observation, not authority. A
     // former primary with local log access replaces it with its durable tail so
     // writes racing the promotion boundary cannot be hidden by stale status.
@@ -1117,6 +1124,7 @@ fn validateRejoinResponse(
         if (assessment.fork_lsn != receipt.observed_lsn) return error.AdminRejoinResponseMismatch;
     } else {
         if (!std.mem.eql(u8, assessment.action, "reject_unfenced")) return error.AdminRejoinResponseMismatch;
+        if (!std.mem.eql(u8, assessment.reason, "no_fence")) return error.AdminRejoinResponseMismatch;
         if (assessment.target_timeline_id != request.identity.timeline_id) return error.AdminRejoinResponseMismatch;
         if (assessment.target_epoch != request.identity.epoch) return error.AdminRejoinResponseMismatch;
         if (assessment.parent_cluster_id != request.identity.cluster_id) return error.AdminRejoinResponseMismatch;
@@ -1124,7 +1132,9 @@ fn validateRejoinResponse(
         if (assessment.parent_table_id != request.identity.table_id) return error.AdminRejoinResponseMismatch;
         if (assessment.parent_timeline_id != request.identity.timeline_id) return error.AdminRejoinResponseMismatch;
         if (assessment.parent_epoch != request.identity.epoch) return error.AdminRejoinResponseMismatch;
-        if (assessment.fork_lsn != request.last_lsn) return error.AdminRejoinResponseMismatch;
+        if (assessment.fork_lsn != assessment.former_last_lsn or assessment.data_loss_discarded) {
+            return error.AdminRejoinResponseMismatch;
+        }
     }
 
     switch (expected) {
