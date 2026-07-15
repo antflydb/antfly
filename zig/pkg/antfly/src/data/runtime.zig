@@ -1544,6 +1544,9 @@ pub const DataServerHAConfig = struct {
     /// Runtime-originated evidence that this exact process is actively
     /// enforcing the shared Kubernetes Lease authority.
     lease_watchdog_proof: ?antfly.ha.http_admin.Server.AuthOptions.LeaseWatchdogProofSource = null,
+    /// Runtime-owned durable authorization written only after a successful
+    /// former-primary rewind on this exact data volume.
+    repair_receipt: ?antfly.ha.http_admin.Server.AuthOptions.RepairReceiptSink = null,
     /// Optional storage-specific producer for an immutable logical snapshot.
     /// DataServer still validates and packages the result; providers cannot
     /// select the published generation root or bypass the mutation barrier.
@@ -3739,6 +3742,7 @@ pub const DataServer = struct {
                         .pod_uid = self.ha_cfg.pod_uid,
                     } else null,
                     .lease_watchdog_proof = self.ha_cfg.lease_watchdog_proof,
+                    .repair_receipt = self.ha_cfg.repair_receipt,
                     .primary_fence_started = .{
                         .ptr = self,
                         .run_fn = DataServer.haPrimaryFenceStartedCallback,

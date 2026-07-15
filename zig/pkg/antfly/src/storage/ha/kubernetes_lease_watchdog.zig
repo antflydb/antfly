@@ -69,20 +69,20 @@ pub const Watchdog = struct {
     local_deadline_ns: u64 = 0,
     fence_reason: ?FenceReason = null,
 
-    pub fn init(cfg: Config, sentinel_generation: ?[]const u8, allow_generation_rotation: bool) !Watchdog {
+    pub fn init(cfg: Config, sentinel_generation: ?[]const u8, repaired_generation: ?[]const u8) !Watchdog {
         if (cfg.grace_ns == 0 or cfg.sentinel_path.len == 0 or cfg.scope.node_id.len == 0 or
             cfg.scope.topology_id.len == 0 or cfg.scope.data_generation.len == 0)
         {
             return error.InvalidLeaseWatchdogConfig;
         }
-        const sentinel_matches = if (sentinel_generation) |generation|
+        const repair_matches = if (repaired_generation) |generation|
             std.mem.eql(u8, generation, cfg.scope.data_generation)
         else
             false;
         // A caller-selected generation string must never clear a fence. The
-        // only permitted mismatch is a generation whose immutable activation
-        // receipt was validated by startup before constructing this watchdog.
-        if (sentinel_generation != null and !sentinel_matches and !allow_generation_rotation) {
+        // only permitted mismatch is the deterministic generation from a
+        // durable repair receipt bound to this exact persisted sentinel.
+        if (sentinel_generation != null and !repair_matches) {
             return .{
                 .cfg = cfg,
                 .authorized_once = true,
@@ -92,9 +92,9 @@ pub const Watchdog = struct {
         }
         return .{
             .cfg = cfg,
-            .authorized_once = sentinel_matches,
-            .latched = sentinel_matches,
-            .fence_reason = if (sentinel_matches) .persisted else null,
+            .authorized_once = false,
+            .latched = false,
+            .fence_reason = null,
         };
     }
 
@@ -243,6 +243,28 @@ pub fn sentinelExists(io: std.Io, path: []const u8) !bool {
 /// no fence exists. Unknown/legacy contents fail closed instead of being
 /// silently treated as a repair authorization.
 pub fn loadSentinelGenerationAlloc(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !?[]u8 {
+    var sentinel = (try loadSentinelAlloc(alloc, io, path)) orelse return null;
+    defer sentinel.deinit(alloc);
+    return try alloc.dupe(u8, sentinel.data_generation);
+}
+
+pub const Sentinel = struct {
+    topology_id: []u8,
+    node_id: []u8,
+    data_generation: []u8,
+    lease_transitions: u64,
+    reason: []u8,
+
+    pub fn deinit(self: *Sentinel, alloc: std.mem.Allocator) void {
+        alloc.free(self.topology_id);
+        alloc.free(self.node_id);
+        alloc.free(self.data_generation);
+        alloc.free(self.reason);
+        self.* = undefined;
+    }
+};
+
+pub fn loadSentinelAlloc(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !?Sentinel {
     const raw = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
@@ -250,13 +272,194 @@ pub fn loadSentinelGenerationAlloc(alloc: std.mem.Allocator, io: std.Io, path: [
     defer alloc.free(raw);
     var lines = std.mem.splitScalar(u8, raw, '\n');
     var version_ok = false;
+    var topology_id: ?[]const u8 = null;
+    var node_id: ?[]const u8 = null;
     var generation: ?[]const u8 = null;
+    var transitions: ?u64 = null;
+    var reason: ?[]const u8 = null;
     while (lines.next()) |line| {
         if (std.mem.eql(u8, line, "version=2")) version_ok = true;
+        if (std.mem.startsWith(u8, line, "topology_id=")) topology_id = line["topology_id=".len..];
+        if (std.mem.startsWith(u8, line, "node_id=")) node_id = line["node_id=".len..];
+        if (std.mem.startsWith(u8, line, "data_generation=")) generation = line["data_generation=".len..];
+        if (std.mem.startsWith(u8, line, "lease_transitions=")) transitions = std.fmt.parseInt(u64, line["lease_transitions=".len..], 10) catch return error.InvalidLeaseFenceSentinel;
+        if (std.mem.startsWith(u8, line, "reason=")) reason = line["reason=".len..];
+    }
+    if (!version_ok or topology_id == null or topology_id.?.len == 0 or node_id == null or node_id.?.len == 0 or
+        generation == null or generation.?.len == 0 or transitions == null or transitions.? == 0 or reason == null or reason.?.len == 0)
+    {
+        return error.InvalidLeaseFenceSentinel;
+    }
+    return .{
+        .topology_id = try alloc.dupe(u8, topology_id.?),
+        .node_id = try alloc.dupe(u8, node_id.?),
+        .data_generation = try alloc.dupe(u8, generation.?),
+        .lease_transitions = transitions.?,
+        .reason = try alloc.dupe(u8, reason.?),
+    };
+}
+
+pub fn repairReceiptPathAlloc(alloc: std.mem.Allocator, sentinel_path: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}.repair", .{sentinel_path});
+}
+
+fn repairGeneration(
+    topology_id: []const u8,
+    node_id: []const u8,
+    prior_generation: []const u8,
+    prior_transitions: u64,
+    target_timeline_id: u64,
+    target_epoch: u64,
+    applied_boundary_lsn: u64,
+    evidence_sha256: []const u8,
+) [71]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly-ha-repair-v1\x00");
+    for ([_][]const u8{ topology_id, node_id, prior_generation }) |field| {
+        hash.update(field);
+        hash.update("\x00");
+    }
+    hash.update(evidence_sha256);
+    hash.update("\x00");
+    var numbers: [32]u8 = undefined;
+    std.mem.writeInt(u64, numbers[0..8], prior_transitions, .big);
+    std.mem.writeInt(u64, numbers[8..16], target_timeline_id, .big);
+    std.mem.writeInt(u64, numbers[16..24], target_epoch, .big);
+    std.mem.writeInt(u64, numbers[24..32], applied_boundary_lsn, .big);
+    hash.update(&numbers);
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    var result: [71]u8 = undefined;
+    @memcpy(result[0..7], "repair-");
+    _ = std.fmt.bufPrint(result[7..], "{x}", .{digest}) catch unreachable;
+    return result;
+}
+
+pub fn persistRepairReceipt(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    sentinel_path: []const u8,
+    topology_id: []const u8,
+    node_id: []const u8,
+    target_timeline_id: u64,
+    target_epoch: u64,
+    applied_boundary_lsn: u64,
+    evidence_sha256: []const u8,
+) ![71]u8 {
+    var sentinel = (try loadSentinelAlloc(alloc, io, sentinel_path)) orelse return error.LeaseFenceSentinelMissing;
+    defer sentinel.deinit(alloc);
+    if (!std.mem.eql(u8, sentinel.topology_id, topology_id) or !std.mem.eql(u8, sentinel.node_id, node_id))
+        return error.LeaseFenceSentinelScopeMismatch;
+    const generation = repairGeneration(topology_id, node_id, sentinel.data_generation, sentinel.lease_transitions, target_timeline_id, target_epoch, applied_boundary_lsn, evidence_sha256);
+    const receipt_path = try repairReceiptPathAlloc(alloc, sentinel_path);
+    defer alloc.free(receipt_path);
+    const temp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{receipt_path});
+    defer alloc.free(temp_path);
+    const parent = std.fs.path.dirname(receipt_path) orelse return error.InvalidLeaseWatchdogConfig;
+    const body = try std.fmt.allocPrint(alloc, "version=1\ntopology_id={s}\nnode_id={s}\nprior_data_generation={s}\nprior_lease_transitions={d}\ntarget_timeline_id={d}\ntarget_epoch={d}\napplied_boundary_lsn={d}\nevidence_sha256={s}\ndata_generation={s}\n", .{ topology_id, node_id, sentinel.data_generation, sentinel.lease_transitions, target_timeline_id, target_epoch, applied_boundary_lsn, evidence_sha256, &generation });
+    defer alloc.free(body);
+    {
+        var file = try fs_paths.createFilePortable(io, temp_path, .{ .truncate = true });
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try writer.interface.writeAll(body);
+        try writer.end();
+        try file.sync(io);
+    }
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), temp_path, std.Io.Dir.cwd(), receipt_path, io);
+    try fs_paths.syncDirPortable(io, parent);
+    return generation;
+}
+
+pub fn loadValidatedRepairGenerationAlloc(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    sentinel_path: []const u8,
+    expected_topology_id: []const u8,
+    expected_node_id: []const u8,
+) !?[]u8 {
+    var sentinel = (try loadSentinelAlloc(alloc, io, sentinel_path)) orelse return null;
+    defer sentinel.deinit(alloc);
+    if (!std.mem.eql(u8, sentinel.topology_id, expected_topology_id) or !std.mem.eql(u8, sentinel.node_id, expected_node_id)) return null;
+    const receipt_path = try repairReceiptPathAlloc(alloc, sentinel_path);
+    defer alloc.free(receipt_path);
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, receipt_path, alloc, .limited(16 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    var version_ok = false;
+    var topology_id: ?[]const u8 = null;
+    var node_id: ?[]const u8 = null;
+    var prior_generation: ?[]const u8 = null;
+    var prior_transitions: ?u64 = null;
+    var timeline: ?u64 = null;
+    var epoch: ?u64 = null;
+    var boundary: ?u64 = null;
+    var evidence_sha256: ?[]const u8 = null;
+    var generation: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.eql(u8, line, "version=1")) version_ok = true;
+        if (std.mem.startsWith(u8, line, "topology_id=")) topology_id = line["topology_id=".len..];
+        if (std.mem.startsWith(u8, line, "node_id=")) node_id = line["node_id=".len..];
+        if (std.mem.startsWith(u8, line, "prior_data_generation=")) prior_generation = line["prior_data_generation=".len..];
+        if (std.mem.startsWith(u8, line, "prior_lease_transitions=")) prior_transitions = std.fmt.parseInt(u64, line["prior_lease_transitions=".len..], 10) catch return error.InvalidLeaseRepairReceipt;
+        if (std.mem.startsWith(u8, line, "target_timeline_id=")) timeline = std.fmt.parseInt(u64, line["target_timeline_id=".len..], 10) catch return error.InvalidLeaseRepairReceipt;
+        if (std.mem.startsWith(u8, line, "target_epoch=")) epoch = std.fmt.parseInt(u64, line["target_epoch=".len..], 10) catch return error.InvalidLeaseRepairReceipt;
+        if (std.mem.startsWith(u8, line, "applied_boundary_lsn=")) boundary = std.fmt.parseInt(u64, line["applied_boundary_lsn=".len..], 10) catch return error.InvalidLeaseRepairReceipt;
+        if (std.mem.startsWith(u8, line, "evidence_sha256=")) evidence_sha256 = line["evidence_sha256=".len..];
         if (std.mem.startsWith(u8, line, "data_generation=")) generation = line["data_generation=".len..];
     }
-    if (!version_ok or generation == null or generation.?.len == 0) return error.InvalidLeaseFenceSentinel;
+    if (!version_ok or topology_id == null or node_id == null or prior_generation == null or prior_transitions == null or
+        timeline == null or epoch == null or boundary == null or evidence_sha256 == null or generation == null or timeline.? == 0 or epoch.? == 0 or boundary.? == 0)
+        return error.InvalidLeaseRepairReceipt;
+    const expected = repairGeneration(topology_id.?, node_id.?, prior_generation.?, prior_transitions.?, timeline.?, epoch.?, boundary.?, evidence_sha256.?);
+    if (!std.mem.eql(u8, generation.?, &expected)) return error.InvalidLeaseRepairReceipt;
+    const prior_sentinel_matches = std.mem.eql(u8, prior_generation.?, sentinel.data_generation) and
+        prior_transitions.? == sentinel.lease_transitions;
+    const rotated_sentinel_matches = std.mem.eql(u8, &expected, sentinel.data_generation) and
+        prior_transitions.? == sentinel.lease_transitions and std.mem.eql(u8, sentinel.reason, "repaired");
+    if (!prior_sentinel_matches and !rotated_sentinel_matches) return null;
     return try alloc.dupe(u8, generation.?);
+}
+
+pub fn rotateSentinelAfterValidatedRepair(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    sentinel_path: []const u8,
+    expected_topology_id: []const u8,
+    expected_node_id: []const u8,
+    repaired_generation: []const u8,
+) !void {
+    const validated = (try loadValidatedRepairGenerationAlloc(alloc, io, sentinel_path, expected_topology_id, expected_node_id)) orelse
+        return error.LeaseRepairReceiptMissing;
+    defer alloc.free(validated);
+    if (!std.mem.eql(u8, validated, repaired_generation)) return error.InvalidLeaseRepairReceipt;
+    var sentinel = (try loadSentinelAlloc(alloc, io, sentinel_path)) orelse return error.LeaseFenceSentinelMissing;
+    defer sentinel.deinit(alloc);
+    if (std.mem.eql(u8, sentinel.data_generation, repaired_generation) and std.mem.eql(u8, sentinel.reason, "repaired")) return;
+    const parent = std.fs.path.dirname(sentinel_path) orelse return error.InvalidLeaseWatchdogConfig;
+    const temp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{sentinel_path});
+    defer alloc.free(temp_path);
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "version=2\ntopology_id={s}\nnode_id={s}\ndata_generation={s}\nlease_transitions={d}\nreason=repaired\n",
+        .{ sentinel.topology_id, sentinel.node_id, repaired_generation, sentinel.lease_transitions },
+    );
+    defer alloc.free(body);
+    {
+        var file = try fs_paths.createFilePortable(io, temp_path, .{ .truncate = true });
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try writer.interface.writeAll(body);
+        try writer.end();
+        try file.sync(io);
+    }
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), temp_path, std.Io.Dir.cwd(), sentinel_path, io);
+    try fs_paths.syncDirPortable(io, parent);
 }
 
 pub fn leaseURLAlloc(
@@ -393,7 +596,7 @@ test "kubernetes lease watchdog fences transfer and API partition and never reop
         \\{"metadata":{"annotations":{"antfly.io/ha-fence-topology-id":"topology-7"}},"spec":{"holderIdentity":"primary-a","leaseDurationSeconds":30,"renewTime":"2026-07-15T12:00:00Z","leaseTransitions":3}}
     ;
     const realtime = try rfc3339UnixNs("2026-07-15T12:00:01Z");
-    var watchdog = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "primary-a", .data_generation = "initial" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, false);
+    var watchdog = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "primary-a", .data_generation = "initial" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, null);
     try std.testing.expectEqual(Decision.authorized, try watchdog.observe(std.testing.allocator, body, realtime, 100));
     try std.testing.expect(watchdog.authorityGranted());
     try std.testing.expectEqual(Decision.grace, watchdog.noteAPIFailure(9 * std.time.ns_per_s));
@@ -410,7 +613,7 @@ test "kubernetes lease watchdog standby waits for transfer then fences rollback"
         \\{"metadata":{"annotations":{"antfly.io/ha-fence-topology-id":"topology-7"}},"spec":{"holderIdentity":"standby-a","leaseDurationSeconds":30,"renewTime":"2026-07-15T12:00:02Z","leaseTransitions":4}}
     ;
     const now = try rfc3339UnixNs("2026-07-15T12:00:03Z");
-    var watchdog = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "standby-a", .data_generation = "seed-a" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, true);
+    var watchdog = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "standby-a", .data_generation = "seed-a" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, null);
     try std.testing.expectEqual(Decision.observed, try watchdog.observe(std.testing.allocator, before, now, 1));
     try std.testing.expectEqualStrings("primary-a", watchdog.observedHolder());
     try std.testing.expectEqual(Decision.authorized, try watchdog.observe(std.testing.allocator, after, now, 2));
@@ -424,7 +627,7 @@ test "kubernetes lease watchdog rejects expired pre-transfer lease as inactive" 
         \\{"metadata":{"annotations":{"antfly.io/ha-fence-topology-id":"topology-7"}},"spec":{"holderIdentity":"primary-a","leaseDurationSeconds":30,"renewTime":"2026-07-15T12:00:00Z","leaseTransitions":3}}
     ;
     const after_expiry = try rfc3339UnixNs("2026-07-15T12:00:31Z");
-    var watchdog = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "standby-a", .data_generation = "seed-a" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, true);
+    var watchdog = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "standby-a", .data_generation = "seed-a" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, null);
 
     // `waiting`, rather than `observed`, tells the runtime not to publish or
     // refresh Active capability proof for this stale Lease.
@@ -439,7 +642,7 @@ test "kubernetes lease watchdog duplicate renewal cannot extend authority deadli
     ;
     const realtime = try rfc3339UnixNs("2026-07-15T12:00:01Z");
     const grace = 10 * std.time.ns_per_s;
-    var watchdog = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "primary-a", .data_generation = "initial" }, .grace_ns = grace, .sentinel_path = "/tmp/fence" }, null, false);
+    var watchdog = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "primary-a", .data_generation = "initial" }, .grace_ns = grace, .sentinel_path = "/tmp/fence" }, null, null);
 
     try std.testing.expectEqual(Decision.authorized, try watchdog.observe(std.testing.allocator, body, realtime, 100));
     const first_deadline = watchdog.local_deadline_ns;
@@ -460,12 +663,12 @@ test "kubernetes lease watchdog rejects older and implausibly future renewals" {
         \\{"metadata":{"annotations":{"antfly.io/ha-fence-topology-id":"topology-7"}},"spec":{"holderIdentity":"primary-a","leaseDurationSeconds":30,"renewTime":"2026-07-15T12:00:08Z","leaseTransitions":3}}
     ;
     const realtime = try rfc3339UnixNs("2026-07-15T12:00:02Z");
-    var watchdog = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "primary-a", .data_generation = "initial" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, false);
+    var watchdog = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "primary-a", .data_generation = "initial" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, null);
     try std.testing.expectEqual(Decision.authorized, try watchdog.observe(std.testing.allocator, initial, realtime, 1));
     try std.testing.expectEqual(Decision.fence, try watchdog.observe(std.testing.allocator, older, realtime, 2));
     try std.testing.expectEqual(FenceReason.renewal_rollback, watchdog.fence_reason.?);
 
-    var fresh = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "primary-a", .data_generation = "initial" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, false);
+    var fresh = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "primary-a", .data_generation = "initial" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, null);
     try std.testing.expectError(error.LeaseRenewTimeInFuture, fresh.observe(std.testing.allocator, future, realtime, 1));
 }
 
@@ -478,7 +681,7 @@ test "kubernetes lease watchdog strictly newer renewal extends authority deadlin
     ;
     const realtime = try rfc3339UnixNs("2026-07-15T12:00:03Z");
     const grace = 10 * std.time.ns_per_s;
-    var watchdog = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "primary-a", .data_generation = "initial" }, .grace_ns = grace, .sentinel_path = "/tmp/fence" }, null, false);
+    var watchdog = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "primary-a", .data_generation = "initial" }, .grace_ns = grace, .sentinel_path = "/tmp/fence" }, null, null);
     try std.testing.expectEqual(Decision.authorized, try watchdog.observe(std.testing.allocator, initial, realtime, 1));
     const first_deadline = watchdog.local_deadline_ns;
     try std.testing.expectEqual(Decision.authorized, try watchdog.observe(std.testing.allocator, newer, realtime, 5 * std.time.ns_per_s));
@@ -501,11 +704,11 @@ test "kubernetes lease watchdog transfer requires nonregressing then strictly ne
     ;
     const realtime = try rfc3339UnixNs("2026-07-15T12:00:03Z");
 
-    var older = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "standby-a", .data_generation = "seed-a" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, true);
+    var older = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "standby-a", .data_generation = "seed-a" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, null);
     try std.testing.expectEqual(Decision.observed, try older.observe(std.testing.allocator, before, realtime, 1));
     try std.testing.expectError(error.LeaseRenewalRollback, older.observe(std.testing.allocator, transfer_older, realtime, 2));
 
-    var equal = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "standby-a", .data_generation = "seed-a" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, true);
+    var equal = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "standby-a", .data_generation = "seed-a" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, null);
     try std.testing.expectEqual(Decision.observed, try equal.observe(std.testing.allocator, before, realtime, 1));
     try std.testing.expectEqual(Decision.pending_authority, try equal.observe(std.testing.allocator, transfer_equal, realtime, 2));
     try std.testing.expect(!equal.authorityGranted());
@@ -513,14 +716,127 @@ test "kubernetes lease watchdog transfer requires nonregressing then strictly ne
     try std.testing.expect(equal.authorityGranted());
 }
 
-test "kubernetes lease watchdog persisted fence only rotates after validated new data generation" {
-    const same = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "old-primary", .data_generation = "generation-a" }, .grace_ns = std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, "generation-a", true);
+test "kubernetes lease watchdog persisted fence only rotates after exact repair generation" {
+    const same = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "old-primary", .data_generation = "generation-a" }, .grace_ns = std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, "generation-a", null);
     try std.testing.expect(same.latched);
 
-    const unvalidated = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "old-primary", .data_generation = "generation-b" }, .grace_ns = std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, "generation-a", false);
+    const unvalidated = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "old-primary", .data_generation = "generation-b" }, .grace_ns = std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, "generation-a", null);
     try std.testing.expect(unvalidated.latched);
 
-    var repaired = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "old-primary", .data_generation = "generation-b" }, .grace_ns = std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, "generation-a", true);
+    var repaired = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "old-primary", .data_generation = "generation-b" }, .grace_ns = std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, "generation-a", "generation-b");
     try std.testing.expect(!repaired.latched);
     try std.testing.expect(!repaired.authorityGranted());
+}
+
+test "kubernetes lease repair receipts authorize only post-rewind exact incarnations across repeated failover" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const sentinel_path = try std.fs.path.join(alloc, &.{ root, "lease-fence" });
+    defer alloc.free(sentinel_path);
+
+    var first_fence = try Watchdog.init(.{
+        .scope = .{ .topology_id = "topology-7", .node_id = "primary-a", .data_generation = "initial" },
+        .grace_ns = std.time.ns_per_s,
+        .sentinel_path = sentinel_path,
+    }, null, null);
+    first_fence.latched = true;
+    first_fence.authorized_once = true;
+    first_fence.last_generation = 2;
+    first_fence.fence_reason = .holder_changed;
+    try first_fence.persistFence(alloc, io);
+
+    // A caller-selected startup generation and a crash before the repair
+    // receipt both remain fenced.
+    try std.testing.expect((try loadValidatedRepairGenerationAlloc(alloc, io, sentinel_path, "topology-7", "primary-a")) == null);
+    const guessed = try Watchdog.init(.{
+        .scope = .{ .topology_id = "topology-7", .node_id = "primary-a", .data_generation = "repair-guessed" },
+        .grace_ns = std.time.ns_per_s,
+        .sentinel_path = sentinel_path,
+    }, "initial", null);
+    try std.testing.expect(guessed.latched);
+
+    const first_generation = try persistRepairReceipt(alloc, io, sentinel_path, "topology-7", "primary-a", 5, 7, 13, "");
+    const loaded_first = (try loadValidatedRepairGenerationAlloc(alloc, io, sentinel_path, "topology-7", "primary-a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(loaded_first);
+    try std.testing.expectEqualStrings(&first_generation, loaded_first);
+    const repaired = try Watchdog.init(.{
+        .scope = .{ .topology_id = "topology-7", .node_id = "primary-a", .data_generation = loaded_first },
+        .grace_ns = std.time.ns_per_s,
+        .sentinel_path = sentinel_path,
+    }, "initial", loaded_first);
+    try std.testing.expect(!repaired.latched);
+    try rotateSentinelAfterValidatedRepair(alloc, io, sentinel_path, "topology-7", "primary-a", loaded_first);
+    var rotated = (try loadSentinelAlloc(alloc, io, sentinel_path)) orelse return error.TestExpectedEqual;
+    defer rotated.deinit(alloc);
+    try std.testing.expectEqualStrings(loaded_first, rotated.data_generation);
+    try std.testing.expectEqualStrings("repaired", rotated.reason);
+    const restart_generation = (try loadValidatedRepairGenerationAlloc(alloc, io, sentinel_path, "topology-7", "primary-a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(restart_generation);
+    const restarted_standby = try Watchdog.init(.{
+        .scope = .{ .topology_id = "topology-7", .node_id = "primary-a", .data_generation = restart_generation },
+        .grace_ns = std.time.ns_per_s,
+        .sentinel_path = sentinel_path,
+    }, loaded_first, restart_generation);
+    try std.testing.expect(!restarted_standby.latched);
+
+    // After A is promoted again and fenced by the next B -> A -> B cycle, the
+    // old repair receipt is bound to the previous sentinel and cannot replay.
+    var second_fence = try Watchdog.init(.{
+        .scope = .{ .topology_id = "topology-7", .node_id = "primary-a", .data_generation = loaded_first },
+        .grace_ns = std.time.ns_per_s,
+        .sentinel_path = sentinel_path,
+    }, null, null);
+    second_fence.latched = true;
+    second_fence.authorized_once = true;
+    second_fence.last_generation = 4;
+    second_fence.fence_reason = .holder_changed;
+    try second_fence.persistFence(alloc, io);
+    try std.testing.expect((try loadValidatedRepairGenerationAlloc(alloc, io, sentinel_path, "topology-7", "primary-a")) == null);
+
+    const second_generation = try persistRepairReceipt(alloc, io, sentinel_path, "topology-7", "primary-a", 7, 9, 21, "");
+    try std.testing.expect(!std.mem.eql(u8, &first_generation, &second_generation));
+    const loaded_second = (try loadValidatedRepairGenerationAlloc(alloc, io, sentinel_path, "topology-7", "primary-a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(loaded_second);
+    try std.testing.expectEqualStrings(&second_generation, loaded_second);
+}
+
+test "kubernetes lease reseed rotation requires exact materialized evidence receipt" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const sentinel_path = try std.fs.path.join(alloc, &.{ root, "lease-fence" });
+    defer alloc.free(sentinel_path);
+    var fence = try Watchdog.init(.{
+        .scope = .{ .topology_id = "topology-7", .node_id = "former-a", .data_generation = "old-volume" },
+        .grace_ns = std.time.ns_per_s,
+        .sentinel_path = sentinel_path,
+    }, null, null);
+    fence.latched = true;
+    fence.authorized_once = true;
+    fence.last_generation = 6;
+    fence.fence_reason = .holder_changed;
+    try fence.persistFence(alloc, io);
+
+    // Merely knowing the activation checkpoint cannot clear the sentinel.
+    const checkpoint_only = try Watchdog.init(.{
+        .scope = .{ .topology_id = "topology-7", .node_id = "former-a", .data_generation = "seed-generation" },
+        .grace_ns = std.time.ns_per_s,
+        .sentinel_path = sentinel_path,
+    }, "old-volume", null);
+    try std.testing.expect(checkpoint_only.latched);
+
+    const materialized_digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const generation = try persistRepairReceipt(alloc, io, sentinel_path, "topology-7", "former-a", 11, 13, 42, materialized_digest);
+    const validated = (try loadValidatedRepairGenerationAlloc(alloc, io, sentinel_path, "topology-7", "former-a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(validated);
+    try std.testing.expectEqualStrings(&generation, validated);
+    const wrong_evidence_generation = repairGeneration("topology-7", "former-a", "old-volume", 6, 11, 13, 42, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    try std.testing.expect(!std.mem.eql(u8, &generation, &wrong_evidence_generation));
 }

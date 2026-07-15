@@ -141,6 +141,15 @@ pub const Server = struct {
             }
         };
 
+        pub const RepairReceiptSink = struct {
+            ptr: *anyopaque,
+            record_fn: *const fn (ptr: *anyopaque, result: rejoin.RewindResult) anyerror!void,
+
+            pub fn record(self: RepairReceiptSink, result: rejoin.RewindResult) !void {
+                return self.record_fn(self.ptr, result);
+            }
+        };
+
         pub const LifecycleReceipts = struct {
             capture_root: ?[]const u8 = null,
             activation_root: ?[]const u8 = null,
@@ -156,6 +165,7 @@ pub const Server = struct {
         seed_capture: ?SeedCaptureHook = null,
         lifecycle_receipts: ?LifecycleReceipts = null,
         lease_watchdog_proof: ?LeaseWatchdogProofSource = null,
+        repair_receipt: ?RepairReceiptSink = null,
         primary_fence_started: ?StateChangedHook = null,
         state_changed: ?StateChangedHook = null,
     };
@@ -1224,18 +1234,25 @@ pub const Server = struct {
                 return try textResponse(self.alloc, 409, message);
             }
 
-            if (receipt) |fence| {
-                self.recordVerifiedLocalRejoinReceipt(parsed.value.node_id, identity, fence) catch |err| {
-                    return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
-                };
-            }
-
             if (expected == .rewind) {
                 const log = self.rejoinRewindLog() orelse
                     return try textResponse(self.alloc, 409, "FormerPrimaryLogUnavailable");
                 const rewind = ha_admin.rewindFormerPrimaryReplicationLog(self.alloc, log, assessment) catch |err| {
                     return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
                 };
+                // The rewind log append is durable before either receipt is
+                // published. A crash before this point leaves the sentinel latched;
+                // only this exact post-success repair record can authorize restart.
+                if (receipt) |fence| {
+                    self.recordVerifiedLocalRejoinReceipt(parsed.value.node_id, identity, fence) catch |err| {
+                        return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+                    };
+                }
+                if (self.auth.repair_receipt) |sink| {
+                    sink.record(rewind) catch |err| {
+                        return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+                    };
+                }
                 const action_id = try std.fmt.allocPrint(self.alloc, "rejoin_rewind:{s}", .{assessment.former_node_id});
                 defer self.alloc.free(action_id);
                 return try self.handleTypedJson(admin_api.HARejoinAssessResponse{
@@ -1258,6 +1275,11 @@ pub const Server = struct {
                 const reseed = ha_admin.markFormerPrimaryForReseed(primary, assessment) catch |err| {
                     return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
                 };
+                if (receipt) |fence| {
+                    self.recordVerifiedLocalRejoinReceipt(parsed.value.node_id, identity, fence) catch |err| {
+                        return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+                    };
+                }
                 const action_id = try std.fmt.allocPrint(self.alloc, "rejoin_reseed:{s}", .{assessment.former_node_id});
                 defer self.alloc.free(action_id);
                 return try self.handleTypedJson(admin_api.HARejoinAssessResponse{
@@ -2532,6 +2554,17 @@ fn writeTestFile(path: []const u8, bytes: []const u8) !void {
     });
 }
 
+const RewindReceiptOrderProbe = struct {
+    log: *replication_log.ReplicationLog,
+    called: bool = false,
+
+    fn record(ptr: *anyopaque, result: rejoin.RewindResult) !void {
+        const self: *RewindReceiptOrderProbe = @ptrCast(@alignCast(ptr));
+        try std.testing.expectEqual(result.current_last_lsn, self.log.lastLsn());
+        self.called = true;
+    }
+};
+
 test "storage.ha http admin executes typed former primary log rewind when configured" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "rejoin-rewind");
@@ -2546,11 +2579,12 @@ test "storage.ha http admin executes typed former primary log rewind when config
     var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
     defer fence_store.close();
 
-    var server = Server.init(alloc, .{
+    var receipt_probe = RewindReceiptOrderProbe{ .log = &former_log };
+    var server = Server.initWithOptions(alloc, .{
         .primary_node_id = "primary-a",
         .fence_store = &fence_store,
         .former_primary_log = &former_log,
-    });
+    }, .{ .repair_receipt = .{ .ptr = &receipt_probe, .record_fn = RewindReceiptOrderProbe.record } });
     defer server.deinit();
 
     const body =
@@ -2574,6 +2608,7 @@ test "storage.ha http admin executes typed former primary log rewind when config
     try expectContains(rewind.body, "\"current_last_lsn\":3");
     try expectContains(rewind.body, "\"next_lsn\":4");
     try std.testing.expectEqual(@as(u64, 3), former_log.lastLsn());
+    try std.testing.expect(receipt_probe.called);
     const current_receipt = (try fence_store.current(alloc)) orelse return error.TestExpectedEqual;
     defer fencing.freeReceipt(alloc, current_receipt);
     try std.testing.expectEqualStrings("primary-a", current_receipt.old_primary_id);

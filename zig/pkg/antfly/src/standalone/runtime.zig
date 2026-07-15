@@ -178,6 +178,7 @@ const RuntimeLeaseWatchdog = struct {
     node_id: []const u8,
     pod_uid: []const u8,
     process_boot_id: [64]u8,
+    owned_data_generation: ?[]u8 = null,
     proof_active: std.atomic.Value(bool) = .init(false),
     proof_capability_deadline_ns: std.atomic.Value(u64) = .init(0),
     proof_authority_deadline_ns: std.atomic.Value(u64) = .init(0),
@@ -192,7 +193,6 @@ const RuntimeLeaseWatchdog = struct {
         env: *const std.process.Environ.Map,
         cli: CliConfig,
         pod_uid: ?[]const u8,
-        validated_new_generation: bool,
     ) !?RuntimeLeaseWatchdog {
         const lease_name = env.get("ANTFLY_HA_LEASE_NAME") orelse return null;
         const namespace = env.get("ANTFLY_HA_LEASE_NAMESPACE") orelse return error.HALeaseNamespaceMissing;
@@ -205,14 +205,30 @@ const RuntimeLeaseWatchdog = struct {
         const node_id = cli.ha_primary_node_id orelse cli.ha_standby_node_id orelse return error.HALeaseNodeIDMissing;
         const grace_ms = std.fmt.parseInt(u64, grace_raw, 10) catch return error.HALeaseGraceInvalid;
         if (grace_ms < ha_lease_min_grace_ms or grace_ms >= 30_000) return error.HALeaseGraceInvalid;
-        const data_generation = cli.ha_startup_generation orelse "initial";
+        const requested_generation = cli.ha_startup_generation orelse "initial";
+        const sentinel_generation = try antfly.ha.kubernetes_lease_watchdog.loadSentinelGenerationAlloc(alloc, io, sentinel_path);
+        defer if (sentinel_generation) |generation| alloc.free(generation);
+        const repaired_generation = if (sentinel_generation != null)
+            try antfly.ha.kubernetes_lease_watchdog.loadValidatedRepairGenerationAlloc(alloc, io, sentinel_path, topology_id, node_id)
+        else
+            null;
+        errdefer if (repaired_generation) |generation| alloc.free(generation);
+        if (repaired_generation) |generation| {
+            try antfly.ha.kubernetes_lease_watchdog.rotateSentinelAfterValidatedRepair(
+                alloc,
+                io,
+                sentinel_path,
+                topology_id,
+                node_id,
+                generation,
+            );
+        }
+        const data_generation = repaired_generation orelse requested_generation;
         const scope = antfly.ha.kubernetes_lease_watchdog.Scope{
             .topology_id = topology_id,
             .node_id = node_id,
             .data_generation = data_generation,
         };
-        const sentinel_generation = try antfly.ha.kubernetes_lease_watchdog.loadSentinelGenerationAlloc(alloc, io, sentinel_path);
-        defer if (sentinel_generation) |generation| alloc.free(generation);
         var entropy: [32]u8 = undefined;
         std.crypto.random.bytes(&entropy);
         const process_boot_id = std.fmt.bytesToHex(entropy, .lower);
@@ -230,7 +246,7 @@ const RuntimeLeaseWatchdog = struct {
                 .scope = scope,
                 .grace_ns = grace_ms * std.time.ns_per_ms,
                 .sentinel_path = sentinel_path,
-            }, sentinel_generation, validated_new_generation),
+            }, sentinel_generation, repaired_generation),
             .executor = executor,
             .uri = try antfly.ha.kubernetes_lease_watchdog.leaseURLAlloc(alloc, host, port, namespace, lease_name),
             .token_path = env.get("ANTFLY_HA_LEASE_TOKEN_PATH") orelse antfly.ha.kubernetes_lease_watchdog.service_account_token_path,
@@ -240,12 +256,34 @@ const RuntimeLeaseWatchdog = struct {
             .node_id = node_id,
             .pod_uid = resolved_pod_uid,
             .process_boot_id = process_boot_id,
+            .owned_data_generation = repaired_generation,
             .sentinel_persisted = sentinel_generation != null and std.mem.eql(u8, sentinel_generation.?, data_generation),
         };
     }
 
     fn proofSource(self: *const RuntimeLeaseWatchdog) antfly.ha.http_admin.Server.AuthOptions.LeaseWatchdogProofSource {
         return .{ .ptr = self, .snapshot_fn = proofSnapshot };
+    }
+
+    fn repairReceiptSink(self: *RuntimeLeaseWatchdog) antfly.ha.http_admin.Server.AuthOptions.RepairReceiptSink {
+        return .{ .ptr = self, .record_fn = recordRepairReceipt };
+    }
+
+    fn recordRepairReceipt(ptr: *anyopaque, result: antfly.ha.rejoin.RewindResult) !void {
+        const self: *RuntimeLeaseWatchdog = @ptrCast(@alignCast(ptr));
+        var io_impl = std.Io.Threaded.init(self.executor.alloc, .{});
+        defer io_impl.deinit();
+        _ = try antfly.ha.kubernetes_lease_watchdog.persistRepairReceipt(
+            self.executor.alloc,
+            io_impl.io(),
+            self.watchdog.cfg.sentinel_path,
+            self.stable_topology_id,
+            self.node_id,
+            result.target_timeline_id,
+            result.target_epoch,
+            result.current_last_lsn,
+            "",
+        );
     }
 
     fn proofSnapshot(ptr: *const anyopaque, alloc: std.mem.Allocator) !?antfly.admin.HALeaseWatchdogProof {
@@ -283,6 +321,7 @@ const RuntimeLeaseWatchdog = struct {
     fn deinit(self: *RuntimeLeaseWatchdog, alloc: std.mem.Allocator) void {
         self.executor.deinit();
         alloc.free(self.uri);
+        if (self.owned_data_generation) |generation| alloc.free(generation);
         self.* = undefined;
     }
 
@@ -1683,6 +1722,40 @@ pub fn runFromIterator(
         }
     else
         null;
+    // A reseed may rotate a persisted Lease fence only after the complete,
+    // immutable activation chain on this exact target volume has validated.
+    // A generic checkpoint or caller-selected startup generation never reaches
+    // this receipt writer.
+    if (ha_startup_checkpoint_lsn) |checkpoint_lsn| {
+        if (ha_startup_expectation) |expectation| {
+            if (init.environ_map.get("ANTFLY_HA_LEASE_SENTINEL_PATH")) |sentinel_path| {
+                if (init.environ_map.get("ANTFLY_HA_LEASE_TOPOLOGY_ID")) |topology_id| {
+                    if (!std.mem.eql(u8, topology_id, expectation.binding.topology_id)) return error.HALeaseSentinelScopeMismatch;
+                    const existing = try antfly.ha.kubernetes_lease_watchdog.loadValidatedRepairGenerationAlloc(
+                        alloc,
+                        setup_io.io(),
+                        sentinel_path,
+                        topology_id,
+                        expectation.binding.node_id,
+                    );
+                    defer if (existing) |generation| alloc.free(generation);
+                    if (existing == null and try antfly.ha.kubernetes_lease_watchdog.sentinelExists(setup_io.io(), sentinel_path)) {
+                        _ = try antfly.ha.kubernetes_lease_watchdog.persistRepairReceipt(
+                            alloc,
+                            setup_io.io(),
+                            sentinel_path,
+                            topology_id,
+                            expectation.binding.node_id,
+                            expectation.expected.identity.timeline_id,
+                            expectation.expected.identity.epoch,
+                            checkpoint_lsn,
+                            expectation.materialized_receipt_sha256.?,
+                        );
+                    }
+                }
+            }
+        }
+    }
     var ha_sync_policy = try haSyncPolicyFromCli(alloc, cli);
     defer ha_sync_policy.deinit(alloc);
     const ha_retention_policy = try haRetentionPolicyFromCli(cli);
@@ -1716,7 +1789,6 @@ pub fn runFromIterator(
         &init.environ_map,
         cli,
         ha_pod_uid,
-        ha_startup_checkpoint_lsn != null,
     );
     defer if (ha_lease_watchdog) |*watchdog| watchdog.deinit(alloc);
 
@@ -1774,6 +1846,7 @@ pub fn runFromIterator(
             .seed_activation_root = cli.ha_startup_target_root,
             .pod_uid = ha_pod_uid,
             .lease_watchdog_proof = if (ha_lease_watchdog) |*watchdog| watchdog.proofSource() else null,
+            .repair_receipt = if (ha_lease_watchdog) |*watchdog| watchdog.repairReceiptSink() else null,
             .internal_primary = if (ha_primary) |*primary| primary else null,
             .primary_retention_policy = ha_retention_policy,
             .primary_sync_policy = ha_sync_policy.policy,
