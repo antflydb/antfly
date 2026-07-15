@@ -5183,6 +5183,10 @@ pub const DB = struct {
 
         var precomputed_generated: PrecomputedGeneratedBatch = .{};
         defer precomputed_generated.deinit(self.alloc);
+        const embed_batches_before_precompute = if (self.enrichment_runtime) |runtime|
+            runtime.stats().embed_batches_completed
+        else
+            0;
         var remote_child_range_dispatches = std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup).empty;
         defer {
             for (remote_child_range_dispatches.items) |*dispatch| dispatch.deinit(self.alloc);
@@ -5215,6 +5219,14 @@ pub const DB = struct {
                 generatedPrecomputeModeForSyncLevel(effective_req.sync_level),
                 opts.force_generated_artifact_names,
             );
+
+            if (self.enrichment_runtime) |runtime| {
+                if (runtime.stats().embed_batches_completed > embed_batches_before_precompute) {
+                    enrichment_runtime_mod.persistStatus(runtime) catch |err| {
+                        std.log.warn("failed to persist synchronous embedding telemetry: {s}", .{@errorName(err)});
+                    };
+                }
+            }
 
             if (opts.document_child_range_dispatcher != null) {
                 try partitionRemoteDocumentChildRangeGeneratedBatch(self, &precomputed_generated, &remote_child_range_dispatches);
@@ -43505,6 +43517,63 @@ test "db computeEnrichments synchronously builds chunk and embedding outputs" {
     try std.testing.expectEqual(@as(usize, 0), result.failed_keys.len);
     try std.testing.expectEqualStrings("ft_chunks", result.documents[0].target_index_names[0]);
     try std.testing.expectEqualStrings("dv_v1", result.dense_embeddings[0].index_name);
+    const enrichment_stats = db.enrichment_runtime.?.stats();
+    try std.testing.expectEqual(@as(u64, 1), enrichment_stats.embed_batches_completed);
+    try std.testing.expectEqual(@as(u64, 3), enrichment_stats.embed_items_completed);
+    try std.testing.expect(enrichment_stats.total_embed_ns > 0);
+}
+
+test "db full index precompute persists embedding telemetry across reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var completed_batches: u64 = 0;
+    var completed_items: u64 = 0;
+    var total_embed_ns: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .dense_embedder = deterministic.interface(),
+            },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" }},
+            .sync_level = .full_index,
+        });
+
+        const stats = db.enrichment_runtime.?.stats();
+        completed_batches = stats.embed_batches_completed;
+        completed_items = stats.embed_items_completed;
+        total_embed_ns = stats.total_embed_ns;
+        try std.testing.expect(completed_batches > 0);
+        try std.testing.expectEqual(@as(u64, 3), completed_items);
+        try std.testing.expect(total_embed_ns > 0);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-b",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer reopened.close();
+    const reopened_stats = reopened.enrichment_runtime.?.stats();
+    try std.testing.expectEqual(completed_batches, reopened_stats.embed_batches_completed);
+    try std.testing.expectEqual(completed_items, reopened_stats.embed_items_completed);
+    try std.testing.expectEqual(total_embed_ns, reopened_stats.total_embed_ns);
 }
 
 test "db leased enrichment worker generates dense embeddings" {

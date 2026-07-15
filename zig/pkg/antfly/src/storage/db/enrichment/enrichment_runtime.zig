@@ -418,6 +418,14 @@ pub fn finishEmbedBatch(runtime: *EnrichmentRuntime, items: usize, bytes: usize,
     noteEmbedBatchFinished(runtime, items, bytes, max_bytes, elapsedNsSince(runtime, started_ns), success);
 }
 
+pub fn persistStatus(runtime: *EnrichmentRuntime) !void {
+    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
+    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
+    const status = runtimeStatusSnapshot(runtime);
+    if (maybe_io) |io| runtime.mutex.unlock(io);
+    try saveRuntimeStatusWithRetry(runtime, scope_name, status);
+}
+
 const TextBatchByteStats = struct {
     total_bytes: usize = 0,
     max_bytes: usize = 0,
