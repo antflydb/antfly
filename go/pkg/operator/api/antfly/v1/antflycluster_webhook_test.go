@@ -1911,6 +1911,9 @@ func TestValidateCreate_HighAvailabilityHotStandbyValid(t *testing.T) {
 	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
+		Runtime: &HARuntimeSpec{Role: HARuntimeRolePrimary, NodeID: "primary-a", FencingLease: &HARuntimeFencingLeaseSpec{
+			Name: "topology-ha-fence", TopologyID: "topology-anchor-uid", WatchdogGraceSeconds: 10,
+		}},
 		Admin: &HAAdminSpec{
 			PrimaryURL:            "http://primary-ha.default.svc:8081",
 			ExecutePlannedActions: true,
@@ -1951,7 +1954,10 @@ func TestValidateCreate_HighAvailabilityHotStandbyValid(t *testing.T) {
 func TestValidateCreate_HighAvailabilityAutomaticFailoverRequiresNoLossDurability(t *testing.T) {
 	base := baseStandaloneCluster()
 	base.Spec.HighAvailability = &HighAvailabilitySpec{
-		Mode:  HAModeHotStandby,
+		Mode: HAModeHotStandby,
+		Runtime: &HARuntimeSpec{Role: HARuntimeRolePrimary, NodeID: "primary-a", FencingLease: &HARuntimeFencingLeaseSpec{
+			Name: "topology-ha-fence", TopologyID: "topology-anchor-uid", WatchdogGraceSeconds: 10,
+		}},
 		Admin: &HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081", ExecutePlannedActions: true},
 		Standbys: []HAStandbySpec{{
 			Name:          "standby-a",

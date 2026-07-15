@@ -274,8 +274,10 @@ func haBindPhysicalIsolationWatchdogProof(cluster *antflyv1.AntflyCluster, actio
 	proof := cluster.Status.HAStatus.PrimaryWatchdogProof
 	if proof == nil || proof.CapabilityVersion != 1 || !proof.Active || proof.LeaseName != receipt.LeaseName ||
 		proof.LeaseNamespace != cluster.Namespace || strings.TrimSpace(proof.TopologyID) == "" ||
-		strings.TrimSpace(proof.HolderNodeID) != strings.TrimSpace(action.StandbyName) || strings.TrimSpace(proof.PodUID) == "" ||
-		strings.TrimSpace(proof.ProcessBootID) == "" || proof.ObservedLeaseTransitions <= 0 ||
+		strings.TrimSpace(proof.LocalNodeID) != strings.TrimSpace(action.StandbyName) ||
+		strings.TrimSpace(proof.ObservedHolderNodeID) != strings.TrimSpace(receipt.LeaseHolder) ||
+		strings.TrimSpace(proof.PodUID) == "" ||
+		!isLowerHexDigest(proof.ProcessBootID) || proof.ObservedLeaseTransitions <= 0 ||
 		uint64(proof.ObservedLeaseTransitions)+1 != action.FenceGeneration || proof.ObservedAt.IsZero() ||
 		!proof.ObservedAt.Before(&receipt.LeaseTransferTime) {
 		return nil
@@ -295,7 +297,7 @@ func haBindPhysicalIsolationWatchdogProof(cluster *antflyv1.AntflyCluster, actio
 			return &antflyv1.HAPhysicalIsolationWatchdogProofStatus{
 				CapabilityVersion: proof.CapabilityVersion, Active: proof.Active,
 				LeaseName: proof.LeaseName, LeaseNamespace: proof.LeaseNamespace,
-				TopologyID: proof.TopologyID, HolderNodeID: proof.HolderNodeID,
+				TopologyID: proof.TopologyID, HolderNodeID: proof.LocalNodeID,
 				PodName: pod.Name, PodUID: string(pod.UID), ContainerName: container.Name,
 				ContainerID: container.ContainerID, ContainerRestartCount: container.RestartCount,
 				ContainerStartedAt: *container.State.Running.StartedAt.DeepCopy(), ProcessBootID: proof.ProcessBootID,

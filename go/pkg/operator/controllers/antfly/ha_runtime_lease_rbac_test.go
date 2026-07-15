@@ -58,7 +58,7 @@ func TestHARuntimeLeaseEnvBindsExactAuthorityAndPersistentSentinel(t *testing.T)
 		values[variable.Name] = variable.Value
 	}
 	if values["ANTFLY_HA_LEASE_NAME"] != haFencingLeaseName(cluster) ||
-		values["ANTFLY_HA_LEASE_CURRENT_PRIMARY_ID"] != cluster.Spec.HighAvailability.Identity.CurrentPrimaryID ||
+		values["ANTFLY_HA_LEASE_TOPOLOGY_ID"] != cluster.Spec.HighAvailability.Runtime.FencingLease.TopologyID ||
 		values["ANTFLY_HA_LEASE_GRACE_MS"] != "10000" ||
 		values["ANTFLY_HA_LEASE_SENTINEL_PATH"] != "/antflydb/ha/lease-fenced" {
 		t.Fatalf("unexpected runtime Lease env: %#v", env)

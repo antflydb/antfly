@@ -35,7 +35,10 @@ pub const Config = struct {
 };
 
 pub const Decision = enum {
+    /// No current exact, unexpired Lease has been validated.
     waiting,
+    /// The exact, unexpired Lease was validated and is held by another node.
+    observed,
     authorized,
     grace,
     fence,
@@ -55,6 +58,8 @@ pub const Watchdog = struct {
     authorized_once: bool = false,
     latched: bool = false,
     last_generation: u64 = 0,
+    last_observed_holder: [128]u8 = undefined,
+    last_observed_holder_len: u8 = 0,
     local_deadline_ns: u64 = 0,
     fence_reason: ?FenceReason = null,
 
@@ -91,6 +96,12 @@ pub const Watchdog = struct {
         return self.authorized_once and !self.latched;
     }
 
+    /// The returned slice is borrowed from mutable watchdog state. Callers
+    /// must copy it while holding the mutex that serializes `observe`.
+    pub fn observedHolder(self: *const Watchdog) []const u8 {
+        return self.last_observed_holder[0..self.last_observed_holder_len];
+    }
+
     pub fn observe(
         self: *Watchdog,
         alloc: std.mem.Allocator,
@@ -110,6 +121,7 @@ pub const Watchdog = struct {
         const annotations = try requiredObject(metadata, "annotations");
 
         const holder = try requiredString(spec, "holderIdentity");
+        if (holder.len == 0 or holder.len > 128) return error.InvalidLeaseResponse;
         const generation = try requiredPositiveInt(spec, "leaseTransitions");
         const duration_seconds = try requiredPositiveInt(spec, "leaseDurationSeconds");
         const renew_time = try requiredString(spec, "renewTime");
@@ -120,16 +132,26 @@ pub const Watchdog = struct {
 
         const scope_matches = try self.scopeMatches(annotations);
         if (self.authorized_once and !scope_matches) return self.latch(.scope_changed);
-        if (self.authorized_once and generation < self.last_generation) return self.latch(.generation_rollback);
+        if (generation < self.last_generation) {
+            if (self.authorized_once) return self.latch(.generation_rollback);
+            return error.LeaseGenerationRollback;
+        }
         if (self.authorized_once and !std.mem.eql(u8, holder, self.cfg.scope.node_id)) return self.latch(.holder_changed);
         if (renew_ns > std.math.maxInt(u64) - duration_ns or realtime_ns >= renew_ns + duration_ns) {
             if (self.authorized_once) return self.latch(.lease_expired);
             return .waiting;
         }
-        if (!scope_matches or !std.mem.eql(u8, holder, self.cfg.scope.node_id)) return .waiting;
+        if (!scope_matches) return error.LeaseScopeMismatch;
+
+        // A standby must publish proof that it is actively monitoring this
+        // exact topology before the holder transfer. Preserve the monotonic
+        // Lease generation even though public authority is not yet granted.
+        self.last_generation = @max(self.last_generation, generation);
+        @memcpy(self.last_observed_holder[0..holder.len], holder);
+        self.last_observed_holder_len = @intCast(holder.len);
+        if (!std.mem.eql(u8, holder, self.cfg.scope.node_id)) return .observed;
 
         self.authorized_once = true;
-        self.last_generation = @max(self.last_generation, generation);
         self.local_deadline_ns = monotonic_ns +| self.cfg.grace_ns;
         return .authorized;
     }
@@ -368,17 +390,33 @@ test "kubernetes lease watchdog standby waits for transfer then fences rollback"
     ;
     const now = try rfc3339UnixNs("2026-07-15T12:00:03Z");
     var watchdog = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "standby-a", .data_generation = "seed-a" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, true);
-    try std.testing.expectEqual(Decision.waiting, try watchdog.observe(std.testing.allocator, before, now, 1));
+    try std.testing.expectEqual(Decision.observed, try watchdog.observe(std.testing.allocator, before, now, 1));
+    try std.testing.expectEqualStrings("primary-a", watchdog.observedHolder());
     try std.testing.expectEqual(Decision.authorized, try watchdog.observe(std.testing.allocator, after, now, 2));
+    try std.testing.expectEqualStrings("standby-a", watchdog.observedHolder());
     try std.testing.expectEqual(Decision.fence, try watchdog.observe(std.testing.allocator, before, now, 3));
     try std.testing.expectEqual(FenceReason.generation_rollback, watchdog.fence_reason.?);
 }
 
+test "kubernetes lease watchdog rejects expired pre-transfer lease as inactive" {
+    const expired =
+        \\{"metadata":{"annotations":{"antfly.io/ha-fence-topology-id":"topology-7"}},"spec":{"holderIdentity":"primary-a","leaseDurationSeconds":30,"renewTime":"2026-07-15T12:00:00Z","leaseTransitions":3}}
+    ;
+    const after_expiry = try rfc3339UnixNs("2026-07-15T12:00:31Z");
+    var watchdog = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "standby-a", .data_generation = "seed-a" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, true);
+
+    // `waiting`, rather than `observed`, tells the runtime not to publish or
+    // refresh Active capability proof for this stale Lease.
+    try std.testing.expectEqual(Decision.waiting, try watchdog.observe(std.testing.allocator, expired, after_expiry, 1));
+    try std.testing.expectEqual(@as(u64, 0), watchdog.last_generation);
+    try std.testing.expectEqual(@as(usize, 0), watchdog.observedHolder().len);
+}
+
 test "kubernetes lease watchdog persisted fence only rotates after validated new data generation" {
-    var same = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "old-primary", .data_generation = "generation-a" }, .grace_ns = std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, "generation-a", true);
+    const same = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "old-primary", .data_generation = "generation-a" }, .grace_ns = std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, "generation-a", true);
     try std.testing.expect(same.latched);
 
-    var unvalidated = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "old-primary", .data_generation = "generation-b" }, .grace_ns = std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, "generation-a", false);
+    const unvalidated = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "old-primary", .data_generation = "generation-b" }, .grace_ns = std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, "generation-a", false);
     try std.testing.expect(unvalidated.latched);
 
     var repaired = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "old-primary", .data_generation = "generation-b" }, .grace_ns = std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, "generation-a", true);

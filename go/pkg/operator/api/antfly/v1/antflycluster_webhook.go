@@ -1474,6 +1474,14 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		if ha.Identity == nil {
 			errors = append(errors, "spec.highAvailability.automaticFailover requires spec.highAvailability.identity")
 		}
+		if fencingAuthority == HAFencingAuthorityKubernetesLease {
+			if ha.Runtime == nil || ha.Runtime.FencingLease == nil {
+				errors = append(errors, "spec.highAvailability.automaticFailover with KubernetesLease requires runtime.fencingLease shared by every topology member")
+			} else if strings.TrimSpace(ha.Runtime.FencingLease.Name) == "" ||
+				strings.TrimSpace(ha.Runtime.FencingLease.TopologyID) == "" {
+				errors = append(errors, "spec.highAvailability.runtime.fencingLease.name and topologyID are required")
+			}
+		}
 		if !failover.requireRemoteApplyOrDefault() {
 			errors = append(errors, "spec.highAvailability.automaticFailover.requireRemoteApply must be true for no-loss automatic failover")
 		}

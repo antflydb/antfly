@@ -149,14 +149,21 @@ pub const HAIdentity = struct {
 
 pub const HALeaseWatchdogProof = struct {
     capability_version: i64,
+    /// Watchdog capability is running and has validated this exact shared Lease.
     active: bool,
+    /// This process is the current holder and its suspend-inclusive local deadline has not elapsed.
+    authority_granted: bool,
     lease_name: []const u8,
     lease_namespace: []const u8,
     stable_topology_id: []const u8,
-    holder_node_id: HANodeID,
+    /// Local runtime node id producing the proof.
+    local_node_id: HANodeID,
+    /// Holder identity copied from the exact validated Kubernetes Lease.
+    observed_holder_node_id: HANodeID,
     pod_uid: []const u8,
     process_boot_id: []const u8,
     observed_lease_transitions: i64,
+    max_fence_latency_ms: i64,
 };
 
 /// Stable HA node id.
@@ -490,6 +497,7 @@ pub const HAStandbySnapshot = struct {
     unapplied_lsn_count: i64,
     caught_up_to_received: bool,
     can_serve_safe_reads: bool,
+    lease_watchdog: ?HALeaseWatchdogProof = null,
 };
 
 pub const HAStandbyStatusResponse = struct {

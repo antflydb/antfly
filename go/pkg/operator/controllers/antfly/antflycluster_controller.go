@@ -8771,6 +8771,9 @@ func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatus(ctx context.Contex
 	cluster.Status.HAStatus.PrimaryAdminFailureThresholdMet = false
 	cluster.Status.HAStatus.PrimaryLSN = status.PrimaryLSN
 	cluster.Status.HAStatus.Retention = status.Retention
+	if status.WatchdogProof != nil {
+		cluster.Status.HAStatus.PrimaryWatchdogProof = status.WatchdogProof.DeepCopy()
+	}
 	cluster.Status.HAStatus.Standbys = status.Standbys
 	if status.Sync != nil {
 		cluster.Status.HAStatus.Sync = *status.Sync
@@ -8827,6 +8830,13 @@ func (r *AntflyClusterReconciler) observeHAPrimaryStatusTyped(ctx context.Contex
 	if err := haValidateObservedPrimaryNodeID(status.NodeID, ha, cluster.Status.HAStatus); err != nil {
 		return haObservedPrimaryStatus{}, err
 	}
+	if haRuntimeLeaseWatchdogEnabled(cluster) {
+		proof, err := haWatchdogProofFromAdmin(status.RawWatchdogProof, cluster, status.NodeID, true, r.haNow())
+		if err != nil {
+			return haObservedPrimaryStatus{}, err
+		}
+		status.WatchdogProof = proof
+	}
 	return status, nil
 }
 
@@ -8845,6 +8855,13 @@ func (r *AntflyClusterReconciler) observeHAStandbyStatusTyped(ctx context.Contex
 	}
 	if err := haValidateObservedNodeID(observed.NodeID, standbyName, "standby"); err != nil {
 		return antflyv1.HAStandbyStatus{}, err
+	}
+	if haRuntimeLeaseWatchdogEnabled(cluster) {
+		proof, err := haWatchdogProofFromAdmin(observed.RawWatchdogProof, cluster, observed.NodeID, false, r.haNow())
+		if err != nil {
+			return antflyv1.HAStandbyStatus{}, err
+		}
+		observed.Status.WatchdogProof = proof
 	}
 	return observed.Status, nil
 }
@@ -8925,18 +8942,21 @@ func haAdminSyncFailureParam(policy antflyv1.HAFailurePolicy) adminsdk.HAPrimary
 }
 
 type haObservedPrimaryStatus struct {
-	NodeID     string
-	PrimaryLSN uint64
-	Retention  antflyv1.HARetentionStatus
-	Standbys   []antflyv1.HAStandbyStatus
-	Sync       *antflyv1.HASyncStatus
-	Identity   haObservedIdentity
+	NodeID           string
+	PrimaryLSN       uint64
+	Retention        antflyv1.HARetentionStatus
+	Standbys         []antflyv1.HAStandbyStatus
+	Sync             *antflyv1.HASyncStatus
+	Identity         haObservedIdentity
+	RawWatchdogProof *adminsdk.HALeaseWatchdogProof
+	WatchdogProof    *antflyv1.HAWatchdogProofStatus
 }
 
 type haObservedStandbyStatus struct {
-	NodeID   string
-	Status   antflyv1.HAStandbyStatus
-	Identity haObservedIdentity
+	NodeID           string
+	Status           antflyv1.HAStandbyStatus
+	Identity         haObservedIdentity
+	RawWatchdogProof *adminsdk.HALeaseWatchdogProof
 }
 
 type haObservedIdentity struct {
@@ -8977,6 +8997,10 @@ func haObservedPrimaryStatusFromAdminSDK(parsed adminsdk.ParsedHAPrimaryStatus) 
 			ActiveSlots:       haUint64ToInt32(snapshot.Retention.ActiveSlots),
 			ReseedRecommended: haUint64ToInt32(snapshot.Retention.ReseedRecommended),
 		},
+	}
+	if parsed.Response.Snapshot.LeaseWatchdog.CapabilityVersion != 0 {
+		proof := parsed.Response.Snapshot.LeaseWatchdog
+		status.RawWatchdogProof = &proof
 	}
 	for _, slot := range snapshot.Slots {
 		status.Standbys = append(status.Standbys, antflyv1.HAStandbyStatus{
@@ -9109,10 +9133,16 @@ func haObservedStandbyStatusFromAdminSDK(response adminsdk.HAStandbyStatusRespon
 	} else if status.CanServeSafeReads && status.Status == "" {
 		status.Status = "healthy"
 	}
+	var rawWatchdogProof *adminsdk.HALeaseWatchdogProof
+	if snapshot.LeaseWatchdog.CapabilityVersion != 0 {
+		proof := snapshot.LeaseWatchdog
+		rawWatchdogProof = &proof
+	}
 	return haObservedStandbyStatus{
-		NodeID:   strings.TrimSpace(snapshot.NodeId),
-		Status:   status,
-		Identity: haObservedIdentityFromAdminSDK(snapshot.Identity),
+		NodeID:           strings.TrimSpace(snapshot.NodeId),
+		Status:           status,
+		Identity:         haObservedIdentityFromAdminSDK(snapshot.Identity),
+		RawWatchdogProof: rawWatchdogProof,
 	}
 }
 
@@ -9124,6 +9154,54 @@ func haObservedIdentityFromAdminSDK(identity adminsdk.HAIdentity) haObservedIden
 		TimelineID: identity.TimelineId,
 		Epoch:      identity.Epoch,
 	}
+}
+
+func haWatchdogProofFromAdmin(raw *adminsdk.HALeaseWatchdogProof, cluster *antflyv1.AntflyCluster, nodeID string, requireAuthority bool, observedAt time.Time) (*antflyv1.HAWatchdogProofStatus, error) {
+	if raw == nil {
+		return nil, fmt.Errorf("HA Lease watchdog capability proof is missing")
+	}
+	lease := cluster.Spec.HighAvailability.Runtime.FencingLease
+	if raw.CapabilityVersion != 1 || !raw.Active || (requireAuthority && !raw.AuthorityGranted) {
+		return nil, fmt.Errorf("HA Lease watchdog is not active for node %s", nodeID)
+	}
+	if strings.TrimSpace(raw.LeaseName) != strings.TrimSpace(lease.Name) ||
+		strings.TrimSpace(raw.LeaseNamespace) != cluster.Namespace ||
+		strings.TrimSpace(raw.StableTopologyId) != strings.TrimSpace(lease.TopologyID) ||
+		strings.TrimSpace(raw.LocalNodeId) != strings.TrimSpace(nodeID) ||
+		strings.TrimSpace(raw.ObservedHolderNodeId) == "" ||
+		strings.TrimSpace(raw.PodUid) == "" ||
+		raw.ObservedLeaseTransitions == 0 || raw.ObservedLeaseTransitions > math.MaxInt32 ||
+		raw.MaxFenceLatencyMs == 0 || raw.MaxFenceLatencyMs > math.MaxInt32 ||
+		!haWatchdogProcessBootIDValid(raw.ProcessBootId) {
+		return nil, fmt.Errorf("HA Lease watchdog proof does not match the configured topology and exact runtime process")
+	}
+	return &antflyv1.HAWatchdogProofStatus{
+		CapabilityVersion:        1,
+		Active:                   true,
+		AuthorityGranted:         raw.AuthorityGranted,
+		LeaseName:                strings.TrimSpace(raw.LeaseName),
+		LeaseNamespace:           strings.TrimSpace(raw.LeaseNamespace),
+		TopologyID:               strings.TrimSpace(raw.StableTopologyId),
+		LocalNodeID:              strings.TrimSpace(raw.LocalNodeId),
+		ObservedHolderNodeID:     strings.TrimSpace(raw.ObservedHolderNodeId),
+		PodUID:                   strings.TrimSpace(raw.PodUid),
+		ProcessBootID:            strings.TrimSpace(raw.ProcessBootId),
+		ObservedLeaseTransitions: int32(raw.ObservedLeaseTransitions),
+		MaxFenceLatencyMS:        int32(raw.MaxFenceLatencyMs),
+		ObservedAt:               metav1.NewTime(observedAt),
+	}, nil
+}
+
+func haWatchdogProcessBootIDValid(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, ch := range value {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func haValidateObservedStatusIdentity(observed haObservedIdentity, ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) error {
@@ -9257,6 +9335,9 @@ func mergeHAStandbyStatus(status *antflyv1.HAStatus, observed antflyv1.HAStandby
 		existing.LastAttemptNs = observed.LastAttemptNs
 		existing.LastSuccessNs = observed.LastSuccessNs
 		existing.ReplicationFailuresTotal = observed.ReplicationFailuresTotal
+		if observed.WatchdogProof != nil {
+			existing.WatchdogProof = observed.WatchdogProof.DeepCopy()
+		}
 		if observed.Status != "" {
 			existing.Status = observed.Status
 		}
@@ -9344,12 +9425,54 @@ func (r *AntflyClusterReconciler) reconcileHAPrimaryRoute(ctx context.Context, c
 		if !haPrimaryRouteActionHasPromotionEvidence(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i) {
 			return nil
 		}
+		if haRuntimeLeaseWatchdogEnabled(cluster) && !haPromotedRuntimeWatchdogReady(cluster, action.RouteTo, action.FenceGeneration) {
+			return nil
+		}
+		if haRuntimeLeaseWatchdogEnabled(cluster) {
+			ready, err := r.haCurrentLeaseAuthorizesRoute(ctx, cluster, action.RouteTo, action.FenceGeneration)
+			if err != nil || !ready {
+				return err
+			}
+		}
 		if action.RouteTo == "" {
 			return nil
 		}
 		return r.updateHAPrimaryRouteService(ctx, cluster, action)
 	}
 	return nil
+}
+
+func (r *AntflyClusterReconciler) haCurrentLeaseAuthorizesRoute(ctx context.Context, cluster *antflyv1.AntflyCluster, nodeID string, generation uint64) (bool, error) {
+	lease := &coordinationv1.Lease{}
+	if err := r.Get(ctx, types.NamespacedName{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != strings.TrimSpace(nodeID) ||
+		lease.Spec.LeaseTransitions == nil || uint64(*lease.Spec.LeaseTransitions) != generation ||
+		lease.Annotations[haFencingLeaseAnnotationTopologyID] != haFencingLeaseTopologyID(cluster) {
+		return false, nil
+	}
+	ready, _ := haLeaseFenceReady(lease, generation, r.haNow())
+	return ready, nil
+}
+
+func haPromotedRuntimeWatchdogReady(cluster *antflyv1.AntflyCluster, nodeID string, fenceGeneration uint64) bool {
+	if cluster == nil || cluster.Status.HAStatus == nil || cluster.Status.HAStatus.PrimaryWatchdogProof == nil ||
+		cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Runtime == nil ||
+		cluster.Spec.HighAvailability.Runtime.FencingLease == nil {
+		return false
+	}
+	proof := cluster.Status.HAStatus.PrimaryWatchdogProof
+	lease := cluster.Spec.HighAvailability.Runtime.FencingLease
+	return proof.Active && proof.AuthorityGranted && proof.CapabilityVersion == 1 &&
+		proof.LocalNodeID == strings.TrimSpace(nodeID) && proof.ObservedHolderNodeID == strings.TrimSpace(nodeID) &&
+		proof.PodUID != "" && proof.ProcessBootID != "" &&
+		proof.LeaseName == strings.TrimSpace(lease.Name) && proof.LeaseNamespace == cluster.Namespace &&
+		proof.TopologyID == strings.TrimSpace(lease.TopologyID) &&
+		uint64(proof.ObservedLeaseTransitions) == fenceGeneration
 }
 
 func (r *AntflyClusterReconciler) updateHAPrimaryRouteService(ctx context.Context, cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) error {

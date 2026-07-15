@@ -134,10 +134,10 @@ pub const Server = struct {
     pub const AuthOptions = struct {
         pub const LeaseWatchdogProofSource = struct {
             ptr: *const anyopaque,
-            snapshot_fn: *const fn (ptr: *const anyopaque) ?admin_api.HALeaseWatchdogProof,
+            snapshot_fn: *const fn (ptr: *const anyopaque, alloc: Allocator) anyerror!?admin_api.HALeaseWatchdogProof,
 
-            pub fn snapshot(self: LeaseWatchdogProofSource) ?admin_api.HALeaseWatchdogProof {
-                return self.snapshot_fn(self.ptr);
+            pub fn snapshot(self: LeaseWatchdogProofSource, alloc: Allocator) !?admin_api.HALeaseWatchdogProof {
+                return self.snapshot_fn(self.ptr, alloc);
             }
         };
 
@@ -357,11 +357,13 @@ pub const Server = struct {
         };
         defer snapshot.deinit(self.alloc);
         const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
+        const watchdog_proof = if (self.auth.lease_watchdog_proof) |source| try source.snapshot(self.alloc) else null;
+        defer if (watchdog_proof) |proof| self.alloc.free(proof.observed_holder_node_id);
         const response = admin_api.HAPrimaryStatusResponse{
             .schema_version = 1,
             .snapshot = blk: {
                 var result = try adminPrimarySnapshot(self.alloc, snapshot, node_id);
-                result.lease_watchdog = if (self.auth.lease_watchdog_proof) |source| source.snapshot() else null;
+                result.lease_watchdog = watchdog_proof;
                 break :blk result;
             },
         };
@@ -385,10 +387,14 @@ pub const Server = struct {
             snapshot.last_success_ns = extras.lastSuccessNs();
             snapshot.replication_failures_total = extras.replicationFailuresTotal();
         }
-        return try self.handleTypedJson(admin_api.HAStandbyStatusResponse{
+        var response = admin_api.HAStandbyStatusResponse{
             .schema_version = 1,
             .snapshot = try adminStandbySnapshot(snapshot, node_id),
-        });
+        };
+        const watchdog_proof = if (self.auth.lease_watchdog_proof) |source| try source.snapshot(self.alloc) else null;
+        defer if (watchdog_proof) |proof| self.alloc.free(proof.observed_holder_node_id);
+        response.snapshot.lease_watchdog = watchdog_proof;
+        return try self.handleTypedJson(response);
     }
 
     fn handleAdminReplicationSlots(self: *Server) !http_common.HttpResponse {

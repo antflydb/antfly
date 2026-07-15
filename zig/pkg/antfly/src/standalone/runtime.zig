@@ -22,6 +22,7 @@ const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
 const fs_paths = @import("../common/fs_paths.zig");
 const platform_time = @import("../platform/time.zig");
+const authority_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 
 const AntflyApiHandler = antfly.public_api.httpx_handler.AntflyApiHandler;
@@ -176,7 +177,10 @@ const RuntimeLeaseWatchdog = struct {
     pod_uid: []const u8,
     process_boot_id: [64]u8,
     proof_active: std.atomic.Value(bool) = .init(false),
+    proof_capability_deadline_ns: std.atomic.Value(u64) = .init(0),
+    proof_authority_deadline_ns: std.atomic.Value(u64) = .init(0),
     proof_transitions: std.atomic.Value(u64) = .init(0),
+    proof_mutex: std.atomic.Mutex = .unlocked,
     sentinel_persisted: bool = false,
     next_poll_ns: u64 = 0,
 
@@ -242,18 +246,29 @@ const RuntimeLeaseWatchdog = struct {
         return .{ .ptr = self, .snapshot_fn = proofSnapshot };
     }
 
-    fn proofSnapshot(ptr: *const anyopaque) ?antfly.admin.HALeaseWatchdogProof {
-        const self: *const RuntimeLeaseWatchdog = @ptrCast(@alignCast(ptr));
+    fn proofSnapshot(ptr: *const anyopaque, alloc: std.mem.Allocator) !?antfly.admin.HALeaseWatchdogProof {
+        const self: *RuntimeLeaseWatchdog = @constCast(@ptrCast(@alignCast(ptr)));
+        platform_sync.lockYielding(&self.proof_mutex);
+        defer self.proof_mutex.unlock();
+        const deadline = self.proof_authority_deadline_ns.load(.acquire);
+        const capability_deadline = self.proof_capability_deadline_ns.load(.acquire);
+        const now = authority_time.authorityNs();
         return .{
             .capability_version = 1,
-            .active = self.proof_active.load(.acquire),
+            .active = self.proof_active.load(.acquire) and capability_deadline != 0 and now < capability_deadline,
+            .authority_granted = deadline != 0 and now < deadline,
             .lease_name = self.lease_name,
             .lease_namespace = self.lease_namespace,
             .stable_topology_id = self.stable_topology_id,
-            .holder_node_id = self.node_id,
+            .local_node_id = self.node_id,
+            // The parsed JSON buffer is released after every poll. Return an
+            // owned copy of the fixed watchdog snapshot so response encoding
+            // can never race a later Lease observation.
+            .observed_holder_node_id = try alloc.dupe(u8, self.watchdog.observedHolder()),
             .pod_uid = self.pod_uid,
             .process_boot_id = &self.process_boot_id,
             .observed_lease_transitions = @intCast(self.proof_transitions.load(.acquire)),
+            .max_fence_latency_ms = @intCast(self.watchdog.cfg.grace_ns / std.time.ns_per_ms),
         };
     }
 
@@ -266,12 +281,12 @@ const RuntimeLeaseWatchdog = struct {
     fn poll(
         self: *RuntimeLeaseWatchdog,
         alloc: std.mem.Allocator,
-        io: std.Io,
         data_server: *antfly.data.runtime.DataServer,
     ) !void {
-        const monotonic_ns = platform_time.monotonicNs();
-        if (monotonic_ns < self.next_poll_ns) return;
-        self.next_poll_ns = monotonic_ns +| ha_lease_poll_interval_ns;
+        const io = self.executor.io_impl.io();
+        const poll_started_ns = authority_time.authorityNs();
+        if (poll_started_ns < self.next_poll_ns) return;
+        self.next_poll_ns = poll_started_ns +| ha_lease_poll_interval_ns;
         const body = antfly.ha.kubernetes_lease_watchdog.fetchLeaseAlloc(
             alloc,
             io,
@@ -280,18 +295,69 @@ const RuntimeLeaseWatchdog = struct {
             self.token_path,
             ha_lease_request_timeout_ms,
         ) catch {
-            return try self.applyDecision(alloc, io, data_server, self.watchdog.noteAPIFailure(monotonic_ns));
+            platform_sync.lockYielding(&self.proof_mutex);
+            const failure = self.watchdog.noteAPIFailure(authority_time.authorityNs());
+            self.proof_mutex.unlock();
+            return try self.applyDecision(alloc, io, data_server, failure);
         };
         defer alloc.free(body);
+        const observed_monotonic_ns = authority_time.authorityNs();
+        platform_sync.lockYielding(&self.proof_mutex);
         const decision = self.watchdog.observe(
             alloc,
             body,
             platform_time.realtimeNs(),
-            monotonic_ns,
+            observed_monotonic_ns,
         ) catch {
-            return try self.applyDecision(alloc, io, data_server, self.watchdog.noteAPIFailure(monotonic_ns));
+            // A syntactically valid HTTP response that cannot prove the exact
+            // topology/generation is not current capability evidence.
+            self.proof_active.store(false, .release);
+            self.proof_capability_deadline_ns.store(0, .release);
+            const failure = self.watchdog.noteAPIFailure(authority_time.authorityNs());
+            self.proof_mutex.unlock();
+            return try self.applyDecision(alloc, io, data_server, failure);
         };
+        // `active` is capability evidence, not write authority. A standby
+        // reports active after validating the shared Lease while another node
+        // still holds it, allowing the controller to certify the exact process
+        // before an in-place promotion.
+        if (decision == .observed or decision == .authorized) {
+            self.proof_transitions.store(self.watchdog.last_generation, .release);
+            self.proof_active.store(true, .release);
+            self.proof_capability_deadline_ns.store(observed_monotonic_ns +| self.watchdog.cfg.grace_ns, .release);
+        } else if (decision == .waiting) {
+            // In particular, an expired pre-transfer Lease must never refresh
+            // the standby's Active proof.
+            self.proof_active.store(false, .release);
+            self.proof_capability_deadline_ns.store(0, .release);
+        }
+        self.proof_mutex.unlock();
         try self.applyDecision(alloc, io, data_server, decision);
+    }
+
+    fn runIndependent(
+        self: *RuntimeLeaseWatchdog,
+        alloc: std.mem.Allocator,
+        data_server: *antfly.data.runtime.DataServer,
+        stop: *const std.atomic.Value(bool),
+        failed: *std.atomic.Value(bool),
+    ) void {
+        var delay = std.posix.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+        while (!stop.load(.acquire)) {
+            self.poll(alloc, data_server) catch {
+                failed.store(true, .release);
+                return;
+            };
+            const sleep_error = std.posix.errno(std.posix.system.nanosleep(&delay, &delay));
+            switch (sleep_error) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => {
+                    failed.store(true, .release);
+                    return;
+                },
+            }
+        }
     }
 
     fn applyDecision(
@@ -302,16 +368,19 @@ const RuntimeLeaseWatchdog = struct {
         decision: antfly.ha.kubernetes_lease_watchdog.Decision,
     ) !void {
         switch (decision) {
-            .waiting, .grace => {},
+            .waiting, .observed, .grace => {},
             .authorized => {
                 self.proof_transitions.store(self.watchdog.last_generation, .release);
                 self.proof_active.store(true, .release);
-                data_server.ha_public_gate_state.publishExternalAuthority(true);
+                self.proof_authority_deadline_ns.store(self.watchdog.local_deadline_ns, .release);
+                data_server.ha_public_gate_state.publishExternalAuthorityUntil(true, self.watchdog.local_deadline_ns);
             },
             .fence => {
                 platform_sync.lockYielding(&data_server.ha_state_mutex);
                 defer data_server.ha_state_mutex.unlock();
                 self.proof_active.store(false, .release);
+                self.proof_capability_deadline_ns.store(0, .release);
+                self.proof_authority_deadline_ns.store(0, .release);
                 data_server.ha_public_gate_state.publishExternalAuthority(false);
                 data_server.ha_public_gate_state.publishPrimaryFence(true);
                 if (!self.sentinel_persisted) {
@@ -1695,9 +1764,25 @@ pub fn runFromIterator(
             // The public listener is not created until this bounded first
             // authority attempt has completed. Failure leaves the primary
             // gate closed and is retried from the main runtime loop.
-            try watchdog.poll(alloc, setup_io.io(), &data_server);
+            try watchdog.poll(alloc, &data_server);
         }
     }
+    var ha_watchdog_stop = std.atomic.Value(bool).init(false);
+    var ha_watchdog_failed = std.atomic.Value(bool).init(false);
+    const ha_watchdog_thread = if (ha_lease_watchdog) |*watchdog|
+        try std.Thread.spawn(.{}, RuntimeLeaseWatchdog.runIndependent, .{
+            watchdog,
+            alloc,
+            &data_server,
+            &ha_watchdog_stop,
+            &ha_watchdog_failed,
+        })
+    else
+        null;
+    defer if (ha_watchdog_thread) |worker| {
+        ha_watchdog_stop.store(true, .release);
+        worker.join();
+    };
 
     antfly_node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(&data_server.provisioned_storage.resource_manager);
     data_server.setAntflyProvider(localAntflyProvider(&antfly_node));
@@ -1792,7 +1877,7 @@ pub fn runFromIterator(
     };
     while (!termination_requested.load(.acquire)) {
         if (unified_lifecycle.runtimeFailure()) |err| return err;
-        if (ha_lease_watchdog) |*watchdog| try watchdog.poll(alloc, setup_io.io(), &data_server);
+        if (ha_watchdog_failed.load(.acquire)) return error.HALeaseWatchdogWorkerFailed;
         data_server.runRound() catch |err| switch (err) {
             error.LsmRootWriterAlreadyOpen, error.WriterLocked => std.log.warn("standalone data round skipped err={}", .{err}),
             else => return err,

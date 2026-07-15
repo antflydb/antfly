@@ -22,7 +22,7 @@ func (r *AntflyClusterReconciler) reconcileHARuntimeLeaseRBAC(ctx context.Contex
 		return "", fmt.Errorf("reconcile HA runtime Lease RBAC: cluster is nil")
 	}
 	configured := strings.TrimSpace(cluster.Spec.ServiceAccountName)
-	if !haKubernetesLeaseRenewalEnabled(cluster) {
+	if !haRuntimeLeaseWatchdogEnabled(cluster) {
 		return configured, nil
 	}
 	serviceAccountName := configured
@@ -72,16 +72,28 @@ func (r *AntflyClusterReconciler) reconcileHARuntimeLeaseRBAC(ctx context.Contex
 }
 
 func haRuntimeLeaseEnv(cluster *antflyv1.AntflyCluster) []corev1.EnvVar {
-	if !haKubernetesLeaseRenewalEnabled(cluster) || cluster.Spec.HighAvailability == nil ||
-		cluster.Spec.HighAvailability.Identity == nil || cluster.Spec.HighAvailability.Runtime == nil {
+	if !haRuntimeLeaseWatchdogEnabled(cluster) {
 		return nil
 	}
-	identity := cluster.Spec.HighAvailability.Identity
+	lease := cluster.Spec.HighAvailability.Runtime.FencingLease
+	graceSeconds := lease.WatchdogGraceSeconds
+	if graceSeconds == 0 {
+		graceSeconds = 10
+	}
 	return []corev1.EnvVar{
-		{Name: "ANTFLY_HA_LEASE_NAME", Value: haFencingLeaseName(cluster)},
+		{Name: "ANTFLY_HA_LEASE_NAME", Value: lease.Name},
 		{Name: "ANTFLY_HA_LEASE_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "metadata.namespace"}}},
-		{Name: "ANTFLY_HA_LEASE_CURRENT_PRIMARY_ID", Value: strings.TrimSpace(identity.CurrentPrimaryID)},
-		{Name: "ANTFLY_HA_LEASE_GRACE_MS", Value: "10000"},
+		{Name: "ANTFLY_HA_LEASE_TOPOLOGY_ID", Value: lease.TopologyID},
+		{Name: "ANTFLY_HA_LEASE_GRACE_MS", Value: fmt.Sprintf("%d", graceSeconds*1000)},
 		{Name: "ANTFLY_HA_LEASE_SENTINEL_PATH", Value: "/antflydb/ha/lease-fenced"},
 	}
+}
+
+func haRuntimeLeaseWatchdogEnabled(cluster *antflyv1.AntflyCluster) bool {
+	if cluster == nil || cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Runtime == nil ||
+		cluster.Spec.HighAvailability.Runtime.FencingLease == nil {
+		return false
+	}
+	lease := cluster.Spec.HighAvailability.Runtime.FencingLease
+	return strings.TrimSpace(lease.Name) != "" && strings.TrimSpace(lease.TopologyID) != ""
 }

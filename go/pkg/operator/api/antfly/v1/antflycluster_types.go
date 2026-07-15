@@ -774,6 +774,13 @@ type HARuntimeSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	NodeID string `json:"nodeID"`
 
+	// FencingLease configures the single topology-stable Kubernetes Lease that
+	// every runtime watches before promotion. Only the topology anchor operator
+	// may renew or transfer it; runtime ServiceAccounts receive exact read-only
+	// access. This reference must be copied unchanged to every standby CR.
+	// +optional
+	FencingLease *HARuntimeFencingLeaseSpec `json:"fencingLease,omitempty"`
+
 	// FencePath is the durable promotion fence WAL path shared by HA admin fence and promotion operations.
 	// Defaults to /antflydb/ha/fence.wal.
 	// +optional
@@ -818,6 +825,27 @@ type HARuntimeSpec struct {
 	// Standby configures standby-side durable HA state and optional continuous pull source.
 	// +optional
 	Standby *HAStandbyRuntimeSpec `json:"standby,omitempty"`
+}
+
+// HARuntimeFencingLeaseSpec binds one runtime to the shared HA authority.
+type HARuntimeFencingLeaseSpec struct {
+	// Name is the exact Lease name in the runtime Pod namespace.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// TopologyID is stable across primary handoff and distinct from a local
+	// standby AntflyCluster UID. Colony uses the anchor primary CR UID and
+	// propagates it unchanged to every topology member.
+	// +kubebuilder:validation:MinLength=1
+	TopologyID string `json:"topologyID"`
+
+	// WatchdogGraceSeconds is the maximum API-unreachable interval before the
+	// runtime durably self-fences. It must not exceed the Lease duration.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=30
+	// +kubebuilder:default=10
+	// +optional
+	WatchdogGraceSeconds int32 `json:"watchdogGraceSeconds,omitempty"`
 }
 
 // HAStartupGateSpec declares the exact receipt required before a runtime may
@@ -1902,19 +1930,25 @@ type HAWatchdogProofStatus struct {
 
 	Active bool `json:"active"`
 
+	AuthorityGranted bool `json:"authorityGranted"`
+
 	LeaseName string `json:"leaseName"`
 
 	LeaseNamespace string `json:"leaseNamespace"`
 
 	TopologyID string `json:"topologyID"`
 
-	HolderNodeID string `json:"holderNodeID"`
+	LocalNodeID string `json:"localNodeID"`
+
+	ObservedHolderNodeID string `json:"observedHolderNodeID"`
 
 	PodUID string `json:"podUID"`
 
 	ProcessBootID string `json:"processBootID"`
 
 	ObservedLeaseTransitions int32 `json:"observedLeaseTransitions"`
+
+	MaxFenceLatencyMS int32 `json:"maxFenceLatencyMS"`
 
 	ObservedAt metav1.Time `json:"observedAt"`
 }
@@ -2006,6 +2040,11 @@ type HAStandbyStatus struct {
 	LastSuccessNs uint64 `json:"lastSuccessNs,omitempty"`
 
 	ReplicationFailuresTotal uint64 `json:"replicationFailuresTotal,omitempty"`
+
+	// WatchdogProof is authenticated runtime evidence from this exact standby
+	// process before any in-place promotion is attempted.
+	// +optional
+	WatchdogProof *HAWatchdogProofStatus `json:"watchdogProof,omitempty"`
 }
 
 // HASyncStatus reports the current synchronous durability policy state.

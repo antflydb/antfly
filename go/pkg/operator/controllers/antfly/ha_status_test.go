@@ -5334,8 +5334,8 @@ func TestReconcileHAFencingLeaseSkipsWithoutSafeCandidate(t *testing.T) {
 
 	lease := &coordinationv1.Lease{}
 	err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease)
-	if !apierrors.IsNotFound(err) {
-		t.Fatalf("expected no fencing lease without safe candidate, got lease=%#v err=%v", lease, err)
+	if err != nil || lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != "primary-a" {
+		t.Fatalf("unsafe candidate transferred healthy-primary authority: lease=%#v err=%v", lease, err)
 	}
 }
 
@@ -5353,8 +5353,8 @@ func TestReconcileHAFencingLeaseSkipsCandidateWithoutSafeReadServing(t *testing.
 
 	lease := &coordinationv1.Lease{}
 	err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease)
-	if !apierrors.IsNotFound(err) {
-		t.Fatalf("expected no fencing lease without safe-read serving, got lease=%#v err=%v", lease, err)
+	if err != nil || lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != "primary-a" {
+		t.Fatalf("candidate without safe reads transferred authority: lease=%#v err=%v", lease, err)
 	}
 }
 
@@ -5372,8 +5372,8 @@ func TestReconcileHAFencingLeaseSkipsCandidateWithoutAdminURL(t *testing.T) {
 
 	lease := &coordinationv1.Lease{}
 	err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease)
-	if !apierrors.IsNotFound(err) {
-		t.Fatalf("expected no fencing lease without candidate admin URL, got lease=%#v err=%v", lease, err)
+	if err != nil || lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != "primary-a" {
+		t.Fatalf("candidate without admin URL transferred authority: lease=%#v err=%v", lease, err)
 	}
 }
 
@@ -5391,8 +5391,8 @@ func TestReconcileHAFencingLeaseSkipsWithoutPromotionBoundary(t *testing.T) {
 
 	lease := &coordinationv1.Lease{}
 	err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease)
-	if !apierrors.IsNotFound(err) {
-		t.Fatalf("expected no fencing lease without promotion boundary, got lease=%#v err=%v", lease, err)
+	if err != nil || lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != "primary-a" {
+		t.Fatalf("candidate without promotion boundary transferred authority: lease=%#v err=%v", lease, err)
 	}
 }
 
@@ -5763,6 +5763,9 @@ func haClusterWithAutomaticKubernetesLeaseFailover() *antflyv1.AntflyCluster {
 	cluster.Spec.HighAvailability.Runtime = &antflyv1.HARuntimeSpec{
 		Role:   antflyv1.HARuntimeRolePrimary,
 		NodeID: "primary-a",
+		FencingLease: &antflyv1.HARuntimeFencingLeaseSpec{
+			Name: "topology-ha-fence", TopologyID: "topology-anchor-uid", WatchdogGraceSeconds: 10,
+		},
 	}
 	cluster.Spec.HighAvailability.Standbys[0].AdminURL = "http://standby-a-ha.default.svc:8081"
 	cluster.Spec.HighAvailability.Standbys[0].RouteSelector = haTestRouteSelector("standby-a")
@@ -5835,6 +5838,9 @@ func haFenceLease(cluster *antflyv1.AntflyCluster, renewTime time.Time, duration
 	annotations := map[string]string{}
 	if scope, ok := haCurrentFencingLeaseScope(cluster); ok {
 		annotations = scope.annotations()
+	}
+	if topologyID := haFencingLeaseTopologyID(cluster); topologyID != "" {
+		annotations[haFencingLeaseAnnotationTopologyID] = topologyID
 	}
 	return &coordinationv1.Lease{
 		ObjectMeta: metav1.ObjectMeta{

@@ -2242,13 +2242,16 @@ components:
       required:
         - capability_version
         - active
+        - authority_granted
         - lease_name
         - lease_namespace
         - stable_topology_id
-        - holder_node_id
+        - local_node_id
+        - observed_holder_node_id
         - pod_uid
         - process_boot_id
         - observed_lease_transitions
+        - max_fence_latency_ms
       properties:
         capability_version:
           type: integer
@@ -2256,6 +2259,10 @@ components:
           minimum: 1
         active:
           type: boolean
+          description: Watchdog capability is running and has validated this exact shared Lease.
+        authority_granted:
+          type: boolean
+          description: This process is the current holder and its suspend-inclusive local deadline has not elapsed.
         lease_name:
           type: string
           minLength: 1
@@ -2265,8 +2272,12 @@ components:
         stable_topology_id:
           type: string
           minLength: 1
-        holder_node_id:
+        local_node_id:
           $ref: "#/components/schemas/HANodeID"
+          description: Local runtime node id producing the proof.
+        observed_holder_node_id:
+          $ref: "#/components/schemas/HANodeID"
+          description: Holder identity copied from the exact validated Kubernetes Lease.
         pod_uid:
           type: string
           minLength: 1
@@ -2274,6 +2285,10 @@ components:
           type: string
           pattern: "^[0-9a-f]{64}$"
         observed_lease_transitions:
+          type: integer
+          format: uint64
+          minimum: 1
+        max_fence_latency_ms:
           type: integer
           format: uint64
           minimum: 1
@@ -2361,6 +2376,9 @@ components:
           type: boolean
         can_serve_safe_reads:
           type: boolean
+        lease_watchdog:
+          nullable: true
+          $ref: "#/components/schemas/HALeaseWatchdogProof"
     HASlotSnapshot:
       type: object
       required:

@@ -72,6 +72,7 @@ type (
 	HAFenceReceipt                     = oapi.HAFenceReceipt
 	HAFenceResponse                    = oapi.HAFenceResponse
 	HAIdentity                         = oapi.HAIdentity
+	HALeaseWatchdogProof               = oapi.HALeaseWatchdogProof
 	HAOwnerJobCheckResponse            = oapi.HAOwnerJobCheckResponse
 	HAOwnerJobDecision                 = oapi.HAOwnerJobDecision
 	HAOwnerJobDecisionAction           = oapi.HAOwnerJobDecisionAction

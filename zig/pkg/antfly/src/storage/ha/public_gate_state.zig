@@ -19,10 +19,16 @@
 //! can close the standby without leaving request paths with borrowed pointers.
 
 const std = @import("std");
+const platform_time = @import("antfly_platform").time;
 const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");
 const standby_mod = @import("standby.zig");
 const write_gate = @import("write_gate.zig");
+
+var test_authority_now_ns: u64 = 0;
+fn testAuthorityNow() u64 {
+    return test_authority_now_ns;
+}
 
 pub const Role = enum(u8) {
     disabled,
@@ -41,7 +47,9 @@ pub const State = struct {
     safe_read_lsn: std.atomic.Value(u64) = .init(0),
     external_authority_required: std.atomic.Value(bool) = .init(false),
     external_authority_granted: std.atomic.Value(bool) = .init(false),
+    external_authority_deadline_ns: std.atomic.Value(u64) = .init(0),
     primary: ?*const primary_mod.Primary = null,
+    monotonic_now_fn: *const fn () u64 = platform_time.authorityNs,
 
     pub fn configureStandby(self: *State, progress: standby_mod.Progress) void {
         self.publishStandbyProgress(progress);
@@ -110,7 +118,12 @@ pub const State = struct {
     }
 
     pub fn publishExternalAuthority(self: *State, granted: bool) void {
+        self.publishExternalAuthorityUntil(granted, if (granted) std.math.maxInt(u64) else 0);
+    }
+
+    pub fn publishExternalAuthorityUntil(self: *State, granted: bool, deadline_ns: u64) void {
         if (!self.external_authority_required.load(.acquire)) return;
+        self.external_authority_deadline_ns.store(if (granted) deadline_ns else 0, .release);
         self.external_authority_granted.store(granted, .release);
         if (!granted) return;
         if (self.primary != null and self.currentRole() == .transitioning) {
@@ -119,8 +132,13 @@ pub const State = struct {
     }
 
     pub fn externalAuthorityGranted(self: *const State) bool {
+        return self.externalAuthorityGrantedAt(self.monotonic_now_fn());
+    }
+
+    pub fn externalAuthorityGrantedAt(self: *const State, monotonic_ns: u64) bool {
         return !self.external_authority_required.load(.acquire) or
-            self.external_authority_granted.load(.acquire);
+            (self.external_authority_granted.load(.acquire) and
+                monotonic_ns < self.external_authority_deadline_ns.load(.acquire));
     }
 
     pub fn currentGeneration(self: *const State) u64 {
@@ -135,6 +153,7 @@ pub const State = struct {
     }
 
     pub fn ownerJobsCanRun(self: *const State) bool {
+        if (!self.externalAuthorityGranted()) return false;
         return switch (self.currentRole()) {
             .disabled, .primary => true,
             .standby, .transitioning, .fenced_primary => false,
@@ -145,8 +164,9 @@ pub const State = struct {
         // Losing an external fencing authority closes the entire public data
         // plane, including stale reads.  Administrative repair/status routes
         // are separate from this gate and remain available for recovery.
-        if (!self.externalAuthorityGranted()) return error.HAReadRequiresPrimary;
-        switch (self.currentRole()) {
+        const role = self.currentRole();
+        if (role != .standby and !self.externalAuthorityGranted()) return error.HAReadRequiresPrimary;
+        switch (role) {
             .disabled, .primary => return,
             // A fence removes authority; it does not make the retained local
             // generation unreadable. Only an explicit stale request may use
@@ -175,6 +195,7 @@ pub const State = struct {
         expected_generation: ?u64,
         after_generation_check: ?*const fn (*const State) void,
     ) !void {
+        if (!self.externalAuthorityGranted()) return error.HAPromotedStandbyRequiresPrimaryOpen;
         if (expected_generation) |expected| {
             if (expected != self.currentGeneration()) {
                 return error.HAPromotedStandbyRequiresPrimaryOpen;
@@ -354,4 +375,25 @@ test "storage.ha standby can preauthorize before in-place promotion" {
     var primary: primary_mod.Primary = undefined;
     state.publishPrimary(&primary, false);
     try std.testing.expectEqual(Role.primary, state.currentRole());
+}
+
+test "storage.ha public gate deadline closes requests even when watchdog worker stalls" {
+    var state = State{};
+    state.monotonic_now_fn = testAuthorityNow;
+    var primary: primary_mod.Primary = undefined;
+    state.configurePrimary(&primary, false);
+    state.requireExternalAuthority();
+    state.publishExternalAuthorityUntil(true, 100);
+
+    try std.testing.expect(state.externalAuthorityGrantedAt(99));
+    try std.testing.expect(!state.externalAuthorityGrantedAt(100));
+    // The production request path reads the same monotonic deadline. A value
+    // in the past proves it cannot remain open waiting for another poll.
+    state.publishExternalAuthorityUntil(true, 100);
+    // Simulate a node resuming after suspension: the poller has not run, but
+    // the suspend-inclusive authority clock has crossed the deadline.
+    test_authority_now_ns = 100;
+    try std.testing.expectError(error.HAReadRequiresPrimary, state.checkRead(.{ .consistency = .primary }));
+    try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, state.checkWrite(null));
+    try std.testing.expect(!state.ownerJobsCanRun());
 }

@@ -1734,6 +1734,24 @@ spec:
                         x-kubernetes-map-type: atomic
                       fencePath:
                         type: string
+                      fencingLease:
+                        properties:
+                          name:
+                            minLength: 1
+                            type: string
+                          topologyID:
+                            minLength: 1
+                            type: string
+                          watchdogGraceSeconds:
+                            default: 10
+                            format: int32
+                            maximum: 30
+                            minimum: 1
+                            type: integer
+                        required:
+                        - name
+                        - topologyID
+                        type: object
                       formerPrimaryLogPath:
                         type: string
                       nodeID:
@@ -5129,17 +5147,24 @@ spec:
                     properties:
                       active:
                         type: boolean
+                      authorityGranted:
+                        type: boolean
                       capabilityVersion:
                         format: int32
                         type: integer
-                      holderNodeID:
-                        type: string
                       leaseName:
                         type: string
                       leaseNamespace:
                         type: string
+                      localNodeID:
+                        type: string
+                      maxFenceLatencyMS:
+                        format: int32
+                        type: integer
                       observedAt:
                         format: date-time
+                        type: string
+                      observedHolderNodeID:
                         type: string
                       observedLeaseTransitions:
                         format: int32
@@ -5152,11 +5177,14 @@ spec:
                         type: string
                     required:
                     - active
+                    - authorityGranted
                     - capabilityVersion
-                    - holderNodeID
                     - leaseName
                     - leaseNamespace
+                    - localNodeID
+                    - maxFenceLatencyMS
                     - observedAt
+                    - observedHolderNodeID
                     - observedLeaseTransitions
                     - podUID
                     - processBootID
@@ -5249,6 +5277,53 @@ spec:
                         upstreamLSN:
                           format: int64
                           type: integer
+                        watchdogProof:
+                          properties:
+                            active:
+                              type: boolean
+                            authorityGranted:
+                              type: boolean
+                            capabilityVersion:
+                              format: int32
+                              type: integer
+                            leaseName:
+                              type: string
+                            leaseNamespace:
+                              type: string
+                            localNodeID:
+                              type: string
+                            maxFenceLatencyMS:
+                              format: int32
+                              type: integer
+                            observedAt:
+                              format: date-time
+                              type: string
+                            observedHolderNodeID:
+                              type: string
+                            observedLeaseTransitions:
+                              format: int32
+                              type: integer
+                            podUID:
+                              type: string
+                            processBootID:
+                              type: string
+                            topologyID:
+                              type: string
+                          required:
+                          - active
+                          - authorityGranted
+                          - capabilityVersion
+                          - leaseName
+                          - leaseNamespace
+                          - localNodeID
+                          - maxFenceLatencyMS
+                          - observedAt
+                          - observedHolderNodeID
+                          - observedLeaseTransitions
+                          - podUID
+                          - processBootID
+                          - topologyID
+                          type: object
                         writeLagLSN:
                           format: int64
                           type: integer
