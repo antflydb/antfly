@@ -12,9 +12,11 @@
 //! 2. Copy it into an owned `.installing-*` directory on the target volume.
 //! 3. Verify and fsync the copy, then atomically rename it to an immutable
 //!    `generations/<generation>` directory.
-//! 4. Publish `ACTIVE.json` with an atomic no-replace operation.
+//! 4. Materialize portable logical state into a separate mutable
+//!    `live-generations/<generation>` runtime tree and publish that tree.
+//! 5. Publish `ACTIVE.json` with an atomic no-replace operation.
 //!
-//! Until step 4 completes there is no active generation. A retry may rebuild
+//! Until step 5 completes there is no active generation. A retry may rebuild
 //! only an install directory carrying the exact expected activation receipt;
 //! it never overwrites an already-published generation. The caller must keep
 //! the Antfly runtime offline until activation succeeds and then open the
@@ -30,11 +32,14 @@ const local_generation_gc = @import("local_generation_gc.zig");
 const object_storage = @import("../object_storage.zig");
 const seed_artifact = @import("seed_artifact.zig");
 const seed_capture = @import("seed_capture.zig");
+const seed_materialization = @import("seed_materialization.zig");
 const standby_mod = @import("standby.zig");
 const validation = @import("validation.zig");
 
-pub const format_version: u16 = 1;
+pub const legacy_format_version: u16 = 1;
+pub const format_version: u16 = 2;
 pub const generations_dir_name = "generations";
+pub const live_generations_dir_name = "live-generations";
 pub const active_receipt_name = "ACTIVE.json";
 pub const generation_receipt_name = ".antfly-ha-active-generation.json";
 
@@ -43,8 +48,14 @@ pub const ActivateRequest = struct {
     target_root: []const u8,
     expected: seed_artifact.ExpectedArtifact,
     binding: ?ActivationBinding = null,
+    materialization: ?MaterializationTarget = null,
     pod_uid: ?[]const u8 = null,
     limits: seed_artifact.Limits = .{},
+};
+
+pub const MaterializationTarget = struct {
+    target_local_node_id: u64,
+    target_replica_id: u64 = 1,
 };
 
 pub const ActivationBinding = seed_artifact.LifecycleBinding;
@@ -57,11 +68,16 @@ pub const StartupExpectation = struct {
     aggregate_sha256: ?[]const u8 = null,
     seed_receipt_sha256: ?[]const u8 = null,
     capture_receipt_sha256: ?[]const u8 = null,
+    materialized_receipt_sha256: ?[]const u8 = null,
+    materialized_aggregate_sha256: ?[]const u8 = null,
+    target_local_node_id: ?u64 = null,
+    target_replica_id: ?u64 = null,
     limits: seed_artifact.Limits = .{},
 };
 
 pub const ActivationResult = struct {
-    /// Absolute path of the immutable generation that the runtime may open.
+    /// Absolute path of the mutable, identity-validated generation that the
+    /// runtime may open. The raw transport generation remains immutable.
     generation_path: []u8,
     active_receipt_json: []u8,
     already_active: bool,
@@ -102,6 +118,11 @@ pub const ActivationReceipt = struct {
     manifest_sha256: []const u8,
     aggregate_sha256: []const u8,
     generation_path: []const u8,
+    raw_generation_path: []const u8 = "",
+    materialized_receipt_sha256: []const u8 = "",
+    materialized_aggregate_sha256: []const u8 = "",
+    target_local_node_id: u64 = 0,
+    target_replica_id: u64 = 0,
     topology_id: []const u8 = "",
     topology_generation: u64 = 0,
     node_id: []const u8 = "",
@@ -120,7 +141,7 @@ pub const ActivationReceipt = struct {
 };
 
 test "storage.ha activation schema preserves capture and seed receipt digest chain" {
-    try std.testing.expectEqual(@as(u16, 1), format_version);
+    try std.testing.expectEqual(@as(u16, 2), format_version);
     try std.testing.expect(@hasField(ActivationReceipt, "capture_receipt_sha256"));
     try std.testing.expect(@hasField(StartupExpectation, "capture_receipt_sha256"));
     try std.testing.expect(@hasField(SeededSlotActivationCheckpoint, "capture_receipt_sha256"));
@@ -129,6 +150,8 @@ test "storage.ha activation schema preserves capture and seed receipt digest cha
 const FailureBoundary = enum {
     generation_copied,
     generation_published,
+    live_generation_materialized,
+    live_generation_published,
     active_published,
 };
 
@@ -160,6 +183,21 @@ const SeededSlotActivationCheckpoint = struct {
     capture_receipt_sha256: []const u8,
     manifest_sha256: []const u8,
     aggregate_sha256: []const u8,
+};
+
+const RawGenerationReceipt = struct {
+    format_version: u16 = 1,
+    generation: []const u8,
+    slot_name: []const u8,
+    seed_receipt_sha256: []const u8,
+    capture_receipt_sha256: []const u8,
+    manifest_sha256: []const u8,
+    aggregate_sha256: []const u8,
+    topology_id: []const u8,
+    topology_generation: u64,
+    node_id: []const u8,
+    target_pvc_name: []const u8,
+    target_pvc_uid: []const u8,
 };
 
 /// Grants target-volume deletion authority only after the runtime's immutable
@@ -247,7 +285,7 @@ pub fn pruneActivatedGenerations(
 }
 
 fn validateActiveForGC(alloc: Allocator, receipt: ActivationReceipt) !void {
-    if (receipt.format_version != format_version or
+    if ((receipt.format_version != legacy_format_version and receipt.format_version != format_version) or
         !validation.isIdentifier(receipt.generation) or
         !validation.isIdentifier(receipt.slot_name) or
         receipt.manifest_id.len == 0 or
@@ -291,7 +329,290 @@ fn validateActivationCheckpoint(
         return error.SeedActivationCheckpointMismatch;
 }
 
+fn activateMaterializedWithOptions(alloc: Allocator, request: ActivateRequest, options: ActivateOptions) !ActivationResult {
+    try validateRequest(request);
+    const target = request.materialization orelse return error.MaterializationTargetMissing;
+    const binding = request.binding orelse return error.ActivationBindingMissing;
+    if (target.target_local_node_id == 0 or target.target_replica_id == 0) return error.InvalidMaterializationTarget;
+
+    // Raw transport validation is always complete before either raw or live
+    // generation roots are created on the target PVC.
+    try seed_artifact.verifyStaged(alloc, request.staging_root, request.expected, request.limits);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const staged_receipt_path = try std.fs.path.join(alloc, &.{ request.staging_root, seed_artifact.receipt_name });
+    defer alloc.free(staged_receipt_path);
+    const staged_receipt_json = try readFileAlloc(io, alloc, staged_receipt_path, request.limits.max_receipt_bytes);
+    defer alloc.free(staged_receipt_json);
+    var staged_receipt = std.json.parseFromSlice(seed_artifact.Receipt, alloc, staged_receipt_json, .{ .ignore_unknown_fields = false }) catch
+        return error.InvalidArtifactReceipt;
+    defer staged_receipt.deinit();
+    if (staged_receipt.value.format_version != seed_artifact.format_version or
+        !isCanonicalSha256(staged_receipt.value.capture_receipt_sha256)) return error.CaptureReceiptAuthorityMissing;
+
+    const staged_manifest_path = try std.fs.path.join(alloc, &.{ request.staging_root, seed_artifact.staged_manifest_name });
+    defer alloc.free(staged_manifest_path);
+    const staged_manifest = try readFileAlloc(io, alloc, staged_manifest_path, request.limits.max_manifest_bytes);
+    defer alloc.free(staged_manifest);
+    try expectSha256(staged_manifest, staged_receipt.value.manifest_sha256, error.ManifestDigestMismatch);
+
+    var seed_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(staged_receipt_json, &seed_digest, .{});
+    var seed_receipt_sha256: [Sha256.digest_length * 2]u8 = undefined;
+    encodeHex(&seed_receipt_sha256, &seed_digest);
+    const capture_receipt_sha256 = staged_receipt.value.capture_receipt_sha256;
+    const expected_capture = request.expected.capture_receipt_sha256 orelse return error.CaptureReceiptAuthorityMissing;
+    if (!std.mem.eql(u8, capture_receipt_sha256, expected_capture)) return error.WrongCaptureReceiptDigest;
+
+    const raw_relative_path = try std.fs.path.join(alloc, &.{ generations_dir_name, request.expected.generation });
+    defer alloc.free(raw_relative_path);
+    const live_relative_path = try std.fs.path.join(alloc, &.{ live_generations_dir_name, request.expected.generation });
+    defer alloc.free(live_relative_path);
+    const raw_root = try std.fs.path.join(alloc, &.{ request.target_root, raw_relative_path });
+    defer alloc.free(raw_root);
+    const live_root = try std.fs.path.join(alloc, &.{ request.target_root, live_relative_path });
+    defer alloc.free(live_root);
+    const active_path = try std.fs.path.join(alloc, &.{ request.target_root, active_receipt_name });
+    defer alloc.free(active_path);
+
+    if (readOptionalFileAlloc(io, alloc, active_path, request.limits.max_receipt_bytes)) |existing_active| {
+        defer alloc.free(existing_active);
+        try validateMaterializedActive(
+            alloc,
+            existing_active,
+            request,
+            &seed_receipt_sha256,
+            capture_receipt_sha256,
+            raw_relative_path,
+            live_relative_path,
+            raw_root,
+            live_root,
+        );
+        try recordLifecycleReceipt(alloc, request, existing_active);
+        return .{
+            .generation_path = try alloc.dupe(u8, live_root),
+            .active_receipt_json = try alloc.dupe(u8, existing_active),
+            .already_active = true,
+        };
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    try inspectTargetRoot(io, request.target_root);
+    const raw_generations_root = try std.fs.path.join(alloc, &.{ request.target_root, generations_dir_name });
+    defer alloc.free(raw_generations_root);
+    const live_generations_root = try std.fs.path.join(alloc, &.{ request.target_root, live_generations_dir_name });
+    defer alloc.free(live_generations_root);
+    try fs_paths.createDirPathPortable(io, request.target_root);
+    try fs_paths.createDirPathPortable(io, raw_generations_root);
+    try fs_paths.createDirPathPortable(io, live_generations_root);
+    try fs_paths.syncDirPortable(io, request.target_root);
+
+    const raw_installing_name = try std.fmt.allocPrint(alloc, ".installing-{s}", .{request.expected.generation});
+    defer alloc.free(raw_installing_name);
+    const raw_installing_root = try std.fs.path.join(alloc, &.{ raw_generations_root, raw_installing_name });
+    defer alloc.free(raw_installing_root);
+    try inspectGenerationsRoot(io, raw_generations_root, request.expected.generation, raw_installing_name);
+
+    const raw_marker_json = try std.json.Stringify.valueAlloc(alloc, RawGenerationReceipt{
+        .generation = request.expected.generation,
+        .slot_name = request.expected.slot_name,
+        .seed_receipt_sha256 = &seed_receipt_sha256,
+        .capture_receipt_sha256 = capture_receipt_sha256,
+        .manifest_sha256 = staged_receipt.value.manifest_sha256,
+        .aggregate_sha256 = staged_receipt.value.aggregate_sha256,
+        .topology_id = binding.topology_id,
+        .topology_generation = binding.topology_generation,
+        .node_id = binding.node_id,
+        .target_pvc_name = binding.target_pvc_name,
+        .target_pvc_uid = binding.target_pvc_uid,
+    }, .{});
+    defer alloc.free(raw_marker_json);
+
+    if (try directoryExists(io, raw_root)) {
+        try validatePublishedRawGeneration(alloc, raw_root, request, raw_marker_json);
+    } else {
+        try recoverInstallingDirectory(alloc, io, raw_installing_root, raw_marker_json, request.limits.max_receipt_bytes);
+        try fs_paths.createDirPathPortable(io, raw_installing_root);
+        const raw_marker_path = try std.fs.path.join(alloc, &.{ raw_installing_root, generation_receipt_name });
+        defer alloc.free(raw_marker_path);
+        _ = try writeImmutableFile(io, alloc, raw_marker_path, raw_marker_json, error.SeedGenerationConflict);
+        for (staged_receipt.value.files) |file| {
+            const source = try std.fs.path.join(alloc, &.{ request.staging_root, file.path });
+            defer alloc.free(source);
+            const destination = try std.fs.path.join(alloc, &.{ raw_installing_root, file.path });
+            defer alloc.free(destination);
+            try copyFileDurably(io, source, destination, raw_installing_root);
+        }
+        const installed_receipt_path = try std.fs.path.join(alloc, &.{ raw_installing_root, seed_artifact.receipt_name });
+        defer alloc.free(installed_receipt_path);
+        try copyFileDurably(io, staged_receipt_path, installed_receipt_path, raw_installing_root);
+        const installed_manifest_path = try std.fs.path.join(alloc, &.{ raw_installing_root, seed_artifact.staged_manifest_name });
+        defer alloc.free(installed_manifest_path);
+        try copyFileDurably(io, staged_manifest_path, installed_manifest_path, raw_installing_root);
+        try validatePublishedRawGeneration(alloc, raw_installing_root, request, raw_marker_json);
+        try failAt(options, .generation_copied);
+        try renameDirectoryNoReplace(io, raw_installing_root, raw_root, error.SeedTargetGenerationConflict);
+        try fs_paths.syncDirPortable(io, raw_generations_root);
+    }
+    try failAt(options, .generation_published);
+
+    const live_installing_name = try std.fmt.allocPrint(alloc, ".installing-{s}", .{request.expected.generation});
+    defer alloc.free(live_installing_name);
+    const live_installing_root = try std.fs.path.join(alloc, &.{ live_generations_root, live_installing_name });
+    defer alloc.free(live_installing_root);
+    try inspectGenerationsRoot(io, live_generations_root, request.expected.generation, live_installing_name);
+
+    var evidence: seed_materialization.PublishedEvidence = undefined;
+    var evidence_owned = false;
+    defer if (evidence_owned) evidence.deinit(alloc);
+    if (try directoryExists(io, live_root)) {
+        evidence = try seed_materialization.loadPublishedEvidence(alloc, live_root, request.expected.generation);
+        evidence_owned = true;
+        try seed_materialization.validatePublishedBeforeRuntime(alloc, live_root, request.expected.generation, &evidence.receipt_sha256);
+    } else {
+        if (try directoryExists(io, live_installing_root)) std.Io.Dir.cwd().deleteTree(io, live_installing_root) catch |err| return err;
+        const materialized = try seed_materialization.materialize(alloc, .{
+            .raw_generation_root = raw_root,
+            .live_installing_root = live_installing_root,
+            .generation = request.expected.generation,
+            .target_local_node_id = target.target_local_node_id,
+            .target_replica_id = target.target_replica_id,
+            .seed_receipt_sha256 = &seed_receipt_sha256,
+            .capture_receipt_sha256 = capture_receipt_sha256,
+            .raw_manifest_sha256 = staged_receipt.value.manifest_sha256,
+            .raw_aggregate_sha256 = staged_receipt.value.aggregate_sha256,
+        });
+        evidence = .{
+            .receipt_json = materialized.receipt_json,
+            .receipt_sha256 = materialized.receipt_sha256,
+            .aggregate_sha256 = materialized.aggregate_sha256,
+        };
+        evidence_owned = true;
+        try seed_materialization.validatePublishedBeforeRuntime(alloc, live_installing_root, request.expected.generation, &evidence.receipt_sha256);
+        try failAt(options, .live_generation_materialized);
+        try renameDirectoryNoReplace(io, live_installing_root, live_root, error.LiveGenerationConflict);
+        try fs_paths.syncDirPortable(io, live_generations_root);
+    }
+    try failAt(options, .live_generation_published);
+
+    const activation_json = try std.json.Stringify.valueAlloc(alloc, ActivationReceipt{
+        .generation = request.expected.generation,
+        .slot_name = request.expected.slot_name,
+        .cluster_id = staged_receipt.value.cluster_id,
+        .shard_id = staged_receipt.value.shard_id,
+        .table_id = staged_receipt.value.table_id,
+        .timeline_id = staged_receipt.value.timeline_id,
+        .epoch = staged_receipt.value.epoch,
+        .manifest_id = staged_receipt.value.manifest_id,
+        .backup_lsn = staged_receipt.value.backup_lsn,
+        .checkpoint_lsn = staged_receipt.value.checkpoint_lsn,
+        .seed_receipt_sha256 = &seed_receipt_sha256,
+        .capture_receipt_sha256 = capture_receipt_sha256,
+        .manifest_sha256 = staged_receipt.value.manifest_sha256,
+        .aggregate_sha256 = staged_receipt.value.aggregate_sha256,
+        .generation_path = live_relative_path,
+        .raw_generation_path = raw_relative_path,
+        .materialized_receipt_sha256 = &evidence.receipt_sha256,
+        .materialized_aggregate_sha256 = &evidence.aggregate_sha256,
+        .target_local_node_id = target.target_local_node_id,
+        .target_replica_id = target.target_replica_id,
+        .topology_id = binding.topology_id,
+        .topology_generation = binding.topology_generation,
+        .node_id = binding.node_id,
+        .target_pvc_name = binding.target_pvc_name,
+        .target_pvc_uid = binding.target_pvc_uid,
+    }, .{});
+    errdefer alloc.free(activation_json);
+    const active_created = try writeImmutableFile(io, alloc, active_path, activation_json, error.ActiveGenerationConflict);
+    try failAt(options, .active_published);
+    try recordLifecycleReceipt(alloc, request, activation_json);
+    return .{
+        .generation_path = try alloc.dupe(u8, live_root),
+        .active_receipt_json = activation_json,
+        .already_active = !active_created,
+    };
+}
+
+fn validatePublishedRawGeneration(alloc: Allocator, raw_root: []const u8, request: ActivateRequest, raw_marker_json: []const u8) !void {
+    seed_artifact.verifyStaged(alloc, raw_root, request.expected, request.limits) catch return error.SeedGenerationConflict;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const marker_path = try std.fs.path.join(alloc, &.{ raw_root, generation_receipt_name });
+    defer alloc.free(marker_path);
+    try verifyGenerationReceipt(io_impl.io(), alloc, marker_path, raw_marker_json, request.limits.max_receipt_bytes);
+}
+
+fn validateMaterializedActive(
+    alloc: Allocator,
+    raw: []const u8,
+    request: ActivateRequest,
+    seed_receipt_sha256: []const u8,
+    capture_receipt_sha256: []const u8,
+    raw_relative_path: []const u8,
+    live_relative_path: []const u8,
+    raw_root: []const u8,
+    live_root: []const u8,
+) !void {
+    var parsed = std.json.parseFromSlice(ActivationReceipt, alloc, raw, .{ .ignore_unknown_fields = false }) catch
+        return error.InvalidActiveReceipt;
+    defer parsed.deinit();
+    const receipt = parsed.value;
+    const binding = request.binding orelse return error.ActivationBindingMissing;
+    const target = request.materialization orelse return error.MaterializationTargetMissing;
+    if (receipt.format_version != format_version or
+        !std.mem.eql(u8, receipt.generation, request.expected.generation) or
+        !std.mem.eql(u8, receipt.slot_name, request.expected.slot_name) or
+        !std.mem.eql(u8, receipt.seed_receipt_sha256, seed_receipt_sha256) or
+        !std.mem.eql(u8, receipt.capture_receipt_sha256, capture_receipt_sha256) or
+        !std.mem.eql(u8, receipt.raw_generation_path, raw_relative_path) or
+        !std.mem.eql(u8, receipt.generation_path, live_relative_path) or
+        receipt.target_local_node_id != target.target_local_node_id or
+        receipt.target_replica_id != target.target_replica_id or
+        !isCanonicalSha256(receipt.materialized_receipt_sha256) or
+        !isCanonicalSha256(receipt.materialized_aggregate_sha256)) return error.ActiveGenerationConflict;
+    try expectIdentity(request.expected.identity, receipt.identity(), error.ActiveGenerationConflict);
+    try expectBinding(binding, receipt, error.ActiveGenerationConflict);
+    const raw_marker = try rawMarkerForActiveAlloc(alloc, receipt);
+    defer alloc.free(raw_marker);
+    try validatePublishedRawGeneration(alloc, raw_root, request, raw_marker);
+    try seed_materialization.validateRuntimeIdentity(
+        alloc,
+        raw_root,
+        live_root,
+        request.expected.generation,
+        receipt.materialized_receipt_sha256,
+    );
+}
+
+fn rawMarkerForActiveAlloc(alloc: Allocator, receipt: ActivationReceipt) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, RawGenerationReceipt{
+        .generation = receipt.generation,
+        .slot_name = receipt.slot_name,
+        .seed_receipt_sha256 = receipt.seed_receipt_sha256,
+        .capture_receipt_sha256 = receipt.capture_receipt_sha256,
+        .manifest_sha256 = receipt.manifest_sha256,
+        .aggregate_sha256 = receipt.aggregate_sha256,
+        .topology_id = receipt.topology_id,
+        .topology_generation = receipt.topology_generation,
+        .node_id = receipt.node_id,
+        .target_pvc_name = receipt.target_pvc_name,
+        .target_pvc_uid = receipt.target_pvc_uid,
+    }, .{});
+}
+
+fn renameDirectoryNoReplace(io: std.Io, source: []const u8, destination: []const u8, conflict: anyerror) !void {
+    std.Io.Dir.rename(std.Io.Dir.cwd(), source, std.Io.Dir.cwd(), destination, io) catch |err| {
+        if (try directoryExists(io, destination)) return conflict;
+        return err;
+    };
+}
+
 fn activateWithOptions(alloc: Allocator, request: ActivateRequest, options: ActivateOptions) !ActivationResult {
+    if (request.materialization != null) return activateMaterializedWithOptions(alloc, request, options);
     try validateRequest(request);
 
     // This must precede every target-volume mutation. Besides validating all
@@ -337,6 +658,7 @@ fn activateWithOptions(alloc: Allocator, request: ActivateRequest, options: Acti
     defer alloc.free(generation_relative_path);
     const binding = request.binding orelse ActivationBinding{};
     const activation_json = try std.json.Stringify.valueAlloc(alloc, ActivationReceipt{
+        .format_version = legacy_format_version,
         .generation = request.expected.generation,
         .slot_name = request.expected.slot_name,
         .cluster_id = staged_receipt.value.cluster_id,
@@ -469,6 +791,10 @@ fn validateRequest(request: ActivateRequest) !void {
     } else if (request.expected.binding != null or request.expected.capture_receipt_sha256 != null) {
         return error.UnexpectedActivationBinding;
     }
+    if (request.materialization) |target| {
+        if (request.binding == null) return error.MaterializationRequiresBinding;
+        if (target.target_local_node_id == 0 or target.target_replica_id == 0) return error.InvalidMaterializationTarget;
+    }
     if (request.pod_uid) |pod_uid| if (!validation.isIdentifier(pod_uid)) return error.InvalidActivationPodUID;
 }
 
@@ -514,6 +840,7 @@ fn inspectTargetRoot(io: std.Io, target_root: []const u8) !void {
     var iterator = dir.iterateAssumeFirstIteration();
     while (try iterator.next(io)) |entry| {
         if (std.mem.eql(u8, entry.name, generations_dir_name) and entry.kind == .directory) continue;
+        if (std.mem.eql(u8, entry.name, live_generations_dir_name) and entry.kind == .directory) continue;
         if (std.mem.eql(u8, entry.name, active_receipt_name) and entry.kind == .file) continue;
         if (std.mem.eql(u8, entry.name, lifecycle_receipt_ledger.ledger_dir_name) and entry.kind == .directory) continue;
         return error.UnsafeActivationTarget;
@@ -547,7 +874,7 @@ fn validateActiveReceipt(
     var parsed = std.json.parseFromSlice(ActivationReceipt, alloc, raw, .{}) catch return error.InvalidActiveReceipt;
     defer parsed.deinit();
     const receipt = parsed.value;
-    if (receipt.format_version != format_version) return error.UnsupportedActivationVersion;
+    if (receipt.format_version != legacy_format_version) return error.UnsupportedActivationVersion;
     if (!std.mem.eql(u8, receipt.generation, expected.generation) or
         !std.mem.eql(u8, receipt.slot_name, expected.slot_name) or
         !std.mem.eql(u8, receipt.seed_receipt_sha256, seed_receipt_sha256) or
@@ -611,13 +938,6 @@ pub fn validateActivatedGeneration(alloc: Allocator, expectation: StartupExpecta
     var active = std.json.parseFromSlice(ActivationReceipt, alloc, active_json, .{}) catch return error.InvalidActiveReceipt;
     defer active.deinit();
     const receipt = active.value;
-    const generation_relative_path = try std.fs.path.join(alloc, &.{ generations_dir_name, expectation.expected.generation });
-    defer alloc.free(generation_relative_path);
-    if (receipt.format_version != format_version or
-        !std.mem.eql(u8, receipt.generation, expectation.expected.generation) or
-        !std.mem.eql(u8, receipt.slot_name, expectation.expected.slot_name) or
-        !std.mem.eql(u8, receipt.generation_path, generation_relative_path) or
-        receipt.checkpoint_lsn < expectation.expected.minimum_checkpoint_lsn) return error.ActiveGenerationConflict;
     try expectIdentity(expectation.expected.identity, receipt.identity(), error.ActiveGenerationConflict);
     try expectBinding(expectation.binding, receipt, error.ActiveGenerationConflict);
     try expectOptionalDigest(expectation.manifest_sha256, receipt.manifest_sha256);
@@ -625,6 +945,58 @@ pub fn validateActivatedGeneration(alloc: Allocator, expectation: StartupExpecta
     try expectOptionalDigest(expectation.seed_receipt_sha256, receipt.seed_receipt_sha256);
     try expectOptionalDigest(expectation.capture_receipt_sha256, receipt.capture_receipt_sha256);
 
+    if (receipt.format_version == format_version) {
+        const raw_relative_path = try std.fs.path.join(alloc, &.{ generations_dir_name, expectation.expected.generation });
+        defer alloc.free(raw_relative_path);
+        const live_relative_path = try std.fs.path.join(alloc, &.{ live_generations_dir_name, expectation.expected.generation });
+        defer alloc.free(live_relative_path);
+        if (!std.mem.eql(u8, receipt.generation, expectation.expected.generation) or
+            !std.mem.eql(u8, receipt.slot_name, expectation.expected.slot_name) or
+            !std.mem.eql(u8, receipt.raw_generation_path, raw_relative_path) or
+            !std.mem.eql(u8, receipt.generation_path, live_relative_path) or
+            receipt.checkpoint_lsn < expectation.expected.minimum_checkpoint_lsn or
+            !isCanonicalSha256(receipt.materialized_receipt_sha256) or
+            !isCanonicalSha256(receipt.materialized_aggregate_sha256) or
+            receipt.target_local_node_id == 0 or receipt.target_replica_id == 0) return error.ActiveGenerationConflict;
+        try expectOptionalDigest(expectation.materialized_receipt_sha256, receipt.materialized_receipt_sha256);
+        try expectOptionalDigest(expectation.materialized_aggregate_sha256, receipt.materialized_aggregate_sha256);
+        if (expectation.target_local_node_id) |node_id| if (node_id != receipt.target_local_node_id) return error.ActiveGenerationConflict;
+        if (expectation.target_replica_id) |replica_id| if (replica_id != receipt.target_replica_id) return error.ActiveGenerationConflict;
+
+        const raw_root = try std.fs.path.join(alloc, &.{ expectation.target_root, raw_relative_path });
+        defer alloc.free(raw_root);
+        const live_root = try std.fs.path.join(alloc, &.{ expectation.target_root, live_relative_path });
+        defer alloc.free(live_root);
+        const raw_marker = try rawMarkerForActiveAlloc(alloc, receipt);
+        defer alloc.free(raw_marker);
+        try validatePublishedRawGeneration(alloc, raw_root, .{
+            .staging_root = "/unused",
+            .target_root = expectation.target_root,
+            .expected = expectation.expected,
+            .binding = expectation.binding,
+            .materialization = .{
+                .target_local_node_id = receipt.target_local_node_id,
+                .target_replica_id = receipt.target_replica_id,
+            },
+            .limits = expectation.limits,
+        }, raw_marker);
+        try seed_materialization.validateRuntimeIdentity(
+            alloc,
+            raw_root,
+            live_root,
+            expectation.expected.generation,
+            receipt.materialized_receipt_sha256,
+        );
+        return receipt.checkpoint_lsn;
+    }
+
+    const generation_relative_path = try std.fs.path.join(alloc, &.{ generations_dir_name, expectation.expected.generation });
+    defer alloc.free(generation_relative_path);
+    if (receipt.format_version != legacy_format_version or
+        !std.mem.eql(u8, receipt.generation, expectation.expected.generation) or
+        !std.mem.eql(u8, receipt.slot_name, expectation.expected.slot_name) or
+        !std.mem.eql(u8, receipt.generation_path, generation_relative_path) or
+        receipt.checkpoint_lsn < expectation.expected.minimum_checkpoint_lsn) return error.ActiveGenerationConflict;
     const generation_path = try std.fs.path.join(alloc, &.{ expectation.target_root, generation_relative_path });
     defer alloc.free(generation_path);
     try validatePublishedGeneration(alloc, generation_path, .{
@@ -912,6 +1284,177 @@ fn prepareTestStaging(alloc: Allocator, root: []const u8, generation: []const u8
     return prepared.root;
 }
 
+fn prepareMaterializedTestStaging(
+    alloc: Allocator,
+    root: []const u8,
+    generation: []const u8,
+    identity: standby_mod.Identity,
+    binding: ActivationBinding,
+) !PreparedTestStaging {
+    const source_root = try std.fs.path.join(alloc, &.{ root, "materialized-source", generation });
+    defer alloc.free(source_root);
+    const source_snapshot_root = try std.fs.path.join(alloc, &.{ source_root, "replicas/group-1" });
+    defer alloc.free(source_snapshot_root);
+    const live_db_path = try std.fs.path.join(alloc, &.{ root, "materialized-primary", generation, "table-db" });
+    defer alloc.free(live_db_path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    try fs_paths.createDirPathPortable(io, source_snapshot_root);
+
+    {
+        var db = try @import("../db/db.zig").DB.open(alloc, live_db_path, .{
+            .identity_namespace = .{
+                .table_id = identity.table_id,
+                .shard_id = identity.shard_id,
+                .range_id = 1,
+            },
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+        });
+        defer db.close();
+        try db.batch(.{ .writes = &.{.{ .key = "doc:seed", .value = "\"materialized-value\"" }} });
+        _ = try db.snapshot("portable-seed");
+    }
+    const captured_snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/portable-seed", .{live_db_path});
+    defer alloc.free(captured_snapshot_root);
+    const store_source = try std.fs.path.join(alloc, &.{ captured_snapshot_root, "store.bin" });
+    defer alloc.free(store_source);
+    const store_target = try std.fs.path.join(alloc, &.{ source_snapshot_root, "store.bin" });
+    defer alloc.free(store_target);
+    try copyFileDurably(io, store_source, store_target, source_snapshot_root);
+    const journal_source = try std.fs.path.join(alloc, &.{ captured_snapshot_root, "change-journal.bin" });
+    defer alloc.free(journal_source);
+    const journal_target = try std.fs.path.join(alloc, &.{ source_snapshot_root, "change-journal.bin" });
+    defer alloc.free(journal_target);
+    try copyFileDurably(io, journal_source, journal_target, source_snapshot_root);
+
+    const store_bytes = try readFileAlloc(io, alloc, store_target, 16 * 1024 * 1024);
+    defer alloc.free(store_bytes);
+    const journal_bytes = try readFileAlloc(io, alloc, journal_target, 16 * 1024 * 1024);
+    defer alloc.free(journal_bytes);
+    var store_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(store_bytes, &store_digest, .{});
+    var store_sha256: [Sha256.digest_length * 2]u8 = undefined;
+    encodeHex(&store_sha256, &store_digest);
+    const topology_json = try std.json.Stringify.valueAlloc(alloc, seed_materialization.Topology{
+        .generation = generation,
+        .catalog = .{
+            .epoch = 1,
+            .tables = &.{.{
+                .table_id = identity.table_id,
+                .name = "docs",
+                .desired_replica_count = 1,
+            }},
+            .ranges = &.{.{
+                .group_id = 1,
+                .range_id = 1,
+                .table_id = identity.table_id,
+                .start_key = "",
+                .doc_identity_shard_id = identity.shard_id,
+                .doc_identity_range_id = 1,
+            }},
+        },
+        .replicas = &.{.{
+            .group_id = 1,
+            .table_id = identity.table_id,
+            .table_name = "docs",
+            .snapshot_path = "replicas/group-1",
+            .logical_sha256 = &store_sha256,
+            .identity_table_id = identity.table_id,
+            .identity_shard_id = identity.shard_id,
+            .identity_range_id = 1,
+        }},
+    }, .{});
+    defer alloc.free(topology_json);
+    const topology_path = try std.fs.path.join(alloc, &.{ source_root, seed_materialization.topology_name });
+    defer alloc.free(topology_path);
+    {
+        var file = try std.Io.Dir.cwd().createFile(io, topology_path, .{ .truncate = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io, topology_json);
+        try file.sync(io);
+    }
+    try fs_paths.syncDirPortable(io, source_root);
+
+    const files = [_]backup_manifest.FileEntry{
+        .{ .path = seed_materialization.topology_name, .kind = .manifest, .size_bytes = topology_json.len, .crc32 = backup_manifest.crc32(topology_json) },
+        .{ .path = "replicas/group-1/store.bin", .kind = .artifact, .size_bytes = store_bytes.len, .crc32 = backup_manifest.crc32(store_bytes) },
+        .{ .path = "replicas/group-1/change-journal.bin", .kind = .artifact, .size_bytes = journal_bytes.len, .crc32 = backup_manifest.crc32(journal_bytes) },
+    };
+    const manifest = try backup_manifest.encodeAlloc(alloc, .{
+        .identity = identity,
+        .manifest_id = generation,
+        .backup_lsn = 8,
+        .checkpoint_lsn = 11,
+        .files = &files,
+    });
+    defer alloc.free(manifest);
+    var manifest_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(manifest, &manifest_digest, .{});
+    var manifest_sha256: [Sha256.digest_length * 2]u8 = undefined;
+    encodeHex(&manifest_sha256, &manifest_digest);
+    const capture_receipt_json = try std.json.Stringify.valueAlloc(alloc, seed_capture.CaptureReceipt{
+        .format_version = seed_capture.format_version,
+        .generation = generation,
+        .slot_name = "standby-a",
+        .cluster_id = identity.cluster_id,
+        .shard_id = identity.shard_id,
+        .table_id = identity.table_id,
+        .timeline_id = identity.timeline_id,
+        .epoch = identity.epoch,
+        .source_plan_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .manifest_id = generation,
+        .backup_lsn = 8,
+        .checkpoint_lsn = 11,
+        .end_record_lsn = 12,
+        .manifest_sha256 = &manifest_sha256,
+        .file_count = files.len,
+        .total_bytes = topology_json.len + store_bytes.len + journal_bytes.len,
+        .topology_id = binding.topology_id,
+        .topology_generation = binding.topology_generation,
+        .node_id = binding.node_id,
+        .target_pvc_name = binding.target_pvc_name,
+        .target_pvc_uid = binding.target_pvc_uid,
+    }, .{});
+    defer alloc.free(capture_receipt_json);
+    var capture_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(capture_receipt_json, &capture_digest, .{});
+    var capture_receipt_sha256: [Sha256.digest_length * 2]u8 = undefined;
+    encodeHex(&capture_receipt_sha256, &capture_digest);
+
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("ha-seeds");
+    const store = seed_artifact.Store{ .client = &client, .bucket = "ha-seeds" };
+    var published = try seed_artifact.publish(alloc, store, .{
+        .generation = generation,
+        .slot_name = "standby-a",
+        .manifest_bytes = manifest,
+        .content_root = source_root,
+        .capture_receipt_json = capture_receipt_json,
+        .capture_receipt_sha256 = &capture_receipt_sha256,
+        .binding = binding,
+    });
+    defer published.deinit(alloc);
+    const staging_root = try std.fs.path.join(alloc, &.{ root, "materialized-staging", generation });
+    errdefer alloc.free(staging_root);
+    var restored = try seed_artifact.restoreToStaging(alloc, store, .{
+        .expected = .{
+            .generation = generation,
+            .slot_name = "standby-a",
+            .identity = identity,
+            .minimum_checkpoint_lsn = 11,
+            .binding = binding,
+            .capture_receipt_sha256 = &capture_receipt_sha256,
+        },
+        .staging_root = staging_root,
+    });
+    restored.deinit(alloc);
+    return .{ .root = staging_root, .capture_receipt_sha256 = capture_receipt_sha256, .bound = true };
+}
+
 fn expectPathMissing(io: std.Io, path: []const u8) !void {
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, path, .{}));
 }
@@ -1153,12 +1696,11 @@ test "storage.ha bound activation keeps immutable transport separate from mutabl
         .target_pvc_name = "standby-a-data",
         .target_pvc_uid = "pvc-uid-1",
     };
-    const prepared = try prepareTestStagingWithBinding(
+    const prepared = try prepareMaterializedTestStaging(
         alloc,
         root,
         "gen-materialized",
         testIdentity(),
-        "catalog-before-runtime-writes",
         binding,
     );
     defer alloc.free(prepared.root);
@@ -1178,6 +1720,7 @@ test "storage.ha bound activation keeps immutable transport separate from mutabl
         .target_root = target_root,
         .expected = expected,
         .binding = binding,
+        .materialization = .{ .target_local_node_id = 7, .target_replica_id = 1 },
         .pod_uid = "pod-materialize",
     });
     defer activated.deinit(alloc);
@@ -1188,22 +1731,25 @@ test "storage.ha bound activation keeps immutable transport separate from mutabl
     defer alloc.free(expected_live_path);
     try std.testing.expectEqualStrings(expected_live_path, activated.generation_path);
 
-    const raw_catalog_path = try std.fs.path.join(alloc, &.{ raw_generation_path, "data/catalog.txt" });
+    const raw_catalog_path = try std.fs.path.join(alloc, &.{ raw_generation_path, seed_materialization.topology_name });
     defer alloc.free(raw_catalog_path);
-    const live_catalog_path = try std.fs.path.join(alloc, &.{ expected_live_path, "data/catalog.txt" });
-    defer alloc.free(live_catalog_path);
     const raw_before = try readFileAlloc(std.testing.io, alloc, raw_catalog_path, 1024);
     defer alloc.free(raw_before);
-    try std.testing.expectEqualStrings("catalog-before-runtime-writes", raw_before);
+    try std.testing.expect(std.mem.indexOf(u8, raw_before, "\"generation\":\"gen-materialized\"") != null);
 
     // Runtime-owned files must be allowed to evolve after ACTIVE publication.
     // Restart validates the immutable receipt chain and installed identity,
     // never by treating the mutable live tree as the raw transport artifact.
+    const live_db_path = try std.fs.path.join(alloc, &.{ expected_live_path, "data/replicas/group-1/table-db" });
+    defer alloc.free(live_db_path);
     {
-        var file = try std.Io.Dir.cwd().createFile(std.testing.io, live_catalog_path, .{ .truncate = true });
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, "catalog-after-runtime-writes");
-        try file.sync(std.testing.io);
+        var db = try @import("../db/db.zig").DB.open(alloc, live_db_path, .{
+            .identity_namespace = .{ .table_id = testIdentity().table_id, .shard_id = testIdentity().shard_id, .range_id = 1 },
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+        });
+        defer db.close();
+        try db.batch(.{ .writes = &.{.{ .key = "doc:after-activation", .value = "\"runtime-write\"" }} });
     }
     try std.testing.expectEqual(@as(u64, 11), try validateActivatedGeneration(alloc, .{
         .target_root = target_root,
@@ -1212,7 +1758,80 @@ test "storage.ha bound activation keeps immutable transport separate from mutabl
     }));
     const raw_after = try readFileAlloc(std.testing.io, alloc, raw_catalog_path, 1024);
     defer alloc.free(raw_after);
-    try std.testing.expectEqualStrings("catalog-before-runtime-writes", raw_after);
+    try std.testing.expectEqualSlices(u8, raw_before, raw_after);
+}
+
+test "storage.ha materialized activation recovers every raw live and ACTIVE publication crash" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const binding = ActivationBinding{
+        .topology_id = "topology-a",
+        .topology_generation = 3,
+        .node_id = "standby-a",
+        .target_pvc_name = "standby-a-data",
+        .target_pvc_uid = "pvc-uid-1",
+    };
+    const prepared = try prepareMaterializedTestStaging(
+        alloc,
+        root,
+        "gen-materialized-crash",
+        testIdentity(),
+        binding,
+    );
+    defer alloc.free(prepared.root);
+    const expected = seed_artifact.ExpectedArtifact{
+        .generation = "gen-materialized-crash",
+        .slot_name = "standby-a",
+        .identity = testIdentity(),
+        .minimum_checkpoint_lsn = 11,
+        .binding = binding,
+        .capture_receipt_sha256 = &prepared.capture_receipt_sha256,
+    };
+
+    inline for (.{
+        FailureBoundary.generation_copied,
+        FailureBoundary.generation_published,
+        FailureBoundary.live_generation_materialized,
+        FailureBoundary.live_generation_published,
+        FailureBoundary.active_published,
+    }, 0..) |boundary, index| {
+        const target_root = try std.fmt.allocPrint(alloc, "{s}/target-materialized-crash-{d}", .{ root, index });
+        defer alloc.free(target_root);
+        const request = ActivateRequest{
+            .staging_root = prepared.root,
+            .target_root = target_root,
+            .expected = expected,
+            .binding = binding,
+            .materialization = .{ .target_local_node_id = 7, .target_replica_id = 1 },
+            .pod_uid = "pod-materialized-crash",
+        };
+        try std.testing.expectError(
+            error.InjectedActivationFailure,
+            activateWithOptions(alloc, request, .{ .fail_after = boundary }),
+        );
+
+        const active_path = try std.fs.path.join(alloc, &.{ target_root, active_receipt_name });
+        defer alloc.free(active_path);
+        if (boundary == .active_published) {
+            try std.Io.Dir.cwd().access(std.testing.io, active_path, .{});
+        } else {
+            try expectPathMissing(std.testing.io, active_path);
+        }
+
+        var recovered = try activate(alloc, request);
+        defer recovered.deinit(alloc);
+        try std.testing.expectEqual(boundary == .active_published, recovered.already_active);
+        try std.testing.expectEqual(@as(u64, 11), try validateActivatedGeneration(alloc, .{
+            .target_root = target_root,
+            .expected = expected,
+            .binding = binding,
+            .target_local_node_id = 7,
+            .target_replica_id = 1,
+        }));
+    }
 }
 
 test "storage.ha seed activation rejects unrelated nonempty targets without mutation" {

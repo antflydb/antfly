@@ -181,6 +181,11 @@ const ActivationReceipt = struct {
     manifest_sha256: []const u8,
     aggregate_sha256: []const u8,
     generation_path: []const u8,
+    raw_generation_path: []const u8 = "",
+    materialized_receipt_sha256: []const u8 = "",
+    materialized_aggregate_sha256: []const u8 = "",
+    target_local_node_id: u64 = 0,
+    target_replica_id: u64 = 0,
     topology_id: []const u8,
     topology_generation: u64,
     node_id: []const u8,
@@ -245,7 +250,7 @@ pub const Ledger = struct {
         var parsed = std.json.parseFromSlice(ActivationReceipt, self.alloc, receipt_json, .{ .ignore_unknown_fields = false }) catch
             return error.InvalidLifecycleReceipt;
         defer parsed.deinit();
-        if (parsed.value.format_version != 1) return error.InvalidLifecycleReceipt;
+        if (parsed.value.format_version != 1 and parsed.value.format_version != 2) return error.InvalidLifecycleReceipt;
         try validateActivationReceipt(parsed.value);
         return try self.record(.activation, normalizedActivation(parsed.value), receipt_json, metadata);
     }
@@ -378,6 +383,13 @@ fn validateActivationReceipt(receipt: ActivationReceipt) !void {
         !validSha256(receipt.manifest_sha256) or
         !validSha256(receipt.aggregate_sha256) or !validation.isNormalizedPath(receipt.generation_path))
         return error.InvalidLifecycleReceipt;
+    if (receipt.format_version == 2 and
+        (!validation.isNormalizedPath(receipt.raw_generation_path) or
+            std.mem.eql(u8, receipt.raw_generation_path, receipt.generation_path) or
+            !validSha256(receipt.materialized_receipt_sha256) or
+            !validSha256(receipt.materialized_aggregate_sha256) or
+            receipt.target_local_node_id == 0 or receipt.target_replica_id == 0))
+        return error.InvalidLifecycleReceipt;
 }
 
 fn validateNormalized(receipt: NormalizedReceipt) !void {
@@ -432,6 +444,8 @@ fn validateStoredEvent(alloc: Allocator, event: StoredEvent) !void {
             var parsed = std.json.parseFromSlice(ActivationReceipt, alloc, event.receipt_json, .{ .ignore_unknown_fields = false }) catch
                 return error.CorruptLifecycleReceiptLedger;
             defer parsed.deinit();
+            if (parsed.value.format_version != 1 and parsed.value.format_version != 2)
+                return error.CorruptLifecycleReceiptLedger;
             validateActivationReceipt(parsed.value) catch return error.CorruptLifecycleReceiptLedger;
             try validateStoredNormalized(event, normalizedActivation(parsed.value));
         },

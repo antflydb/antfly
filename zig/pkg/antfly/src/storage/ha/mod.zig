@@ -21,6 +21,7 @@ pub const session = @import("session.zig");
 pub const backup_manifest = @import("backup_manifest.zig");
 pub const seed_artifact = @import("seed_artifact.zig");
 pub const seed_activation = @import("seed_activation.zig");
+pub const seed_materialization = @import("seed_materialization.zig");
 pub const seed_capture = @import("seed_capture.zig");
 pub const lifecycle_receipt_ledger = @import("lifecycle_receipt_ledger.zig");
 pub const local_generation_gc = @import("local_generation_gc.zig");
@@ -60,6 +61,7 @@ test {
     _ = backup_manifest;
     _ = seed_artifact;
     _ = seed_activation;
+    _ = seed_materialization;
     _ = seed_capture;
     _ = lifecycle_receipt_ledger;
     _ = local_generation_gc;
