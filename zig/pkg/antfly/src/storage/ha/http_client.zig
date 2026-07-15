@@ -817,10 +817,26 @@ fn validateFenceResponse(response: admin_api.HAFenceResponse, request: admin_api
     try validateSchemaVersion(response.schema_version, error.AdminFenceResponseMismatch);
     try validateActionReceipt(response.action, "fence_acquire", "applied", request.promoted_node_id, error.AdminFenceResponseMismatch);
     try validateFenceReceipt(response.receipt);
+    if (response.receipt.identity.cluster_id != request.identity.cluster_id or
+        response.receipt.identity.shard_id != request.identity.shard_id or
+        response.receipt.identity.table_id != request.identity.table_id or
+        response.receipt.identity.timeline_id != request.new_timeline_id or
+        response.receipt.identity.epoch != request.new_epoch or
+        response.receipt.parent_timeline_id != request.identity.timeline_id or
+        response.receipt.parent_epoch != request.identity.epoch)
+    {
+        return error.AdminFenceResponseMismatch;
+    }
     if (!std.mem.eql(u8, response.receipt.promoted_node_id, request.promoted_node_id)) return error.AdminFenceResponseMismatch;
     if (!std.mem.eql(u8, response.receipt.old_primary_id, request.old_primary_id)) return error.AdminFenceResponseMismatch;
     if (response.receipt.new_timeline_id != request.new_timeline_id or response.receipt.new_epoch != request.new_epoch) return error.AdminFenceResponseMismatch;
-    if (response.receipt.required_lsn != request.required_lsn or response.receipt.observed_lsn < request.observed_lsn) return error.AdminFenceResponseMismatch;
+    if (response.receipt.required_lsn < request.required_lsn or
+        response.receipt.observed_lsn < request.observed_lsn or
+        response.receipt.forced != request.force or
+        (!response.receipt.forced and response.receipt.observed_lsn < response.receipt.required_lsn))
+    {
+        return error.AdminFenceResponseMismatch;
+    }
 }
 
 fn validateCurrentFenceResponse(response: admin_api.HACurrentFenceResponse) !void {
