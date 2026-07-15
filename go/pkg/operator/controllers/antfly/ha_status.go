@@ -1054,6 +1054,7 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 		haBindSeedCaptureResult(&action, status)
 		haBindSeedArtifactProtections(&action, status)
 		haBindSeedTopology(&action, ha)
+		haBindFormerPrimaryTopology(&action, ha)
 		adminMethod, adminPath := haAdminOperation(action)
 		statusAction := antflyv1.HAPlannedActionStatus{
 			Kind:                             string(action.Kind),
@@ -1103,6 +1104,35 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 		out = append(out, statusAction)
 	}
 	return out
+}
+
+func haBindFormerPrimaryTopology(action *haPlannedAction, ha *antflyv1.HighAvailabilitySpec) {
+	if action == nil || (action.Kind != haActionRewindFormerPrimary &&
+		action.Kind != haActionReseedFormerPrimary && action.Kind != haActionDemoteFormerPrimary) {
+		return
+	}
+	standby, ok := haStandbySpecByName(ha, strings.TrimSpace(action.StandbyName))
+	if !ok || standby.SeedArtifact == nil {
+		return
+	}
+	artifact := standby.SeedArtifact
+	topologyID := strings.TrimSpace(artifact.TopologyID)
+	nodeID := strings.TrimSpace(artifact.NodeID)
+	targetPVCUID := strings.TrimSpace(artifact.TargetPVCUID)
+	if topologyID == "" || artifact.TopologyGeneration <= 0 || nodeID == "" ||
+		nodeID != strings.TrimSpace(action.StandbyName) || artifact.TargetPVC == nil ||
+		strings.TrimSpace(artifact.TargetPVC.ClaimName) == "" || targetPVCUID == "" {
+		return
+	}
+	// Rejoin execution is observed through a remote node-local admin endpoint.
+	// Freeze the declarative topology/PVC incarnation into status so a Colony
+	// controller can reject receipts and retries that belong to a replaced
+	// former-primary volume even though the admin request itself is remote.
+	action.TopologyID = topologyID
+	action.TopologyGeneration = artifact.TopologyGeneration
+	action.TopologyNodeID = nodeID
+	action.TargetPVCName = strings.TrimSpace(artifact.TargetPVC.ClaimName)
+	action.TargetPVCUID = targetPVCUID
 }
 
 func haBindSeedTopology(action *haPlannedAction, ha *antflyv1.HighAvailabilitySpec) {
