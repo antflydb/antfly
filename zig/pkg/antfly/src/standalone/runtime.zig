@@ -1502,7 +1502,7 @@ pub fn runFromIterator(
             .internal_primary = if (ha_primary) |*primary| primary else null,
             .primary_retention_policy = ha_retention_policy,
             .primary_sync_policy = ha_sync_policy.policy,
-            .standby_replication = try haStandbyReplicationConfigFromCli(cli),
+            .standby_replication = try haStandbyReplicationConfigFromCliWithBearerToken(cli, admin_bearer_token),
         } else .{},
         .backend_runtime = node_backend_runtime.ptr(),
     }, local_metadata.catalogSource(), local_metadata.statusSource());
@@ -3458,6 +3458,13 @@ fn optionalHAStartupDigest(value: ?[]const u8) !?[]const u8 {
 }
 
 fn haStandbyReplicationConfigFromCli(cli: CliConfig) !?antfly.data.runtime.HAStandbyReplicationConfig {
+    return try haStandbyReplicationConfigFromCliWithBearerToken(cli, null);
+}
+
+fn haStandbyReplicationConfigFromCliWithBearerToken(
+    cli: CliConfig,
+    bearer_token: ?[]const u8,
+) !?antfly.data.runtime.HAStandbyReplicationConfig {
     if (cli.ha_standby_upstream_url == null and cli.ha_standby_slot == null) return null;
     const upstream = try requireHAString(cli.ha_standby_upstream_url, error.HAStandbyUpstreamUrlMissing, error.HAStandbyUpstreamUrlInvalid);
     const slot = try requireHAIdentifier(cli.ha_standby_slot, error.HAStandbySlotMissing, error.HAStandbySlotInvalid);
@@ -3467,6 +3474,7 @@ fn haStandbyReplicationConfigFromCli(cli: CliConfig) !?antfly.data.runtime.HASta
     return .{
         .upstream_base_uri = upstream,
         .slot_name = slot,
+        .bearer_token = bearer_token,
         .standby_log_path = cli.ha_standby_log,
         .standby_progress_path = cli.ha_standby_progress,
     };
@@ -4495,7 +4503,7 @@ test "parse cli accepts HA standby runtime flags" {
     try std.testing.expectEqual(@as(u64, 3), cfg.ha_timeline_id.?);
     try std.testing.expectEqual(@as(u64, 4), cfg.ha_epoch.?);
 
-    const replication_cfg = (try haStandbyReplicationConfigFromCli(cfg, "runtime-secret-token")) orelse return error.TestExpectedEqual;
+    const replication_cfg = (try haStandbyReplicationConfigFromCliWithBearerToken(cfg, "runtime-secret-token")) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("http://primary.antfly.svc:8080", replication_cfg.upstream_base_uri);
     try std.testing.expectEqualStrings("standby-a", replication_cfg.slot_name);
     try std.testing.expectEqualStrings("runtime-secret-token", replication_cfg.bearer_token orelse return error.TestExpectedEqual);

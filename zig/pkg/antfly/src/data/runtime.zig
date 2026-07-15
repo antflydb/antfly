@@ -1708,6 +1708,10 @@ fn haPrimarySyncWaitFromConfig(cfg: HASyncWaitConfig) antfly.db.HAPrimaryProgres
 pub const HAStandbyReplicationConfig = struct {
     upstream_base_uri: []const u8,
     slot_name: []const u8,
+    /// Authentication authority for the upstream internal HA endpoints.
+    /// Standalone wires this from the same env-backed secret used by its
+    /// authenticated HA admin listener; it is never accepted on argv.
+    bearer_token: ?[]const u8 = null,
     standby_log_path: ?[]const u8 = null,
     standby_progress_path: ?[]const u8 = null,
     options: HAStandbyReplicationOptions = .{},
@@ -2791,7 +2795,11 @@ pub const DataServer = struct {
         options: HAStandbyReplicationOptions,
     ) !HAStandbyReplicationResult {
         if (self.http_server == null) try self.initApiServer();
-        var client = antfly.ha.http_replication_client.Client.init(self.alloc, executor);
+        var client = antfly.ha.http_replication_client.Client.initWithOptions(
+            self.alloc,
+            executor,
+            self.haStandbyReplicationAuth(),
+        );
         return try self.replicateHAStandbyAvailableWithClient(&client, upstream_base_uri, slot_name, options);
     }
 
@@ -2803,7 +2811,11 @@ pub const DataServer = struct {
         options: HAStandbyReplicationOptions,
     ) !HAStandbyReplicationLoopResult {
         if (self.http_server == null) try self.initApiServer();
-        var client = antfly.ha.http_replication_client.Client.init(self.alloc, executor);
+        var client = antfly.ha.http_replication_client.Client.initWithOptions(
+            self.alloc,
+            executor,
+            self.haStandbyReplicationAuth(),
+        );
         var iterations: usize = 0;
         var received_count: usize = 0;
         var applied_count: usize = 0;
@@ -2836,6 +2848,11 @@ pub const DataServer = struct {
                 return error.InternalReplicationDidNotAdvance;
             }
         }
+    }
+
+    fn haStandbyReplicationAuth(self: *const DataServer) antfly.ha.http_replication_client.AuthOptions {
+        const configured = if (self.ha_cfg.standby_replication) |cfg| cfg.bearer_token else null;
+        return .{ .bearer_token = configured orelse self.ha_cfg.admin_bearer_token };
     }
 
     fn replicateHAStandbyAvailableWithClient(
@@ -18872,6 +18889,7 @@ test "data server pulls and applies HA standby replication through internal HTTP
     var admin_status = try server.http_server.?.handle(.{
         .method = .GET,
         .uri = antfly.admin.routes.ha_standby_status,
+        .authorization = "Bearer runtime-secret-token",
     });
     defer admin_status.deinit(server.http_server.?.alloc);
     try std.testing.expectEqual(@as(u16, 200), admin_status.status);

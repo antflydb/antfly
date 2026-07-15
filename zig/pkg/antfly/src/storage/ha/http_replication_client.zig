@@ -79,14 +79,24 @@ pub const AppliedBatch = struct {
     progress: standby_mod.Progress,
 };
 
+pub const AuthOptions = struct {
+    bearer_token: ?[]const u8 = null,
+};
+
 pub const Client = struct {
     alloc: Allocator,
     executor: http_common.RequestExecutor,
+    auth: AuthOptions = .{},
 
     pub fn init(alloc: Allocator, executor: http_common.RequestExecutor) Client {
+        return initWithOptions(alloc, executor, .{});
+    }
+
+    pub fn initWithOptions(alloc: Allocator, executor: http_common.RequestExecutor, auth: AuthOptions) Client {
         return .{
             .alloc = alloc,
             .executor = executor,
+            .auth = auth,
         };
     }
 
@@ -436,12 +446,21 @@ pub const Client = struct {
         try verifyStandbyStatusUpdateResponse(parsed.value, slot_name, identity, progress);
     }
 
-    fn execute(self: *Client, req: http_common.HttpRequest) !OwnedResponse {
+    fn execute(self: *Client, raw_request: http_common.HttpRequest) !OwnedResponse {
+        var request = raw_request;
+        var authorization: ?[]u8 = null;
+        defer if (authorization) |value| self.alloc.free(value);
+        if (self.auth.bearer_token) |token| {
+            try validateBearerToken(token);
+            authorization = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{token});
+            request.authorization = authorization.?;
+        }
+
         var attempt: usize = 0;
         while (true) {
             return .{
-                .request_uri = req.uri,
-                .response = self.executor.execute(self.alloc, req) catch |err| switch (err) {
+                .request_uri = request.uri,
+                .response = self.executor.execute(self.alloc, request) catch |err| switch (err) {
                     error.HttpConnectionClosing,
                     error.ConnectionResetByPeer,
                     error.ConnectionRefused,
@@ -650,6 +669,13 @@ fn positiveUint64FromJson(value: i64) !u64 {
 
 fn validateSlotName(slot_name: []const u8) !void {
     if (!validation.isIdentifier(slot_name)) return error.InvalidSlotName;
+}
+
+fn validateBearerToken(token: []const u8) !void {
+    if (token.len == 0) return error.InvalidInternalReplicationBearerToken;
+    for (token) |byte| {
+        if (byte <= 0x20 or byte == 0x7f) return error.InvalidInternalReplicationBearerToken;
+    }
 }
 
 fn validateBaseURI(base_uri: []const u8) !void {
