@@ -82,8 +82,8 @@ fn parseBackendType(value: []const u8) ?inference.backends.BackendType {
     if (std.mem.eql(u8, value, "onnx")) return .onnx;
     if (std.mem.eql(u8, value, "metal")) return .metal;
     if (std.mem.eql(u8, value, "cuda")) return .cuda;
-    if (std.mem.eql(u8, value, "xla") or std.mem.eql(u8, value, "pjrt")) return .pjrt;
-    if (std.mem.eql(u8, value, "wasm") or std.mem.eql(u8, value, "webgpu")) return .wasm;
+    if (std.mem.eql(u8, value, "pjrt")) return .pjrt;
+    if (std.mem.eql(u8, value, "webgpu")) return .webgpu;
     return null;
 }
 

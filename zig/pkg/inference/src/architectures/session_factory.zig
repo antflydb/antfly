@@ -4273,7 +4273,7 @@ fn makeComputeBackend(
         else
             return error.CudaNotEnabled,
         .onnx => return error.OnnxNotSupportedHere,
-        .wasm => return error.WasmNotSupportedHere,
+        .webgpu => return error.WasmNotSupportedHere,
     };
 }
 
@@ -4557,7 +4557,7 @@ pub fn memoryBudgetExceededDetail(
             std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
         .cuda => std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
         .onnx => std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
-        .wasm => std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
+        .webgpu => std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
     };
 }
 
@@ -4574,7 +4574,7 @@ pub fn attachSharedPrefetchState(session: Session, shared_prefetch: *runtime.tie
         .pjrt => self.backend_data.pjrt.native.shared_prefetch = shared_prefetch,
         .cuda => {},
         .onnx => {},
-        .wasm => {},
+        .webgpu => {},
     }
 }
 
@@ -5649,7 +5649,7 @@ fn archClose(ptr: *anyopaque) void {
             }
         },
         .onnx => {},
-        .wasm => {},
+        .webgpu => {},
     }
     self.allocator.destroy(self);
 }

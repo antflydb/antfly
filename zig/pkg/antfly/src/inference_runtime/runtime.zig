@@ -84,8 +84,8 @@ pub fn parseBackendType(value: []const u8) ?inference.backends.BackendType {
     if (std.mem.eql(u8, value, "onnx")) return .onnx;
     if (std.mem.eql(u8, value, "metal")) return .metal;
     if (std.mem.eql(u8, value, "cuda")) return .cuda;
-    if (std.mem.eql(u8, value, "xla") or std.mem.eql(u8, value, "pjrt")) return .pjrt;
-    if (std.mem.eql(u8, value, "wasm") or std.mem.eql(u8, value, "webgpu")) return .wasm;
+    if (std.mem.eql(u8, value, "pjrt")) return .pjrt;
+    if (std.mem.eql(u8, value, "webgpu")) return .webgpu;
     return null;
 }
 
@@ -113,7 +113,9 @@ pub fn resolveBackendPriority(
     const out = try alloc.alloc(inference.backends.BackendType, values.len);
     errdefer alloc.free(out);
     for (values, 0..) |value, i| {
-        if (std.mem.indexOfScalar(u8, value, ':') != null or std.mem.eql(u8, value, "auto"))
+        if (std.mem.indexOfScalar(u8, value, ':') != null or
+            std.mem.eql(u8, value, "auto") or
+            std.mem.eql(u8, value, "xla"))
             return error.InvalidConfig;
         out[i] = parseBackendType(value) orelse return error.InvalidConfig;
     }
@@ -780,6 +782,7 @@ test "inference run rejects invalid backend priorities" {
     inline for (.{
         &.{},
         &.{"auto"},
+        &.{"xla"},
         &.{"onnx:cuda"},
         &.{"unknown"},
     }) |priority| {
@@ -823,7 +826,7 @@ test "inference pull rejects flags from the other model domain" {
 
 test "parseBackendType accepts warm generator backends" {
     try std.testing.expectEqual(inference.backends.BackendType.metal, parseBackendType("metal").?);
-    try std.testing.expectEqual(inference.backends.BackendType.wasm, parseBackendType("webgpu").?);
-    try std.testing.expectEqual(inference.backends.BackendType.pjrt, parseBackendType("xla").?);
+    try std.testing.expectEqual(inference.backends.BackendType.webgpu, parseBackendType("webgpu").?);
+    try std.testing.expectEqual(inference.backends.BackendType.pjrt, parseBackendType("pjrt").?);
     try std.testing.expect(try parseOptionalBackendType("auto") == null);
 }

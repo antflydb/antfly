@@ -192,7 +192,7 @@ func ParseBackendType(s string) (BackendType, error) {
 	switch strings.ToLower(s) {
 	case "onnx":
 		return BackendONNX, nil
-	case "xla":
+	case "xla", "pjrt":
 		return BackendXLA, nil
 	case "coreml":
 		return BackendCoreML, nil

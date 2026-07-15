@@ -2513,12 +2513,6 @@ spec:
                                         - medium
                                         - low
                                         type: string
-                                      strategy:
-                                        enum:
-                                        - eager
-                                        - lazy
-                                        - bounded
-                                        type: string
                                       tasks:
                                         items:
                                           type: string

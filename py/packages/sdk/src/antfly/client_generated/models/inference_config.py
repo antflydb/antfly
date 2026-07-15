@@ -72,9 +72,9 @@ class InferenceConfig:
             combination that supports the model.
 
             **Examples**:
-            - `["native", "onnx", "xla"]` - Try backends with auto device detection
-            - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
-             Example: ['cuda', 'onnx:cuda', 'xla:tpu', 'native'].
+            - `["native", "onnx", "pjrt"]` - Try backends with auto device detection
+            - `["cuda", "onnx:cuda", "pjrt:tpu", "native"]` - Prefer GPU, fall back to CPU
+             Example: ['cuda', 'onnx:cuda', 'pjrt:tpu', 'native'].
         max_concurrent_requests (int | Unset): Maximum weighted inference work admitted concurrently by the Zig runtime.
             Requests beyond the limit receive 503 Service Unavailable with Retry-After;
             they are not held in an in-process wait queue. Set to 0 for unlimited.

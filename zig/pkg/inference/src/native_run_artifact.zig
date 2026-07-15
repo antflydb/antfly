@@ -1234,7 +1234,7 @@ fn runPjrtHloArtifactFull(
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
-        .wasm => return error.UnexpectedWasmBackend,
+        .webgpu => return error.UnexpectedWasmBackend,
     };
     const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
     const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
@@ -2082,7 +2082,7 @@ fn materializePartitionInputs(
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
-        .wasm => return error.UnexpectedWasmBackend,
+        .webgpu => return error.UnexpectedWasmBackend,
     };
     const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
     const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
@@ -2462,7 +2462,7 @@ fn computeNativeLastLogitsForArtifact(
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
-        .wasm => return error.UnexpectedWasmBackend,
+        .webgpu => return error.UnexpectedWasmBackend,
     };
 
     return computeNativeLastLogitsWithBackend(

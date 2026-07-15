@@ -24,7 +24,7 @@ pub const Choice = enum {
     native,
     metal,
     cuda,
-    xla,
+    pjrt,
     webgpu,
 };
 
@@ -34,7 +34,7 @@ pub fn parse(value: []const u8) ?Choice {
     if (std.mem.eql(u8, value, "native")) return .native;
     if (std.mem.eql(u8, value, "metal")) return .metal;
     if (std.mem.eql(u8, value, "cuda")) return .cuda;
-    if (std.mem.eql(u8, value, "xla")) return .xla;
+    if (std.mem.eql(u8, value, "pjrt")) return .pjrt;
     if (std.mem.eql(u8, value, "webgpu")) return .webgpu;
     return null;
 }
@@ -42,7 +42,7 @@ pub fn parse(value: []const u8) ?Choice {
 pub fn validate(choice: Choice) !void {
     switch (choice) {
         .cuda => if (!build_options.enable_cuda) return error.BackendUnavailable,
-        .xla => if (!build_options.enable_pjrt) return error.BackendUnavailable,
+        .pjrt => if (!build_options.enable_pjrt) return error.BackendUnavailable,
         .webgpu => if (!(build_options.enable_wasm and build_options.enable_webgpu)) return error.BackendUnavailable,
         .auto, .onnx, .native, .metal => {},
     }
@@ -50,16 +50,20 @@ pub fn validate(choice: Choice) !void {
 
 pub fn configureSessionPreference(session_manager: *backends.SessionManager, choice: Choice) void {
     session_manager.preferred_backends = switch (choice) {
-        .auto => if (build_options.enable_wasm)
-            &.{backends.BackendType.wasm}
+        .auto => if (build_options.enable_wasm and build_options.enable_webgpu)
+            &.{ backends.BackendType.webgpu, backends.BackendType.native }
+        else if (build_options.enable_wasm)
+            &.{backends.BackendType.native}
         else if (build_options.enable_metal)
             &.{ backends.BackendType.metal, backends.BackendType.native }
         else
             &.{backends.BackendType.native},
         .onnx => if (build_options.enable_native)
             &.{ backends.BackendType.onnx, backends.BackendType.native }
+        else if (build_options.enable_wasm and build_options.enable_webgpu)
+            &.{ backends.BackendType.onnx, backends.BackendType.webgpu, backends.BackendType.native }
         else if (build_options.enable_wasm)
-            &.{ backends.BackendType.onnx, backends.BackendType.wasm }
+            &.{ backends.BackendType.onnx, backends.BackendType.native }
         else if (build_options.enable_metal)
             &.{ backends.BackendType.onnx, backends.BackendType.metal }
         else
@@ -68,10 +72,10 @@ pub fn configureSessionPreference(session_manager: *backends.SessionManager, cho
         .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
         .cuda => if (build_options.enable_cuda) &.{backends.BackendType.cuda} else &.{backends.BackendType.native},
         .webgpu => if (build_options.enable_wasm and build_options.enable_webgpu)
-            &.{backends.BackendType.wasm}
+            &.{backends.BackendType.webgpu}
         else
             &.{},
-        .xla => if (build_options.enable_native)
+        .pjrt => if (build_options.enable_native)
             &.{backends.BackendType.native}
         else if (build_options.enable_metal)
             &.{backends.BackendType.metal}
@@ -83,7 +87,7 @@ pub fn configureSessionPreference(session_manager: *backends.SessionManager, cho
 pub fn compiledPartitionBackend(choice: Choice) ?ops.BackendKind {
     return switch (choice) {
         .onnx => .onnx,
-        .xla => .pjrt,
+        .pjrt => .pjrt,
         .auto, .native, .metal, .cuda, .webgpu => null,
     };
 }
@@ -112,13 +116,13 @@ pub fn pjrtPluginPathFromEnv(allocator: std.mem.Allocator) !?[:0]u8 {
 
 test "parse accepts explicit compiled backends" {
     try std.testing.expectEqual(Choice.onnx, parse("onnx").?);
-    try std.testing.expectEqual(Choice.xla, parse("xla").?);
+    try std.testing.expectEqual(Choice.pjrt, parse("pjrt").?);
     try std.testing.expectEqual(Choice.webgpu, parse("webgpu").?);
 }
 
 test "compiledPartitionBackend maps explicit compiled backends" {
     try std.testing.expectEqual(@as(?ops.BackendKind, .onnx), compiledPartitionBackend(.onnx));
-    try std.testing.expectEqual(@as(?ops.BackendKind, .pjrt), compiledPartitionBackend(.xla));
+    try std.testing.expectEqual(@as(?ops.BackendKind, .pjrt), compiledPartitionBackend(.pjrt));
     try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackend(.metal));
     try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackend(.webgpu));
     if (build_options.enable_metal) {

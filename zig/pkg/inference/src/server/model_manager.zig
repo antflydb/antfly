@@ -2216,7 +2216,7 @@ fn preferredModelPathForBackend(
 ) ?[]const u8 {
     return switch (backend) {
         .onnx => man.onnx_path orelse model_dir,
-        .native, .metal, .cuda, .wasm => if (!manifestHasNativeAssets(man) and man.onnx_path != null)
+        .native, .metal, .cuda, .webgpu => if (!manifestHasNativeAssets(man) and man.onnx_path != null)
             man.onnx_path.?
         else
             model_dir,

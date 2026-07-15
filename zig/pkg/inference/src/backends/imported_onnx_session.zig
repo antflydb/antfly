@@ -143,38 +143,46 @@ const BackendContext = union(enum) {
     },
     wasm: struct {
         compute: *WasmCompute,
+        backend_type: BackendType,
     },
 
     fn init(allocator: std.mem.Allocator, requested: BackendType, io: ?std.Io) !BackendContext {
         return switch (requested) {
             .native, .onnx => blk: {
-                if (comptime !build_options.enable_native) return error.NativeNotEnabled;
-                const compute = try allocator.create(NativeCompute);
-                errdefer allocator.destroy(compute);
-                const weight_store = try allocator.create(WeightStore);
-                errdefer allocator.destroy(weight_store);
-                weight_store.* = .{
-                    .allocator = allocator,
-                    .resident_weights = .empty,
-                    .lazy_weights = .empty,
-                };
-                compute.* = if (io) |runtime|
-                    NativeCompute.initWithIo(allocator, weight_store, null, runtime)
-                else
-                    NativeCompute.init(allocator, weight_store, null);
-                break :blk .{
-                    .native = .{
-                        .compute = compute,
-                        .weight_store = weight_store,
-                    },
-                };
+                if (comptime build_options.enable_wasm) {
+                    const compute = try allocator.create(WasmCompute);
+                    errdefer allocator.destroy(compute);
+                    compute.* = wasm_compute_mod.WasmCompute.initNative(allocator);
+                    break :blk .{ .wasm = .{ .compute = compute, .backend_type = .native } };
+                } else {
+                    if (comptime !build_options.enable_native) return error.NativeNotEnabled;
+                    const compute = try allocator.create(NativeCompute);
+                    errdefer allocator.destroy(compute);
+                    const weight_store = try allocator.create(WeightStore);
+                    errdefer allocator.destroy(weight_store);
+                    weight_store.* = .{
+                        .allocator = allocator,
+                        .resident_weights = .empty,
+                        .lazy_weights = .empty,
+                    };
+                    compute.* = if (io) |runtime|
+                        NativeCompute.initWithIo(allocator, weight_store, null, runtime)
+                    else
+                        NativeCompute.init(allocator, weight_store, null);
+                    break :blk .{
+                        .native = .{
+                            .compute = compute,
+                            .weight_store = weight_store,
+                        },
+                    };
+                }
             },
-            .wasm => blk: {
-                if (comptime !build_options.enable_wasm) return error.WasmNotEnabled;
+            .webgpu => blk: {
+                if (comptime !(build_options.enable_wasm and build_options.enable_webgpu)) return error.WebGpuUnavailable;
                 const compute = try allocator.create(WasmCompute);
                 errdefer allocator.destroy(compute);
                 compute.* = wasm_compute_mod.WasmCompute.init(allocator);
-                break :blk .{ .wasm = .{ .compute = compute } };
+                break :blk .{ .wasm = .{ .compute = compute, .backend_type = .webgpu } };
             },
             .metal => blk: {
                 if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
@@ -256,7 +264,7 @@ const BackendContext = union(enum) {
         return switch (self.*) {
             .native => .native,
             .metal_hosted => .metal,
-            .wasm => .wasm,
+            .wasm => |ctx| ctx.backend_type,
         };
     }
 

@@ -229,16 +229,9 @@ func (r *InferencePoolReconciler) reconcileService(ctx context.Context, pool *an
 }
 
 func (r *InferencePoolReconciler) reconcileConfigMap(ctx context.Context, pool *antflyaiv1alpha1.InferencePool) error {
-	// Generate complete configuration
-	completeConfig, err := r.generateCompleteConfig(pool)
+	data, err := r.generateConfigMapData(pool)
 	if err != nil {
-		return fmt.Errorf("failed to generate complete config: %w", err)
-	}
-
-	// Build model list for environment variables (inference runtime metadata)
-	models := make([]string, 0, len(pool.Spec.Models.Preload))
-	for _, m := range pool.Spec.Models.Preload {
-		models = append(models, m.Name)
+		return fmt.Errorf("failed to generate config map data: %w", err)
 	}
 
 	cm := &corev1.ConfigMap{
@@ -247,19 +240,7 @@ func (r *InferencePoolReconciler) reconcileConfigMap(ctx context.Context, pool *
 			Namespace: pool.Namespace,
 			Labels:    r.labels(pool),
 		},
-		Data: map[string]string{
-			// Config file for --config flag
-			"config.json": completeConfig,
-			// Environment variables (inference runtime metadata)
-			"ANTFLY_INFERENCE_MODELS":           strings.Join(models, ","),
-			"ANTFLY_INFERENCE_POOL":             pool.Name,
-			"ANTFLY_INFERENCE_WORKLOAD_TYPE":    string(pool.Spec.WorkloadType),
-			"ANTFLY_INFERENCE_LOADING_STRATEGY": string(pool.Spec.Models.LoadingStrategy),
-		},
-	}
-
-	if pool.Spec.Models.RegistryURL != "" {
-		cm.Data["ANTFLY_REGISTRY_URL"] = pool.Spec.Models.RegistryURL
+		Data: data,
 	}
 
 	// Set owner reference
@@ -284,6 +265,28 @@ func (r *InferencePoolReconciler) reconcileConfigMap(ctx context.Context, pool *
 	return nil
 }
 
+func (r *InferencePoolReconciler) generateConfigMapData(pool *antflyaiv1alpha1.InferencePool) (map[string]string, error) {
+	completeConfig, err := r.generateCompleteConfig(pool)
+	if err != nil {
+		return nil, err
+	}
+	models := make([]string, 0, len(pool.Spec.Models.Preload))
+	for _, model := range pool.Spec.Models.Preload {
+		models = append(models, model.Name)
+	}
+	data := map[string]string{
+		"config.json":                       completeConfig,
+		"ANTFLY_INFERENCE_MODELS":           strings.Join(models, ","),
+		"ANTFLY_INFERENCE_POOL":             pool.Name,
+		"ANTFLY_INFERENCE_WORKLOAD_TYPE":    string(pool.Spec.WorkloadType),
+		"ANTFLY_INFERENCE_LOADING_STRATEGY": string(pool.Spec.Models.LoadingStrategy),
+	}
+	if pool.Spec.Models.RegistryURL != "" {
+		data["ANTFLY_REGISTRY_URL"] = pool.Spec.Models.RegistryURL
+	}
+	return data, nil
+}
+
 // generateCompleteConfig merges user-provided config with auto-generated settings
 func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.InferencePool) (string, error) {
 	// Start with user config or empty object
@@ -295,21 +298,32 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 		}
 	}
 
-	// Build preload model list
+	loadingStrategy := pool.Spec.Models.LoadingStrategy
+	if loadingStrategy == "" {
+		loadingStrategy = antflyaiv1alpha1.LoadingStrategyEager
+	}
+
+	// Init containers provision every model, but only eager pools ask the
+	// runtime to warm the models before it starts serving.
 	preload := make([]map[string]any, 0, len(pool.Spec.Models.Preload))
 	for _, m := range pool.Spec.Models.Preload {
 		if m.Kind == "" {
 			return "", fmt.Errorf("preload model %q is missing kind", m.Name)
 		}
-		preload = append(preload, map[string]any{
-			"kind": m.Kind,
-			"name": m.Name,
-		})
+		if loadingStrategy == antflyaiv1alpha1.LoadingStrategyEager {
+			preload = append(preload, map[string]any{
+				"kind": m.Kind,
+				"name": m.Name,
+			})
+		}
 	}
 
 	// Set auto-generated config (don't override if user specified)
 	if _, exists := config["preload"]; !exists && len(preload) > 0 {
 		config["preload"] = preload
+	}
+	if _, exists := config["max_loaded_models"]; !exists && len(preload) > 10 {
+		config["max_loaded_models"] = len(preload)
 	}
 
 	if _, exists := config["models_dir"]; !exists {
@@ -319,8 +333,8 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 	// Set loading strategy config
 	// Note: Inference defaults to lazy loading (5m keep_alive) like Ollama.
 	// Eager loading must be explicitly set with keep_alive="0".
-	if pool.Spec.Models.LoadingStrategy != "" {
-		switch pool.Spec.Models.LoadingStrategy {
+	if loadingStrategy != "" {
+		switch loadingStrategy {
 		case antflyaiv1alpha1.LoadingStrategyEager:
 			// Eager loading: explicitly set keep_alive=0 to load all models at startup
 			if _, exists := config["keep_alive"]; !exists {
@@ -355,10 +369,14 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 
 	// A single configured backend is strict: the runtime fails startup when the
 	// accelerator backend is unavailable instead of silently running on CPU.
-	if _, exists := config["backend_priority"]; !exists && pool.Spec.Hardware.Accelerator != "" {
+	// PJRT executes compiled graph partitions and cannot load model sessions
+	// directly, so TPU pools retain native as their direct-loading fallback.
+	if pool.Spec.Hardware.Accelerator != "" {
 		if strings.Contains(pool.Spec.Hardware.Accelerator, "tpu") {
-			config["backend_priority"] = []string{"xla"}
-		} else {
+			if _, exists := config["backend_priority"]; !exists {
+				config["backend_priority"] = []string{"pjrt", "native"}
+			}
+		} else if _, exists := config["backend_priority"]; !exists {
 			config["backend_priority"] = []string{"cuda"}
 		}
 	}
@@ -505,6 +523,20 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 	// Add probes
 	r.addProbes(sts, pool)
 
+	configData, err := r.generateConfigMapData(pool)
+	if err != nil {
+		return fmt.Errorf("generate config map data for pod hash: %w", err)
+	}
+	configDataJSON, err := json.Marshal(configData)
+	if err != nil {
+		return fmt.Errorf("marshal config map data for pod hash: %w", err)
+	}
+	configHash := sha256.Sum256(configDataJSON)
+	if sts.Spec.Template.Annotations == nil {
+		sts.Spec.Template.Annotations = make(map[string]string)
+	}
+	sts.Spec.Template.Annotations["inference.antfly.io/config-hash"] = hex.EncodeToString(configHash[:8])
+
 	// Set owner reference
 	if err := ctrl.SetControllerReference(pool, sts, r.Scheme); err != nil {
 		return err
@@ -515,9 +547,6 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 	templateHash, err := computePodTemplateHash(&sts.Spec.Template)
 	if err != nil {
 		return fmt.Errorf("compute pod template hash: %w", err)
-	}
-	if sts.Spec.Template.Annotations == nil {
-		sts.Spec.Template.Annotations = make(map[string]string)
 	}
 	sts.Spec.Template.Annotations["inference.antfly.io/template-hash"] = templateHash
 

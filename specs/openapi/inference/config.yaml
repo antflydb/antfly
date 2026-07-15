@@ -957,7 +957,7 @@ components:
           type: boolean
           description: Whether the CUDA backend is built into this runtime
           example: false
-        xla:
+        pjrt:
           type: boolean
           description: Whether the PJRT/XLA backend is built into this runtime
           example: false
@@ -1418,11 +1418,11 @@ components:
       description: |
         Optional backend preference for model loading or request execution.
         `auto` keeps the node default behavior.
-        `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via
+        `pjrt` selects the PJRT backend and may require a PJRT plugin path via
         `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`,
         `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
         `webgpu` selects the Wasm/WebGPU backend in Wasm builds.
-      enum: [auto, native, onnx, metal, cuda, xla, webgpu, wasm]
+      enum: [auto, native, onnx, metal, cuda, pjrt, webgpu]
 
     ModelFormat:
       type: string
@@ -1604,21 +1604,23 @@ components:
           type: array
           items:
             type: string
-            enum: [native, onnx, metal, cuda, xla, wasm]
+            enum: [native, onnx, metal, cuda, pjrt, webgpu]
           description: |
-            Explicit backend order for model loading. Antfly inference tries entries in order
-            and uses the first backend supported by both the build and the model. An empty list
+            Explicit backend order for inference. Antfly tries entries in order and uses the first
+            backend supported by both the build and the operation. Direct model loading skips
+            compiled-only `pjrt` entries and continues to the next backend, while generation uses
+            PJRT for compiled graph partitions when it is the first available entry. An empty list
             is invalid. A single entry is a strict backend requirement and causes startup to fail
-            when that backend is unavailable.
+            when that backend is unavailable or cannot directly load a model session.
 
             **Backends** (depend on build flags):
             - `native` - Native CPU backend
             - `onnx` - ONNX Runtime backend
             - `metal` - Apple Metal backend
             - `cuda` - NVIDIA CUDA backend
-            - `xla` - PJRT/XLA compiled backend
-            - `wasm` - Wasm/WebGPU backend
-          example: ["cuda", "native"]
+            - `pjrt` - PJRT compiled graph backend
+            - `webgpu` - WebGPU backend for Wasm builds
+          example: ["pjrt", "native"]
         max_concurrent_requests:
           type: integer
           minimum: 0

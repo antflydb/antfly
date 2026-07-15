@@ -41,16 +41,16 @@ pub const BackendType = enum {
     metal,
     cuda,
     pjrt,
-    wasm,
+    webgpu,
 
     pub fn available(self: BackendType) bool {
         return switch (self) {
-            .native => build_options.enable_native,
+            .native => build_options.enable_native or build_options.enable_wasm,
             .onnx => build_options.enable_onnx,
             .metal => build_options.enable_metal,
             .cuda => build_options.enable_cuda,
             .pjrt => build_options.enable_pjrt,
-            .wasm => build_options.enable_wasm,
+            .webgpu => build_options.enable_wasm and build_options.enable_webgpu,
         };
     }
 
@@ -60,7 +60,7 @@ pub const BackendType = enum {
             .metal => 15,
             .cuda => 25,
             .pjrt => 35,
-            .wasm => 50,
+            .webgpu => 50,
             .native => 100,
         };
     }
@@ -75,7 +75,7 @@ pub const BackendType = enum {
     /// Whether SessionManager.loadModel can create a Session directly for this backend.
     pub fn supportsDirectSessionLoad(self: BackendType) bool {
         return switch (self) {
-            .native, .onnx, .metal, .cuda, .wasm => true,
+            .native, .onnx, .metal, .cuda, .webgpu => true,
             .pjrt => false,
         };
     }
@@ -150,7 +150,11 @@ pub const SessionManager = struct {
             }
             std.log.info("trying backend {s} for {s}", .{ @tagName(backend), model_path });
             const effective_model_path = switch (backend) {
-                .onnx, .wasm => if (manifest) |m| m.onnx_path orelse model_path else model_path,
+                .onnx, .webgpu => if (manifest) |m| m.onnx_path orelse model_path else model_path,
+                .native => if (build_options.enable_wasm)
+                    if (manifest) |m| m.onnx_path orelse model_path else model_path
+                else
+                    model_path,
                 else => model_path,
             };
 
@@ -186,7 +190,12 @@ pub const SessionManager = struct {
                     }
                 else
                     continue,
-                .native => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
+                .native => if (build_options.enable_wasm and self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
+                    self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx) catch |err| {
+                        std.log.err("imported ONNX native Wasm session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
+                        continue;
+                    }
+                else if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx native session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         continue;
@@ -196,8 +205,8 @@ pub const SessionManager = struct {
                         std.log.err("native session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         continue;
                     },
-                .wasm => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
-                    self.createImportedOnnxSession(effective_model_path, .wasm, shared_backend_ctx) catch |err| {
+                .webgpu => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
+                    self.createImportedOnnxSession(effective_model_path, .webgpu, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx wasm session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         continue;
                     }
@@ -257,7 +266,7 @@ pub const SessionManager = struct {
 };
 
 fn configuredPreferredBackends() []const BackendType {
-    if (build_options.enable_wasm) return &.{.wasm};
+    if (build_options.enable_wasm) return if (build_options.enable_webgpu) &.{ .webgpu, .native } else &.{.native};
     if (preferredBackendOverride()) |backend| {
         return preferredBackendsForOverride(backend);
     }
@@ -282,12 +291,12 @@ fn preferredBackendsForOverride(backend: BackendType) []const BackendType {
         .cuda => if (build_options.enable_cuda) &.{ .cuda, .onnx, .metal, .native } else &.{ .native, .onnx, .metal },
         .pjrt => if (build_options.enable_pjrt) &.{ .pjrt, .onnx, .metal, .native } else &.{ .onnx, .metal, .native },
         .native => &.{ .native, .onnx, .metal },
-        .wasm => &.{ .onnx, .metal, .native },
+        .webgpu => if (build_options.enable_wasm) &.{ .webgpu, .native } else &.{ .onnx, .metal, .native },
     };
 }
 
 fn defaultImportedOnnxBackend() BackendType {
-    return if (build_options.enable_wasm) .wasm else .native;
+    return .native;
 }
 
 fn isOnnxFilePath(path: []const u8) bool {
@@ -303,9 +312,8 @@ test "onnx backend availability follows linked onnx runtime" {
     try std.testing.expectEqual(build_options.enable_onnx, BackendType.onnx.available());
     try std.testing.expect(BackendType.onnx.supportsDirectSessionLoad());
     if (build_options.enable_wasm) {
-        try std.testing.expectEqual(BackendType.wasm, configuredPreferredBackends()[0]);
-        try std.testing.expectEqual(BackendType.wasm, defaultImportedOnnxBackend());
-        try std.testing.expect(BackendType.wasm.supportsDirectSessionLoad());
+        try std.testing.expectEqual(if (build_options.enable_webgpu) BackendType.webgpu else BackendType.native, configuredPreferredBackends()[0]);
+        try std.testing.expect(BackendType.native.available());
     } else {
         try std.testing.expectEqual(BackendType.native, defaultImportedOnnxBackend());
     }

@@ -166,7 +166,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
-        .wasm => return error.UnexpectedWasmBackend,
+        .webgpu => return error.UnexpectedWasmBackend,
     };
     const kv_dtype = if (opts.cache_dtype) |name|
         runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDtype
@@ -584,7 +584,7 @@ fn predictedWeightTier(
             if (build_options.enable_metal and !shouldPreferNativeAheadOfMetal(allocator, manifest)) return .backend;
             return .host;
         },
-        .onnx, .xla, .webgpu => return .host,
+        .onnx, .pjrt, .webgpu => return .host,
     }
 }
 
@@ -594,7 +594,7 @@ fn predictedBackendType(choice: BackendChoice, tier: runtime.tier.memory.Residen
         .metal => .metal,
         .cuda => .cuda,
         .auto => .metal,
-        .onnx, .native, .xla, .webgpu => .native,
+        .onnx, .native, .pjrt, .webgpu => .native,
     };
 }
 
@@ -797,7 +797,7 @@ fn printGgufSummary(
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference smoke <model-dir> <prompt> [--backend auto|onnx|native|metal|xla] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--prefill-chunk-size N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--draft-model path] [--inspect-only] [--no-chat-template]
+        \\usage: antfly inference smoke <model-dir> <prompt> [--backend auto|onnx|native|metal|pjrt] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--prefill-chunk-size N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--draft-model path] [--inspect-only] [--no-chat-template]
         \\  Loads a native GGUF/SafeTensors model, prints GGUF tensor coverage, and runs one native generation pass.
         \\  With --draft-model, prints Gemma4 MTP target/assistant compatibility metadata.
         \\

@@ -21,7 +21,7 @@ pub const BackendRuntimes = struct {
     /// Whether the CUDA backend is built into this runtime
     cuda: ?bool = null,
     /// Whether the PJRT/XLA backend is built into this runtime
-    xla: ?bool = null,
+    pjrt: ?bool = null,
     /// Whether the WASM backend is built into this runtime
     wasm: ?bool = null,
 };
@@ -102,7 +102,7 @@ pub const Config = struct {
     pool_size: ?i64 = null,
     /// Native generator prompt KV cache settings.
     prompt_cache: ?PromptCacheConfig = null,
-    /// Explicit backend order for model loading. Antfly inference tries entries in order and uses the first backend supported by both the build and the model. An empty list is invalid. A single entry is a strict backend requirement and causes startup to fail when that backend is unavailable. **Backends** (depend on build flags): - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend - `wasm` - Wasm/WebGPU backend
+    /// Explicit backend order for inference. Antfly tries entries in order and uses the first backend supported by both the build and the operation. Direct model loading skips compiled-only `pjrt` entries and continues to the next backend, while generation uses PJRT for compiled graph partitions when it is the first available entry. An empty list is invalid. A single entry is a strict backend requirement and causes startup to fail when that backend is unavailable or cannot directly load a model session. **Backends** (depend on build flags): - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `pjrt` - PJRT compiled graph backend - `webgpu` - WebGPU backend for Wasm builds
     backend_priority: ?[]const []const u8 = null,
     /// Maximum weighted inference work admitted concurrently by the Zig runtime. Requests beyond the limit receive 503 Service Unavailable with Retry-After; they are not held in an in-process wait queue. Set to 0 for unlimited.
     max_concurrent_requests: ?i64 = null,
@@ -464,16 +464,15 @@ pub const MediaContentPart = struct {
     mime_type: ?[]const u8 = null,
 };
 
-/// Optional backend preference for model loading or request execution. `auto` keeps the node default behavior. `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds.
+/// Optional backend preference for model loading or request execution. `auto` keeps the node default behavior. `pjrt` selects the PJRT backend and may require a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds.
 pub const ModelBackend = enum {
     auto,
     native,
     onnx,
     metal,
     cuda,
-    xla,
+    pjrt,
     webgpu,
-    wasm,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -482,9 +481,8 @@ pub const ModelBackend = enum {
             .onnx => "onnx",
             .metal => "metal",
             .cuda => "cuda",
-            .xla => "xla",
+            .pjrt => "pjrt",
             .webgpu => "webgpu",
-            .wasm => "wasm",
         };
         try jw.write(s);
     }
@@ -500,9 +498,8 @@ pub const ModelBackend = enum {
             .{ "onnx", .onnx },
             .{ "metal", .metal },
             .{ "cuda", .cuda },
-            .{ "xla", .xla },
+            .{ "pjrt", .pjrt },
             .{ "webgpu", .webgpu },
-            .{ "wasm", .wasm },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

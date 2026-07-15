@@ -20,7 +20,7 @@ class InferenceBackendRuntimes:
         onnx (bool | Unset): Whether the ONNX Runtime backend is built into this runtime
         metal (bool | Unset): Whether the Metal backend is built into this runtime Example: True.
         cuda (bool | Unset): Whether the CUDA backend is built into this runtime
-        xla (bool | Unset): Whether the PJRT/XLA backend is built into this runtime
+        pjrt (bool | Unset): Whether the PJRT/XLA backend is built into this runtime
         wasm (bool | Unset): Whether the WASM backend is built into this runtime
     """
 
@@ -28,7 +28,7 @@ class InferenceBackendRuntimes:
     onnx: bool | Unset = UNSET
     metal: bool | Unset = UNSET
     cuda: bool | Unset = UNSET
-    xla: bool | Unset = UNSET
+    pjrt: bool | Unset = UNSET
     wasm: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -41,7 +41,7 @@ class InferenceBackendRuntimes:
 
         cuda = self.cuda
 
-        xla = self.xla
+        pjrt = self.pjrt
 
         wasm = self.wasm
 
@@ -56,8 +56,8 @@ class InferenceBackendRuntimes:
             field_dict["metal"] = metal
         if cuda is not UNSET:
             field_dict["cuda"] = cuda
-        if xla is not UNSET:
-            field_dict["xla"] = xla
+        if pjrt is not UNSET:
+            field_dict["pjrt"] = pjrt
         if wasm is not UNSET:
             field_dict["wasm"] = wasm
 
@@ -74,7 +74,7 @@ class InferenceBackendRuntimes:
 
         cuda = d.pop("cuda", UNSET)
 
-        xla = d.pop("xla", UNSET)
+        pjrt = d.pop("pjrt", UNSET)
 
         wasm = d.pop("wasm", UNSET)
 
@@ -83,7 +83,7 @@ class InferenceBackendRuntimes:
             onnx=onnx,
             metal=metal,
             cuda=cuda,
-            xla=xla,
+            pjrt=pjrt,
             wasm=wasm,
         )
 

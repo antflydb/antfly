@@ -69,7 +69,7 @@ class InferenceGenerateRequest:
             request.
         backend (InferenceModelBackend | Unset): Optional backend preference for model loading or request execution.
             `auto` keeps the node default behavior.
-            `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via
+            `pjrt` selects the PJRT backend and may require a PJRT plugin path via
             `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`,
             `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
             `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with

@@ -185,7 +185,11 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 	var backendPriority []backends.BackendSpec
 	if len(config.BackendPriority) > 0 {
 		var err error
-		backendPriority, err = backends.ParseBackendPriority(config.BackendPriority)
+		priorityNames := make([]string, len(config.BackendPriority))
+		for i, backend := range config.BackendPriority {
+			priorityNames[i] = string(backend)
+		}
+		backendPriority, err = backends.ParseBackendPriority(priorityNames)
 		if err != nil {
 			zl.Fatal("Invalid backend_priority configuration", zap.Error(err))
 		}

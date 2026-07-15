@@ -11700,14 +11700,14 @@ export interface components {
         /**
          * @description Optional backend preference for model loading or request execution.
          *     `auto` keeps the node default behavior.
-         *     `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via
+         *     `pjrt` selects the PJRT backend and may require a PJRT plugin path via
          *     `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`,
          *     `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
          *     `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with
          *     `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
          * @enum {string}
          */
-        InferenceModelBackend: "auto" | "native" | "onnx" | "metal" | "cuda" | "xla" | "webgpu" | "wasm";
+        InferenceModelBackend: "auto" | "native" | "onnx" | "metal" | "cuda" | "pjrt" | "webgpu";
         /**
          * @description Optional artifact format preference for loading a model.
          * @enum {string}
@@ -11727,8 +11727,8 @@ export interface components {
          *     - `onnx` - ONNX Runtime backend
          *     - `metal` - Apple Metal backend
          *     - `cuda` - NVIDIA CUDA backend
-         *     - `xla` - PJRT/XLA compiled backend
-         *     - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds
+         *     - `pjrt` - PJRT compiled backend
+         *     - `webgpu` - WebGPU backend in Wasm builds
          *
          *     Devices:
          *     - `auto` - Auto-detect best available (default)
@@ -11861,17 +11861,17 @@ export interface components {
              *     combination that supports the model.
              *
              *     **Examples**:
-             *     - `["native", "onnx", "xla"]` - Try backends with auto device detection
-             *     - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
+             *     - `["native", "onnx", "pjrt"]` - Try backends with auto device detection
+             *     - `["cuda", "onnx:cuda", "pjrt:tpu", "native"]` - Prefer GPU, fall back to CPU
              * @default [
              *       "native",
              *       "onnx",
-             *       "xla"
+             *       "pjrt"
              *     ]
              * @example [
              *       "cuda",
              *       "onnx:cuda",
-             *       "xla:tpu",
+             *       "pjrt:tpu",
              *       "native"
              *     ]
              */
@@ -11983,7 +11983,7 @@ export interface components {
              * @description Whether the PJRT/XLA backend is built into this runtime
              * @example false
              */
-            xla?: boolean;
+            pjrt?: boolean;
             /**
              * @description Whether the WASM backend is built into this runtime
              * @example false

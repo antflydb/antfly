@@ -4149,7 +4149,7 @@ pub const InferenceAudioChunkConfig = struct {
     vad: ?VADOptions = null,
 };
 
-/// Backend priority entry for model loading. Use `backend` or `backend:device`, where device defaults to `auto`. Backends: - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds Devices: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only
+/// Backend priority entry for model loading. Use `backend` or `backend:device`, where device defaults to `auto`. Backends: - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `pjrt` - PJRT compiled backend - `webgpu` - WebGPU backend in Wasm builds Devices: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only
 pub const InferenceBackendPriorityEntry = []const u8;
 
 /// Runtime backends compiled into this inference server.
@@ -4163,7 +4163,7 @@ pub const InferenceBackendRuntimes = struct {
     /// Whether the CUDA backend is built into this runtime
     cuda: ?bool = null,
     /// Whether the PJRT/XLA backend is built into this runtime
-    xla: ?bool = null,
+    pjrt: ?bool = null,
     /// Whether the WASM backend is built into this runtime
     wasm: ?bool = null,
 };
@@ -4341,7 +4341,7 @@ pub const InferenceConfig = struct {
     pool_size: ?i64 = null,
     /// Native generator prompt KV cache settings.
     prompt_cache: ?InferencePromptCacheConfig = null,
-    /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Antfly inference tries entries in order and uses the first available backend+device combination that supports the model. **Examples**: - `["native", "onnx", "xla"]` - Try backends with auto device detection - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
+    /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Antfly inference tries entries in order and uses the first available backend+device combination that supports the model. **Examples**: - `["native", "onnx", "pjrt"]` - Try backends with auto device detection - `["cuda", "onnx:cuda", "pjrt:tpu", "native"]` - Prefer GPU, fall back to CPU
     backend_priority: ?[]const InferenceBackendPriorityEntry = null,
     /// Maximum weighted inference work admitted concurrently by the Zig runtime. Requests beyond the limit receive 503 Service Unavailable with Retry-After; they are not held in an in-process wait queue. Set to 0 for unlimited.
     max_concurrent_requests: ?i64 = null,
@@ -4768,16 +4768,15 @@ pub const InferenceLevel = enum {
 
 pub const InferenceMediaContentPart = MediaContentPart;
 
-/// Optional backend preference for model loading or request execution. `auto` keeps the node default behavior. `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
+/// Optional backend preference for model loading or request execution. `auto` keeps the node default behavior. `pjrt` selects the PJRT backend and may require a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
 pub const InferenceModelBackend = enum {
     auto,
     native,
     onnx,
     metal,
     cuda,
-    xla,
+    pjrt,
     webgpu,
-    wasm,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -4786,9 +4785,8 @@ pub const InferenceModelBackend = enum {
             .onnx => "onnx",
             .metal => "metal",
             .cuda => "cuda",
-            .xla => "xla",
+            .pjrt => "pjrt",
             .webgpu => "webgpu",
-            .wasm => "wasm",
         };
         try jw.write(s);
     }
@@ -4804,9 +4802,8 @@ pub const InferenceModelBackend = enum {
             .{ "onnx", .onnx },
             .{ "metal", .metal },
             .{ "cuda", .cuda },
-            .{ "xla", .xla },
+            .{ "pjrt", .pjrt },
             .{ "webgpu", .webgpu },
-            .{ "wasm", .wasm },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

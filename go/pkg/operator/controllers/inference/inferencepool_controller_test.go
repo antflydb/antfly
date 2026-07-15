@@ -16,6 +16,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -104,6 +105,10 @@ var _ = Describe("InferencePool Controller", func() {
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_POOL"]).To(Equal(poolName))
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_WORKLOAD_TYPE"]).To(Equal("general"))
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_LOADING_STRATEGY"]).To(Equal("eager"))
+			var runtimeConfig map[string]any
+			Expect(json.Unmarshal([]byte(createdConfigMap.Data["config.json"]), &runtimeConfig)).To(Succeed())
+			Expect(runtimeConfig["backend_priority"]).To(HaveExactElements("pjrt", "native"))
+			Expect(runtimeConfig["preload"]).To(HaveLen(1))
 
 			// Verify the StatefulSet was created
 			stsLookupKey := types.NamespacedName{Name: poolName, Namespace: poolNamespace}
@@ -114,6 +119,8 @@ var _ = Describe("InferencePool Controller", func() {
 			}, timeout, interval).Should(BeTrue())
 
 			Expect(*createdSts.Spec.Replicas).To(Equal(int32(1)))
+			initialConfigHash := createdSts.Spec.Template.Annotations["inference.antfly.io/config-hash"]
+			Expect(initialConfigHash).NotTo(BeEmpty())
 			Expect(createdSts.Spec.ServiceName).To(Equal(poolName))
 			Expect(createdSts.Spec.Template.Spec.Containers).To(HaveLen(1))
 			Expect(createdSts.Spec.Template.Spec.Containers[0].Name).To(Equal("inference"))
@@ -203,6 +210,21 @@ var _ = Describe("InferencePool Controller", func() {
 				}
 				return *createdSts.Spec.Replicas
 			}, timeout, interval).Should(Equal(int32(3)))
+
+			Eventually(func() error {
+				if err := k8sClient.Get(ctx, poolLookupKey, pool); err != nil {
+					return err
+				}
+				pool.Spec.Config = `{"max_concurrent_requests":7}`
+				return k8sClient.Update(ctx, pool)
+			}, timeout, interval).Should(Succeed())
+
+			Eventually(func() string {
+				if err := k8sClient.Get(ctx, stsLookupKey, createdSts); err != nil {
+					return initialConfigHash
+				}
+				return createdSts.Spec.Template.Annotations["inference.antfly.io/config-hash"]
+			}, timeout, interval).ShouldNot(Equal(initialConfigHash))
 
 			// Cleanup
 			Expect(k8sClient.Delete(ctx, pool)).Should(Succeed())
@@ -315,6 +337,28 @@ var _ = Describe("InferencePool Controller", func() {
 			}, timeout, interval).Should(BeTrue())
 
 			Expect(k8sClient.Delete(ctx, pool)).Should(Succeed())
+		})
+	})
+
+	Context("When generating model loading configuration", func() {
+		It("Should only warm models for eager pools", func() {
+			reconciler := &InferencePoolReconciler{}
+			pool := &antflyaiv1alpha1.InferencePool{
+				Spec: antflyaiv1alpha1.InferencePoolSpec{
+					Models: antflyaiv1alpha1.ModelConfig{
+						Preload: []antflyaiv1alpha1.ModelSpec{{
+							Name: "test-model", Kind: antflyaiv1alpha1.ModelKindGenerator,
+						}},
+						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyLazy,
+					},
+				},
+			}
+			configJSON, err := reconciler.generateCompleteConfig(pool)
+			Expect(err).NotTo(HaveOccurred())
+			var config map[string]any
+			Expect(json.Unmarshal([]byte(configJSON), &config)).To(Succeed())
+			Expect(config).NotTo(HaveKey("preload"))
+			Expect(config["keep_alive"]).To(Equal("5m"))
 		})
 	})
 

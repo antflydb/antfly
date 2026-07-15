@@ -147,7 +147,8 @@ type InferencePoolSpec struct {
 
 // ModelConfig defines model loading configuration
 type ModelConfig struct {
-	// Preload lists models to preload on this pool
+	// Preload lists models to provision on this pool. Eager pools warm them at
+	// startup; lazy and bounded pools pull the artifacts but load on demand.
 	Preload []ModelSpec `json:"preload"`
 
 	// LoadingStrategy defines how models are loaded
@@ -192,12 +193,6 @@ type ModelSpec struct {
 	// +kubebuilder:validation:Enum=high;medium;low
 	// +kubebuilder:default=medium
 	Priority ModelPriority `json:"priority,omitempty"`
-
-	// Strategy overrides the pool-level loading strategy for this model.
-	// If not specified, uses the pool's loadingStrategy.
-	// +optional
-	// +kubebuilder:validation:Enum=eager;lazy;bounded
-	Strategy LoadingStrategy `json:"strategy,omitempty"`
 }
 
 // ReplicaConfig defines replica scaling bounds

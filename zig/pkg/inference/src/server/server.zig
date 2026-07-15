@@ -214,6 +214,24 @@ pub const NodeConfig = struct {
     prompt_cache_resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver = null,
 };
 
+pub const GenerationBackend = native_backend_choice.Choice;
+
+fn generationBackendFromPriority(priority: ?[]const backends_mod.BackendType) GenerationBackend {
+    const configured = priority orelse return .auto;
+    for (configured) |backend| {
+        if (!backend.available()) continue;
+        return switch (backend) {
+            .native => .native,
+            .onnx => .onnx,
+            .metal => .metal,
+            .cuda => .cuda,
+            .pjrt => .pjrt,
+            .webgpu => .webgpu,
+        };
+    }
+    return .auto;
+}
+
 pub const WarmModelKind = enum {
     generator,
     embedder,
@@ -245,6 +263,7 @@ const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
 
 const GenerateBackendSelection = struct {
     native_choice: native_backend_choice.Choice = .auto,
+    override_model_loading: bool = false,
     compiled_partition_backend: ?ops.BackendKind = null,
     compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = .partitioned,
     graph_mode_requested: bool = false,
@@ -256,10 +275,19 @@ fn parseGenerateBackendSelection(
     mode_value: ?[]const u8,
     compiled_target_value: ?[]const u8,
 ) !GenerateBackendSelection {
+    return parseGenerateBackendSelectionWithDefault(backend_value, mode_value, compiled_target_value, .auto);
+}
+
+fn parseGenerateBackendSelectionWithDefault(
+    backend_value: ?api.ModelBackend,
+    mode_value: ?[]const u8,
+    compiled_target_value: ?[]const u8,
+    default_choice: GenerationBackend,
+) !GenerateBackendSelection {
     const choice = if (backend_value) |value|
         modelBackendToNativeChoice(value)
     else
-        native_backend_choice.Choice.auto;
+        default_choice;
     try native_backend_choice.validate(choice);
 
     var eager_mode_requested = false;
@@ -287,6 +315,7 @@ fn parseGenerateBackendSelection(
 
     return .{
         .native_choice = choice,
+        .override_model_loading = backend_value != null and choice != .auto,
         .compiled_partition_backend = explicit_partition_backend,
         .compiled_attachment_target = compiled_attachment_target,
         .graph_mode_requested = compiled_mode_requested,
@@ -316,8 +345,8 @@ fn modelBackendToNativeChoice(value: api.ModelBackend) native_backend_choice.Cho
         .native => .native,
         .metal => .metal,
         .cuda => .cuda,
-        .xla => .xla,
-        .webgpu, .wasm => .webgpu,
+        .pjrt => .pjrt,
+        .webgpu => .webgpu,
     };
 }
 
@@ -335,7 +364,7 @@ fn singleBackendPreference(backend: backends_mod.BackendType) []const backends_m
         .metal => &.{.metal},
         .cuda => &.{.cuda},
         .pjrt => &.{.pjrt},
-        .wasm => &.{.wasm},
+        .webgpu => &.{.webgpu},
     };
 }
 
@@ -922,7 +951,7 @@ pub const Node = struct {
             .native => .native,
             .metal => .metal,
             .cuda => .cuda,
-            .pjrt, .onnx, .wasm => return error.UnsupportedGeneratorProvider,
+            .pjrt, .onnx, .webgpu => return error.UnsupportedGeneratorProvider,
         };
         const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
         const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
@@ -2466,7 +2495,12 @@ pub const Node = struct {
             .prompt_cache_enabled = self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and prompt_cache_key != null and !want_stream,
             .prompt_cache_key = prompt_cache_key,
         };
-        const backend_selection = parseGenerateBackendSelection(body.backend, body.mode, body.compiled_target) catch |err| {
+        const backend_selection = parseGenerateBackendSelectionWithDefault(
+            body.backend,
+            body.mode,
+            body.compiled_target,
+            generationBackendFromPriority(self.config.backend_priority),
+        ) catch |err| {
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = switch (err) {
@@ -2478,7 +2512,7 @@ pub const Node = struct {
         };
         const allow_onnx = effective_draft_model_name == null and
             !backend_selection.graph_mode_requested and
-            (body.backend == null or backend_selection.native_choice == .onnx);
+            (backend_selection.native_choice == .auto or backend_selection.native_choice == .onnx);
 
         if (body.response_format) |rf| {
             if (std.mem.eql(u8, rf.type, "json_object")) {
@@ -2723,7 +2757,7 @@ pub const Node = struct {
         }
 
         // Fall back to native generation (CPU/GPU GPT arch forward pass).
-        const model = if (backend_selection.native_choice != .auto) blk: {
+        const model = if (backend_selection.override_model_loading) blk: {
             var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
             configureGenerateBackendPreference(&request_session_manager, backend_selection);
             break :blk self.model_manager.loadFromDirWithPreferredBackendsForRequest(request_id, model_path, request_session_manager.preferred_backends, false) catch |err|
@@ -2759,7 +2793,7 @@ pub const Node = struct {
             .cuda => .cuda,
             .pjrt => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected PJRT backend in native generation path" }),
             .onnx => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected ONNX backend in native generation path" }),
-            .wasm => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected WASM backend in server generation path" }),
+            .webgpu => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected WebGPU backend in server generation path" }),
         };
         const kv_dtype = if (config.cache_dtype) |name|
             runtime.kv.pool.parseKvDType(name) orelse
@@ -2806,7 +2840,7 @@ pub const Node = struct {
             const plugin_path = pjrt_plugin_path orelse
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
-                    .message = "xla backend requires TERMITE_XLA_PLUGIN or TERMITE_PJRT_PLUGIN",
+                    .message = "pjrt backend requires ANTFLY_INFERENCE_PJRT_PLUGIN or PJRT_PLUGIN_PATH",
                 });
             pjrt_client = pjrt_lib.pjrt.Client.init(plugin_path) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
@@ -2830,7 +2864,7 @@ pub const Node = struct {
                     }
                 }
                 if (load_draft_backend) {
-                    const draft_model = if (backend_selection.native_choice != .auto) blk: {
+                    const draft_model = if (backend_selection.override_model_loading) blk: {
                         var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
                         configureGenerateBackendPreference(&request_session_manager, backend_selection);
                         break :blk self.model_manager.loadFromDirWithPreferredBackendsForRequest(request_id, draft_model_path, request_session_manager.preferred_backends, false) catch |err|
@@ -3286,7 +3320,7 @@ pub const Node = struct {
         if (body.compiled_target != null) return .{ .code = "UNSUPPORTED_COMPILED_TARGET", .message = "batch generation does not support compiled_target yet", .retryable = false };
         if (body.backend) |backend| switch (backend) {
             .auto, .native, .metal, .cuda => {},
-            .onnx, .xla, .webgpu, .wasm => return .{ .code = "UNSUPPORTED_BACKEND", .message = "batch generation requires a native backend", .retryable = false },
+            .onnx, .pjrt, .webgpu => return .{ .code = "UNSUPPORTED_BACKEND", .message = "batch generation requires a native backend", .retryable = false },
         };
         if (generateRequestHasNonTextContentParts(body)) {
             return .{ .code = "UNSUPPORTED_MULTIMODAL", .message = "batch generation currently supports text-only native requests", .retryable = false };
@@ -3506,7 +3540,12 @@ pub const Node = struct {
                 pending[first_idx] = false;
                 continue;
             };
-            const selection = parseGenerateBackendSelection(first_body.backend, first_body.mode, first_body.compiled_target) catch {
+            const selection = parseGenerateBackendSelectionWithDefault(
+                first_body.backend,
+                first_body.mode,
+                first_body.compiled_target,
+                generationBackendFromPriority(self.config.backend_priority),
+            ) catch {
                 results[first_idx].@"error" = .{ .code = "INVALID_REQUEST", .message = "unsupported backend", .retryable = false };
                 pending[first_idx] = false;
                 continue;
@@ -3525,7 +3564,7 @@ pub const Node = struct {
                 try group_indices.append(ctx.allocator, idx);
             }
 
-            const model = if (selection.native_choice != .auto) blk: {
+            const model = if (selection.override_model_loading) blk: {
                 var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
                 configureGenerateBackendPreference(&request_session_manager, selection);
                 break :blk self.model_manager.loadFromDirWithPreferredBackendsForRequest(group_request_id, model_path, request_session_manager.preferred_backends, false) catch |err| {
@@ -7261,6 +7300,27 @@ test "generate backend selection keeps compiled mode explicit" {
 
     try std.testing.expectError(error.InvalidGenerateMode, parseGenerateBackendSelection(null, "graph", null));
     try std.testing.expectError(error.InvalidCompiledTarget, parseGenerateBackendSelection(null, "compiled", "full"));
+}
+
+test "generate backend selection follows shared priority" {
+    const default_backend = generationBackendFromPriority(&.{ .pjrt, .native });
+    const selection = try parseGenerateBackendSelectionWithDefault(
+        null,
+        null,
+        null,
+        default_backend,
+    );
+    try std.testing.expect(!selection.override_model_loading);
+    if (build_options.enable_pjrt) {
+        try std.testing.expectEqual(native_backend_choice.Choice.pjrt, selection.native_choice);
+        try std.testing.expectEqual(@as(?ops.BackendKind, .pjrt), selection.compiled_partition_backend);
+    } else if (build_options.enable_native) {
+        try std.testing.expectEqual(native_backend_choice.Choice.native, selection.native_choice);
+        try std.testing.expectEqual(@as(?ops.BackendKind, null), selection.compiled_partition_backend);
+    } else {
+        try std.testing.expectEqual(native_backend_choice.Choice.auto, selection.native_choice);
+        try std.testing.expectEqual(@as(?ops.BackendKind, null), selection.compiled_partition_backend);
+    }
 }
 
 test "singleBackendPreference is strict" {
