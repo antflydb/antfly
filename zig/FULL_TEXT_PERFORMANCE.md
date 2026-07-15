@@ -2399,10 +2399,52 @@ zero obsolete files, and zero untracked files.
 
 This accepts the 750K production gate for batched deletion, record-internal
 subchunking, family-partitioned primary runs, bounded memory, disk accounting,
-and both graceful and crash recovery. The next validations are a fresh 2.2M
-gate followed by the full 5.03M product gate. No Quickwit corpus or comparator
-recollection is required; its archived authoritative result remains the
-comparison baseline.
+and both graceful and crash recovery.
+
+The first fresh 2.2M attempt then exposed an independent accounting CPU bug.
+`StreamingEncoder.workingSetBytes()` was invoked after each appended LSM table
+entry, but recomputed completed-block-owned heap by traversing every accumulated
+block. A live sample at 483,455 documents put 1,187 of 2,088 samples in that
+accounting function. Thus a production `ResourceManager` observation had made
+large flush and compaction builders quadratic. The encoder now increments the
+completed-block heap subtotal exactly when it publishes a block, making each
+observation O(1) without weakening or sampling resource accounting. The full
+LSM suite still passes 255 tests with one platform skip, zero failures, and zero
+leaks. A verification sample at the same scale contained no
+`observeBuilderWorkingSet` hot-stack entries.
+
+The clean post-fix 2.2M gate completed upload plus `full_index` in 357.528
+seconds at 6,153 documents/second with zero backpressure. The timed run included
+a diagnostic stack sample; its progress had reached 2,155,897 documents in
+306.145 seconds before the final batches and synchronization. This is a strict
+improvement over the earlier roughly 351-second upload whose final synchronization
+then remained incomplete for more than 600 additional seconds.
+
+Before restart, lifetime physical footprint peaked at 1,437,079,384 bytes.
+Attributed peaks included 373,466,878 bytes of `lsm.in_memory_state`,
+215,536,079 bytes of `lsm.table_builder_working_set`, 100,663,296 bytes of
+`lsm.compaction_work`, 546,083 bytes of `derived.replay_window`, 75,697,562
+bytes of `full_text.build_working_set`, 1,623,217,985 bytes of evictable
+file-backed `full_text.segment_residency`, and 246,270,052 bytes of text-merge
+buffers. The settled production-tier segment state occupied 6,103,342,883
+bytes: 3,172,168,491 bytes in 15 primary runs, 39,091,202 bytes of primary WAL,
+2,891,854,257 bytes in 65 text segments, and 171,970 bytes in text-index runs.
+All primary runs obeyed the namespace/key-family partition, with zero obsolete
+or untracked files.
+
+Exact correctness was 2,200,000 `match_all` hits and 7,875 `alpha` hits before
+restart and after both graceful and forced process-loss restart. Crash recovery
+checkpointed the primary WAL to 56 bytes and flushed mutable state, leaving a
+6,073,791,604-byte root with 19 partition-conforming primary runs and still
+zero obsolete or untracked files. Recovery's process physical-footprint peak
+was 2,632,374,032 bytes and settled to 790,319,616 bytes; the full-corpus gate
+must preserve this restart measurement rather than reporting ingest memory
+alone.
+
+This accepts the 2.2M production gate. The next scale validation is the full
+5.03M product gate, followed by the planned concurrency/freshness matrix. No
+Quickwit corpus or comparator recollection is required; its archived
+authoritative result remains the comparison baseline.
 
 ## Result Artifact
 

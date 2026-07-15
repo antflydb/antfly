@@ -1012,6 +1012,9 @@ pub const StreamingEncoder = struct {
     encoded_filter_bytes: std.ArrayListUnmanaged(u8) = .empty,
     block_hashes: std.ArrayListUnmanaged([2]u64) = .empty,
     block_prefix_hashes: std.ArrayListUnmanaged([2]u64) = .empty,
+    /// Heap owned by completed block metadata. Keep this incrementally so
+    /// resource accounting remains O(1) as a streaming table grows.
+    blocks_owned_heap_bytes: u64 = 0,
     entry_count_offset: usize,
     entry_data_len_offset: usize,
     entry_data_start: usize,
@@ -1087,7 +1090,7 @@ pub const StreamingEncoder = struct {
         bytes +|= capacityBytes(u8, self.encoded_filter_bytes.capacity);
         bytes +|= capacityBytes([2]u64, self.block_hashes.capacity);
         bytes +|= capacityBytes([2]u64, self.block_prefix_hashes.capacity);
-        for (self.blocks.items) |block| bytes +|= ownedEncodedBlockMetaHeapBytes(block);
+        bytes +|= self.blocks_owned_heap_bytes;
         if (self.block_smallest_namespace_name) |name| bytes +|= name.len;
         bytes +|= self.block_smallest_key.len;
         if (self.block_largest_namespace_name) |name| bytes +|= name.len;
@@ -1298,6 +1301,7 @@ pub const StreamingEncoder = struct {
             .prefix_filter = block_prefix_filter,
             .hash_slots = hash_slots,
         });
+        self.blocks_owned_heap_bytes +|= ownedEncodedBlockMetaHeapBytes(self.blocks.items[self.blocks.items.len - 1]);
 
         self.block_bytes.clearRetainingCapacity();
         self.block_hashes.clearRetainingCapacity();
