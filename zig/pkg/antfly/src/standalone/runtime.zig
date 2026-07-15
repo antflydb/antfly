@@ -138,6 +138,10 @@ const CliConfig = struct {
     ha_startup_aggregate_sha256: ?[]const u8 = null,
     ha_startup_seed_receipt_sha256: ?[]const u8 = null,
     ha_startup_capture_receipt_sha256: ?[]const u8 = null,
+    ha_startup_materialized_receipt_sha256: ?[]const u8 = null,
+    ha_startup_materialized_aggregate_sha256: ?[]const u8 = null,
+    ha_startup_target_local_node_id: ?u64 = null,
+    ha_startup_target_replica_id: ?u64 = null,
     ha_cluster_id: ?u64 = null,
     ha_shard_id: ?u64 = null,
     ha_table_id: ?u64 = null,
@@ -3039,6 +3043,22 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.ha_startup_capture_receipt_sha256 = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--ha-startup-materialized-receipt-sha256")) {
+            cfg.ha_startup_materialized_receipt_sha256 = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-startup-materialized-aggregate-sha256")) {
+            cfg.ha_startup_materialized_aggregate_sha256 = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-startup-target-local-node-id")) {
+            cfg.ha_startup_target_local_node_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-startup-target-replica-id")) {
+            cfg.ha_startup_target_replica_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--ha-cluster-id")) {
             cfg.ha_cluster_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
@@ -3301,7 +3321,11 @@ fn haStartupGateRequested(cli: CliConfig) bool {
         cli.ha_startup_manifest_sha256 != null or
         cli.ha_startup_aggregate_sha256 != null or
         cli.ha_startup_seed_receipt_sha256 != null or
-        cli.ha_startup_capture_receipt_sha256 != null;
+        cli.ha_startup_capture_receipt_sha256 != null or
+        cli.ha_startup_materialized_receipt_sha256 != null or
+        cli.ha_startup_materialized_aggregate_sha256 != null or
+        cli.ha_startup_target_local_node_id != null or
+        cli.ha_startup_target_replica_id != null;
 }
 
 fn haSyncPolicyRequested(cli: CliConfig) bool {
@@ -3431,6 +3455,21 @@ fn haStartupExpectationFromCli(cli: CliConfig) !?antfly.ha.seed_activation.Start
     };
     const capture_receipt_sha256 = (try optionalHAStartupDigest(cli.ha_startup_capture_receipt_sha256)) orelse
         return error.HAStartupCaptureReceiptSHA256Missing;
+    const materialized_receipt_sha256 = (try optionalHAStartupDigest(cli.ha_startup_materialized_receipt_sha256)) orelse
+        return error.HAStartupMaterializedReceiptSHA256Missing;
+    const materialized_aggregate_sha256 = (try optionalHAStartupDigest(cli.ha_startup_materialized_aggregate_sha256)) orelse
+        return error.HAStartupMaterializedAggregateSHA256Missing;
+    const target_local_node_id = cli.ha_startup_target_local_node_id orelse
+        return error.HAStartupTargetLocalNodeIDMissing;
+    if (target_local_node_id == 0) return error.HAStartupTargetLocalNodeIDInvalid;
+    if (target_local_node_id != (cli.local_node_id orelse 1)) return error.HAStartupTargetLocalNodeIDMismatch;
+    const target_replica_id = cli.ha_startup_target_replica_id orelse
+        return error.HAStartupTargetReplicaIDMissing;
+    if (target_replica_id == 0) return error.HAStartupTargetReplicaIDInvalid;
+    // Standalone owns one local replica whose identity is fixed at 1. Opening
+    // a generation materialized for any other replica would silently point the
+    // catalog at a topology this runtime cannot own.
+    if (target_replica_id != 1) return error.HAStartupTargetReplicaIDMismatch;
     return .{
         .target_root = try requireHAPath(cli.ha_startup_target_root, error.HAStartupTargetRootMissing, error.HAStartupTargetRootInvalid),
         .expected = .{
@@ -3445,6 +3484,10 @@ fn haStartupExpectationFromCli(cli: CliConfig) !?antfly.ha.seed_activation.Start
         .aggregate_sha256 = try optionalHAStartupDigest(cli.ha_startup_aggregate_sha256),
         .seed_receipt_sha256 = try optionalHAStartupDigest(cli.ha_startup_seed_receipt_sha256),
         .capture_receipt_sha256 = capture_receipt_sha256,
+        .materialized_receipt_sha256 = materialized_receipt_sha256,
+        .materialized_aggregate_sha256 = materialized_aggregate_sha256,
+        .target_local_node_id = target_local_node_id,
+        .target_replica_id = target_replica_id,
     };
 }
 
@@ -3781,6 +3824,17 @@ fn printUsage() void {
         \\  --ha-standby-node-id <id>             HA standby node id for typed admin receipts
         \\  --ha-standby-upstream-url <url>       Upstream primary URL for continuous standby pull/apply
         \\  --ha-standby-slot <name>              Upstream replication slot name for continuous standby pull/apply
+        \\  --ha-startup-target-root <path>       Activated standby generation root; requires the complete startup evidence set
+        \\  --ha-startup-topology-id <id>         Exact topology id bound into the activation receipt
+        \\  --ha-startup-topology-generation <n>  Exact topology generation bound into the activation receipt
+        \\  --ha-startup-generation <id>          Exact activated seed generation
+        \\  --ha-startup-target-pvc-name <name>   Exact target PVC name bound into the activation receipt
+        \\  --ha-startup-target-pvc-uid <uid>     Exact target PVC UID bound into the activation receipt
+        \\  --ha-startup-capture-receipt-sha256 <sha256> Exact runtime capture authority digest
+        \\  --ha-startup-materialized-receipt-sha256 <sha256> Exact materialized topology receipt digest
+        \\  --ha-startup-materialized-aggregate-sha256 <sha256> Exact materialized file aggregate digest
+        \\  --ha-startup-target-local-node-id <id> Exact local node id used to materialize the live generation
+        \\  --ha-startup-target-replica-id <id>   Exact replica id used to materialize the live generation
         \\  --ha-cluster-id <id>                  HA replicated cluster id
         \\  --ha-shard-id <id>                    HA replicated shard id (default: 0)
         \\  --ha-table-id <id>                    HA replicated table id (default: 0)
@@ -4438,6 +4492,8 @@ test "parse cli accepts HA primary retention policy flags" {
 
 test "parse cli accepts HA standby runtime flags" {
     var argv = [_][*:0]const u8{
+        "--id",
+        "7",
         "--ha-standby-log",
         "/tmp/ha-standby.log",
         "--ha-standby-progress",
@@ -4549,6 +4605,14 @@ test "parse cli accepts HA standby runtime flags" {
     var missing_target_replica = cfg;
     missing_target_replica.ha_startup_target_replica_id = null;
     try std.testing.expectError(error.HAStartupTargetReplicaIDMissing, haStartupExpectationFromCli(missing_target_replica));
+
+    var wrong_target_local_node = cfg;
+    wrong_target_local_node.ha_startup_target_local_node_id = 8;
+    try std.testing.expectError(error.HAStartupTargetLocalNodeIDMismatch, haStartupExpectationFromCli(wrong_target_local_node));
+
+    var wrong_target_replica = cfg;
+    wrong_target_replica.ha_startup_target_replica_id = 2;
+    try std.testing.expectError(error.HAStartupTargetReplicaIDMismatch, haStartupExpectationFromCli(wrong_target_replica));
 }
 
 test "standalone HA standby replication flags require upstream and slot" {
