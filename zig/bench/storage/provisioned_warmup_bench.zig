@@ -126,7 +126,7 @@ fn runScenario(alloc: std.mem.Allocator, cfg: Config, operation: Operation, warm
 
     var server = initBenchServer(alloc, std.mem.span(path));
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
 
     var summary: Summary = .{
         .operation = operation,
