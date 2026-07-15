@@ -14510,6 +14510,7 @@ pub const DB = struct {
         return try db_query_search.collectExplicitTextStats(alloc, requests, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
+            .load_many_stored = loadStoredSearchDocumentManyCallback,
         });
     }
 

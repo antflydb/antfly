@@ -17381,6 +17381,7 @@ test "explicit text stats requests carry resolved doc filters and apply exact pr
     defer distributed_stats_mod.deinitTextFieldStats(alloc, stats);
     try std.testing.expectEqual(@as(usize, 1), stats.len);
     try std.testing.expectEqual(@as(u32, 1), stats[0].global_doc_count);
+    try std.testing.expectEqual(@as(u64, 2), stats[0].global_total_field_len);
     try std.testing.expectEqual(@as(u32, 1), stats[0].termDocFreq("alpha").?);
     try std.testing.expectEqual(@as(u32, 1), stats[0].termDocFreq("beta").?);
     try std.testing.expectEqual(@as(u32, 0), stats[0].termDocFreq("gamma").?);
