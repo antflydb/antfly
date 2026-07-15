@@ -489,6 +489,44 @@ def _wait_for_promoted_write_check(
     )
 
 
+def _wait_for_promoted_primary_missing_lookup(
+    cluster: HACluster,
+    table_name: str,
+    key: str,
+    *,
+    timeout_s: float = 20.0,
+) -> requests.Response:
+    """Wait for the asynchronous promotion handoff to reach the public gate."""
+    deadline = time.monotonic() + timeout_s
+    last_response: str | None = None
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        if cluster.standby.proc is not None and cluster.standby.proc.poll() is not None:
+            break
+        try:
+            response = requests.get(
+                f"{cluster.standby.url}{DB_API_ROOT}{lookup_key_path(table_name, key)}",
+                timeout=30,
+            )
+        except requests.RequestException as err:
+            last_error = err
+            time.sleep(0.1)
+            continue
+        if response.status_code == 404:
+            return response
+        last_response = f"{response.status_code}: {response.text}"
+        if response.status_code != 503 or response.text != "read requires primary":
+            cluster.standby._check(response)
+            raise AssertionError(f"promoted primary unexpectedly contained {key!r}")
+        time.sleep(0.1)
+    exit_code = cluster.standby.proc.poll() if cluster.standby.proc is not None else None
+    raise AssertionError(
+        "promoted standby did not publish primary read authority before the deadline; "
+        f"exit_code={exit_code}; last_response={last_response}; last_error={last_error}\n"
+        f"{cluster.debug_logs()}"
+    )
+
+
 def _wait_for_standby_lookup(
     cluster: HACluster,
     table_name: str,
@@ -990,7 +1028,9 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
         action_kind="fence_acquire",
         target="standby-a",
         state="applied",
-        node_id="standby-a",
+        # Receipts identify the node-local endpoint that performed the action;
+        # the promoted standby remains the separately asserted action target.
+        node_id="primary-a",
     )
     assert primary_fence["receipt"]["promoted_node_id"] == "standby-a"
     fenced_write_check = ha_cluster.primary.admin_post(
@@ -1070,10 +1110,20 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
         ha_cluster.primary.lookup_key(table_name, "doc:old-primary", consistency="stale")
     assert missing_old_primary_doc.value.response is not None
     assert missing_old_primary_doc.value.response.status_code == 404
-    with pytest.raises(requests.HTTPError) as missing_promoted_primary_doc:
-        ha_cluster.standby.lookup_key(table_name, "doc:old-primary")
-    assert missing_promoted_primary_doc.value.response is not None
-    assert missing_promoted_primary_doc.value.response.status_code == 404
+    missing_promoted_primary_doc = _wait_for_promoted_primary_missing_lookup(
+        ha_cluster,
+        table_name,
+        "doc:old-primary",
+    )
+    assert missing_promoted_primary_doc.status_code == 404
+
+    ha_cluster.standby.batch_write(table_name, {"doc:promoted": {"title": "promoted"}})
+    promoted_doc = ha_cluster.standby.lookup_key(table_name, "doc:promoted")
+    assert promoted_doc["title"] == "promoted"
+    with pytest.raises(requests.HTTPError) as missing_former_primary_copy:
+        ha_cluster.primary.lookup_key(table_name, "doc:promoted", consistency="stale")
+    assert missing_former_primary_copy.value.response is not None
+    assert missing_former_primary_copy.value.response.status_code == 404
 
 
 def test_forced_promotion_receipt_records_lossy_runtime_evidence(ha_cluster: HACluster):
