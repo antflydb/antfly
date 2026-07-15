@@ -91,10 +91,23 @@ pub const ObjectStore = struct {
             return;
         }
 
-        var result = try self.opened.client.putObject(self.opened.bucket, key, encoded, .{
+        var result = self.opened.client.putObject(self.opened.bucket, key, encoded, .{
             .content_type = "application/octet-stream",
             .if_none_match = true,
-        });
+        }) catch |err| switch (err) {
+            error.PreconditionFailed => {
+                // Immutable manifests are keyed by namespace and version. Two
+                // publishers may both observe a missing key before one wins
+                // the conditional create. Treat the loser as idempotent only
+                // when the winner published exactly the same manifest.
+                const existing = (try self.tryGetEncoded(self.alloc, key)) orelse
+                    return error.PreconditionFailed;
+                defer self.alloc.free(existing);
+                if (!std.mem.eql(u8, existing, encoded)) return error.ManifestVersionAlreadyExists;
+                return;
+            },
+            else => return err,
+        };
         defer result.deinit(self.alloc);
     }
 
@@ -328,6 +341,10 @@ test "objectstore-backed manifest store supports publish and list" {
     defer manifest.deinit(std.testing.allocator);
 
     try store.put(manifest);
+    try store.put(manifest);
+    manifest.built_at_ns = 11;
+    try std.testing.expectError(error.ManifestVersionAlreadyExists, store.put(manifest));
+    manifest.built_at_ns = 10;
     try std.testing.expect(try store.compareAndSwapHead("docs", null, 1));
     manifest.version = 2;
     try store.put(manifest);

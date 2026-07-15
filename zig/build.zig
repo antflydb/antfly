@@ -3119,31 +3119,31 @@ pub fn build(b: *std.Build) void {
     const lite_native_test_step = b.step("lite-native-test", "Run Lite native backend tests");
     lite_native_test_step.dependOn(&run_lite_native_tests.step);
 
-    const lite_cli_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/lite_cli_test.zig"),
+    const cmd_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/cmd_test.zig"),
         .target = target,
         .optimize = optimize,
     });
-    lite_cli_test_mod.addImport("antfly-zig", lib_mod);
-    lite_cli_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
-    lite_cli_test_mod.addImport("httpx", httpx_mod);
-    lite_cli_test_mod.addImport("antfly_vellum", vellum_mod);
-    lite_cli_test_mod.addImport("raft_engine", raft_engine_mod);
-    lite_cli_test_mod.addImport("structlog", structlog_mod);
-    lite_cli_test_mod.addImport("antfly_platform", platform_mod);
-    lite_cli_test_mod.addImport("handlebars", handlebars_mod);
-    lite_cli_test_mod.addOptions("build_options", build_options);
-    const lite_cli_tests = b.addTest(.{
-        .root_module = lite_cli_test_mod,
-        .filters = &.{ "cmd.lite", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.mod" },
+    cmd_test_mod.addImport("antfly-zig", lib_mod);
+    cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
+    cmd_test_mod.addImport("httpx", httpx_mod);
+    cmd_test_mod.addImport("antfly_vellum", vellum_mod);
+    cmd_test_mod.addImport("raft_engine", raft_engine_mod);
+    cmd_test_mod.addImport("structlog", structlog_mod);
+    cmd_test_mod.addImport("antfly_platform", platform_mod);
+    cmd_test_mod.addImport("handlebars", handlebars_mod);
+    cmd_test_mod.addOptions("build_options", build_options);
+    const cmd_tests = b.addTest(.{
+        .root_module = cmd_test_mod,
+        .filters = &.{ "cmd.lite", "cmd.serverless", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.mod" },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_lite_cli_tests = b.addRunArtifact(lite_cli_tests);
-    const lite_cli_test_step = b.step("lite-cli-test", "Run Antfly Lite CLI tests");
-    lite_cli_test_step.dependOn(&run_lite_cli_tests.step);
+    const run_cmd_tests = b.addRunArtifact(cmd_tests);
+    const cmd_test_step = b.step("cmd-test", "Run Antfly command and client CLI tests");
+    cmd_test_step.dependOn(&run_cmd_tests.step);
 
     const lib_recall_default_filters = [_][]const u8{
         "HBC recall",
@@ -3409,6 +3409,7 @@ pub fn build(b: *std.Build) void {
         "data raft apply store applies delete operations into group state",
         "data raft apply store orders independent groups through separate shards",
         "data raft apply store skips persisted split commands in overlapping replay",
+        "data raft apply store reconciles exact split state ahead of its durable watermark",
         "data raft apply store seeds pre-raft snapshots once at reserved index zero",
         "group state range scan is allocation-failure safe",
         "db merge coordinator opt-in applies configured receiver identity namespace",
@@ -5108,7 +5109,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
     unit_test_step.dependOn(&run_capi_tests.step);
     unit_test_step.dependOn(&run_lite_native_tests.step);
-    unit_test_step.dependOn(&run_lite_cli_tests.step);
+    unit_test_step.dependOn(&run_cmd_tests.step);
     unit_test_step.dependOn(&run_lib_db_tests.step);
     unit_test_step.dependOn(&run_introducer_tests.step);
     unit_test_step.dependOn(&run_lib_db_text_query_tests.step);
@@ -7354,7 +7355,7 @@ pub fn build(b: *std.Build) void {
     const run_lite_core_main_tests = b.addRunArtifact(lite_core_main_tests);
     const lite_core_test_step = b.step("lite-core-test", "Run Antfly Lite core wrapper tests");
     lite_core_test_step.dependOn(&run_lite_core_main_tests.step);
-    lite_core_test_step.dependOn(&run_lite_cli_tests.step);
+    lite_core_test_step.dependOn(&run_cmd_tests.step);
     lite_core_test_step.dependOn(&run_lite_native_tests.step);
     lite_core_test_step.dependOn(&run_lite_capi_smoke.step);
     lite_core_test_step.dependOn(&run_lite_go_tests.step);
@@ -7384,7 +7385,7 @@ pub fn build(b: *std.Build) void {
     lite_full_step.dependOn(&install_lite_capi_lib.step);
     lite_full_step.dependOn(&install_lite_capi_header.step);
     lite_full_step.dependOn(&run_antfly_main_tests.step);
-    lite_full_step.dependOn(&run_lite_cli_tests.step);
+    lite_full_step.dependOn(&run_cmd_tests.step);
     lite_full_step.dependOn(&run_lite_native_tests.step);
     lite_full_step.dependOn(&run_lite_capi_smoke.step);
     lite_full_step.dependOn(&run_lite_go_tests.step);
@@ -7428,7 +7429,7 @@ pub fn build(b: *std.Build) void {
     lite_dev_step.dependOn(&install_lite_capi_header.step);
     lite_dev_step.dependOn(&run_antfly_main_tests.step);
     lite_dev_step.dependOn(&run_lite_core_main_tests.step);
-    lite_dev_step.dependOn(&run_lite_cli_tests.step);
+    lite_dev_step.dependOn(&run_cmd_tests.step);
     lite_dev_step.dependOn(&run_lite_native_tests.step);
     lite_dev_step.dependOn(&run_lite_capi_smoke.step);
     lite_dev_step.dependOn(&run_lite_go_tests.step);

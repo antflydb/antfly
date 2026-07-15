@@ -541,6 +541,13 @@ pub fn appendOperationEffects(
             try writes.append(alloc, .{ .key = range_key, .value = range_value });
         },
         .prepare_split => |split_key| {
+            if (split_state) |state| {
+                const already_prepared = switch (state.phase) {
+                    .prepare, .splitting, .finalizing => std.mem.eql(u8, state.split_key, split_key),
+                    .none, .rolling_back => false,
+                };
+                if (already_prepared) continue;
+            }
             const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
                 .phase = state.phase,
                 .split_key = state.split_key,
@@ -582,6 +589,14 @@ pub fn appendOperationEffects(
             try deletes.append(alloc, try alloc.dupe(u8, acknowledgement_key));
         },
         .start_split => |start| {
+            if (split_state) |state| {
+                const already_started = switch (state.phase) {
+                    .splitting, .finalizing => state.new_shard_id == start.new_shard_id and
+                        std.mem.eql(u8, state.split_key, start.split_key),
+                    .none, .prepare, .rolling_back => false,
+                };
+                if (already_started) continue;
+            }
             const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
                 .phase = state.phase,
                 .split_key = state.split_key,

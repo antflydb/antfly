@@ -14,6 +14,7 @@
 
 test {
     _ = @import("cmd/lite.zig");
+    _ = @import("cmd/serverless.zig");
     _ = @import("cmd/cli/backup.zig");
     _ = @import("cmd/cli/index.zig");
     _ = @import("cmd/cli/mod.zig");

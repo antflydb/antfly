@@ -1140,6 +1140,79 @@ test "data raft apply store skips persisted split commands in overlapping replay
     try std.testing.expectEqualStrings("doc:m", split_state.split_key);
 }
 
+test "data raft apply store reconciles exact split state ahead of its durable watermark" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-split-watermark-lag", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const prepare = try data_raft_batch.encode(std.testing.allocator, "docs", .{
+        .split_transition = .{
+            .kind = .prepare,
+            .destination_group_id = 222,
+            .split_key = "doc:m",
+        },
+    });
+    defer std.testing.allocator.free(prepare);
+    const range_entry = raft_engine.core.Entry{
+        .term = 1,
+        .index = 1,
+        .entry_type = .normal,
+        .data = @constCast("range:doc:a:doc:z"),
+    };
+    const prepare_entry = raft_engine.core.Entry{
+        .term = 1,
+        .index = 2,
+        .entry_type = .normal,
+        .data = prepare,
+    };
+
+    {
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer store.deinit();
+
+        const applied = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{ range_entry, prepare_entry });
+        defer std.testing.allocator.free(applied);
+        try store.snapshotBuilder().applyBatch(.{
+            .group_id = 221,
+            .commit_index = 2,
+            .entries_bytes = applied,
+        });
+
+        // Model the observed durable state: the lifecycle effect is visible
+        // while this projection's watermark still points at the prior entry.
+        const lagging = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{range_entry});
+        defer std.testing.allocator.free(lagging);
+        var key_buf: [128]u8 = undefined;
+        const key = try RaftApplyStore.keyForGroup(&key_buf, 221);
+        const value = try std.testing.allocator.alloc(u8, @sizeOf(u64) + lagging.len);
+        defer std.testing.allocator.free(value);
+        std.mem.writeInt(u64, value[0..8], 1, .little);
+        @memcpy(value[8..], lagging);
+        try store.store.put(key, value);
+    }
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    const replay = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{prepare_entry});
+    defer std.testing.allocator.free(replay);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 221,
+        .commit_index = 2,
+        .entries_bytes = replay,
+    });
+
+    const batch = (try store.latestBatch(221)) orelse return error.MissingDataBatch;
+    try std.testing.expectEqual(@as(u64, 2), batch.commit_index);
+    try std.testing.expectEqual(@as(u64, 2), batch.last_entry_index);
+    const split_state = (try store.currentSplitState(std.testing.allocator, 221)) orelse
+        return error.MissingSplitState;
+    defer shard_state_store.freeSplitState(std.testing.allocator, split_state);
+    try std.testing.expectEqual(shard_mod.SplitPhase.prepare, split_state.phase);
+    try std.testing.expectEqualStrings("doc:m", split_state.split_key);
+}
+
 test "data raft apply store seeds pre-raft snapshots once at reserved index zero" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
