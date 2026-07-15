@@ -2018,7 +2018,7 @@ func TestValidateCreate_HighAvailabilityAllowsExecutableActionsWithoutEveryStand
 }
 
 func TestValidateCreate_HighAvailabilityAllowsPortableSeedArtifact(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Standbys: []HAStandbySpec{{
@@ -2043,7 +2043,7 @@ func TestValidateCreate_HighAvailabilityAllowsPortableSeedArtifact(t *testing.T)
 }
 
 func TestValidateCreate_HighAvailabilityAllowsRuntimeOwnedSeedCapture(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Identity: &HAReplicationIdentitySpec{
@@ -2070,7 +2070,7 @@ func TestValidateCreate_HighAvailabilityAllowsRuntimeOwnedSeedCapture(t *testing
 }
 
 func TestValidateCreate_HighAvailabilityAllowsExactActivatedSeedStartupGate(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Identity: &HAReplicationIdentitySpec{
@@ -2084,7 +2084,7 @@ func TestValidateCreate_HighAvailabilityAllowsExactActivatedSeedStartupGate(t *t
 				RuntimeEligible:    false,
 				ReceiptMatchPolicy: HAReceiptMatchPolicyExact,
 				RequiredReceipt: &HARequiredSeedActivationReceipt{
-					TopologyID: "test-swarm-cluster", TopologyGeneration: 3, NodeID: "standby-a", SlotName: "standby-a",
+					TopologyID: "test-standalone-cluster", TopologyGeneration: 3, NodeID: "standby-a", SlotName: "standby-a",
 					Generation: "prod-standby-a-10", TargetPVCName: "standby-a-data",
 					ManifestSHA256: strings.Repeat("a", 64),
 				},
@@ -2108,7 +2108,7 @@ func TestValidateCreate_HighAvailabilityAllowsExactActivatedSeedStartupGate(t *t
 
 func TestValidateCreate_HighAvailabilityAllowsSharedTopologyAnnotationAcrossRuntimeCRs(t *testing.T) {
 	targetOnly := false
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Name = "antflydb-standby-a"
 	cluster.Annotations = map[string]string{"antfly.io/ha-topology-id": "antflydb"}
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
@@ -2159,7 +2159,7 @@ func TestValidateCreate_HighAvailabilityAllowsSharedTopologyAnnotationAcrossRunt
 }
 
 func TestValidateCreate_HighAvailabilityAllowsExplicitSuspendStartupGate(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode:     HAModeHotStandby,
 		Identity: &HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 2, Epoch: 2, CurrentPrimaryID: "primary-b"},
@@ -2194,7 +2194,7 @@ func TestValidateCreate_HighAvailabilityAllowsExplicitSuspendStartupGate(t *test
 }
 
 func TestValidateCreate_HighAvailabilityRejectsUnboundStartupGate(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode:     HAModeHotStandby,
 		Identity: &HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 1, Epoch: 1, CurrentPrimaryID: "primary-a"},
@@ -2245,7 +2245,7 @@ func TestValidateCreate_HighAvailabilityRejectsUnboundStartupGate(t *testing.T) 
 }
 
 func TestValidateCreate_HighAvailabilityRejectsUnsafeSeedArtifact(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Standbys: []HAStandbySpec{{
@@ -2352,7 +2352,7 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 }
 
 func TestValidateCreate_HighAvailabilityComparesRetryBaseWithEffectiveDefaultMaximum(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	retryBaseSeconds := int32(121)
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode:  HAModeHotStandby,
@@ -2366,7 +2366,7 @@ func TestValidateCreate_HighAvailabilityComparesRetryBaseWithEffectiveDefaultMax
 }
 
 func TestValidateCreate_HighAvailabilityComparesRetryMaximumWithEffectiveDefaultBase(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	retryMaxSeconds := int32(4)
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode:  HAModeHotStandby,
@@ -2380,7 +2380,7 @@ func TestValidateCreate_HighAvailabilityComparesRetryMaximumWithEffectiveDefault
 }
 
 func TestValidateUpdate_HighAvailabilityRetryGenerationCannotDecrease(t *testing.T) {
-	oldCluster := baseSwarmCluster()
+	oldCluster := baseStandaloneCluster()
 	oldCluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode:  HAModeHotStandby,
 		Admin: &HAAdminSpec{RetryGeneration: 2},
