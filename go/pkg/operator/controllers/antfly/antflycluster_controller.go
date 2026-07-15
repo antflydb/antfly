@@ -5647,11 +5647,14 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
 			return true, err
 		}
+		// validateHASeedCaptureBinding rejects non-positive generations, and every
+		// positive int64 value is exactly representable as uint64.
+		topologyGeneration := uint64(action.TopologyGeneration) //nolint:gosec // G115: validated positive int64 widens without overflow
 		body := adminsdk.SeedArtifactCaptureRequest{
 			SlotName:           action.SlotName,
 			Generation:         action.SeedArtifactGeneration,
 			TopologyId:         action.TopologyID,
-			TopologyGeneration: uint64(action.TopologyGeneration),
+			TopologyGeneration: topologyGeneration,
 			NodeId:             action.TopologyNodeID,
 			TargetPvcName:      action.TargetPVCName,
 			TargetPvcUid:       action.TargetPVCUID,
