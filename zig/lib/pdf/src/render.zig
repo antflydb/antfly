@@ -384,11 +384,17 @@ fn renderPageContentRgbaInBoxAlloc(
     const page_h = @max(1.0, page_box.max_y - page_box.min_y);
     const width = ceilPositiveToUsize(page_w, 1);
     const height = ceilPositiveToUsize(page_h, 1);
+    const pixel_count = std.math.mul(usize, width, height) catch return error.RenderedPageTooLarge;
+    if (pixel_count > 100_000_000) return error.RenderedPageTooLarge;
+    const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.RenderedPageTooLarge;
 
-    const rgba = try alloc.alloc(u8, width * height * 4);
+    const rgba = try alloc.alloc(u8, rgba_len);
     @memset(rgba, 0xff);
     var plan = try buildRenderPlanAlloc(alloc, text_runs, image_runs, shading_runs, pattern_runs, shape_runs);
     defer plan.deinit(alloc);
+    const canvas_count = std.math.add(usize, plan.groups.len, 1) catch return error.RenderedPageTooLarge;
+    const planned_pixels = std.math.mul(usize, pixel_count, canvas_count) catch return error.RenderedPageTooLarge;
+    if (planned_pixels > 200_000_000) return error.RenderedPageTooLarge;
     try renderGroupChildrenAlloc(alloc, rgba, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, &plan, 0, false);
 
     return .{ .rgba = rgba, .width = width, .height = height };

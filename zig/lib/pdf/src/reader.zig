@@ -1160,6 +1160,71 @@ fn extractShapeRunsFromContentAppendWithState(
     }
 }
 
+const EncryptionContext = struct {
+    file_key: [16]u8,
+};
+
+const pdf_password_padding = [_]u8{
+    0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41,
+    0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08,
+    0x2e, 0x2e, 0x00, 0xb6, 0xd0, 0x68, 0x3e, 0x80,
+    0x2f, 0x0c, 0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a,
+};
+
+fn rc4Crypt(key: []const u8, bytes: []u8) void {
+    var state: [256]u8 = undefined;
+    for (&state, 0..) |*value, i| value.* = @intCast(i);
+    var j: u8 = 0;
+    for (0..256) |i| {
+        j +%= state[i] +% key[i % key.len];
+        std.mem.swap(u8, &state[i], &state[j]);
+    }
+    var i: u8 = 0;
+    j = 0;
+    for (bytes) |*byte| {
+        i +%= 1;
+        j +%= state[i];
+        std.mem.swap(u8, &state[i], &state[j]);
+        byte.* ^= state[state[i] +% state[j]];
+    }
+}
+
+fn decryptAesV2Alloc(alloc: Allocator, encrypted: []const u8, key: [16]u8) ![]u8 {
+    if (encrypted.len < 32 or (encrypted.len - 16) % 16 != 0) return error.InvalidEncryptedPdf;
+    const ciphertext = encrypted[16..];
+    var plaintext = try alloc.alloc(u8, ciphertext.len);
+    errdefer alloc.free(plaintext);
+    const aes = std.crypto.core.aes.Aes128.initDec(key);
+    var previous: [16]u8 = encrypted[0..16].*;
+    var offset: usize = 0;
+    while (offset < ciphertext.len) : (offset += 16) {
+        const block: [16]u8 = ciphertext[offset..][0..16].*;
+        var decoded: [16]u8 = undefined;
+        aes.decrypt(&decoded, &block);
+        for (&decoded, previous) |*value, prior| value.* ^= prior;
+        plaintext[offset..][0..16].* = decoded;
+        previous = block;
+    }
+    const padding = plaintext[plaintext.len - 1];
+    if (padding == 0 or padding > 16 or padding > plaintext.len) return error.InvalidEncryptedPdf;
+    for (plaintext[plaintext.len - padding ..]) |value| if (value != padding) return error.InvalidEncryptedPdf;
+    const result = try alloc.dupe(u8, plaintext[0 .. plaintext.len - padding]);
+    alloc.free(plaintext);
+    return result;
+}
+
+fn objectEncryptionKey(file_key: [16]u8, ptr: syntax.ObjRef) [16]u8 {
+    var material: [25]u8 = undefined;
+    @memcpy(material[0..16], &file_key);
+    material[16] = @truncate(ptr.id);
+    material[17] = @truncate(ptr.id >> 8);
+    material[18] = @truncate(ptr.id >> 16);
+    material[19] = @truncate(ptr.gen);
+    material[20] = @truncate(ptr.gen >> 8);
+    @memcpy(material[21..25], "sAlT");
+    return std.crypto.hash.Md5.hashResult(&material);
+}
+
 pub const Reader = struct {
     alloc: Allocator,
     bytes: []const u8,
@@ -1169,6 +1234,30 @@ pub const Reader = struct {
     trailer: syntax.Object,
     page_index: ?[]syntax.Object = null,
     font_cache: *std.AutoHashMapUnmanaged(u64, PageFont),
+    encryption: ?EncryptionContext = null,
+    decrypted_streams: *std.AutoHashMapUnmanaged(usize, []u8),
+
+    const max_recursive_pdf_objects: usize = 100_000;
+
+    const TraversalGuard = struct {
+        visited: std.AutoHashMapUnmanaged(u64, void) = .empty,
+        nodes: usize = 0,
+
+        fn deinit(self: *TraversalGuard, alloc: Allocator) void {
+            self.visited.deinit(alloc);
+        }
+
+        fn enter(self: *TraversalGuard, alloc: Allocator, value: *const syntax.Object, invalid_error: anyerror) !void {
+            self.nodes = std.math.add(usize, self.nodes, 1) catch return invalid_error;
+            if (self.nodes > max_recursive_pdf_objects) return invalid_error;
+            if (value.* == .obj_ref) {
+                const ptr = value.obj_ref;
+                const key = (@as(u64, ptr.id) << 16) | ptr.gen;
+                const result = try self.visited.getOrPut(alloc, key);
+                if (result.found_existing) return invalid_error;
+            }
+        }
+    };
 
     pub fn init(alloc: Allocator, bytes: []const u8) !Reader {
         if (bytes.len < 10) return error.InvalidPdfHeader;
@@ -1195,20 +1284,39 @@ pub const Reader = struct {
         try parseXrefTable(alloc, bytes, startxref_offset, &entries, &trailer);
         if (trailer == null) return error.MissingTrailer;
 
-        const font_cache = try alloc.create(std.AutoHashMapUnmanaged(u64, PageFont));
-        errdefer alloc.destroy(font_cache);
+        const xref_entries = try entries.toOwnedSlice(alloc);
+
+        const font_cache = alloc.create(std.AutoHashMapUnmanaged(u64, PageFont)) catch |err| {
+            alloc.free(xref_entries);
+            return err;
+        };
         font_cache.* = .empty;
 
-        return .{
+        const decrypted_streams = alloc.create(std.AutoHashMapUnmanaged(usize, []u8)) catch |err| {
+            alloc.destroy(font_cache);
+            alloc.free(xref_entries);
+            return err;
+        };
+        decrypted_streams.* = .empty;
+
+        const owned_trailer = trailer.?;
+        trailer = null;
+
+        var reader: Reader = .{
             .alloc = alloc,
             .bytes = bytes,
             .version_minor = minor - '0',
             .startxref_offset = startxref_offset,
-            .xref_entries = try entries.toOwnedSlice(alloc),
-            .trailer = trailer.?,
+            .xref_entries = xref_entries,
+            .trailer = owned_trailer,
             .page_index = null,
             .font_cache = font_cache,
+            .encryption = null,
+            .decrypted_streams = decrypted_streams,
         };
+        errdefer reader.deinit();
+        try reader.initializeEncryption();
+        return reader;
     }
 
     pub fn deinit(self: *Reader) void {
@@ -1220,6 +1328,10 @@ pub const Reader = struct {
         while (font_iter.next()) |font| font.deinit(self.alloc);
         self.font_cache.deinit(self.alloc);
         self.alloc.destroy(self.font_cache);
+        var stream_iter = self.decrypted_streams.valueIterator();
+        while (stream_iter.next()) |stream| self.alloc.free(stream.*);
+        self.decrypted_streams.deinit(self.alloc);
+        self.alloc.destroy(self.decrypted_streams);
         self.alloc.free(self.xref_entries);
         self.trailer.deinit(self.alloc);
         self.* = undefined;
@@ -1227,6 +1339,100 @@ pub const Reader = struct {
 
     pub fn trailerGet(self: *const Reader, key: []const u8) ?*const syntax.Object {
         return self.trailer.get(key);
+    }
+
+    fn initializeEncryption(self: *Reader) !void {
+        // Support the common "encrypted" compatibility case used by public
+        // document corpora: Standard Security Handler revision 4, AESV2, and
+        // an empty user password. Password-protected documents and newer
+        // handlers remain explicitly unsupported rather than guessing.
+        const encrypt_value = self.trailerGet("Encrypt") orelse return;
+        var encrypt = try self.resolveValue(encrypt_value);
+        defer encrypt.deinit(self.alloc);
+        if (encrypt != .dict) return error.UnsupportedPdfEncryption;
+        if (!std.mem.eql(u8, (encrypt.get("Filter") orelse return error.UnsupportedPdfEncryption).asName() orelse return error.UnsupportedPdfEncryption, "Standard")) return error.UnsupportedPdfEncryption;
+        if ((encrypt.get("V") orelse return error.UnsupportedPdfEncryption).asInteger() != 4) return error.UnsupportedPdfEncryption;
+        if ((encrypt.get("R") orelse return error.UnsupportedPdfEncryption).asInteger() != 4) return error.UnsupportedPdfEncryption;
+        if ((encrypt.get("Length") orelse return error.UnsupportedPdfEncryption).asInteger() != 128) return error.UnsupportedPdfEncryption;
+        const owner_key = switch ((encrypt.get("O") orelse return error.UnsupportedPdfEncryption).*) {
+            .string => |value| value,
+            else => return error.UnsupportedPdfEncryption,
+        };
+        if (owner_key.len != 32) return error.UnsupportedPdfEncryption;
+        const permissions_i = (encrypt.get("P") orelse return error.UnsupportedPdfEncryption).asInteger() orelse return error.UnsupportedPdfEncryption;
+        if (permissions_i < std.math.minInt(i32) or permissions_i > std.math.maxInt(i32)) return error.UnsupportedPdfEncryption;
+        const id_array = switch ((self.trailerGet("ID") orelse return error.UnsupportedPdfEncryption).*) {
+            .array => |value| value,
+            else => return error.UnsupportedPdfEncryption,
+        };
+        if (id_array.len == 0) return error.UnsupportedPdfEncryption;
+        const file_id = switch (id_array[0]) {
+            .string => |value| value,
+            else => return error.UnsupportedPdfEncryption,
+        };
+        const crypt_filters = encrypt.get("CF") orelse return error.UnsupportedPdfEncryption;
+        const std_filter = crypt_filters.get("StdCF") orelse return error.UnsupportedPdfEncryption;
+        if (!std.mem.eql(u8, (std_filter.get("CFM") orelse return error.UnsupportedPdfEncryption).asName() orelse return error.UnsupportedPdfEncryption, "AESV2")) return error.UnsupportedPdfEncryption;
+        if (!std.mem.eql(u8, (encrypt.get("StmF") orelse return error.UnsupportedPdfEncryption).asName() orelse return error.UnsupportedPdfEncryption, "StdCF")) return error.UnsupportedPdfEncryption;
+        if (!std.mem.eql(u8, (encrypt.get("StrF") orelse return error.UnsupportedPdfEncryption).asName() orelse return error.UnsupportedPdfEncryption, "StdCF")) return error.UnsupportedPdfEncryption;
+
+        var md5 = std.crypto.hash.Md5.init(.{});
+        md5.update(&pdf_password_padding);
+        md5.update(owner_key);
+        var permissions: [4]u8 = undefined;
+        std.mem.writeInt(u32, &permissions, @bitCast(@as(i32, @intCast(permissions_i))), .little);
+        md5.update(&permissions);
+        md5.update(file_id);
+        if (encrypt.get("EncryptMetadata")) |metadata| {
+            if (metadata.* == .boolean and !metadata.boolean) md5.update(&.{ 0xff, 0xff, 0xff, 0xff });
+        }
+        var digest: [16]u8 = undefined;
+        md5.final(&digest);
+        for (0..50) |_| digest = std.crypto.hash.Md5.hashResult(&digest);
+
+        const user_key = switch ((encrypt.get("U") orelse return error.UnsupportedPdfEncryption).*) {
+            .string => |value| value,
+            else => return error.UnsupportedPdfEncryption,
+        };
+        if (user_key.len < 16) return error.UnsupportedPdfEncryption;
+        var user_md5 = std.crypto.hash.Md5.init(.{});
+        user_md5.update(&pdf_password_padding);
+        user_md5.update(file_id);
+        var user_check: [16]u8 = undefined;
+        user_md5.final(&user_check);
+        rc4Crypt(&digest, &user_check);
+        for (1..20) |round| {
+            var round_key: [16]u8 = undefined;
+            for (&round_key, digest) |*value, key_byte| value.* = key_byte ^ @as(u8, @intCast(round));
+            rc4Crypt(&round_key, &user_check);
+        }
+        if (!std.mem.eql(u8, user_key[0..16], &user_check)) return error.UnsupportedPdfEncryption;
+        self.encryption = .{ .file_key = digest };
+    }
+
+    fn decryptObject(self: *const Reader, obj: *syntax.Object, ptr: syntax.ObjRef) !void {
+        const context = self.encryption orelse return;
+        const key = objectEncryptionKey(context.file_key, ptr);
+        switch (obj.*) {
+            .string => |encrypted| {
+                const decrypted = try decryptAesV2Alloc(self.alloc, encrypted, key);
+                self.alloc.free(encrypted);
+                obj.* = .{ .string = decrypted };
+            },
+            .array => |items| for (items) |*item| try self.decryptObject(item, ptr),
+            .dict => |entries| for (entries) |*entry| try self.decryptObject(&entry.value, ptr),
+            .stream => |stream| {
+                for (stream.header) |*entry| try self.decryptObject(&entry.value, ptr);
+                if (!self.decrypted_streams.contains(stream.data_offset)) {
+                    const end = std.math.add(usize, stream.data_offset, stream.data_length) catch return error.InvalidObjectOffset;
+                    if (end > self.bytes.len) return error.InvalidObjectOffset;
+                    const decrypted = try decryptAesV2Alloc(self.alloc, self.bytes[stream.data_offset..end], key);
+                    errdefer self.alloc.free(decrypted);
+                    try self.decrypted_streams.put(self.alloc, stream.data_offset, decrypted);
+                }
+            },
+            else => {},
+        }
     }
 
     pub fn readIndirectObject(self: *const Reader, ptr: syntax.ObjRef) anyerror!syntax.Object {
@@ -1247,13 +1453,19 @@ pub const Reader = struct {
 
         const value = try parsed.obj_def.value.clone(self.alloc);
         parsed.deinit(self.alloc);
-        return value;
+        var decrypted = value;
+        errdefer decrypted.deinit(self.alloc);
+        if (self.encryption != null) try self.decryptObject(&decrypted, ptr);
+        return decrypted;
     }
 
     pub fn readRawStreamData(self: *const Reader, obj: *const syntax.Object) ![]u8 {
         if (obj.* != .stream) return error.NotAStream;
         const stream_value = obj.stream;
-        const end = stream_value.data_offset + stream_value.data_length;
+        if (self.decrypted_streams.get(stream_value.data_offset)) |decrypted| {
+            return try self.alloc.dupe(u8, decrypted);
+        }
+        const end = std.math.add(usize, stream_value.data_offset, stream_value.data_length) catch return error.InvalidObjectOffset;
         if (end > self.bytes.len) return error.InvalidObjectOffset;
         return try self.alloc.dupe(u8, self.bytes[stream_value.data_offset..end]);
     }
@@ -1933,13 +2145,16 @@ pub const Reader = struct {
         var pages = std.ArrayList(syntax.Object).empty;
         defer pages.deinit(self.alloc);
         errdefer for (pages.items) |*page| page.deinit(self.alloc);
-        try self.appendPageTreeLeaves(&pages, pages_obj, 0);
+        var guard: TraversalGuard = .{};
+        defer guard.deinit(self.alloc);
+        try self.appendPageTreeLeaves(&pages, pages_obj, 0, &guard);
         if (pages.items.len == 0) return error.EmptyPdfPageTree;
         mutable.page_index = try pages.toOwnedSlice(self.alloc);
     }
 
-    fn appendPageTreeLeaves(self: *const Reader, out: *std.ArrayList(syntax.Object), node_obj: *const syntax.Object, depth: usize) anyerror!void {
+    fn appendPageTreeLeaves(self: *const Reader, out: *std.ArrayList(syntax.Object), node_obj: *const syntax.Object, depth: usize, guard: *TraversalGuard) anyerror!void {
         if (depth > 128) return error.InvalidPageTree;
+        try guard.enter(self.alloc, node_obj, error.InvalidPageTree);
         var node = try self.resolveValue(node_obj);
         defer node.deinit(self.alloc);
         if (node != .dict) return error.InvalidPageTree;
@@ -1956,7 +2171,7 @@ pub const Reader = struct {
         var kids = try self.resolveValue(node.get("Kids") orelse return error.InvalidPageTree);
         defer kids.deinit(self.alloc);
         if (kids != .array) return error.InvalidPageTree;
-        for (kids.array) |*kid| try self.appendPageTreeLeaves(out, kid, depth + 1);
+        for (kids.array) |*kid| try self.appendPageTreeLeaves(out, kid, depth + 1, guard);
     }
 
     /// Resolve a page's Contents value recursively. Real-world PDFs commonly
@@ -1968,17 +2183,20 @@ pub const Reader = struct {
             for (out.items) |*stream| stream.deinit(self.alloc);
             out.deinit(self.alloc);
         }
-        try self.appendContentStreams(&out, contents, 0);
+        var guard: TraversalGuard = .{};
+        defer guard.deinit(self.alloc);
+        try self.appendContentStreams(&out, contents, 0, &guard);
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn appendContentStreams(self: *const Reader, out: *std.ArrayList(syntax.Object), value: *const syntax.Object, depth: usize) anyerror!void {
+    fn appendContentStreams(self: *const Reader, out: *std.ArrayList(syntax.Object), value: *const syntax.Object, depth: usize, guard: *TraversalGuard) anyerror!void {
         if (depth > 128) return error.InvalidContents;
+        try guard.enter(self.alloc, value, error.InvalidContents);
         var resolved = try self.resolveValue(value);
         defer resolved.deinit(self.alloc);
         switch (resolved) {
             .stream => try out.append(self.alloc, try resolved.clone(self.alloc)),
-            .array => |items| for (items) |*item| try self.appendContentStreams(out, item, depth + 1),
+            .array => |items| for (items) |*item| try self.appendContentStreams(out, item, depth + 1, guard),
             .null => {},
             else => return error.NotAStream,
         }
@@ -2922,6 +3140,9 @@ pub const Reader = struct {
 
         const width: u32 = @intCast(width_i);
         const height: u32 = @intCast(height_i);
+        const pixel_count = std.math.mul(usize, width, height) catch return error.UnsupportedPdfRendering;
+        if (pixel_count > 100_000_000) return error.RenderedPageTooLarge;
+        const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.UnsupportedPdfRendering;
         if (has_ccitt) {
             const raw = try self.readRawStreamData(obj);
             defer self.alloc.free(raw);
@@ -2929,8 +3150,7 @@ pub const Reader = struct {
             const gray = try decodeCcittGrayAlloc(self.alloc, raw, width, height, filter_param);
             defer self.alloc.free(gray);
 
-            const pixel_count = @as(usize, width) * @as(usize, height);
-            const rgba = try self.alloc.alloc(u8, pixel_count * 4);
+            const rgba = try self.alloc.alloc(u8, rgba_len);
             errdefer self.alloc.free(rgba);
             if (image_mask) {
                 try decodeGrayMaskToRgba(rgba, gray, obj.get("Decode"));
@@ -2989,8 +3209,7 @@ pub const Reader = struct {
         const decoded = try self.readDecodedStreamData(obj);
         defer self.alloc.free(decoded);
 
-        const pixel_count = @as(usize, width) * @as(usize, height);
-        const rgba = try self.alloc.alloc(u8, pixel_count * 4);
+        const rgba = try self.alloc.alloc(u8, rgba_len);
         errdefer self.alloc.free(rgba);
         if (image_mask) {
             try decodeImageMaskToRgba(rgba, width, height, decoded, obj.get("Decode"));
@@ -3039,10 +3258,13 @@ pub const Reader = struct {
     }
 
     fn jpeg2000DecodedToRgbaAlloc(alloc: Allocator, decoded: *const image_lib.jpeg2000.DecodedImage) ![]u8 {
-        const pixel_count = @as(usize, decoded.width) * @as(usize, decoded.height);
-        if (decoded.pixels.len != pixel_count * decoded.components) return error.UnsupportedPdfRendering;
+        const pixel_count = std.math.mul(usize, decoded.width, decoded.height) catch return error.UnsupportedPdfRendering;
+        if (pixel_count > 100_000_000) return error.RenderedPageTooLarge;
+        const sample_count = std.math.mul(usize, pixel_count, decoded.components) catch return error.UnsupportedPdfRendering;
+        if (decoded.pixels.len != sample_count) return error.UnsupportedPdfRendering;
 
-        const rgba = try alloc.alloc(u8, pixel_count * 4);
+        const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.UnsupportedPdfRendering;
+        const rgba = try alloc.alloc(u8, rgba_len);
         errdefer alloc.free(rgba);
         switch (decoded.components) {
             1 => {
@@ -3952,11 +4174,27 @@ fn parseXrefTable(
     entries: *std.ArrayList(XrefEntry),
     trailer_out: *?syntax.Object,
 ) anyerror!void {
+    var visited: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    defer visited.deinit(alloc);
+    return try parseXrefTableGuarded(alloc, bytes, offset, entries, trailer_out, &visited);
+}
+
+fn parseXrefTableGuarded(
+    alloc: Allocator,
+    bytes: []const u8,
+    offset: usize,
+    entries: *std.ArrayList(XrefEntry),
+    trailer_out: *?syntax.Object,
+    visited: *std.AutoHashMapUnmanaged(usize, void),
+) anyerror!void {
     if (offset >= bytes.len) return error.InvalidStartXref;
+    const visit = try visited.getOrPut(alloc, offset);
+    if (visit.found_existing) return error.CyclicXref;
+    if (visited.count() > 4096) return error.InvalidXref;
     var cursor = offset;
     skipPdfWs(bytes, &cursor);
     if (!std.mem.startsWith(u8, bytes[cursor..], "xref")) {
-        return try parseXrefStream(alloc, bytes, cursor, entries, trailer_out);
+        return try parseXrefStream(alloc, bytes, cursor, entries, trailer_out, visited);
     }
     cursor += "xref".len;
 
@@ -3991,7 +4229,7 @@ fn parseXrefTable(
 
     if (trailer.get("Prev")) |prev_value| {
         if (prev_value.asInteger()) |prev| {
-            if (prev >= 0) try parseXrefTable(alloc, bytes, @intCast(prev), entries, trailer_out);
+            if (prev >= 0) try parseXrefTableGuarded(alloc, bytes, @intCast(prev), entries, trailer_out, visited);
         }
     }
 }
@@ -4002,6 +4240,7 @@ fn parseXrefStream(
     offset: usize,
     entries: *std.ArrayList(XrefEntry),
     trailer_out: *?syntax.Object,
+    visited: *std.AutoHashMapUnmanaged(usize, void),
 ) anyerror!void {
     if (offset >= bytes.len) return error.InvalidStartXref;
 
@@ -4033,7 +4272,7 @@ fn parseXrefStream(
 
     if (trailer.get("Prev")) |prev_value| {
         if (prev_value.asInteger()) |prev| {
-            if (prev >= 0) try parseXrefTable(alloc, bytes, @intCast(prev), entries, trailer_out);
+            if (prev >= 0) try parseXrefTableGuarded(alloc, bytes, @intCast(prev), entries, trailer_out, visited);
         }
     }
 }
@@ -4381,7 +4620,12 @@ fn decodeStreamFiltersAlloc(
     filter_obj: ?*const syntax.Object,
     decode_parms_obj: ?*const syntax.Object,
 ) ![]u8 {
-    if (filter_obj == null) return try alloc.dupe(u8, raw);
+    if (filter_obj == null) {
+        // Some allocators reuse a sentinel for zero-length allocations. Avoid
+        // passing the same sentinel as both source and destination to dupe.
+        if (raw.len == 0) return try alloc.alloc(u8, 0);
+        return try alloc.dupe(u8, raw);
+    }
 
     var current = try alloc.dupe(u8, raw);
     errdefer alloc.free(current);
@@ -4421,11 +4665,19 @@ fn applyStreamFilterAlloc(
 ) ![]u8 {
     if (std.mem.eql(u8, name, "FlateDecode")) {
         var in: std.Io.Reader = .fixed(input);
-        var aw: std.Io.Writer.Allocating = .init(alloc);
-        defer aw.deinit();
-        var decompress: std.compress.flate.Decompress = .init(&in, .zlib, &.{});
-        _ = try decompress.reader.streamRemaining(&aw.writer);
-        const inflated = try aw.toOwnedSlice();
+        var flate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+        var decompress: std.compress.flate.Decompress = .init(&in, .zlib, &flate_buffer);
+        var inflated_list = std.ArrayList(u8).empty;
+        defer inflated_list.deinit(alloc);
+        var read_buf: [64 * 1024]u8 = undefined;
+        const max_decoded_stream_bytes: usize = 256 * 1024 * 1024;
+        while (true) {
+            const n = try decompress.reader.readSliceShort(&read_buf);
+            if (n == 0) break;
+            if (inflated_list.items.len > max_decoded_stream_bytes -| n) return error.DecodedStreamTooLarge;
+            try inflated_list.appendSlice(alloc, read_buf[0..n]);
+        }
+        const inflated = try inflated_list.toOwnedSlice(alloc);
         defer alloc.free(inflated);
         return try applyPredictorAlloc(alloc, inflated, param);
     }
@@ -8514,19 +8766,11 @@ fn applySoftMaskAlpha(rgba: []u8, smask_rgba: []const u8) void {
 }
 
 fn applyExplicitMaskAlpha(rgba: []u8, mask_rgba: []const u8, mask_is_stencil: bool) void {
-    const lanes = 16;
-    var i: usize = 0;
-    while (i + lanes <= rgba.len and i + lanes <= mask_rgba.len) : (i += lanes) {
-        var dst_block: [16]u8 = rgba[i..][0..16].*;
-        const src_block: [16]u8 = mask_rgba[i..][0..16].*;
-        inline for (0..4) |lane| {
-            const src_channel: usize = if (mask_is_stencil) 3 else 0;
-            dst_block[lane * 4 + 3] = src_block[lane * 4 + src_channel];
-        }
-        rgba[i..][0..16].* = dst_block;
-    }
-    while (i + 3 < rgba.len and i + 3 < mask_rgba.len) : (i += 4) {
-        rgba[i + 3] = if (mask_is_stencil) mask_rgba[i + 3] else mask_rgba[i];
+    const src_channel: usize = if (mask_is_stencil) 3 else 0;
+    const pixel_count = @min(rgba.len, mask_rgba.len) / 4;
+    for (0..pixel_count) |pixel| {
+        const offset = pixel * 4;
+        rgba[offset + 3] = mask_rgba[offset + src_channel];
     }
 }
 
@@ -9307,6 +9551,38 @@ test "xref trailer is deinitialized once when recursive Prev parsing fails" {
         error.ExpectedTrailerDict,
         parseXrefTable(alloc, bytes, invalid_previous.len, &entries, &trailer),
     );
+}
+
+test "xref parser rejects a cyclic Prev chain" {
+    const alloc = std.testing.allocator;
+    const bytes =
+        "xref\n" ++
+        "0 0\n" ++
+        "trailer\n" ++
+        "<< /Size 1 /Prev 0 >>\n";
+
+    var entries = std.ArrayList(XrefEntry).empty;
+    defer entries.deinit(alloc);
+    var trailer: ?syntax.Object = null;
+    defer if (trailer) |*value| value.deinit(alloc);
+
+    try std.testing.expectError(
+        error.CyclicXref,
+        parseXrefTable(alloc, bytes, 0, &entries, &trailer),
+    );
+}
+
+test "AESV2 object data decrypts and removes PKCS7 padding" {
+    const alloc = std.testing.allocator;
+    const key = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
+    const encrypted = [_]u8{
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+        0x2f, 0x7c, 0x27, 0x82, 0x57, 0x39, 0x7a, 0x9a, 0x28, 0x09, 0xd3, 0x3b, 0x35, 0x02, 0x2f, 0xbd,
+        0x38, 0xba, 0xae, 0xbb, 0x7f, 0x6c, 0x90, 0xa0, 0x25, 0x98, 0x52, 0x2f, 0x07, 0x23, 0x43, 0x03,
+    };
+    const decrypted = try decryptAesV2Alloc(alloc, &encrypted, key);
+    defer alloc.free(decrypted);
+    try std.testing.expectEqualStrings("hello encrypted pdf", decrypted);
 }
 
 test "xref parser ignores an out-of-range generation sentinel" {

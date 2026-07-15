@@ -654,7 +654,7 @@ fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config
         config.ocr_render_dpi = @intCast(dpi);
     }
     if (intField(ocr, "max_rendered_pixels")) |pixels| {
-        if (pixels < 1) return error.InvalidDocumentExtractionConfig;
+        if (pixels < 1 or pixels > 100_000_000) return error.InvalidDocumentExtractionConfig;
         config.ocr_max_rendered_pixels = @intCast(pixels);
     }
     if (ocr.get("config")) |producer| {
@@ -3360,6 +3360,9 @@ test "OCR options parse configurable thresholds resolution model and explicit pr
     try std.testing.expectEqual(@as(usize, 75), config.ocr_quality.min_content_chars);
     try std.testing.expectEqualStrings("antflydb/Florence-2-base", config.ocr_model);
     try std.testing.expectEqualStrings("Preserve tables", config.ocr_prompt);
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
+        \\{"ocr":{"enabled":true,"max_rendered_pixels":100000001,"config":{"provider":"antfly"}}}
+    ));
 }
 
 test "generated text provider config is validated while parsing extraction config" {
