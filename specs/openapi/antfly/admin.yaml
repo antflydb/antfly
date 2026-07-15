@@ -2243,6 +2243,7 @@ components:
         - capability_version
         - active
         - authority_granted
+        - authority_remaining_ms
         - lease_name
         - lease_namespace
         - stable_topology_id
@@ -2263,6 +2264,10 @@ components:
         authority_granted:
           type: boolean
           description: This process is the current holder and its suspend-inclusive local deadline has not elapsed.
+        authority_remaining_ms:
+          type: integer
+          format: uint64
+          description: Suspend-inclusive local authority remaining when this proof snapshot was created; zero when authority is not granted.
         lease_name:
           type: string
           minLength: 1

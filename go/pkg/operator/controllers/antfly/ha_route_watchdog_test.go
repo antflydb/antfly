@@ -147,6 +147,7 @@ func TestHAWatchdogAuthorityProofRequiresObservedSelfHolder(t *testing.T) {
 		CapabilityVersion:        1,
 		Active:                   true,
 		AuthorityGranted:         true,
+		AuthorityRemainingMs:     10_000,
 		LeaseName:                "topology-ha-fence",
 		LeaseNamespace:           "default",
 		StableTopologyId:         "topology-anchor-uid",
@@ -157,8 +158,39 @@ func TestHAWatchdogAuthorityProofRequiresObservedSelfHolder(t *testing.T) {
 		ObservedLeaseTransitions: 4,
 		MaxFenceLatencyMs:        10_000,
 	}
-	if _, err := haWatchdogProofFromAdmin(raw, cluster, "standby-a", true, time.Now()); err == nil {
+	now := time.Now()
+	if _, err := haWatchdogProofFromAdmin(raw, cluster, "standby-a", true, now, now); err == nil {
 		t.Fatal("authority proof with a different observed Lease holder was accepted")
+	}
+}
+
+func TestHAWatchdogAuthorityProofSubtractsDelayedResponseRTT(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	raw := &adminsdk.HALeaseWatchdogProof{
+		CapabilityVersion:        1,
+		Active:                   true,
+		AuthorityGranted:         true,
+		AuthorityRemainingMs:     10_000,
+		LeaseName:                "topology-ha-fence",
+		LeaseNamespace:           "default",
+		StableTopologyId:         "topology-anchor-uid",
+		LocalNodeId:              "standby-a",
+		ObservedHolderNodeId:     "standby-a",
+		PodUid:                   "promoted-pod-uid",
+		ProcessBootId:            strings.Repeat("a", 64),
+		ObservedLeaseTransitions: 4,
+		MaxFenceLatencyMs:        10_000,
+	}
+	started := time.Date(2026, 7, 15, 16, 0, 0, 0, time.UTC)
+	if _, err := haWatchdogProofFromAdmin(raw, cluster, "standby-a", true, started, started.Add(9800*time.Millisecond)); err == nil {
+		t.Fatal("delayed admin response refreshed already-expired runtime authority")
+	}
+	proof, err := haWatchdogProofFromAdmin(raw, cluster, "standby-a", true, started, started.Add(time.Second))
+	if err != nil {
+		t.Fatalf("bounded admin response rejected: %v", err)
+	}
+	if proof.AuthorityRemainingMS != 8_750 {
+		t.Fatalf("operator did not subtract RTT and margin: remaining=%d", proof.AuthorityRemainingMS)
 	}
 }
 
@@ -167,6 +199,7 @@ func validRouteWatchdogProof(now time.Time) *antflyv1.HAWatchdogProofStatus {
 		CapabilityVersion:        1,
 		Active:                   true,
 		AuthorityGranted:         true,
+		AuthorityRemainingMS:     9_750,
 		LeaseName:                "topology-ha-fence",
 		LeaseNamespace:           "default",
 		TopologyID:               "topology-anchor-uid",

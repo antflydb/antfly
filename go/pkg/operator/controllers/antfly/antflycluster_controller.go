@@ -8830,10 +8830,12 @@ func (r *AntflyClusterReconciler) observeHAPrimaryStatusTyped(ctx context.Contex
 	if err != nil {
 		return haObservedPrimaryStatus{}, err
 	}
+	requestStartedAt := r.haNow()
 	response, err := adminClient.PrimaryStatusParsedResponse(ctx, haPrimaryStatusParams(ha))
 	if err != nil {
 		return haObservedPrimaryStatus{}, err
 	}
+	observedAt := r.haNow()
 	status := haObservedPrimaryStatusFromAdminSDK(*response.Value)
 	if err := haValidateObservedStatusIdentity(status.Identity, ha, cluster.Status.HAStatus); err != nil {
 		return haObservedPrimaryStatus{}, err
@@ -8842,7 +8844,7 @@ func (r *AntflyClusterReconciler) observeHAPrimaryStatusTyped(ctx context.Contex
 		return haObservedPrimaryStatus{}, err
 	}
 	if haRuntimeLeaseWatchdogEnabled(cluster) {
-		proof, err := haWatchdogProofFromAdmin(status.RawWatchdogProof, cluster, status.NodeID, true, r.haNow())
+		proof, err := haWatchdogProofFromAdmin(status.RawWatchdogProof, cluster, status.NodeID, true, requestStartedAt, observedAt)
 		if err != nil {
 			return haObservedPrimaryStatus{}, err
 		}
@@ -8856,10 +8858,12 @@ func (r *AntflyClusterReconciler) observeHAStandbyStatusTyped(ctx context.Contex
 	if err != nil {
 		return antflyv1.HAStandbyStatus{}, err
 	}
+	requestStartedAt := r.haNow()
 	response, err := adminClient.StandbyStatusParsedResponse(ctx, haStandbyStatusParams(upstreamLSN))
 	if err != nil {
 		return antflyv1.HAStandbyStatus{}, err
 	}
+	observedAt := r.haNow()
 	observed := haObservedStandbyStatusFromAdminSDK(*response.Value, standbyName, slotName)
 	if err := haValidateObservedStatusIdentity(observed.Identity, ha, cluster.Status.HAStatus); err != nil {
 		return antflyv1.HAStandbyStatus{}, err
@@ -8868,7 +8872,7 @@ func (r *AntflyClusterReconciler) observeHAStandbyStatusTyped(ctx context.Contex
 		return antflyv1.HAStandbyStatus{}, err
 	}
 	if haRuntimeLeaseWatchdogEnabled(cluster) {
-		proof, err := haWatchdogProofFromAdmin(observed.RawWatchdogProof, cluster, observed.NodeID, false, r.haNow())
+		proof, err := haWatchdogProofFromAdmin(observed.RawWatchdogProof, cluster, observed.NodeID, false, requestStartedAt, observedAt)
 		if err != nil {
 			return antflyv1.HAStandbyStatus{}, err
 		}
@@ -9167,7 +9171,7 @@ func haObservedIdentityFromAdminSDK(identity adminsdk.HAIdentity) haObservedIden
 	}
 }
 
-func haWatchdogProofFromAdmin(raw *adminsdk.HALeaseWatchdogProof, cluster *antflyv1.AntflyCluster, nodeID string, requireAuthority bool, observedAt time.Time) (*antflyv1.HAWatchdogProofStatus, error) {
+func haWatchdogProofFromAdmin(raw *adminsdk.HALeaseWatchdogProof, cluster *antflyv1.AntflyCluster, nodeID string, requireAuthority bool, requestStartedAt, observedAt time.Time) (*antflyv1.HAWatchdogProofStatus, error) {
 	if raw == nil {
 		return nil, fmt.Errorf("HA Lease watchdog capability proof is missing")
 	}
@@ -9178,6 +9182,22 @@ func haWatchdogProofFromAdmin(raw *adminsdk.HALeaseWatchdogProof, cluster *antfl
 	expectedMaxFenceLatencyMS := int32(10_000)
 	if lease.WatchdogGraceSeconds > 0 {
 		expectedMaxFenceLatencyMS = lease.WatchdogGraceSeconds * 1000
+	}
+	rtt := observedAt.Sub(requestStartedAt)
+	if rtt < 0 {
+		return nil, fmt.Errorf("HA Lease watchdog proof request clock moved backwards")
+	}
+	authorityRemainingMS := int32(0)
+	if raw.AuthorityGranted {
+		const responseSafetyMarginMS = int64(250)
+		rttMS := int64((rtt + time.Millisecond - 1) / time.Millisecond)
+		if raw.AuthorityRemainingMs == 0 || raw.AuthorityRemainingMs > math.MaxInt32 ||
+			int64(raw.AuthorityRemainingMs) <= rttMS+responseSafetyMarginMS {
+			return nil, fmt.Errorf("HA Lease watchdog authority expired or has insufficient margin after admin response RTT")
+		}
+		authorityRemainingMS = int32(int64(raw.AuthorityRemainingMs) - rttMS - responseSafetyMarginMS)
+	} else if raw.AuthorityRemainingMs != 0 {
+		return nil, fmt.Errorf("HA Lease watchdog denied authority but reported a nonzero authority remainder")
 	}
 	if strings.TrimSpace(raw.LeaseName) != strings.TrimSpace(lease.Name) ||
 		strings.TrimSpace(raw.LeaseNamespace) != cluster.Namespace ||
@@ -9195,6 +9215,7 @@ func haWatchdogProofFromAdmin(raw *adminsdk.HALeaseWatchdogProof, cluster *antfl
 		CapabilityVersion:        1,
 		Active:                   true,
 		AuthorityGranted:         raw.AuthorityGranted,
+		AuthorityRemainingMS:     authorityRemainingMS,
 		LeaseName:                strings.TrimSpace(raw.LeaseName),
 		LeaseNamespace:           strings.TrimSpace(raw.LeaseNamespace),
 		TopologyID:               strings.TrimSpace(raw.StableTopologyId),
@@ -9491,6 +9512,8 @@ func (r *AntflyClusterReconciler) haPromotedRuntimeWatchdogReady(ctx context.Con
 	now := r.haNow()
 	if proof.ObservedAt.IsZero() || now.Before(proof.ObservedAt.Time) ||
 		now.Sub(proof.ObservedAt.Time) > time.Duration(proof.MaxFenceLatencyMS)*time.Millisecond ||
+		proof.AuthorityRemainingMS <= 0 ||
+		now.Sub(proof.ObservedAt.Time) >= time.Duration(proof.AuthorityRemainingMS)*time.Millisecond ||
 		proof.MaxFenceLatencyMS != expectedMaxFenceLatencyMS ||
 		!(proof.Active && proof.AuthorityGranted && proof.CapabilityVersion == 1 &&
 			proof.LocalNodeID == strings.TrimSpace(nodeID) && proof.ObservedHolderNodeID == strings.TrimSpace(nodeID) &&

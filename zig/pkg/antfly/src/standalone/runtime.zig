@@ -255,10 +255,16 @@ const RuntimeLeaseWatchdog = struct {
         const deadline = self.proof_authority_deadline_ns.load(.acquire);
         const capability_deadline = self.proof_capability_deadline_ns.load(.acquire);
         const now = authority_time.authorityNs();
+        const authority_remaining_ms = if (deadline > now)
+            (deadline - now) / std.time.ns_per_ms
+        else
+            0;
         return .{
             .capability_version = 1,
             .active = self.proof_active.load(.acquire) and capability_deadline != 0 and now < capability_deadline,
-            .authority_granted = deadline != 0 and now < deadline,
+            // Rounding down makes the proof conservative at the sub-ms edge.
+            .authority_granted = authority_remaining_ms > 0,
+            .authority_remaining_ms = authority_remaining_ms,
             .lease_name = self.lease_name,
             .lease_namespace = self.lease_namespace,
             .stable_topology_id = self.stable_topology_id,

@@ -153,6 +153,8 @@ pub const HALeaseWatchdogProof = struct {
     active: bool,
     /// This process is the current holder and its suspend-inclusive local deadline has not elapsed.
     authority_granted: bool,
+    /// Suspend-inclusive local authority remaining when this proof snapshot was created; zero when authority is not granted.
+    authority_remaining_ms: i64,
     lease_name: []const u8,
     lease_namespace: []const u8,
     stable_topology_id: []const u8,

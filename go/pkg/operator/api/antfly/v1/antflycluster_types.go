@@ -1932,6 +1932,10 @@ type HAWatchdogProofStatus struct {
 
 	AuthorityGranted bool `json:"authorityGranted"`
 
+	// AuthorityRemainingMS is the conservative operator-side remainder after
+	// subtracting the full authenticated admin request RTT and safety margin.
+	AuthorityRemainingMS int32 `json:"authorityRemainingMS"`
+
 	LeaseName string `json:"leaseName"`
 
 	LeaseNamespace string `json:"leaseNamespace"`

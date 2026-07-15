@@ -5162,6 +5162,9 @@ spec:
                         type: boolean
                       authorityGranted:
                         type: boolean
+                      authorityRemainingMS:
+                        format: int32
+                        type: integer
                       capabilityVersion:
                         format: int32
                         type: integer
@@ -5191,6 +5194,7 @@ spec:
                     required:
                     - active
                     - authorityGranted
+                    - authorityRemainingMS
                     - capabilityVersion
                     - leaseName
                     - leaseNamespace
@@ -5296,6 +5300,9 @@ spec:
                               type: boolean
                             authorityGranted:
                               type: boolean
+                            authorityRemainingMS:
+                              format: int32
+                              type: integer
                             capabilityVersion:
                               format: int32
                               type: integer
@@ -5325,6 +5332,7 @@ spec:
                           required:
                           - active
                           - authorityGranted
+                          - authorityRemainingMS
                           - capabilityVersion
                           - leaseName
                           - leaseNamespace
