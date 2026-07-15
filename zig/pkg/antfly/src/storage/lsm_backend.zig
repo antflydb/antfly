@@ -241,6 +241,11 @@ pub const MutableSnapshotCloneReasonStats = struct {
     peak_bytes: u64 = 0,
 };
 
+const MutableSnapshotPin = struct {
+    state: *const State,
+    readers: usize,
+};
+
 pub const MaintenanceWaker = struct {
     ptr: *anyopaque,
     wake_fn: *const fn (ptr: *anyopaque) void,
@@ -312,6 +317,9 @@ pub const Options = struct {
     max_compaction_input_bytes: u64 = 0,
     max_compaction_input_allow_oversized_single_job: bool = true,
     max_run_file_bytes: usize = 512 * 1024 * 1024,
+    /// Finish a run when the namespace or the first N key bytes change. This
+    /// only controls run layout; the persisted table-file format is unchanged.
+    run_partition_prefix_bytes: usize = 0,
     bloom: bloom.Config = lsm_table_file.default_filter_config,
     table_block_compression: lsm_table_file.CompressionPolicy = .snappy_adaptive,
     table_prefix_extractor: lsm_table_file.PrefixExtractor = lsm_table_file.default_prefix_extractor,
@@ -1335,6 +1343,10 @@ pub const Backend = struct {
     mutable_wal_range: WalSegmentRange = .{},
     empty_mutable_snapshot: State = .{},
     mutable_read_snapshot: ?*State = null,
+    /// Exact mutable generations borrowed by read transactions. A global
+    /// reader count cannot express this lifetime: unrelated long-lived point
+    /// probes would otherwise retain every invalidated mutable snapshot.
+    mutable_snapshot_pins: std.ArrayListUnmanaged(MutableSnapshotPin) = .empty,
     immutable_memtables: std.ArrayListUnmanaged(*State) = .empty,
     immutable_wal_ranges: std.ArrayListUnmanaged(WalSegmentRange) = .empty,
     immutable_head: usize = 0,
@@ -1786,7 +1798,7 @@ pub const Backend = struct {
                 if (level_len > target_runs) {
                     stats.level_overflow_runs += @intCast(level_len - target_runs);
                 }
-                const target_bytes = maintenanceLevelByteTarget(level, self.options.level_target_bytes_base, self.options.level_target_bytes_multiplier);
+                const target_bytes = compaction_mod.levelByteTargetForRuns(self.runs.items, level, self.options.level_target_bytes_base, self.options.level_target_bytes_multiplier);
                 if (target_bytes > 0 and level_bytes > target_bytes) {
                     stats.level_overflow_bytes += level_bytes - target_bytes;
                 }
@@ -1945,7 +1957,7 @@ pub const Backend = struct {
             if (level_len > target_runs) {
                 level_overflow_runs +|= @intCast(level_len - target_runs);
             }
-            const target_bytes = maintenanceLevelByteTarget(level, self.options.level_target_bytes_base, self.options.level_target_bytes_multiplier);
+            const target_bytes = compaction_mod.levelByteTargetForRuns(self.runs.items, level, self.options.level_target_bytes_base, self.options.level_target_bytes_multiplier);
             if (target_bytes > 0 and level_bytes > target_bytes) {
                 level_overflow_bytes +|= level_bytes - target_bytes;
             }
@@ -2270,16 +2282,51 @@ pub const Backend = struct {
     }
 
     pub fn snapshotMutableStateWithReason(self: *Backend, reason: MutableSnapshotReason) !*const State {
-        if (self.mutable_read_snapshot) |snapshot| return snapshot;
+        if (self.mutable_read_snapshot) |snapshot| {
+            try self.retainMutableSnapshot(snapshot);
+            return snapshot;
+        }
         if (self.mutable.entries.items.len == 0) return &self.empty_mutable_snapshot;
+        try self.mutable_snapshot_pins.ensureUnusedCapacity(self.allocator, 1);
         const snapshot = try self.allocator.create(State);
         errdefer self.allocator.destroy(snapshot);
         snapshot.* = try self.cloneMutableStateWithReason(reason);
         errdefer snapshot.deinit(self.allocator);
         try self.retired_mutable_snapshots.ensureUnusedCapacity(self.allocator, 1);
         self.mutable_read_snapshot = snapshot;
+        self.mutable_snapshot_pins.appendAssumeCapacity(.{ .state = snapshot, .readers = 1 });
         self.syncTrackedInMemoryStateUsageCurrentLocked();
         return snapshot;
+    }
+
+    fn retainMutableSnapshot(self: *Backend, snapshot: *const State) !void {
+        for (self.mutable_snapshot_pins.items) |*pin| {
+            if (pin.state != snapshot) continue;
+            pin.readers += 1;
+            return;
+        }
+        try self.mutable_snapshot_pins.append(self.allocator, .{ .state = snapshot, .readers = 1 });
+    }
+
+    /// Release the exact mutable generation borrowed by a read transaction.
+    /// The current generation remains cached for reuse; a retired generation
+    /// is reclaimed as soon as its own last borrower exits, independently of
+    /// readers that never observed it.
+    pub fn releaseMutableStateSnapshot(self: *Backend, snapshot: *const State) void {
+        if (snapshot == &self.empty_mutable_snapshot) return;
+        for (self.mutable_snapshot_pins.items, 0..) |*pin, i| {
+            if (pin.state != snapshot) continue;
+            std.debug.assert(pin.readers > 0);
+            pin.readers -= 1;
+            if (pin.readers != 0) return;
+            _ = self.mutable_snapshot_pins.swapRemove(i);
+            if (self.mutable_read_snapshot != snapshot) {
+                self.reclaimRetiredMutableSnapshot(snapshot);
+            }
+            self.syncTrackedInMemoryStateUsageCurrentLocked();
+            return;
+        }
+        std.debug.assert(false);
     }
 
     pub fn cloneCurrentScanMutableStateForBulkIngest(self: *Backend) !?State {
@@ -2357,7 +2404,7 @@ pub const Backend = struct {
     }
 
     fn retireMutableSnapshot(self: *Backend, state: *State) void {
-        if (self.active_readers == 0) {
+        if (!self.mutableSnapshotIsPinned(state)) {
             self.destroyMutableSnapshot(state);
             return;
         }
@@ -2365,6 +2412,22 @@ pub const Backend = struct {
             // Keep the old snapshot alive rather than risk invalidating
             // active readers when we cannot queue it for retirement.
         };
+    }
+
+    fn mutableSnapshotIsPinned(self: *const Backend, state: *const State) bool {
+        for (self.mutable_snapshot_pins.items) |pin| {
+            if (pin.state == state) return pin.readers > 0;
+        }
+        return false;
+    }
+
+    fn reclaimRetiredMutableSnapshot(self: *Backend, state: *const State) void {
+        for (self.retired_mutable_snapshots.items, 0..) |retired, i| {
+            if (retired != state) continue;
+            const removed = self.retired_mutable_snapshots.swapRemove(i);
+            self.destroyMutableSnapshot(removed);
+            return;
+        }
     }
 
     fn drainRetiredImmutableMemtables(self: *Backend) void {
@@ -2382,10 +2445,16 @@ pub const Backend = struct {
     }
 
     fn drainRetiredMutableSnapshots(self: *Backend) void {
-        for (self.retired_mutable_snapshots.items) |state| {
+        var i: usize = 0;
+        while (i < self.retired_mutable_snapshots.items.len) {
+            const state = self.retired_mutable_snapshots.items[i];
+            if (self.mutableSnapshotIsPinned(state)) {
+                i += 1;
+                continue;
+            }
+            _ = self.retired_mutable_snapshots.swapRemove(i);
             self.destroyMutableSnapshot(state);
         }
-        self.retired_mutable_snapshots.clearRetainingCapacity();
         self.syncTrackedInMemoryStateUsageCurrentLocked();
     }
 
@@ -2496,17 +2565,6 @@ pub const Backend = struct {
         var remaining = level - 1;
         while (remaining > 0) : (remaining -= 1) {
             target = std.math.mul(usize, target, @max(@as(usize, 1), multiplier)) catch return std.math.maxInt(usize);
-        }
-        return target;
-    }
-
-    fn maintenanceLevelByteTarget(level: u32, base: usize, multiplier: usize) u64 {
-        if (level == 0 or base == 0) return 0;
-        var target: u64 = @intCast(base);
-        var remaining = level - 1;
-        while (remaining > 0) : (remaining -= 1) {
-            const multiplier_u64: u64 = @intCast(@max(@as(usize, 1), multiplier));
-            target = std.math.mul(u64, target, multiplier_u64) catch return std.math.maxInt(u64);
         }
         return target;
     }
@@ -4903,10 +4961,10 @@ pub const Backend = struct {
         return stats;
     }
 
-    fn cleanupOrphanedRunFilesForManifest(self: *Backend) !bool {
-        const root_dir = self.root_dir orelse return false;
-        if (self.storage == null or self.options.backend.read_only) return false;
-        if (!std.fs.path.isAbsolute(root_dir)) return false;
+    pub fn cleanupOrphanedRunFilesForManifest(self: *Backend) !RecoveredRunFileCleanupStats {
+        const root_dir = self.root_dir orelse return .{};
+        if (self.storage == null or self.options.backend.read_only) return .{};
+        if (!std.fs.path.isAbsolute(root_dir)) return .{};
 
         const runs_dir = try std.fs.path.join(self.allocator, &.{ root_dir, "runs" });
         defer self.allocator.free(runs_dir);
@@ -4915,12 +4973,12 @@ pub const Backend = struct {
         defer io_impl.deinit();
 
         var dir = std.Io.Dir.cwd().openDir(io_impl.io(), runs_dir, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return false,
+            error.FileNotFound => return .{},
             else => return err,
         };
         defer dir.close(io_impl.io());
 
-        var deleted = false;
+        var stats: RecoveredRunFileCleanupStats = .{};
         var it = dir.iterate();
         while (try it.next(io_impl.io())) |entry| {
             if (entry.kind != .file) continue;
@@ -4931,13 +4989,15 @@ pub const Backend = struct {
             defer self.allocator.free(path);
             if (self.pathTrackedByManifestLocked(path) or self.obsoletePathPinnedByOpenVersion(path)) continue;
 
+            const size = self.storage.?.fileSize(path) catch 0;
             repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, path) catch |err| switch (err) {
                 error.FileNotFound => {},
                 else => return err,
             };
-            deleted = true;
+            stats.files_deleted +|= 1;
+            stats.bytes_deleted +|= size;
         }
-        return deleted;
+        return stats;
     }
 
     fn reconcileObsoletePathsForManifest(self: *Backend) !void {
@@ -12555,6 +12615,61 @@ test "lsm backend resource manager accounts pinned mutable read snapshots" {
     try std.testing.expectEqual(maintenance.mutable_bytes +| maintenance.immutable_bytes, after_release);
 }
 
+test "lsm backend reclaims mutable generations independently of unrelated probe readers" {
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    var backend = Backend.init(std.testing.allocator, .{ .resource_manager = &manager });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", "A");
+        try txn.commit();
+    }
+
+    // This reader never borrows a mutable snapshot. It must not extend the
+    // lifetime of mutable generations borrowed by the two read transactions.
+    var probe = try runtime.beginProbe();
+    defer probe.abort();
+
+    var read_a = try backend.beginRead();
+    var read_a_open = true;
+    defer if (read_a_open) read_a.abort();
+    try std.testing.expectEqualStrings("A", try read_a.get(.{ .name = "docs" }, "doc:a"));
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:b", "B");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), backend.retired_mutable_snapshots.items.len);
+
+    var read_b = try backend.beginRead();
+    var read_b_open = true;
+    defer if (read_b_open) read_b.abort();
+    try std.testing.expectEqualStrings("B", try read_b.get(.{ .name = "docs" }, "doc:b"));
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:c", "C");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 2), backend.retired_mutable_snapshots.items.len);
+    const both_retired_bytes = manager.sliceStats(.lsm_in_memory_state).used_bytes;
+
+    read_a.abort();
+    read_a_open = false;
+    try std.testing.expectEqual(@as(usize, 1), backend.retired_mutable_snapshots.items.len);
+    try std.testing.expect(manager.sliceStats(.lsm_in_memory_state).used_bytes < both_retired_bytes);
+
+    read_b.abort();
+    read_b_open = false;
+    try std.testing.expectEqual(@as(usize, 0), backend.retired_mutable_snapshots.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.active_readers_by_kind[readerPinKindIndex(.probe_txn)]);
+}
+
 test "lsm backend rotates large mutable state for read snapshots instead of cloning" {
     var backend = Backend.init(std.testing.allocator, .{
         .read_snapshot_rotate_mutable_bytes = 1,
@@ -14193,6 +14308,88 @@ test "lsm backend splits oversized flushes into persisted run segments" {
     }
 }
 
+test "lsm backend partitions persisted runs at configured key family boundaries" {
+    const alloc = std.testing.allocator;
+    var memory_storage = storage_io.MemoryStorage.init(alloc);
+    defer memory_storage.deinit();
+
+    const root_dir = "/memory/key-family-partition";
+    const options = Options{
+        .flush_threshold = 3,
+        .compact_threshold_runs = 100,
+        .max_run_file_bytes = 1024 * 1024,
+        .run_partition_prefix_bytes = 1,
+        .storage = memory_storage.storage(),
+    };
+    {
+        var backend = try Backend.open(alloc, root_dir, options);
+        defer backend.close();
+
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+        var txn = try runtime.beginWrite();
+        try txn.put("\x00metadata", "m");
+        try txn.put("\x01document", "d");
+        try txn.put("\x03artifact", "a");
+        try txn.commit();
+
+        try std.testing.expectEqual(@as(usize, 3), backend.runs.items.len);
+        for (backend.runs.items) |run| {
+            try std.testing.expectEqual(@as(usize, 1), run.entry_count);
+            try std.testing.expectEqual(run.smallest_key[0], run.largest_key[0]);
+        }
+    }
+
+    var reopened = try Backend.open(alloc, root_dir, options);
+    defer reopened.close();
+    var runtime = try reopened.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+    var read = try runtime.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("m", try read.get("\x00metadata"));
+    try std.testing.expectEqualStrings("d", try read.get("\x01document"));
+    try std.testing.expectEqualStrings("a", try read.get("\x03artifact"));
+}
+
+test "lsm backend preserves key family partitions in streaming compaction output" {
+    const alloc = std.testing.allocator;
+    var memory_storage = storage_io.MemoryStorage.init(alloc);
+    defer memory_storage.deinit();
+
+    var backend = try Backend.open(alloc, "/memory/key-family-compaction", .{
+        .flush_threshold = 3,
+        .compact_threshold_runs = 2,
+        .foreground_soft_compaction = true,
+        .level_target_runs_base = 100,
+        .level_target_bytes_base = 0,
+        .max_run_file_bytes = 1024 * 1024,
+        .run_partition_prefix_bytes = 1,
+        .storage = memory_storage.storage(),
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    for (0..3) |batch| {
+        var txn = try runtime.beginWrite();
+        var keys: [3][32]u8 = undefined;
+        const metadata = try std.fmt.bufPrint(&keys[0], "\x00metadata:{d}", .{batch});
+        const document = try std.fmt.bufPrint(&keys[1], "\x01document:{d}", .{batch});
+        const artifact = try std.fmt.bufPrint(&keys[2], "\x03artifact:{d}", .{batch});
+        try txn.put(metadata, "m");
+        try txn.put(document, "d");
+        try txn.put(artifact, "a");
+        try txn.commit();
+    }
+    try backend.finalizeDeferredStorageWork();
+    try std.testing.expect(backend.compaction_stats.compactions > 0);
+    for (backend.runs.items) |run| {
+        try std.testing.expect(run.smallest_key.len > 0);
+        try std.testing.expect(run.largest_key.len > 0);
+        try std.testing.expectEqual(run.smallest_key[0], run.largest_key[0]);
+    }
+}
+
 test "lsm backend splits oversized compaction output into persisted run segments" {
     const alloc = std.testing.allocator;
     var memory_storage = storage_io.MemoryStorage.init(alloc);
@@ -15064,7 +15261,7 @@ test "lsm backend ignores orphaned committed run files not referenced by manifes
         try std.testing.expectError(error.NotFound, txn.get("doc:orphan"));
     }
 }
-test "lsm backend leaves orphaned committed run files to explicit repair" {
+test "lsm backend reclaims orphaned committed run files after manifest recovery" {
     var path_buf: [256]u8 = undefined;
     const path = repository_mod.tmpPath(&path_buf, "orphan-run-cleanup");
     defer repository_mod.cleanupTmp(path);
@@ -15103,7 +15300,7 @@ test "lsm backend leaves orphaned committed run files to explicit repair" {
         defer reopened.close();
 
         try std.testing.expectEqual(@as(usize, 1), reopened.runs.items.len);
-        try std.Io.Dir.cwd().access(std.testing.io, orphan_path, .{});
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, orphan_path, .{}));
 
         var runtime = try reopened.runtimeStore(std.testing.allocator, .{ .name = "docs" });
         defer runtime.deinit();

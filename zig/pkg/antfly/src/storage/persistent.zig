@@ -1775,10 +1775,18 @@ pub const PersistentIndex = struct {
 
     /// Tombstone a document by external ID and persist the segment deletion bitmap.
     pub fn deleteById(self: *PersistentIndex, doc_id: []const u8) !bool {
+        return try self.deleteByIds(&.{doc_id});
+    }
+
+    /// Tombstone a batch of external IDs in one segment traversal and one
+    /// storage transaction. This preserves all-or-nothing bitmap persistence
+    /// without multiplying the scan cost by the number of IDs.
+    pub fn deleteByIds(self: *PersistentIndex, doc_ids: []const []const u8) !bool {
+        if (doc_ids.len == 0) return false;
         self.lockStorage();
         defer self.unlockStorage();
 
-        const delete_infos = try self.writer.deleteAllByIdTracked(self.alloc, doc_id);
+        const delete_infos = try self.writer.deleteAllByIdsTracked(self.alloc, doc_ids);
         defer index_mod.IndexWriter.freeDeleteInfos(self.alloc, delete_infos);
         if (delete_infos.len == 0) return false;
         var persisted = false;

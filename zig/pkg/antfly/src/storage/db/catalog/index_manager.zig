@@ -9945,11 +9945,7 @@ pub const IndexManager = struct {
     }
 
     fn deleteTextBatchEntry(_: *IndexManager, entry: *TextIndex, keys: []const []const u8) !TextBatchMutationStats {
-        var deleted_any = false;
-        for (keys) |key| {
-            deleted_any = (try entry.persistent.deleteById(key)) or deleted_any;
-        }
-        return .{ .deleted_any = deleted_any };
+        return .{ .deleted_any = try entry.persistent.deleteByIds(keys) };
     }
 
     fn finalizeTextBatchMutations(

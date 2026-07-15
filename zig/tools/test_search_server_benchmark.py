@@ -160,6 +160,20 @@ class ServerBenchmarkTest(unittest.TestCase):
             inventory = benchmark.directory_inventory(root)
         manifest = inventory["lsm_manifests"][0]
         self.assertEqual({"files": 1, "bytes": 11, "missing": 0, "logical_bytes": 10}, manifest["active"])
+        self.assertEqual(
+            {
+                "id": 1,
+                "level": 0,
+                "size_bytes": 10,
+                "entry_count": 1,
+                "smallest_namespace_hex": "",
+                "smallest_key_hex": "61",
+                "largest_namespace_hex": "",
+                "largest_key_hex": "7a",
+                "partition_prefix_equal": False,
+            },
+            manifest["active_runs"][0],
+        )
         self.assertEqual({"files": 1, "bytes": 13, "missing": 0}, manifest["obsolete"])
         self.assertEqual({"files": 3, "bytes": 41, "missing": 0}, manifest["physical"])
         self.assertEqual({"files": 1, "bytes": 17, "missing": 0}, manifest["untracked"])

@@ -1,6 +1,7 @@
 import io
 import json
 import unittest
+from unittest import mock
 
 import load_antfly_search_benchmark as loader
 
@@ -36,6 +37,37 @@ class AntflyLoaderTest(unittest.TestCase):
     def test_rejects_missing_text(self):
         with self.assertRaisesRegex(ValueError, "missing string text"):
             loader.encode_entry(b'{"body":"wrong"}\n', 3)
+
+    def test_ingest_retries_explicit_backpressure(self):
+        class Response:
+            def __init__(self, status, body):
+                self.status = status
+                self._body = body
+
+            def read(self):
+                return self._body
+
+        class Connection:
+            def __init__(self, *_, **__):
+                self.requests = 0
+
+            def request(self, *_, **__):
+                self.requests += 1
+
+            def getresponse(self):
+                if self.requests == 1:
+                    return Response(429, b"table backpressured")
+                return Response(201, b'{"inserted":1}')
+
+            def close(self):
+                pass
+
+        with mock.patch.object(loader.http.client, "HTTPConnection", Connection), mock.patch.object(loader.time, "sleep"):
+            client = loader.AntflyClient("http://127.0.0.1:8080/db/v1", "docs", 1)
+            self.assertEqual(1, client.ingest(b'"doc:1":{}', "write"))
+            self.assertEqual(2, client.connection.requests)
+            self.assertEqual(1, client.backpressure_retries)
+            self.assertGreater(client.backpressure_wait_seconds, 0)
 
 
 if __name__ == "__main__":

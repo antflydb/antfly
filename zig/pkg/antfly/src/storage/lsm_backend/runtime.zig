@@ -2462,11 +2462,15 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                 &.{};
             errdefer releaseImmutableMemtableSnapshotList(BackendType, backend, immutable_memtables);
             const mutable_snapshot = try snapshotReadMutable(BackendType, backend, .bound_read_txn);
-            errdefer if (mutable_snapshot.owned) {
-                var owned = @constCast(mutable_snapshot.state);
-                owned.deinit(backend.allocator);
-                backend.allocator.destroy(owned);
-            };
+            errdefer {
+                if (mutable_snapshot.owned) {
+                    var owned = @constCast(mutable_snapshot.state);
+                    owned.deinit(backend.allocator);
+                    backend.allocator.destroy(owned);
+                } else {
+                    releaseMutableReadSnapshot(BackendType, backend, mutable_snapshot.state, false);
+                }
+            }
             return .{
                 .allocator = backend.allocator,
                 .metadata_allocator = metadata_allocator,
@@ -2495,6 +2499,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
+            releaseMutableReadSnapshot(BackendType, backend, self.mutable_snapshot, self.owns_mutable_snapshot);
             releaseImmutableMemtableSnapshotList(BackendType, backend, self.immutable_memtables);
             releaseReadReader(BackendType, backend, .bound_read_txn);
             self.* = undefined;
@@ -2567,6 +2572,20 @@ fn releaseImmutableMemtablePins(
 ) void {
     if (@hasDecl(BackendType, "releaseImmutableMemtablePins")) {
         backend.releaseImmutableMemtablePins(snapshot);
+    }
+}
+
+/// Release the exact shared mutable generation returned by
+/// `snapshotMutableStateWithReason`. Fallback backends return owned snapshots
+/// and do not implement this hook.
+fn releaseMutableReadSnapshot(
+    comptime BackendType: type,
+    backend: *BackendType,
+    snapshot: *const State,
+    owned: bool,
+) void {
+    if (!owned and @hasDecl(BackendType, "releaseMutableStateSnapshot")) {
+        backend.releaseMutableStateSnapshot(snapshot);
     }
 }
 
@@ -2905,6 +2924,13 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             };
         }
 
+        fn borrowedPtr(self: *@This()) ?*const State {
+            return switch (self.*) {
+                .borrowed => |state| state,
+                else => null,
+            };
+        }
+
         fn deinitOwned(self: *@This(), allocator: Allocator) void {
             switch (self.*) {
                 .owned => |state| {
@@ -2959,6 +2985,9 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
                 if (mutable_snapshot_is_bulk_current_scan_clone and @hasDecl(BackendType, "releaseCurrentScanMutableStateForBulkIngest")) {
                     if (mutable_snapshot.ownedPtr()) |snapshot| backend.releaseCurrentScanMutableStateForBulkIngest(snapshot);
                 }
+                if (mutable_snapshot.borrowedPtr()) |snapshot| {
+                    releaseMutableReadSnapshot(BackendType, backend, snapshot, false);
+                }
                 mutable_snapshot.deinitOwned(backend.allocator);
             }
             if (mutable_snapshot.ptr() == null) {
@@ -3003,6 +3032,9 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
                 releaseImmutableMemtableSnapshotList(BackendType, backend, self.immutable_memtables);
                 if (self.mutable_snapshot_is_bulk_current_scan_clone and @hasDecl(BackendType, "releaseCurrentScanMutableStateForBulkIngest")) {
                     if (self.mutable_snapshot.ownedPtr()) |snapshot| backend.releaseCurrentScanMutableStateForBulkIngest(snapshot);
+                }
+                if (self.mutable_snapshot.borrowedPtr()) |snapshot| {
+                    releaseMutableReadSnapshot(BackendType, backend, snapshot, false);
                 }
                 releaseReadReader(BackendType, backend, .current_scan);
             }
@@ -3676,11 +3708,15 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
                 &.{};
             errdefer releaseImmutableMemtableSnapshotList(BackendType, backend, immutable_memtables);
             const mutable_snapshot = try snapshotReadMutable(BackendType, backend, .namespace_read_txn);
-            errdefer if (mutable_snapshot.owned) {
-                var owned = @constCast(mutable_snapshot.state);
-                owned.deinit(backend.allocator);
-                backend.allocator.destroy(owned);
-            };
+            errdefer {
+                if (mutable_snapshot.owned) {
+                    var owned = @constCast(mutable_snapshot.state);
+                    owned.deinit(backend.allocator);
+                    backend.allocator.destroy(owned);
+                } else {
+                    releaseMutableReadSnapshot(BackendType, backend, mutable_snapshot.state, false);
+                }
+            }
             return .{
                 .allocator = backend.allocator,
                 .metadata_allocator = metadata_allocator,
@@ -3709,6 +3745,7 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
+            releaseMutableReadSnapshot(BackendType, backend, self.mutable_snapshot, self.owns_mutable_snapshot);
             releaseImmutableMemtableSnapshotList(BackendType, backend, self.immutable_memtables);
             releaseReadReader(BackendType, backend, .namespace_read_txn);
             self.* = undefined;

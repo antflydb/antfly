@@ -440,6 +440,12 @@ pub const ResourceManager = struct {
     pub fn awaitAdmission(self: *ResourceManager, slice: Slice, additional_bytes: u64) !void {
         while (true) {
             const decision = self.admissionDecision(slice, additional_bytes);
+            // No amount of waiting can admit a single request whose projected
+            // footprint exceeds the entire slice. Avoid an unbounded wait when
+            // the configured hard action is write throttling.
+            if (decision.hard_limit_bytes > 0 and additional_bytes > decision.hard_limit_bytes) {
+                return error.ResourceBudgetExceeded;
+            }
             switch (decision.action) {
                 .report, .shrink_cache, .defer_background_work => return,
                 .reject_work => return error.ResourceBudgetExceeded,
@@ -729,4 +735,18 @@ test "resource manager bounds soft write throttling without waiting for compacti
     const elapsed_ns = platform_time.monotonicNs() - started_ns;
     try std.testing.expect(elapsed_ns < std.time.ns_per_s);
     try std.testing.expectEqual(Pressure.soft, manager.sliceStats(.lsm_in_memory_state).pressure);
+}
+
+test "resource manager rejects an impossible projected admission without waiting" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.lsm_in_memory_state)] = .{
+        .soft_limit_bytes = 10,
+        .hard_limit_bytes = 20,
+    };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        manager.awaitAdmission(.lsm_in_memory_state, 21),
+    );
 }

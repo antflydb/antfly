@@ -49,6 +49,7 @@ const Worker = struct {
     replay_cursor_open_sequence: u64 = 0,
     catch_up_active: bool = false,
     last_replay_tail_records: u64 = 0,
+    pressure_retry_backoff: catch_up_policy.PressureRetryBackoff = .{},
 };
 
 const PersistSnapshot = struct {
@@ -725,14 +726,15 @@ fn workerMain(worker: *Worker) void {
                 const sequence = worker.applied_sequence;
                 runtime.mutex.unlock(io);
                 const persisted = persistIdleAppliedSequence(runtime, worker, sequence, io) catch |err| {
-                    if (err == error.WriterLocked) {
-                        io.sleep(Io.Duration.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
+                    if (err == error.WriterLocked or err == error.ResourceBudgetExceeded) {
+                        sleepAfterRecoverableCatchUpError(worker, err, io);
                         runtime.mutex.lockUncancelable(io);
                         continue;
                     }
                     runtime.recordError(io, worker.name, "idle_persist", err);
                     return;
                 };
+                worker.pressure_retry_backoff.reset();
                 if (!persisted) io.sleep(Io.Duration.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
                 runtime.mutex.lockUncancelable(io);
                 continue;
@@ -769,6 +771,15 @@ fn workerMain(worker: *Worker) void {
             worker.catch_up_active = false;
             runtime.cond.broadcast(io);
             runtime.mutex.unlock(io);
+            if (isRecoverableCatchUpError(worker, err)) {
+                closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
+                    close_success = false;
+                    runtime.recordError(io, worker.name, "recoverable_begin_catch_up_close", close_err);
+                    return;
+                };
+                sleepAfterRecoverableCatchUpError(worker, err, io);
+                continue;
+            }
             close_success = false;
             runtime.recordError(io, worker.name, "begin_catch_up_session", err);
             return;
@@ -786,7 +797,7 @@ fn workerMain(worker: *Worker) void {
                     runtime.recordError(io, worker.name, "recoverable_catch_up_close", close_err);
                     return;
                 };
-                io.sleep(Io.Duration.zero, .awake) catch {};
+                sleepAfterRecoverableCatchUpError(worker, err, io);
                 continue;
             }
             close_success = false;
@@ -820,6 +831,15 @@ fn workerMain(worker: *Worker) void {
                     worker.catch_up_active = false;
                     runtime.cond.broadcast(io);
                     runtime.mutex.unlock(io);
+                    if (isRecoverableCatchUpError(worker, err)) {
+                        closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
+                            close_success = false;
+                            runtime.recordError(io, worker.name, "recoverable_refresh_replay_cursor_close", close_err);
+                            return;
+                        };
+                        sleepAfterRecoverableCatchUpError(worker, err, io);
+                        continue;
+                    }
                     close_success = false;
                     runtime.recordError(io, worker.name, "refresh_replay_cursor", err);
                     return;
@@ -835,7 +855,7 @@ fn workerMain(worker: *Worker) void {
                             runtime.recordError(io, worker.name, "recoverable_refreshed_catch_up_close", close_err);
                             return;
                         };
-                        io.sleep(Io.Duration.zero, .awake) catch {};
+                        sleepAfterRecoverableCatchUpError(worker, err, io);
                         continue;
                     }
                     close_success = false;
@@ -879,7 +899,7 @@ fn workerMain(worker: *Worker) void {
         if (caught_up_sequence > from_sequence) {
             closeWorkerCatchUpState(runtime, worker, true) catch |err| {
                 if (isRecoverablePublishError(worker, err)) {
-                    io.sleep(Io.Duration.zero, .awake) catch {};
+                    sleepAfterRecoverableCatchUpError(worker, err, io);
                     continue;
                 }
                 close_success = false;
@@ -891,8 +911,8 @@ fn workerMain(worker: *Worker) void {
         var persisted = false;
         if (caught_up_sequence > from_sequence) {
             persisted = runtime.persist_fn(runtime.ctx, worker.name, caught_up_sequence, forcePersistAppliedSequence(worker)) catch |err| {
-                if (err == error.WriterLocked) {
-                    io.sleep(Io.Duration.zero, .awake) catch {};
+                if (err == error.WriterLocked or err == error.ResourceBudgetExceeded) {
+                    sleepAfterRecoverableCatchUpError(worker, err, io);
                     continue;
                 }
                 runtime.recordError(io, worker.name, "persist", err);
@@ -921,6 +941,7 @@ fn workerMain(worker: *Worker) void {
             runtime.cond.broadcast(io);
         }
         runtime.mutex.unlock(io);
+        worker.pressure_retry_backoff.reset();
 
         if (shouldRefreshReplayCursor(worker, caught_up_sequence)) {
             closeWorkerReplayCursor(runtime, worker);
@@ -1035,7 +1056,7 @@ fn closeWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, success: b
 fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
     return switch (err) {
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,
-        error.ReplayDocumentNotVisible, error.ArtifactRepairRequired, error.WriterLocked => true,
+        error.ReplayDocumentNotVisible, error.ArtifactRepairRequired, error.WriterLocked, error.ResourceBudgetExceeded => true,
         else => false,
     };
 }
@@ -1043,12 +1064,29 @@ fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
 fn isRecoverableCatchUpError(worker: *const Worker, err: anyerror) bool {
     return switch (err) {
         error.WriterLocked,
+        error.ResourceBudgetExceeded,
         error.ReplayDocumentNotVisible,
         error.ArtifactRepairRequired,
         => true,
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,
         else => false,
     };
+}
+
+fn sleepAfterRecoverableCatchUpError(worker: *Worker, err: anyerror, io: Io) void {
+    if (err != error.ResourceBudgetExceeded) {
+        worker.pressure_retry_backoff.reset();
+        io.sleep(Io.Duration.zero, .awake) catch {};
+        return;
+    }
+    const delay_ns = worker.pressure_retry_backoff.nextDelayNs();
+    if (worker.pressure_retry_backoff.shouldLog()) {
+        std.log.warn(
+            "derived worker resource admission deferred worker={s} failures={} retry_ms={}",
+            .{ worker.name, worker.pressure_retry_backoff.failures, delay_ns / std.time.ns_per_ms },
+        );
+    }
+    io.sleep(Io.Duration.fromNanoseconds(@intCast(delay_ns)), .awake) catch {};
 }
 
 fn waitForCatchUpSessionReuse(runtime: *DerivedRuntime, worker: *Worker, io: Io) bool {
@@ -1149,8 +1187,10 @@ const TestThreadedRuntimeCapture = struct {
     finish_calls: std.atomic.Value(u64) = .init(0),
     publish_failures: std.atomic.Value(u64) = .init(0),
     apply_not_found_failures: std.atomic.Value(u64) = .init(0),
+    resource_budget_failures: std.atomic.Value(u64) = .init(0),
     persisted_sequence: std.atomic.Value(u64) = .init(0),
     fail_next_dense_apply_not_found: std.atomic.Value(bool) = .init(false),
+    fail_next_apply_resource_budget: std.atomic.Value(bool) = .init(false),
     fail_next_publish: std.atomic.Value(bool) = .init(false),
 };
 
@@ -1158,6 +1198,10 @@ fn testThreadedRuntimeApply(ctx: *anyopaque, batch: derived_types.DerivedBatch, 
     _ = batch;
     const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(ctx));
     _ = capture.apply_calls.fetchAdd(1, .monotonic);
+    if (capture.fail_next_apply_resource_budget.swap(false, .monotonic)) {
+        _ = capture.resource_budget_failures.fetchAdd(1, .monotonic);
+        return error.ResourceBudgetExceeded;
+    }
     if (index_ref.kind == .dense_vector and capture.fail_next_dense_apply_not_found.swap(false, .monotonic)) {
         _ = capture.apply_not_found_failures.fetchAdd(1, .monotonic);
         return error.NotFound;
@@ -1303,5 +1347,52 @@ test "io threaded dense publish NotFound retries with a fresh session" {
     try std.testing.expect(capture.begin_calls.load(.monotonic) >= 2);
     try std.testing.expect(capture.finish_calls.load(.monotonic) >= 2);
     try std.testing.expectEqual(@as(u64, 1), runtime.appliedSequence("dense_idx").?);
+    try std.testing.expectEqual(@as(u64, 1), capture.persisted_sequence.load(.monotonic));
+}
+
+test "io threaded full-text resource pressure retries without poisoning runtime" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/io-threaded-full-text-resource-retry-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testThreadedRuntimeJournalOpenOptions());
+    defer journal.close();
+    try appendTestThreadedRuntimeRecord(&journal, alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.full_text},
+    });
+
+    var capture = TestThreadedRuntimeCapture{};
+    capture.fail_next_apply_resource_budget.store(true, .monotonic);
+    var runtime = try DerivedRuntime.init(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        &capture,
+        testThreadedRuntimeApply,
+        testThreadedRuntimePersist,
+        testThreadedRuntimeTruncate,
+        testThreadedRuntimeBeginCatchUp,
+        testThreadedRuntimeFinishCatchUp,
+        null,
+        null,
+    );
+    defer runtime.deinit();
+
+    try runtime.addWorker("text_idx", .{ .name = "text_idx", .kind = .full_text }, 0);
+    runtime.notifySequence(1);
+    try runtime.waitForAll(1);
+    try runtime.failIfUnhealthy();
+
+    try std.testing.expectEqual(@as(u64, 1), capture.resource_budget_failures.load(.monotonic));
+    try std.testing.expect(capture.apply_calls.load(.monotonic) >= 2);
+    try std.testing.expect(capture.begin_calls.load(.monotonic) >= 2);
+    try std.testing.expect(capture.finish_calls.load(.monotonic) >= 2);
+    try std.testing.expectEqual(@as(u64, 1), runtime.appliedSequence("text_idx").?);
     try std.testing.expectEqual(@as(u64, 1), capture.persisted_sequence.load(.monotonic));
 }

@@ -4541,6 +4541,52 @@ pub const DB = struct {
         }
     }
 
+    fn projectedBatchLsmAdmissionBytes(req: types.BatchRequest) u64 {
+        var payload_bytes: u64 = 0;
+        var operations: u64 = 0;
+        for (req.writes) |write| {
+            payload_bytes +|= @intCast(write.key.len);
+            payload_bytes +|= @intCast(write.value.len);
+            operations +|= 1;
+        }
+        for (req.deletes) |key| {
+            payload_bytes +|= @intCast(key.len);
+            operations +|= 1;
+        }
+        for (req.transforms) |transform| {
+            payload_bytes +|= @intCast(transform.key.len);
+            operations +|= 1;
+            for (transform.operations) |operation| {
+                payload_bytes +|= @intCast(operation.path.len);
+                if (operation.value_json) |value| payload_bytes +|= @intCast(value.len);
+                operations +|= 1;
+            }
+        }
+        for (req.graph_writes) |write| {
+            payload_bytes +|= @intCast(write.index_name.len);
+            payload_bytes +|= @intCast(write.source.len);
+            payload_bytes +|= @intCast(write.target.len);
+            payload_bytes +|= @intCast(write.edge_type.len);
+            payload_bytes +|= @intCast(write.metadata_json.len);
+            operations +|= 1;
+        }
+        for (req.graph_deletes) |delete| {
+            payload_bytes +|= @intCast(delete.index_name.len);
+            payload_bytes +|= @intCast(delete.source.len);
+            payload_bytes +|= @intCast(delete.target.len);
+            payload_bytes +|= @intCast(delete.edge_type.len);
+            operations +|= 1;
+        }
+        for (req.predicates) |predicate| payload_bytes +|= @intCast(predicate.key.len);
+
+        // Primary rows are accompanied by internal identity/timestamp/replay
+        // records, allocator capacity, and the memtable hash index. Two times
+        // encoded payload plus a per-operation allowance is deliberately a
+        // conservative preflight; the backend still performs the exact guard
+        // immediately before WAL append.
+        return (payload_bytes *| 2) +| (operations *| 512);
+    }
+
     pub fn drainDocumentArtifactChildRangeOutbox(
         self: *DB,
         dispatcher: DocumentArtifactChildRangeDispatcher,
@@ -4838,7 +4884,7 @@ pub const DB = struct {
         // the final projected check before WAL append, so this non-reserving
         // preflight is an early wait, not the durability guard.
         if (self.core.index_manager.resource_manager) |manager| {
-            try manager.awaitAdmission(.lsm_in_memory_state, 0);
+            try manager.awaitAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req));
         }
 
         lockApply(self);
@@ -32193,6 +32239,17 @@ test "db evaluates policy-gated algebraic adaptive candidates" {
     try std.testing.expectEqualStrings(progress[0].materialization_id, active_progress.materialization_id);
     try std.testing.expectEqualStrings("backfilling", active_progress.lifecycle);
     try std.testing.expectEqual(progress[0].target_sequence, active_progress.target_sequence);
+}
+
+test "db batch projected admission includes payload and internal record overhead" {
+    const writes = [_]types.BatchWrite{.{ .key = "doc:a", .value = "1234567890" }};
+    const deletes = [_][]const u8{"doc:b"};
+    const estimated = DB.projectedBatchLsmAdmissionBytes(.{
+        .writes = writes[0..],
+        .deletes = deletes[0..],
+    });
+    const payload_bytes = "doc:a".len + "1234567890".len + "doc:b".len;
+    try std.testing.expectEqual(@as(u64, payload_bytes * 2 + 2 * 512), estimated);
 }
 
 test "db open borrows shared backend runtime" {

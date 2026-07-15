@@ -2219,6 +2219,191 @@ The validated 650K release load accepts the LSM process-memory gate. The next
 production load must quantify the new text-residency counters and final RSS;
 merge allocator retention remains a separately measured optimization target.
 
+### Production admission, recovery, and mutable-snapshot lifetime follow-up
+
+The subsequent full-server qualification hardened failure and recovery paths
+before another public result was accepted. Unlocked compaction now pins every
+source run path for the complete build and deletes any completed output when a
+later publication step fails. Production open removes committed `.tbl` files
+that are absent from the recovered manifest as interrupted-publication orphans;
+one preserved failed root reclaimed 11 files / 4,297,896,878 bytes. Derived
+workers treat `ResourceBudgetExceeded` as recoverable at session open, replay,
+apply, publication, and persistence boundaries. They restart from the last
+applied sequence with exponential backoff from 10 ms to 250 ms rather than
+poisoning the runtime or losing durable work.
+
+Public write admission now has an explicit two-level contract. Before taking
+the DB apply lock, a write estimates its expanded LSM cost as two copies of
+payload plus 512 bytes per operation and waits on the shared
+`lsm.in_memory_state` slice. The backend still repeats the exact nonblocking
+pre-WAL check. An individual request larger than the hard slice is rejected
+immediately because waiting cannot make it fit. Budget rejection maps to HTTP
+429 `Backpressured`, not HTTP 500, and the benchmark loader retries only that
+explicit status with bounded 10--250 ms exponential delay while reporting retry
+count and wait time.
+
+A fresh 450K acceptance gate crossed the former deterministic 411,354-document
+failure and completed full-index synchronization in 243.875 seconds with zero
+retries. Final primary state was three active runs / 632,446,662 bytes, zero
+obsolete and untracked files, and 23,019,898 bytes of WAL. Text occupied about
+606 MB across 18 segments. Settled RSS was 1.845 GB, while physical footprint
+was 164.4 MB and live malloc allocation 195.6 MB, confirming that most RSS was
+clean file-backed residency rather than anonymous retained state.
+
+The next fresh full-corpus attempt exposed one remaining allocator lifetime bug
+at 644,596 documents. Ingestion stopped with `lsm.in_memory_state` fixed at
+800,843,922 bytes against an 805,306,368-byte hard limit. A roughly 1 GB
+compaction completed and L0 drained, but the accounted state did not fall, so
+no future batch could be admitted. The primary run set itself was about 1.014
+GB and native runs remained range-read rather than mmap-backed. Two long-lived
+probe readers were active. The retained bytes were cached mutable read
+snapshots: invalidating a snapshot retired it whenever *any* backend reader was
+active, so unrelated probes retained every old mutable generation.
+
+Mutable snapshots now use exact per-generation reference pins. Bound reads,
+namespace reads, and current scans release the specific shared snapshot they
+borrowed on every success and error path. Invalidation destroys an unpinned
+generation immediately; a pinned retired generation is reclaimed when its own
+last borrower exits, independently of probes or readers of other generations.
+The current generation may remain cached without a pin, and the empty snapshot
+requires no bookkeeping. ResourceManager accounting includes current and
+retired mutable generations and drops synchronously on exact release. A
+regression holds an unrelated probe open while retiring two different mutable
+snapshots and proves each is reclaimed as its own reader closes. The complete
+LSM backend suite passes 252 tests with one platform skip, zero failures, and
+zero leaks.
+
+The fresh 750K release gate validates the production fix. Canonical 4 MiB
+requests crossed 411,354 documents in 60.554 seconds and reached 689,615 in
+91.128 seconds. All 750,000 documents uploaded in 344 requests and full-index
+synchronization completed in 650.189 seconds with zero backpressure retries,
+zero soft-pressure events, and zero hard rejections. During a 683 MB primary
+compaction, active primary runs reached 1.065 GB while
+`lsm.in_memory_state` was only 5.76 MB; its lifetime peak was 79.94 MB. At one
+settled compaction sample RSS fell to about 81 MB with 1.10 GB of runs still on
+disk, directly demonstrating that run-file residency is reclaimable and not
+heap state.
+
+After full synchronization, the primary contained 1,099,698,324 bytes of runs,
+941,169,722 bytes of physical entry payload, 35,419,886 bytes of retained WAL,
+zero active readers, and 5,843,186 bytes of LSM in-memory state. Text contained
+18 mmap-backed segments / 1,004,280,431 bytes with zero heap segments. The
+complete root occupied 2,159,152 KiB: 1,103,444 KiB primary runs, 35,592 KiB
+WAL, and 1,026,780 KiB indexes. Final RSS was 1.444 GB with 288.4 MB live malloc
+allocation. This accepts mutable-generation lifetime and admission correctness;
+the long final-sync wall time remains a product throughput cost to report, not
+a memory-safety failure.
+
+### Primary run geometry and replay-CPU follow-up
+
+The next scale attempts separated primary compaction geometry from derived text
+CPU. A static-level full-corpus attempt was stopped after roughly 4.636 million
+documents when fixed lower-level targets scheduled an unnecessary downstream
+rewrite. Level byte targets now derive from the live data scale. On a fresh
+2.2-million-document gate, upload completed in about 351 seconds and primary
+state settled without the former L3 cascade: one 296 MB L1 run plus eight L2
+runs totaling about 3.18 GB. The run was still rejected because `full_index`
+did not complete within 600 seconds.
+
+Exact manifest bounds identified why the remaining compaction closures could
+still be oversized. A persisted primary run bundled several binary key
+families in the same `docs` namespace: ordinary document rows beginning with
+`0x01`, ordinal/identity metadata beginning with `0x02`, and replay/internal
+rows beginning with `0x03`, plus metadata rows. Run-level bounds therefore made
+otherwise disjoint lower-level partitions appear to overlap. New primary runs
+are now cut whenever namespace or the configured first key byte changes.
+Streaming compaction applies the same boundary before appending an entry to its
+output. This changes only run layout; manifest and table encodings remain v8,
+so the branch opens the format on `main` and narrows legacy broad runs as normal
+compaction rewrites them.
+
+The complete LSM suite passes 255 tests with one platform skip, zero failures,
+and zero leaks. A fresh 750K gate confirmed the layout under production writes:
+30 early flushes produced 60 family-partitioned runs. The preserved final
+primary manifest contains 20 active runs / 1,080,827,659 bytes, zero obsolete
+files, and zero untracked files. Every primary run has equal smallest/largest
+namespace and equal first key-family byte. The server benchmark manifest
+decoder now emits each run's level, size, entry count, namespace/key bounds,
+and `partition_prefix_equal`, so future gates assert this property directly
+rather than inferring it from aggregate bytes.
+
+That 750K run rejected the first replay-CPU fix. Upload reached 735,871
+documents in 370.349 seconds, but the final `full_index` barrier remained active
+for more than five additional minutes and was deliberately stopped. Memory was
+bounded: lifetime physical footprint peaked at 778,784,056 bytes, live
+`lsm.in_memory_state` peaked at 86,777,504 bytes, and the online replay-key
+window peaked near 538 KB. A live profile nevertheless found a derived worker
+inside one text apply while a merge worker attempted to build and publish
+segments. Restarting the rejected durable root exposed an 18,989,198-byte
+single replay record. The existing first-record forward-progress rule correctly
+allowed it to exceed the nominal 16 MiB collection target, so a collection
+item limit alone could not bound its apply latency.
+
+The dominant CPU defect was more fundamental. Replay deliberately tombstones
+upsert IDs before adding their new versions so a crash between segment publish
+and applied-sequence persistence remains idempotent. `deleteById`, however,
+scanned every stored document in every active segment for each ID. An 8K replay
+batch against a 750K-document index therefore performed approximately 8K full
+index scans before tokenization. Deletion now builds one borrowed ID hash set,
+traverses each segment once, updates one deletion bitmap per affected segment,
+and commits all affected bitmaps in one storage transaction. Failure rolls the
+in-memory bitmaps back. The format and replay semantics are unchanged. The
+storage/index suite passes 659 tests with one platform skip, including
+multi-segment duplicates, duplicate requested IDs, atomic rollback, reopen, and
+the new batched path.
+
+Replaying the exact rejected root with that binary applied 157 pending replay
+entries in two windows with 76.694 seconds of measured apply time, instead of
+remaining inside one apply for several minutes. Phase metrics put individual
+4K-document text builds at roughly 55--208 ms depending on document length;
+analysis/stemming and inverted construction are now the visible CPU work, not
+repeated stored-document scans.
+
+Oversized durable records are additionally subchunked at the apply boundary.
+Explicit deletes and overwrites run first, followed by bounded document slices;
+the managed-index apply lock is released between slices. The durable sequence
+is persisted only after every slice succeeds. A crash during the record may
+redo completed slices, but the same tombstone-before-add rule makes that replay
+safe. A focused regression proves that one five-document record with a
+two-document limit invokes three applies while exposing one scanned/applied
+record and advances the same sequence only after all three calls. Collection
+memory remains governed by `ResourceManager`; apply CPU and lock hold time are
+now independently bounded.
+
+The subsequent fresh ReleaseFast 750K gate accepted both changes. Upload plus
+the `full_index` barrier completed in 124.784 seconds at 6,010 documents/second
+with zero backpressure retries, 5.21x faster than the earlier accepted
+650.189-second gate. It reached 735,871 documents in 108.411 seconds versus
+370.349 seconds in the rejected per-ID-delete run; the remaining documents and
+full synchronization added about 16.4 seconds.
+
+Lifetime physical footprint peaked at 660,637,664 bytes. Attributed peaks were
+300,045,666 bytes for `lsm.in_memory_state`, 100,663,296 bytes for
+`lsm.compaction_work`, 537,818 bytes for `derived.replay_window`, 73,721,592
+bytes for `full_text.build_working_set`, and 1,016,156,206 mmap-resident bytes
+for `full_text.segment_residency`. The mmap residency is file-backed and
+resource-managed rather than anonymous heap. The text index merged from 29
+segments / 1,016,156,206 bytes to 10 segments / 990,867,656 bytes. Primary LSM
+state settled within about 30 seconds from 107 active runs to 13 and later 11,
+with no active compaction left at measurement time.
+
+The settled pre-restart root occupied 2,107,602,361 bytes: 1,097,032,782 bytes
+in 11 primary runs, 19,574,183 bytes of primary WAL, 990,867,656 bytes in 10
+text segments, and 64,660 bytes in index runs. All 11 primary runs obeyed the
+namespace/key-family partition boundary, with zero obsolete or untracked
+files. A graceful restart retained the exact 2,700-hit `alpha` result. A forced
+process-loss restart then recovered an exact 750,000-document `match_all` and
+the same exact 2,700-hit `alpha` result. Recovery checkpointed the WAL to 56
+bytes and flushed mutable state, leaving 15 partition-conforming primary runs,
+zero obsolete files, and zero untracked files.
+
+This accepts the 750K production gate for batched deletion, record-internal
+subchunking, family-partitioned primary runs, bounded memory, disk accounting,
+and both graceful and crash recovery. The next validations are a fresh 2.2M
+gate followed by the full 5.03M product gate. No Quickwit corpus or comparator
+recollection is required; its archived authoritative result remains the
+comparison baseline.
+
 ## Result Artifact
 
 Each run should produce one directory containing at least:

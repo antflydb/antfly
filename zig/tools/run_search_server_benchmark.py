@@ -521,18 +521,46 @@ def lsm_manifest_inventory(root: Path, manifest_path: Path) -> dict[str, Any] | 
         run_count, obsolete_count = struct.unpack_from("<II", raw, offset)
         offset += 8
         active_paths: list[Path] = []
+        active_runs: list[dict[str, Any]] = []
         active_logical_bytes = 0
         for _ in range(run_count):
-            _, _, size_bytes = struct.unpack_from("<QIQ", raw, offset)
+            run_id, level, size_bytes = struct.unpack_from("<QIQ", raw, offset)
             offset += 20 + 40  # id/level/size plus five compression counters
             lengths = struct.unpack_from("<IIIII", raw, offset)
             offset += 20
-            offset += 4  # entry count
-            path_length = lengths[0]
+            entry_count = struct.unpack_from("<I", raw, offset)[0]
+            offset += 4
+            path_length, smallest_namespace_length, smallest_key_length, largest_namespace_length, largest_key_length = lengths
             run_path = raw[offset : offset + path_length].decode("utf-8")
-            offset += sum(lengths)
+            offset += path_length
+            smallest_namespace = raw[offset : offset + smallest_namespace_length]
+            offset += smallest_namespace_length
+            smallest_key = raw[offset : offset + smallest_key_length]
+            offset += smallest_key_length
+            largest_namespace = raw[offset : offset + largest_namespace_length]
+            offset += largest_namespace_length
+            largest_key = raw[offset : offset + largest_key_length]
+            offset += largest_key_length
             active_paths.append(resolve_manifest_path(manifest_path.parent, run_path))
             active_logical_bytes += size_bytes
+            active_runs.append(
+                {
+                    "id": run_id,
+                    "level": level,
+                    "size_bytes": size_bytes,
+                    "entry_count": entry_count,
+                    "smallest_namespace_hex": smallest_namespace.hex(),
+                    "smallest_key_hex": smallest_key.hex(),
+                    "largest_namespace_hex": largest_namespace.hex(),
+                    "largest_key_hex": largest_key.hex(),
+                    "partition_prefix_equal": bool(
+                        smallest_namespace == largest_namespace
+                        and smallest_key
+                        and largest_key
+                        and smallest_key[0] == largest_key[0]
+                    ),
+                }
+            )
         obsolete_paths: list[Path] = []
         for _ in range(obsolete_count):
             _, path_length = struct.unpack_from("<QI", raw, offset)
@@ -555,6 +583,7 @@ def lsm_manifest_inventory(root: Path, manifest_path: Path) -> dict[str, Any] | 
         "version": version,
         "next_run_id": next_run_id,
         "active": active,
+        "active_runs": active_runs,
         "obsolete": path_stats(obsolete_paths),
         "physical": path_stats(physical_paths),
         "untracked": path_stats(untracked_paths),

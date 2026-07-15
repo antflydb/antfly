@@ -1619,8 +1619,21 @@ pub const IndexWriter = struct {
     /// Delete every live copy of a document and return one updated deletion
     /// bitmap per affected segment for atomic persistence by the caller.
     pub fn deleteAllByIdTracked(self: *IndexWriter, alloc: Allocator, doc_id: []const u8) ![]DeleteInfo {
+        return self.deleteAllByIdsTracked(alloc, &.{doc_id});
+    }
+
+    /// Delete every live copy of a set of external document IDs with one
+    /// traversal of each segment. Returning one bitmap per affected segment
+    /// lets persistent callers commit the complete batch atomically.
+    pub fn deleteAllByIdsTracked(self: *IndexWriter, alloc: Allocator, doc_ids: []const []const u8) ![]DeleteInfo {
         self.lockMutex();
         defer self.mu.unlock();
+
+        var wanted = std.StringHashMapUnmanaged(void).empty;
+        defer wanted.deinit(alloc);
+        for (doc_ids) |doc_id| {
+            if (doc_id.len > 0) try wanted.put(alloc, doc_id, {});
+        }
 
         const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
         var delete_infos = std.ArrayListUnmanaged(DeleteInfo).empty;
@@ -1638,7 +1651,7 @@ pub const IndexWriter = struct {
             defer local_ids.deinit(alloc);
             for (0..seg.reader.doc_count) |local_id| {
                 const stored = seg.reader.storedDoc(@intCast(local_id)) orelse continue;
-                if (std.mem.eql(u8, stored.id, doc_id)) {
+                if (wanted.contains(stored.id)) {
                     if (seg.shared.deleted) |d| {
                         if (d.contains(@intCast(local_id))) continue;
                     }
@@ -2134,6 +2147,36 @@ test "tracked multi-segment deletion can roll back before persistence" {
     const current_results = try writer.snapshot().search(alloc, "body", &.{"current"}, 10);
     defer alloc.free(current_results.hits);
     try std.testing.expectEqual(@as(usize, 1), current_results.hits.len);
+}
+
+test "tracked batch deletion removes many IDs with one result per affected segment" {
+    const alloc = std.testing.allocator;
+    const first = try buildTestSegmentWithIds(alloc, &.{
+        .{ .id = "doc:a", .terms = &.{.{ .term = "x", .freq = 1, .norm = 10 }} },
+        .{ .id = "doc:b", .terms = &.{.{ .term = "x", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(first);
+    const second = try buildTestSegmentWithIds(alloc, &.{
+        .{ .id = "doc:b", .terms = &.{.{ .term = "x", .freq = 1, .norm = 10 }} },
+        .{ .id = "doc:c", .terms = &.{.{ .term = "x", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(second);
+
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(first);
+    try writer.addSegment(second);
+
+    const delete_infos = try writer.deleteAllByIdsTracked(alloc, &.{ "doc:b", "missing", "doc:a", "doc:b" });
+    defer IndexWriter.freeDeleteInfos(alloc, delete_infos);
+    try std.testing.expectEqual(@as(usize, 2), delete_infos.len);
+    try std.testing.expectEqual(@as(u32, 1), writer.snapshot().global_doc_count);
+
+    const results = try writer.snapshot().search(alloc, "body", &.{"x"}, 10);
+    defer alloc.free(results.hits);
+    try std.testing.expectEqual(@as(usize, 1), results.hits.len);
+    const remaining = writer.snapshot().storedDoc(results.hits[0].doc_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("doc:c", remaining.id);
 }
 
 test "index writer removeSegments frees staged segment list when retired allocation fails" {

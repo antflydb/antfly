@@ -68,6 +68,8 @@ pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .l0_hard_limit_bytes = 2 * 1024 * 1024 * 1024,
     .level_target_bytes_base = doc_lsm_level_target_bytes_base,
     .level_target_bytes_multiplier = doc_lsm_level_target_bytes_multiplier,
+    .max_compaction_input_bytes = 2 * gib,
+    .run_partition_prefix_bytes = 1,
     .wal_soft_limit_segments = primary_wal_soft_limit_segments,
     .wal_hard_limit_segments = primary_wal_hard_limit_segments,
     .wal_soft_limit_bytes = primary_wal_soft_limit_bytes,
@@ -463,6 +465,7 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(@as(usize, 32), primary_opts.l0_soft_limit_runs);
     try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), primary_opts.level_target_bytes_base);
     try std.testing.expectEqual(@as(usize, 10), primary_opts.level_target_bytes_multiplier);
+    try std.testing.expectEqual(@as(u64, 2 * gib), primary_opts.max_compaction_input_bytes);
     try std.testing.expectEqual(primary_wal_soft_limit_segments, primary_opts.wal_soft_limit_segments);
     try std.testing.expectEqual(primary_wal_hard_limit_segments, primary_opts.wal_hard_limit_segments);
     try std.testing.expectEqual(primary_wal_soft_limit_bytes, primary_opts.wal_soft_limit_bytes);
@@ -470,6 +473,7 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(@as(u64, 256 * mib), primary_opts.max_deferred_immutable_bytes);
     try std.testing.expect(primary_opts.foreground_soft_wal_checkpoint);
     try std.testing.expectEqual(@as(@TypeOf(primary_opts.table_prefix_extractor), .first_separator), primary_opts.table_prefix_extractor);
+    try std.testing.expectEqual(@as(usize, 1), primary_opts.run_partition_prefix_bytes);
 }
 
 test "index backend resolver honors explicit lsm storage over memory primary" {

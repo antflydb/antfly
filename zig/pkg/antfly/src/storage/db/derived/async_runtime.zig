@@ -48,6 +48,7 @@ const Worker = struct {
     replay_cursor: ?replay_source_mod.MatchingCursor = null,
     replay_cursor_open_sequence: u64 = 0,
     last_replay_tail_records: u64 = 0,
+    pressure_retry_backoff: catch_up_policy.PressureRetryBackoff = .{},
 };
 
 fn forcePersistAppliedSequence(worker: *const Worker) bool {
@@ -434,13 +435,14 @@ fn workerMain(worker: *Worker) void {
         if (target_sequence <= from_sequence) {
             if (from_sequence > persisted_sequence) {
                 const persisted = persistIdleAppliedSequence(runtime, worker, from_sequence) catch |err| {
-                    if (err == error.WriterLocked) {
-                        sleepNs(50 * std.time.ns_per_ms);
+                    if (err == error.WriterLocked or err == error.ResourceBudgetExceeded) {
+                        sleepAfterRecoverableCatchUpError(worker, err);
                         continue;
                     }
                     runtime.recordError(err);
                     return;
                 };
+                worker.pressure_retry_backoff.reset();
                 if (!persisted) sleepNs(50 * std.time.ns_per_ms);
                 continue;
             }
@@ -455,6 +457,15 @@ fn workerMain(worker: *Worker) void {
         }
 
         ensureWorkerCatchUpState(runtime, worker, from_sequence) catch |err| {
+            if (isRecoverableCatchUpError(worker, err)) {
+                closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
+                    close_success = false;
+                    runtime.recordError(close_err);
+                    return;
+                };
+                sleepAfterRecoverableCatchUpError(worker, err);
+                continue;
+            }
             close_success = false;
             runtime.recordError(err);
             return;
@@ -468,7 +479,7 @@ fn workerMain(worker: *Worker) void {
                     runtime.recordError(close_err);
                     return;
                 };
-                std.Thread.yield() catch {};
+                sleepAfterRecoverableCatchUpError(worker, err);
                 continue;
             }
             close_success = false;
@@ -489,6 +500,15 @@ fn workerMain(worker: *Worker) void {
             } else if (worker.replay_cursor != null) {
                 closeWorkerReplayCursor(runtime, worker);
                 ensureWorkerCatchUpState(runtime, worker, from_sequence) catch |err| {
+                    if (isRecoverableCatchUpError(worker, err)) {
+                        closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
+                            close_success = false;
+                            runtime.recordError(close_err);
+                            return;
+                        };
+                        sleepAfterRecoverableCatchUpError(worker, err);
+                        continue;
+                    }
                     close_success = false;
                     runtime.recordError(err);
                     return;
@@ -500,7 +520,7 @@ fn workerMain(worker: *Worker) void {
                             runtime.recordError(close_err);
                             return;
                         };
-                        std.Thread.yield() catch {};
+                        sleepAfterRecoverableCatchUpError(worker, err);
                         continue;
                     }
                     close_success = false;
@@ -539,7 +559,7 @@ fn workerMain(worker: *Worker) void {
         if (caught_up_sequence > from_sequence) {
             closeWorkerCatchUpState(runtime, worker, true) catch |err| {
                 if (isRecoverablePublishError(worker, err)) {
-                    std.Thread.yield() catch {};
+                    sleepAfterRecoverableCatchUpError(worker, err);
                     continue;
                 }
                 close_success = false;
@@ -551,8 +571,8 @@ fn workerMain(worker: *Worker) void {
         var persisted = false;
         if (caught_up_sequence > from_sequence) {
             persisted = runtime.persist_fn(runtime.ctx, worker.name, caught_up_sequence, forcePersistAppliedSequence(worker)) catch |err| {
-                if (err == error.WriterLocked) {
-                    std.Thread.yield() catch {};
+                if (err == error.WriterLocked or err == error.ResourceBudgetExceeded) {
+                    sleepAfterRecoverableCatchUpError(worker, err);
                     continue;
                 }
                 runtime.recordError(err);
@@ -579,6 +599,7 @@ fn workerMain(worker: *Worker) void {
             runtime.truncates_in_flight += 1;
         }
         runtime.mutex.unlock();
+        worker.pressure_retry_backoff.reset();
 
         if (shouldRefreshReplayCursor(worker, caught_up_sequence)) {
             closeWorkerReplayCursor(runtime, worker);
@@ -675,7 +696,7 @@ fn closeWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, success: b
 fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
     return switch (err) {
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,
-        error.ReplayDocumentNotVisible, error.ArtifactRepairRequired, error.WriterLocked => true,
+        error.ReplayDocumentNotVisible, error.ArtifactRepairRequired, error.WriterLocked, error.ResourceBudgetExceeded => true,
         else => false,
     };
 }
@@ -683,12 +704,29 @@ fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
 fn isRecoverableCatchUpError(worker: *const Worker, err: anyerror) bool {
     return switch (err) {
         error.WriterLocked,
+        error.ResourceBudgetExceeded,
         error.ReplayDocumentNotVisible,
         error.ArtifactRepairRequired,
         => true,
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,
         else => false,
     };
+}
+
+fn sleepAfterRecoverableCatchUpError(worker: *Worker, err: anyerror) void {
+    if (err != error.ResourceBudgetExceeded) {
+        worker.pressure_retry_backoff.reset();
+        std.Thread.yield() catch {};
+        return;
+    }
+    const delay_ns = worker.pressure_retry_backoff.nextDelayNs();
+    if (worker.pressure_retry_backoff.shouldLog()) {
+        std.log.warn(
+            "derived worker resource admission deferred worker={s} failures={} retry_ms={}",
+            .{ worker.name, worker.pressure_retry_backoff.failures, delay_ns / std.time.ns_per_ms },
+        );
+    }
+    sleepNs(delay_ns);
 }
 
 fn waitForCatchUpSessionReuse(runtime: *DerivedRuntime, worker: *Worker, from_sequence: u64) bool {

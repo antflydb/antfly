@@ -103,6 +103,9 @@ class AntflyClient:
         self.base_path = parsed.path.rstrip("/")
         self.table = table
         self.path = f"{parsed.path.rstrip('/')}/tables/{quote(table, safe='')}/batch"
+        self.timeout = timeout
+        self.backpressure_retries = 0
+        self.backpressure_wait_seconds = 0.0
 
     def ensure_table(self) -> None:
         path = f"{self.base_path}/tables/{quote(self.table, safe='')}"
@@ -115,13 +118,25 @@ class AntflyClient:
 
     def ingest(self, entries: bytes, sync_level: str) -> int:
         payload = batch_payload(entries, sync_level)
-        self.connection.request("POST", self.path, body=payload, headers={"Content-Type": "application/json"})
-        response = self.connection.getresponse()
-        body = response.read()
-        if not 200 <= response.status < 300:
-            raise RuntimeError(f"Antfly batch failed with HTTP {response.status}: {body[:1000]!r}")
-        result = json.loads(body)
-        return int(result.get("inserted", 0))
+        deadline = time.monotonic() + self.timeout
+        delay = 0.01
+        while True:
+            self.connection.request("POST", self.path, body=payload, headers={"Content-Type": "application/json"})
+            response = self.connection.getresponse()
+            body = response.read()
+            if 200 <= response.status < 300:
+                result = json.loads(body)
+                return int(result.get("inserted", 0))
+            if response.status != 429:
+                raise RuntimeError(f"Antfly batch failed with HTTP {response.status}: {body[:1000]!r}")
+            now = time.monotonic()
+            if now >= deadline:
+                raise TimeoutError(f"Antfly batch remained backpressured for {self.timeout:.3f}s")
+            sleep_seconds = min(delay, deadline - now)
+            time.sleep(sleep_seconds)
+            self.backpressure_retries += 1
+            self.backpressure_wait_seconds += sleep_seconds
+            delay = min(delay * 2, 0.25)
 
     def close(self) -> None:
         self.connection.close()
@@ -181,6 +196,8 @@ def main() -> int:
         "documents_per_second": submitted / elapsed,
         "elapsed_seconds": elapsed,
         "final_sync_level": "full_index",
+        "backpressure_retries": client.backpressure_retries,
+        "backpressure_wait_seconds": client.backpressure_wait_seconds,
     }, sort_keys=True))
     return 0
 
