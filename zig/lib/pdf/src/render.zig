@@ -158,20 +158,22 @@ fn choiceOrder(
 fn addOrUpdateGroupMeta(
     alloc: Allocator,
     groups: *std.ArrayList(GroupMeta),
+    group_indices: *std.AutoHashMapUnmanaged(u32, usize),
     id: u32,
     parent_id: ?u32,
     isolated: bool,
     knockout: bool,
     paint_order: usize,
 ) anyerror!void {
-    for (groups.items) |*group| {
-        if (group.id != id) continue;
+    if (group_indices.get(id)) |idx| {
+        const group = &groups.items[idx];
         group.parent_id = parent_id;
         group.isolated = isolated;
         group.knockout = knockout;
         group.min_paint_order = @min(group.min_paint_order, paint_order);
         return;
     }
+    const idx = groups.items.len;
     try groups.append(alloc, .{
         .id = id,
         .parent_id = parent_id,
@@ -179,97 +181,110 @@ fn addOrUpdateGroupMeta(
         .knockout = knockout,
         .min_paint_order = paint_order,
     });
+    try group_indices.put(alloc, id, idx);
 }
 
-fn collectGroupMetasAlloc(
-    alloc: Allocator,
-    text_runs: []const reader.TextRun,
-    image_runs: []const reader.ImageRun,
-    shading_runs: []const reader.ShadingRun,
-    pattern_runs: []const reader.PatternRun,
-    shape_runs: []const reader.ShapeRun,
-) ![]GroupMeta {
-    var groups = std.ArrayList(GroupMeta).empty;
-    errdefer groups.deinit(alloc);
+const RenderSchedule = std.ArrayListUnmanaged(RenderChoice);
 
-    for (text_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
-    for (image_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
-    for (shading_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
-    for (pattern_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
-    for (shape_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
+const RenderPlan = struct {
+    groups: []GroupMeta,
+    schedules: []RenderSchedule,
 
-    std.mem.sort(GroupMeta, groups.items, {}, struct {
-        fn lessThan(_: void, a: GroupMeta, b: GroupMeta) bool {
-            return a.min_paint_order < b.min_paint_order;
-        }
-    }.lessThan);
-    return try groups.toOwnedSlice(alloc);
+    fn deinit(self: *RenderPlan, alloc: Allocator) void {
+        for (self.schedules) |*schedule| schedule.deinit(alloc);
+        alloc.free(self.schedules);
+        alloc.free(self.groups);
+        self.* = undefined;
+    }
+};
+
+fn renderChoiceKindOrder(choice: RenderChoice) u8 {
+    return switch (choice) {
+        .text => 0,
+        .image => 1,
+        .shading => 2,
+        .pattern => 3,
+        .shape => 4,
+        .group => 5,
+    };
 }
 
-fn nextRenderChoice(
-    current_group: ?u32,
-    after_order: ?usize,
+fn renderChoiceIndex(choice: RenderChoice) usize {
+    return switch (choice) {
+        inline else => |idx| idx,
+    };
+}
+
+const RenderChoiceSortContext = struct {
     text_runs: []const reader.TextRun,
     image_runs: []const reader.ImageRun,
     shading_runs: []const reader.ShadingRun,
     pattern_runs: []const reader.PatternRun,
     shape_runs: []const reader.ShapeRun,
     groups: []const GroupMeta,
-) ?RenderChoice {
-    const min_after = after_order orelse 0;
-    var best_order: ?usize = null;
-    var best: ?RenderChoice = null;
 
-    for (text_runs, 0..) |run, idx| {
-        if (run.group_id != current_group) continue;
-        if (after_order != null and run.paint_order <= min_after) continue;
-        if (best_order == null or run.paint_order < best_order.?) {
-            best_order = run.paint_order;
-            best = .{ .text = idx };
-        }
+    fn lessThan(ctx: @This(), a: RenderChoice, b: RenderChoice) bool {
+        const a_order = choiceOrder(a, ctx.text_runs, ctx.image_runs, ctx.shading_runs, ctx.pattern_runs, ctx.shape_runs, ctx.groups);
+        const b_order = choiceOrder(b, ctx.text_runs, ctx.image_runs, ctx.shading_runs, ctx.pattern_runs, ctx.shape_runs, ctx.groups);
+        if (a_order != b_order) return a_order < b_order;
+        const a_kind = renderChoiceKindOrder(a);
+        const b_kind = renderChoiceKindOrder(b);
+        if (a_kind != b_kind) return a_kind < b_kind;
+        return renderChoiceIndex(a) < renderChoiceIndex(b);
     }
-    for (image_runs, 0..) |run, idx| {
-        if (run.group_id != current_group) continue;
-        if (after_order != null and run.paint_order <= min_after) continue;
-        if (best_order == null or run.paint_order < best_order.?) {
-            best_order = run.paint_order;
-            best = .{ .image = idx };
-        }
-    }
-    for (shading_runs, 0..) |run, idx| {
-        if (run.group_id != current_group) continue;
-        if (after_order != null and run.paint_order <= min_after) continue;
-        if (best_order == null or run.paint_order < best_order.?) {
-            best_order = run.paint_order;
-            best = .{ .shading = idx };
-        }
-    }
-    for (pattern_runs, 0..) |run, idx| {
-        if (run.group_id != current_group) continue;
-        if (after_order != null and run.paint_order <= min_after) continue;
-        if (best_order == null or run.paint_order < best_order.?) {
-            best_order = run.paint_order;
-            best = .{ .pattern = idx };
-        }
-    }
-    for (shape_runs, 0..) |run, idx| {
-        if (run.group_id != current_group) continue;
-        if (after_order != null and run.paint_order <= min_after) continue;
-        if (best_order == null or run.paint_order < best_order.?) {
-            best_order = run.paint_order;
-            best = .{ .shape = idx };
-        }
-    }
-    for (groups, 0..) |group, idx| {
-        if (group.parent_id != current_group) continue;
-        if (after_order != null and group.min_paint_order <= min_after) continue;
-        if (best_order == null or group.min_paint_order < best_order.?) {
-            best_order = group.min_paint_order;
-            best = .{ .group = idx };
-        }
+};
+
+fn buildRenderPlanAlloc(
+    alloc: Allocator,
+    text_runs: []const reader.TextRun,
+    image_runs: []const reader.ImageRun,
+    shading_runs: []const reader.ShadingRun,
+    pattern_runs: []const reader.PatternRun,
+    shape_runs: []const reader.ShapeRun,
+) !RenderPlan {
+    var groups = std.ArrayList(GroupMeta).empty;
+    errdefer groups.deinit(alloc);
+    var group_indices = std.AutoHashMapUnmanaged(u32, usize).empty;
+    defer group_indices.deinit(alloc);
+
+    for (text_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
+    for (image_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
+    for (shading_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
+    for (pattern_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
+    for (shape_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
+
+    const owned_groups = try groups.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_groups);
+    const schedules = try alloc.alloc(RenderSchedule, owned_groups.len + 1);
+    errdefer alloc.free(schedules);
+    for (schedules) |*schedule| schedule.* = .empty;
+    var initialized_schedules: usize = schedules.len;
+    errdefer for (schedules[0..initialized_schedules]) |*schedule| schedule.deinit(alloc);
+
+    for (text_runs, 0..) |run, idx| try schedules[if (run.group_id) |id| (group_indices.get(id) orelse return error.InvalidRenderGroup) + 1 else 0].append(alloc, .{ .text = idx });
+    for (image_runs, 0..) |run, idx| try schedules[if (run.group_id) |id| (group_indices.get(id) orelse return error.InvalidRenderGroup) + 1 else 0].append(alloc, .{ .image = idx });
+    for (shading_runs, 0..) |run, idx| try schedules[if (run.group_id) |id| (group_indices.get(id) orelse return error.InvalidRenderGroup) + 1 else 0].append(alloc, .{ .shading = idx });
+    for (pattern_runs, 0..) |run, idx| try schedules[if (run.group_id) |id| (group_indices.get(id) orelse return error.InvalidRenderGroup) + 1 else 0].append(alloc, .{ .pattern = idx });
+    for (shape_runs, 0..) |run, idx| try schedules[if (run.group_id) |id| (group_indices.get(id) orelse return error.InvalidRenderGroup) + 1 else 0].append(alloc, .{ .shape = idx });
+    for (owned_groups, 0..) |group, idx| {
+        const parent_schedule = if (group.parent_id) |parent_id|
+            if (group_indices.get(parent_id)) |parent_idx| parent_idx + 1 else 0
+        else
+            0;
+        try schedules[parent_schedule].append(alloc, .{ .group = idx });
     }
 
-    return best;
+    const sort_context = RenderChoiceSortContext{
+        .text_runs = text_runs,
+        .image_runs = image_runs,
+        .shading_runs = shading_runs,
+        .pattern_runs = pattern_runs,
+        .shape_runs = shape_runs,
+        .groups = owned_groups,
+    };
+    for (schedules) |schedule| std.mem.sort(RenderChoice, schedule.items, sort_context, RenderChoiceSortContext.lessThan);
+    initialized_schedules = 0;
+    return .{ .groups = owned_groups, .schedules = schedules };
 }
 
 fn renderChildGroupAlloc(
@@ -283,10 +298,10 @@ fn renderChildGroupAlloc(
     shading_runs: []const reader.ShadingRun,
     pattern_runs: []const reader.PatternRun,
     shape_runs: []const reader.ShapeRun,
-    groups: []const GroupMeta,
+    plan: *const RenderPlan,
     group_index: usize,
 ) anyerror!void {
-    const meta = groups[group_index];
+    const meta = plan.groups[group_index];
     const child = try alloc.alloc(u8, width * height * 4);
     defer alloc.free(child);
     if (meta.isolated) {
@@ -294,7 +309,7 @@ fn renderChildGroupAlloc(
     } else {
         @memcpy(child, target);
     }
-    try renderGroupChildrenAlloc(alloc, child, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, groups, meta.id, meta.knockout);
+    try renderGroupChildrenAlloc(alloc, child, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, group_index + 1, meta.knockout);
     if (meta.isolated) {
         compositeGroupCanvas(target, child);
     } else {
@@ -313,7 +328,7 @@ fn renderChoiceAlloc(
     shading_runs: []const reader.ShadingRun,
     pattern_runs: []const reader.PatternRun,
     shape_runs: []const reader.ShapeRun,
-    groups: []const GroupMeta,
+    plan: *const RenderPlan,
     choice: RenderChoice,
 ) !void {
     switch (choice) {
@@ -322,7 +337,7 @@ fn renderChoiceAlloc(
         .shading => |idx| drawShadingRun(canvas, width, height, page_box.min_x, page_box.max_y, shading_runs[idx]),
         .pattern => |idx| try drawPatternRun(alloc, canvas, width, height, page_box.min_x, page_box.max_y, pattern_runs[idx]),
         .shape => |idx| drawShapeRun(canvas, width, height, page_box.min_x, page_box.max_y, shape_runs[idx]),
-        .group => |idx| try renderChildGroupAlloc(alloc, canvas, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, groups, idx),
+        .group => |idx| try renderChildGroupAlloc(alloc, canvas, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, idx),
     }
 }
 
@@ -337,24 +352,22 @@ fn renderGroupChildrenAlloc(
     shading_runs: []const reader.ShadingRun,
     pattern_runs: []const reader.PatternRun,
     shape_runs: []const reader.ShapeRun,
-    groups: []const GroupMeta,
-    current_group: ?u32,
+    plan: *const RenderPlan,
+    schedule_index: usize,
     knockout: bool,
 ) anyerror!void {
     const backdrop = if (knockout) try alloc.dupe(u8, canvas) else null;
     defer if (backdrop) |buf| alloc.free(buf);
 
-    var after_order: ?usize = null;
-    while (nextRenderChoice(current_group, after_order, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, groups)) |choice| {
+    for (plan.schedules[schedule_index].items) |choice| {
         if (knockout) {
             const scratch = try alloc.dupe(u8, backdrop orelse canvas);
             defer alloc.free(scratch);
-            try renderChoiceAlloc(alloc, scratch, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, groups, choice);
+            try renderChoiceAlloc(alloc, scratch, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, choice);
             replaceCanvasWhereChanged(canvas, scratch, backdrop orelse canvas);
         } else {
-            try renderChoiceAlloc(alloc, canvas, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, groups, choice);
+            try renderChoiceAlloc(alloc, canvas, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, choice);
         }
-        after_order = choiceOrder(choice, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, groups);
     }
 }
 
@@ -374,9 +387,9 @@ fn renderPageContentRgbaInBoxAlloc(
 
     const rgba = try alloc.alloc(u8, width * height * 4);
     @memset(rgba, 0xff);
-    const groups = try collectGroupMetasAlloc(alloc, text_runs, image_runs, shading_runs, pattern_runs, shape_runs);
-    defer alloc.free(groups);
-    try renderGroupChildrenAlloc(alloc, rgba, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, groups, null, false);
+    var plan = try buildRenderPlanAlloc(alloc, text_runs, image_runs, shading_runs, pattern_runs, shape_runs);
+    defer plan.deinit(alloc);
+    try renderGroupChildrenAlloc(alloc, rgba, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, &plan, 0, false);
 
     return .{ .rgba = rgba, .width = width, .height = height };
 }
@@ -1449,6 +1462,73 @@ fn pointPassesClip(
         };
     }
     return true;
+}
+
+test "render plan preserves paint order ties and nested group schedules" {
+    const alloc = std.testing.allocator;
+    const text_runs = [_]reader.TextRun{
+        .{ .text = "root", .x = 0, .y = 0, .font_size = 12, .paint_order = 4 },
+        .{ .text = "child", .x = 0, .y = 0, .font_size = 12, .paint_order = 6, .group_id = 1 },
+        .{ .text = "nested", .x = 0, .y = 0, .font_size = 12, .paint_order = 8, .group_id = 2, .group_parent_id = 1 },
+    };
+    const shape_runs = [_]reader.ShapeRun{
+        .{ .kind = .fill, .paint_order = 4, .color = .{ 0, 0, 0, 0xff }, .stroke_width = 0, .closed = true, .points = @constCast(&[_][2]f64{}) },
+        .{ .kind = .fill, .paint_order = 7, .group_id = 1, .color = .{ 0, 0, 0, 0xff }, .stroke_width = 0, .closed = true, .points = @constCast(&[_][2]f64{}) },
+    };
+
+    var plan = try buildRenderPlanAlloc(alloc, &text_runs, &.{}, &.{}, &.{}, &shape_runs);
+    defer plan.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), plan.groups.len);
+    try std.testing.expectEqual(@as(usize, 3), plan.schedules[0].items.len);
+    try std.testing.expect(plan.schedules[0].items[0] == .text);
+    try std.testing.expect(plan.schedules[0].items[1] == .shape);
+    try std.testing.expect(plan.schedules[0].items[2] == .group);
+
+    const child_group_index = switch (plan.schedules[0].items[2]) {
+        .group => |idx| idx,
+        else => unreachable,
+    };
+    const child_schedule = plan.schedules[child_group_index + 1].items;
+    try std.testing.expectEqual(@as(usize, 3), child_schedule.len);
+    try std.testing.expect(child_schedule[0] == .text);
+    try std.testing.expect(child_schedule[1] == .shape);
+    try std.testing.expect(child_schedule[2] == .group);
+}
+
+test "render plan schedules a large page exactly once per choice" {
+    const alloc = std.testing.allocator;
+    const count = 10_000;
+    const text_runs = try alloc.alloc(reader.TextRun, count);
+    defer alloc.free(text_runs);
+    for (text_runs, 0..) |*run, idx| run.* = .{
+        .text = "",
+        .x = 0,
+        .y = 0,
+        .font_size = 12,
+        .paint_order = count - idx,
+    };
+
+    var plan = try buildRenderPlanAlloc(alloc, text_runs, &.{}, &.{}, &.{}, &.{});
+    defer plan.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, count), plan.schedules[0].items.len);
+
+    const seen = try alloc.alloc(bool, count);
+    defer alloc.free(seen);
+    @memset(seen, false);
+    var previous_order: usize = 0;
+    for (plan.schedules[0].items, 0..) |choice, position| {
+        const idx = switch (choice) {
+            .text => |text_idx| text_idx,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expect(!seen[idx]);
+        seen[idx] = true;
+        const order = text_runs[idx].paint_order;
+        if (position > 0) try std.testing.expect(previous_order <= order);
+        previous_order = order;
+    }
+    for (seen) |was_seen| try std.testing.expect(was_seen);
 }
 
 test "blend pixel mode multiply darkens with backdrop" {
