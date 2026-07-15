@@ -941,6 +941,7 @@ fn cloneProjectedSplitTransitionsOwned(
     for (records, 0..) |record, i| {
         out[i] = .{
             .transition_id = record.transition_id,
+            .attempt_epoch = record.attempt_epoch,
             .source_group_id = record.source_group_id,
             .destination_group_id = record.destination_group_id,
             .phase = record.phase,
@@ -6342,6 +6343,7 @@ test "metadata service proposes split transitions into the metadata group" {
 
     try svc.upsertSplitTransition(.{
         .transition_id = 4001,
+        .attempt_epoch = 1,
         .source_group_id = 2001,
         .destination_group_id = 2002,
         .phase = .prepare,

@@ -443,38 +443,8 @@ pub fn writeSnapshotTxn(
     try writer.writeByte(group_snapshot_version);
     try writeSnapshotBytes(writer, byte_range.start);
     try writeSnapshotBytes(writer, byte_range.end);
-    const document_count = try countGroupDocumentsTxn(txn, alloc, group_id, cancelled);
-    try writeSnapshotU32(writer, try snapshotLength(document_count));
     try writeGroupDocumentsTxn(txn, alloc, group_id, writer, cancelled);
-    try writeSnapshotEntries(writer, controls);
-}
-
-fn countGroupDocumentsTxn(
-    txn: *docstore.DocStore.Txn,
-    alloc: std.mem.Allocator,
-    group_id: u64,
-    cancelled: ?*const std.atomic.Value(bool),
-) !usize {
-    const logical_prefix = try groupDocumentPrefixAlloc(alloc, group_id);
-    defer alloc.free(logical_prefix);
-    const lower = try internal_keys.documentRangeLowerAlloc(alloc, logical_prefix);
-    defer alloc.free(lower);
-    const upper = (try internal_keys.documentRangeUpperAlloc(alloc, logical_prefix)) orelse return 0;
-    defer alloc.free(upper);
-
-    var cur = try txn.openCursor();
-    defer cur.close();
-    cur.setUpperBound(upper);
-    var count: usize = 0;
-    var entry = try cur.seekAtOrAfter(lower);
-    while (entry) |kv| : (entry = try cur.next()) {
-        if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
-        if (std.mem.order(u8, kv.key, upper) != .lt) break;
-        const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse continue;
-        defer alloc.free(logical_key);
-        if (std.mem.startsWith(u8, logical_key, logical_prefix)) count += 1;
-    }
-    return count;
+    try writeSnapshotTerminatedEntries(writer, controls);
 }
 
 fn writeGroupDocumentsTxn(
@@ -488,7 +458,10 @@ fn writeGroupDocumentsTxn(
     defer alloc.free(logical_prefix);
     const lower = try internal_keys.documentRangeLowerAlloc(alloc, logical_prefix);
     defer alloc.free(lower);
-    const upper = (try internal_keys.documentRangeUpperAlloc(alloc, logical_prefix)) orelse return;
+    const upper = (try internal_keys.documentRangeUpperAlloc(alloc, logical_prefix)) orelse {
+        try writer.writeByte(0);
+        return;
+    };
     defer alloc.free(upper);
 
     var cur = try txn.openCursor();
@@ -501,17 +474,20 @@ fn writeGroupDocumentsTxn(
         const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse continue;
         defer alloc.free(logical_key);
         if (!std.mem.startsWith(u8, logical_key, logical_prefix)) continue;
+        try writer.writeByte(1);
         try writeSnapshotBytes(writer, logical_key[logical_prefix.len..]);
         try writeSnapshotBytes(writer, kv.value);
     }
+    try writer.writeByte(0);
 }
 
-fn writeSnapshotEntries(writer: *std.Io.Writer, entries: []const AppliedDataKV) !void {
-    try writeSnapshotU32(writer, try snapshotLength(entries.len));
+fn writeSnapshotTerminatedEntries(writer: *std.Io.Writer, entries: []const AppliedDataKV) !void {
     for (entries) |entry| {
+        try writer.writeByte(1);
         try writeSnapshotBytes(writer, entry.key);
         try writeSnapshotBytes(writer, entry.value);
     }
+    try writer.writeByte(0);
 }
 
 fn writeSnapshotBytes(writer: *std.Io.Writer, bytes: []const u8) !void {
@@ -538,7 +514,44 @@ pub const GroupStateSnapshot = struct {
     }
 };
 
+const GroupStateSnapshotView = struct {
+    byte_range: AppliedDataRange,
+    entries: []AppliedDataKV,
+    controls: []AppliedDataKV,
+
+    fn deinit(self: *GroupStateSnapshotView, alloc: std.mem.Allocator) void {
+        alloc.free(self.entries);
+        alloc.free(self.controls);
+        self.* = undefined;
+    }
+};
+
 pub fn decodeGroupStateSnapshotAlloc(alloc: std.mem.Allocator, encoded: []const u8) !GroupStateSnapshot {
+    if (encoded.len < group_snapshot_magic.len + 1 or
+        !std.mem.eql(u8, encoded[0..group_snapshot_magic.len], group_snapshot_magic))
+    {
+        return error.InvalidGroupStateSnapshot;
+    }
+    const snapshot_version = encoded[group_snapshot_magic.len];
+    if (snapshot_version != group_snapshot_version) return error.InvalidGroupStateSnapshot;
+    var pos: usize = group_snapshot_magic.len + 1;
+    const start = try readSnapshotBytesAlloc(alloc, encoded, &pos);
+    errdefer alloc.free(start);
+    const end = try readSnapshotBytesAlloc(alloc, encoded, &pos);
+    errdefer alloc.free(end);
+    const entries = try readSnapshotTerminatedEntriesAlloc(alloc, encoded, &pos);
+    errdefer freeGroupStateEntries(alloc, entries);
+    const controls = try readSnapshotTerminatedEntriesAlloc(alloc, encoded, &pos);
+    errdefer freeGroupStateEntries(alloc, controls);
+    if (pos != encoded.len) return error.InvalidGroupStateSnapshot;
+    return .{
+        .byte_range = .{ .start = start, .end = end },
+        .entries = entries,
+        .controls = controls,
+    };
+}
+
+fn decodeGroupStateSnapshotViewAlloc(alloc: std.mem.Allocator, encoded: []const u8) !GroupStateSnapshotView {
     if (encoded.len < group_snapshot_magic.len + 1 or
         !std.mem.eql(u8, encoded[0..group_snapshot_magic.len], group_snapshot_magic) or
         encoded[group_snapshot_magic.len] != group_snapshot_version)
@@ -546,14 +559,12 @@ pub fn decodeGroupStateSnapshotAlloc(alloc: std.mem.Allocator, encoded: []const 
         return error.InvalidGroupStateSnapshot;
     }
     var pos: usize = group_snapshot_magic.len + 1;
-    const start = try readSnapshotBytesAlloc(alloc, encoded, &pos);
-    errdefer alloc.free(start);
-    const end = try readSnapshotBytesAlloc(alloc, encoded, &pos);
-    errdefer alloc.free(end);
-    const entries = try readSnapshotEntriesAlloc(alloc, encoded, &pos);
-    errdefer freeGroupStateEntries(alloc, entries);
-    const controls = try readSnapshotEntriesAlloc(alloc, encoded, &pos);
-    errdefer freeGroupStateEntries(alloc, controls);
+    const start = try readSnapshotBytesView(encoded, &pos);
+    const end = try readSnapshotBytesView(encoded, &pos);
+    const entries = try readSnapshotTerminatedEntryViewsAlloc(alloc, encoded, &pos);
+    errdefer alloc.free(entries);
+    const controls = try readSnapshotTerminatedEntryViewsAlloc(alloc, encoded, &pos);
+    errdefer alloc.free(controls);
     if (pos != encoded.len) return error.InvalidGroupStateSnapshot;
     return .{
         .byte_range = .{ .start = start, .end = end },
@@ -573,7 +584,7 @@ pub fn installSnapshotWithMetadata(
     encoded: []const u8,
     external_metadata_writes: []const docstore.KVPair,
 ) !void {
-    var snapshot = try decodeGroupStateSnapshotAlloc(alloc, encoded);
+    var snapshot = try decodeGroupStateSnapshotViewAlloc(alloc, encoded);
     defer snapshot.deinit(alloc);
     try validateGroupStateSnapshot(alloc, group_id, snapshot);
 
@@ -597,7 +608,7 @@ pub fn installSnapshotWithMetadata(
     );
 }
 
-pub fn validateGroupStateSnapshot(alloc: std.mem.Allocator, group_id: u64, snapshot: GroupStateSnapshot) !void {
+pub fn validateGroupStateSnapshot(alloc: std.mem.Allocator, group_id: u64, snapshot: anytype) !void {
     if (snapshot.byte_range.start.len > 0 and
         snapshot.byte_range.end.len > 0 and
         std.mem.order(u8, snapshot.byte_range.start, snapshot.byte_range.end) != .lt)
@@ -668,16 +679,20 @@ pub fn validateGroupStateSnapshot(alloc: std.mem.Allocator, group_id: u64, snaps
         return error.InvalidGroupStateSnapshot;
     }
 
+    const snapshot_range = AppliedDataRange{
+        .start = snapshot.byte_range.start,
+        .end = snapshot.byte_range.end,
+    };
     const document_range = if (state) |active|
         AppliedDataRange{
-            .start = snapshot.byte_range.start,
+            .start = snapshot_range.start,
             .end = if (active.phase == .splitting or active.phase == .finalizing)
                 active.original_range_end
             else
-                snapshot.byte_range.end,
+                snapshot_range.end,
         }
     else
-        snapshot.byte_range;
+        snapshot_range;
     if (document_range.start.len > 0 and document_range.end.len > 0 and
         std.mem.order(u8, document_range.start, document_range.end) != .lt)
     {
@@ -769,30 +784,50 @@ fn validateGroupControlEntry(alloc: std.mem.Allocator, group_id: u64, entry: App
     }
 }
 
-fn readSnapshotEntriesAlloc(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) ![]AppliedDataKV {
-    const count = try readSnapshotU32(encoded, pos);
-    if (pos.* > encoded.len or count > (encoded.len - pos.*) / 8) return error.InvalidGroupStateSnapshot;
-    const entries = try alloc.alloc(AppliedDataKV, count);
-    var initialized: usize = 0;
+fn readSnapshotTerminatedEntriesAlloc(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) ![]AppliedDataKV {
+    var entries = std.ArrayListUnmanaged(AppliedDataKV).empty;
     errdefer {
-        for (entries[0..initialized]) |entry| {
+        for (entries.items) |entry| {
             alloc.free(@constCast(entry.key));
             alloc.free(@constCast(entry.value));
         }
-        alloc.free(entries);
+        entries.deinit(alloc);
     }
-    while (initialized < entries.len) : (initialized += 1) {
+    while (true) {
+        if (pos.* >= encoded.len) return error.InvalidGroupStateSnapshot;
+        const tag = encoded[pos.*];
+        pos.* += 1;
+        if (tag == 0) break;
+        if (tag != 1) return error.InvalidGroupStateSnapshot;
         const key = try readSnapshotBytesAlloc(alloc, encoded, pos);
         const value = readSnapshotBytesAlloc(alloc, encoded, pos) catch |err| {
             alloc.free(key);
             return err;
         };
-        entries[initialized] = .{
-            .key = key,
-            .value = value,
+        entries.append(alloc, .{ .key = key, .value = value }) catch |err| {
+            alloc.free(key);
+            alloc.free(value);
+            return err;
         };
     }
-    return entries;
+    return try entries.toOwnedSlice(alloc);
+}
+
+fn readSnapshotTerminatedEntryViewsAlloc(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) ![]AppliedDataKV {
+    var entries = std.ArrayListUnmanaged(AppliedDataKV).empty;
+    errdefer entries.deinit(alloc);
+    while (true) {
+        if (pos.* >= encoded.len) return error.InvalidGroupStateSnapshot;
+        const tag = encoded[pos.*];
+        pos.* += 1;
+        if (tag == 0) break;
+        if (tag != 1) return error.InvalidGroupStateSnapshot;
+        try entries.append(alloc, .{
+            .key = try readSnapshotBytesView(encoded, pos),
+            .value = try readSnapshotBytesView(encoded, pos),
+        });
+    }
+    return try entries.toOwnedSlice(alloc);
 }
 
 fn readSnapshotBytesAlloc(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) ![]u8 {
@@ -801,6 +836,13 @@ fn readSnapshotBytesAlloc(alloc: std.mem.Allocator, encoded: []const u8, pos: *u
     const value = try alloc.dupe(u8, encoded[pos.* .. pos.* + len]);
     pos.* += len;
     return value;
+}
+
+fn readSnapshotBytesView(encoded: []const u8, pos: *usize) ![]const u8 {
+    const len = try readSnapshotU32(encoded, pos);
+    if (pos.* > encoded.len or len > encoded.len - pos.*) return error.InvalidGroupStateSnapshot;
+    defer pos.* += len;
+    return encoded[pos.* .. pos.* + len];
 }
 
 fn readSnapshotU32(encoded: []const u8, pos: *usize) !u32 {
@@ -1584,7 +1626,7 @@ fn stripAnyGroupDocumentPrefixAlloc(alloc: std.mem.Allocator, logical_key: []con
 }
 
 const group_snapshot_magic = "AFDS";
-const group_snapshot_version: u8 = 2;
+const group_snapshot_version: u8 = 3;
 
 pub fn encodeGroupStateSnapshot(
     alloc: std.mem.Allocator,
@@ -1600,19 +1642,20 @@ pub fn encodeGroupStateSnapshot(
     try out.appendSlice(alloc, byte_range.start);
     try appendSnapshotU32(alloc, &out, try snapshotLength(byte_range.end.len));
     try out.appendSlice(alloc, byte_range.end);
-    try appendSnapshotEntries(alloc, &out, entries);
-    try appendSnapshotEntries(alloc, &out, controls);
+    try appendSnapshotTerminatedEntries(alloc, &out, entries);
+    try appendSnapshotTerminatedEntries(alloc, &out, controls);
     return try out.toOwnedSlice(alloc);
 }
 
-fn appendSnapshotEntries(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), entries: []const AppliedDataKV) !void {
-    try appendSnapshotU32(alloc, out, try snapshotLength(entries.len));
+fn appendSnapshotTerminatedEntries(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), entries: []const AppliedDataKV) !void {
     for (entries) |entry| {
+        try out.append(alloc, 1);
         try appendSnapshotU32(alloc, out, try snapshotLength(entry.key.len));
         try out.appendSlice(alloc, entry.key);
         try appendSnapshotU32(alloc, out, try snapshotLength(entry.value.len));
         try out.appendSlice(alloc, entry.value);
     }
+    try out.append(alloc, 0);
 }
 
 fn snapshotLength(value: usize) !u32 {

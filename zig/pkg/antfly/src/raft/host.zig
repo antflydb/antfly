@@ -165,6 +165,9 @@ pub const HostMetrics = struct {
     runtime_pending_apply_bytes: usize = 0,
     runtime_transport_queue_denials: usize = 0,
     runtime_apply_queue_denials: usize = 0,
+    runtime_snapshot_compaction_completions: usize = 0,
+    runtime_snapshot_compaction_failures: usize = 0,
+    runtime_snapshot_compaction_candidates: usize = 0,
     backup_bootstrap_attempts: usize = 0,
     backup_bootstrap_failures: usize = 0,
     backup_bootstrap_successes: usize = 0,
@@ -486,6 +489,9 @@ pub const Host = struct {
         snapshot.runtime_pending_apply_bytes = runtime_metrics.pending_apply_bytes;
         snapshot.runtime_transport_queue_denials = runtime_metrics.transport_queue_denials;
         snapshot.runtime_apply_queue_denials = runtime_metrics.apply_queue_denials;
+        snapshot.runtime_snapshot_compaction_completions = runtime_metrics.snapshot_compaction_completions;
+        snapshot.runtime_snapshot_compaction_failures = runtime_metrics.snapshot_compaction_failures;
+        snapshot.runtime_snapshot_compaction_candidates = runtime_metrics.snapshot_compaction_candidates;
         return snapshot;
     }
 

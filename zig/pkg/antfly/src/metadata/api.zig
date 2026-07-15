@@ -605,6 +605,7 @@ test "metadata admin snapshot captures projected metadata state" {
             const records = try alloc.alloc(transition_state.SplitTransitionRecord, 1);
             records[0] = .{
                 .transition_id = 9001,
+                .attempt_epoch = 1,
                 .source_group_id = 10,
                 .destination_group_id = 11,
                 .split_key = try alloc.dupe(u8, "doc:m"),

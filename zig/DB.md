@@ -1262,19 +1262,31 @@ Snapshot compaction is asynchronous, fair, bounded-memory maintenance:
   retry with capped exponential backoff without blocking Raft apply or transport;
 - shutdown cooperatively cancels the active point-in-time source before joining
   its worker, while source cancellation and destruction remain thread-safe;
-- data snapshots stream from the MVCC cursor into a temporary artifact with a
-  fixed-size buffer instead of first materializing all documents in memory;
+- data snapshots stream each MVCC cursor once into a temporary artifact with a
+  fixed-size buffer. Current-only AFDS v3 uses terminated records, avoiding a
+  separate document-count pass before encoding. Followers validate and install
+  from borrowed payload slices, allocating only entry descriptors rather than a
+  second payload-sized copy;
 - durable replica state publishes payloads by `(index, term)` before advancing
   checkpoint metadata, retains the preceding payload until that checkpoint is
-  durable, and loads payload bytes only when snapshot transfer requests them;
+  durable, and loads payload bytes only when snapshot transfer requests them.
+  Each payload is an `AFRSPAY` v1 envelope whose SHA-256 binds its index, term,
+  declared length, and bytes. Artifact publication enforces the declared length,
+  and replica startup fails closed when the referenced payload is missing,
+  truncated, has the wrong identity, or fails checksum validation;
 - WAL/checkpoint state retains snapshot metadata but does not retain or encode a
-  second full copy of the document image.
+  second full copy of the document image. Checkpoint and delta format v3 makes
+  external payload ownership explicit; current readers accept only the exact
+  current version, with no compatibility decoders or inline-payload fallback.
 
 The data and metadata point-in-time views share the same worker contract, but
 metadata remains an in-memory payload because its bounded control-plane state is
 small. One declarative metadata key registry drives both snapshot collection and
-group-ownership validation so adding a durable projection cannot update one
-allowlist while silently omitting the other.
+group-ownership validation. Its exhaustive projection enum and unique descriptor
+table prevent a registered durable projection from updating one allowlist while
+silently omitting the other. Operators receive only the actionable compaction
+metrics: queued candidates, completions, and failures; payload volume, build
+timing, and detailed scheduler outcomes remain internal diagnostics.
 
 Transition observation reads only this already-open replicated control state.
 It does not open the live table DB, initialize indexes, or compete with the

@@ -1242,27 +1242,53 @@ pub const RaftApplyStore = struct {
     const metadata_snapshot_version: u8 = 1;
 
     const MetadataSnapshotKeyFn = *const fn ([]u8, u64) anyerror![]const u8;
-    const metadata_snapshot_prefixes = [_]MetadataSnapshotKeyFn{
-        splitTransitionPrefixForGroup,
-        mergeTransitionPrefixForGroup,
-        placementPrefixForGroup,
-        nodePrefixForGroup,
-        storePrefixForGroup,
-        tablePrefixForGroup,
-        schemaProgressPrefixForGroup,
-        restoreProgressPrefixForGroup,
-        replicationSourceStatusPrefixForGroup,
-        extensionPackagePrefixForGroup,
-        installedExtensionPrefixForGroup,
-        extensionMemberPrefixForGroup,
-        extensionDependencyPrefixForGroup,
-        shuffleJoinLeasePrefixForGroup,
-        restoreJobPrefixForGroup,
-        rangePrefixForGroup,
+    const MetadataSnapshotProjection = enum {
+        split_transition,
+        merge_transition,
+        placement,
+        node,
+        store,
+        table,
+        schema_progress,
+        restore_progress,
+        replication_source_status,
+        extension_package,
+        installed_extension,
+        extension_member,
+        extension_dependency,
+        shuffle_join_lease,
+        restore_job,
+        range,
+        reconcile_lease,
+        reallocation_request,
     };
-    const metadata_snapshot_point_keys = [_]MetadataSnapshotKeyFn{
-        reconcileLeaseKeyForGroup,
-        reallocationRequestKeyForGroup,
+    const MetadataSnapshotKey = union(enum) {
+        prefix: MetadataSnapshotKeyFn,
+        point: MetadataSnapshotKeyFn,
+    };
+    const MetadataSnapshotProjectionDescriptor = struct {
+        projection: MetadataSnapshotProjection,
+        key: MetadataSnapshotKey,
+    };
+    const metadata_snapshot_projections = [_]MetadataSnapshotProjectionDescriptor{
+        .{ .projection = .split_transition, .key = .{ .prefix = splitTransitionPrefixForGroup } },
+        .{ .projection = .merge_transition, .key = .{ .prefix = mergeTransitionPrefixForGroup } },
+        .{ .projection = .placement, .key = .{ .prefix = placementPrefixForGroup } },
+        .{ .projection = .node, .key = .{ .prefix = nodePrefixForGroup } },
+        .{ .projection = .store, .key = .{ .prefix = storePrefixForGroup } },
+        .{ .projection = .table, .key = .{ .prefix = tablePrefixForGroup } },
+        .{ .projection = .schema_progress, .key = .{ .prefix = schemaProgressPrefixForGroup } },
+        .{ .projection = .restore_progress, .key = .{ .prefix = restoreProgressPrefixForGroup } },
+        .{ .projection = .replication_source_status, .key = .{ .prefix = replicationSourceStatusPrefixForGroup } },
+        .{ .projection = .extension_package, .key = .{ .prefix = extensionPackagePrefixForGroup } },
+        .{ .projection = .installed_extension, .key = .{ .prefix = installedExtensionPrefixForGroup } },
+        .{ .projection = .extension_member, .key = .{ .prefix = extensionMemberPrefixForGroup } },
+        .{ .projection = .extension_dependency, .key = .{ .prefix = extensionDependencyPrefixForGroup } },
+        .{ .projection = .shuffle_join_lease, .key = .{ .prefix = shuffleJoinLeasePrefixForGroup } },
+        .{ .projection = .restore_job, .key = .{ .prefix = restoreJobPrefixForGroup } },
+        .{ .projection = .range, .key = .{ .prefix = rangePrefixForGroup } },
+        .{ .projection = .reconcile_lease, .key = .{ .point = reconcileLeaseKeyForGroup } },
+        .{ .projection = .reallocation_request, .key = .{ .point = reallocationRequestKeyForGroup } },
     };
 
     const PreparedSnapshot = struct {
@@ -1409,13 +1435,12 @@ pub const RaftApplyStore = struct {
             rows.deinit(alloc);
         }
         var buf: [256]u8 = undefined;
-        for (metadata_snapshot_prefixes) |prefix_fn| {
+        for (metadata_snapshot_projections) |descriptor| {
             if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
-            try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try prefix_fn(&buf, group_id));
-        }
-        for (metadata_snapshot_point_keys) |key_fn| {
-            if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
-            try appendMetadataPointRowTxn(alloc, txn, &rows, try key_fn(&buf, group_id));
+            switch (descriptor.key) {
+                .prefix => |key_fn| try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try key_fn(&buf, group_id)),
+                .point => |key_fn| try appendMetadataPointRowTxn(alloc, txn, &rows, try key_fn(&buf, group_id)),
+            }
         }
         std.sort.pdq(docstore.OwnedKVPair, rows.items, {}, metadataSnapshotRowLessThan);
         return try rows.toOwnedSlice(alloc);
@@ -4690,32 +4715,37 @@ fn validateMetadataSnapshotRows(
 
 fn metadataSnapshotKeyBelongsToGroup(group_id: u64, key: []const u8) bool {
     var buf: [256]u8 = undefined;
-    for (RaftApplyStore.metadata_snapshot_prefixes) |prefix_fn| {
-        const prefix = prefix_fn(&buf, group_id) catch return false;
-        if (std.mem.startsWith(u8, key, prefix)) return true;
-    }
-    for (RaftApplyStore.metadata_snapshot_point_keys) |key_fn| {
-        const point_key = key_fn(&buf, group_id) catch return false;
-        if (std.mem.eql(u8, key, point_key)) return true;
+    for (RaftApplyStore.metadata_snapshot_projections) |descriptor| {
+        const owned_key = switch (descriptor.key) {
+            .prefix => |key_fn| key_fn(&buf, group_id) catch return false,
+            .point => |key_fn| key_fn(&buf, group_id) catch return false,
+        };
+        switch (descriptor.key) {
+            .prefix => if (std.mem.startsWith(u8, key, owned_key)) return true,
+            .point => if (std.mem.eql(u8, key, owned_key)) return true,
+        }
     }
     return false;
 }
 
 test "metadata raft apply store snapshot key registry covers every durable projection class" {
-    try std.testing.expectEqual(@as(usize, 16), RaftApplyStore.metadata_snapshot_prefixes.len);
-    try std.testing.expectEqual(@as(usize, 2), RaftApplyStore.metadata_snapshot_point_keys.len);
+    const projection_count = @typeInfo(RaftApplyStore.MetadataSnapshotProjection).@"enum".fields.len;
+    try std.testing.expectEqual(projection_count, RaftApplyStore.metadata_snapshot_projections.len);
 
+    var seen = [_]bool{false} ** projection_count;
     var buf: [256]u8 = undefined;
-    for (RaftApplyStore.metadata_snapshot_prefixes) |prefix_fn| {
-        const prefix = try prefix_fn(&buf, 41);
-        try std.testing.expect(metadataSnapshotKeyBelongsToGroup(41, prefix));
-        try std.testing.expect(!metadataSnapshotKeyBelongsToGroup(42, prefix));
-    }
-    for (RaftApplyStore.metadata_snapshot_point_keys) |key_fn| {
-        const key = try key_fn(&buf, 41);
+    for (RaftApplyStore.metadata_snapshot_projections) |descriptor| {
+        const ordinal = @intFromEnum(descriptor.projection);
+        try std.testing.expect(!seen[ordinal]);
+        seen[ordinal] = true;
+        const key = switch (descriptor.key) {
+            .prefix => |key_fn| try key_fn(&buf, 41),
+            .point => |key_fn| try key_fn(&buf, 41),
+        };
         try std.testing.expect(metadataSnapshotKeyBelongsToGroup(41, key));
         try std.testing.expect(!metadataSnapshotKeyBelongsToGroup(42, key));
     }
+    for (seen) |present| try std.testing.expect(present);
 }
 
 fn appendInt(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), comptime T: type, value: T) !void {

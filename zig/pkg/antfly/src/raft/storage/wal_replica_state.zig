@@ -22,9 +22,11 @@ const snapshot_payload_store = @import("snapshot_payload_store.zig");
 const storage_iface = raft_engine.runtime.storage_iface;
 
 const magic: u32 = 0x41524654; // ARFT
-const version: u32 = 2;
+// Version 3 checkpoints and deltas refer to checksummed external snapshot
+// payloads, preventing older binaries from accepting metadata-only snapshots.
+const version: u32 = 3;
 const delta_magic: u32 = 0x4152444c; // ARDL
-const delta_version: u32 = 2;
+const delta_version: u32 = 3;
 const applied_watermark_magic: u32 = 0x4152574d; // ARWM
 const applied_watermark_version: u32 = 1;
 
@@ -107,35 +109,60 @@ pub const WalReplicaState = struct {
         cfg: WalReplicaStateConfig,
     ) !WalReplicaState {
         var io_impl = std.Io.Threaded.init(alloc, .{});
-        errdefer io_impl.deinit();
+        var io_owned = true;
+        errdefer if (io_owned) io_impl.deinit();
 
         try fs_paths.createDirPathPortable(io_impl.io(), layout.log_dir);
         try fs_paths.createDirPathPortable(io_impl.io(), layout.snapshot_dir);
         const wal_dir = try std.fmt.allocPrint(alloc, "{s}/state-wal", .{layout.log_dir});
-        errdefer alloc.free(wal_dir);
+        var wal_dir_owned = true;
+        errdefer if (wal_dir_owned) alloc.free(wal_dir);
         try fs_paths.createDirPathPortable(io_impl.io(), wal_dir);
         const wal_dir_z = try alloc.dupeZ(u8, wal_dir);
-        errdefer alloc.free(wal_dir_z);
+        var wal_dir_z_owned = true;
+        errdefer if (wal_dir_z_owned) alloc.free(wal_dir_z);
         const applied_watermark_path = try std.fmt.allocPrint(alloc, "{s}/applied-watermark.bin", .{layout.log_dir});
-        errdefer alloc.free(applied_watermark_path);
+        var applied_watermark_path_owned = true;
+        errdefer if (applied_watermark_path_owned) alloc.free(applied_watermark_path);
+        const root_dir = try alloc.dupe(u8, layout.root_dir);
+        var root_dir_owned = true;
+        errdefer if (root_dir_owned) alloc.free(root_dir);
+        const log_dir = try alloc.dupe(u8, layout.log_dir);
+        var log_dir_owned = true;
+        errdefer if (log_dir_owned) alloc.free(log_dir);
+        const snapshot_dir = try alloc.dupe(u8, layout.snapshot_dir);
+        var snapshot_dir_owned = true;
+        errdefer if (snapshot_dir_owned) alloc.free(snapshot_dir);
+        var wal = try wal_mod.WAL.open(wal_dir_z.ptr, cfg.wal);
+        var wal_owned = true;
+        errdefer if (wal_owned) wal.close();
 
         var self = WalReplicaState{
             .alloc = alloc,
             .cfg = cfg,
             .io_impl = io_impl,
             .layout = .{
-                .root_dir = try alloc.dupe(u8, layout.root_dir),
-                .log_dir = try alloc.dupe(u8, layout.log_dir),
-                .snapshot_dir = try alloc.dupe(u8, layout.snapshot_dir),
+                .root_dir = root_dir,
+                .log_dir = log_dir,
+                .snapshot_dir = snapshot_dir,
             },
             .wal_dir = wal_dir,
             .wal_dir_z = wal_dir_z,
             .applied_watermark_path = applied_watermark_path,
-            .wal = try wal_mod.WAL.open(wal_dir_z.ptr, cfg.wal),
+            .wal = wal,
             .store = raft_engine.core.MemoryStorage.init(alloc),
         };
+        io_owned = false;
+        wal_dir_owned = false;
+        wal_dir_z_owned = false;
+        applied_watermark_path_owned = false;
+        root_dir_owned = false;
+        log_dir_owned = false;
+        snapshot_dir_owned = false;
+        wal_owned = false;
         errdefer self.deinit();
         try self.load();
+        try self.validateDurableSnapshotPayload();
         self.cleanupOrphanSnapshotPayloads();
         return self;
     }
@@ -380,6 +407,22 @@ pub const WalReplicaState = struct {
             self.layout.snapshot_dir,
             @errorName(err),
         });
+    }
+
+    fn validateDurableSnapshotPayload(self: *WalReplicaState) !void {
+        const snapshot = self.store.snapshot_state;
+        if (snapshot.metadata.index == 0) {
+            if (snapshot.data.len != 0) return error.InvalidReplicaState;
+            return;
+        }
+        if (snapshot.data.len != 0) return error.InvalidReplicaState;
+        try snapshot_payload_store.validate(
+            self.alloc,
+            self.io_impl.io(),
+            self.layout.snapshot_dir,
+            snapshot.metadata.index,
+            snapshot.metadata.term,
+        );
     }
 
     fn storageInitialState(ptr: *anyopaque, alloc: std.mem.Allocator) !raft_engine.core.Storage.InitialState {
@@ -639,17 +682,14 @@ pub const WalReplicaState = struct {
         var cursor: usize = 0;
         if (try readInt(u32, bytes, &cursor) != magic) return error.InvalidReplicaState;
         const file_version = try readInt(u32, bytes, &cursor);
-        if (file_version != 1 and file_version != version) return error.UnsupportedReplicaStateVersion;
+        if (file_version != version) return error.UnsupportedReplicaStateVersion;
 
         self.store.setHardState(.{
             .current_term = try readInt(u64, bytes, &cursor),
             .voted_for = if (try readBool(bytes, &cursor)) try readInt(u64, bytes, &cursor) else null,
             .commit_index = try readInt(u64, bytes, &cursor),
         });
-        self.applied_index = if (file_version >= 2)
-            try readInt(u64, bytes, &cursor)
-        else
-            self.store.hard_state.commit_index;
+        self.applied_index = try readInt(u64, bytes, &cursor);
 
         var conf_state = try decodeConfState(self.alloc, bytes, &cursor);
         defer conf_state.deinit(self.alloc);
@@ -1463,6 +1503,33 @@ test "wal replica state persists semantic compaction snapshot and preserves suff
         try std.testing.expectEqual(@as(u64, 0), stats.replayed_delta_records);
         try std.testing.expectEqual(@as(u64, 0), stats.replay_debt_records);
     }
+}
+
+test "wal replica state refuses a missing durable snapshot payload on reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/missing-wal-snapshot", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(std.testing.allocator, root, 201, 16);
+    defer layout.deinit(std.testing.allocator);
+    const cfg = WalReplicaStateConfig{
+        .checkpoint_replay_records_threshold = 0,
+        .checkpoint_replay_bytes_threshold = 0,
+    };
+
+    {
+        var state = try WalReplicaState.init(std.testing.allocator, layout, cfg);
+        defer state.deinit();
+        try state.groupStorage().persistReady(201, .{
+            .snapshot = .{
+                .metadata = .{ .index = 6, .term = 10 },
+                .data = @constCast("durable-state"),
+            },
+        });
+    }
+
+    snapshot_payload_store.delete(std.testing.allocator, std.testing.io, layout.snapshot_dir, 6, 10);
+    try std.testing.expectError(error.FileNotFound, WalReplicaState.init(std.testing.allocator, layout, cfg));
 }
 
 test "wal replica state reopens from full-image checkpoint plus newer delta tail" {

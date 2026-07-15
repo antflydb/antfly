@@ -566,6 +566,10 @@ pub const HealthSource = struct {
         const auto_bulk_stats = live_write_source.autoBulkIngestStatsBestEffort();
         const fanout_metrics = antfly.public_api.table_reads.parallelFanoutMetricsSnapshot();
         const graph_fanout_metrics = antfly.public_api.distributed_graph.graphFanoutMetricsSnapshot();
+        const raft_metrics = if (self.data_server.data_raft) |raft|
+            raft.host.http_host.host.metricsSnapshot()
+        else
+            antfly.raft.host.HostMetrics{};
         const api_request_stats = if (self.data_server.http_server) |*http_server|
             http_server.requestStats()
         else
@@ -577,6 +581,9 @@ pub const HealthSource = struct {
             "Whether the data server process is running (1 = yes)",
             1,
         );
+        try health_metrics.appendPromMetric(writer, "antfly_raft_snapshot_compaction_completions_total", "counter", "Raft snapshot compactions published", raft_metrics.runtime_snapshot_compaction_completions);
+        try health_metrics.appendPromMetric(writer, "antfly_raft_snapshot_compaction_failures_total", "counter", "Raft snapshot compaction build or publication failures", raft_metrics.runtime_snapshot_compaction_failures);
+        try health_metrics.appendPromMetric(writer, "antfly_raft_snapshot_compaction_candidates", "gauge", "Raft groups currently queued for snapshot compaction", raft_metrics.runtime_snapshot_compaction_candidates);
         try health_metrics.appendPromMetric(writer, "antfly_data_api_requests_total", "counter", "Requests handled by the local API server process", api_request_stats.request_count);
         try health_metrics.appendPromMetric(writer, "antfly_data_api_first_request_elapsed_ms", "gauge", "Milliseconds from API server initialization until the first handled request", api_request_stats.first_request_elapsed_ms);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_hits_total", "counter", "Query embedding cache hits", api_request_stats.query_embedding_cache.hits);

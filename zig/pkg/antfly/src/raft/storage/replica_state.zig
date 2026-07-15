@@ -17,9 +17,12 @@ const fs_paths = @import("../../common/fs_paths.zig");
 const raft_engine = @import("raft_engine");
 const storage_mod = @import("mod.zig");
 const snapshot_payload_store = @import("snapshot_payload_store.zig");
+const file_snapshot_artifact = @import("file_snapshot_artifact.zig");
 
 const magic: u32 = 0x41524654; // ARFT
-const version: u32 = 2;
+// Version 3 stores snapshot bytes in a checksummed sidecar. Older binaries
+// must reject metadata-only checkpoints instead of exposing empty snapshots.
+const version: u32 = 3;
 var state_publish_nonce = std.atomic.Value(u64).init(1);
 
 const SnapshotIdentity = struct { index: u64, term: u64 };
@@ -44,19 +47,37 @@ pub const PersistentReplicaState = struct {
         alloc: std.mem.Allocator,
         layout: storage_mod.ReplicaPathLayout,
     ) !PersistentReplicaState {
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_owned = true;
+        errdefer if (io_owned) io_impl.deinit();
+        const root_dir = try alloc.dupe(u8, layout.root_dir);
+        var root_dir_owned = true;
+        errdefer if (root_dir_owned) alloc.free(root_dir);
+        const log_dir = try alloc.dupe(u8, layout.log_dir);
+        var log_dir_owned = true;
+        errdefer if (log_dir_owned) alloc.free(log_dir);
+        const snapshot_dir = try alloc.dupe(u8, layout.snapshot_dir);
+        var snapshot_dir_owned = true;
+        errdefer if (snapshot_dir_owned) alloc.free(snapshot_dir);
+
         var self = PersistentReplicaState{
             .alloc = alloc,
-            .io_impl = std.Io.Threaded.init(alloc, .{}),
+            .io_impl = io_impl,
             .layout = .{
-                .root_dir = try alloc.dupe(u8, layout.root_dir),
-                .log_dir = try alloc.dupe(u8, layout.log_dir),
-                .snapshot_dir = try alloc.dupe(u8, layout.snapshot_dir),
+                .root_dir = root_dir,
+                .log_dir = log_dir,
+                .snapshot_dir = snapshot_dir,
             },
             .store = raft_engine.core.MemoryStorage.init(alloc),
         };
+        io_owned = false;
+        root_dir_owned = false;
+        log_dir_owned = false;
+        snapshot_dir_owned = false;
         errdefer self.deinit();
         try fs_paths.createDirPathPortable(self.io_impl.io(), self.layout.snapshot_dir);
         try self.load();
+        try self.validateDurableSnapshotPayload();
         self.cleanupOrphanSnapshotPayloads();
         return self;
     }
@@ -187,6 +208,22 @@ pub const PersistentReplicaState = struct {
         });
     }
 
+    fn validateDurableSnapshotPayload(self: *PersistentReplicaState) !void {
+        const snapshot = self.store.snapshot_state;
+        if (snapshot.metadata.index == 0) {
+            if (snapshot.data.len != 0) return error.InvalidReplicaState;
+            return;
+        }
+        if (snapshot.data.len != 0) return error.InvalidReplicaState;
+        try snapshot_payload_store.validate(
+            self.alloc,
+            self.io_impl.io(),
+            self.layout.snapshot_dir,
+            snapshot.metadata.index,
+            snapshot.metadata.term,
+        );
+    }
+
     fn storageInitialState(ptr: *anyopaque, alloc: std.mem.Allocator) !raft_engine.core.Storage.InitialState {
         const self: *PersistentReplicaState = @ptrCast(@alignCast(ptr));
         return try self.store.storage().initialState(alloc);
@@ -241,17 +278,14 @@ pub const PersistentReplicaState = struct {
         var cursor: usize = 0;
         if (try readInt(u32, bytes, &cursor) != magic) return error.InvalidReplicaState;
         const file_version = try readInt(u32, bytes, &cursor);
-        if (file_version != 1 and file_version != version) return error.UnsupportedReplicaStateVersion;
+        if (file_version != version) return error.UnsupportedReplicaStateVersion;
 
         self.store.setHardState(.{
             .current_term = try readInt(u64, bytes, &cursor),
             .voted_for = if (try readBool(bytes, &cursor)) try readInt(u64, bytes, &cursor) else null,
             .commit_index = try readInt(u64, bytes, &cursor),
         });
-        self.applied_index = if (file_version >= 2)
-            try readInt(u64, bytes, &cursor)
-        else
-            self.store.hard_state.commit_index;
+        self.applied_index = try readInt(u64, bytes, &cursor);
 
         var conf_state = try decodeConfState(self.alloc, bytes, &cursor);
         defer conf_state.deinit(self.alloc);
@@ -649,4 +683,79 @@ test "persistent replica state persists snapshots across reopen" {
         try std.testing.expectEqualStrings("snap", snapshot.data);
         try std.testing.expectEqualSlices(u64, &.{ 4, 5 }, snapshot.metadata.conf_state.voters);
     }
+}
+
+test "persistent replica state refuses a corrupt durable snapshot payload on reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/corrupt-persistent-snapshot", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(std.testing.allocator, root, 89, 4);
+    defer layout.deinit(std.testing.allocator);
+
+    {
+        var state = try PersistentReplicaState.init(std.testing.allocator, layout);
+        defer state.deinit();
+        try state.groupStorage().persistReady(89, .{
+            .snapshot = .{
+                .metadata = .{ .index = 7, .term = 3 },
+                .data = @constCast("durable-state"),
+            },
+        });
+    }
+
+    const path = try snapshot_payload_store.pathAlloc(std.testing.allocator, layout.snapshot_dir, 7, 3);
+    defer std.testing.allocator.free(path);
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var file = try std.Io.Dir.cwd().openFile(io_impl.io(), path, .{ .mode = .read_write });
+    try file.writePositionalAll(io_impl.io(), "X", 72);
+    file.close(io_impl.io());
+
+    try std.testing.expectError(
+        error.SnapshotPayloadChecksumMismatch,
+        PersistentReplicaState.init(std.testing.allocator, layout),
+    );
+}
+
+test "persistent replica state publishes an artifact snapshot and reopens it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/persistent-artifact-snapshot", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(std.testing.allocator, root, 90, 4);
+    defer layout.deinit(std.testing.allocator);
+
+    {
+        var state = try PersistentReplicaState.init(std.testing.allocator, layout);
+        defer state.deinit();
+        try state.groupStorage().persistReady(90, .{
+            .hard_state = .{ .current_term = 3, .commit_index = 2 },
+            .entries = &.{
+                .{ .index = 1, .term = 3, .data = @constCast("one") },
+                .{ .index = 2, .term = 3, .data = @constCast("two") },
+            },
+        });
+
+        const spool_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/snapshot-spool", .{layout.root_dir});
+        defer std.testing.allocator.free(spool_path);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = spool_path, .data = "artifact-state" });
+        const artifact = try file_snapshot_artifact.FileSnapshotArtifact.create(
+            std.testing.allocator,
+            std.testing.io,
+            spool_path,
+            "artifact-state".len,
+        );
+        defer artifact.deinit();
+        try state.groupStorage().compactSnapshotArtifact(std.testing.allocator, 90, .{
+            .index = 2,
+            .term = 3,
+        }, artifact);
+    }
+
+    var reopened = try PersistentReplicaState.init(std.testing.allocator, layout);
+    defer reopened.deinit();
+    var snapshot = try reopened.storage().snapshot(std.testing.allocator);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("artifact-state", snapshot.data);
 }

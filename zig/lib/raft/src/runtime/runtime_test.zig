@@ -15,6 +15,7 @@
 const std = @import("std");
 const core = @import("../core/mod.zig");
 const runtime = @import("mod.zig");
+const clock = @import("clock.zig");
 
 const StorageRecorder = struct {
     alloc: std.mem.Allocator,
@@ -139,6 +140,47 @@ const DiskBatcherRecorder = struct {
     }
 };
 
+const TestSnapshotArtifact = struct {
+    alloc: std.mem.Allocator,
+    bytes: []u8,
+
+    fn create(alloc: std.mem.Allocator, bytes: []u8) !runtime.storage_iface.SnapshotArtifact {
+        const self = try alloc.create(TestSnapshotArtifact);
+        self.* = .{ .alloc = alloc, .bytes = bytes };
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .len = len,
+                .write_to = writeTo,
+                .read_all = readAll,
+                .deinit = deinit,
+            },
+        };
+    }
+
+    fn len(ptr: *anyopaque) u64 {
+        const self: *TestSnapshotArtifact = @ptrCast(@alignCast(ptr));
+        return self.bytes.len;
+    }
+
+    fn writeTo(ptr: *anyopaque, writer: *std.Io.Writer) !void {
+        const self: *TestSnapshotArtifact = @ptrCast(@alignCast(ptr));
+        try writer.writeAll(self.bytes);
+    }
+
+    fn readAll(ptr: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+        const self: *TestSnapshotArtifact = @ptrCast(@alignCast(ptr));
+        return try alloc.dupe(u8, self.bytes);
+    }
+
+    fn deinit(ptr: *anyopaque) void {
+        const self: *TestSnapshotArtifact = @ptrCast(@alignCast(ptr));
+        const alloc = self.alloc;
+        alloc.free(self.bytes);
+        alloc.destroy(self);
+    }
+};
+
 const ApplyRecorder = struct {
     alloc: std.mem.Allocator,
     apply_calls: usize = 0,
@@ -153,6 +195,7 @@ const ApplyRecorder = struct {
     block_snapshot_materialization: bool = false,
     snapshot_materialization_started: std.atomic.Value(bool) = .init(false),
     release_snapshot_materialization: std.atomic.Value(bool) = .init(false),
+    materialize_artifact: bool = false,
 
     const PreparedSnapshot = struct {
         recorder: *ApplyRecorder,
@@ -186,7 +229,12 @@ const ApplyRecorder = struct {
                     std.Thread.yield() catch {};
                 }
             }
-            return .{ .bytes = try std.fmt.allocPrint(alloc, "applied-state-{d}", .{self.applied_index}) };
+            const bytes = try std.fmt.allocPrint(alloc, "applied-state-{d}", .{self.applied_index});
+            if (!self.recorder.materialize_artifact) return .{ .bytes = bytes };
+            return .{ .artifact = TestSnapshotArtifact.create(alloc, bytes) catch |err| {
+                alloc.free(bytes);
+                return err;
+            } };
         }
 
         fn deinit(ptr: *anyopaque) void {
@@ -741,7 +789,7 @@ test "multi raft compacts active applied log after retained entry window" {
     defer storage_recorder.deinit();
     try storage_recorder.registerStore(63, &store);
 
-    var apply_recorder = ApplyRecorder{ .alloc = std.testing.allocator };
+    var apply_recorder = ApplyRecorder{ .alloc = std.testing.allocator, .materialize_artifact = true };
 
     var host = runtime.MultiRaft.init(std.testing.allocator, .{
         .applied_log_retained_entries = 2,
@@ -764,10 +812,10 @@ test "multi raft compacts active applied log after retained entry window" {
         try std.testing.expectEqual(@as(usize, 1), try drainGroup(&host, 63));
     }
 
-    var wait_iterations: usize = 0;
-    while (host.metricsSnapshot().snapshot_compaction_completions == 0 and wait_iterations < 10_000) : (wait_iterations += 1) {
+    const completion_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
+    while (host.metricsSnapshot().snapshot_compaction_completions == 0 and clock.monotonicNs() < completion_deadline) {
         _ = try host.drainReady(0);
-        std.Thread.yield() catch {};
+        std.Thread.sleep(std.time.ns_per_ms);
     }
 
     const grp = host.group(63) orelse return error.UnknownGroup;
@@ -808,9 +856,9 @@ test "multi raft drops a completed snapshot from a retired group incarnation" {
     try host.propose(64, "old-generation");
     try std.testing.expectEqual(@as(usize, 1), try drainGroup(&host, 64));
 
-    var wait_iterations: usize = 0;
-    while (!apply_recorder.snapshot_materialization_started.load(.acquire) and wait_iterations < 10_000) : (wait_iterations += 1) {
-        std.Thread.yield() catch {};
+    const start_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
+    while (!apply_recorder.snapshot_materialization_started.load(.acquire) and clock.monotonicNs() < start_deadline) {
+        std.Thread.sleep(std.time.ns_per_ms);
     }
     try std.testing.expect(apply_recorder.snapshot_materialization_started.load(.acquire));
     try std.testing.expect(host.removeGroup(64));
@@ -818,10 +866,10 @@ test "multi raft drops a completed snapshot from a retired group incarnation" {
     try addSingleNodeGroup(&host, 64, &replacement_store, false);
 
     apply_recorder.release_snapshot_materialization.store(true, .release);
-    wait_iterations = 0;
-    while (host.metricsSnapshot().snapshot_compaction_stale_drops == 0 and wait_iterations < 10_000) : (wait_iterations += 1) {
+    const stale_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
+    while (host.metricsSnapshot().snapshot_compaction_stale_drops == 0 and clock.monotonicNs() < stale_deadline) {
         _ = try host.drainReady(0);
-        std.Thread.yield() catch {};
+        std.Thread.sleep(std.time.ns_per_ms);
     }
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().snapshot_compaction_stale_drops);
     try std.testing.expectEqual(@as(usize, 0), storage_recorder.persisted_snapshots);
@@ -934,9 +982,9 @@ test "multi raft shutdown cancels a blocked snapshot materialization" {
     try host.propose(70, "blocked-build");
     try std.testing.expectEqual(@as(usize, 1), try drainGroup(&host, 70));
 
-    var wait_iterations: usize = 0;
-    while (!apply_recorder.snapshot_materialization_started.load(.acquire) and wait_iterations < 10_000) : (wait_iterations += 1) {
-        std.Thread.yield() catch {};
+    const start_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
+    while (!apply_recorder.snapshot_materialization_started.load(.acquire) and clock.monotonicNs() < start_deadline) {
+        std.Thread.sleep(std.time.ns_per_ms);
     }
     try std.testing.expect(apply_recorder.snapshot_materialization_started.load(.acquire));
 
@@ -978,9 +1026,9 @@ test "multi raft snapshot scheduling is fair when a hot group requeues" {
     try host.propose(66, "hot-0");
     try std.testing.expectEqual(@as(usize, 1), try drainGroup(&host, 66));
 
-    var wait_iterations: usize = 0;
-    while (!apply_recorder.snapshot_materialization_started.load(.acquire) and wait_iterations < 10_000) : (wait_iterations += 1) {
-        std.Thread.yield() catch {};
+    const start_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
+    while (!apply_recorder.snapshot_materialization_started.load(.acquire) and clock.monotonicNs() < start_deadline) {
+        std.Thread.sleep(std.time.ns_per_ms);
     }
     try std.testing.expect(apply_recorder.snapshot_materialization_started.load(.acquire));
     try host.propose(67, "cold");
@@ -992,10 +1040,10 @@ test "multi raft snapshot scheduling is fair when a hot group requeues" {
     }
 
     apply_recorder.release_snapshot_materialization.store(true, .release);
-    wait_iterations = 0;
-    while (apply_recorder.snapshot_materializations.load(.acquire) < 3 and wait_iterations < 10_000) : (wait_iterations += 1) {
+    const completion_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
+    while (apply_recorder.snapshot_materializations.load(.acquire) < 3 and clock.monotonicNs() < completion_deadline) {
         _ = try host.drainReady(0);
-        std.Thread.yield() catch {};
+        std.Thread.sleep(std.time.ns_per_ms);
     }
     try std.testing.expect(apply_recorder.snapshot_materializations.load(.acquire) >= 3);
     try std.testing.expectEqual(@as(core.types.GroupId, 66), apply_recorder.materialized_groups[0].load(.acquire));

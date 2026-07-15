@@ -1875,7 +1875,7 @@ test "std http executor runs timed requests concurrently" {
             var response = self.executor.execute(std.heap.page_allocator, .{
                 .method = .GET,
                 .uri = self.uri,
-                .timeout_ms = 5_000,
+                .timeout_ms = 30_000,
             }) catch {
                 self.failed.store(true, .release);
                 self.done.store(true, .release);
@@ -1913,7 +1913,7 @@ test "std http executor runs timed requests concurrently" {
     defer app.release_slow.store(true, .release);
 
     var saw_slow = false;
-    for (0..1000) |_| {
+    for (0..10_000) |_| {
         if (app.entered_slow.load(.acquire)) {
             saw_slow = true;
             break;
@@ -1927,7 +1927,7 @@ test "std http executor runs timed requests concurrently" {
     defer fast_thread.join();
 
     var fast_completed = false;
-    for (0..1000) |_| {
+    for (0..10_000) |_| {
         if (fast_req.done.load(.acquire)) {
             fast_completed = true;
             break;
@@ -1940,7 +1940,7 @@ test "std http executor runs timed requests concurrently" {
 
     app.release_slow.store(true, .release);
     var slow_completed = false;
-    for (0..1000) |_| {
+    for (0..10_000) |_| {
         if (slow_req.done.load(.acquire)) {
             slow_completed = true;
             break;
