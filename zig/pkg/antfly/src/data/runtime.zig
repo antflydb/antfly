@@ -1583,24 +1583,14 @@ pub const HASeedSnapshotProvider = struct {
     }
 };
 
-const ha_seed_snapshot_format_version: u16 = 1;
-const ha_seed_snapshot_topology_name = "TOPOLOGY.json";
+const ha_seed_snapshot_format_version = antfly.ha.seed_materialization.topology_format_version;
+const ha_seed_snapshot_topology_name = antfly.ha.seed_materialization.topology_name;
 const ha_seed_snapshot_max_topology_bytes = 16 * 1024 * 1024;
 const ha_seed_snapshot_max_store_bytes: u64 = 64 * 1024 * 1024 * 1024;
 
-const HASeedSnapshotTopologyReplica = struct {
-    group_id: u64,
-    table_id: u64,
-    table_name: []const u8,
-    snapshot_path: []const u8,
-    logical_sha256: []const u8,
-};
-
-const HASeedSnapshotTopology = struct {
-    format_version: u16 = ha_seed_snapshot_format_version,
-    generation: []const u8,
-    replicas: []const HASeedSnapshotTopologyReplica,
-};
+const HASeedSnapshotTopologyReplica = antfly.ha.seed_materialization.ReplicaSnapshot;
+const HASeedSnapshotExtensionArtifact = antfly.ha.seed_materialization.ExtensionArtifact;
+const HASeedSnapshotTopology = antfly.ha.seed_materialization.Topology;
 
 fn haSeedSnapshotFileSha256HexAlloc(
     alloc: std.mem.Allocator,
@@ -3187,6 +3177,21 @@ pub const DataServer = struct {
 
         var metadata_snapshot = try self.write_source.catalog.adminSnapshot();
         defer self.write_source.catalog.freeAdminSnapshot(&metadata_snapshot);
+        if (metadata_snapshot.status.metadata_epoch == 0 or
+            metadata_snapshot.tables.len == 0 or
+            metadata_snapshot.ranges.len == 0 or
+            records.len != metadata_snapshot.ranges.len)
+            return error.HASeedSnapshotIncompleteTopology;
+        std.mem.sort(antfly.metadata.TableRecord, metadata_snapshot.tables, {}, struct {
+            fn lessThan(_: void, left: antfly.metadata.TableRecord, right: antfly.metadata.TableRecord) bool {
+                return left.table_id < right.table_id;
+            }
+        }.lessThan);
+        std.mem.sort(antfly.metadata.RangeRecord, metadata_snapshot.ranges, {}, struct {
+            fn lessThan(_: void, left: antfly.metadata.RangeRecord, right: antfly.metadata.RangeRecord) bool {
+                return left.group_id < right.group_id;
+            }
+        }.lessThan);
 
         var topology_replicas = std.ArrayListUnmanaged(HASeedSnapshotTopologyReplica).empty;
         defer {
@@ -3227,11 +3232,23 @@ pub const DataServer = struct {
                 .table_name = table.name,
                 .snapshot_path = snapshot_path,
                 .logical_sha256 = digest,
+                .identity_table_id = table.table_id,
+                .identity_shard_id = range.doc_identity_shard_id,
+                .identity_range_id = range.doc_identity_range_id,
             });
         }
 
         const topology_json = try std.json.Stringify.valueAlloc(alloc, HASeedSnapshotTopology{
             .generation = request.generation,
+            .catalog = .{
+                .epoch = metadata_snapshot.status.metadata_epoch,
+                .tables = metadata_snapshot.tables,
+                .ranges = metadata_snapshot.ranges,
+                .extension_packages = metadata_snapshot.extension_packages,
+                .installed_extensions = metadata_snapshot.installed_extensions,
+                .extension_members = metadata_snapshot.extension_members,
+                .extension_dependencies = metadata_snapshot.extension_dependencies,
+            },
             .replicas = topology_replicas.items,
         }, .{});
         defer alloc.free(topology_json);
@@ -3303,6 +3320,16 @@ pub const DataServer = struct {
         if (topology.format_version != ha_seed_snapshot_format_version or
             !std.mem.eql(u8, topology.generation, generation) or topology.replicas.len == 0)
             return error.InvalidHASeedSnapshotTopology;
+        antfly.ha.seed_materialization.validateTopology(
+            alloc,
+            io,
+            prepared_root,
+            generation,
+            topology,
+        ) catch |err| switch (err) {
+            error.SeedLogicalDigestMismatch => return error.HASeedSnapshotLogicalDigestMismatch,
+            else => return error.InvalidHASeedSnapshotTopology,
+        };
 
         for (topology.replicas, 0..) |replica, index| {
             if (index > 0 and topology.replicas[index - 1].group_id >= replica.group_id)
@@ -3371,6 +3398,7 @@ pub const DataServer = struct {
         }
         const capture_root = self.ha_cfg.seed_capture_root orelse return error.HASeedCaptureRootMissing;
         const node_id = ctx.primary_node_id orelse return error.HAPrimaryNodeIdMissing;
+        if (self.api_server_cfg.auth_enabled) return error.HASeedCaptureAuthUnsupported;
         if (self.lsm_maintenance_active.load(.acquire) or self.auto_bulk_finish_active.load(.acquire))
             return error.HASeedSnapshotRuntimeBusy;
         var activity_lease = try self.write_source.acquireHASeedCaptureActivityLease();
@@ -17002,15 +17030,34 @@ const TestHASeedSnapshotProvider = struct {
             digest_hex[index * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
         }
 
-        const topology_json = try std.json.Stringify.valueAlloc(alloc, .{
-            .format_version = @as(u16, 1),
+        const topology_json = try std.json.Stringify.valueAlloc(alloc, HASeedSnapshotTopology{
             .generation = request.generation,
+            .catalog = .{
+                .epoch = 7,
+                .tables = &.{.{
+                    .table_id = 20,
+                    .name = "docs",
+                    .placement_role = "data",
+                }},
+                .ranges = &.{.{
+                    .group_id = 1,
+                    .range_id = 1,
+                    .table_id = 20,
+                    .start_key = "",
+                    .end_key = null,
+                    .doc_identity_shard_id = 10,
+                    .doc_identity_range_id = 1,
+                }},
+            },
             .replicas = &.{.{
-                .group_id = @as(u64, 1),
-                .table_id = @as(u64, 20),
+                .group_id = 1,
+                .table_id = 20,
                 .table_name = "docs",
                 .snapshot_path = "replicas/group-1",
                 .logical_sha256 = digest_hex[0..],
+                .identity_table_id = 20,
+                .identity_shard_id = 10,
+                .identity_range_id = 1,
             }},
         }, .{});
         defer alloc.free(topology_json);
@@ -17045,7 +17092,7 @@ test "data server wires configured HA executors into API server" {
 
         fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
             return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .status = .{ .metadata_group_id = 1, .metadata_epoch = 7, .metrics = .{} },
                 .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
                     .table_id = 20,
                     .name = "docs",
@@ -17130,7 +17177,7 @@ test "data server wires configured HA executors into API server" {
     {
         var db = try antfly.db.DB.open(alloc, replica_db_path, .{
             .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
-            .identity_namespace = .{ .table_id = 20, .shard_id = 1, .range_id = 1 },
+            .identity_namespace = .{ .table_id = 20, .shard_id = 10, .range_id = 1 },
             .start_index_workers = false,
         });
         defer db.close();
