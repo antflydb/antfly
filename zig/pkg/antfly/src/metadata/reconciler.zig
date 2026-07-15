@@ -110,6 +110,11 @@ pub const PlacementRemoval = struct {
     local_node_id: u64,
 };
 
+pub const SplitAdmission = struct {
+    expected_source_epoch: u64,
+    record: transition_state.SplitTransitionRecord,
+};
+
 pub const PlacementChangeKind = enum {
     stable,
     repair_required,
@@ -120,6 +125,7 @@ pub const ReconciliationPlan = struct {
     placement_upserts: []raft_reconciler.PlacementIntent,
     table_upserts: []table_manager.TableRecord,
     range_upserts: []table_manager.RangeRecord,
+    split_admissions: []SplitAdmission,
     split_upserts: []transition_state.SplitTransitionRecord,
     merge_upserts: []transition_state.MergeTransitionRecord,
     placement_removals: []PlacementRemoval,
@@ -139,6 +145,7 @@ pub const ReconciliationPlan = struct {
             .placement_upserts = &.{},
             .table_upserts = &.{},
             .range_upserts = &.{},
+            .split_admissions = &.{},
             .split_upserts = &.{},
             .merge_upserts = &.{},
             .placement_removals = &.{},
@@ -162,6 +169,8 @@ pub const ReconciliationPlan = struct {
         alloc.free(self.table_upserts);
         for (self.range_upserts) |record| table_manager.freeRange(alloc, record);
         alloc.free(self.range_upserts);
+        for (self.split_admissions) |admission| table_manager.freeSplitTransitionRecord(alloc, admission.record);
+        alloc.free(self.split_admissions);
         for (self.split_upserts) |record| table_manager.freeSplitTransitionRecord(alloc, record);
         alloc.free(self.split_upserts);
         for (self.merge_upserts) |record| table_manager.freeMergeTransitionRecord(alloc, record);
@@ -291,6 +300,11 @@ pub const Reconciler = struct {
             for (split_upserts.items) |record| table_manager.freeSplitTransitionRecord(self.alloc, record);
             split_upserts.deinit(self.alloc);
         }
+        var split_admissions = std.ArrayListUnmanaged(SplitAdmission).empty;
+        errdefer {
+            for (split_admissions.items) |admission| table_manager.freeSplitTransitionRecord(self.alloc, admission.record);
+            split_admissions.deinit(self.alloc);
+        }
         var merge_upserts = std.ArrayListUnmanaged(transition_state.MergeTransitionRecord).empty;
         errdefer {
             for (merge_upserts.items) |record| table_manager.freeMergeTransitionRecord(self.alloc, record);
@@ -341,6 +355,7 @@ pub const Reconciler = struct {
         for (desired_ranges) |desired| {
             const existing = findRangeRecord(current.ranges, desired.group_id);
             if (existing == null or !rangeRecordsEqual(existing.?, desired)) {
+                if (rangeEpochPublishedBySplitAdmission(current, desired_splits, desired)) continue;
                 try range_upserts.append(self.alloc, try table_manager.cloneRange(self.alloc, desired));
             }
         }
@@ -348,6 +363,13 @@ pub const Reconciler = struct {
             const existing = findSplitRecord(current.split_transitions, desired.transition_id);
             if (existing == null) {
                 if (!splitTransitionDocIdentityCompatible(current, desired)) continue;
+                if (splitAdmissionExpectedEpoch(current, desired)) |expected_source_epoch| {
+                    try split_admissions.append(self.alloc, .{
+                        .expected_source_epoch = expected_source_epoch,
+                        .record = try cloneSplitRecord(self.alloc, desired),
+                    });
+                    continue;
+                }
                 try split_upserts.append(self.alloc, try cloneSplitRecord(self.alloc, desired));
                 continue;
             }
@@ -469,6 +491,7 @@ pub const Reconciler = struct {
             .placement_upserts = try placement_upserts.toOwnedSlice(self.alloc),
             .table_upserts = try table_upserts.toOwnedSlice(self.alloc),
             .range_upserts = try range_upserts.toOwnedSlice(self.alloc),
+            .split_admissions = try split_admissions.toOwnedSlice(self.alloc),
             .split_upserts = try split_upserts.toOwnedSlice(self.alloc),
             .merge_upserts = try merge_upserts.toOwnedSlice(self.alloc),
             .placement_removals = try placement_removals.toOwnedSlice(self.alloc),
@@ -2055,6 +2078,35 @@ fn findRangeRecord(records: []const table_manager.RangeRecord, group_id: u64) ?t
     return null;
 }
 
+fn splitAdmissionExpectedEpoch(current: CurrentMetadataState, split: transition_state.SplitTransitionRecord) ?u64 {
+    if (split.phase != .prepare or split.attempt_epoch == 0 or split.split_key == null) return null;
+    const source = findRangeRecord(current.ranges, split.source_group_id) orelse return null;
+    if (source.split_attempt_epoch == std.math.maxInt(u64) or
+        split.attempt_epoch != source.split_attempt_epoch + 1 or
+        !optionalBytesEqual(source.end_key, split.source_range_end))
+    {
+        return null;
+    }
+    return source.split_attempt_epoch;
+}
+
+fn rangeEpochPublishedBySplitAdmission(
+    current: CurrentMetadataState,
+    desired_splits: []const transition_state.SplitTransitionRecord,
+    desired_range: table_manager.RangeRecord,
+) bool {
+    for (desired_splits) |split| {
+        if (split.source_group_id != desired_range.group_id or
+            split.attempt_epoch != desired_range.split_attempt_epoch or
+            findSplitRecord(current.split_transitions, split.transition_id) != null)
+        {
+            continue;
+        }
+        if (splitAdmissionExpectedEpoch(current, split) != null) return true;
+    }
+    return false;
+}
+
 fn allocSplitProvisioningRanges(
     alloc: std.mem.Allocator,
     ranges: []const table_manager.RangeRecord,
@@ -3600,10 +3652,10 @@ test "metadata reconciler plans an automatic split from fresh group status" {
     });
     defer plan.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), plan.split_upserts.len);
-    try std.testing.expectEqual(@as(u64, 4001), plan.split_upserts[0].source_group_id);
-    try std.testing.expect(plan.split_upserts[0].destination_group_id != 0);
-    try std.testing.expectEqualStrings("doc:m", plan.split_upserts[0].split_key.?);
+    try std.testing.expectEqual(@as(usize, 1), plan.split_admissions.len);
+    try std.testing.expectEqual(@as(u64, 4001), plan.split_admissions[0].record.source_group_id);
+    try std.testing.expect(plan.split_admissions[0].record.destination_group_id != 0);
+    try std.testing.expectEqualStrings("doc:m", plan.split_admissions[0].record.split_key.?);
 }
 
 test "metadata reconciler plans an automatic split from disk size when doc count is stale" {
@@ -3658,10 +3710,10 @@ test "metadata reconciler plans an automatic split from disk size when doc count
     });
     defer plan.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), plan.split_upserts.len);
-    try std.testing.expectEqual(@as(u64, 4101), plan.split_upserts[0].source_group_id);
-    try std.testing.expect(plan.split_upserts[0].destination_group_id != 0);
-    try std.testing.expectEqualStrings("doc:m", plan.split_upserts[0].split_key.?);
+    try std.testing.expectEqual(@as(usize, 1), plan.split_admissions.len);
+    try std.testing.expectEqual(@as(u64, 4101), plan.split_admissions[0].record.source_group_id);
+    try std.testing.expect(plan.split_admissions[0].record.destination_group_id != 0);
+    try std.testing.expectEqualStrings("doc:m", plan.split_admissions[0].record.split_key.?);
 }
 
 test "metadata reconciler keeps structurally valid automatic split intent across transient recompute miss" {
@@ -5301,7 +5353,7 @@ test "metadata reconciler enforces per-table automatic transition budget" {
     });
     defer plan.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), plan.split_upserts.len);
+    try std.testing.expectEqual(@as(usize, 1), plan.split_admissions.len);
 }
 
 test "metadata reconciler enforces cluster automatic transition budget" {
@@ -5373,7 +5425,7 @@ test "metadata reconciler enforces cluster automatic transition budget" {
     });
     defer plan.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), plan.split_upserts.len);
+    try std.testing.expectEqual(@as(usize, 1), plan.split_admissions.len);
 }
 
 test "metadata reconciler respects disable shard alloc unless reallocation is requested" {
@@ -5440,7 +5492,7 @@ test "metadata reconciler respects disable shard alloc unless reallocation is re
         .reallocate_requested = true,
     });
     defer forced_plan.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), forced_plan.split_upserts.len);
+    try std.testing.expectEqual(@as(usize, 1), forced_plan.split_admissions.len);
     try std.testing.expect(forced_plan.forced_reallocation);
     try std.testing.expect(forced_plan.clear_reallocation_request);
 }
@@ -5875,8 +5927,8 @@ test "metadata reconciler uses live median key lookup for split planning" {
     });
     defer plan.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), plan.split_upserts.len);
-    try std.testing.expectEqualStrings("doc:t", plan.split_upserts[0].split_key.?);
+    try std.testing.expectEqual(@as(usize, 1), plan.split_admissions.len);
+    try std.testing.expectEqualStrings("doc:t", plan.split_admissions[0].record.split_key.?);
 }
 
 test "metadata reconciler requires leader-known group status for automatic planning" {
@@ -6087,8 +6139,8 @@ test "metadata reconciler prefers live median key lookup for automatic split" {
     });
     defer plan.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), plan.split_upserts.len);
-    try std.testing.expectEqualStrings("doc:m", plan.split_upserts[0].split_key.?);
+    try std.testing.expectEqual(@as(usize, 1), plan.split_admissions.len);
+    try std.testing.expectEqualStrings("doc:m", plan.split_admissions[0].record.split_key.?);
 }
 
 test "metadata reconciler skips automatic split when live median key lookup fails" {

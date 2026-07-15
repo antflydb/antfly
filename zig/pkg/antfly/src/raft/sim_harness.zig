@@ -35,6 +35,7 @@ const transition_service = @import("transition_service.zig");
 const raft_state_machine = @import("state_machine/mod.zig");
 const raft_engine = @import("raft_engine");
 const data_mod = @import("../data/mod.zig");
+const data_shard_state_store = @import("../data/storage/shard_state_store.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 
 fn simulationHoldsTransitionAuthority(_: ?*anyopaque, _: u64) bool {
@@ -1559,6 +1560,7 @@ const StorageRecorder = struct {
             .ptr = self,
             .vtable = &.{
                 .persist_ready = persistReady,
+                .compact_snapshot = compactSnapshot,
             },
         };
     }
@@ -1570,6 +1572,12 @@ const StorageRecorder = struct {
         if (ready.hard_state) |hard_state| store.setHardState(hard_state);
         if (ready.conf_state) |conf_state| try store.setConfState(conf_state);
         if (ready.entries.len > 0) try store.append(ready.entries);
+    }
+
+    fn compactSnapshot(ptr: *anyopaque, group_id: u64, snapshot: raft_engine.core.types.Snapshot) !void {
+        const self: *StorageRecorder = @ptrCast(@alignCast(ptr));
+        const store = self.stores.get(group_id) orelse return error.UnknownGroup;
+        try store.compactToSnapshot(snapshot);
     }
 };
 
@@ -3840,11 +3848,10 @@ test "managed http cluster simulation restarts a rejoined node from persisted sn
     const BackingCase = struct {
         backend: host.ReplicaStateBackend,
         label: []const u8,
-        snapshot_data: []const u8,
     };
     const cases = [_]BackingCase{
-        .{ .backend = .file_image, .label = "file-image", .snapshot_data = "cluster-snapshot-state-file-image" },
-        .{ .backend = .wal, .label = "wal", .snapshot_data = "cluster-snapshot-state-wal" },
+        .{ .backend = .file_image, .label = "file-image" },
+        .{ .backend = .wal, .label = "wal" },
     };
 
     for (cases) |case_cfg| {
@@ -3958,7 +3965,12 @@ test "managed http cluster simulation restarts a rejoined node from persisted sn
 
         const snapshot_voters = try std.testing.allocator.dupe(u64, &.{ 1, 2, 3 });
         defer std.testing.allocator.free(snapshot_voters);
-        const snapshot_data = try std.testing.allocator.dupe(u8, case_cfg.snapshot_data);
+        const snapshot_data = try data_shard_state_store.encodeGroupStateSnapshot(
+            std.testing.allocator,
+            .{ .start = "", .end = "" },
+            &.{},
+            &.{},
+        );
         defer std.testing.allocator.free(snapshot_data);
 
         try cluster.node(0).runtime.svc.host.http_host.transport_stack.snapshot_transport.transport().sendSnapshot(.{

@@ -103,6 +103,10 @@ pub const TransitionCommand = union(enum) {
     remove_range: struct {
         group_id: u64,
     },
+    admit_split_transition: struct {
+        expected_source_epoch: u64,
+        record: metadata.SplitTransitionRecord,
+    },
     upsert_split_transition: metadata.SplitTransitionRecord,
     remove_split_transition: struct {
         transition_id: u64,
@@ -182,6 +186,11 @@ pub const TransitionCommand = union(enum) {
                 if (record.source_range_end) |end| alloc.free(end);
                 if (record.rollback_reason) |reason| alloc.free(reason);
             },
+            .admit_split_transition => |*admission| {
+                if (admission.record.split_key) |split_key| alloc.free(split_key);
+                if (admission.record.source_range_end) |end| alloc.free(end);
+                if (admission.record.rollback_reason) |reason| alloc.free(reason);
+            },
             .upsert_merge_transition => |*record| {
                 if (record.rollback_reason) |reason| alloc.free(reason);
             },
@@ -229,6 +238,19 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
         .remove_restore_progress => |record| try group_ids.requireDataGroupId(record.group_id),
         .upsert_range => |record| try group_ids.requireDataGroupId(record.group_id),
         .remove_range => |record| try group_ids.requireDataGroupId(record.group_id),
+        .admit_split_transition => |admission| {
+            try group_ids.requireDataGroupId(admission.record.source_group_id);
+            try group_ids.requireDataGroupId(admission.record.destination_group_id);
+            if (admission.record.transition_id == 0 or
+                admission.record.attempt_epoch == 0 or
+                admission.expected_source_epoch == std.math.maxInt(u64) or
+                admission.record.attempt_epoch != admission.expected_source_epoch + 1 or
+                admission.record.phase != .prepare or
+                admission.record.split_key == null)
+            {
+                return error.InvalidSplitAdmission;
+            }
+        },
         .upsert_split_transition => |record| {
             try group_ids.requireDataGroupId(record.source_group_id);
             try group_ids.requireDataGroupId(record.destination_group_id);
@@ -1501,6 +1523,9 @@ pub const RaftApplyStore = struct {
                     .group_id = record.group_id,
                 });
             },
+            .admit_split_transition => |admission| {
+                try self.applySplitAdmissionTxn(txn, group_id, admission.expected_source_epoch, admission.record);
+            },
             .upsert_split_transition => |record| {
                 var key_buf: [160]u8 = undefined;
                 const key = try splitTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
@@ -1730,6 +1755,94 @@ pub const RaftApplyStore = struct {
                 try self.applyExtensionLifecycleDeltaTxn(txn, group_id, delta);
             },
         }
+    }
+
+    /// Atomically reserves the next source-local split epoch and publishes its
+    /// transition. Failed compare-and-set preconditions are deterministic
+    /// no-ops because a committed Raft command must always remain applicable.
+    fn applySplitAdmissionTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        expected_source_epoch: u64,
+        record: metadata.SplitTransitionRecord,
+    ) !void {
+        const split_key = record.split_key orelse return error.InvalidSplitAdmission;
+
+        var transition_key_buf: [160]u8 = undefined;
+        const transition_key = try splitTransitionKeyForGroup(&transition_key_buf, group_id, record.transition_id);
+        const existing_transition = txn.get(transition_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (existing_transition) |encoded| {
+            const existing = try decodeSplitTransitionRecord(self.alloc, encoded);
+            defer metadata_table_manager.freeSplitTransitionRecord(self.alloc, existing);
+            if (splitTransitionActive(existing)) return;
+        }
+
+        var source_key_buf: [160]u8 = undefined;
+        const source_key = try rangeKeyForGroup(&source_key_buf, group_id, record.source_group_id);
+        const encoded_source = txn.get(source_key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        var source = try decodeRangeRecord(self.alloc, encoded_source);
+        defer metadata_table_manager.freeRange(self.alloc, source);
+        if (source.split_attempt_epoch != expected_source_epoch or
+            expected_source_epoch == std.math.maxInt(u64) or
+            record.attempt_epoch != expected_source_epoch + 1 or
+            !optionalBytesEqual(source.end_key, record.source_range_end) or
+            !keyStrictlyInsideRange(split_key, source.start_key, source.end_key))
+        {
+            return;
+        }
+
+        var destination_key_buf: [160]u8 = undefined;
+        const destination_key = try rangeKeyForGroup(&destination_key_buf, group_id, record.destination_group_id);
+        if (txn.get(destination_key)) |_| {
+            return;
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
+
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try splitTransitionPrefixForGroup(&prefix_buf, group_id);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(prefix);
+        while (entry) |kv| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+            const existing = try decodeSplitTransitionRecord(self.alloc, kv.value);
+            defer metadata_table_manager.freeSplitTransitionRecord(self.alloc, existing);
+            if (splitTransitionActive(existing) and existing.source_group_id == record.source_group_id) return;
+        }
+
+        source.split_attempt_epoch = record.attempt_epoch;
+        const source_value = try encodeRangeRecord(self.alloc, source);
+        defer self.alloc.free(source_value);
+        const transition_value = try encodeSplitTransitionRecord(self.alloc, record);
+        defer self.alloc.free(transition_value);
+        try txn.put(source_key, source_value);
+        try txn.put(transition_key, transition_value);
+
+        const table_name = try self.lookupTableNameTxn(txn, group_id, source.table_id);
+        defer if (table_name) |name| self.alloc.free(name);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = source_key });
+        self.notifyProjectionListeners(.{
+            .kind = .range,
+            .metadata_group_id = group_id,
+            .table_name = table_name,
+            .table_id = source.table_id,
+            .group_id = source.group_id,
+        });
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = transition_key });
+        self.notifyProjectionListeners(.{
+            .kind = .split_transition,
+            .metadata_group_id = group_id,
+            .group_id = record.source_group_id,
+        });
     }
 
     fn applyExtensionLifecycleDeltaTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, delta: ExtensionLifecycleDelta) !void {
@@ -2108,6 +2221,7 @@ const TransitionTag = enum(u8) {
     upsert_restore_job = 41,
     remove_restore_job = 42,
     remove_restore_jobs = 43,
+    admit_split_transition = 44,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -2204,6 +2318,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .remove_range => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.remove_range));
             try appendInt(alloc, &out, u64, record.group_id);
+        },
+        .admit_split_transition => |admission| {
+            try out.append(alloc, @intFromEnum(TransitionTag.admit_split_transition));
+            try appendInt(alloc, &out, u64, admission.expected_source_epoch);
+            try appendSplitTransitionRecord(alloc, &out, admission.record);
         },
         .upsert_split_transition => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_split_transition));
@@ -2386,6 +2505,12 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         },
         .remove_range => .{
             .remove_range = .{ .group_id = try readInt(encoded, &pos, u64) },
+        },
+        .admit_split_transition => .{
+            .admit_split_transition = .{
+                .expected_source_epoch = try readInt(encoded, &pos, u64),
+                .record = try readSplitTransitionRecord(alloc, encoded, &pos),
+            },
         },
         .upsert_split_transition => .{
             .upsert_split_transition = try readSplitTransitionRecord(alloc, encoded, &pos),
@@ -4315,6 +4440,21 @@ fn storeKeyForGroup(buf: []u8, group_id: u64, store_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_store:{d}:{d}", .{ group_id, store_id });
 }
 
+fn splitTransitionActive(record: metadata.SplitTransitionRecord) bool {
+    return record.phase != .finalized and record.phase != .rolled_back;
+}
+
+fn optionalBytesEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn keyStrictlyInsideRange(key: []const u8, start_key: []const u8, end_key: ?[]const u8) bool {
+    if (std.mem.order(u8, key, start_key) != .gt) return false;
+    if (end_key) |end| return std.mem.order(u8, key, end) == .lt;
+    return true;
+}
+
 test "metadata raft apply store persists batches across reopen" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4525,6 +4665,72 @@ test "metadata raft apply store preserves node drain across store upsert" {
     try std.testing.expect(!metadata_table_manager.nodeLifecycleActive(nodes[0].lifecycle));
     try std.testing.expectEqual(@as(usize, 1), stores.len);
     try std.testing.expect(stores[0].drain_requested);
+}
+
+test "metadata raft apply store admits one split epoch atomically and retries idempotently" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-split-admission", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const source_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_range = .{
+        .group_id = 101,
+        .table_id = 10,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    } });
+    defer std.testing.allocator.free(source_cmd);
+    const first_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .admit_split_transition = .{
+        .expected_source_epoch = 0,
+        .record = .{
+            .transition_id = 7001,
+            .attempt_epoch = 1,
+            .source_group_id = 101,
+            .destination_group_id = 103,
+            .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
+        },
+    } });
+    defer std.testing.allocator.free(first_cmd);
+    const competing_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .admit_split_transition = .{
+        .expected_source_epoch = 0,
+        .record = .{
+            .transition_id = 7002,
+            .attempt_epoch = 1,
+            .source_group_id = 101,
+            .destination_group_id = 104,
+            .phase = .prepare,
+            .split_key = "doc:n",
+            .source_range_end = "doc:z",
+        },
+    } });
+    defer std.testing.allocator.free(competing_cmd);
+    const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = source_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = first_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = competing_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = first_cmd },
+    });
+    defer std.testing.allocator.free(encoded_entries);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 21,
+        .commit_index = 4,
+        .entries_bytes = encoded_entries,
+    });
+
+    const ranges = try store.listRanges(std.testing.allocator, 21);
+    defer store.freeRanges(std.testing.allocator, ranges);
+    const transitions = try store.listSplitTransitions(std.testing.allocator, 21);
+    defer store.freeSplitTransitions(std.testing.allocator, transitions);
+    try std.testing.expectEqual(@as(usize, 1), ranges.len);
+    try std.testing.expectEqual(@as(u64, 1), ranges[0].split_attempt_epoch);
+    try std.testing.expectEqual(@as(usize, 1), transitions.len);
+    try std.testing.expectEqual(@as(u64, 7001), transitions[0].transition_id);
+    try std.testing.expectEqual(@as(u64, 1), transitions[0].attempt_epoch);
 }
 
 test "metadata raft apply store ignores stale drained first store registration after cancellation" {
@@ -5874,7 +6080,7 @@ test "metadata state machine projects transitions through metadata apply store" 
     });
     defer std.testing.allocator.free(cmd);
 
-    try sm.stateMachine().applyReady(41, &.{
+    try sm.stateMachine().applyReady(41, null, &.{
         .{ .term = 3, .index = 12, .entry_type = .normal, .data = cmd },
     }, &.{});
 
@@ -6015,7 +6221,7 @@ test "metadata apply store replay is idempotent when applied watermark lags WAL 
             .applied_sink = raft_state_machine.noopAppliedIndexSink(),
             .snapshot_builder = store.snapshotBuilder(),
         };
-        try sm.stateMachine().applyReady(202, &.{
+        try sm.stateMachine().applyReady(202, null, &.{
             .{ .term = 5, .index = 1, .entry_type = .normal, .data = cmd },
         }, &.{});
     }
@@ -6049,7 +6255,7 @@ test "metadata apply store replay is idempotent when applied watermark lags WAL 
             .applied_sink = raft_state_machine.noopAppliedIndexSink(),
             .snapshot_builder = store.snapshotBuilder(),
         };
-        try sm.stateMachine().applyReady(202, rd.committed_entries, &.{});
+        try sm.stateMachine().applyReady(202, rd.snapshot, rd.committed_entries, &.{});
 
         const batch = (try store.latestBatch(202)) orelse return error.MissingMetadataBatch;
         try std.testing.expectEqual(@as(u64, 1), batch.commit_index);

@@ -71,6 +71,7 @@ pub const PersistentReplicaProvider = struct {
                 .ptr = self,
                 .vtable = &.{
                     .persist_ready = persistReady,
+                    .compact_snapshot = compactSnapshot,
                 },
             },
         };
@@ -107,6 +108,12 @@ pub const PersistentReplicaProvider = struct {
         const self: *PersistentReplicaProvider = @ptrCast(@alignCast(ptr));
         const state = self.states.get(group_id) orelse return error.UnknownGroup;
         try state.groupStorage().persistReady(group_id, ready);
+    }
+
+    fn compactSnapshot(ptr: *anyopaque, group_id: u64, snapshot: raft_engine.core.types.Snapshot) !void {
+        const self: *PersistentReplicaProvider = @ptrCast(@alignCast(ptr));
+        const state = self.states.get(group_id) orelse return error.UnknownGroup;
+        try state.groupStorage().compactSnapshot(group_id, snapshot);
     }
 
     fn setAppliedIndex(

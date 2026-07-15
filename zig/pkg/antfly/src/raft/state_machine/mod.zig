@@ -41,6 +41,13 @@ pub const SnapshotBuilder = struct {
 
     pub const VTable = struct {
         build_snapshot: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) anyerror![]u8,
+        install_snapshot: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            commit_index: u64,
+            snapshot: []const u8,
+        ) anyerror!void = null,
         apply_batch: *const fn (ptr: *anyopaque, batch: ApplyBatch) anyerror!void,
     };
 
@@ -50,6 +57,18 @@ pub const SnapshotBuilder = struct {
 
     pub fn applyBatch(self: SnapshotBuilder, batch: ApplyBatch) !void {
         return try self.vtable.apply_batch(self.ptr, batch);
+    }
+
+    pub fn installSnapshot(
+        self: SnapshotBuilder,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        commit_index: u64,
+        snapshot: []const u8,
+    ) !bool {
+        const install = self.vtable.install_snapshot orelse return false;
+        try install(self.ptr, alloc, group_id, commit_index, snapshot);
+        return true;
     }
 };
 
@@ -176,8 +195,8 @@ test "routed state machine uses metadata and data apply paths" {
         .data_state_machine = data_sm.stateMachine(),
     };
 
-    try routed.stateMachine().applyReady(42, &.{.{ .term = 1, .index = 7 }}, &.{});
-    try routed.stateMachine().applyReady(99, &.{.{ .term = 1, .index = 11 }}, &.{});
+    try routed.stateMachine().applyReady(42, null, &.{.{ .term = 1, .index = 7 }}, &.{});
+    try routed.stateMachine().applyReady(99, null, &.{.{ .term = 1, .index = 11 }}, &.{});
 
     try std.testing.expectEqual(@as(u64, 7), sink_recorder.metadata_applied);
     try std.testing.expectEqual(@as(u64, 11), sink_recorder.data_applied);
@@ -222,7 +241,7 @@ test "routed state machine forwards read states into observer" {
     const ctx = try std.testing.allocator.dupe(u8, "readable");
     defer std.testing.allocator.free(ctx);
 
-    try routed.stateMachine().applyReady(42, &.{}, &.{.{
+    try routed.stateMachine().applyReady(42, null, &.{}, &.{.{
         .index = 9,
         .request_ctx = ctx,
     }});
@@ -331,10 +350,10 @@ test "metadata and data state machines forward applied batches into snapshot bui
         .snapshot_builder = data_builder.builder(),
     };
 
-    try metadata_sm.stateMachine().applyReady(7, &.{.{ .term = 2, .index = 9, .data = @constCast("meta") }}, &.{});
-    try data_sm.stateMachine().applyReady(8, &.{.{ .term = 3, .index = 11, .data = @constCast("data") }}, &.{});
-    try metadata_sm.stateMachine().applyReady(7, &.{}, &.{});
-    try data_sm.stateMachine().applyReady(8, &.{}, &.{});
+    try metadata_sm.stateMachine().applyReady(7, null, &.{.{ .term = 2, .index = 9, .data = @constCast("meta") }}, &.{});
+    try data_sm.stateMachine().applyReady(8, null, &.{.{ .term = 3, .index = 11, .data = @constCast("data") }}, &.{});
+    try metadata_sm.stateMachine().applyReady(7, null, &.{}, &.{});
+    try data_sm.stateMachine().applyReady(8, null, &.{}, &.{});
 
     try std.testing.expectEqual(@as(u64, 7), metadata_builder.last_group_id);
     try std.testing.expectEqual(@as(u64, 9), metadata_builder.last_commit_index);
@@ -355,7 +374,7 @@ test "metadata and data state machines publish applied index only after delegate
             return .{ .ptr = self, .vtable = &.{ .apply_ready = applyReady } };
         }
 
-        fn applyReady(_: *anyopaque, _: u64, _: []const raft_engine.core.Entry, _: []const raft_engine.core.ReadState) !void {
+        fn applyReady(_: *anyopaque, _: u64, _: ?raft_engine.core.types.Snapshot, _: []const raft_engine.core.Entry, _: []const raft_engine.core.ReadState) !void {
             return error.DelegateApplyFailed;
         }
     };
@@ -387,8 +406,8 @@ test "metadata and data state machines publish applied index only after delegate
     };
     const entries: []const raft_engine.core.Entry = &.{.{ .term = 1, .index = 3 }};
 
-    try std.testing.expectError(error.DelegateApplyFailed, metadata_sm.stateMachine().applyReady(7, entries, &.{}));
-    try std.testing.expectError(error.DelegateApplyFailed, data_sm.stateMachine().applyReady(8, entries, &.{}));
+    try std.testing.expectError(error.DelegateApplyFailed, metadata_sm.stateMachine().applyReady(7, null, entries, &.{}));
+    try std.testing.expectError(error.DelegateApplyFailed, data_sm.stateMachine().applyReady(8, null, entries, &.{}));
     try std.testing.expectEqual(@as(usize, 0), metadata_sink.calls);
     try std.testing.expectEqual(@as(usize, 0), data_sink.calls);
 }

@@ -452,25 +452,29 @@ pub fn decodeGroupStateSnapshotAlloc(alloc: std.mem.Allocator, encoded: []const 
 }
 
 pub fn installSnapshot(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64, encoded: []const u8) !void {
+    try installSnapshotWithMetadata(store, alloc, group_id, encoded, &.{});
+}
+
+pub fn installSnapshotWithMetadata(
+    store: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    encoded: []const u8,
+    external_metadata_writes: []const docstore.KVPair,
+) !void {
     var snapshot = try decodeGroupStateSnapshotAlloc(alloc, encoded);
     defer snapshot.deinit(alloc);
-    var seen_controls = std.StringHashMapUnmanaged(void).empty;
-    defer seen_controls.deinit(alloc);
-    try seen_controls.ensureTotalCapacity(alloc, @intCast(snapshot.controls.len));
-    for (snapshot.controls) |control| {
-        const result = try seen_controls.getOrPut(alloc, control.key);
-        if (result.found_existing) return error.InvalidGroupStateSnapshot;
-        try validateGroupControlEntry(alloc, group_id, control);
-    }
+    try validateGroupStateSnapshot(alloc, group_id, snapshot);
 
     const existing_controls = try groupControlState(store, alloc, group_id);
     defer freeGroupStateEntries(alloc, existing_controls);
     const deletes = try alloc.alloc([]const u8, existing_controls.len);
     defer alloc.free(deletes);
     for (existing_controls, 0..) |control, i| deletes[i] = control.key;
-    const writes = try alloc.alloc(docstore.KVPair, snapshot.controls.len);
+    const writes = try alloc.alloc(docstore.KVPair, snapshot.controls.len + external_metadata_writes.len);
     defer alloc.free(writes);
     for (snapshot.controls, 0..) |control, i| writes[i] = .{ .key = control.key, .value = control.value };
+    @memcpy(writes[snapshot.controls.len..], external_metadata_writes);
     try replaceGroupSnapshotWithMetadataAndDeletes(
         store,
         alloc,
@@ -480,6 +484,119 @@ pub fn installSnapshot(store: *docstore.DocStore, alloc: std.mem.Allocator, grou
         writes,
         deletes,
     );
+}
+
+pub fn validateGroupStateSnapshot(alloc: std.mem.Allocator, group_id: u64, snapshot: GroupStateSnapshot) !void {
+    if (snapshot.byte_range.start.len > 0 and
+        snapshot.byte_range.end.len > 0 and
+        std.mem.order(u8, snapshot.byte_range.start, snapshot.byte_range.end) != .lt)
+    {
+        return error.InvalidGroupStateSnapshot;
+    }
+
+    var seen_entries = std.StringHashMapUnmanaged(void).empty;
+    defer seen_entries.deinit(alloc);
+    try seen_entries.ensureTotalCapacity(alloc, @intCast(snapshot.entries.len));
+    for (snapshot.entries) |entry| {
+        const result = try seen_entries.getOrPut(alloc, entry.key);
+        if (result.found_existing) return error.InvalidGroupStateSnapshot;
+    }
+
+    var seen_controls = std.StringHashMapUnmanaged(void).empty;
+    defer seen_controls.deinit(alloc);
+    try seen_controls.ensureTotalCapacity(alloc, @intCast(snapshot.controls.len));
+    var state_entry: ?AppliedDataKV = null;
+    var sequence: ?u64 = null;
+    var acknowledgement: ?SplitAcknowledgement = null;
+    var terminal_entry: ?AppliedDataKV = null;
+    var delta_count: u64 = 0;
+    var max_delta_sequence: u64 = 0;
+    for (snapshot.controls) |control| {
+        const result = try seen_controls.getOrPut(alloc, control.key);
+        if (result.found_existing) return error.InvalidGroupStateSnapshot;
+        try validateGroupControlEntry(alloc, group_id, control);
+        switch (groupControlKind(group_id, control.key) orelse unreachable) {
+            .split_state => state_entry = control,
+            .delta_sequence => sequence = std.mem.readInt(u64, control.value[0..8], .little),
+            .acknowledgement => acknowledgement = .{
+                .transition_id = std.mem.readInt(u64, control.value[0..8], .little),
+                .attempt_epoch = std.mem.readInt(u64, control.value[8..16], .little),
+                .destination_group_id = std.mem.readInt(u64, control.value[16..24], .little),
+                .delta_sequence = std.mem.readInt(u64, control.value[24..32], .little),
+            },
+            .terminal => terminal_entry = control,
+            .delta => |delta_sequence| {
+                if (delta_sequence == 0) return error.InvalidGroupStateSnapshot;
+                delta_count += 1;
+                max_delta_sequence = @max(max_delta_sequence, delta_sequence);
+            },
+        }
+    }
+
+    const source_sequence = sequence orelse 0;
+    if ((delta_count > 0 and sequence == null) or
+        max_delta_sequence > source_sequence or
+        (delta_count > 0 and (delta_count != max_delta_sequence or max_delta_sequence != source_sequence)))
+    {
+        return error.InvalidGroupStateSnapshot;
+    }
+
+    var state: ?AppliedSplitState = null;
+    defer if (state) |value| freeSplitState(alloc, value);
+    if (state_entry) |entry| state = decodeSplitStateAlloc(alloc, entry.value) catch return error.InvalidGroupStateSnapshot;
+    var terminal: ?AppliedSplitTerminal = null;
+    defer if (terminal) |value| freeSplitTerminal(alloc, value);
+    if (terminal_entry) |entry| terminal = decodeSplitTerminalAlloc(alloc, entry.value) catch return error.InvalidGroupStateSnapshot;
+
+    if (state) |active| {
+        if (sequence == null) return error.InvalidGroupStateSnapshot;
+        if (terminal) |completed| {
+            if (active.attempt_epoch <= completed.attempt_epoch) return error.InvalidGroupStateSnapshot;
+        }
+    } else if (delta_count != 0 or sequence != null) {
+        return error.InvalidGroupStateSnapshot;
+    }
+
+    const document_range = if (state) |active|
+        AppliedDataRange{
+            .start = snapshot.byte_range.start,
+            .end = if (active.phase == .splitting or active.phase == .finalizing)
+                active.original_range_end
+            else
+                snapshot.byte_range.end,
+        }
+    else
+        snapshot.byte_range;
+    if (document_range.start.len > 0 and document_range.end.len > 0 and
+        std.mem.order(u8, document_range.start, document_range.end) != .lt)
+    {
+        return error.InvalidGroupStateSnapshot;
+    }
+    for (snapshot.entries) |entry| {
+        if (!document_range.contains(entry.key)) return error.InvalidGroupStateSnapshot;
+    }
+
+    if (acknowledgement) |ack| {
+        if (state) |active| {
+            if (ack.delta_sequence > source_sequence or
+                active.transition_id != ack.transition_id or
+                active.attempt_epoch != ack.attempt_epoch or
+                active.new_shard_id != ack.destination_group_id)
+            {
+                return error.InvalidGroupStateSnapshot;
+            }
+        } else if (terminal) |completed| {
+            if (completed.outcome != .finalized or
+                completed.transition_id != ack.transition_id or
+                completed.attempt_epoch != ack.attempt_epoch or
+                completed.destination_group_id != ack.destination_group_id)
+            {
+                return error.InvalidGroupStateSnapshot;
+            }
+        } else {
+            return error.InvalidGroupStateSnapshot;
+        }
+    }
 }
 
 const GroupControlKind = union(enum) {
@@ -1024,11 +1141,9 @@ pub fn appendOperationEffects(
             removeDeleteByKey(alloc, deletes, split_state_key);
             try deletes.append(alloc, try alloc.dupe(u8, split_state_key));
             removeOwnedWritesWithPrefix(alloc, writes, "\x00\x00__metadata__:data_group_split_delta:");
-            removeDeletesWithPrefix(alloc, deletes, "\x00\x00__metadata__:data_group_split_delta:");
             const split_delta_seq_key = try groupSplitDeltaSeqKeyAlloc(alloc, group_id);
             defer alloc.free(split_delta_seq_key);
             removeOwnedWriteByKey(alloc, writes, split_delta_seq_key);
-            removeDeleteByKey(alloc, deletes, split_delta_seq_key);
             try appendSplitTerminal(
                 alloc,
                 group_id,
@@ -1089,11 +1204,9 @@ pub fn appendOperationEffects(
             removeDeleteByKey(alloc, deletes, split_state_key);
             try deletes.append(alloc, try alloc.dupe(u8, split_state_key));
             removeOwnedWritesWithPrefix(alloc, writes, "\x00\x00__metadata__:data_group_split_delta:");
-            removeDeletesWithPrefix(alloc, deletes, "\x00\x00__metadata__:data_group_split_delta:");
             const split_delta_seq_key = try groupSplitDeltaSeqKeyAlloc(alloc, group_id);
             defer alloc.free(split_delta_seq_key);
             removeOwnedWriteByKey(alloc, writes, split_delta_seq_key);
-            removeDeleteByKey(alloc, deletes, split_delta_seq_key);
             const acknowledgement_key = try groupSplitAcknowledgementKeyAlloc(alloc, group_id);
             defer alloc.free(acknowledgement_key);
             removeOwnedWriteByKey(alloc, writes, acknowledgement_key);
@@ -1230,22 +1343,6 @@ fn removeOwnedWritesWithPrefix(
     }
 }
 
-fn removeDeletesWithPrefix(
-    alloc: std.mem.Allocator,
-    deletes: *std.ArrayListUnmanaged([]u8),
-    prefix: []const u8,
-) void {
-    var i: usize = 0;
-    while (i < deletes.items.len) {
-        if (std.mem.startsWith(u8, deletes.items[i], prefix)) {
-            const removed = deletes.swapRemove(i);
-            alloc.free(removed);
-            continue;
-        }
-        i += 1;
-    }
-}
-
 fn appendSplitTerminal(
     alloc: std.mem.Allocator,
     group_id: u64,
@@ -1357,7 +1454,7 @@ fn stripAnyGroupDocumentPrefixAlloc(alloc: std.mem.Allocator, logical_key: []con
 const group_snapshot_magic = "AFDS";
 const group_snapshot_version: u8 = 2;
 
-fn encodeGroupStateSnapshot(
+pub fn encodeGroupStateSnapshot(
     alloc: std.mem.Allocator,
     byte_range: AppliedDataRange,
     entries: []const AppliedDataKV,
@@ -1867,6 +1964,35 @@ test "shard state snapshot round trips split control state" {
     defer freeSplitTerminal(std.testing.allocator, terminal);
     try std.testing.expectEqual(@as(u64, 1), terminal.attempt_epoch);
     try std.testing.expectEqual(SplitTerminalOutcome.rolled_back, terminal.outcome);
+}
+
+test "shard state snapshot rejects duplicate and out-of-range documents" {
+    var duplicate_entries = [_]AppliedDataKV{
+        .{ .key = "doc:b", .value = "one" },
+        .{ .key = "doc:b", .value = "two" },
+    };
+    try std.testing.expectError(error.InvalidGroupStateSnapshot, validateGroupStateSnapshot(
+        std.testing.allocator,
+        91,
+        .{
+            .byte_range = .{ .start = "doc:a", .end = "doc:m" },
+            .entries = &duplicate_entries,
+            .controls = &.{},
+        },
+    ));
+
+    var out_of_range_entries = [_]AppliedDataKV{
+        .{ .key = "doc:z", .value = "outside" },
+    };
+    try std.testing.expectError(error.InvalidGroupStateSnapshot, validateGroupStateSnapshot(
+        std.testing.allocator,
+        91,
+        .{
+            .byte_range = .{ .start = "doc:a", .end = "doc:m" },
+            .entries = &out_of_range_entries,
+            .controls = &.{},
+        },
+    ));
 }
 
 test "shard state store finalize split reclaims right-hand document range" {

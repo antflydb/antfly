@@ -1378,6 +1378,7 @@ const BatchExecutionOptions = struct {
     bypass_ha_write_gate: bool = false,
     ha_applied_lsn_marker: ?u64 = null,
     suppress_derived_replay_append: bool = false,
+    extra_store_writes: []const docstore_mod.KVPair = &.{},
 };
 
 const ha_applied_lsn_value_len: usize = @sizeOf(u64);
@@ -2459,6 +2460,14 @@ fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
     }
 }
 
+fn splitBootstrapMarkersEqual(a: range_state_mod.SplitBootstrapMarker, b: range_state_mod.SplitBootstrapMarker) bool {
+    return a.transition_id == b.transition_id and
+        a.attempt_epoch == b.attempt_epoch and
+        a.source_group_id == b.source_group_id and
+        a.destination_group_id == b.destination_group_id and
+        a.bootstrap_complete == b.bootstrap_complete;
+}
+
 fn lockAtomicWithBackoffProfiled(mutex: *std.atomic.Mutex, stats: *MutexContentionStats) ProfiledLock {
     if (!asyncIndexProfileEnabled()) {
         lockAtomicWithBackoff(mutex);
@@ -2865,6 +2874,7 @@ pub const DB = struct {
     index_repair_barriers: std.atomic.Value(u32) = .init(0),
     published_dense_searches: std.atomic.Value(u32) = .init(0),
     index_repair_mutex: std.atomic.Mutex = .unlocked,
+    generation_replace_mutex: std.atomic.Mutex = .unlocked,
     active_index_repairs: std.StringHashMapUnmanaged(void) = .{},
     shadow_index_repair_hook: ?@This().ShadowIndexRepairHook = null,
 
@@ -5375,6 +5385,7 @@ pub const DB = struct {
             &owned_store_keys,
             &owned_store_values,
         );
+        try store_writes.appendSlice(self.alloc, opts.extra_store_writes);
         try delete_keys.appendSlice(self.alloc, identity_visibility_deletes.items);
         const replay_append: ?docstore_mod.DocStore.ReplayAppend = if (opts.suppress_derived_replay_append)
             null
@@ -8080,6 +8091,182 @@ pub const DB = struct {
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.saveSplitBootstrapMarker(marker);
+    }
+
+    /// Replaces all primary documents and the range for a Raft snapshot in a
+    /// single durable commit. Derived indexes consume the same replacement
+    /// batch, so stale documents are removed instead of surviving restore.
+    pub fn replaceRaftDocumentSnapshot(
+        self: *DB,
+        alloc: Allocator,
+        byte_range: types.ByteRange,
+        writes: []const types.BatchWrite,
+    ) !void {
+        lockAtomicWithBackoff(&self.generation_replace_mutex);
+        defer self.generation_replace_mutex.unlock();
+        if (byte_range.start.len > 0 and byte_range.end.len > 0 and
+            std.mem.order(u8, byte_range.start, byte_range.end) != .lt)
+        {
+            return error.InvalidAppliedDataRange;
+        }
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(alloc);
+        try seen.ensureTotalCapacity(alloc, @intCast(writes.len));
+        for (writes) |write| {
+            if (!byte_range.contains(write.key)) return error.KeyOutOfRange;
+            const result = try seen.getOrPut(alloc, write.key);
+            if (result.found_existing) return error.DuplicateDocumentKey;
+        }
+
+        const lower = try internal_keys.documentRangeLowerAlloc(alloc, "");
+        defer alloc.free(lower);
+        const upper = (try internal_keys.documentRangeUpperAlloc(alloc, "")) orelse return error.InvalidAppliedDataRange;
+        defer alloc.free(upper);
+        lockApplyShared(self);
+        const existing_documents = self.core.scanStoreRange(alloc, lower, upper) catch |err| {
+            self.core.unlockApplyShared();
+            return err;
+        };
+        self.core.unlockApplyShared();
+        defer docstore_mod.DocStore.freeResults(alloc, existing_documents);
+
+        var deletes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (deletes.items) |key| alloc.free(key);
+            deletes.deinit(alloc);
+        }
+        for (existing_documents) |entry| {
+            const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, entry.key)) orelse continue;
+            errdefer alloc.free(logical_key);
+            try deletes.append(alloc, logical_key);
+        }
+
+        var range_buf: [1024]u8 = undefined;
+        const range_write = try range_state_mod.rangeMetadataWrite(byte_range, &range_buf);
+        try self.batchInternal(.{
+            .writes = writes,
+            .deletes = deletes.items,
+            .sync_level = .write,
+        }, null, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+            .bypass_ha_write_gate = true,
+            .extra_store_writes = &.{range_write},
+        });
+        try self.refreshSplitBootstrapRangeInMemory(byte_range);
+    }
+
+    /// Atomically replaces a split destination generation. The primary
+    /// document mutations, derived replay record, range, replay fence, and
+    /// completed marker share one storage commit. Callers must hold the
+    /// destination generation's exclusive lifecycle lease.
+    pub fn replaceSplitBootstrap(
+        self: *DB,
+        alloc: Allocator,
+        byte_range: types.ByteRange,
+        writes: []const types.BatchWrite,
+        base_delta_sequence: u64,
+        marker: range_state_mod.SplitBootstrapMarker,
+    ) !bool {
+        lockAtomicWithBackoff(&self.generation_replace_mutex);
+        defer self.generation_replace_mutex.unlock();
+
+        if (marker.transition_id == 0 or marker.attempt_epoch == 0 or
+            marker.source_group_id == 0 or marker.destination_group_id == 0 or
+            !marker.bootstrap_complete)
+        {
+            return error.InvalidSplitBootstrapMarker;
+        }
+        if (byte_range.start.len > 0 and byte_range.end.len > 0 and
+            std.mem.order(u8, byte_range.start, byte_range.end) != .lt)
+        {
+            return error.InvalidAppliedDataRange;
+        }
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(alloc);
+        try seen.ensureTotalCapacity(alloc, @intCast(writes.len));
+        for (writes) |write| {
+            if (!byte_range.contains(write.key)) return error.KeyOutOfRange;
+            const result = try seen.getOrPut(alloc, write.key);
+            if (result.found_existing) return error.DuplicateDocumentKey;
+        }
+
+        if (try self.getSplitBootstrapMarker(alloc)) |existing| {
+            if (splitBootstrapMarkersEqual(existing, marker)) {
+                try self.refreshSplitBootstrapRangeInMemory(byte_range);
+                return false;
+            }
+            if (existing.source_group_id != marker.source_group_id or
+                existing.destination_group_id != marker.destination_group_id or
+                existing.attempt_epoch >= marker.attempt_epoch)
+            {
+                return error.ConflictingSplitTransition;
+            }
+        }
+
+        const lower = try internal_keys.documentRangeLowerAlloc(alloc, "");
+        defer alloc.free(lower);
+        const upper = (try internal_keys.documentRangeUpperAlloc(alloc, "")) orelse return error.InvalidAppliedDataRange;
+        defer alloc.free(upper);
+        lockApplyShared(self);
+        const existing_documents = self.core.scanStoreRange(alloc, lower, upper) catch |err| {
+            self.core.unlockApplyShared();
+            return err;
+        };
+        self.core.unlockApplyShared();
+        defer docstore_mod.DocStore.freeResults(alloc, existing_documents);
+
+        var deletes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (deletes.items) |key| alloc.free(key);
+            deletes.deinit(alloc);
+        }
+        for (existing_documents) |entry| {
+            const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, entry.key)) orelse continue;
+            errdefer alloc.free(logical_key);
+            try deletes.append(alloc, logical_key);
+        }
+
+        var range_buf: [1024]u8 = undefined;
+        var sequence_buf: [8]u8 = undefined;
+        var marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
+        const metadata_writes = try range_state_mod.splitBootstrapMetadataWrites(
+            byte_range,
+            base_delta_sequence,
+            marker,
+            &range_buf,
+            &sequence_buf,
+            &marker_buf,
+        );
+        self.batchInternal(.{
+            .writes = writes,
+            .deletes = deletes.items,
+            .sync_level = .write,
+        }, null, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+            .bypass_ha_write_gate = true,
+            .extra_store_writes = &metadata_writes,
+        }) catch |err| {
+            if (try self.getSplitBootstrapMarker(alloc)) |committed| {
+                if (splitBootstrapMarkersEqual(committed, marker)) {
+                    try self.refreshSplitBootstrapRangeInMemory(byte_range);
+                    return true;
+                }
+            }
+            return err;
+        };
+        try self.refreshSplitBootstrapRangeInMemory(byte_range);
+        return true;
+    }
+
+    fn refreshSplitBootstrapRangeInMemory(self: *DB, byte_range: types.ByteRange) !void {
+        const start = try self.alloc.dupe(u8, byte_range.start);
+        errdefer self.alloc.free(start);
+        const end = try self.alloc.dupe(u8, byte_range.end);
+        lockApply(self);
+        defer self.core.unlockApply();
+        self.core.replaceRangeInMemoryOwned(start, end);
     }
 
     pub fn clearSplitBootstrapMarker(self: *DB) !void {

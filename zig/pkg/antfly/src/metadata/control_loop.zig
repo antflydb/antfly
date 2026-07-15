@@ -26,6 +26,7 @@ pub const ReconcileSummary = struct {
     rebalance_placement_groups: usize = 0,
     table_upserts: usize = 0,
     range_upserts: usize = 0,
+    split_admissions: usize = 0,
     split_upserts: usize = 0,
     merge_upserts: usize = 0,
     placement_removals: usize = 0,
@@ -100,6 +101,7 @@ pub const MetadataControlLoop = struct {
             .rebalance_placement_groups = plan.rebalance_placement_groups,
             .table_upserts = plan.table_upserts.len,
             .range_upserts = plan.range_upserts.len,
+            .split_admissions = plan.split_admissions.len,
             .split_upserts = plan.split_upserts.len,
             .merge_upserts = plan.merge_upserts.len,
             .placement_removals = plan.placement_removals.len,
@@ -149,6 +151,7 @@ test "metadata control loop proposes desired transitions through the service sea
         tables: []const metadata_table_manager.TableRecord,
         ranges: []const metadata_table_manager.RangeRecord,
         placement_upserts: usize = 0,
+        split_admissions: usize = 0,
         split_upserts: usize = 0,
         merge_upserts: usize = 0,
 
@@ -227,6 +230,7 @@ test "metadata control loop proposes desired transitions through the service sea
 
         pub fn applyReconciliationPlan(self: *@This(), plan: *const metadata_reconciler.ReconciliationPlan) !void {
             self.placement_upserts += plan.placement_upserts.len;
+            self.split_admissions += plan.split_admissions.len;
             self.split_upserts += plan.split_upserts.len;
             self.merge_upserts += plan.merge_upserts.len;
         }
@@ -265,10 +269,11 @@ test "metadata control loop proposes desired transitions through the service sea
     };
     const summary = try loop.reconcileOnce(&fake);
     try std.testing.expectEqual(@as(usize, 0), summary.table_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.range_upserts);
+    try std.testing.expectEqual(@as(usize, 0), summary.range_upserts);
     try std.testing.expectEqual(@as(usize, 0), summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.split_upserts);
-    try std.testing.expectEqual(@as(usize, 1), fake.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), summary.split_admissions);
+    try std.testing.expectEqual(@as(usize, 1), fake.split_admissions);
+    try std.testing.expectEqual(@as(usize, 0), summary.split_upserts);
 }
 
 test "metadata control loop plans placement intents from desired topology and candidates" {
@@ -491,8 +496,8 @@ test "metadata control loop installs service median key lookup for automatic spl
                 std.testing.allocator.free(value);
                 self.planned_split_key = null;
             }
-            if (plan.split_upserts.len != 0) {
-                self.planned_split_key = try std.testing.allocator.dupe(u8, plan.split_upserts[0].split_key.?);
+            if (plan.split_admissions.len != 0) {
+                self.planned_split_key = try std.testing.allocator.dupe(u8, plan.split_admissions[0].record.split_key.?);
             }
         }
     };
@@ -538,7 +543,7 @@ test "metadata control loop installs service median key lookup for automatic spl
     defer fake.deinit(std.testing.allocator);
 
     const summary = try loop.reconcileOnce(&fake);
-    try std.testing.expectEqual(@as(usize, 1), summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), summary.split_admissions);
     try std.testing.expect(fake.planned_split_key != null);
     try std.testing.expectEqualStrings("doc:m", fake.planned_split_key.?);
 }

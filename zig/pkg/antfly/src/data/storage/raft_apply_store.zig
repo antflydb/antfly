@@ -119,6 +119,7 @@ pub const RaftApplyStore = struct {
             .ptr = self,
             .vtable = &.{
                 .build_snapshot = buildSnapshot,
+                .install_snapshot = installSnapshotFromRaft,
                 .apply_batch = applyBatch,
             },
         };
@@ -163,12 +164,48 @@ pub const RaftApplyStore = struct {
         return try shard_state_store.groupState(&self.store, alloc, group_id);
     }
 
-    pub fn installSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, encoded: []const u8) !void {
+    pub fn installSnapshot(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        commit_index: u64,
+        encoded: []const u8,
+    ) !void {
         const io = self.io_impl.io();
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
-        try shard_state_store.installSnapshot(&self.store, alloc, group_id, encoded);
+
+        if (shard.batches.getPtr(group_id) == null) try shard.batches.ensureUnusedCapacity(self.alloc, 1);
+        const empty_batch = try raft_state_machine.encodeCommittedEntries(alloc, &.{});
+        defer alloc.free(empty_batch);
+        var key_buf: [128]u8 = undefined;
+        const key = try keyForGroup(&key_buf, group_id);
+        const value = try alloc.alloc(u8, @sizeOf(u64) + empty_batch.len);
+        defer alloc.free(value);
+        std.mem.writeInt(u64, value[0..8], commit_index, .little);
+        @memcpy(value[8..], empty_batch);
+        try shard_state_store.installSnapshotWithMetadata(
+            &self.store,
+            alloc,
+            group_id,
+            encoded,
+            &.{.{ .key = key, .value = value }},
+        );
+
+        const summary = AppliedDataBatch{
+            .commit_index = commit_index,
+            .entry_count = 0,
+            .normal_entry_count = 0,
+            .admin_entry_count = 0,
+            .last_entry_term = 0,
+            .last_entry_index = commit_index,
+        };
+        if (shard.batches.getPtr(group_id)) |existing| {
+            existing.* = summary;
+        } else {
+            shard.batches.putAssumeCapacity(group_id, summary);
+        }
     }
 
     /// Seeds a group that predates the data-Raft apply projection. Index zero is
@@ -257,7 +294,22 @@ pub const RaftApplyStore = struct {
 
     fn buildSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) ![]u8 {
         const self: *RaftApplyStore = @ptrCast(@alignCast(ptr));
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
         return try shard_state_store.buildSnapshot(&self.store, alloc, group_id);
+    }
+
+    fn installSnapshotFromRaft(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        commit_index: u64,
+        encoded: []const u8,
+    ) !void {
+        const self: *RaftApplyStore = @ptrCast(@alignCast(ptr));
+        try self.installSnapshot(alloc, group_id, commit_index, encoded);
     }
 
     fn applyBatch(ptr: *anyopaque, batch: raft_state_machine.ApplyBatch) !void {
@@ -400,6 +452,7 @@ pub const RaftApplyStore = struct {
         const commit_index = std.mem.readInt(u64, encoded[0..8], .little);
         var summary = try summarizeEntries(self.alloc, encoded[8..]);
         summary.commit_index = commit_index;
+        if (summary.last_entry_index == 0 and commit_index > 0) summary.last_entry_index = commit_index;
         try shard.batches.put(self.alloc, group_id, summary);
         return shard.batches.getPtr(group_id);
     }
@@ -1447,6 +1500,59 @@ test "data raft apply store seeds pre-raft snapshots once at reserved index zero
     try std.testing.expectEqualStrings("doc:b", state[1].key);
 }
 
+test "data raft apply store installs snapshot watermark atomically" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshot-watermark-source", .{tmp.sub_path});
+    defer std.testing.allocator.free(source_root);
+    const target_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshot-watermark-target", .{tmp.sub_path});
+    defer std.testing.allocator.free(target_root);
+
+    var source = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
+    defer source.deinit();
+    try std.testing.expect(try source.seedGroupSnapshotIfAbsent(
+        std.testing.allocator,
+        301,
+        .{ .start = "doc:a", .end = "doc:z" },
+        &.{.{ .key = "doc:b", .value = "one" }},
+    ));
+    const snapshot = try source.snapshotBuilder().buildSnapshot(std.testing.allocator, 301);
+    defer std.testing.allocator.free(snapshot);
+
+    {
+        var target = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = target_root });
+        defer target.deinit();
+        try target.installSnapshot(std.testing.allocator, 301, 50, snapshot);
+        const batch = (try target.latestBatch(301)) orelse return error.MissingAppliedBatch;
+        try std.testing.expectEqual(@as(u64, 50), batch.commit_index);
+        try std.testing.expectEqual(@as(u64, 50), batch.last_entry_index);
+    }
+
+    {
+        var target = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = target_root });
+        defer target.deinit();
+        const restored = (try target.latestBatch(301)) orelse return error.MissingAppliedBatch;
+        try std.testing.expectEqual(@as(u64, 50), restored.commit_index);
+        try std.testing.expectEqual(@as(u64, 50), restored.last_entry_index);
+
+        const suffix = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{.{
+            .term = 7,
+            .index = 51,
+            .entry_type = .normal,
+            .data = @constCast("put:doc:c=two"),
+        }});
+        defer std.testing.allocator.free(suffix);
+        try target.snapshotBuilder().applyBatch(.{
+            .group_id = 301,
+            .commit_index = 51,
+            .entries_bytes = suffix,
+        });
+        const advanced = (try target.latestBatch(301)) orelse return error.MissingAppliedBatch;
+        try std.testing.expectEqual(@as(u64, 51), advanced.commit_index);
+        try std.testing.expectEqual(@as(u64, 51), advanced.last_entry_index);
+    }
+}
+
 test "data apply store replay is idempotent when applied watermark lags WAL state" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1488,7 +1594,7 @@ test "data apply store replay is idempotent when applied watermark lags WAL stat
             .snapshot_builder = store.snapshotBuilder(),
         };
 
-        try sm.stateMachine().applyReady(201, &.{
+        try sm.stateMachine().applyReady(201, null, &.{
             .{ .term = 4, .index = 1, .entry_type = .normal, .data = @constCast("put:doc:a=1") },
             .{ .term = 4, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b=2") },
         }, &.{});
@@ -1523,7 +1629,7 @@ test "data apply store replay is idempotent when applied watermark lags WAL stat
             .applied_sink = raft_state_machine.noopAppliedIndexSink(),
             .snapshot_builder = store.snapshotBuilder(),
         };
-        try sm.stateMachine().applyReady(201, rd.committed_entries, &.{});
+        try sm.stateMachine().applyReady(201, rd.snapshot, rd.committed_entries, &.{});
 
         const batch = (try store.latestBatch(201)) orelse return error.MissingDataBatch;
         try std.testing.expectEqual(@as(u64, 2), batch.commit_index);

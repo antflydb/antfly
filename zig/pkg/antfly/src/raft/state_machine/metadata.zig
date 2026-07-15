@@ -35,6 +35,7 @@ pub const MetadataStateMachine = struct {
     fn applyReady(
         ptr: *anyopaque,
         group_id: raft_engine.core.types.GroupId,
+        snapshot: ?raft_engine.core.types.Snapshot,
         committed_entries: []const raft_engine.core.Entry,
         read_states: []const raft_engine.core.ReadState,
     ) !void {
@@ -51,10 +52,14 @@ pub const MetadataStateMachine = struct {
             }
         }
         if (self.delegate) |delegate| {
-            try delegate.applyReady(group_id, committed_entries, read_states);
+            try delegate.applyReady(group_id, snapshot, committed_entries, read_states);
         }
-        if (committed_entries.len > 0) {
-            try self.applied_sink.setAppliedIndex(group_id, committed_entries[committed_entries.len - 1].index);
-        }
+        const applied_index = if (committed_entries.len > 0)
+            committed_entries[committed_entries.len - 1].index
+        else if (snapshot) |value|
+            value.metadata.index
+        else
+            0;
+        if (applied_index > 0) try self.applied_sink.setAppliedIndex(group_id, applied_index);
     }
 };

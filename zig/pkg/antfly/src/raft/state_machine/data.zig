@@ -27,18 +27,33 @@ pub const DataStateMachine = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .build_snapshot = buildSnapshot,
                 .apply_ready = applyReady,
             },
         };
     }
 
+    fn buildSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: raft_engine.core.types.GroupId) !?[]u8 {
+        const self: *DataStateMachine = @ptrCast(@alignCast(ptr));
+        const builder = self.snapshot_builder orelse return null;
+        return try builder.buildSnapshot(alloc, group_id);
+    }
+
     fn applyReady(
         ptr: *anyopaque,
         group_id: raft_engine.core.types.GroupId,
+        snapshot: ?raft_engine.core.types.Snapshot,
         committed_entries: []const raft_engine.core.Entry,
         read_states: []const raft_engine.core.ReadState,
     ) !void {
         const self: *DataStateMachine = @ptrCast(@alignCast(ptr));
+        if (snapshot) |value| {
+            if (self.snapshot_builder) |snapshot_builder| {
+                if (!try snapshot_builder.installSnapshot(self.alloc, group_id, value.metadata.index, value.data)) {
+                    return error.SnapshotInstallUnsupported;
+                }
+            }
+        }
         if (committed_entries.len > 0) {
             if (self.snapshot_builder) |snapshot_builder| {
                 const payload = try mod.encodeCommittedEntries(self.alloc, committed_entries);
@@ -51,10 +66,14 @@ pub const DataStateMachine = struct {
             }
         }
         if (self.delegate) |delegate| {
-            try delegate.applyReady(group_id, committed_entries, read_states);
+            try delegate.applyReady(group_id, snapshot, committed_entries, read_states);
         }
-        if (committed_entries.len > 0) {
-            try self.applied_sink.setAppliedIndex(group_id, committed_entries[committed_entries.len - 1].index);
-        }
+        const applied_index = if (committed_entries.len > 0)
+            committed_entries[committed_entries.len - 1].index
+        else if (snapshot) |value|
+            value.metadata.index
+        else
+            0;
+        if (applied_index > 0) try self.applied_sink.setAppliedIndex(group_id, applied_index);
     }
 };

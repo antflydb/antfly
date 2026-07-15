@@ -149,11 +149,13 @@ pub const HostMetrics = struct {
 
 const PendingApplyTask = struct {
     group_id: core.types.GroupId,
+    snapshot: ?core.types.Snapshot,
     entries: []core.Entry,
     read_states: []core.ReadState,
     approx_bytes: usize,
 
     fn deinit(self: *PendingApplyTask, alloc: std.mem.Allocator) void {
+        if (self.snapshot) |*snapshot| snapshot.deinit(alloc);
         core.types.freeEntries(alloc, self.entries);
         for (self.read_states) |*read_state| read_state.deinit(alloc);
         if (self.read_states.len > 0) alloc.free(self.read_states);
@@ -610,8 +612,8 @@ pub const MultiRaft = struct {
             return false;
         }
         if (!self.hasApplyCapacity(
-            if (ready.committed_entries.len > 0 or ready.read_states.len > 0) 1 else 0,
-            ready_pressure.committed_entry_bytes + approxReadStatesSize(ready.read_states),
+            if (ready.snapshot != null or ready.committed_entries.len > 0 or ready.read_states.len > 0) 1 else 0,
+            ready_pressure.snapshot_bytes + ready_pressure.committed_entry_bytes + approxReadStatesSize(ready.read_states),
         )) {
             if (diagnostics) |diag| {
                 diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
@@ -677,7 +679,7 @@ pub const MultiRaft = struct {
             if (diagnostics) |diag| diag.async_ready_elapsed_ns = clock.elapsedSinceNs(async_ready_start_ns);
         } else {
             const enqueue_apply_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-            try self.enqueueApply(group_id, ready.committed_entries, ready.read_states);
+            try self.enqueueApply(group_id, ready.snapshot, ready.committed_entries, ready.read_states);
             if (diagnostics) |diag| diag.enqueue_apply_elapsed_ns = clock.elapsedSinceNs(enqueue_apply_start_ns);
             const outbox_append_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             try outbox.appendMessages(self.alloc, group_id, ready.messages);
@@ -721,7 +723,7 @@ pub const MultiRaft = struct {
         if (diagnostics) |diag| diag.clone_messages_elapsed_ns = clock.elapsedSinceNs(clone_messages_start_ns);
 
         const enqueue_apply_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-        try self.enqueueApply(group_id, ready.committed_entries, ready.read_states);
+        try self.enqueueApply(group_id, ready.snapshot, ready.committed_entries, ready.read_states);
         if (diagnostics) |diag| diag.enqueue_apply_elapsed_ns = clock.elapsedSinceNs(enqueue_apply_start_ns);
         if (flush_apply_queue) {
             const inline_apply_flush_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
@@ -743,21 +745,46 @@ pub const MultiRaft = struct {
     fn enqueueApply(
         self: *MultiRaft,
         group_id: core.types.GroupId,
+        snapshot: ?core.types.Snapshot,
         committed_entries: []const core.Entry,
         read_states: []const core.ReadState,
     ) !void {
-        if (committed_entries.len == 0 and read_states.len == 0) return;
+        if (snapshot == null and committed_entries.len == 0 and read_states.len == 0) return;
 
         var cloned_read_states = try self.alloc.alloc(core.ReadState, read_states.len);
-        errdefer self.alloc.free(cloned_read_states);
-        for (read_states, 0..) |read_state, i| cloned_read_states[i] = try read_state.clone(self.alloc);
+        var cloned_read_state_count: usize = 0;
+        var read_states_owned = true;
+        errdefer if (read_states_owned) {
+            for (cloned_read_states[0..cloned_read_state_count]) |*read_state| read_state.deinit(self.alloc);
+            if (cloned_read_states.len > 0) self.alloc.free(cloned_read_states);
+        };
+        for (read_states, 0..) |read_state, i| {
+            cloned_read_states[i] = try read_state.clone(self.alloc);
+            cloned_read_state_count += 1;
+        }
 
-        try self.pending_apply.append(self.alloc, .{
+        var cloned_snapshot = if (snapshot) |value| try value.clone(self.alloc) else null;
+        var snapshot_owned = true;
+        errdefer if (snapshot_owned) if (cloned_snapshot) |*value| value.deinit(self.alloc);
+        const cloned_entries = try core.types.cloneEntries(self.alloc, committed_entries);
+        var entries_owned = true;
+        errdefer if (entries_owned) core.types.freeEntries(self.alloc, cloned_entries);
+        var task: PendingApplyTask = .{
             .group_id = group_id,
-            .entries = try core.types.cloneEntries(self.alloc, committed_entries),
+            .snapshot = cloned_snapshot,
+            .entries = cloned_entries,
             .read_states = cloned_read_states,
-            .approx_bytes = core.types.entriesApproxEncodedSize(committed_entries) + approxReadStatesSize(read_states),
-        });
+            .approx_bytes = core.types.entriesApproxEncodedSize(committed_entries) +
+                approxReadStatesSize(read_states) +
+                if (snapshot) |value| value.data.len else 0,
+        };
+        read_states_owned = false;
+        snapshot_owned = false;
+        entries_owned = false;
+        self.pending_apply.append(self.alloc, task) catch |err| {
+            task.deinit(self.alloc);
+            return err;
+        };
     }
 
     fn flushPendingApply(self: *MultiRaft) !void {
@@ -768,13 +795,19 @@ pub const MultiRaft = struct {
 
         if (self.hooks.apply_queue) |apply_queue| {
             for (self.pending_apply.items[0..drain_count]) |task| {
-                try apply_queue.enqueueApply(task.group_id, task.entries, task.read_states);
+                apply_queue.enqueueApply(task.group_id, task.snapshot, task.entries, task.read_states) catch |err| {
+                    apply_queue.abort();
+                    return err;
+                };
             }
-            try apply_queue.drain();
+            apply_queue.drain() catch |err| {
+                apply_queue.abort();
+                return err;
+            };
             self.metrics.apply_queue_drains += 1;
         } else if (self.hooks.state_machine) |state_machine| {
             for (self.pending_apply.items[0..drain_count]) |task| {
-                try state_machine.applyReady(task.group_id, task.entries, task.read_states);
+                try state_machine.applyReady(task.group_id, task.snapshot, task.entries, task.read_states);
             }
         }
         try self.compactAppliedLogs(self.pending_apply.items[0..drain_count]);
@@ -784,8 +817,18 @@ pub const MultiRaft = struct {
 
     fn compactAppliedLogs(self: *MultiRaft, tasks: []const PendingApplyTask) !void {
         if (self.cfg.applied_log_retained_entries == 0) return;
-        for (tasks) |task| {
+        const state_machine = self.hooks.state_machine orelse return;
+        const group_storage = self.hooks.group_storage orelse return;
+        for (tasks, 0..) |task, task_index| {
             if (task.entries.len == 0) continue;
+            var has_later_group_task = false;
+            for (tasks[task_index + 1 ..]) |later| {
+                if (later.group_id == task.group_id) {
+                    has_later_group_task = true;
+                    break;
+                }
+            }
+            if (has_later_group_task) continue;
             const last_applied = task.entries[task.entries.len - 1].index;
             if (last_applied <= self.cfg.applied_log_retained_entries) continue;
             const compact_index = last_applied - self.cfg.applied_log_retained_entries;
@@ -799,7 +842,19 @@ pub const MultiRaft = struct {
             {
                 continue;
             }
-            try grp.compactAppliedLogTo(compact_index);
+            const snapshot_data = (try state_machine.buildSnapshot(self.alloc, task.group_id)) orelse continue;
+            defer self.alloc.free(snapshot_data);
+            const status = grp.status();
+            const snapshot = core.types.Snapshot{
+                .metadata = .{
+                    .index = last_applied,
+                    .term = try grp.termAt(last_applied),
+                    .conf_state = status.conf_state,
+                },
+                .data = snapshot_data,
+            };
+            try group_storage.compactSnapshot(task.group_id, snapshot);
+            try grp.compactAppliedLogTo(last_applied);
         }
     }
 

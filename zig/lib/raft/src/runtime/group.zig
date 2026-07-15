@@ -140,6 +140,10 @@ pub const Group = struct {
     pub fn compactAppliedLogTo(self: *Group, index: core.types.Index) !void {
         try self.raw_node.compactAppliedLogTo(index);
     }
+
+    pub fn termAt(self: *Group, index: core.types.Index) !core.types.Term {
+        return try self.raw_node.termAt(index);
+    }
 };
 
 test "group wraps a real raw node" {

@@ -183,6 +183,38 @@ pub const MemoryStorage = struct {
         self.snapshot_state = try snapshot.clone(self.alloc);
     }
 
+    /// Installs a locally-created state-machine snapshot while preserving the
+    /// persisted log suffix newer than the snapshot. Received Raft snapshots
+    /// must continue to use applySnapshot because they replace local history.
+    pub fn compactToSnapshot(self: *MemoryStorage, snapshot: types.Snapshot) !void {
+        if (snapshot.metadata.index < self.snapshot_state.metadata.index) return error.SnapshotOutOfDate;
+        const local_term = try termImpl(self, snapshot.metadata.index);
+        if (local_term != snapshot.metadata.term) return error.SnapshotTermMismatch;
+
+        var owned_snapshot = try snapshot.clone(self.alloc);
+        errdefer owned_snapshot.deinit(self.alloc);
+        try self.setConfState(snapshot.metadata.conf_state);
+
+        var remove_count: usize = 0;
+        while (remove_count < self.entries_state.items.len and
+            self.entries_state.items[remove_count].index <= snapshot.metadata.index)
+        {
+            remove_count += 1;
+        }
+        for (self.entries_state.items[0..remove_count]) |*entry| entry.deinit(self.alloc);
+        if (remove_count > 0) {
+            std.mem.copyForwards(
+                types.Entry,
+                self.entries_state.items[0 .. self.entries_state.items.len - remove_count],
+                self.entries_state.items[remove_count..],
+            );
+            self.entries_state.shrinkRetainingCapacity(self.entries_state.items.len - remove_count);
+        }
+
+        self.snapshot_state.deinit(self.alloc);
+        self.snapshot_state = owned_snapshot;
+    }
+
     pub fn compactTo(self: *MemoryStorage, index: types.Index, conf_state: types.ConfState) !void {
         const snap_term = try termImpl(self, index);
         try self.setConfState(conf_state);

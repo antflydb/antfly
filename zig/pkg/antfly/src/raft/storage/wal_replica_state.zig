@@ -34,9 +34,6 @@ pub const WalReplicaStateConfig = struct {
     checkpoint_replay_records_threshold: usize = 64,
     checkpoint_replay_bytes_threshold: usize = 256 * 1024,
     applied_watermark_persist_interval: u64 = 64,
-    compaction_retained_entries: u64 = 4096,
-    compaction_min_interval_entries: u64 = 4096,
-    compaction_single_node_only: bool = true,
 };
 
 pub const WalReplicaStateStats = struct {
@@ -150,6 +147,7 @@ pub const WalReplicaState = struct {
             .ptr = self,
             .vtable = &.{
                 .persist_ready = persistReady,
+                .compact_snapshot = compactSnapshot,
                 .persist_ready_diagnostics = persistReadyWithDiagnostics,
             },
         };
@@ -206,7 +204,6 @@ pub const WalReplicaState = struct {
         self.applied_index = index;
         self.stats.applied_index_updates += 1;
         if (self.shouldPersistAppliedWatermark(index)) try self.persistAppliedWatermark();
-        try self.compactAppliedStorageIfNeeded();
         try self.persistCheckpointIfNeeded();
     }
 
@@ -223,6 +220,21 @@ pub const WalReplicaState = struct {
     ) !void {
         const self: *WalReplicaState = @ptrCast(@alignCast(ptr));
         try self.persistReadyInternal(group_id, ready, diagnostics);
+    }
+
+    fn compactSnapshot(ptr: *anyopaque, group_id: u64, snapshot: raft_engine.core.types.Snapshot) !void {
+        _ = group_id;
+        const self: *WalReplicaState = @ptrCast(@alignCast(ptr));
+        const started_ns = nowNs();
+        try self.store.compactToSnapshot(snapshot);
+        self.last_compacted_index = snapshot.metadata.index;
+        self.stats.storage_compactions += 1;
+        const elapsed = elapsedSince(started_ns);
+        self.stats.storage_compaction_ns += elapsed;
+        self.stats.max_storage_compaction_ns = @max(self.stats.max_storage_compaction_ns, elapsed);
+        try self.persistCheckpoint();
+        self.delta_records_since_checkpoint = 0;
+        self.delta_bytes_since_checkpoint = 0;
     }
 
     fn persistReadyInternal(
@@ -454,39 +466,6 @@ pub const WalReplicaState = struct {
         if (watermark > self.applied_index) self.applied_index = watermark;
     }
 
-    fn compactAppliedStorageIfNeeded(self: *WalReplicaState) !void {
-        const retained = self.cfg.compaction_retained_entries;
-        if (retained == 0 or self.applied_index <= retained) return;
-        if (self.cfg.compaction_single_node_only and !(try self.hasSingleNodeConfState())) return;
-
-        var compact_index = self.applied_index - retained;
-        if (compact_index <= self.last_compacted_index) return;
-
-        const min_interval = self.cfg.compaction_min_interval_entries;
-        if (min_interval > 0 and compact_index - self.last_compacted_index < min_interval) return;
-
-        const last_index = try self.store.storage().lastIndex();
-        if (compact_index > last_index) compact_index = last_index;
-        if (compact_index <= self.last_compacted_index) return;
-
-        const first_index = try self.store.storage().firstIndex();
-        if (compact_index < first_index) return;
-
-        const started_ns = nowNs();
-        var initial_state = try self.store.storage().initialState(self.alloc);
-        defer initial_state.deinit(self.alloc);
-        try self.store.compactTo(compact_index, initial_state.conf_state);
-        self.last_compacted_index = compact_index;
-        const elapsed = elapsedSince(started_ns);
-        self.stats.storage_compactions += 1;
-        self.stats.storage_compaction_ns += elapsed;
-        self.stats.max_storage_compaction_ns = @max(self.stats.max_storage_compaction_ns, elapsed);
-
-        try self.persistCheckpoint();
-        self.delta_records_since_checkpoint = 0;
-        self.delta_bytes_since_checkpoint = 0;
-    }
-
     fn refreshLastCompactedIndex(self: *WalReplicaState) !void {
         const snapshot = try self.store.storage().snapshot(self.alloc);
         defer {
@@ -494,16 +473,6 @@ pub const WalReplicaState = struct {
             owned.deinit(self.alloc);
         }
         self.last_compacted_index = snapshot.metadata.index;
-    }
-
-    fn hasSingleNodeConfState(self: *WalReplicaState) !bool {
-        var initial_state = try self.store.storage().initialState(self.alloc);
-        defer initial_state.deinit(self.alloc);
-        return initial_state.conf_state.voters.len == 1 and
-            initial_state.conf_state.voters_outgoing.len == 0 and
-            initial_state.conf_state.learners.len == 0 and
-            initial_state.conf_state.learners_next.len == 0 and
-            !initial_state.conf_state.auto_leave;
     }
 
     fn decodeWalRecord(self: *WalReplicaState, bytes: []const u8) !void {
@@ -1234,7 +1203,6 @@ test "wal replica state batches applied watermark persistence between durable ch
         .checkpoint_replay_records_threshold = 0,
         .checkpoint_replay_bytes_threshold = 0,
         .applied_watermark_persist_interval = 4,
-        .compaction_retained_entries = 0,
     };
 
     {
@@ -1284,7 +1252,7 @@ test "wal replica state batches applied watermark persistence between durable ch
     }
 }
 
-test "wal replica state compacts applied storage and checkpoints compacted image" {
+test "wal replica state persists semantic compaction snapshot and preserves suffix" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1298,9 +1266,6 @@ test "wal replica state compacts applied storage and checkpoints compacted image
         .checkpoint_replay_records_threshold = 0,
         .checkpoint_replay_bytes_threshold = 0,
         .applied_watermark_persist_interval = 64,
-        .compaction_retained_entries = 2,
-        .compaction_min_interval_entries = 1,
-        .compaction_single_node_only = false,
     };
 
     {
@@ -1318,13 +1283,27 @@ test "wal replica state compacts applied storage and checkpoints compacted image
             try state.setAppliedIndex(index);
         }
 
+        try std.testing.expectEqual(@as(u64, 1), try state.storage().firstIndex());
+        const snapshot_data = try std.testing.allocator.dupe(u8, "state-machine-6");
+        defer std.testing.allocator.free(snapshot_data);
+        try state.groupStorage().compactSnapshot(200, .{
+            .metadata = .{
+                .index = 6,
+                .term = 10,
+            },
+            .data = snapshot_data,
+        });
+
         const stats = state.statsSnapshot();
-        try std.testing.expect(stats.storage_compactions > 0);
+        try std.testing.expectEqual(@as(u64, 1), stats.storage_compactions);
         try std.testing.expectEqual(@as(u64, 6), stats.last_compacted_index);
-        try std.testing.expectEqual(@as(u64, 6), stats.checkpoint_persist_calls);
+        try std.testing.expectEqual(@as(u64, 1), stats.checkpoint_persist_calls);
         try std.testing.expectEqual(@as(u64, 0), stats.replay_debt_records);
         try std.testing.expectEqual(@as(u64, 7), try state.storage().firstIndex());
         try std.testing.expectEqual(@as(u64, 8), try state.storage().lastIndex());
+        var snapshot = try state.storage().snapshot(std.testing.allocator);
+        defer snapshot.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("state-machine-6", snapshot.data);
     }
 
     {
@@ -1334,6 +1313,9 @@ test "wal replica state compacts applied storage and checkpoints compacted image
         try std.testing.expectEqual(@as(u64, 8), reopened.appliedIndex());
         try std.testing.expectEqual(@as(u64, 7), try reopened.storage().firstIndex());
         try std.testing.expectEqual(@as(u64, 8), try reopened.storage().lastIndex());
+        var snapshot = try reopened.storage().snapshot(std.testing.allocator);
+        defer snapshot.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("state-machine-6", snapshot.data);
 
         const stats = reopened.statsSnapshot();
         try std.testing.expectEqual(@as(u64, 6), stats.last_compacted_index);

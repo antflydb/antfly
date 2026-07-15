@@ -127,11 +127,15 @@ pub const TransitionService = struct {
         if (findSplitIndex(self.pending_split.items, record.transition_id)) |index| {
             const attempt_changed = self.pending_split.items[index].attempt_epoch != record.attempt_epoch;
             const phase_changed = self.pending_split.items[index].phase != record.phase;
+            var replacement = try cloneSplitRecord(self.alloc, record);
+            errdefer deinitSplitRecord(self.alloc, &replacement);
             deinitSplitRecord(self.alloc, &self.pending_split.items[index]);
-            self.pending_split.items[index] = try cloneSplitRecord(self.alloc, record);
+            self.pending_split.items[index] = replacement;
             if (attempt_changed or phase_changed) _ = self.split_retries.remove(record.transition_id);
         } else {
-            try self.pending_split.append(self.alloc, try cloneSplitRecord(self.alloc, record));
+            var owned = try cloneSplitRecord(self.alloc, record);
+            errdefer deinitSplitRecord(self.alloc, &owned);
+            try self.pending_split.append(self.alloc, owned);
         }
         self.metrics.queued_split_transitions = self.pending_split.items.len;
     }
@@ -140,11 +144,15 @@ pub const TransitionService = struct {
         _ = self.removeCompletedMerge(record.transition_id);
         if (findMergeIndex(self.pending_merge.items, record.transition_id)) |index| {
             const phase_changed = self.pending_merge.items[index].phase != record.phase;
+            var replacement = try cloneMergeRecord(self.alloc, record);
+            errdefer deinitMergeRecord(self.alloc, &replacement);
             deinitMergeRecord(self.alloc, &self.pending_merge.items[index]);
-            self.pending_merge.items[index] = try cloneMergeRecord(self.alloc, record);
+            self.pending_merge.items[index] = replacement;
             if (phase_changed) _ = self.merge_retries.remove(record.transition_id);
         } else {
-            try self.pending_merge.append(self.alloc, try cloneMergeRecord(self.alloc, record));
+            var owned = try cloneMergeRecord(self.alloc, record);
+            errdefer deinitMergeRecord(self.alloc, &owned);
+            try self.pending_merge.append(self.alloc, owned);
         }
         self.metrics.queued_merge_transitions = self.pending_merge.items.len;
     }
@@ -489,16 +497,21 @@ fn findCompletedMergeIndex(records: []const metadata.MergeRuntimeObservation, tr
 }
 
 fn cloneSplitRecord(alloc: std.mem.Allocator, record: metadata.SplitTransitionRecord) !metadata.SplitTransitionRecord {
-    return .{
+    var owned: metadata.SplitTransitionRecord = .{
         .transition_id = record.transition_id,
         .attempt_epoch = record.attempt_epoch,
         .source_group_id = record.source_group_id,
         .destination_group_id = record.destination_group_id,
         .phase = record.phase,
-        .split_key = if (record.split_key) |split_key| try alloc.dupe(u8, split_key) else null,
-        .source_range_end = if (record.source_range_end) |end| try alloc.dupe(u8, end) else null,
-        .rollback_reason = if (record.rollback_reason) |reason| try alloc.dupe(u8, reason) else null,
+        .split_key = null,
+        .source_range_end = null,
+        .rollback_reason = null,
     };
+    errdefer deinitSplitRecord(alloc, &owned);
+    if (record.split_key) |split_key| owned.split_key = try alloc.dupe(u8, split_key);
+    if (record.source_range_end) |end| owned.source_range_end = try alloc.dupe(u8, end);
+    if (record.rollback_reason) |reason| owned.rollback_reason = try alloc.dupe(u8, reason);
+    return owned;
 }
 
 fn deinitSplitRecord(alloc: std.mem.Allocator, record: *metadata.SplitTransitionRecord) void {
@@ -756,6 +769,48 @@ test "transition service upserts and removes queued transitions by id" {
     try std.testing.expectEqual(metadata.TransitionPhase.rolling_back, svc.pending_merge.items[0].phase);
     try std.testing.expect(svc.removeMerge(8));
     try std.testing.expectEqual(@as(usize, 0), svc.pending_merge.items.len);
+}
+
+test "transition service queue replacement is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var svc = TransitionService.init(alloc, .{});
+            defer svc.deinit();
+            try svc.submitSplit(.{
+                .transition_id = 7,
+                .attempt_epoch = 1,
+                .source_group_id = 11,
+                .destination_group_id = 12,
+                .split_key = "doc:m",
+                .source_range_end = "doc:z",
+                .rollback_reason = "first",
+            });
+            try svc.submitSplit(.{
+                .transition_id = 7,
+                .attempt_epoch = 2,
+                .source_group_id = 11,
+                .destination_group_id = 12,
+                .phase = .replay_deltas,
+                .split_key = "doc:n",
+                .source_range_end = "doc:z",
+                .rollback_reason = "replacement",
+            });
+            try svc.submitMerge(.{
+                .transition_id = 8,
+                .donor_group_id = 21,
+                .receiver_group_id = 22,
+                .rollback_reason = "first",
+            });
+            try svc.submitMerge(.{
+                .transition_id = 8,
+                .donor_group_id = 21,
+                .receiver_group_id = 22,
+                .phase = .finalizing,
+                .rollback_reason = "replacement",
+            });
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "transition service clears completed observations on resubmit and remove" {

@@ -446,6 +446,11 @@ pub const DBCore = struct {
         try range_state_mod.saveRange(self.store, self.shard_manager.getByteRange());
     }
 
+    pub fn replaceRangeInMemoryOwned(self: *DBCore, start: []u8, end: []u8) void {
+        self.shard_manager.replaceByteRangeOwned(start, end);
+        self.refreshIndexRange();
+    }
+
     pub fn nextDerivedSequence(self: *DBCore) u64 {
         return self.store.lastReplaySequence(0);
     }

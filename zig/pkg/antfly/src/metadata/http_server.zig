@@ -597,18 +597,28 @@ pub const AdminSource = struct {
         try validateSplitDocIdentityCompatibility(&snapshot, source_group_id);
         const destination_group_id = req.destination_group_id orelse deriveGroupId(table_name, req.split_key, 0x53504c47, source_group_id);
         try group_ids.requireDataGroupId(destination_group_id);
+        const transition_id = req.transition_id orelse deriveTransitionId(table_name, req.split_key, 0x53504c54);
+        if (findActiveSplitForSource(snapshot.split_transitions, source_group_id)) |active| {
+            if (splitRequestMatches(active, transition_id, source_group_id, destination_group_id, req.split_key)) return;
+            return error.SplitInProgress;
+        }
 
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
-        try workflow.bootstrapDesiredFromCommitted(svc);
         _ = try workflow.requestSplit(svc, .{
-            .transition_id = req.transition_id orelse deriveTransitionId(table_name, req.split_key, 0x53504c54),
+            .transition_id = transition_id,
             .table_id = table.table_id,
             .source_group_id = source_group_id,
             .destination_group_id = destination_group_id,
             .split_key = req.split_key,
         });
         try flushMetadataServiceMutation(svc);
+        var committed = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&committed);
+        const accepted = findSplitById(committed.split_transitions, transition_id) orelse return error.SplitInProgress;
+        if (!splitRequestMatches(accepted, transition_id, source_group_id, destination_group_id, req.split_key)) {
+            return error.SplitInProgress;
+        }
     }
 
     fn metadataServiceRequestMerge(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: MergeRequest) !void {
@@ -899,18 +909,28 @@ pub const AdminSource = struct {
         try validateSplitDocIdentityCompatibility(&snapshot, source_group_id);
         const destination_group_id = req.destination_group_id orelse deriveGroupId(table_name, req.split_key, 0x53504c47, source_group_id);
         try group_ids.requireDataGroupId(destination_group_id);
+        const transition_id = req.transition_id orelse deriveTransitionId(table_name, req.split_key, 0x53504c54);
+        if (findActiveSplitForSource(snapshot.split_transitions, source_group_id)) |active| {
+            if (splitRequestMatches(active, transition_id, source_group_id, destination_group_id, req.split_key)) return;
+            return error.SplitInProgress;
+        }
 
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
-        try workflow.bootstrapDesiredFromCommitted(svc);
         _ = try workflow.requestSplit(svc, .{
-            .transition_id = req.transition_id orelse deriveTransitionId(table_name, req.split_key, 0x53504c54),
+            .transition_id = transition_id,
             .table_id = table.table_id,
             .source_group_id = source_group_id,
             .destination_group_id = destination_group_id,
             .split_key = req.split_key,
         });
         try flushMetadataHttpServiceMutation(svc);
+        var committed = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&committed);
+        const accepted = findSplitById(committed.split_transitions, transition_id) orelse return error.SplitInProgress;
+        if (!splitRequestMatches(accepted, transition_id, source_group_id, destination_group_id, req.split_key)) {
+            return error.SplitInProgress;
+        }
     }
 
     fn metadataHttpServiceRequestMerge(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: MergeRequest) !void {
@@ -1266,6 +1286,7 @@ pub const MetadataHttpServer = struct {
                     self.source.requestSplit(alloc, table.table_name, split_req) catch |err| switch (err) {
                         error.TableNotFound, error.RangeNotFound => return try textResponse(alloc, 404, "not found"),
                         error.DocIdentityNamespaceMismatch => return try textResponse(alloc, 409, "doc identity namespace mismatch"),
+                        error.SplitInProgress, error.ConflictingSplitTransition => return try textResponse(alloc, 409, "split already in progress"),
                         error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                         else => return try textResponse(alloc, 400, "invalid split request"),
                     };
@@ -2659,6 +2680,45 @@ fn findRangeForKey(ranges: []const metadata_table_manager.RangeRecord, table_id:
         return record.group_id;
     }
     return null;
+}
+
+fn findSplitById(
+    records: []const metadata_transition_state.SplitTransitionRecord,
+    transition_id: u64,
+) ?metadata_transition_state.SplitTransitionRecord {
+    for (records) |record| {
+        if (record.transition_id == transition_id) return record;
+    }
+    return null;
+}
+
+fn findActiveSplitForSource(
+    records: []const metadata_transition_state.SplitTransitionRecord,
+    source_group_id: u64,
+) ?metadata_transition_state.SplitTransitionRecord {
+    for (records) |record| {
+        if (record.source_group_id == source_group_id and
+            record.phase != .finalized and
+            record.phase != .rolled_back)
+        {
+            return record;
+        }
+    }
+    return null;
+}
+
+fn splitRequestMatches(
+    record: metadata_transition_state.SplitTransitionRecord,
+    transition_id: u64,
+    source_group_id: u64,
+    destination_group_id: u64,
+    split_key: []const u8,
+) bool {
+    return record.transition_id == transition_id and
+        record.source_group_id == source_group_id and
+        record.destination_group_id == destination_group_id and
+        record.split_key != null and
+        std.mem.eql(u8, record.split_key.?, split_key);
 }
 
 fn validateMergeDocIdentityCompatibility(

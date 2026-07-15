@@ -280,12 +280,12 @@ pub const Destination = struct {
         self.* = undefined;
     }
 
-    pub fn applyHandoff(self: *Destination, alloc: std.mem.Allocator, handoff: data_store.SplitHandoff) !void {
-        try self.db.updateRange(.{
-            .start = handoff.byte_range.start,
-            .end = handoff.byte_range.end,
-        });
-
+    pub fn applyHandoff(
+        self: *Destination,
+        alloc: std.mem.Allocator,
+        handoff: data_store.SplitHandoff,
+        marker: range_state.SplitBootstrapMarker,
+    ) !bool {
         const writes = try alloc.alloc(db_types.BatchWrite, handoff.entries.len);
         defer alloc.free(writes);
         for (handoff.entries, 0..) |entry, i| {
@@ -294,10 +294,13 @@ pub const Destination = struct {
                 .value = entry.value,
             };
         }
-        try self.db.batch(.{
-            .writes = writes,
-        });
-        try self.db.setSplitDeltaFinalSeq(handoff.base_delta_sequence);
+        return try self.db.replaceSplitBootstrap(
+            alloc,
+            handoff.byte_range,
+            writes,
+            handoff.base_delta_sequence,
+            marker,
+        );
     }
 
     pub fn applyMergeBootstrap(
@@ -615,26 +618,15 @@ pub const SyncCoordinator = struct {
         if (source_phase == null) return false;
         if (source_phase.? != .splitting and source_phase.? != .finalizing) return false;
 
-        if (try dest.db.getSplitBootstrapMarker(self.alloc)) |marker| {
-            if (marker.transition_id == self.transition_id and
-                marker.attempt_epoch == self.attempt_epoch and
-                marker.source_group_id == self.source_group_id and
-                marker.destination_group_id == self.dest_group_id)
-            {
-                if (marker.bootstrap_complete) return false;
-            } else return error.ConflictingSplitTransition;
-        }
         const handoff = try source.captureSplitHandoff(self.alloc, self.source_group_id);
         defer shard_state_store.freeHandoff(self.alloc, handoff);
-        try dest.applyHandoff(self.alloc, handoff);
-        try dest.db.setSplitBootstrapMarker(.{
+        return try dest.applyHandoff(self.alloc, handoff, .{
             .transition_id = self.transition_id,
             .attempt_epoch = self.attempt_epoch,
             .source_group_id = self.source_group_id,
             .destination_group_id = self.dest_group_id,
             .bootstrap_complete = true,
         });
-        return true;
     }
 
     pub fn startSourceSplit(self: *SyncCoordinator) !bool {
@@ -1305,7 +1297,13 @@ test "db split destination applies handoff and filtered split deltas" {
 
     const handoff = try src.captureSplitHandoff(std.testing.allocator, 101);
     defer shard_state_store.freeHandoff(std.testing.allocator, handoff);
-    try dst.applyHandoff(std.testing.allocator, handoff);
+    _ = try dst.applyHandoff(std.testing.allocator, handoff, .{
+        .transition_id = 90,
+        .attempt_epoch = 1,
+        .source_group_id = 101,
+        .destination_group_id = 90,
+        .bootstrap_complete = true,
+    });
     try std.testing.expectEqual(@as(u64, 1), try dst.appliedDeltaSequence(std.testing.allocator));
     try std.testing.expectEqualStrings("doc:m", dst.getRange().start);
     try std.testing.expectEqualStrings("doc:z", dst.getRange().end);
@@ -1332,6 +1330,74 @@ test "db split destination applies handoff and filtered split deltas" {
     defer std.testing.allocator.free(right);
     try std.testing.expectEqualStrings("{\"v\":\"right-2\"}", right);
     try std.testing.expect((try dst.get(std.testing.allocator, "doc:c")) == null);
+}
+
+test "db split successor bootstrap atomically replaces stale destination generation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dst_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-handoff-successor", .{tmp.sub_path});
+    defer std.testing.allocator.free(dst_root);
+    var dst = try Destination.init(std.testing.allocator, .{ .root_dir = dst_root });
+    defer dst.deinit();
+
+    var first_entries = [_]shard_state_store.AppliedDataKV{
+        .{ .key = "doc:m", .value = "{\"v\":1}" },
+        .{ .key = "doc:t", .value = "{\"stale\":true}" },
+    };
+    const first = data_store.SplitHandoff{
+        .byte_range = .{ .start = "doc:m", .end = "doc:z" },
+        .split_state = .{
+            .phase = .splitting,
+            .transition_id = 80,
+            .attempt_epoch = 1,
+            .split_key = "doc:m",
+            .new_shard_id = 200,
+            .original_range_end = "doc:z",
+        },
+        .base_delta_sequence = 7,
+        .entries = &first_entries,
+    };
+    try std.testing.expect(try dst.applyHandoff(std.testing.allocator, first, .{
+        .transition_id = 80,
+        .attempt_epoch = 1,
+        .source_group_id = 100,
+        .destination_group_id = 200,
+        .bootstrap_complete = true,
+    }));
+
+    var successor_entries = [_]shard_state_store.AppliedDataKV{
+        .{ .key = "doc:n", .value = "{\"v\":2}" },
+    };
+    const successor = data_store.SplitHandoff{
+        .byte_range = .{ .start = "doc:m", .end = "doc:z" },
+        .split_state = .{
+            .phase = .splitting,
+            .transition_id = 81,
+            .attempt_epoch = 2,
+            .split_key = "doc:m",
+            .new_shard_id = 200,
+            .original_range_end = "doc:z",
+        },
+        .base_delta_sequence = 3,
+        .entries = &successor_entries,
+    };
+    try std.testing.expect(try dst.applyHandoff(std.testing.allocator, successor, .{
+        .transition_id = 81,
+        .attempt_epoch = 2,
+        .source_group_id = 100,
+        .destination_group_id = 200,
+        .bootstrap_complete = true,
+    }));
+
+    try std.testing.expect((try dst.get(std.testing.allocator, "doc:m")) == null);
+    try std.testing.expect((try dst.get(std.testing.allocator, "doc:t")) == null);
+    const current = (try dst.get(std.testing.allocator, "doc:n")) orelse return error.TestExpectedEqual;
+    defer std.testing.allocator.free(current);
+    try std.testing.expectEqualStrings("{\"v\":2}", current);
+    try std.testing.expectEqual(@as(u64, 3), try dst.appliedDeltaSequence(std.testing.allocator));
+    const marker = (try dst.db.getSplitBootstrapMarker(std.testing.allocator)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 81), marker.transition_id);
+    try std.testing.expectEqual(@as(u64, 2), marker.attempt_epoch);
 }
 
 test "db split destination persists handoff state across reopen" {
@@ -1365,7 +1431,13 @@ test "db split destination persists handoff state across reopen" {
     {
         var dst = try Destination.init(std.testing.allocator, .{ .root_dir = dst_root });
         defer dst.deinit();
-        try dst.applyHandoff(std.testing.allocator, handoff);
+        _ = try dst.applyHandoff(std.testing.allocator, handoff, .{
+            .transition_id = 91,
+            .attempt_epoch = 1,
+            .source_group_id = 111,
+            .destination_group_id = 91,
+            .bootstrap_complete = true,
+        });
         try std.testing.expectEqual(@as(u64, 0), try dst.appliedDeltaSequence(std.testing.allocator));
 
         const catchup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{

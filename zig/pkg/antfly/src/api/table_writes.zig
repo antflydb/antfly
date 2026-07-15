@@ -30,6 +30,7 @@ const metadata_transition_state = @import("../metadata/transition_state.zig");
 const raft_mod = @import("../raft/mod.zig");
 const backup_restore = @import("../raft/storage/backup_restore.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
+const shard_state_store = @import("../data/storage/shard_state_store.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
 const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
@@ -10184,29 +10185,31 @@ pub const ProvisionedTableWriteSource = struct {
             defer cached.deinit(alloc);
             try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
             runTestBeforeBatchExecutionHook();
-            if (apply_req.split_replication) |replication|
-                try validateOrEstablishSplitReplicationMarker(alloc, cached.db, replication);
             if (apply_req.split_checkpoint) |checkpoint| {
                 if (checkpoint.destination_group_id != group_id and checkpoint.source_group_id != group_id) {
                     return error.InvalidBatchRequest;
                 }
                 if (checkpoint.kind == .destination) {
                     if (checkpoint.destination_group_id != group_id) return error.InvalidBatchRequest;
-                    try cached.db.updateRange(.{ .start = checkpoint.range_start, .end = checkpoint.range_end });
+                    _ = try cached.db.replaceSplitBootstrap(
+                        alloc,
+                        .{ .start = checkpoint.range_start, .end = checkpoint.range_end },
+                        apply_req.writes,
+                        checkpoint.delta_sequence,
+                        .{
+                            .transition_id = checkpoint.transition_id,
+                            .attempt_epoch = checkpoint.attempt_epoch,
+                            .source_group_id = checkpoint.source_group_id,
+                            .destination_group_id = checkpoint.destination_group_id,
+                            .bootstrap_complete = true,
+                        },
+                    );
                 } else if (checkpoint.source_group_id != group_id) return error.InvalidBatchRequest;
+            } else if (apply_req.split_replication) |replication| {
+                try validateSplitReplicationMarker(alloc, cached.db, replication);
             }
-            try cached.db.batchReplicatedApply(apply_req);
-            if (apply_req.split_checkpoint) |checkpoint| {
-                if (checkpoint.kind == .destination) {
-                    try cached.db.setSplitDeltaFinalSeq(checkpoint.delta_sequence);
-                    try cached.db.setSplitBootstrapMarker(.{
-                        .transition_id = checkpoint.transition_id,
-                        .attempt_epoch = checkpoint.attempt_epoch,
-                        .source_group_id = checkpoint.source_group_id,
-                        .destination_group_id = checkpoint.destination_group_id,
-                        .bootstrap_complete = true,
-                    });
-                }
+            if (apply_req.split_checkpoint == null or apply_req.split_checkpoint.?.kind != .destination) {
+                try cached.db.batchReplicatedApply(apply_req);
             }
             cache.publishCachedLeaseGeneration(&cached, target_generation);
             {
@@ -10232,29 +10235,31 @@ pub const ProvisionedTableWriteSource = struct {
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
             runTestBeforeBatchExecutionHook();
-            if (apply_req.split_replication) |replication|
-                try validateOrEstablishSplitReplicationMarker(alloc, &db, replication);
             if (apply_req.split_checkpoint) |checkpoint| {
                 if (checkpoint.destination_group_id != group_id and checkpoint.source_group_id != group_id) {
                     return error.InvalidBatchRequest;
                 }
                 if (checkpoint.kind == .destination) {
                     if (checkpoint.destination_group_id != group_id) return error.InvalidBatchRequest;
-                    try db.updateRange(.{ .start = checkpoint.range_start, .end = checkpoint.range_end });
+                    _ = try db.replaceSplitBootstrap(
+                        alloc,
+                        .{ .start = checkpoint.range_start, .end = checkpoint.range_end },
+                        apply_req.writes,
+                        checkpoint.delta_sequence,
+                        .{
+                            .transition_id = checkpoint.transition_id,
+                            .attempt_epoch = checkpoint.attempt_epoch,
+                            .source_group_id = checkpoint.source_group_id,
+                            .destination_group_id = checkpoint.destination_group_id,
+                            .bootstrap_complete = true,
+                        },
+                    );
                 } else if (checkpoint.source_group_id != group_id) return error.InvalidBatchRequest;
+            } else if (apply_req.split_replication) |replication| {
+                try validateSplitReplicationMarker(alloc, &db, replication);
             }
-            try db.batchReplicatedApply(apply_req);
-            if (apply_req.split_checkpoint) |checkpoint| {
-                if (checkpoint.kind == .destination) {
-                    try db.setSplitDeltaFinalSeq(checkpoint.delta_sequence);
-                    try db.setSplitBootstrapMarker(.{
-                        .transition_id = checkpoint.transition_id,
-                        .attempt_epoch = checkpoint.attempt_epoch,
-                        .source_group_id = checkpoint.source_group_id,
-                        .destination_group_id = checkpoint.destination_group_id,
-                        .bootstrap_complete = true,
-                    });
-                }
+            if (apply_req.split_checkpoint == null or apply_req.split_checkpoint.?.kind != .destination) {
+                try db.batchReplicatedApply(apply_req);
             }
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
             lockAtomic(&self.local_db_mutex);
@@ -10262,6 +10267,80 @@ pub const ProvisionedTableWriteSource = struct {
             self.local_db_mutex.unlock();
             self.notifyLocalChange(table_name, .data);
         }
+    }
+
+    pub fn installRaftSnapshotGroupLocal(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        encoded: []const u8,
+    ) !void {
+        var state = try shard_state_store.decodeGroupStateSnapshotAlloc(alloc, encoded);
+        defer state.deinit(alloc);
+        try shard_state_store.validateGroupStateSnapshot(alloc, group_id, state);
+
+        var catalog_snapshot = try self.catalog.adminSnapshot();
+        defer self.catalog.freeAdminSnapshot(&catalog_snapshot);
+        const range = metadata_mod.findAdminRange(&catalog_snapshot, group_id) orelse return error.UnknownGroup;
+        const table = metadata_mod.findAdminTable(&catalog_snapshot, range.table_id) orelse return error.TableNotFound;
+        const table_name = table.name;
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const writes = try alloc.alloc(db_mod.types.BatchWrite, state.entries.len);
+        defer alloc.free(writes);
+        for (state.entries, 0..) |entry, i| writes[i] = .{ .key = entry.key, .value = entry.value };
+
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateReadCache(table_name);
+        self.markWriteCacheDirty(table_name);
+        self.local_db_mutex.unlock();
+        errdefer {
+            lockAtomic(&self.local_db_mutex);
+            defer self.local_db_mutex.unlock();
+            self.invalidateReadCache(table_name);
+            self.invalidateWriteCache(table_name);
+        }
+
+        if (self.write_cache) |cache| {
+            const target_generation = self.visibleRootGeneration(group_id);
+            var cached = try self.getOrOpenCachedDbForLocalMutation(
+                alloc,
+                cache,
+                path,
+                group_id,
+                target_generation,
+                table_name,
+                true,
+            );
+            defer cached.deinit(alloc);
+            try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, writes, &.{}, &.{});
+            try cached.db.replaceRaftDocumentSnapshot(alloc, state.byte_range, writes);
+            cache.publishCachedLeaseGeneration(&cached, target_generation);
+        } else {
+            var db = try openManagedDbForReplicatedApply(
+                alloc,
+                path,
+                self.catalog,
+                table_name,
+                group_id,
+                self.backend_runtime,
+                self.ha_write_gate,
+                self.ha_async_mirror,
+                null,
+            );
+            defer db.close();
+            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+            try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, writes, &.{}, &.{});
+            try db.replaceRaftDocumentSnapshot(alloc, state.byte_range, writes);
+            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+        }
+        lockAtomic(&self.local_db_mutex);
+        self.markWriteCacheDirty(table_name);
+        self.local_db_mutex.unlock();
+        self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+        self.notifyLocalChange(table_name, .data);
     }
 
     pub fn applyHAReplicationRecordGroupLocal(
@@ -16745,32 +16824,30 @@ fn validateSplitReplicationForApply(req: db_mod.types.BatchRequest, group_id: u6
         {
             return error.InvalidBatchRequest;
         }
+        if (req.deletes.len != 0 or req.transforms.len != 0 or
+            req.graph_writes.len != 0 or req.graph_deletes.len != 0 or
+            req.predicates.len != 0)
+        {
+            return error.InvalidBatchRequest;
+        }
     }
     return replication.identity_namespace;
 }
 
-fn validateOrEstablishSplitReplicationMarker(
+fn validateSplitReplicationMarker(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
     replication: db_mod.types.SplitReplicationContext,
 ) !void {
-    if (try db.getSplitBootstrapMarker(alloc)) |marker| {
-        if (marker.transition_id != replication.transition_id or
-            marker.attempt_epoch != replication.attempt_epoch or
-            marker.source_group_id != replication.source_group_id or
-            marker.destination_group_id != replication.destination_group_id)
-        {
-            return error.ConflictingSplitTransition;
-        }
-        return;
+    const marker = (try db.getSplitBootstrapMarker(alloc)) orelse return error.SplitBootstrapRequired;
+    if (marker.transition_id != replication.transition_id or
+        marker.attempt_epoch != replication.attempt_epoch or
+        marker.source_group_id != replication.source_group_id or
+        marker.destination_group_id != replication.destination_group_id or
+        !marker.bootstrap_complete)
+    {
+        return error.ConflictingSplitTransition;
     }
-    try db.setSplitBootstrapMarker(.{
-        .transition_id = replication.transition_id,
-        .attempt_epoch = replication.attempt_epoch,
-        .source_group_id = replication.source_group_id,
-        .destination_group_id = replication.destination_group_id,
-        .bootstrap_complete = false,
-    });
 }
 
 fn validateSplitReplicationIdentityAgainstCatalog(

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const std = @import("std");
 const core = @import("../core/mod.zig");
 
 pub const ReadyPersistenceDiagnostics = struct {
@@ -40,6 +41,7 @@ pub const GroupStorage = struct {
 
     pub const VTable = struct {
         persist_ready: *const fn (ptr: *anyopaque, group_id: core.types.GroupId, ready: core.Ready) anyerror!void,
+        compact_snapshot: *const fn (ptr: *anyopaque, group_id: core.types.GroupId, snapshot: core.types.Snapshot) anyerror!void,
         persist_ready_diagnostics: ?*const fn (
             ptr: *anyopaque,
             group_id: core.types.GroupId,
@@ -50,6 +52,10 @@ pub const GroupStorage = struct {
 
     pub fn persistReady(self: GroupStorage, group_id: core.types.GroupId, ready: core.Ready) !void {
         return try self.vtable.persist_ready(self.ptr, group_id, ready);
+    }
+
+    pub fn compactSnapshot(self: GroupStorage, group_id: core.types.GroupId, snapshot: core.types.Snapshot) !void {
+        return try self.vtable.compact_snapshot(self.ptr, group_id, snapshot);
     }
 
     pub fn persistReadyWithDiagnostics(
@@ -128,21 +134,33 @@ pub const StateMachine = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        build_snapshot: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: core.types.GroupId,
+        ) anyerror!?[]u8 = null,
         apply_ready: *const fn (
             ptr: *anyopaque,
             group_id: core.types.GroupId,
+            snapshot: ?core.types.Snapshot,
             committed_entries: []const core.Entry,
             read_states: []const core.ReadState,
         ) anyerror!void,
     };
 
+    pub fn buildSnapshot(self: StateMachine, alloc: std.mem.Allocator, group_id: core.types.GroupId) !?[]u8 {
+        const build = self.vtable.build_snapshot orelse return null;
+        return try build(self.ptr, alloc, group_id);
+    }
+
     pub fn applyReady(
         self: StateMachine,
         group_id: core.types.GroupId,
+        snapshot: ?core.types.Snapshot,
         committed_entries: []const core.Entry,
         read_states: []const core.ReadState,
     ) !void {
-        return try self.vtable.apply_ready(self.ptr, group_id, committed_entries, read_states);
+        return try self.vtable.apply_ready(self.ptr, group_id, snapshot, committed_entries, read_states);
     }
 };
 
@@ -156,22 +174,29 @@ pub const ApplyQueue = struct {
         enqueue_apply: *const fn (
             ptr: *anyopaque,
             group_id: core.types.GroupId,
+            snapshot: ?core.types.Snapshot,
             committed_entries: []const core.Entry,
             read_states: []const core.ReadState,
         ) anyerror!void,
         drain: *const fn (ptr: *anyopaque) anyerror!void,
+        abort: *const fn (ptr: *anyopaque) void,
     };
 
     pub fn enqueueApply(
         self: ApplyQueue,
         group_id: core.types.GroupId,
+        snapshot: ?core.types.Snapshot,
         committed_entries: []const core.Entry,
         read_states: []const core.ReadState,
     ) !void {
-        return try self.vtable.enqueue_apply(self.ptr, group_id, committed_entries, read_states);
+        return try self.vtable.enqueue_apply(self.ptr, group_id, snapshot, committed_entries, read_states);
     }
 
     pub fn drain(self: ApplyQueue) !void {
         return try self.vtable.drain(self.ptr);
+    }
+
+    pub fn abort(self: ApplyQueue) void {
+        self.vtable.abort(self.ptr);
     }
 };

@@ -464,11 +464,15 @@ const RaftTableApplyStateMachine = struct {
     fn applyReady(
         ptr: *anyopaque,
         group_id: raft_engine.core.types.GroupId,
+        snapshot: ?raft_engine.core.types.Snapshot,
         committed_entries: []const raft_engine.core.Entry,
         _: []const raft_engine.core.ReadState,
     ) !void {
         const self: *RaftTableApplyStateMachine = @ptrCast(@alignCast(ptr));
-        var last_index: u64 = 0;
+        var last_index: u64 = if (snapshot) |value| value.metadata.index else 0;
+        if (snapshot) |value| {
+            try self.write_source.installRaftSnapshotGroupLocal(self.alloc, group_id, value.data);
+        }
         for (committed_entries) |entry| {
             if (entry.index > last_index) last_index = entry.index;
             if (entry.entry_type != .normal) continue;

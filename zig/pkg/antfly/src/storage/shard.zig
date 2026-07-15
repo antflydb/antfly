@@ -473,6 +473,12 @@ pub const ShardManager = struct {
         const end = try self.alloc.dupe(u8, byte_range.end);
         errdefer self.alloc.free(end);
 
+        self.replaceByteRangeOwned(start, end);
+    }
+
+    /// Replaces the in-memory range without allocation. Ownership of both
+    /// buffers transfers to the shard manager.
+    pub fn replaceByteRangeOwned(self: *ShardManager, start: []u8, end: []u8) void {
         self.alloc.free(self.owned_range_start);
         self.alloc.free(self.owned_range_end);
         self.owned_range_start = start;

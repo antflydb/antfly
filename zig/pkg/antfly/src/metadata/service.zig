@@ -1365,6 +1365,13 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .upsert_split_transition = record });
     }
 
+    pub fn admitSplitTransition(self: *MetadataService, admission: metadata_reconciler.SplitAdmission) !void {
+        try self.proposeTransitionCommand(.{ .admit_split_transition = .{
+            .expected_source_epoch = admission.expected_source_epoch,
+            .record = admission.record,
+        } });
+    }
+
     pub fn upsertReplicaIntent(self: *MetadataService, intent: raft_reconciler.PlacementIntent) !void {
         try self.proposeTransitionCommand(.{ .upsert_replica_intent = intent });
     }
@@ -1567,6 +1574,7 @@ pub const MetadataService = struct {
     pub fn applyReconciliationPlan(self: *MetadataService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
         for (plan.placement_upserts) |intent| try self.upsertReplicaIntent(intent);
         for (plan.table_upserts) |record| try self.upsertTable(record);
+        for (plan.split_admissions) |admission| try self.admitSplitTransition(admission);
         for (plan.range_upserts) |record| try self.upsertRange(record);
         for (plan.split_upserts) |record| try self.upsertSplitTransition(record);
         for (plan.merge_upserts) |record| try self.upsertMergeTransition(record);
@@ -2614,6 +2622,13 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .upsert_split_transition = record });
     }
 
+    pub fn admitSplitTransition(self: *MetadataHttpService, admission: metadata_reconciler.SplitAdmission) !void {
+        try self.proposeTransitionCommand(.{ .admit_split_transition = .{
+            .expected_source_epoch = admission.expected_source_epoch,
+            .record = admission.record,
+        } });
+    }
+
     pub fn upsertReplicaIntent(self: *MetadataHttpService, intent: raft_reconciler.PlacementIntent) !void {
         try self.proposeTransitionCommand(.{ .upsert_replica_intent = intent });
     }
@@ -2932,6 +2947,7 @@ pub const MetadataHttpService = struct {
     pub fn applyReconciliationPlan(self: *MetadataHttpService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
         for (plan.placement_upserts) |intent| try self.upsertReplicaIntent(intent);
         for (plan.table_upserts) |record| try self.upsertTable(record);
+        for (plan.split_admissions) |admission| try self.admitSplitTransition(admission);
         for (plan.range_upserts) |record| try self.upsertRange(record);
         for (plan.split_upserts) |record| try self.upsertSplitTransition(record);
         for (plan.merge_upserts) |record| try self.upsertMergeTransition(record);

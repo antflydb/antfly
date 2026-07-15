@@ -48,11 +48,7 @@ fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
 }
 
 fn metadataWalReplicaStateConfig() antfly.raft.storage.WalReplicaStateConfig {
-    return .{
-        .compaction_retained_entries = metadata_raft_retained_entries,
-        .compaction_min_interval_entries = metadata_raft_compaction_min_interval_entries,
-        .compaction_single_node_only = false,
-    };
+    return .{};
 }
 
 const CliConfig = struct {
@@ -1579,11 +1575,6 @@ test "metadata runtime enables bounded raft storage compaction for multi-node gr
     try std.testing.expectEqual(@as(u64, metadata_raft_retained_entries), runtime_cfg.applied_log_retained_entries);
     try std.testing.expectEqual(@as(u64, metadata_raft_compaction_min_interval_entries), runtime_cfg.applied_log_compaction_min_interval_entries);
     try std.testing.expect(!runtime_cfg.applied_log_compaction_single_node_only);
-
-    const wal_cfg = metadataWalReplicaStateConfig();
-    try std.testing.expectEqual(@as(u64, metadata_raft_retained_entries), wal_cfg.compaction_retained_entries);
-    try std.testing.expectEqual(@as(u64, metadata_raft_compaction_min_interval_entries), wal_cfg.compaction_min_interval_entries);
-    try std.testing.expect(!wal_cfg.compaction_single_node_only);
 }
 
 test "metadata runtime chooses one preferred bootstrap campaigner" {

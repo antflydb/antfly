@@ -37,6 +37,7 @@ const StorageRecorder = struct {
             .ptr = self,
             .vtable = &.{
                 .persist_ready = persistReady,
+                .compact_snapshot = compactSnapshot,
             },
         };
     }
@@ -58,6 +59,14 @@ const StorageRecorder = struct {
         if (ready.entries.len > 0) {
             try store.append(ready.entries);
         }
+    }
+
+    fn compactSnapshot(ptr: *anyopaque, group_id: core.types.GroupId, snapshot: core.types.Snapshot) !void {
+        const self: *StorageRecorder = @ptrCast(@alignCast(ptr));
+        const store = self.stores.get(group_id) orelse return error.UnknownGroup;
+        self.persist_calls += 1;
+        self.persisted_snapshots += 1;
+        try store.compactToSnapshot(snapshot);
     }
 };
 
@@ -128,18 +137,25 @@ const ApplyRecorder = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .build_snapshot = buildSnapshot,
                 .apply_ready = applyReady,
             },
         };
     }
 
+    fn buildSnapshot(_: *anyopaque, alloc: std.mem.Allocator, _: core.types.GroupId) !?[]u8 {
+        return try alloc.dupe(u8, "applied-state");
+    }
+
     fn applyReady(
         ptr: *anyopaque,
         group_id: core.types.GroupId,
+        snapshot: ?core.types.Snapshot,
         committed_entries: []const core.Entry,
         read_states: []const core.ReadState,
     ) !void {
         _ = group_id;
+        _ = snapshot;
         const self: *ApplyRecorder = @ptrCast(@alignCast(ptr));
         self.apply_calls += 1;
         self.applied_entries += committed_entries.len;
@@ -165,6 +181,7 @@ const ApplyQueueRecorder = struct {
             .vtable = &.{
                 .enqueue_apply = enqueueApply,
                 .drain = drain,
+                .abort = abort,
             },
         };
     }
@@ -172,6 +189,7 @@ const ApplyQueueRecorder = struct {
     fn enqueueApply(
         ptr: *anyopaque,
         group_id: core.types.GroupId,
+        _: ?core.types.Snapshot,
         committed_entries: []const core.Entry,
         read_states: []const core.ReadState,
     ) !void {
@@ -186,6 +204,8 @@ const ApplyQueueRecorder = struct {
         const self: *ApplyQueueRecorder = @ptrCast(@alignCast(ptr));
         self.drain_calls += 1;
     }
+
+    fn abort(_: *anyopaque) void {}
 };
 
 const TransportRecorder = struct {
