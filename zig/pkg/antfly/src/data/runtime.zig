@@ -1592,6 +1592,17 @@ const HASeedSnapshotTopologyReplica = antfly.ha.seed_materialization.ReplicaSnap
 const HASeedSnapshotExtensionArtifact = antfly.ha.seed_materialization.ExtensionArtifact;
 const HASeedSnapshotTopology = antfly.ha.seed_materialization.Topology;
 
+fn freeHASeedSnapshotExtensionArtifacts(
+    alloc: std.mem.Allocator,
+    artifacts: *std.ArrayListUnmanaged(HASeedSnapshotExtensionArtifact),
+) void {
+    for (artifacts.items) |artifact| {
+        alloc.free(artifact.path);
+        alloc.free(artifact.sha256);
+    }
+    artifacts.deinit(alloc);
+}
+
 fn haSeedSnapshotFileSha256HexAlloc(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -1629,6 +1640,44 @@ fn validLowerSha256(value: []const u8) bool {
         if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return false;
     }
     return true;
+}
+
+fn haSeedPackageManifestsEqual(
+    alloc: std.mem.Allocator,
+    left: antfly.extensions.PackageManifest,
+    right: antfly.extensions.PackageManifest,
+) !bool {
+    const left_json = try std.json.Stringify.valueAlloc(alloc, left, .{});
+    defer alloc.free(left_json);
+    const right_json = try std.json.Stringify.valueAlloc(alloc, right, .{});
+    defer alloc.free(right_json);
+    return std.mem.eql(u8, left_json, right_json);
+}
+
+fn haSeedExtensionEntryForPath(
+    path: []const u8,
+    entries: []const antfly.extensions.PackageStoreEntry,
+) !usize {
+    var found: ?usize = null;
+    for (entries, 0..) |entry, index| {
+        if (!antfly.ha.validation.isAbsoluteNormalizedPathWithinRoot(path, entry.package_root_path)) continue;
+        if (found != null) return error.HASeedExtensionOverlappingPackageRoots;
+        found = index;
+    }
+    return found orelse error.HASeedExtensionUnexpectedArtifact;
+}
+
+fn haSeedExtensionArtifactDirectory(
+    artifacts: []const HASeedSnapshotExtensionArtifact,
+    path: []const u8,
+) bool {
+    for (artifacts) |artifact| {
+        if (artifact.path.len > path.len and
+            std.mem.startsWith(u8, artifact.path, path) and
+            artifact.path[path.len] == std.fs.path.sep)
+            return true;
+    }
+    return false;
 }
 
 pub const HASyncWaitConfig = struct {
@@ -3192,6 +3241,13 @@ pub const DataServer = struct {
                 return left.group_id < right.group_id;
             }
         }.lessThan);
+        std.mem.sort(antfly.extensions.PackageManifest, metadata_snapshot.extension_packages, {}, struct {
+            fn lessThan(_: void, left: antfly.extensions.PackageManifest, right: antfly.extensions.PackageManifest) bool {
+                const name_order = std.mem.order(u8, left.name, right.name);
+                if (name_order != .eq) return name_order == .lt;
+                return std.mem.order(u8, left.version, right.version) == .lt;
+            }
+        }.lessThan);
 
         var topology_replicas = std.ArrayListUnmanaged(HASeedSnapshotTopologyReplica).empty;
         defer {
@@ -3238,6 +3294,16 @@ pub const DataServer = struct {
             });
         }
 
+        var topology_extension_artifacts = std.ArrayListUnmanaged(HASeedSnapshotExtensionArtifact).empty;
+        defer freeHASeedSnapshotExtensionArtifacts(alloc, &topology_extension_artifacts);
+        try self.captureHASeedExtensionArtifacts(
+            alloc,
+            io,
+            building_root,
+            metadata_snapshot.extension_packages,
+            &topology_extension_artifacts,
+        );
+
         const topology_json = try std.json.Stringify.valueAlloc(alloc, HASeedSnapshotTopology{
             .generation = request.generation,
             .catalog = .{
@@ -3250,6 +3316,7 @@ pub const DataServer = struct {
                 .extension_dependencies = metadata_snapshot.extension_dependencies,
             },
             .replicas = topology_replicas.items,
+            .extension_artifacts = topology_extension_artifacts.items,
         }, .{});
         defer alloc.free(topology_json);
         if (topology_json.len > ha_seed_snapshot_max_topology_bytes) return error.HASeedSnapshotTopologyTooLarge;
@@ -3285,6 +3352,148 @@ pub const DataServer = struct {
     fn findHASeedTable(tables: []const antfly.metadata.TableRecord, table_id: u64) ?antfly.metadata.TableRecord {
         for (tables) |table| if (table.table_id == table_id) return table;
         return null;
+    }
+
+    fn captureHASeedExtensionArtifacts(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        building_root: []const u8,
+        packages: []const antfly.extensions.PackageManifest,
+        artifacts: *std.ArrayListUnmanaged(HASeedSnapshotExtensionArtifact),
+    ) !void {
+        const store_root = self.api_server_cfg.extension_package_store_dir orelse {
+            if (packages.len != 0) return error.HASeedExtensionCatalogMismatch;
+            return;
+        };
+        if (!antfly.ha.validation.isAbsoluteNormalizedPath(store_root))
+            return error.InvalidHASeedExtensionStoreRoot;
+
+        const entries = try antfly.extensions.scanPackageStoreAlloc(alloc, io, store_root);
+        defer antfly.extensions.freePackageStoreEntries(alloc, entries);
+        if (entries.len != packages.len) return error.HASeedExtensionCatalogMismatch;
+
+        const catalog_index_by_entry = try alloc.alloc(usize, entries.len);
+        defer if (catalog_index_by_entry.len > 0) alloc.free(catalog_index_by_entry);
+        @memset(catalog_index_by_entry, std.math.maxInt(usize));
+        for (packages, 0..) |package, package_index| {
+            package.validate() catch return error.HASeedExtensionCatalogMismatch;
+            var matched_entry: ?usize = null;
+            for (entries, 0..) |entry, entry_index| {
+                if (!std.mem.eql(u8, package.name, entry.manifest.name) or
+                    !std.mem.eql(u8, package.version, entry.manifest.version)) continue;
+                if (matched_entry != null) return error.HASeedExtensionCatalogMismatch;
+                matched_entry = entry_index;
+            }
+            const entry_index = matched_entry orelse return error.HASeedExtensionCatalogMismatch;
+            if (catalog_index_by_entry[entry_index] != std.math.maxInt(usize) or
+                !try haSeedPackageManifestsEqual(alloc, package, entries[entry_index].manifest))
+                return error.HASeedExtensionCatalogMismatch;
+            catalog_index_by_entry[entry_index] = package_index;
+        }
+        for (catalog_index_by_entry) |package_index| {
+            if (package_index == std.math.maxInt(usize)) return error.HASeedExtensionCatalogMismatch;
+        }
+
+        var store_dir = std.Io.Dir.cwd().openDir(io, store_root, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return error.HASeedExtensionCatalogMismatch,
+            else => return err,
+        };
+        defer store_dir.close(io);
+        var walker = try store_dir.walk(alloc);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            if (entry.kind == .directory) continue;
+            if (entry.kind != .file) return error.HASeedExtensionUnsafeArtifact;
+            if (artifacts.items.len >= antfly.ha.seed_materialization.max_files)
+                return error.HASeedExtensionTooManyArtifacts;
+
+            const source_path = try std.fs.path.join(alloc, &.{ store_root, entry.path });
+            defer alloc.free(source_path);
+            const entry_index = try haSeedExtensionEntryForPath(source_path, entries);
+            const package = packages[catalog_index_by_entry[entry_index]];
+            const source_before = try std.Io.Dir.cwd().statFile(io, source_path, .{ .follow_symlinks = false });
+            if (source_before.kind != .file or source_before.size > antfly.ha.seed_materialization.max_file_bytes)
+                return error.HASeedExtensionUnsafeArtifact;
+            const digest_before = try haSeedSnapshotFileSha256HexAlloc(alloc, io, source_path);
+            errdefer alloc.free(digest_before);
+            const artifact_path = try std.fs.path.join(alloc, &.{ "extensions", entry.path });
+            errdefer alloc.free(artifact_path);
+            if (!antfly.ha.validation.isNormalizedPath(artifact_path)) return error.HASeedExtensionUnsafeArtifact;
+            const destination_path = try std.fs.path.join(alloc, &.{ building_root, artifact_path });
+            defer alloc.free(destination_path);
+            try std.Io.Dir.copyFile(std.Io.Dir.cwd(), source_path, std.Io.Dir.cwd(), destination_path, io, .{
+                .make_path = true,
+                .replace = false,
+            });
+            try fs_paths.syncFileAndParentPortable(io, destination_path);
+
+            const source_after = try std.Io.Dir.cwd().statFile(io, source_path, .{ .follow_symlinks = false });
+            const digest_after = try haSeedSnapshotFileSha256HexAlloc(alloc, io, source_path);
+            defer alloc.free(digest_after);
+            const destination_after = try std.Io.Dir.cwd().statFile(io, destination_path, .{ .follow_symlinks = false });
+            const destination_digest = try haSeedSnapshotFileSha256HexAlloc(alloc, io, destination_path);
+            defer alloc.free(destination_digest);
+            if (source_after.kind != .file or destination_after.kind != .file or
+                source_before.size != source_after.size or source_before.size != destination_after.size or
+                !std.mem.eql(u8, digest_before, digest_after) or
+                !std.mem.eql(u8, digest_before, destination_digest))
+                return error.HASeedExtensionChangedDuringCapture;
+            try artifacts.append(alloc, .{
+                .package_name = package.name,
+                .package_version = package.version,
+                .path = artifact_path,
+                .size_bytes = source_before.size,
+                .sha256 = digest_before,
+            });
+        }
+
+        std.mem.sort(HASeedSnapshotExtensionArtifact, artifacts.items, {}, struct {
+            fn lessThan(_: void, left: HASeedSnapshotExtensionArtifact, right: HASeedSnapshotExtensionArtifact) bool {
+                return std.mem.order(u8, left.path, right.path) == .lt;
+            }
+        }.lessThan);
+        for (artifacts.items, 0..) |artifact, index| {
+            if (index > 0 and std.mem.eql(u8, artifacts.items[index - 1].path, artifact.path))
+                return error.HASeedExtensionUnexpectedArtifact;
+        }
+
+        // A second full walk binds the published image to one filesystem
+        // observation. It detects source additions, removals, type changes,
+        // and mutations that race the per-file copy loop.
+        var verify_walker = try store_dir.walk(alloc);
+        defer verify_walker.deinit();
+        var verified_files: usize = 0;
+        while (try verify_walker.next(io)) |entry| {
+            if (entry.kind == .directory) continue;
+            if (entry.kind != .file) return error.HASeedExtensionChangedDuringCapture;
+            const source_path = try std.fs.path.join(alloc, &.{ store_root, entry.path });
+            defer alloc.free(source_path);
+            const entry_index = haSeedExtensionEntryForPath(source_path, entries) catch
+                return error.HASeedExtensionChangedDuringCapture;
+            const package = packages[catalog_index_by_entry[entry_index]];
+            const artifact_path = try std.fs.path.join(alloc, &.{ "extensions", entry.path });
+            defer alloc.free(artifact_path);
+            var found: ?HASeedSnapshotExtensionArtifact = null;
+            for (artifacts.items) |artifact| {
+                if (std.mem.eql(u8, artifact.path, artifact_path) and
+                    std.mem.eql(u8, artifact.package_name, package.name) and
+                    std.mem.eql(u8, artifact.package_version, package.version))
+                {
+                    found = artifact;
+                    break;
+                }
+            }
+            const artifact = found orelse return error.HASeedExtensionChangedDuringCapture;
+            const stat = try std.Io.Dir.cwd().statFile(io, source_path, .{ .follow_symlinks = false });
+            const digest = try haSeedSnapshotFileSha256HexAlloc(alloc, io, source_path);
+            defer alloc.free(digest);
+            if (stat.kind != .file or stat.size != artifact.size_bytes or
+                !std.mem.eql(u8, digest, artifact.sha256))
+                return error.HASeedExtensionChangedDuringCapture;
+            verified_files += 1;
+        }
+        if (verified_files != artifacts.items.len) return error.HASeedExtensionChangedDuringCapture;
     }
 
     fn validateHASeedPreparedSnapshot(
@@ -3357,19 +3566,26 @@ pub const DataServer = struct {
                 if (std.mem.eql(u8, entry.path, "replicas")) continue;
                 for (topology.replicas) |replica| {
                     if (std.mem.eql(u8, entry.path, replica.snapshot_path)) break;
-                } else return error.HASeedSnapshotUnexpectedArtifact;
+                } else if (!haSeedExtensionArtifactDirectory(topology.extension_artifacts, entry.path)) {
+                    return error.HASeedSnapshotUnexpectedArtifact;
+                }
                 continue;
             }
             if (entry.kind != .file) return error.HASeedSnapshotUnexpectedArtifact;
             if (std.mem.eql(u8, entry.path, ha_seed_snapshot_topology_name)) continue;
-            for (topology.replicas) |replica| {
-                const store_rel = try std.fs.path.join(alloc, &.{ replica.snapshot_path, "store.bin" });
-                defer alloc.free(store_rel);
-                if (std.mem.eql(u8, entry.path, store_rel)) break;
-                const journal_rel = try std.fs.path.join(alloc, &.{ replica.snapshot_path, "change-journal.bin" });
-                defer alloc.free(journal_rel);
-                if (std.mem.eql(u8, entry.path, journal_rel)) break;
-            } else return error.HASeedSnapshotUnexpectedArtifact;
+            for (topology.extension_artifacts) |artifact| {
+                if (std.mem.eql(u8, entry.path, artifact.path)) break;
+            } else {
+                for (topology.replicas) |replica| {
+                    const store_rel = try std.fs.path.join(alloc, &.{ replica.snapshot_path, "store.bin" });
+                    defer alloc.free(store_rel);
+                    if (std.mem.eql(u8, entry.path, store_rel)) break;
+                    const journal_rel = try std.fs.path.join(alloc, &.{ replica.snapshot_path, "change-journal.bin" });
+                    defer alloc.free(journal_rel);
+                    if (std.mem.eql(u8, entry.path, journal_rel)) break;
+                } else return error.HASeedSnapshotUnexpectedArtifact;
+                continue;
+            }
         }
     }
 

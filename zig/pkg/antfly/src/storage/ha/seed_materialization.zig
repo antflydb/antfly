@@ -397,6 +397,26 @@ pub fn validateTopology(
         topology.catalog.extension_members,
         topology.catalog.extension_dependencies,
     );
+    for (topology.catalog.extension_packages, 0..) |package, index| {
+        package.validate() catch return error.InvalidExtensionSeedCatalog;
+        if (index > 0) {
+            const prior = topology.catalog.extension_packages[index - 1];
+            const name_order = std.mem.order(u8, prior.name, package.name);
+            if (name_order == .gt or
+                (name_order == .eq and std.mem.order(u8, prior.version, package.version) != .lt))
+                return error.NonCanonicalSeedTopology;
+        }
+        var artifact_count: usize = 0;
+        var has_manifest = false;
+        for (topology.extension_artifacts) |artifact| {
+            if (!std.mem.eql(u8, artifact.package_name, package.name) or
+                !std.mem.eql(u8, artifact.package_version, package.version)) continue;
+            artifact_count += 1;
+            if (std.mem.eql(u8, std.fs.path.basename(artifact.path), extensions.package_manifest_filename))
+                has_manifest = true;
+        }
+        if (artifact_count == 0 or !has_manifest) return error.ExtensionSeedCatalogMismatch;
+    }
 
     for (topology.replicas, 0..) |replica, index| {
         if (index > 0 and topology.replicas[index - 1].group_id >= replica.group_id) return error.NonCanonicalSeedTopology;
