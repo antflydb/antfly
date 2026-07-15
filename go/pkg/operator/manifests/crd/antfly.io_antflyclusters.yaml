@@ -1745,8 +1745,8 @@ spec:
                           watchdogGraceSeconds:
                             default: 10
                             format: int32
-                            maximum: 30
-                            minimum: 1
+                            maximum: 29
+                            minimum: 10
                             type: integer
                         required:
                         - name

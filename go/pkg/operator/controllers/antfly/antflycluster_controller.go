@@ -2137,7 +2137,7 @@ func periodicRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
 func periodicRequeueAfterAt(cluster *antflyv1.AntflyCluster, now time.Time) time.Duration {
 	var requeueAfter time.Duration
 	if haKubernetesLeaseRenewalEnabled(cluster) {
-		requeueAfter = minPositiveDuration(requeueAfter, haFencingLeaseRenewalRequeueAfter())
+		requeueAfter = minPositiveDuration(requeueAfter, haFencingLeaseRenewalRequeueAfter(cluster))
 	}
 	if retryAfter := haDirectAdminRetryRequeueAfter(cluster, now); retryAfter > 0 {
 		requeueAfter = minPositiveDuration(requeueAfter, retryAfter)

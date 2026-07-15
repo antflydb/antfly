@@ -840,9 +840,9 @@ type HARuntimeFencingLeaseSpec struct {
 	TopologyID string `json:"topologyID"`
 
 	// WatchdogGraceSeconds is the maximum API-unreachable interval before the
-	// runtime durably self-fences. It must not exceed the Lease duration.
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=30
+	// runtime durably self-fences. It must be less than the Lease duration.
+	// +kubebuilder:validation:Minimum=10
+	// +kubebuilder:validation:Maximum=29
 	// +kubebuilder:default=10
 	// +optional
 	WatchdogGraceSeconds int32 `json:"watchdogGraceSeconds,omitempty"`

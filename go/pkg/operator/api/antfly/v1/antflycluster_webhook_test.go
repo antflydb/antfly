@@ -2014,6 +2014,20 @@ func TestValidateCreate_HighAvailabilityAutomaticFailoverRequiresNoLossDurabilit
 			},
 			message: "automaticFailover.requireRemoteApply must be true",
 		},
+		{
+			name: "watchdog grace below timing floor",
+			mutate: func(ha *HighAvailabilitySpec) {
+				ha.Runtime.FencingLease.WatchdogGraceSeconds = 9
+			},
+			message: "watchdogGraceSeconds must be at least 10 seconds",
+		},
+		{
+			name: "watchdog grace reaches lease duration",
+			mutate: func(ha *HighAvailabilitySpec) {
+				ha.Runtime.FencingLease.WatchdogGraceSeconds = 30
+			},
+			message: "watchdogGraceSeconds must be less than the 30 second Lease duration",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

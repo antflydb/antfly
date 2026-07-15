@@ -46,6 +46,8 @@ const antfarm_asset_roots = [_][]const u8{
 };
 const ha_lease_poll_interval_ns: u64 = 2 * std.time.ns_per_s;
 const ha_lease_request_timeout_ms: u32 = 1_000;
+const ha_lease_timing_jitter_ns: u64 = std.time.ns_per_s;
+const ha_lease_min_grace_ms: u64 = 10_000;
 
 var termination_requested: std.atomic.Value(bool) = .init(false);
 
@@ -202,7 +204,7 @@ const RuntimeLeaseWatchdog = struct {
         const resolved_pod_uid = pod_uid orelse return error.HALeasePodUIDMissing;
         const node_id = cli.ha_primary_node_id orelse cli.ha_standby_node_id orelse return error.HALeaseNodeIDMissing;
         const grace_ms = std.fmt.parseInt(u64, grace_raw, 10) catch return error.HALeaseGraceInvalid;
-        if (grace_ms == 0 or grace_ms > 30_000) return error.HALeaseGraceInvalid;
+        if (grace_ms < ha_lease_min_grace_ms or grace_ms >= 30_000) return error.HALeaseGraceInvalid;
         const data_generation = cli.ha_startup_generation orelse "initial";
         const scope = antfly.ha.kubernetes_lease_watchdog.Scope{
             .topology_id = topology_id,
@@ -321,7 +323,7 @@ const RuntimeLeaseWatchdog = struct {
         // reports active after validating the shared Lease while another node
         // still holds it, allowing the controller to certify the exact process
         // before an in-place promotion.
-        if (decision == .observed or decision == .authorized) {
+        if (decision == .observed or decision == .authorized or decision == .grace) {
             self.proof_transitions.store(self.watchdog.last_generation, .release);
             self.proof_active.store(true, .release);
             self.proof_capability_deadline_ns.store(observed_monotonic_ns +| self.watchdog.cfg.grace_ns, .release);
@@ -4212,6 +4214,12 @@ const RecordingServer = struct {
 test "standalone runtime module compiles" {
     _ = run;
     _ = runFromIterator;
+}
+
+test "HA Lease minimum grace contains poll request and scheduling margin" {
+    const minimum_grace_ns = ha_lease_min_grace_ms * std.time.ns_per_ms;
+    const request_timeout_ns = @as(u64, ha_lease_request_timeout_ms) * std.time.ns_per_ms;
+    try std.testing.expect(ha_lease_poll_interval_ns + request_timeout_ns + ha_lease_timing_jitter_ns < minimum_grace_ns);
 }
 
 test "standalone Lite enforces one shard and one replica" {

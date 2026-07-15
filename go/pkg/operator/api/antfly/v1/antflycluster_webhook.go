@@ -1480,6 +1480,10 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 			} else if strings.TrimSpace(ha.Runtime.FencingLease.Name) == "" ||
 				strings.TrimSpace(ha.Runtime.FencingLease.TopologyID) == "" {
 				errors = append(errors, "spec.highAvailability.runtime.fencingLease.name and topologyID are required")
+			} else if ha.Runtime.FencingLease.WatchdogGraceSeconds > 0 && ha.Runtime.FencingLease.WatchdogGraceSeconds < 10 {
+				errors = append(errors, "spec.highAvailability.runtime.fencingLease.watchdogGraceSeconds must be at least 10 seconds so polling and request latency fit inside the authority window")
+			} else if ha.Runtime.FencingLease.WatchdogGraceSeconds >= 30 {
+				errors = append(errors, "spec.highAvailability.runtime.fencingLease.watchdogGraceSeconds must be less than the 30 second Lease duration")
 			}
 		}
 		if !failover.requireRemoteApplyOrDefault() {
