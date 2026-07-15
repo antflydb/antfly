@@ -367,6 +367,94 @@ func TestHAPlannedActionOperationIDVersionsTopologyBindingWithoutRekeyingLegacyA
 	}
 }
 
+func TestHARewindFormerPrimaryBindsImmutableTopologyAndPVCExecutionIdentity(t *testing.T) {
+	ha := &antflyv1.HighAvailabilitySpec{
+		Admin: &antflyv1.HAAdminSpec{
+			PrimaryURL:      "http://primary-ha.default.svc:8081",
+			RetryGeneration: 4,
+		},
+		Identity: &antflyv1.HAReplicationIdentitySpec{
+			ClusterID: 100, TimelineID: 5, Epoch: 7, CurrentPrimaryID: "standby-a",
+		},
+		Standbys: []antflyv1.HAStandbySpec{{
+			Name:     "old-primary",
+			AdminURL: "http://old-primary-ha.default.svc:8081",
+			SeedArtifact: &antflyv1.HASeedArtifactSpec{
+				Location:           "s3://ha-seeds/instance-a",
+				Generation:         "seed-old-primary-10",
+				TopologyID:         "instance-a",
+				TopologyGeneration: 7,
+				NodeID:             "old-primary",
+				TargetPVCUID:       "old-primary-pvc-uid-1",
+				StagingRoot:        "/target/.antfly-ha/staging",
+				TargetPVC: &antflyv1.HASeedArtifactPVCSpec{
+					ClaimName: "old-primary-data",
+					MountPath: "/target",
+				},
+			},
+		}},
+	}
+	action := haPlannedAction{
+		Kind:            haActionRewindFormerPrimary,
+		DependsOn:       haActionFenceFormerPrimary,
+		StandbyName:     "old-primary",
+		TargetLSN:       10,
+		ObservedLSN:     10,
+		RetainedFromLSN: 8,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:     "standby-a",
+		FenceGeneration: 4,
+		Reason:          "parent_timeline_retained",
+	}
+
+	initial := haPlannedActionStatuses([]haPlannedAction{action}, ha, &antflyv1.HAStatus{})
+	if len(initial) != 1 {
+		t.Fatalf("expected one rewind action, got %#v", initial)
+	}
+	rewind := initial[0]
+	if rewind.TopologyID != "instance-a" || rewind.TopologyGeneration != 7 ||
+		rewind.TopologyNodeID != "old-primary" || rewind.TargetPVCName != "old-primary-data" ||
+		rewind.TargetPVCUID != "old-primary-pvc-uid-1" || !strings.HasPrefix(rewind.OperationID, "haop-v2-") ||
+		rewind.RetryGeneration != 4 {
+		t.Fatalf("REWIND_TOPOLOGY_IDENTITY_MISSING: %#v", rewind)
+	}
+
+	previous := *rewind.DeepCopy()
+	previous.ExecutionStateVersion = 1
+	previous.AdminJobName = haAdminDirectAPIName
+	previous.AdminJobPhase = haAdminJobPhaseRunning
+	previous.AttemptCount = 3
+	previous.RetryBudgetUsed = 1
+	previous.InFlightAttempt = 3
+	previous.AttemptID = "rewind-attempt-3"
+	previous.Retryable = true
+	status := &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{previous}}
+
+	action.TargetLSN = 11
+	action.ObservedLSN = 11
+	sameIdentity := haPlannedActionStatuses([]haPlannedAction{action}, ha, status)[0]
+	if sameIdentity.OperationID != previous.OperationID || sameIdentity.AttemptCount != 3 ||
+		sameIdentity.RetryBudgetUsed != 1 || sameIdentity.InFlightAttempt != 3 ||
+		sameIdentity.AttemptID != "rewind-attempt-3" || sameIdentity.TargetLSN != 10 ||
+		sameIdentity.ObservedLSN != 10 {
+		t.Fatalf("stable rewind identity lost frozen execution state: %#v", sameIdentity)
+	}
+
+	ha.Standbys[0].SeedArtifact.TopologyGeneration = 8
+	newTopology := haPlannedActionStatuses([]haPlannedAction{action}, ha, status)[0]
+	if newTopology.OperationID == previous.OperationID || newTopology.TopologyGeneration != 8 ||
+		newTopology.AttemptCount != 0 || newTopology.RetryBudgetUsed != 0 ||
+		newTopology.InFlightAttempt != 0 || newTopology.AttemptID != "" {
+		t.Fatalf("replacement topology reused stale rewind execution: %#v", newTopology)
+	}
+
+	ha.Standbys[0].SeedArtifact.TargetPVCUID = "old-primary-pvc-uid-2"
+	replacementPVC := haPlannedActionStatuses([]haPlannedAction{action}, ha, &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{newTopology}})[0]
+	if replacementPVC.OperationID == newTopology.OperationID || replacementPVC.TargetPVCUID != "old-primary-pvc-uid-2" {
+		t.Fatalf("replacement PVC did not rotate exact rewind operation identity: %#v", replacementPVC)
+	}
+}
+
 func TestHAPlannedActionStatusesPreserveTypedExecutionAcrossAdminCommandHints(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
 		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
