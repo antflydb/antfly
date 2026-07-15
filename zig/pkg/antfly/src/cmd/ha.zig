@@ -244,6 +244,8 @@ const ArtifactFlag = enum {
     node_id,
     target_pvc_name,
     target_pvc_uid,
+    target_local_node_id,
+    target_replica_id,
     retain_generations,
     protect_generation,
 };
@@ -288,6 +290,8 @@ const ArtifactOptions = struct {
     identity: IdentityOptions = .{},
     binding: ActivationBindingOptions = .{},
     minimum_checkpoint_lsn: u64 = 0,
+    target_local_node_id: ?u64 = null,
+    target_replica_id: ?u64 = null,
     retain_generations: usize = 2,
     protected_generations: []const []const u8 = &.{},
     owns_protected_generations: bool = false,
@@ -384,6 +388,10 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             const target_root = options.target_root orelse return error.SeedActivationTargetMissing;
             const capture_receipt_sha256 = try requireCaptureReceiptDigest(options.capture_receipt_sha256);
             const binding = (try options.binding.finish()) orelse return error.SeedArtifactBindingMissing;
+            const target_local_node_id = options.target_local_node_id orelse return error.TargetLocalNodeIdMissing;
+            const target_replica_id = options.target_replica_id orelse return error.TargetReplicaIdMissing;
+            if (target_local_node_id == 0) return error.InvalidTargetLocalNodeId;
+            if (target_replica_id == 0) return error.InvalidTargetReplicaId;
             var result = try ha.seed_activation.activate(alloc, .{
                 .staging_root = staging_root,
                 .target_root = target_root,
@@ -396,6 +404,10 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
                     .capture_receipt_sha256 = capture_receipt_sha256,
                 },
                 .binding = binding,
+                .materialization = .{
+                    .target_local_node_id = target_local_node_id,
+                    .target_replica_id = target_replica_id,
+                },
                 .pod_uid = try resolveHAPodUID(),
             });
             defer result.deinit(alloc);
@@ -511,6 +523,8 @@ fn parseArtifactArgs(alloc: std.mem.Allocator, argv: []const []const u8) !Artifa
             .node_id => options.binding.node_id = try artifactValue(argv, &idx),
             .target_pvc_name => options.binding.target_pvc_name = try artifactValue(argv, &idx),
             .target_pvc_uid => options.binding.target_pvc_uid = try artifactValue(argv, &idx),
+            .target_local_node_id => options.target_local_node_id = try parseU64(try artifactValue(argv, &idx)),
+            .target_replica_id => options.target_replica_id = try parseU64(try artifactValue(argv, &idx)),
             .retain_generations => {
                 options.retain_generations = std.math.cast(usize, try parseU64(try artifactValue(argv, &idx))) orelse return error.InvalidSeedRetention;
                 if (options.retain_generations == 0) return error.InvalidSeedRetention;
@@ -555,6 +569,8 @@ fn artifactFlag(raw: []const u8) ?ArtifactFlag {
         .{ "--node-id", .node_id },
         .{ "--target-pvc-name", .target_pvc_name },
         .{ "--target-pvc-uid", .target_pvc_uid },
+        .{ "--target-local-node-id", .target_local_node_id },
+        .{ "--target-replica-id", .target_replica_id },
         .{ "--retain-generations", .retain_generations },
         .{ "--protect-generation", .protect_generation },
     });
@@ -574,6 +590,7 @@ fn artifactFlagAllowed(action: ArtifactAction, flag: ArtifactFlag) bool {
         .slot_activation_receipt => action == .gc_target,
         .ha_cluster_id, .ha_shard_id, .ha_table_id, .ha_timeline_id, .ha_epoch, .minimum_checkpoint_lsn => action == .restore or action == .verify or action == .activate,
         .topology_id, .topology_generation, .node_id, .target_pvc_name, .target_pvc_uid => action == .publish or action == .restore or action == .verify or action == .activate,
+        .target_local_node_id, .target_replica_id => action == .activate,
         .retain_generations => action == .prune or action == .gc_source or action == .gc_target,
         .protect_generation => action == .gc_source or action == .gc_target,
     };
@@ -1495,7 +1512,7 @@ fn printUsage(argv0: []const u8) void {
         \\examples:
         \\  {s} ha artifact publish --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --manifest /source/manifest.afha --content-root /source/content
         \\  {s} ha artifact restore --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --staging-root /target/seed --ha-cluster-id 1 --ha-shard-id 0 --ha-table-id 0 --ha-timeline-id 1 --ha-epoch 1 --minimum-checkpoint-lsn 42
-        \\  {s} ha artifact activate --generation seed-standby-a-42 --slot standby-a --staging-root /target/.antfly-ha/staging --target-root /target --ha-cluster-id 1 --ha-shard-id 0 --ha-table-id 0 --ha-timeline-id 1 --ha-epoch 1 --minimum-checkpoint-lsn 42
+        \\  {s} ha artifact activate --generation seed-standby-a-42 --slot standby-a --staging-root /target/.antfly-ha/staging --target-root /target --target-local-node-id 2 --target-replica-id 1 --ha-cluster-id 1 --ha-shard-id 0 --ha-table-id 0 --ha-timeline-id 1 --ha-epoch 1 --minimum-checkpoint-lsn 42
         \\  {s} ha artifact prune --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --retain-generations 2
         \\  {s} ha artifact gc-source --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --capture-root /source/.antfly-ha/captures --retain-generations 2 --protect-generation seed-standby-a-41
         \\  {s} ha artifact gc-target --target-root /target --slot-activation-receipt /checkpoint/seeded-slot-activation.json --retain-generations 2 --protect-generation seed-standby-a-41
@@ -1618,6 +1635,8 @@ test "ha cmd artifact parses offline seed activation target and identity" {
     try std.testing.expectEqualStrings("pvc-uid-1", options.binding.target_pvc_uid.?);
     try std.testing.expect(@hasField(ArtifactOptions, "target_local_node_id"));
     try std.testing.expect(@hasField(ArtifactOptions, "target_replica_id"));
+    try std.testing.expectEqual(@as(u64, 77), options.target_local_node_id.?);
+    try std.testing.expectEqual(@as(u64, 9), options.target_replica_id.?);
 }
 
 test "ha cmd artifact accepts portable publish and restore topology pvc binding" {
