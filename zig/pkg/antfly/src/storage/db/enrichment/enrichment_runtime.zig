@@ -2777,6 +2777,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
         .ocr => "ocr_text",
         .transcript => "transcript_text",
     };
+    const ocr_prompt = if (kind == .ocr) document_extraction_mod.effectiveOcrPrompt(config) else "";
 
     var requests = std.ArrayListUnmanaged(asset_producer_mod.Request).empty;
     defer requests.deinit(runtime.alloc);
@@ -2842,7 +2843,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
             continue;
         }
         if (requests.items.len > 0 and (requests.items.len >= batch_policy.max_items or batch_bytes + request_bytes > batch_policy.max_bytes)) {
-            try flushRuntimeGeneratedTextBatch(runtime, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality);
+            try flushRuntimeGeneratedTextBatch(runtime, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt);
             requests.clearRetainingCapacity();
             unit_indices.clearRetainingCapacity();
             batch_bytes = 0;
@@ -2854,7 +2855,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
         batch_bytes = addUsizeSaturating(batch_bytes, request_bytes);
     }
     if (requests.items.len > 0) {
-        try flushRuntimeGeneratedTextBatch(runtime, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality);
+        try flushRuntimeGeneratedTextBatch(runtime, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt);
     }
 }
 
@@ -2883,20 +2884,21 @@ fn flushRuntimeGeneratedTextBatch(
     method: []const u8,
     kind: RuntimeGeneratedUnitTextKind,
     quality_config: document_extraction_mod.OcrQualityConfig,
+    ocr_prompt: []const u8,
 ) !void {
     if (requests.len == 0) return;
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
 
     var produced = producer.produceBatch(runtime.alloc, requests) catch |err| {
         if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
-        return try flushRuntimeGeneratedTextBatchSequential(runtime, producer, requests, unit_indices, parts_values, units, method, kind, quality_config);
+        return try flushRuntimeGeneratedTextBatchSequential(runtime, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt);
     };
     if (produced.len != requests.len) {
         for (produced) |item| {
             if (item.len > 0) runtime.alloc.free(item);
         }
         runtime.alloc.free(produced);
-        return try flushRuntimeGeneratedTextBatchSequential(runtime, producer, requests, unit_indices, parts_values, units, method, kind, quality_config);
+        return try flushRuntimeGeneratedTextBatchSequential(runtime, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt);
     }
 
     defer runtime.alloc.free(produced);
@@ -2907,7 +2909,7 @@ fn flushRuntimeGeneratedTextBatch(
     }
     for (produced, unit_indices, 0..) |item, unit_idx, i| {
         produced[i] = &.{};
-        applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], item, method, "completed", kind, quality_config) catch |err| {
+        applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], item, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
             if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
             try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
         };
@@ -2925,6 +2927,7 @@ fn flushRuntimeGeneratedTextBatchSequential(
     method: []const u8,
     kind: RuntimeGeneratedUnitTextKind,
     quality_config: document_extraction_mod.OcrQualityConfig,
+    ocr_prompt: []const u8,
 ) !void {
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
     for (requests, unit_indices) |request, unit_idx| {
@@ -2933,7 +2936,7 @@ fn flushRuntimeGeneratedTextBatchSequential(
             try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
             continue;
         };
-        applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], produced, method, "completed", kind, quality_config) catch |err| {
+        applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], produced, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
             if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
             try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
         };
@@ -2990,7 +2993,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextUnit(
         .content_type = "text/plain",
     });
     errdefer runtime.alloc.free(produced);
-    try applyRuntimeGeneratedUnitText(runtime.alloc, unit, produced, method, "completed", kind, config.ocr_quality);
+    try applyRuntimeGeneratedUnitText(runtime.alloc, unit, produced, method, "completed", kind, config.ocr_quality, if (kind == .ocr) document_extraction_mod.effectiveOcrPrompt(config) else "");
 }
 
 const RuntimeGeneratedUnitTextKind = enum { ocr, transcript };
@@ -3003,6 +3006,7 @@ fn applyRuntimeGeneratedUnitText(
     status: []const u8,
     kind: RuntimeGeneratedUnitTextKind,
     quality_config: document_extraction_mod.OcrQualityConfig,
+    ocr_prompt: []const u8,
 ) !void {
     if (produced.len == 0 and kind != .ocr) {
         alloc.free(produced);
@@ -3011,6 +3015,7 @@ fn applyRuntimeGeneratedUnitText(
     defer alloc.free(produced);
     var parsed = try parseRuntimeGeneratedUnitTextOutputAlloc(alloc, produced);
     errdefer parsed.deinit(alloc);
+    if (kind == .ocr and document_extraction_mod.isOcrPromptEcho(parsed.text, ocr_prompt)) return error.OcrPromptEcho;
     if (kind == .ocr and !std.mem.eql(u8, unit.unit_type, "image")) {
         unit.ocr_attempted = true;
         const embedded_quality = document_extraction_mod.assessOcrQuality(unit.text, quality_config);
@@ -8987,6 +8992,83 @@ test "document extraction generated OCR batches honor execution item cap" {
     try std.testing.expectEqualStrings("ocr text 0", units[0].text);
     try std.testing.expectEqualStrings("ocr text 1", units[1].text);
     try std.testing.expectEqualStrings("ocr text 0", units[2].text);
+}
+
+test "document extraction rejects and records Florence prompt echoes" {
+    const alloc = std.testing.allocator;
+
+    const EchoProducer = struct {
+        fn producer(self: *@This()) asset_producer_mod.Producer {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .produce = produce,
+                    .produce_batch = produceBatch,
+                },
+            };
+        }
+
+        fn produce(_: *anyopaque, a: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            return try a.dupe(u8, document_extraction_mod.florence_ocr_canonical_prompt);
+        }
+
+        fn produceBatch(_: *anyopaque, a: Allocator, requests: []const asset_producer_mod.Request) ![][]u8 {
+            const out = try a.alloc([]u8, requests.len);
+            errdefer a.free(out);
+            var initialized: usize = 0;
+            errdefer for (out[0..initialized]) |item| a.free(item);
+            for (out) |*item| {
+                item.* = try a.dupe(u8, document_extraction_mod.florence_ocr_canonical_prompt);
+                initialized += 1;
+            }
+            return out;
+        }
+    };
+
+    var fake = EchoProducer{};
+    const producer = fake.producer();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .asset_producer = producer },
+        .ownership = undefined,
+    };
+    var units = [_]document_extraction_mod.Unit{.{
+        .unit_id = try alloc.dupe(u8, "image:1"),
+        .unit_type = try alloc.dupe(u8, "image"),
+        .text = try alloc.dupe(u8, "ocr_pending"),
+        .method = try alloc.dupe(u8, "ocr_pending"),
+        .extraction_status = try alloc.dupe(u8, "pending_ocr"),
+    }};
+    defer units[0].deinit(alloc);
+
+    try completeRuntimeDocumentExtractionGeneratedTextBatch(
+        &runtime,
+        producer,
+        .{ .ocr_enabled = true, .ocr_model = "antflydb/Florence-2-base" },
+        .{ .max_items = 8, .max_bytes = 1024 * 1024 },
+        "data:image/png;base64,AA==",
+        "",
+        "image",
+        "image/png",
+        units[0..],
+        .ocr,
+        null,
+    );
+
+    try std.testing.expectEqualStrings("failed_ocr", units[0].extraction_status.?);
+    try std.testing.expectEqualStrings("", units[0].text);
+    try std.testing.expect(!units[0].ocr_used);
+    try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "OcrPromptEcho") != null);
 }
 
 test "generic generated asset batch fallback isolates malformed batch envelope" {

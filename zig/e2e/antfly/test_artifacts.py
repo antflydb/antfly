@@ -259,7 +259,7 @@ def test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e(
         "max_rendered_pixels": 4_000_000,
         "config": {
             "provider": "antfly",
-            "model": "e2e-reader",
+            "model": "antflydb/Florence-2-base",
             "api_url": pdf_ocr_e2e_server.reader_api_url,
         },
     }
@@ -475,7 +475,16 @@ def test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e(
     assert reader_stats["png_requests"] >= 5, reader_stats
     assert reader_stats["jpeg_requests"] >= 1, reader_stats
     requests = reader_stats["requests"]
-    assert any("Render tables as Markdown" in request["prompt"] for request in requests)
+    png_requests = [
+        request
+        for request in requests
+        if any(image["kind"] == "png" for image in request["images"])
+    ]
+    assert png_requests
+    assert all(request["prompt"] == "<OCR>" for request in png_requests)
+    assert all(
+        "Render tables as Markdown" not in request["prompt"] for request in png_requests
+    )
     png_hashes = {
         image["sha256"]
         for request in requests

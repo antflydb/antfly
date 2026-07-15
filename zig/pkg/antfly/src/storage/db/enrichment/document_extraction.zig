@@ -137,7 +137,7 @@ pub fn ocrPagePartsJsonAlloc(alloc: Allocator, config: Config, route_type: []con
     const encoded = try alloc.alloc(u8, encoded_len);
     defer alloc.free(encoded);
     _ = std.base64.standard.Encoder.encode(encoded, png);
-    const prompt = if (config.ocr_prompt.len > 0) config.ocr_prompt else default_ocr_prompt;
+    const prompt = effectiveOcrPrompt(config);
     return try std.json.Stringify.valueAlloc(alloc, .{
         .{ .type = "text", .text = prompt },
         .{ .type = "media", .mime_type = "image/png", .data = encoded },
@@ -260,6 +260,7 @@ pub const Config = struct {
     ocr_render_dpi: u16 = 150,
     ocr_max_rendered_pixels: u64 = 40_000_000,
     ocr_prompt: []const u8 = "",
+    ocr_model: []const u8 = "",
     ocr_quality: OcrQualityConfig = .{},
     transcription_enabled: bool = false,
     transcription_config_json: []const u8 = "",
@@ -282,6 +283,7 @@ pub const Config = struct {
         if (self.last_modified_field.len > 0) alloc.free(@constCast(self.last_modified_field));
         if (self.ocr_config_json.len > 0) alloc.free(@constCast(self.ocr_config_json));
         if (self.ocr_prompt.len > 0) alloc.free(@constCast(self.ocr_prompt));
+        if (self.ocr_model.len > 0) alloc.free(@constCast(self.ocr_model));
         if (self.transcription_config_json.len > 0) alloc.free(@constCast(self.transcription_config_json));
         for (self.routes) |*route| route.deinit(alloc);
         if (self.routes.len > 0) alloc.free(self.routes);
@@ -295,6 +297,51 @@ pub const OcrMode = enum {
 };
 
 pub const default_ocr_prompt = "Transcribe this page faithfully. Preserve reading order, headings, lists, and table structure. Render tables as Markdown with one row per visual row. Do not summarize, infer, or omit text. Return only the transcription.";
+pub const florence_ocr_prompt = "<OCR>";
+pub const florence_ocr_canonical_prompt = "What is the text in the image?";
+
+pub fn effectiveOcrPrompt(config: Config) []const u8 {
+    if (config.ocr_prompt.len > 0) return config.ocr_prompt;
+    if (isFlorenceModel(config.ocr_model)) return florence_ocr_prompt;
+    return default_ocr_prompt;
+}
+
+fn isFlorenceModel(model: []const u8) bool {
+    return containsAsciiIgnoreCase(model, "florence-2");
+}
+
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    var offset: usize = 0;
+    while (offset <= haystack.len - needle.len) : (offset += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[offset..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
+pub fn isOcrPromptEcho(text: []const u8, prompt: []const u8) bool {
+    if (prompt.len == 0) return false;
+    if (normalizedPromptTextEqual(text, prompt)) return true;
+    return std.mem.eql(u8, prompt, florence_ocr_prompt) and normalizedPromptTextEqual(text, florence_ocr_canonical_prompt);
+}
+
+fn normalizedPromptTextEqual(a_raw: []const u8, b_raw: []const u8) bool {
+    const a = std.mem.trim(u8, a_raw, &std.ascii.whitespace);
+    const b = std.mem.trim(u8, b_raw, &std.ascii.whitespace);
+    var ai: usize = 0;
+    var bi: usize = 0;
+    while (true) {
+        while (ai < a.len and a[ai] < 0x80 and !std.ascii.isAlphanumeric(a[ai])) ai += 1;
+        while (bi < b.len and b[bi] < 0x80 and !std.ascii.isAlphanumeric(b[bi])) bi += 1;
+        if (ai == a.len or bi == b.len) return ai == a.len and bi == b.len;
+        const ac = if (a[ai] < 0x80) std.ascii.toLower(a[ai]) else a[ai];
+        const bc = if (b[bi] < 0x80) std.ascii.toLower(b[bi]) else b[bi];
+        if (ac != bc) return false;
+        ai += 1;
+        bi += 1;
+    }
+}
 
 pub const OcrQualityConfig = struct {
     min_content_chars: usize = 50,
@@ -584,6 +631,12 @@ fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config
     if (intField(ocr, "max_rendered_pixels")) |pixels| {
         if (pixels < 1) return error.InvalidDocumentExtractionConfig;
         config.ocr_max_rendered_pixels = @intCast(pixels);
+    }
+    if (ocr.get("config")) |producer| {
+        if (producer == .object) if (producer.object.get("model")) |model| {
+            if (model != .string) return error.InvalidDocumentExtractionConfig;
+            config.ocr_model = try alloc.dupe(u8, model.string);
+        };
     }
     if (ocr.get("prompt")) |prompt| {
         if (prompt != .string) return error.InvalidDocumentExtractionConfig;
@@ -3246,10 +3299,10 @@ test "OCR text selection retains embedded text on ties and chooses a better tran
     try std.testing.expect(!preferOcrText(ocr, ocr));
 }
 
-test "OCR options parse configurable thresholds resolution and layout prompt" {
+test "OCR options parse configurable thresholds resolution model and explicit prompt" {
     const alloc = std.testing.allocator;
     var config = try parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"mode":"always","render_dpi":200,"max_rendered_pixels":123456,"quality":{"min_content_chars":75,"max_replacement_char_ratio":0.1},"config":{"provider":"antfly","prompt":"Preserve tables"}}}
+        \\{"ocr":{"enabled":true,"mode":"always","render_dpi":200,"max_rendered_pixels":123456,"quality":{"min_content_chars":75,"max_replacement_char_ratio":0.1},"config":{"provider":"antfly","model":"antflydb/Florence-2-base","prompt":"Preserve tables"}}}
     );
     defer config.deinit(alloc);
     try std.testing.expect(config.ocr_enabled);
@@ -3257,6 +3310,7 @@ test "OCR options parse configurable thresholds resolution and layout prompt" {
     try std.testing.expectEqual(@as(u16, 200), config.ocr_render_dpi);
     try std.testing.expectEqual(@as(u64, 123456), config.ocr_max_rendered_pixels);
     try std.testing.expectEqual(@as(usize, 75), config.ocr_quality.min_content_chars);
+    try std.testing.expectEqualStrings("antflydb/Florence-2-base", config.ocr_model);
     try std.testing.expectEqualStrings("Preserve tables", config.ocr_prompt);
 }
 
@@ -3270,7 +3324,7 @@ test "generated text provider config is validated while parsing extraction confi
     ));
 }
 
-test "OCR page request carries PNG media page metadata and layout prompt" {
+test "OCR page request uses the Florence task prompt by default" {
     const alloc = std.testing.allocator;
     const unit = Unit{
         .unit_id = @constCast("page:000002"),
@@ -3279,10 +3333,36 @@ test "OCR page request carries PNG media page metadata and layout prompt" {
         .method = @constCast("pdf_ocr_pending"),
         .page_number = 2,
     };
-    const parts = try ocrPagePartsJsonAlloc(alloc, .{}, "pdf", "application/pdf", unit, "png");
+    const parts = try ocrPagePartsJsonAlloc(alloc, .{ .ocr_model = "antflydb/Florence-2-base" }, "pdf", "application/pdf", unit, "png");
     defer alloc.free(parts);
     try std.testing.expect(std.mem.indexOf(u8, parts, "image/png") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parts, "Render tables as Markdown") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parts, "<OCR>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parts, "Render tables as Markdown") == null);
     try std.testing.expect(std.mem.indexOf(u8, parts, "page:000002") != null);
     try std.testing.expect(std.mem.indexOf(u8, parts, "cG5n") != null);
+}
+
+test "OCR page request preserves explicit and generic reader prompts" {
+    const alloc = std.testing.allocator;
+    const unit = Unit{
+        .unit_id = @constCast("page:000001"),
+        .unit_type = @constCast("page"),
+        .text = @constCast(""),
+        .method = @constCast("pdf_ocr_pending"),
+        .page_number = 1,
+    };
+    const explicit = try ocrPagePartsJsonAlloc(alloc, .{ .ocr_model = "antflydb/Florence-2-base", .ocr_prompt = "custom instruction" }, "pdf", "application/pdf", unit, "png");
+    defer alloc.free(explicit);
+    try std.testing.expect(std.mem.indexOf(u8, explicit, "custom instruction") != null);
+
+    const generic = try ocrPagePartsJsonAlloc(alloc, .{}, "pdf", "application/pdf", unit, "png");
+    defer alloc.free(generic);
+    try std.testing.expect(std.mem.indexOf(u8, generic, "Render tables as Markdown") != null);
+}
+
+test "OCR prompt echo detection covers Florence task and canonical prompts" {
+    try std.testing.expect(isOcrPromptEcho(" <OCR>\n", florence_ocr_prompt));
+    try std.testing.expect(isOcrPromptEcho("what is the text in the image", florence_ocr_prompt));
+    try std.testing.expect(isOcrPromptEcho("TRANSCRIBE this page faithfully!", "Transcribe this page faithfully."));
+    try std.testing.expect(!isOcrPromptEcho("Invoice total: $123.45", florence_ocr_prompt));
 }
