@@ -2425,6 +2425,8 @@ fn processDocumentExtractionAsset(
     const empty_units: [0]document_extraction_mod.Unit = .{};
     var ocr_failed_page_numbers = std.ArrayListUnmanaged(u32).empty;
     defer ocr_failed_page_numbers.deinit(runtime.alloc);
+    var ocr_failure_details = std.ArrayListUnmanaged(document_extraction_mod.OcrFailureDetail).empty;
+    defer ocr_failure_details.deinit(runtime.alloc);
     var ocr_attempted_count: usize = 0;
     var ocr_selected_count: usize = 0;
     var ocr_retained_embedded_count: usize = 0;
@@ -2439,6 +2441,12 @@ fn processDocumentExtractionAsset(
             if (std.mem.eql(u8, status, "failed_ocr")) {
                 ocr_failed_count += 1;
                 if (ocr_failed_page_numbers.items.len < 32) if (unit.page_number) |page| try ocr_failed_page_numbers.append(runtime.alloc, page);
+                if (ocr_failure_details.items.len < 32) try ocr_failure_details.append(runtime.alloc, .{
+                    .page_number = unit.page_number,
+                    .unit_id = unit.unit_id,
+                    .retained_method = unit.method,
+                    .error_message = unit.extraction_warning orelse "OCR failed without a recorded cause",
+                });
             }
         }
     }
@@ -2452,6 +2460,7 @@ fn processDocumentExtractionAsset(
         .ocr_retained_embedded_count = ocr_retained_embedded_count,
         .ocr_failed_count = ocr_failed_count,
         .ocr_failed_page_numbers = ocr_failed_page_numbers.items,
+        .ocr_failure_details = ocr_failure_details.items,
     };
 
     const in_progress_manifest = try documentExtractionManifestPayloadAlloc(
@@ -7480,6 +7489,20 @@ fn documentExtractionManifestPayloadAlloc(
     }
     try out.append(alloc, ']');
     try appendJsonFieldBool(alloc, &out, &first, "ocr_failed_pages_truncated", extraction.ocr_failed_count > extraction.ocr_failed_page_numbers.len);
+    try appendJsonFieldName(alloc, &out, &first, "ocr_failure_details");
+    try out.append(alloc, '[');
+    for (extraction.ocr_failure_details, 0..) |detail, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        var detail_first = true;
+        if (detail.page_number) |page| try appendJsonFieldU64(alloc, &out, &detail_first, "page_number", page);
+        try appendJsonFieldString(alloc, &out, &detail_first, "unit_id", detail.unit_id);
+        try appendJsonFieldString(alloc, &out, &detail_first, "retained_method", detail.retained_method);
+        try appendJsonFieldString(alloc, &out, &detail_first, "error_message", detail.error_message);
+        try appendJsonFieldBool(alloc, &out, &detail_first, "retryable", true);
+        try out.append(alloc, '}');
+    }
+    try out.append(alloc, ']');
     try appendJsonFieldName(alloc, &out, &first, "child_ranges");
     try out.append(alloc, '[');
     if (child_ranges_override.len > 0) {
@@ -9437,6 +9460,15 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
         .content_type = @constCast("text/plain"),
         .route_type = @constCast("text"),
         .units = @constCast(units[0..]),
+        .ocr_attempted_count = 1,
+        .ocr_failed_count = 1,
+        .ocr_failed_page_numbers = &.{5},
+        .ocr_failure_details = &.{.{
+            .page_number = 5,
+            .unit_id = "unit:b",
+            .retained_method = "pdf_text",
+            .error_message = "pdf_ocr failed: UnsupportedStreamFilter",
+        }},
     };
     const desired_descriptors = [_]DocumentExtractionUnitDescriptor{
         .{ .key = unit_keys[0], .fingerprint = "same-fingerprint" },
@@ -9519,6 +9551,9 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"op\":\"delete\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"ocr_failure_details\":[{\"page_number\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"error_message\":\"pdf_ocr failed: UnsupportedStreamFilter\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"retryable\":true") != null);
 
     const in_progress = try documentExtractionManifestPayloadAlloc(
         alloc,

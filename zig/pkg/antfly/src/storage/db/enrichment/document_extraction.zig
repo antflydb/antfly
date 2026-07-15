@@ -226,6 +226,9 @@ pub const Result = struct {
     ocr_retained_embedded_count: usize = 0,
     ocr_failed_count: usize = 0,
     ocr_failed_page_numbers: []const u32 = &.{},
+    /// Borrowed failure summaries used while serializing the public raw
+    /// manifest. The page units remain the owning source of these strings.
+    ocr_failure_details: []const OcrFailureDetail = &.{},
 
     pub fn deinit(self: *Result, alloc: Allocator) void {
         alloc.free(self.content_type);
@@ -235,6 +238,13 @@ pub const Result = struct {
         if (self.units.len > 0) alloc.free(self.units);
         self.* = undefined;
     }
+};
+
+pub const OcrFailureDetail = struct {
+    page_number: ?u32,
+    unit_id: []const u8,
+    retained_method: []const u8,
+    error_message: []const u8,
 };
 
 pub const StreamInfo = struct {

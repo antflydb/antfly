@@ -20005,6 +20005,25 @@ fn documentExtractionManifestPayloadAlloc(
     }
     try out.append(alloc, ']');
     try appendJsonFieldBool(alloc, &out, &first, "ocr_failed_pages_truncated", ocr_failed_count > failed_pages_len);
+    try appendJsonFieldName(alloc, &out, &first, "ocr_failure_details");
+    try out.append(alloc, '[');
+    var failure_detail_count: usize = 0;
+    for (extraction.units) |unit| {
+        const status = unit.extraction_status orelse continue;
+        if (!std.mem.eql(u8, status, "failed_ocr")) continue;
+        if (failure_detail_count >= 32) break;
+        if (failure_detail_count > 0) try out.append(alloc, ',');
+        failure_detail_count += 1;
+        try out.append(alloc, '{');
+        var detail_first = true;
+        if (unit.page_number) |page| try appendJsonFieldU64(alloc, &out, &detail_first, "page_number", page);
+        try appendJsonFieldString(alloc, &out, &detail_first, "unit_id", unit.unit_id);
+        try appendJsonFieldString(alloc, &out, &detail_first, "retained_method", unit.method);
+        try appendJsonFieldString(alloc, &out, &detail_first, "error_message", unit.extraction_warning orelse "OCR failed without a recorded cause");
+        try appendJsonFieldBool(alloc, &out, &detail_first, "retryable", true);
+        try out.append(alloc, '}');
+    }
+    try out.append(alloc, ']');
     try appendJsonFieldName(alloc, &out, &first, "child_ranges");
     try out.append(alloc, '[');
     try appendDocumentExtractionRangeDescriptors(alloc, &out, artifact_name, unit_keys, chunk_keys, extraction.units, previous_child_ranges);
@@ -40153,7 +40172,11 @@ test "db document extraction manifest classifies unit fingerprint keeps" {
             .unit_id = @constCast("unit:b"),
             .unit_type = @constCast("document"),
             .text = @constCast("changed"),
-            .method = @constCast("text"),
+            .method = @constCast("pdf_text"),
+            .extraction_status = @constCast("failed_ocr"),
+            .extraction_warning = @constCast("pdf_ocr failed: UnsupportedStreamFilter"),
+            .page_number = 5,
+            .ocr_attempted = true,
         },
     };
     const extraction = document_extraction_mod.Result{
@@ -40206,6 +40229,9 @@ test "db document extraction manifest classifies unit fingerprint keeps" {
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"first_key\":\"unit:a\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"first_key\":\"unit:b\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"ocr_failure_details\":[{\"page_number\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"error_message\":\"pdf_ocr failed: UnsupportedStreamFilter\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"retryable\":true") != null);
 }
 
 test "db document extraction skips stable unit local rewrites without text consumers" {
