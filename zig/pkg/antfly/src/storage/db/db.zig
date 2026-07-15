@@ -12877,7 +12877,11 @@ pub const DB = struct {
         defer types.freeIndexConfigs(alloc, configs);
         const async_indexing = self.snapshotAsyncIndexingStats();
         const identity_stats = dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
-        const primary_doc_count = self.scanPrimaryDocCount(self.core.byteRange()) catch 0;
+        // Coverage is accounted once per primary source document. Derived
+        // artifacts (for example, page chunks) may intentionally outnumber
+        // both source documents and document-identity ordinals, so neither is
+        // an authoritative source total here.
+        const primary_doc_count = try self.scanPrimaryDocCount(self.core.byteRange());
         const repair_summary = try self.artifactRepairSummaryRootSnapshot(alloc);
         const repair_issue_count = repair_summary.count;
         var repair_index_fallback = ArtifactRepairIndexFallbackCounts{ .alloc = alloc };
@@ -12998,7 +13002,7 @@ pub const DB = struct {
         }
 
         return .{
-            .source_doc_count = identity_stats.live_ordinals,
+            .source_doc_count = primary_doc_count,
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
             .indexes = index_stats[0..index_count],
@@ -13192,7 +13196,7 @@ pub const DB = struct {
         }
 
         return .{
-            .source_doc_count = identity_stats.live_ordinals,
+            .source_doc_count = identity_stats.scanned_primary_docs,
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
             .indexes = index_stats[0..index_count],
@@ -13246,6 +13250,7 @@ pub const DB = struct {
         defer types.freeIndexConfigs(alloc, configs);
         var visible_doc_count: u64 = 0;
         const identity_stats = dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
+        const primary_doc_count = try self.scanPrimaryDocCount(self.core.byteRange());
         const repair_summary = try self.artifactRepairSummaryRootSnapshot(alloc);
         const repair_issue_count = repair_summary.count;
         var repair_index_fallback = ArtifactRepairIndexFallbackCounts{ .alloc = alloc };
@@ -13312,7 +13317,7 @@ pub const DB = struct {
         }
 
         return .{
-            .source_doc_count = identity_stats.live_ordinals,
+            .source_doc_count = primary_doc_count,
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
             .indexes = index_stats[0..index_count],
@@ -52827,6 +52832,50 @@ test "db dense and sparse field-backed vector indexes strip vector fields and pe
 
     try db.batch(.{ .deletes = &.{"doc:b"}, .sync_level = .full_index });
     try ExpectCoverage.run(&db, 4, 3, 1);
+}
+
+test "db coverage source count follows primary documents when identity summary is absent" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
+        });
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"embedding\":[1,0,0]}" },
+                .{ .key = "doc:b", .value = "{\"embedding\":[0,1,0]}" },
+            },
+            .sync_level = .full_index,
+        });
+
+        // Reproduce a status surface where primary rows and coverage outcomes
+        // are durable but the fast identity summary cannot supply a count.
+        var summary_batch = try db.core.store.beginWriteBatch();
+        errdefer summary_batch.abort();
+        try summary_batch.delete(internal_keys.identity_visibility_summary_key[0..]);
+        try summary_batch.commit();
+
+        const stats = try db.runtimeStatusStatsConsistent(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 2), stats.source_doc_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.live_ordinals);
+        try std.testing.expectEqual(@as(u64, 2), stats.indexes[0].coverage_produced_count);
+    }
+
+    var status_only = try DB.open(alloc, std.mem.span(path), .{ .open_mode = .status_only });
+    defer status_only.close();
+    const reopened_stats = try status_only.runtimeStatusStatsConsistent(alloc);
+    defer types.freeDBStats(alloc, reopened_stats);
+    try std.testing.expectEqual(@as(u64, 2), reopened_stats.source_doc_count);
+    try std.testing.expectEqual(@as(u64, 2), reopened_stats.indexes[0].coverage_produced_count);
 }
 
 test "db external dense coverage tracks exact writes deletes and reopen" {
