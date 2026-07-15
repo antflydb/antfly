@@ -138,15 +138,32 @@ const PageFont = struct {
     type1: ?Type1Font = null,
     truetype: ?TrueTypeFont = null,
     cff_otf: ?CffOpenTypeFont = null,
+    borrowed: bool = false,
 
     fn deinit(self: *PageFont, alloc: Allocator) void {
         alloc.free(self.name);
+        if (self.borrowed) {
+            self.* = undefined;
+            return;
+        }
         self.decoder.deinit(alloc);
         if (self.type3) |*type3| type3.deinit(alloc);
         if (self.type1) |*type1| type1.deinit(alloc);
         if (self.truetype) |*truetype| truetype.deinit(alloc);
         if (self.cff_otf) |*cff_otf| cff_otf.deinit(alloc);
         self.* = undefined;
+    }
+
+    fn borrowAlloc(self: *const PageFont, alloc: Allocator, name: []const u8) !PageFont {
+        return .{
+            .name = try alloc.dupe(u8, name),
+            .decoder = self.decoder,
+            .type3 = self.type3,
+            .type1 = self.type1,
+            .truetype = self.truetype,
+            .cff_otf = self.cff_otf,
+            .borrowed = true,
+        };
     }
 };
 
@@ -1151,6 +1168,7 @@ pub const Reader = struct {
     xref_entries: []XrefEntry,
     trailer: syntax.Object,
     page_index: ?[]syntax.Object = null,
+    font_cache: *std.AutoHashMapUnmanaged(u64, PageFont),
 
     pub fn init(alloc: Allocator, bytes: []const u8) !Reader {
         if (bytes.len < 10) return error.InvalidPdfHeader;
@@ -1177,6 +1195,10 @@ pub const Reader = struct {
         try parseXrefTable(alloc, bytes, startxref_offset, &entries, &trailer);
         if (trailer == null) return error.MissingTrailer;
 
+        const font_cache = try alloc.create(std.AutoHashMapUnmanaged(u64, PageFont));
+        errdefer alloc.destroy(font_cache);
+        font_cache.* = .empty;
+
         return .{
             .alloc = alloc,
             .bytes = bytes,
@@ -1185,6 +1207,7 @@ pub const Reader = struct {
             .xref_entries = try entries.toOwnedSlice(alloc),
             .trailer = trailer.?,
             .page_index = null,
+            .font_cache = font_cache,
         };
     }
 
@@ -1193,6 +1216,10 @@ pub const Reader = struct {
             for (pages) |*page| page.deinit(self.alloc);
             self.alloc.free(pages);
         }
+        var font_iter = self.font_cache.valueIterator();
+        while (font_iter.next()) |font| font.deinit(self.alloc);
+        self.font_cache.deinit(self.alloc);
+        self.alloc.destroy(self.font_cache);
         self.alloc.free(self.xref_entries);
         self.trailer.deinit(self.alloc);
         self.* = undefined;
@@ -2458,10 +2485,37 @@ pub const Reader = struct {
             out.deinit(self.alloc);
         }
         for (resolved_fonts.dict) |entry| {
+            if (entry.value == .obj_ref) {
+                const ptr = entry.value.obj_ref;
+                const cache_key = (@as(u64, ptr.id) << 16) | @as(u64, ptr.gen);
+                if (self.font_cache.getPtr(cache_key)) |cached| {
+                    var borrowed = try cached.borrowAlloc(self.alloc, entry.key);
+                    errdefer borrowed.deinit(self.alloc);
+                    try out.append(self.alloc, borrowed);
+                    continue;
+                }
+
+                var font_obj = try self.resolveValue(&entry.value);
+                defer font_obj.deinit(self.alloc);
+                if (font_obj != .dict) continue;
+                var cached_font = try self.buildPageFont(entry.key, &font_obj);
+                var owns_cached_font = true;
+                errdefer if (owns_cached_font) cached_font.deinit(self.alloc);
+                try self.font_cache.put(self.alloc, cache_key, cached_font);
+                owns_cached_font = false;
+                const cached = self.font_cache.getPtr(cache_key) orelse unreachable;
+                var borrowed = try cached.borrowAlloc(self.alloc, entry.key);
+                errdefer borrowed.deinit(self.alloc);
+                try out.append(self.alloc, borrowed);
+                continue;
+            }
+
             var font_obj = try self.resolveValue(&entry.value);
             defer font_obj.deinit(self.alloc);
             if (font_obj != .dict) continue;
-            try out.append(self.alloc, try self.buildPageFont(entry.key, &font_obj));
+            var font = try self.buildPageFont(entry.key, &font_obj);
+            errdefer font.deinit(self.alloc);
+            try out.append(self.alloc, font);
         }
         return try out.toOwnedSlice(self.alloc);
     }
@@ -9246,6 +9300,23 @@ test "xref parser ignores an out-of-range generation sentinel" {
         error.MalformedXrefTable,
         parseXrefEntry(1, "0000000000 invalid n"),
     );
+}
+
+test "reader caches shared page fonts across text analysis" {
+    const alloc = std.testing.allocator;
+    const bytes = @embedFile("../testdata/two_page_text_fixture.pdf");
+    var parsed = try Reader.init(alloc, bytes);
+    defer parsed.deinit();
+
+    var first = try parsed.extractPageTextAnalysisAlloc(1);
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), parsed.font_cache.count());
+
+    var second = try parsed.extractPageTextAnalysisAlloc(2);
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), parsed.font_cache.count());
+    try std.testing.expectEqualStrings("FIRST PAGE", std.mem.trim(u8, first.text, &std.ascii.whitespace));
+    try std.testing.expectEqualStrings("SECOND PAGE", std.mem.trim(u8, second.text, &std.ascii.whitespace));
 }
 
 test "reader extracts positioned text runs from text matrix operators" {
