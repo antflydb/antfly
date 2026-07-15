@@ -1867,6 +1867,24 @@ pub const ProvisionedTableWriteCache = struct {
         }
     }
 
+    fn invalidateGroupTable(self: *ProvisionedTableWriteCache, group_id: u64, table_name: []const u8) !void {
+        var matching_entries: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.group_id == group_id and std.mem.eql(u8, entry.table_name, table_name)) matching_entries += 1;
+        }
+        try self.reserveLifecycleRetireCapacityLocked(matching_entries);
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const entry = self.entries.items[i];
+            if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) {
+                i += 1;
+                continue;
+            }
+            _ = self.entries.orderedRemove(i);
+            self.retireEntryLocked(entry);
+        }
+    }
+
     fn retireDbEntriesForTableLocked(self: *ProvisionedTableWriteCache, table_name: []const u8) !void {
         var matching_entries: usize = 0;
         for (self.entries.items) |entry| {
@@ -4415,6 +4433,7 @@ pub const ProvisionedTableWriteSource = struct {
         structural_reconcile_queued: usize = 0,
         structural_reconcile_waiters: usize = 0,
         restore_preparations: usize = 0,
+        generation_preparation_active: bool = false,
     };
 
     const StartupCatchUpBackoff = struct {
@@ -4940,7 +4959,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn pruneTableActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: ?u64) void {
         const index = self.findTableActivityLocked(table_name, group_id) orelse return;
         const entry = self.active_table_activities.items[index];
-        if (entry.table_request_active > 0 or entry.read_request_active > 0 or entry.operation_active or entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) return;
+        if (entry.table_request_active > 0 or entry.read_request_active > 0 or entry.operation_active or entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0 or entry.generation_preparation_active) return;
         const removed = self.active_table_activities.swapRemove(index);
         std.heap.page_allocator.free(removed.table_name);
         if (self.active_table_activities.items.len == 0) {
@@ -4954,6 +4973,13 @@ pub const ProvisionedTableWriteSource = struct {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (entry.group_id == null) continue;
             if (entry.operation_active) return true;
+        }
+        return false;
+    }
+
+    fn hasAnyGenerationPreparationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
+        for (self.active_table_activities.items) |entry| {
+            if (entry.group_id != null and entry.generation_preparation_active and std.mem.eql(u8, entry.table_name, table_name)) return true;
         }
         return false;
     }
@@ -5019,6 +5045,10 @@ pub const ProvisionedTableWriteSource = struct {
         defer self.table_activity_mutex.unlock(io);
         self.activityEntryLocked(table_name, null).structural_reconcile_waiters += 1;
         while (true) {
+            if (self.hasAnyGenerationPreparationLocked(table_name)) {
+                self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                continue;
+            }
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
                 if (entry.structural_active or entry.structural_reconcile_active or entry.restore_preparations > 0 or entry.table_request_active > 0) {
@@ -5061,7 +5091,7 @@ pub const ProvisionedTableWriteSource = struct {
             const index = self.findTableActivityLocked(table_name, null) orelse unreachable;
             const entry = self.active_table_activities.items[index];
             std.debug.assert(entry.structural_reconcile_queued > 0);
-            if (entry.structural_active or entry.structural_reconcile_active or entry.restore_preparations > 0 or entry.table_request_active > 0) {
+            if (entry.structural_active or entry.structural_reconcile_active or entry.restore_preparations > 0 or entry.table_request_active > 0 or self.hasAnyGenerationPreparationLocked(table_name)) {
                 self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                 continue;
             }
@@ -5146,7 +5176,7 @@ pub const ProvisionedTableWriteSource = struct {
             }
             if (self.findTableActivityLocked(table_name, group_id)) |index| {
                 const entry = self.active_table_activities.items[index];
-                if (entry.operation_active) {
+                if (entry.operation_active or entry.generation_preparation_active) {
                     self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                     continue;
                 }
@@ -5164,7 +5194,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         if (self.findTableActivityLocked(table_name, group_id)) |index| {
             const entry = self.active_table_activities.items[index];
-            if (entry.operation_active) return false;
+            if (entry.operation_active or entry.generation_preparation_active) return false;
         }
         const entry = self.activityEntryLocked(table_name, group_id);
         entry.operation_active = true;
@@ -5180,11 +5210,47 @@ pub const ProvisionedTableWriteSource = struct {
         self.table_activity_ready.broadcast(io);
     }
 
+    fn beginGroupGenerationPreparation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        while (true) {
+            if (self.findTableActivityLocked(table_name, null)) |index| {
+                const entry = self.active_table_activities.items[index];
+                if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) {
+                    self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                    continue;
+                }
+            }
+            if (self.findTableActivityLocked(table_name, group_id)) |index| {
+                const entry = self.active_table_activities.items[index];
+                if (entry.operation_active or entry.generation_preparation_active) {
+                    self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                    continue;
+                }
+            }
+            self.activityEntryLocked(table_name, group_id).generation_preparation_active = true;
+            return;
+        }
+    }
+
+    fn endGroupGenerationPreparation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const index = self.findTableActivityLocked(table_name, group_id) orelse unreachable;
+        std.debug.assert(self.active_table_activities.items[index].generation_preparation_active);
+        self.active_table_activities.items[index].generation_preparation_active = false;
+        self.pruneTableActivityLocked(table_name, group_id);
+        self.table_activity_ready.broadcast(io);
+    }
+
     fn tryBeginStructuralTableActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
             if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0 or entry.table_request_active > 0 or entry.read_request_active > 0) return false;
         }
+        if (self.hasAnyGenerationPreparationLocked(table_name)) return false;
         if (self.hasAnyActiveGroupOperationLocked(table_name)) return false;
         const entry = self.activityEntryLocked(table_name, null);
         entry.structural_active = true;
@@ -5201,7 +5267,7 @@ pub const ProvisionedTableWriteSource = struct {
                     continue;
                 }
             }
-            if (self.hasAnyActiveGroupOperationLocked(table_name)) {
+            if (self.hasAnyGenerationPreparationLocked(table_name) or self.hasAnyActiveGroupOperationLocked(table_name)) {
                 self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                 continue;
             }
@@ -5229,7 +5295,7 @@ pub const ProvisionedTableWriteSource = struct {
                     continue;
                 }
             }
-            if (self.hasAnyActiveGroupOperationLocked(table_name)) {
+            if (self.hasAnyGenerationPreparationLocked(table_name) or self.hasAnyActiveGroupOperationLocked(table_name)) {
                 self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                 continue;
             }
@@ -5638,6 +5704,67 @@ pub const ProvisionedTableWriteSource = struct {
         self.drainWriteCachePendingCloses();
         self.endStructuralTableActivity(table_name);
     }
+
+    fn beginLocalGroupGenerationTransitionFromPreparation(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+    ) !LocalGroupGenerationTransition {
+        var read_cache_exclusive = try self.beginReadCacheGroupExclusive(group_id);
+        errdefer if (read_cache_exclusive) |*exclusive| exclusive.deinit();
+
+        lockAtomic(&self.local_db_mutex);
+        errdefer self.local_db_mutex.unlock();
+        if (self.write_cache) |cache| try cache.invalidateGroupTable(group_id, table_name);
+        if (self.startup_write_cache) |cache| try cache.invalidateGroupTable(group_id, table_name);
+        self.invalidateRuntimeStatusCache(table_name);
+        self.local_db_mutex.unlock();
+        self.drainWriteCachePendingClosesForGroups(table_name, &.{group_id});
+        return .{
+            .source = self,
+            .table_name = table_name,
+            .group_id = group_id,
+            .read_cache_exclusive = read_cache_exclusive,
+        };
+    }
+
+    const LocalGroupGenerationTransition = struct {
+        source: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+        read_cache_exclusive: ?table_reads.ProvisionedTableReadCache.ExclusiveGroupAccess = null,
+        preparation_open: bool = true,
+
+        fn finishMutation(self: *@This()) void {
+            std.debug.assert(self.preparation_open);
+            self.source.invalidateRuntimeStatusCache(self.table_name);
+            self.source.endGroupGenerationPreparation(self.table_name, self.group_id);
+            self.preparation_open = false;
+        }
+
+        fn abort(self: *@This()) void {
+            if (self.preparation_open) {
+                self.source.endGroupGenerationPreparation(self.table_name, self.group_id);
+                self.preparation_open = false;
+            }
+            self.releaseReadExclusive();
+        }
+
+        fn deinit(self: *@This()) void {
+            if (self.preparation_open) {
+                self.source.endGroupGenerationPreparation(self.table_name, self.group_id);
+                self.preparation_open = false;
+            }
+            self.releaseReadExclusive();
+        }
+
+        fn releaseReadExclusive(self: *@This()) void {
+            if (self.read_cache_exclusive) |*exclusive| {
+                exclusive.deinit();
+                self.read_cache_exclusive = null;
+            }
+        }
+    };
 
     const LocalTableGenerationTransition = struct {
         source: *ProvisionedTableWriteSource,
@@ -6200,6 +6327,14 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?table_reads.ProvisionedTableReadCache.ExclusiveTableAccess {
         const cache = self.read_cache orelse return null;
         return try cache.beginExclusiveTableAccess(table_name);
+    }
+
+    fn beginReadCacheGroupExclusive(
+        self: *ProvisionedTableWriteSource,
+        group_id: u64,
+    ) !?table_reads.ProvisionedTableReadCache.ExclusiveGroupAccess {
+        const cache = self.read_cache orelse return null;
+        return try cache.beginExclusiveGroupAccess(group_id);
     }
 
     fn invalidateWriteCacheForTable(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -7500,7 +7635,8 @@ pub const ProvisionedTableWriteSource = struct {
             if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) return true;
         }
         if (self.findTableActivityLocked(table_name, group_id)) |index| {
-            if (self.active_table_activities.items[index].operation_active) return true;
+            const entry = self.active_table_activities.items[index];
+            if (entry.operation_active or entry.generation_preparation_active) return true;
         }
         return false;
     }
@@ -7545,7 +7681,7 @@ pub const ProvisionedTableWriteSource = struct {
         for (self.active_table_activities.items) |activity| {
             if (!std.mem.eql(u8, activity.table_name, table_name)) continue;
             const group_id = activity.group_id orelse continue;
-            if (!activity.operation_active) continue;
+            if (!activity.operation_active and !activity.generation_preparation_active) continue;
             try groups.append(alloc, group_id);
         }
 
@@ -8319,10 +8455,9 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         staged_generation: *const db_mod.generation_lifecycle.StagedGeneration,
         group_id: u64,
-        table_name: []const u8,
         indexes_json: []const u8,
+        identity_namespace: doc_identity.Namespace,
     ) !db_mod.DB {
-        const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
         var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
             alloc,
             staged_generation.path(),
@@ -10308,23 +10443,47 @@ pub const ProvisionedTableWriteSource = struct {
         const state = try shard_state_store.GroupStateSnapshotStream.init(encoded);
         try shard_state_store.validateGroupStateSnapshotStream(alloc, group_id, state);
 
-        var catalog_snapshot = try self.catalog.adminSnapshot();
-        defer self.catalog.freeAdminSnapshot(&catalog_snapshot);
-        const range = metadata_mod.findAdminRange(&catalog_snapshot, group_id) orelse return error.UnknownGroup;
-        const table = metadata_mod.findAdminTable(&catalog_snapshot, range.table_id) orelse return error.TableNotFound;
-        const table_name = table.name;
+        var discovery_snapshot = try self.catalog.adminSnapshot();
+        var discovery_snapshot_owned = true;
+        defer if (discovery_snapshot_owned) self.catalog.freeAdminSnapshot(&discovery_snapshot);
+        const discovered_range = metadata_mod.findAdminRange(&discovery_snapshot, group_id) orelse return error.UnknownGroup;
+        const discovered_table = metadata_mod.findAdminTable(&discovery_snapshot, discovered_range.table_id) orelse return error.TableNotFound;
+        const table_id = discovered_table.table_id;
+        const table_name = try alloc.dupe(u8, discovered_table.name);
+        self.catalog.freeAdminSnapshot(&discovery_snapshot);
+        discovery_snapshot_owned = false;
+        defer alloc.free(table_name);
+
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
 
-        self.beginRestoreLifecycleActivity(table_name);
+        self.beginGroupGenerationPreparation(table_name, group_id);
         var preparation_activity = true;
-        defer if (preparation_activity) self.endRestoreLifecycleActivity(table_name);
+        defer if (preparation_activity) self.endGroupGenerationPreparation(table_name, group_id);
+
+        // Capture every catalog value consumed by staging after admission. The
+        // same contract is checked again before publication so a concurrent
+        // split or schema/index change cannot publish a generation built for a
+        // stale table topology.
+        var catalog_snapshot = try self.catalog.adminSnapshot();
+        defer self.catalog.freeAdminSnapshot(&catalog_snapshot);
+        const range = metadata_mod.findAdminRange(&catalog_snapshot, group_id) orelse return error.CatalogChanged;
+        if (range.table_id != table_id) return error.CatalogChanged;
+        const table = metadata_mod.findAdminTable(&catalog_snapshot, table_id) orelse return error.CatalogChanged;
+        if (!std.mem.eql(u8, table.name, table_name)) return error.CatalogChanged;
+        if (!std.mem.eql(u8, state.byte_range.start, range.start_key) or
+            !std.mem.eql(u8, state.byte_range.end, range.end_key orelse ""))
+        {
+            return error.SnapshotRangeMismatch;
+        }
+        const identity_namespace = tableIdentityNamespaceForRange(table.*, range.*);
 
         const generation_source = self.groupVisibleRootGenerationSource();
-        const generation_reserved = if (generation_source) |root_generation_source|
-            try root_generation_source.prepareRootGenerationForGroup(group_id)
+        var generation_reservation = if (generation_source) |root_generation_source|
+            try root_generation_source.reserveRootGenerationForGroup(group_id)
         else
-            false;
+            null;
+        defer if (generation_reservation) |*reservation| reservation.deinit();
 
         var preparation = try db_mod.generation_lifecycle.beginProcessPreparationWithRuntime(path, self.backend_runtime);
         defer preparation.deinit();
@@ -10340,8 +10499,8 @@ pub const ProvisionedTableWriteSource = struct {
                 alloc,
                 &staged,
                 group_id,
-                table_name,
                 table.indexes_json,
+                identity_namespace,
             );
             defer staged_db.close();
             try applyLocalTableSchemaJson(alloc, &staged_db, table.schema_json);
@@ -10378,15 +10537,26 @@ pub const ProvisionedTableWriteSource = struct {
         }
         try staged.seal();
 
-        var transition = try self.beginLocalTableGenerationTransitionFromPreparation(table_name);
+        var transition = try self.beginLocalGroupGenerationTransitionFromPreparation(table_name, group_id);
         preparation_activity = false;
         errdefer transition.abort();
         defer transition.deinit();
+
+        // Draining an old read generation can take time. Fence the catalog only
+        // after that drain so the final check is adjacent to namespace publish.
+        var publication_snapshot = try self.catalog.adminSnapshot();
+        defer self.catalog.freeAdminSnapshot(&publication_snapshot);
+        const publication_range = metadata_mod.findAdminRange(&publication_snapshot, group_id) orelse return error.CatalogChanged;
+        const publication_table = metadata_mod.findAdminTable(&publication_snapshot, table_id) orelse return error.CatalogChanged;
+        if (!raftSnapshotCatalogContractEqual(table.*, range.*, publication_table.*, publication_range.*)) {
+            return error.CatalogChanged;
+        }
+
         self.invalidateSharedPathCaches(path);
         var shard_transition = try preparation.promote();
         defer shard_transition.deinit();
         const publication_outcome = try staged.publish();
-        if (generation_reserved) generation_source.?.advanceRootGenerationForGroup(group_id);
+        if (generation_reservation) |*reservation| reservation.advance();
         self.invalidateSharedPathCaches(path);
         transition.finishMutation();
         self.notifyLocalChange(table_name, .structural);
@@ -16822,13 +16992,33 @@ fn loadTableIdentityNamespaceForGroup(
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
     for (snapshot.ranges) |range| {
         if (range.table_id != table.table_id or range.group_id != group_id) continue;
-        return .{
-            .table_id = table.table_id,
-            .shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
-            .range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
-        };
+        return tableIdentityNamespaceForRange(table.*, range);
     }
     return null;
+}
+
+fn tableIdentityNamespaceForRange(
+    table: metadata_table_manager.TableRecord,
+    range: metadata_table_manager.RangeRecord,
+) doc_identity.Namespace {
+    return .{
+        .table_id = table.table_id,
+        .shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
+        .range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
+    };
+}
+
+fn raftSnapshotCatalogContractEqual(
+    expected_table: metadata_table_manager.TableRecord,
+    expected_range: metadata_table_manager.RangeRecord,
+    actual_table: metadata_table_manager.TableRecord,
+    actual_range: metadata_table_manager.RangeRecord,
+) bool {
+    return expected_table.table_id == actual_table.table_id and
+        std.mem.eql(u8, expected_table.name, actual_table.name) and
+        std.mem.eql(u8, expected_table.schema_json, actual_table.schema_json) and
+        std.mem.eql(u8, expected_table.indexes_json, actual_table.indexes_json) and
+        metadata_table_manager.rangeRecordsEqual(expected_range, actual_range);
 }
 
 fn findTableRecord(tables: []const metadata_table_manager.TableRecord, table_id: u64) ?metadata_table_manager.TableRecord {
@@ -31078,6 +31268,148 @@ fn testingVisibleRootGenerationSource(value: *u64) table_reads.GroupVisibleRootG
 
 fn testingVisibleRootGenerationForGroup(ptr: *anyopaque, _: u64) u64 {
     return (@as(*u64, @ptrCast(@alignCast(ptr)))).*;
+}
+
+const RaftSnapshotInstallTestCatalog = struct {
+    calls: usize = 0,
+    change_on_call: ?usize = null,
+
+    fn iface(self: *@This()) table_catalog.CatalogSource {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+            },
+        };
+    }
+
+    fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        const changed = if (self.change_on_call) |call| self.calls >= call else false;
+        const ranges = if (changed)
+            @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                .group_id = 7001,
+                .table_id = 7,
+                .range_id = 7102,
+                .start_key = "",
+                .end_key = null,
+            }})[0..])
+        else
+            @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                .group_id = 7001,
+                .table_id = 7,
+                .range_id = 7101,
+                .start_key = "",
+                .end_key = null,
+            }})[0..]);
+        return .{
+            .status = .{ .metadata_group_id = 1, .metrics = .{} },
+            .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                .table_id = 7,
+                .name = "docs",
+                .indexes_json = "{\"indexes\":[]}",
+                .placement_role = "data",
+            }})[0..]),
+            .ranges = ranges,
+            .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+            .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+            .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+            .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+        };
+    }
+
+    fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+};
+
+const RaftSnapshotInstallGenerationTracker = struct {
+    generation: u64 = table_reads.backend_current_root_generation,
+    reservations: usize = 0,
+
+    fn iface(self: *@This()) table_reads.GroupVisibleRootGenerationSource {
+        return .{
+            .ptr = self,
+            .visible_root_generation_for_group = visible,
+            .reserve_root_generation_for_group = reserve,
+            .finish_root_generation_reservation = finish,
+        };
+    }
+
+    fn visible(ptr: *anyopaque, _: u64) u64 {
+        return (@as(*@This(), @ptrCast(@alignCast(ptr)))).generation;
+    }
+
+    fn reserve(ptr: *anyopaque, _: u64) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.reservations += 1;
+    }
+
+    fn finish(ptr: *anyopaque, _: u64, advance: bool) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        std.debug.assert(self.reservations > 0);
+        if (advance) self.generation +%= 1;
+        self.reservations -= 1;
+    }
+};
+
+test "provisioned Raft snapshot install publishes a fenced group generation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/raft-snapshot-install", .{tmp.sub_path});
+    defer alloc.free(replica_root);
+
+    var catalog = RaftSnapshotInstallTestCatalog{};
+    var generations = RaftSnapshotInstallGenerationTracker{};
+    var source = ProvisionedTableWriteSource.init(replica_root, catalog.iface());
+    defer source.deinit();
+    _ = source.withGroupVisibleRootGeneration(generations.iface());
+
+    const wrong_range = try shard_state_store.encodeGroupStateSnapshot(alloc, .{ .start = "a", .end = "z" }, &.{}, &.{});
+    defer alloc.free(wrong_range);
+    try std.testing.expectError(error.SnapshotRangeMismatch, source.installRaftSnapshotGroupLocal(alloc, 7001, wrong_range));
+
+    const encoded = try shard_state_store.encodeGroupStateSnapshot(
+        alloc,
+        .{ .start = "", .end = "" },
+        &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+        &.{},
+    );
+    defer alloc.free(encoded);
+    try source.installRaftSnapshotGroupLocal(alloc, 7001, encoded);
+
+    try std.testing.expectEqual(@as(usize, 5), catalog.calls);
+    try std.testing.expectEqual(@as(u64, 1), generations.generation);
+    try std.testing.expectEqual(@as(usize, 0), generations.reservations);
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root, 7001);
+    defer alloc.free(path);
+    var db = try openManagedDbForTableGroupWithRuntime(alloc, path, catalog.iface(), "docs", 7001, null);
+    defer db.close();
+    var result = (try db.lookup(alloc, "doc:a", .{})).?;
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"name\":\"alpha\"}", result.json);
+}
+
+test "provisioned Raft snapshot install rejects a changed catalog contract" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/raft-snapshot-catalog-fence", .{tmp.sub_path});
+    defer alloc.free(replica_root);
+
+    var catalog = RaftSnapshotInstallTestCatalog{ .change_on_call = 3 };
+    var generations = RaftSnapshotInstallGenerationTracker{};
+    var source = ProvisionedTableWriteSource.init(replica_root, catalog.iface());
+    defer source.deinit();
+    _ = source.withGroupVisibleRootGeneration(generations.iface());
+    const encoded = try shard_state_store.encodeGroupStateSnapshot(alloc, .{ .start = "", .end = "" }, &.{}, &.{});
+    defer alloc.free(encoded);
+
+    try std.testing.expectError(error.CatalogChanged, source.installRaftSnapshotGroupLocal(alloc, 7001, encoded));
+    try std.testing.expectEqual(@as(usize, 3), catalog.calls);
+    try std.testing.expectEqual(@as(u64, 0), generations.generation);
+    try std.testing.expectEqual(@as(usize, 0), generations.reservations);
 }
 
 test "write cache prunes stale visible root generations instead of clearing current entries" {

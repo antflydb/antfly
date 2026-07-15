@@ -4547,6 +4547,7 @@ pub fn build(b: *std.Build) void {
             "aggregation completeness requires exact total relation",
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
             "provisioned read cache exclusive access drains active read leases",
+            "provisioned read cache group exclusive drains only the published group",
             "provisioned storage inspection uses table read admission",
             "provisioned distributed aggregations collect path terms nested cardinality",
             "parseRemoteSearchResult preserves fused index scores",
@@ -4677,6 +4678,9 @@ pub fn build(b: *std.Build) void {
             "dirty auto bulk writer publishes runtime status without closing the cached writer",
             "write cache retirement is allocation-free after entry installation",
             "provisioned read cache retirement is allocation-free after entry installation",
+            "provisioned group storage prunes stale visible root generations",
+            "provisioned Raft snapshot install publishes a fenced group generation",
+            "provisioned Raft snapshot install rejects a changed catalog contract",
         },
     });
     const run_api_table_writes_production_regression_tests = b.addRunArtifact(api_table_writes_production_regression_tests);

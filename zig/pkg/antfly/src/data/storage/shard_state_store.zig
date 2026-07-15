@@ -593,7 +593,7 @@ pub const GroupStateSnapshotStream = struct {
         return .{ .encoded = self.encoded, .pos = self.entries_pos };
     }
 
-    fn controls(self: GroupStateSnapshotStream) Iterator {
+    pub fn controls(self: GroupStateSnapshotStream) Iterator {
         return .{ .encoded = self.encoded, .pos = self.controls_pos };
     }
 };
@@ -669,6 +669,65 @@ pub fn validateGroupStateSnapshotStream(alloc: std.mem.Allocator, group_id: u64,
 
 pub fn installSnapshot(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64, encoded: []const u8) !void {
     try installSnapshotWithMetadata(store, alloc, group_id, encoded, &.{});
+}
+
+/// Imports a validated snapshot into a private, empty generation. Publication
+/// is owned by the caller, so independently committed chunks cannot become
+/// visible. Memory is bounded by one chunk of transformed keys and descriptors.
+pub fn installSnapshotStreamIntoEmptyStore(
+    store: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    snapshot: GroupStateSnapshotStream,
+    external_metadata_writes: []const docstore.KVPair,
+) !void {
+    try validateGroupStateSnapshotStream(alloc, group_id, snapshot);
+
+    const max_chunk_entries = 512;
+    var writes: [max_chunk_entries]docstore.KVPair = undefined;
+    var owned_keys: [max_chunk_entries][]u8 = undefined;
+    var entries = snapshot.entries();
+    var exhausted = false;
+    while (!exhausted) {
+        var len: usize = 0;
+        defer for (owned_keys[0..len]) |key| alloc.free(key);
+        while (len < writes.len) {
+            const entry = (try entries.next()) orelse {
+                exhausted = true;
+                break;
+            };
+            const key = try groupDocumentStoreKeyAlloc(alloc, group_id, entry.key);
+            owned_keys[len] = key;
+            writes[len] = .{ .key = key, .value = entry.value };
+            len += 1;
+        }
+        if (len > 0) try store.putBatch(writes[0..len], &.{});
+    }
+
+    var controls = snapshot.controls();
+    exhausted = false;
+    while (!exhausted) {
+        var len: usize = 0;
+        while (len < writes.len) {
+            const control = (try controls.next()) orelse {
+                exhausted = true;
+                break;
+            };
+            writes[len] = .{ .key = control.key, .value = control.value };
+            len += 1;
+        }
+        if (len > 0) try store.putBatch(writes[0..len], &.{});
+    }
+
+    const range_key = try groupRangeKeyAlloc(alloc, group_id);
+    defer alloc.free(range_key);
+    var range_buf: [1024]u8 = undefined;
+    const range_value = try range_state.encodeRange(snapshot.byte_range, &range_buf);
+    if (external_metadata_writes.len > max_chunk_entries - 1) return error.SnapshotMetadataTooLarge;
+    writes[0] = .{ .key = range_key, .value = range_value };
+    @memcpy(writes[1..][0..external_metadata_writes.len], external_metadata_writes);
+    try store.putBatch(writes[0 .. external_metadata_writes.len + 1], &.{});
+    try store.sync(true);
 }
 
 pub fn installSnapshotWithMetadata(

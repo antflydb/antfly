@@ -74,14 +74,31 @@ the admission-critical publication path.
 Data-Raft snapshot apply follows the same generation boundary. The apply path
 validates the canonical snapshot stream without materializing document values
 or a descriptor per document, builds a fresh staged DB in fixed-size borrowed
-batches, syncs and seals it, then atomically publishes it under the table and
-shard transition capabilities. It never scans or deletes the old live table.
+batches, syncs and seals it, then atomically publishes it under a group-scoped
+generation capability. It never scans or deletes the old live table. Durable
+data-Raft projections are physically partitioned by group, while a root-level
+coordinator retains the single process writer authority. This makes snapshot
+replacement proportional to the incoming group snapshot and avoids rewriting,
+describing, or retaining keys for unrelated groups.
 Shared cache-generation bookkeeping is reserved before staging and advanced
 without allocation immediately after the namespace exchange, so no fallible
 bookkeeping step can leave the new root visible under the old cache identity.
 Schema validation is parsed once per snapshot and applied per bounded batch;
 derived replay remains durable in the staged generation for normal workers to
-resume after publication.
+resume after publication. Staging excludes only applies for the target group;
+other groups, including groups in the same table, continue serving and applying.
+Publication retires and drains only the target group's read/write owners and
+uses an exact group read-cache admission fence. Table-wide drop, schema, index,
+and restore transitions wait for every group preparation and retain table-wide
+epochs.
+
+The install's catalog inputs form one explicit contract: table identity, table
+name, schema, index catalog, range topology, and document-identity namespace are
+captured after group admission. The snapshot's encoded range must match that
+catalog range. The exact contract is recaptured after serving
+leases drain and immediately before namespace publication. A split, merge,
+schema, index, or identity change therefore fails the install closed with no
+live-root mutation; unrelated metadata changes do not force a retry.
 
 `DB.restoreSnapshotToDeferredRuntimeRepair()` accepts a `StagedGeneration`
 capability and rejects a path that is not the capability's staging root. Raw
@@ -316,6 +333,17 @@ forwarding API source must not create a second activity or cache domain over the
 same table-group path. Its read-preparation and primary-lookup interfaces must
 delegate to the canonical local write owner even when those interfaces were
 captured before owner attachment.
+
+Data-Raft snapshot installation uses the narrower group generation transition.
+A preparation token serializes the target group's apply stream while allowing
+other group operations and table reads to continue. Publication then acquires a
+group-exclusive read-cache lease, retires only matching write/startup owners,
+drains their leases, exchanges the staged root, advances a reserved visible-root
+generation, and releases queued applies. The reservation itself owns a map
+reference, so topology pruning cannot remove generation bookkeeping during a
+fallible staging operation. Exchanged old apply roots are submitted to the
+shared backend runtime cleanup lane rather than reclaimed on the Raft apply
+critical path.
 
 Split and merge control paths follow the same rule. Transition coordinators
 borrow the raft host's apply store and retain the managed destination or
@@ -1277,8 +1305,8 @@ Snapshot compaction is asynchronous, fair, bounded-memory maintenance:
 - data snapshots stream each MVCC cursor once into a temporary artifact with a
   fixed-size buffer. Current-only AFDS v3 uses terminated records, avoiding a
   separate document-count pass before encoding. Followers validate and install
-  from borrowed payload slices, allocating only entry descriptors rather than a
-  second payload-sized copy;
+  from borrowed payload slices in fixed-size batches, without a payload-sized
+  copy or document-count-sized descriptor allocation;
 - durable replica state publishes payloads by `(index, term)` before advancing
   checkpoint metadata, retains the preceding payload until that checkpoint is
   durable, and loads payload bytes only when snapshot transfer requests them.
