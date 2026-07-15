@@ -50,8 +50,6 @@ class GraphIndexStats:
         catch_up_phase (str | Unset):
         catch_up_applied_sequence (int | Unset):
         catch_up_target_sequence (int | Unset):
-        source_artifact (GraphSourceArtifactStatus | Unset): Materialization status for one configured graph artifact
-            source.
         source_artifacts (list[GraphSourceArtifactStatus] | Unset): Materialization status for every configured graph
             source artifact.
         resolver_replay (GraphIndexStatsResolverReplay | Unset): Resolver replay diagnostics for graph materialization.
@@ -107,7 +105,6 @@ class GraphIndexStats:
     catch_up_phase: str | Unset = UNSET
     catch_up_applied_sequence: int | Unset = UNSET
     catch_up_target_sequence: int | Unset = UNSET
-    source_artifact: GraphSourceArtifactStatus | Unset = UNSET
     source_artifacts: list[GraphSourceArtifactStatus] | Unset = UNSET
     resolver_replay: GraphIndexStatsResolverReplay | Unset = UNSET
     async_indexing: GraphIndexStatsAsyncIndexing | Unset = UNSET
@@ -181,10 +178,6 @@ class GraphIndexStats:
         catch_up_applied_sequence = self.catch_up_applied_sequence
 
         catch_up_target_sequence = self.catch_up_target_sequence
-
-        source_artifact: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.source_artifact, Unset):
-            source_artifact = self.source_artifact.to_dict()
 
         source_artifacts: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.source_artifacts, Unset):
@@ -298,8 +291,6 @@ class GraphIndexStats:
             field_dict["catch_up_applied_sequence"] = catch_up_applied_sequence
         if catch_up_target_sequence is not UNSET:
             field_dict["catch_up_target_sequence"] = catch_up_target_sequence
-        if source_artifact is not UNSET:
-            field_dict["source_artifact"] = source_artifact
         if source_artifacts is not UNSET:
             field_dict["source_artifacts"] = source_artifacts
         if resolver_replay is not UNSET:
@@ -411,13 +402,6 @@ class GraphIndexStats:
 
         catch_up_target_sequence = d.pop("catch_up_target_sequence", UNSET)
 
-        _source_artifact = d.pop("source_artifact", UNSET)
-        source_artifact: GraphSourceArtifactStatus | Unset
-        if isinstance(_source_artifact, Unset):
-            source_artifact = UNSET
-        else:
-            source_artifact = GraphSourceArtifactStatus.from_dict(_source_artifact)
-
         _source_artifacts = d.pop("source_artifacts", UNSET)
         source_artifacts: list[GraphSourceArtifactStatus] | Unset = UNSET
         if _source_artifacts is not UNSET:
@@ -520,7 +504,6 @@ class GraphIndexStats:
             catch_up_phase=catch_up_phase,
             catch_up_applied_sequence=catch_up_applied_sequence,
             catch_up_target_sequence=catch_up_target_sequence,
-            source_artifact=source_artifact,
             source_artifacts=source_artifacts,
             resolver_replay=resolver_replay,
             async_indexing=async_indexing,

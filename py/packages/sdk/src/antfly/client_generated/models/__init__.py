@@ -255,7 +255,12 @@ from .google_embedder_config import GoogleEmbedderConfig
 from .google_generator_config import GoogleGeneratorConfig
 from .graph_index_config import GraphIndexConfig
 from .graph_index_source import GraphIndexSource
+from .graph_index_source_context import GraphIndexSourceContext
+from .graph_index_source_edge import GraphIndexSourceEdge
+from .graph_index_source_edge_metadata import GraphIndexSourceEdgeMetadata
 from .graph_index_source_format import GraphIndexSourceFormat
+from .graph_index_source_nodes import GraphIndexSourceNodes
+from .graph_index_source_nodes_model import GraphIndexSourceNodesModel
 from .graph_index_stats import GraphIndexStats
 from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
 from .graph_index_stats_algebraic_graph_traversal import GraphIndexStatsAlgebraicGraphTraversal
@@ -923,7 +928,12 @@ __all__ = (
     "GoogleGeneratorConfig",
     "GraphIndexConfig",
     "GraphIndexSource",
+    "GraphIndexSourceContext",
+    "GraphIndexSourceEdge",
+    "GraphIndexSourceEdgeMetadata",
     "GraphIndexSourceFormat",
+    "GraphIndexSourceNodes",
+    "GraphIndexSourceNodesModel",
     "GraphIndexStats",
     "GraphIndexStatsAlgebraicGraph",
     "GraphIndexStatsAlgebraicGraphTraversal",

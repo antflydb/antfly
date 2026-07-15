@@ -292,6 +292,14 @@ pub fn collectArtifactEnrichmentsFromTableIndexesJson(
     alloc: std.mem.Allocator,
     indexes_json: []const u8,
 ) ![]db_mod.types.EnrichmentConfig {
+    return try collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(alloc, indexes_json, .{});
+}
+
+pub fn collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+    embedding_options: managed_embedder.InitOptions,
+) ![]db_mod.types.EnrichmentConfig {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexesJsonSource(indexes_json), .{});
     defer parsed.deinit();
 
@@ -300,7 +308,7 @@ pub fn collectArtifactEnrichmentsFromTableIndexesJson(
         for (out.items) |*cfg| cfg.deinit(alloc);
         out.deinit(alloc);
     }
-    try collectArtifactEnrichmentsFromValue(alloc, parsed.value, &out);
+    try collectArtifactEnrichmentsFromValue(alloc, parsed.value, embedding_options, &out);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -386,6 +394,7 @@ pub fn sortArtifactEnrichmentsByDependency(configs: []db_mod.types.EnrichmentCon
 fn collectArtifactEnrichmentsFromValue(
     alloc: std.mem.Allocator,
     value: std.json.Value,
+    embedding_options: managed_embedder.InitOptions,
     out: *std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig),
 ) !void {
     switch (value) {
@@ -394,7 +403,7 @@ fn collectArtifactEnrichmentsFromValue(
                 const type_value = object.get("type") orelse break :blk null;
                 if (type_value != .string or !std.mem.eql(u8, type_value.string, "embeddings")) break :blk null;
                 if (object.get("embedder") == null) break :blk null;
-                break :blk try managed_embedder.embeddingSemanticProducerJsonAlloc(alloc, value);
+                break :blk try managed_embedder.embeddingSemanticProducerJsonAllocWithOptions(alloc, value, embedding_options);
             };
             defer if (embedding_producer_json) |raw| alloc.free(raw);
             if (object.get("enrichments")) |enrichments| {
@@ -421,11 +430,11 @@ fn collectArtifactEnrichmentsFromValue(
             var it = object.iterator();
             while (it.next()) |entry| {
                 if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
-                try collectArtifactEnrichmentsFromValue(alloc, entry.value_ptr.*, out);
+                try collectArtifactEnrichmentsFromValue(alloc, entry.value_ptr.*, embedding_options, out);
             }
         },
         .array => |array| {
-            for (array.items) |item| try collectArtifactEnrichmentsFromValue(alloc, item, out);
+            for (array.items) |item| try collectArtifactEnrichmentsFromValue(alloc, item, embedding_options, out);
         },
         else => {},
     }
@@ -952,7 +961,6 @@ const GraphSourceStatus = struct {
 
 const GraphSourcesStatus = struct {
     sources: []const std.json.Value = &.{},
-    legacy: ?GraphSourceStatus = null,
 };
 
 fn graphSourceStatusFromValue(source: std.json.Value) ?GraphSourceStatus {
@@ -974,27 +982,9 @@ fn graphSourceStatusFromValue(source: std.json.Value) ?GraphSourceStatus {
 
 fn graphSourcesStatus(config: std.json.Value) ?GraphSourcesStatus {
     if (config != .object) return null;
-    if (config.object.get("sources")) |sources| {
-        if (sources != .array or sources.array.items.len == 0) return null;
-        return .{ .sources = sources.array.items };
-    }
-    const source = config.object.get("source") orelse return null;
-    if (source != .object) return null;
-    const kind = source.object.get("kind") orelse return null;
-    if (kind != .string or !std.mem.eql(u8, kind.string, "artifact")) return null;
-    const artifact = source.object.get("artifact") orelse return null;
-    if (artifact != .string or artifact.string.len == 0) return null;
-    return .{ .legacy = .{
-        .artifact = artifact.string,
-        .path = if (source.object.get("path")) |value| switch (value) {
-            .string => value.string,
-            else => "",
-        } else "",
-        .format = if (source.object.get("format")) |value| switch (value) {
-            .string => value.string,
-            else => "extraction_relation",
-        } else "extraction_relation",
-    } };
+    const sources = config.object.get("sources") orelse return null;
+    if (sources != .array or sources.array.items.len == 0) return null;
+    return .{ .sources = sources.array.items };
 }
 
 fn appendGraphSourceStatusObject(
@@ -2468,26 +2458,13 @@ fn appendSingleIndexRuntimeStatus(
             const materialization_pending = catch_up_active or replay_catch_up_required;
             try out.appendSlice(alloc, ",\"source_artifacts\":[");
             var first = true;
-            var compatibility_source: ?GraphSourceStatus = status.legacy;
             for (status.sources) |source_value| {
                 const source = graphSourceStatusFromValue(source_value) orelse continue;
-                if (compatibility_source == null) compatibility_source = source;
                 if (!first) try out.append(alloc, ',');
                 first = false;
                 try appendGraphSourceStatusObject(alloc, out, source, materialization_pending);
             }
-            if (status.legacy) |source| {
-                if (!first) try out.append(alloc, ',');
-                try appendGraphSourceStatusObject(alloc, out, source, materialization_pending);
-            }
             try out.append(alloc, ']');
-
-            // Keep the singular field for compatibility while exposing every
-            // configured source in source_artifacts.
-            if (compatibility_source) |source| {
-                try out.appendSlice(alloc, ",\"source_artifact\":");
-                try appendGraphSourceStatusObject(alloc, out, source, materialization_pending);
-            }
         }
     }
     if (index_type == .algebraic) try appendAlgebraicIndexStatsFields(alloc, out, item);
@@ -3292,6 +3269,13 @@ pub fn testEmbeddingEnrichmentsPersistSemanticProducerIdentity() !void {
     try std.testing.expectEqualStrings(configs[0].producer_json, configs[1].producer_json);
     try std.testing.expect(std.mem.indexOf(u8, configs[0].producer_json, "embed-v1") != null);
     try std.testing.expect(std.mem.indexOf(u8, configs[0].producer_json, "secret") == null);
+
+    const effective = try collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(std.testing.allocator,
+        \\{"vectors":{"type":"embeddings","dimension":3,"embedder":{"provider":"antfly","model":"embed-v1"},"sources":[{"artifact":"dense_v1"}],"enrichments":[{"name":"dense_v1","kind":"embedding","field":"body"}]}}
+    , .{ .inference_api_url = "https://inference.example" });
+    defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, effective);
+    try std.testing.expectEqual(@as(usize, 1), effective.len);
+    try std.testing.expect(std.mem.indexOf(u8, effective[0].producer_json, "https://inference.example/ai/v1") != null);
 }
 
 test "embedding enrichments persist canonical semantic producer identity" {
@@ -3538,8 +3522,8 @@ pub fn testGraphArtifactSourceMaterializationStatus() !void {
 
     const encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "relations_graph", &local_status)).?;
     defer alloc.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_artifact\":{\"name\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\",\"materialization_pending\":true}") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_artifacts\":[{\"name\":\"relations_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_artifact\":") == null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "{\"name\":\"entity_graph_v1\",\"path\":\"$.graph\",\"format\":\"extraction_graph\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"shard_status\":{\"7\":{") != null);
 }

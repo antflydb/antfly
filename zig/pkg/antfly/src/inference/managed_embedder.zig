@@ -370,7 +370,6 @@ pub const ManagedEmbeddingEntry = struct {
     io: ?std.Io = null,
     deadline_ns: ?u64 = null,
     index_name: []u8,
-    embedding_name: []u8 = "",
     embedding_names: [][]u8 = &.{},
     provider: ProviderKind,
     model: []u8,
@@ -394,7 +393,6 @@ pub const ManagedEmbeddingEntry = struct {
     fn deinit(self: *ManagedEmbeddingEntry, alloc: std.mem.Allocator) void {
         std.debug.assert(self.alloc.ptr == alloc.ptr);
         alloc.free(self.index_name);
-        if (self.embedding_name.len > 0) alloc.free(self.embedding_name);
         for (self.embedding_names) |name| alloc.free(name);
         if (self.embedding_names.len > 0) alloc.free(self.embedding_names);
         alloc.free(self.model);
@@ -492,9 +490,54 @@ fn managedEmbeddingEntriesEquivalentForLookup(
 /// and retry settings. It is persisted on embedding enrichments so compatibility
 /// is checked against the producer that owns an artifact stream, rather than
 /// inferred only from the set of index configs currently loaded in memory.
+const SemanticProducerLocation = struct {
+    endpoint: []u8,
+    region: []u8,
+
+    fn deinit(self: *SemanticProducerLocation, alloc: std.mem.Allocator) void {
+        alloc.free(self.endpoint);
+        alloc.free(self.region);
+        self.* = undefined;
+    }
+};
+
+fn resolveSemanticProducerLocationAlloc(
+    alloc: std.mem.Allocator,
+    provider: ProviderKind,
+    embedder_cfg: embeddings_types.Config,
+    options: InitOptions,
+) !SemanticProducerLocation {
+    const region = if (provider == .bedrock)
+        try resolveBedrockRegion(alloc, embedder_cfg)
+    else
+        try alloc.dupe(u8, "");
+    errdefer alloc.free(region);
+
+    const endpoint = switch (provider) {
+        .openai => try resolveOpenAiBaseUrl(alloc, embedder_cfg),
+        .ollama => try resolveOllamaBaseUrl(alloc, embedder_cfg),
+        .bedrock => try resolveBedrockEndpoint(alloc, embedder_cfg, region),
+        .antfly => if (shouldUseAntflyProvider(embedder_cfg, options))
+            // Embedded inference has no network endpoint, but it is a distinct
+            // producer from a remote Antfly service with the same model name.
+            try alloc.dupe(u8, "antfly:embedded")
+        else
+            try resolveAntflyInferenceBaseUrl(alloc, embedder_cfg, options),
+    };
+    return .{ .endpoint = endpoint, .region = region };
+}
+
 pub fn embeddingSemanticProducerJsonAlloc(
     alloc: std.mem.Allocator,
     value: std.json.Value,
+) ![]u8 {
+    return try embeddingSemanticProducerJsonAllocWithOptions(alloc, value, .{});
+}
+
+pub fn embeddingSemanticProducerJsonAllocWithOptions(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    options: InitOptions,
 ) ![]u8 {
     var parsed_cfg = try parseEmbeddingsIndexConfigFromValue(alloc, value);
     defer parsed_cfg.deinit();
@@ -508,8 +551,10 @@ pub fn embeddingSemanticProducerJsonAlloc(
     const provider = try parseEmbedderProvider(embedder_cfg);
     if (embedder_cfg.model.len == 0) return error.InvalidCreateTableRequest;
     const sparse = cfg.sparse orelse false;
+    var location = try resolveSemanticProducerLocationAlloc(alloc, provider, embedder_cfg, options);
+    defer location.deinit(alloc);
     const SemanticProducer = struct {
-        version: u8 = 1,
+        version: u8 = 2,
         provider: []const u8,
         model: []const u8,
         endpoint: []const u8,
@@ -522,8 +567,8 @@ pub fn embeddingSemanticProducerJsonAlloc(
     return try std.json.Stringify.valueAlloc(alloc, SemanticProducer{
         .provider = @tagName(provider),
         .model = embedder_cfg.model,
-        .endpoint = embedder_cfg.url,
-        .region = embedder_cfg.region,
+        .endpoint = location.endpoint,
+        .region = location.region,
         .sparse = sparse,
         .multimodal = embedder_cfg.multimodal,
         .input_type = embedder_cfg.input_type,
@@ -619,7 +664,6 @@ fn validateManagedEmbeddingLookupNames(
     for (entries) |*entry| {
         try validateEntryVectorSpaceMode(entry, vector_spaces);
         try validateManagedEmbeddingLookupName(alloc, &names, vector_spaces, entry.index_name, entry);
-        if (entry.embedding_name.len > 0) try validateManagedEmbeddingLookupName(alloc, &names, vector_spaces, entry.embedding_name, entry);
         for (entry.embedding_names) |name| try validateManagedEmbeddingLookupName(alloc, &names, vector_spaces, name, entry);
     }
 }
@@ -870,7 +914,6 @@ pub const ManagedEmbedder = struct {
             if (std.mem.eql(u8, entry.index_name, index_name)) return entry;
         }
         for (self.entries) |*entry| {
-            if (entry.embedding_name.len > 0 and std.mem.eql(u8, entry.embedding_name, index_name)) return entry;
             for (entry.embedding_names) |name| {
                 if (std.mem.eql(u8, name, index_name)) return entry;
             }
@@ -1151,20 +1194,22 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     const sparse = cfg.sparse orelse false;
     const external = cfg.external orelse false;
     const semantic_producer_json = if (!external and root.get("embedder") != null)
-        try embeddingSemanticProducerJsonAlloc(alloc, value)
+        try embeddingSemanticProducerJsonAllocWithOptions(alloc, value, options)
     else
         null;
     defer if (semantic_producer_json) |raw| alloc.free(raw);
 
     if (root.get("summarizer") != null) return error.UnsupportedCreateTableRequest;
+    // Artifact-backed indexes have exactly one public shape. Do not silently
+    // accept removed aliases through ignore_unknown_fields parsing.
+    if (root.get("embedding_name") != null or root.get("source_artifact_name") != null) {
+        return error.InvalidCreateTableRequest;
+    }
 
     const field_name = cfg.field;
     const template_value = cfg.template;
 
     const artifact_sources = cfg.sources orelse &.{};
-    if (artifact_sources.len > 0 and (cfg.embedding_name != null or root.get("source_artifact_name") != null)) {
-        return error.InvalidCreateTableRequest;
-    }
     if (artifact_sources.len > 0 and (external or field_name != null or template_value != null or root.get("chunker") != null)) {
         return error.InvalidCreateTableRequest;
     }
@@ -1186,15 +1231,6 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         "body"
     else
         "embedding";
-    const artifact_embedding_name = if (root.get("embedding_name")) |json_value| blk: {
-        if (json_value != .string or json_value.string.len == 0) return error.InvalidCreateTableRequest;
-        break :blk json_value.string;
-    } else null;
-    const artifact_source_name = if (root.get("source_artifact_name")) |json_value| blk: {
-        if (json_value != .string or json_value.string.len == 0) return error.InvalidCreateTableRequest;
-        break :blk json_value.string;
-    } else null;
-
     const chunker_json = if (root.get("chunker")) |chunker_value| blk: {
         var chunker_cfg = try chunking_types.parseConfigFromValue(alloc, chunker_value);
         defer chunker_cfg.deinit(alloc);
@@ -1300,9 +1336,6 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         try resolveEmbeddingDimensionsForManagedConfig(alloc, index_name, cfg, embedder, options)
     else
         try resolveDeclaredEmbeddingDimensionsRequired(cfg);
-    if (artifact_embedding_name != null and external) return error.InvalidCreateTableRequest;
-    if (artifact_source_name != null and artifact_embedding_name == null) return error.InvalidCreateTableRequest;
-
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
 
@@ -1325,10 +1358,10 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         try out.append(alloc, ']');
     } else {
         try out.appendSlice(alloc, ",\"embedding_name\":");
-        try appendJsonString(alloc, &out, artifact_embedding_name orelse index_name);
+        try appendJsonString(alloc, &out, index_name);
     }
 
-    if (artifact_sources.len > 0 or artifact_embedding_name != null) {
+    if (artifact_sources.len > 0) {
         if (chunker_json != null or template_value != null) return error.InvalidCreateTableRequest;
     } else if (!external) {
         try out.appendSlice(alloc, ",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":");
@@ -1452,6 +1485,10 @@ fn parseManagedEmbeddingEntry(
     const external = cfg.external orelse false;
     if (external) return null;
 
+    if (root.get("embedding_name") != null or root.get("source_artifact_name") != null) {
+        return error.InvalidManagedEmbeddingIndex;
+    }
+
     const sparse = cfg.sparse orelse false;
 
     const embedder = root.get("embedder") orelse return null;
@@ -1493,8 +1530,6 @@ fn buildManagedEmbeddingEntry(
         null;
     const owned_index_name = try alloc.dupe(u8, index_name);
     errdefer alloc.free(owned_index_name);
-    const owned_embedding_name: []u8 = if (cfg.embedding_name) |embedding_name| try alloc.dupe(u8, embedding_name) else @constCast("");
-    errdefer if (owned_embedding_name.len > 0) alloc.free(owned_embedding_name);
     const owned_embedding_names: [][]u8 = if (cfg.sources) |sources| blk: {
         const names = try alloc.alloc([]u8, sources.len);
         var initialized: usize = 0;
@@ -1547,7 +1582,6 @@ fn buildManagedEmbeddingEntry(
         .io = options.io,
         .deadline_ns = options.deadline_ns,
         .index_name = owned_index_name,
-        .embedding_name = owned_embedding_name,
         .embedding_names = owned_embedding_names,
         .provider = provider,
         .model = owned_model,
@@ -2845,7 +2879,7 @@ test "managed embedder rejects unsupported execution namespaces" {
 pub fn testArtifactBackedEmbeddingTranslation() !void {
     var local = TestLocalDenseProvider{ .dimensions = 384 };
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"type":"embeddings","field":"embedding","embedding_name":"document_chunk_dense_v1","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+        \\{"type":"embeddings","sources":[{"artifact":"document_chunk_dense_v1"}],"dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
     , .{});
     defer parsed.deinit();
 
@@ -2854,12 +2888,12 @@ pub fn testArtifactBackedEmbeddingTranslation() !void {
 
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"field\":\"embedding\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"dims\":384") != null);
-    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"embedding_name\":\"document_chunk_dense_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"sources\":[{\"artifact\":\"document_chunk_dense_v1\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"embedder\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"generator\"") == null);
 
     var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
-        \\{"document_vectors":{"type":"embeddings","field":"embedding","embedding_name":"document_chunk_dense_v1","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}}
+        \\{"document_vectors":{"type":"embeddings","sources":[{"artifact":"document_chunk_dense_v1"}],"dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}}
     , local.provider());
     defer managed.deinit();
     try std.testing.expect(managed.findEntry("document_vectors") != null);
@@ -2934,12 +2968,29 @@ test "managed embedder rejects duplicate or mixed artifact sources" {
     try testInvalidMultiSourceEmbeddingConfigs();
 }
 
-test "managed embedder allows equivalent embedding name aliases" {
+test "managed embedder rejects removed singular artifact source fields" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"embeddings","field":"embedding","embedding_name":"legacy_dense_v1","source_artifact_name":"legacy_chunks_v1","dimension":3,"embedder":{"provider":"openai","model":"embed-v1"}}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        translateEmbeddingsIndexConfigJson(std.testing.allocator, "document_vectors", parsed.value),
+    );
+    try std.testing.expectError(
+        error.InvalidManagedEmbeddingIndex,
+        ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+            \\{"document_vectors":{"type":"embeddings","field":"embedding","embedding_name":"legacy_dense_v1","source_artifact_name":"legacy_chunks_v1","dimension":3,"embedder":{"provider":"openai","model":"embed-v1"}}}
+        ),
+    );
+}
+
+test "managed embedder allows equivalent shared artifact sources" {
     var local = TestLocalDenseProvider{ .dimensions = 384 };
     var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
         \\{
-        \\  "document_vectors_primary":{"type":"embeddings","field":"embedding","embedding_name":"document_chunk_dense_v1","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}},
-        \\  "document_vectors_secondary":{"type":"embeddings","field":"embedding","embedding_name":"document_chunk_dense_v1","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+        \\  "document_vectors_primary":{"type":"embeddings","sources":[{"artifact":"document_chunk_dense_v1"}],"dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}},
+        \\  "document_vectors_secondary":{"type":"embeddings","sources":[{"artifact":"document_chunk_dense_v1"}],"dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
         \\}
     , local.provider());
     defer managed.deinit();
@@ -2949,12 +3000,12 @@ test "managed embedder allows equivalent embedding name aliases" {
     try std.testing.expect(managed.findEntry("document_chunk_dense_v1") != null);
 }
 
-test "managed embedder rejects conflicting embedding name aliases" {
+test "managed embedder rejects conflicting shared artifact sources" {
     var local = TestLocalDenseProvider{ .dimensions = 384 };
     try std.testing.expectError(error.InvalidManagedEmbeddingIndex, ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
         \\{
-        \\  "document_vectors_primary":{"type":"embeddings","field":"embedding","embedding_name":"document_chunk_dense_v1","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}},
-        \\  "document_vectors_secondary":{"type":"embeddings","field":"embedding","embedding_name":"document_chunk_dense_v1","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/other"}}
+        \\  "document_vectors_primary":{"type":"embeddings","sources":[{"artifact":"document_chunk_dense_v1"}],"dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}},
+        \\  "document_vectors_secondary":{"type":"embeddings","sources":[{"artifact":"document_chunk_dense_v1"}],"dimension":384,"embedder":{"provider":"antfly","model":"antflydb/other"}}
         \\}
     , local.provider()));
 }
@@ -2962,8 +3013,8 @@ test "managed embedder rejects conflicting embedding name aliases" {
 pub fn testVectorSpaceCompatibility() !void {
     try std.testing.expectError(error.InvalidManagedEmbeddingIndex, ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
         \\{
-        \\  "primary":{"type":"embeddings","field":"embedding","embedding_name":"shared_dense_v1","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"https://first.example/v1","api_key":"credential-a","requests_per_minute":100}},
-        \\  "secondary":{"type":"embeddings","field":"embedding","embedding_name":"shared_dense_v1","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"https://second.example/v1","api_key":"credential-b","requests_per_minute":200}}
+        \\  "primary":{"type":"embeddings","sources":[{"artifact":"shared_dense_v1"}],"dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"https://first.example/v1","api_key":"credential-a","requests_per_minute":100}},
+        \\  "secondary":{"type":"embeddings","sources":[{"artifact":"shared_dense_v1"}],"dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"https://second.example/v1","api_key":"credential-b","requests_per_minute":200}}
         \\}
     ));
 
@@ -2994,8 +3045,8 @@ pub fn testVectorSpaceCompatibility() !void {
 
     try std.testing.expectError(error.InvalidManagedEmbeddingIndex, ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
         \\{
-        \\  "primary":{"type":"embeddings","field":"embedding","embedding_name":"implicit_dense_v1","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-a"}},
-        \\  "secondary":{"type":"embeddings","field":"embedding","embedding_name":"implicit_dense_v1","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-b"}}
+        \\  "primary":{"type":"embeddings","sources":[{"artifact":"implicit_dense_v1"}],"dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-a"}},
+        \\  "secondary":{"type":"embeddings","sources":[{"artifact":"implicit_dense_v1"}],"dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-b"}}
         \\}
     , local.provider()));
 }
@@ -3033,12 +3084,68 @@ test "embedding semantic producer identity includes endpoint and excludes creden
     try testEmbeddingSemanticProducerIdentity();
 }
 
-test "managed embedder rejects index name and embedding name collisions with different configs" {
+test "embedding semantic producer identity tracks effective configured inference service" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"embeddings","dimension":3,"embedder":{"provider":"antfly","model":"embed-v1"}}
+    , .{});
+    defer parsed.deinit();
+
+    const first = try embeddingSemanticProducerJsonAllocWithOptions(std.testing.allocator, parsed.value, .{
+        .inference_api_url = "https://first.example",
+    });
+    defer std.testing.allocator.free(first);
+    const second = try embeddingSemanticProducerJsonAllocWithOptions(std.testing.allocator, parsed.value, .{
+        .inference_api_url = "https://second.example",
+    });
+    defer std.testing.allocator.free(second);
+
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    try std.testing.expect(std.mem.indexOf(u8, first, "https://first.example/ai/v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "https://second.example/ai/v1") != null);
+}
+
+test "embedding semantic producer identity tracks environment endpoint changes" {
+    if (!builtin.link_libc) return;
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const env_name: [:0]const u8 = "OPENAI_BASE_URL";
+    const original = resolveOptionalEnv(std.testing.allocator, env_name);
+    defer if (original) |value| std.testing.allocator.free(value);
+    const original_z = if (original) |value| try std.testing.allocator.dupeZ(u8, value) else null;
+    defer if (original_z) |value| std.testing.allocator.free(value);
+    defer {
+        if (original_z) |value| {
+            _ = c.setenv(env_name, value.ptr, 1);
+        } else {
+            _ = c.unsetenv(env_name);
+        }
+    }
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"embeddings","dimension":3,"embedder":{"provider":"openai","model":"embed-v1"}}
+    , .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name, "https://first.example", 1));
+    const first = try embeddingSemanticProducerJsonAlloc(std.testing.allocator, parsed.value);
+    defer std.testing.allocator.free(first);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name, "https://second.example", 1));
+    const second = try embeddingSemanticProducerJsonAlloc(std.testing.allocator, parsed.value);
+    defer std.testing.allocator.free(second);
+
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    try std.testing.expect(std.mem.indexOf(u8, first, "https://first.example/v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "https://second.example/v1") != null);
+}
+
+test "managed embedder rejects index name and artifact source collisions with different configs" {
     var local = TestLocalDenseProvider{ .dimensions = 384 };
     try std.testing.expectError(error.InvalidManagedEmbeddingIndex, ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
         \\{
-        \\  "aliased_vectors":{"type":"embeddings","field":"embedding","embedding_name":"document_vectors","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}},
-        \\  "document_vectors":{"type":"embeddings","field":"embedding","embedding_name":"document_vectors_v2","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/other"}}
+        \\  "aliased_vectors":{"type":"embeddings","sources":[{"artifact":"document_vectors"}],"dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}},
+        \\  "document_vectors":{"type":"embeddings","sources":[{"artifact":"document_vectors_v2"}],"dimension":384,"embedder":{"provider":"antfly","model":"antflydb/other"}}
         \\}
     , local.provider()));
 }

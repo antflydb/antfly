@@ -6533,7 +6533,13 @@ pub const ProvisionedTableWriteSource = struct {
             hosted_group_ids,
             tables,
             ranges,
-            .{ .backend_runtime = backend_runtime },
+            .{
+                .backend_runtime = backend_runtime,
+                .embedding_options = .{
+                    .antfly_provider = self.antfly_provider,
+                    .inference_api_url = self.inference_api_url,
+                },
+            },
         );
 
         if (cache.backend_runtime == null) cache.backend_runtime = backend_runtime orelse self.backend_runtime;
@@ -6568,7 +6574,12 @@ pub const ProvisionedTableWriteSource = struct {
                 defer cached.deinit(alloc);
                 try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, cached.db);
                 try applyLocalTableSchemaJson(alloc, cached.db, table.schema_json);
-                const index_summary = try metadata_table_provisioner.reconcileDbIndexes(alloc, cached.db, table.indexes_json);
+                const index_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, table.indexes_json, .{
+                    .embedding_options = .{
+                        .antfly_provider = self.antfly_provider,
+                        .inference_api_url = self.inference_api_url,
+                    },
+                });
                 summary.indexes_removed += index_summary.indexes_removed;
                 summary.indexes_added += index_summary.indexes_added;
                 summary.enrichments_added += index_summary.enrichments_added;
@@ -6580,7 +6591,7 @@ pub const ProvisionedTableWriteSource = struct {
                 try cache.replaceTableMetadataLocked(table.name, table.indexes_json, table.schema_json);
                 continue;
             }
-            var opened: ?db_mod.DB = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+            var opened: ?db_mod.DB = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                 alloc,
                 path,
                 table.indexes_json,
@@ -6594,6 +6605,7 @@ pub const ProvisionedTableWriteSource = struct {
                 self.secret_store,
                 self.remote_content,
                 identity_namespace,
+                .{ .inference_api_url = self.inference_api_url },
             );
             defer if (opened) |*db| db.close();
             summary.dbs_opened += 1;
@@ -8735,6 +8747,10 @@ pub const ProvisionedTableWriteSource = struct {
             if (metadata.indexes_json) |indexes_json| {
                 _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
                     .drain_resolver_backfill = false,
+                    .embedding_options = .{
+                        .antfly_provider = self.antfly_provider,
+                        .inference_api_url = self.inference_api_url,
+                    },
                 });
             }
             if (configured_indexes_storage) |configured_indexes| {
@@ -8833,6 +8849,10 @@ pub const ProvisionedTableWriteSource = struct {
         if (metadata.indexes_json) |indexes_json| {
             _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
                 .drain_resolver_backfill = false,
+                .embedding_options = .{
+                    .antfly_provider = self.antfly_provider,
+                    .inference_api_url = self.inference_api_url,
+                },
             });
         }
         if (configured_indexes_storage) |configured_indexes| {
@@ -9146,7 +9166,12 @@ pub const ProvisionedTableWriteSource = struct {
                 try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, cached.db);
                 try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
                 if (indexes_json) |value| {
-                    _ = try metadata_table_provisioner.reconcileDbIndexes(alloc, cached.db, value);
+                    _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, value, .{
+                        .embedding_options = .{
+                            .antfly_provider = self.antfly_provider,
+                            .inference_api_url = self.inference_api_url,
+                        },
+                    });
                     try rebuildEmptyVersionedFullTextIndexesAfterSchemaUpdate(alloc, cached.db, value);
                 }
                 try drainManagedDbBeforeClose(cached.db);
@@ -12996,6 +13021,9 @@ fn extractIndexConfigJsonWithOptions(
     const kind = try parseIndexKind(value);
     switch (kind) {
         .dense_vector, .sparse_vector => return try managed_embedder.translateEmbeddingsIndexConfigJsonWithOptions(alloc, index_name, value, options),
+        .graph => if (value.object.get("source") != null or value.object.get("artifact") != null) {
+            return error.InvalidCreateTableRequest;
+        },
         else => {},
     }
 
@@ -13423,7 +13451,10 @@ fn applyIndexCreateToCachedDb(
         try db.reconfigureEnrichmentRuntime(enrichments.config());
         enrichments.forgetTransferred();
     }
-    try reconcileDbArtifactEnrichmentsFromIndexesJson(alloc, db, indexes_json);
+    try reconcileDbArtifactEnrichmentsFromIndexesJson(alloc, db, indexes_json, .{
+        .antfly_provider = antfly_provider,
+        .inference_api_url = inference_api_url,
+    });
     db.addIndex(.{
         .name = owned_name,
         .kind = kind,
@@ -13439,8 +13470,9 @@ fn reconcileDbArtifactEnrichmentsFromIndexesJson(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
     indexes_json: []const u8,
+    embedding_options: managed_embedder.InitOptions,
 ) !void {
-    const enrichments = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
+    const enrichments = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(alloc, indexes_json, embedding_options);
     defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
     indexes_api.sortArtifactEnrichmentsByDependency(enrichments);
     for (enrichments) |cfg| {
@@ -14810,6 +14842,10 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
 
     const summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
         .drain_resolver_backfill = options.drain_resolver_backfill,
+        .embedding_options = .{
+            .antfly_provider = antfly_provider,
+            .inference_api_url = options.inference_api_url,
+        },
     });
     if (summary.indexManagerCatalogChanged()) {
         // First-open provisioning can mutate the live index manager. Reopen so

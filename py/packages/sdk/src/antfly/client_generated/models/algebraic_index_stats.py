@@ -98,8 +98,6 @@ class AlgebraicIndexStats:
             stale_groups (int | Unset):
             missing_groups (int | Unset):
             unknown_remote_groups (int | Unset):
-            source_artifact (GraphSourceArtifactStatus | Unset): Materialization status for one configured graph artifact
-                source.
             source_artifacts (list[GraphSourceArtifactStatus] | Unset): All source artifact streams used to materialize
                 graph edges, in configured order.
             resolver_replay (AlgebraicIndexStatsResolverReplay | Unset): Graph resolver replay diagnostics.
@@ -170,7 +168,6 @@ class AlgebraicIndexStats:
     stale_groups: int | Unset = UNSET
     missing_groups: int | Unset = UNSET
     unknown_remote_groups: int | Unset = UNSET
-    source_artifact: GraphSourceArtifactStatus | Unset = UNSET
     source_artifacts: list[GraphSourceArtifactStatus] | Unset = UNSET
     resolver_replay: AlgebraicIndexStatsResolverReplay | Unset = UNSET
     resolution: AlgebraicIndexStatsResolution | Unset = UNSET
@@ -307,10 +304,6 @@ class AlgebraicIndexStats:
         missing_groups = self.missing_groups
 
         unknown_remote_groups = self.unknown_remote_groups
-
-        source_artifact: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.source_artifact, Unset):
-            source_artifact = self.source_artifact.to_dict()
 
         source_artifacts: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.source_artifacts, Unset):
@@ -462,8 +455,6 @@ class AlgebraicIndexStats:
             field_dict["missing_groups"] = missing_groups
         if unknown_remote_groups is not UNSET:
             field_dict["unknown_remote_groups"] = unknown_remote_groups
-        if source_artifact is not UNSET:
-            field_dict["source_artifact"] = source_artifact
         if source_artifacts is not UNSET:
             field_dict["source_artifacts"] = source_artifacts
         if resolver_replay is not UNSET:
@@ -620,13 +611,6 @@ class AlgebraicIndexStats:
 
         unknown_remote_groups = d.pop("unknown_remote_groups", UNSET)
 
-        _source_artifact = d.pop("source_artifact", UNSET)
-        source_artifact: GraphSourceArtifactStatus | Unset
-        if isinstance(_source_artifact, Unset):
-            source_artifact = UNSET
-        else:
-            source_artifact = GraphSourceArtifactStatus.from_dict(_source_artifact)
-
         _source_artifacts = d.pop("source_artifacts", UNSET)
         source_artifacts: list[GraphSourceArtifactStatus] | Unset = UNSET
         if _source_artifacts is not UNSET:
@@ -721,7 +705,6 @@ class AlgebraicIndexStats:
             stale_groups=stale_groups,
             missing_groups=missing_groups,
             unknown_remote_groups=unknown_remote_groups,
-            source_artifact=source_artifact,
             source_artifacts=source_artifacts,
             resolver_replay=resolver_replay,
             resolution=resolution,

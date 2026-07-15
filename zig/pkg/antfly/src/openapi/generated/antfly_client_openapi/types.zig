@@ -476,8 +476,6 @@ pub const AlgebraicIndexStats = struct {
     stale_groups: ?i64 = null,
     missing_groups: ?i64 = null,
     unknown_remote_groups: ?i64 = null,
-    /// Source artifact stream used to materialize graph edges.
-    source_artifact: ?GraphSourceArtifactStatus = null,
     /// All source artifact streams used to materialize graph edges, in configured order.
     source_artifacts: ?[]const GraphSourceArtifactStatus = null,
     /// Graph resolver replay diagnostics.
@@ -2516,10 +2514,6 @@ pub const EmbeddingsIndexConfig = struct {
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by the artifact name and its source key. All sources must use the same dense vector space or the same sparse token space. Not allowed for external or direct field/template indexes.
     sources: ?[]const ArtifactIndexSource = null,
-    /// Deprecated single-source alias for sources: [{artifact: <embedding_name>}].
-    embedding_name: ?[]const u8 = null,
-    /// Deprecated descriptive field for the input to the legacy embedding_name enrichment. New configurations define that input only on the matching enrichment.
-    source_artifact_name: ?[]const u8 = null,
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
@@ -3660,6 +3654,34 @@ pub const GraphIndexSource = struct {
     format: ?[]const u8 = null,
     /// Optional provenance edge type emitted for resolver mention decisions from this source.
     mention_edge_type: ?[]const u8 = null,
+    /// Optional node mapping templates for this artifact stream.
+    nodes: ?GraphIndexSourceNodes = null,
+    /// Optional edge mapping templates for this artifact stream.
+    edge: ?GraphIndexSourceEdge = null,
+    /// Document fields explicitly available to this source's mapping templates.
+    context: ?GraphIndexSourceContext = null,
+};
+
+pub const GraphIndexSourceContext = struct {
+    /// Document fields that source templates may reference through _doc.value.
+    doc_fields: ?[]const []const u8 = null,
+};
+
+pub const GraphIndexSourceEdge = struct {
+    /// Template or literal edge type.
+    type: ?std.json.Value = null,
+    /// Template or numeric literal edge weight.
+    weight: ?std.json.Value = null,
+    /// Metadata object whose string leaves may contain templates.
+    metadata: ?std.json.Value = null,
+};
+
+pub const GraphIndexSourceNodes = struct {
+    model: ?[]const u8 = null,
+    /// Template for the source node identifier.
+    source: ?[]const u8 = null,
+    /// Template for the target node identifier.
+    target: ?[]const u8 = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -3722,8 +3744,6 @@ pub const GraphIndexStats = struct {
     catch_up_phase: ?[]const u8 = null,
     catch_up_applied_sequence: ?i64 = null,
     catch_up_target_sequence: ?i64 = null,
-    /// Graph source artifact materialization status.
-    source_artifact: ?GraphSourceArtifactStatus = null,
     /// Materialization status for every configured graph source artifact.
     source_artifacts: ?[]const GraphSourceArtifactStatus = null,
     /// Resolver replay diagnostics for graph materialization.
@@ -3964,10 +3984,6 @@ pub const IndexConfig = struct {
     dimension: ?i64 = null,
     /// Field to extract embeddings from for direct managed indexes. Omit when sources is set.
     field: ?[]const u8 = null,
-    /// Deprecated single-source alias for sources: [{artifact: <embedding_name>}].
-    embedding_name: ?[]const u8 = null,
-    /// Deprecated descriptive field for the input to the legacy embedding_name enrichment. New configurations define that input only on the matching enrichment.
-    source_artifact_name: ?[]const u8 = null,
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
@@ -4036,14 +4052,6 @@ pub const IndexConfig = struct {
         }
         if (self.field) |value| {
             try jw.objectField("field");
-            try jw.write(value);
-        }
-        if (self.embedding_name) |value| {
-            try jw.objectField("embedding_name");
-            try jw.write(value);
-        }
-        if (self.source_artifact_name) |value| {
-            try jw.objectField("source_artifact_name");
             try jw.write(value);
         }
         if (self.template) |value| {

@@ -17,8 +17,52 @@ limitations under the License.
 package sdk
 
 import (
+	"encoding/json"
 	"fmt"
+	"math"
 )
+
+// NewGraphIndexSourceEdgeType creates a string-valued edge type template or literal.
+func NewGraphIndexSourceEdgeType(value string) (GraphIndexSourceEdgeType, error) {
+	var result GraphIndexSourceEdgeType
+	if err := result.FromGraphIndexSourceEdgeType0(value); err != nil {
+		return GraphIndexSourceEdgeType{}, fmt.Errorf("encode graph edge type: %w", err)
+	}
+	return result, nil
+}
+
+// NewGraphIndexSourceNumericEdgeType creates a numeric edge type literal.
+func NewGraphIndexSourceNumericEdgeType(value float64) (GraphIndexSourceEdgeType, error) {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return GraphIndexSourceEdgeType{}, fmt.Errorf("graph edge type must be finite")
+	}
+	var result GraphIndexSourceEdgeType
+	if err := result.FromGraphIndexSourceEdgeType1(value); err != nil {
+		return GraphIndexSourceEdgeType{}, fmt.Errorf("encode graph edge type: %w", err)
+	}
+	return result, nil
+}
+
+// NewGraphIndexSourceEdgeWeight creates a string-valued edge weight template.
+func NewGraphIndexSourceEdgeWeight(value string) (GraphIndexSourceEdgeWeight, error) {
+	var result GraphIndexSourceEdgeWeight
+	if err := result.FromGraphIndexSourceEdgeWeight0(value); err != nil {
+		return GraphIndexSourceEdgeWeight{}, fmt.Errorf("encode graph edge weight: %w", err)
+	}
+	return result, nil
+}
+
+// NewGraphIndexSourceNumericEdgeWeight creates a numeric edge weight literal.
+func NewGraphIndexSourceNumericEdgeWeight(value float64) (GraphIndexSourceEdgeWeight, error) {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return GraphIndexSourceEdgeWeight{}, fmt.Errorf("graph edge weight must be finite")
+	}
+	var result GraphIndexSourceEdgeWeight
+	if err := result.FromGraphIndexSourceEdgeWeight1(value); err != nil {
+		return GraphIndexSourceEdgeWeight{}, fmt.Errorf("encode graph edge weight: %w", err)
+	}
+	return result, nil
+}
 
 func NewEmbedderConfig(config any) (*EmbedderConfig, error) {
 	var provider EmbedderProvider
@@ -193,7 +237,7 @@ func NewArtifactIndexSources(artifacts ...string) ([]ArtifactIndexSource, error)
 }
 
 // NewGraphIndexSources validates and copies graph sources while preserving
-// source-specific path and format.
+// source-specific path, format, and mapping configuration.
 func NewGraphIndexSources(sources ...GraphIndexSource) ([]GraphIndexSource, error) {
 	if len(sources) == 0 {
 		return nil, fmt.Errorf("at least one graph artifact source is required")
@@ -213,8 +257,33 @@ func NewGraphIndexSources(sources ...GraphIndexSource) ([]GraphIndexSource, erro
 		if source.Format != "" && source.Format != GraphIndexSourceFormatExtractionRelation && source.Format != GraphIndexSourceFormatExtractionGraph {
 			return nil, fmt.Errorf("sources[%d].format is invalid", i)
 		}
+		if source.Nodes.Model != "" && source.Nodes.Model != GraphIndexSourceNodesModelDocument && source.Nodes.Model != GraphIndexSourceNodesModelExternal {
+			return nil, fmt.Errorf("sources[%d].nodes.model is invalid", i)
+		}
+		seenDocFields := make(map[string]struct{}, len(source.Context.DocFields))
+		for fieldIndex, field := range source.Context.DocFields {
+			if field == "" {
+				return nil, fmt.Errorf("sources[%d].context.doc_fields[%d] is required", i, fieldIndex)
+			}
+			if _, ok := seenDocFields[field]; ok {
+				return nil, fmt.Errorf("sources[%d].context.doc_fields contains duplicate %q", i, field)
+			}
+			seenDocFields[field] = struct{}{}
+		}
 		seen[source.Artifact] = struct{}{}
 		result[i] = source
+		result[i].Context.DocFields = append([]string(nil), source.Context.DocFields...)
+		if source.Edge.Metadata != nil {
+			encoded, err := json.Marshal(source.Edge.Metadata)
+			if err != nil {
+				return nil, fmt.Errorf("sources[%d].edge.metadata must contain JSON values: %w", i, err)
+			}
+			var metadata map[string]interface{}
+			if err := json.Unmarshal(encoded, &metadata); err != nil {
+				return nil, fmt.Errorf("copy sources[%d].edge.metadata: %w", i, err)
+			}
+			result[i].Edge.Metadata = metadata
+		}
 	}
 	return result, nil
 }

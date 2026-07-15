@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any, Literal
 
 MAX_ARTIFACT_SOURCES = 64
@@ -31,6 +32,51 @@ def artifact_index_sources(*artifacts: str) -> list[dict[str, str]]:
 
 
 GraphArtifactFormat = Literal["extraction_relation", "extraction_graph"]
+GraphNodeModel = Literal["document", "external"]
+
+
+def _clone_json_value(value: Any, path: str) -> Any:
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if not isfinite(value):
+            raise ValueError(f"{path} must be finite")
+        return value
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key, child in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{path} keys must be strings")
+            result[key] = _clone_json_value(child, f"{path}.{key}")
+        return result
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_clone_json_value(child, f"{path}[{index}]") for index, child in enumerate(value)]
+    raise ValueError(f"{path} must contain only JSON values")
+
+
+@dataclass(frozen=True, slots=True)
+class GraphNodeMapping:
+    """Optional node identifier templates for one graph artifact stream."""
+
+    model: GraphNodeModel = "document"
+    source: str | None = None
+    target: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GraphEdgeMapping:
+    """Optional edge templates and metadata for one graph artifact stream."""
+
+    type: str | int | float | None = None
+    weight: str | int | float | None = None
+    metadata: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GraphContextMapping:
+    """Document fields explicitly exposed to graph mapping templates."""
+
+    doc_fields: Sequence[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +87,9 @@ class GraphArtifactSource:
     path: str | None = None
     format: GraphArtifactFormat = "extraction_relation"
     mention_edge_type: str | None = None
+    nodes: GraphNodeMapping | None = None
+    edge: GraphEdgeMapping | None = None
+    context: GraphContextMapping | None = None
 
 
 def graph_index_sources(*sources: GraphArtifactSource) -> list[dict[str, Any]]:
@@ -51,6 +100,20 @@ def graph_index_sources(*sources: GraphArtifactSource) -> list[dict[str, Any]]:
     for index, source in enumerate(sources):
         if source.format not in ("extraction_relation", "extraction_graph"):
             raise ValueError(f"sources[{index}].format is invalid")
+        if source.nodes is not None and source.nodes.model not in ("document", "external"):
+            raise ValueError(f"sources[{index}].nodes.model is invalid")
+        if source.edge is not None:
+            for field_name, value in (("type", source.edge.type), ("weight", source.edge.weight)):
+                if value is not None and (isinstance(value, bool) or not isinstance(value, (str, int, float))):
+                    raise ValueError(f"sources[{index}].edge.{field_name} must be a string or number")
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and not isfinite(value):
+                    raise ValueError(f"sources[{index}].edge.{field_name} must be finite")
+        if source.context is not None:
+            fields = list(source.context.doc_fields)
+            if any(not isinstance(field, str) or not field for field in fields):
+                raise ValueError(f"sources[{index}].context.doc_fields entries must be non-empty strings")
+            if len(fields) != len(set(fields)):
+                raise ValueError(f"sources[{index}].context.doc_fields must be unique")
         item: dict[str, Any] = {
             "artifact": source.artifact,
             "format": source.format,
@@ -59,6 +122,32 @@ def graph_index_sources(*sources: GraphArtifactSource) -> list[dict[str, Any]]:
             item["path"] = source.path
         if source.mention_edge_type is not None:
             item["mention_edge_type"] = source.mention_edge_type
+        if source.nodes is not None:
+            item["nodes"] = {
+                key: value
+                for key, value in {
+                    "model": source.nodes.model,
+                    "source": source.nodes.source,
+                    "target": source.nodes.target,
+                }.items()
+                if value is not None
+            }
+        if source.edge is not None:
+            item["edge"] = {
+                key: value
+                for key, value in {
+                    "type": source.edge.type,
+                    "weight": source.edge.weight,
+                    "metadata": (
+                        _clone_json_value(source.edge.metadata, f"sources[{index}].edge.metadata")
+                        if source.edge.metadata is not None
+                        else None
+                    ),
+                }.items()
+                if value is not None
+            }
+        if source.context is not None:
+            item["context"] = {"doc_fields": list(source.context.doc_fields)}
         result.append(item)
     return result
 

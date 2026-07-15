@@ -138,6 +138,62 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: "Optional provenance edge type emitted for resolver mention decisions from this source."
+        nodes:
+          $ref: "#/components/schemas/GraphIndexSourceNodes"
+          description: "Optional node mapping templates for this artifact stream."
+        edge:
+          $ref: "#/components/schemas/GraphIndexSourceEdge"
+          description: "Optional edge mapping templates for this artifact stream."
+        context:
+          $ref: "#/components/schemas/GraphIndexSourceContext"
+          description: "Document fields explicitly available to this source's mapping templates."
+    GraphIndexSourceNodes:
+      type: object
+      additionalProperties: false
+      properties:
+        model:
+          type: string
+          enum:
+            - document
+            - external
+          default: document
+        source:
+          type: string
+          description: "Template for the source node identifier."
+        target:
+          type: string
+          description: "Template for the target node identifier."
+    GraphIndexSourceEdge:
+      type: object
+      additionalProperties: false
+      properties:
+        type:
+          oneOf:
+            - type: string
+            - type: number
+              format: double
+          description: "Template or literal edge type."
+        weight:
+          oneOf:
+            - type: string
+            - type: number
+              format: double
+          description: "Template or numeric literal edge weight."
+        metadata:
+          type: object
+          additionalProperties: true
+          description: "Metadata object whose string leaves may contain templates."
+    GraphIndexSourceContext:
+      type: object
+      additionalProperties: false
+      properties:
+        doc_fields:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+          description: "Document fields that source templates may reference through _doc.value."
     GraphSourceArtifactStatus:
       type: object
       additionalProperties: false
@@ -486,16 +542,6 @@ components:
             $ref: "#/components/schemas/ArtifactIndexSource"
           x-go-type-skip-optional-pointer: true
           description: "Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by the artifact name and its source key. All sources must use the same dense vector space or the same sparse token space. Not allowed for external or direct field/template indexes."
-        embedding_name:
-          x-go-type-skip-optional-pointer: true
-          type: string
-          deprecated: true
-          description: "Deprecated single-source alias for sources: [{artifact: <embedding_name>}]."
-        source_artifact_name:
-          x-go-type-skip-optional-pointer: true
-          type: string
-          deprecated: true
-          description: "Deprecated descriptive field for the input to the legacy embedding_name enrichment. New configurations define that input only on the matching enrichment."
         template:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -1169,10 +1215,6 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: uint64
-        source_artifact:
-          x-go-type-skip-optional-pointer: true
-          $ref: "#/components/schemas/GraphSourceArtifactStatus"
-          description: "Source artifact stream used to materialize graph edges."
         source_artifacts:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -1493,10 +1535,6 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: uint64
-        source_artifact:
-          x-go-type-skip-optional-pointer: true
-          $ref: "#/components/schemas/GraphSourceArtifactStatus"
-          description: "Graph source artifact materialization status."
         source_artifacts:
           x-go-type-skip-optional-pointer: true
           type: array

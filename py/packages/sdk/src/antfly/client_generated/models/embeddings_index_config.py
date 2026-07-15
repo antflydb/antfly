@@ -41,9 +41,6 @@ class EmbeddingsIndexConfig:
                 is an independent vector member identified by the artifact name and its source key. All sources must use the
                 same dense vector space or the same sparse token space. Not allowed for external or direct field/template
                 indexes.
-            embedding_name (str | Unset): Deprecated single-source alias for sources: [{artifact: <embedding_name>}].
-            source_artifact_name (str | Unset): Deprecated descriptive field for the input to the legacy embedding_name
-                enrichment. New configurations define that input only on the matching enrichment.
             template (str | Unset): Handlebars template for generating prompts (managed indexes only; not allowed when
                 external=true). See https://handlebarsjs.com/guide/ for more information. Example: Hello, {{#if (eq Name
                 "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old..
@@ -242,8 +239,6 @@ class EmbeddingsIndexConfig:
     dimension: int | Unset = UNSET
     field: str | Unset = UNSET
     sources: list[ArtifactIndexSource] | Unset = UNSET
-    embedding_name: str | Unset = UNSET
-    source_artifact_name: str | Unset = UNSET
     template: str | Unset = UNSET
     distance_metric: DistanceMetric | Unset = UNSET
     mem_only: bool | Unset = UNSET
@@ -275,10 +270,6 @@ class EmbeddingsIndexConfig:
             for sources_item_data in self.sources:
                 sources_item = sources_item_data.to_dict()
                 sources.append(sources_item)
-
-        embedding_name = self.embedding_name
-
-        source_artifact_name = self.source_artifact_name
 
         template = self.template
 
@@ -325,10 +316,6 @@ class EmbeddingsIndexConfig:
             field_dict["field"] = field
         if sources is not UNSET:
             field_dict["sources"] = sources
-        if embedding_name is not UNSET:
-            field_dict["embedding_name"] = embedding_name
-        if source_artifact_name is not UNSET:
-            field_dict["source_artifact_name"] = source_artifact_name
         if template is not UNSET:
             field_dict["template"] = template
         if distance_metric is not UNSET:
@@ -385,10 +372,6 @@ class EmbeddingsIndexConfig:
 
                 sources.append(sources_item)
 
-        embedding_name = d.pop("embedding_name", UNSET)
-
-        source_artifact_name = d.pop("source_artifact_name", UNSET)
-
         template = d.pop("template", UNSET)
 
         _distance_metric = d.pop("distance_metric", UNSET)
@@ -441,8 +424,6 @@ class EmbeddingsIndexConfig:
             dimension=dimension,
             field=field,
             sources=sources,
-            embedding_name=embedding_name,
-            source_artifact_name=source_artifact_name,
             template=template,
             distance_metric=distance_metric,
             mem_only=mem_only,

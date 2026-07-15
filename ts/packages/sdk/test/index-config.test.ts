@@ -30,7 +30,14 @@ describe("artifact index configuration", () => {
   it("preserves graph-specific source interpretation", () => {
     expect(
       graphIndexSources(
-        { artifact: "relations_v1", path: "$.relations[*]", format: "extraction_relation" },
+        {
+          artifact: "relations_v1",
+          path: "$.relations[*]",
+          format: "extraction_relation",
+          nodes: { source: "{{source}}", target: "{{target}}" },
+          edge: { type: "{{relation}}", metadata: { origin: "extractor" } },
+          context: { doc_fields: ["title", "url"] },
+        },
         { artifact: "graph_v1", path: "$.graph", format: "extraction_graph" }
       )
     ).toHaveLength(2);

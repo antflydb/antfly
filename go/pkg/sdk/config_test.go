@@ -182,11 +182,29 @@ func containsJSONField(data []byte, field string) bool {
 }
 
 func TestGraphIndexConfigUsesPerSourcePathAndFormat(t *testing.T) {
+	edgeType, err := NewGraphIndexSourceEdgeType("{{relation}}")
+	if err != nil {
+		t.Fatalf("NewGraphIndexSourceEdgeType failed: %v", err)
+	}
+	edgeWeight, err := NewGraphIndexSourceNumericEdgeWeight(1.0)
+	if err != nil {
+		t.Fatalf("NewGraphIndexSourceNumericEdgeWeight failed: %v", err)
+	}
 	graphSources, err := NewGraphIndexSources(
 		GraphIndexSource{
 			Artifact: "title_relations_v1",
 			Path:     "$.relations[*]",
 			Format:   GraphIndexSourceFormatExtractionRelation,
+			Nodes: GraphIndexSourceNodes{
+				Model:  GraphIndexSourceNodesModelDocument,
+				Source: "{{source}}",
+				Target: "{{target}}",
+			},
+			Edge: GraphIndexSourceEdge{
+				Type: edgeType, Weight: edgeWeight,
+				Metadata: map[string]interface{}{"origin": "extractor"},
+			},
+			Context: GraphIndexSourceContext{DocFields: []string{"title", "url"}},
 		},
 		GraphIndexSource{
 			Artifact: "entity_graph_v1",
@@ -222,6 +240,12 @@ func TestGraphIndexConfigUsesPerSourcePathAndFormat(t *testing.T) {
 	second := sources[1].(map[string]any)
 	if first["path"] != "$.relations[*]" || first["format"] != "extraction_relation" {
 		t.Fatalf("first source = %#v", first)
+	}
+	if first["nodes"].(map[string]any)["source"] != "{{source}}" {
+		t.Fatalf("first source nodes = %#v", first["nodes"])
+	}
+	if first["edge"].(map[string]any)["type"] != "{{relation}}" || first["edge"].(map[string]any)["weight"] != float64(1) {
+		t.Fatalf("first source edge = %#v", first["edge"])
 	}
 	if second["path"] != "$.graph" || second["format"] != "extraction_graph" {
 		t.Fatalf("second source = %#v", second)

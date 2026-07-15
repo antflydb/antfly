@@ -60,7 +60,7 @@ pub struct ArtifactIndexSourceSpec {
     pub artifact: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GraphIndexSourceSpec {
     pub artifact: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,6 +69,51 @@ pub struct GraphIndexSourceSpec {
     pub format: Option<GraphArtifactFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mention_edge_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nodes: Option<GraphNodeMappingSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge: Option<GraphEdgeMappingSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<GraphContextMappingSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraphNodeMappingSpec {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<GraphNodeModel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphNodeModel {
+    Document,
+    External,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GraphEdgeMappingSpec {
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub edge_type: Option<GraphTemplateOrNumber>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight: Option<GraphTemplateOrNumber>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum GraphTemplateOrNumber {
+    Template(String),
+    Number(f64),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraphContextMappingSpec {
+    pub doc_fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -82,6 +127,24 @@ pub fn graph_index_sources(
     sources: Vec<GraphIndexSourceSpec>,
 ) -> Result<Vec<GraphIndexSourceSpec>, IndexConfigError> {
     validate_artifact_names(sources.iter().map(|source| source.artifact.as_str()))?;
+    for (source_index, source) in sources.iter().enumerate() {
+        let Some(context) = source.context.as_ref() else {
+            continue;
+        };
+        let mut seen = std::collections::HashSet::with_capacity(context.doc_fields.len());
+        for (field_index, field) in context.doc_fields.iter().enumerate() {
+            if field.is_empty() {
+                return Err(IndexConfigError(format!(
+                    "sources[{source_index}].context.doc_fields[{field_index}] is required"
+                )));
+            }
+            if !seen.insert(field) {
+                return Err(IndexConfigError(format!(
+                    "sources[{source_index}].context.doc_fields contains duplicate {field:?}"
+                )));
+            }
+        }
+    }
     Ok(sources)
 }
 
@@ -277,8 +340,10 @@ include!(concat!(env!("OUT_DIR"), "/client.rs"));
 mod tests {
     use super::{
         ArtifactEmbeddingDistanceMetric, ArtifactEmbeddingIndexOptions,
-        ArtifactEmbeddingSourceSpec, artifact_embedding_index_config, artifact_index_sources,
-        normalize_base_url,
+        ArtifactEmbeddingSourceSpec, GraphArtifactFormat, GraphContextMappingSpec,
+        GraphEdgeMappingSpec, GraphIndexSourceSpec, GraphNodeMappingSpec, GraphNodeModel,
+        GraphTemplateOrNumber, artifact_embedding_index_config, artifact_index_sources,
+        graph_index_sources, normalize_base_url,
     };
     use serde_json::json;
 
@@ -368,5 +433,33 @@ mod tests {
             },
         );
         assert!(invalid.is_err());
+    }
+
+    #[test]
+    fn builds_graph_sources_with_local_mappings() {
+        let sources = graph_index_sources(vec![GraphIndexSourceSpec {
+            artifact: "relations_v1".into(),
+            path: Some("$.relations[*]".into()),
+            format: Some(GraphArtifactFormat::ExtractionRelation),
+            mention_edge_type: None,
+            nodes: Some(GraphNodeMappingSpec {
+                model: Some(GraphNodeModel::Document),
+                source: Some("{{source}}".into()),
+                target: Some("{{target}}".into()),
+            }),
+            edge: Some(GraphEdgeMappingSpec {
+                edge_type: Some(GraphTemplateOrNumber::Template("{{relation}}".into())),
+                weight: Some(GraphTemplateOrNumber::Number(1.0)),
+                metadata: None,
+            }),
+            context: Some(GraphContextMappingSpec {
+                doc_fields: vec!["title".into(), "url".into()],
+            }),
+        }])
+        .unwrap();
+        let encoded = serde_json::to_value(sources).unwrap();
+        assert_eq!(encoded[0]["nodes"]["source"], "{{source}}");
+        assert_eq!(encoded[0]["edge"]["weight"], 1.0);
+        assert_eq!(encoded[0]["context"]["doc_fields"][1], "url");
     }
 }

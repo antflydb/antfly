@@ -451,8 +451,9 @@ artifact stream.
 All sources in one index must have the same dense dimension and must inhabit a
 compatible vector space. `vector_space` is optional. When every source omits
 it, Antfly compares the durable canonical semantic producer identity stored on
-every embedding enrichment (provider, model, endpoint, region, dense/sparse
-mode, multimodal mode, input type, and truncation) and rejects
+every embedding enrichment (provider, model, effective normalized endpoint,
+effective region, dense/sparse mode, multimodal mode, input type, and
+truncation) and rejects
 unknown or incompatible producers. Endpoint is semantic because an
 OpenAI-compatible endpoint can serve an unrelated model under the same model
 name. Credentials, pacing, retries, and batch limits are execution settings and
@@ -461,9 +462,12 @@ reconstructed from the currently loaded index configs, so stale or externally
 written artifact streams cannot silently pass validation.
 
 Managed embedding artifact freshness hashes bind the rendered source content
-to that same canonical producer identity. Changing the provider, model,
-endpoint, region, modality, input type, or truncation therefore forces
-regeneration even when the source text and artifact name are unchanged.
+to that same canonical producer identity. Provider defaults, environment
+overrides, configured inference service URLs, and embedded Antfly inference are
+resolved through the same code path used for execution before the identity is
+persisted. Changing the provider, model, effective endpoint, effective region,
+modality, input type, or truncation therefore forces regeneration even when the
+source text and artifact name are unchanged.
 
 To combine intentionally compatible but distinct or externally produced
 embeddings, every source must declare the same non-empty `vector_space`.
@@ -477,11 +481,9 @@ repeated on the index.
 For vector indexes, `sources` is mutually exclusive with direct managed
 `field`/`template`/`chunker` configuration and `external: true`; it is supported
 for both dense and sparse indexes. Dense sources share dimensions, metric, and
-vector space. Sparse sources share one tokenizer/model token space. The legacy
-single-source `embedding_name` is accepted as a compatibility alias for
-`sources: [{"artifact": embedding_name}]`; `source_artifact_name` is also read
-for legacy status/config compatibility. New configurations and SDK output must
-use `sources`.
+vector space. Sparse sources share one tokenizer/model token space. Artifact-
+backed indexes have one configuration path in the API and SDKs: `sources`.
+Removed singular aliases are rejected rather than silently normalized.
 
 Embedder batching belongs on each matching embedding enrichment. When an index
 declares multiple sources, each producer may use its own `execution` policy;

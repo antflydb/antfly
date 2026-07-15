@@ -8452,16 +8452,6 @@ export interface components {
             /** @description Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by the artifact name and its source key. All sources must use the same dense vector space or the same sparse token space. Not allowed for external or direct field/template indexes. */
             sources?: components["schemas"]["ArtifactIndexSource"][];
             /**
-             * @deprecated
-             * @description Deprecated single-source alias for sources: [{artifact: <embedding_name>}].
-             */
-            embedding_name?: string;
-            /**
-             * @deprecated
-             * @description Deprecated descriptive field for the input to the legacy embedding_name enrichment. New configurations define that input only on the matching enrichment.
-             */
-            source_artifact_name?: string;
-            /**
              * @description Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
              * @example Hello, {{#if (eq Name "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old.
              */
@@ -8494,6 +8484,31 @@ export interface components {
             /** @description Non-semantic execution policy for shorthand-created chunking or embedding producers. */
             execution?: components["schemas"]["IndexExecutionConfig"];
         };
+        GraphIndexSourceNodes: {
+            /**
+             * @default document
+             * @enum {string}
+             */
+            model?: "document" | "external";
+            /** @description Template for the source node identifier. */
+            source?: string;
+            /** @description Template for the target node identifier. */
+            target?: string;
+        };
+        GraphIndexSourceEdge: {
+            /** @description Template or literal edge type. */
+            type?: string | number;
+            /** @description Template or numeric literal edge weight. */
+            weight?: string | number;
+            /** @description Metadata object whose string leaves may contain templates. */
+            metadata?: {
+                [key: string]: unknown;
+            };
+        };
+        GraphIndexSourceContext: {
+            /** @description Document fields that source templates may reference through _doc.value. */
+            doc_fields?: string[];
+        };
         /** @description Graph-specific artifact source. The source owns the payload path and format because different artifact streams in one graph index may require different interpretations. */
         GraphIndexSource: {
             /** @description Stable name of the generated graph artifact. */
@@ -8511,6 +8526,12 @@ export interface components {
             format?: "extraction_relation" | "extraction_graph";
             /** @description Optional provenance edge type emitted for resolver mention decisions from this source. */
             mention_edge_type?: string;
+            /** @description Optional node mapping templates for this artifact stream. */
+            nodes?: components["schemas"]["GraphIndexSourceNodes"];
+            /** @description Optional edge mapping templates for this artifact stream. */
+            edge?: components["schemas"]["GraphIndexSourceEdge"];
+            /** @description Document fields explicitly available to this source's mapping templates. */
+            context?: components["schemas"]["GraphIndexSourceContext"];
         };
         /** @description Configuration for a specific edge type */
         EdgeTypeConfig: {
@@ -9382,8 +9403,6 @@ export interface components {
             catch_up_applied_sequence?: number;
             /** Format: uint64 */
             catch_up_target_sequence?: number;
-            /** @description Graph source artifact materialization status. */
-            source_artifact?: components["schemas"]["GraphSourceArtifactStatus"];
             /** @description Materialization status for every configured graph source artifact. */
             source_artifacts?: components["schemas"]["GraphSourceArtifactStatus"][];
             /** @description Resolver replay diagnostics for graph materialization. */
@@ -9618,8 +9637,6 @@ export interface components {
             missing_groups?: number;
             /** Format: uint64 */
             unknown_remote_groups?: number;
-            /** @description Source artifact stream used to materialize graph edges. */
-            source_artifact?: components["schemas"]["GraphSourceArtifactStatus"];
             /** @description All source artifact streams used to materialize graph edges, in configured order. */
             source_artifacts?: components["schemas"]["GraphSourceArtifactStatus"][];
             /** @description Graph resolver replay diagnostics. */

@@ -9,6 +9,27 @@ import type {
 
 const MAX_ARTIFACT_SOURCES = 64;
 
+function cloneJsonValue(value: unknown, path: string): unknown {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError(`${path} must be finite`);
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item, index) => cloneJsonValue(item, `${path}[${index}]`));
+  }
+  if (typeof value === "object") {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new TypeError(`${path} must contain only JSON values`);
+    }
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, cloneJsonValue(item, `${path}.${key}`)])
+    );
+  }
+  throw new TypeError(`${path} must contain only JSON values`);
+}
+
 function validateArtifactNames(artifacts: readonly string[]): void {
   if (artifacts.length === 0) throw new TypeError("at least one artifact source is required");
   if (artifacts.length > MAX_ARTIFACT_SOURCES) {
@@ -39,8 +60,58 @@ export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSou
     ) {
       throw new TypeError(`sources[${index}].format is invalid`);
     }
+    if (
+      source.nodes?.model !== undefined &&
+      source.nodes.model !== "document" &&
+      source.nodes.model !== "external"
+    ) {
+      throw new TypeError(`sources[${index}].nodes.model is invalid`);
+    }
+    for (const [fieldName, value] of [
+      ["type", source.edge?.type],
+      ["weight", source.edge?.weight],
+    ] as const) {
+      if (typeof value === "number" && !Number.isFinite(value)) {
+        throw new TypeError(`sources[${index}].edge.${fieldName} must be finite`);
+      }
+    }
+    const docFields = source.context?.doc_fields;
+    if (docFields !== undefined) {
+      if (docFields.some((field) => typeof field !== "string" || field.length === 0)) {
+        throw new TypeError(`sources[${index}].context.doc_fields entries must be non-empty strings`);
+      }
+      if (new Set(docFields).size !== docFields.length) {
+        throw new TypeError(`sources[${index}].context.doc_fields must be unique`);
+      }
+    }
   });
-  return sources.map((source) => ({ ...source }));
+  return sources.map((source) => ({
+    ...source,
+    nodes: source.nodes === undefined ? undefined : { ...source.nodes },
+    edge:
+      source.edge === undefined
+        ? undefined
+        : {
+            ...source.edge,
+            metadata:
+              source.edge.metadata === undefined
+                ? undefined
+                : (cloneJsonValue(
+                  source.edge.metadata,
+                  "graph source edge metadata"
+                  ) as NonNullable<GraphIndexSource["edge"]>["metadata"]),
+          },
+    context:
+      source.context === undefined
+        ? undefined
+        : {
+            ...source.context,
+            doc_fields:
+              source.context.doc_fields === undefined
+                ? undefined
+                : [...source.context.doc_fields],
+          },
+  }));
 }
 
 export interface ArtifactEmbeddingSourceConfig {

@@ -36795,7 +36795,7 @@ test "db starts resolver replay workers only while resolver catalog is configure
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -36857,8 +36857,8 @@ test "db backfills a mention name embedding so ann/cosine resolution links end-t
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]",
-        \\    "format":"extraction_relation","mention_edge_type":"mentions"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]",
+        \\    "format":"extraction_relation","mention_edge_type":"mentions"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -36936,7 +36936,7 @@ test "db resolves extracted entities into a resolution artifact end-to-end" {
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -36995,7 +36995,7 @@ test "db re-resolves the corpus when upsertResolver bumps the config generation"
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -37059,7 +37059,7 @@ test "db re-resolves existing corpus when upsertResolver inserts a new resolver"
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -37125,7 +37125,7 @@ test "db drains pending resolver backfill when retrying a no-op upsertResolver" 
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -37189,7 +37189,7 @@ test "db refuses resolver removal while resolution or promotion replay is pendin
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -37283,7 +37283,7 @@ test "db promotes resolved entities into entity-document upserts end-to-end" {
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -37347,7 +37347,7 @@ test "db graph index materializes relation asset artifacts into graph edge artif
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -37489,9 +37489,9 @@ test "db graph index materializes unit-derived chunk artifacts into graph edge a
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"document_chunks_v1","format":"extraction_relation"},
-        \\  "nodes":{"source":"{{ _artifact.value._parent_unit_key }}","target":"{{ _artifact.value.text }}"},
-        \\  "edge":{"type":"mentions","metadata":{"unit":"{{ _artifact.value._parent_unit_id }}","artifact":"{{ _artifact.name }}"}}
+        \\  "sources":[{"artifact":"document_chunks_v1","format":"extraction_relation",
+        \\    "nodes":{"source":"{{ _artifact.value._parent_unit_key }}","target":"{{ _artifact.value.text }}"},
+        \\    "edge":{"type":"mentions","metadata":{"unit":"{{ _artifact.value._parent_unit_id }}","artifact":"{{ _artifact.name }}"}}}]
         \\}
         ,
     });
@@ -37530,8 +37530,8 @@ test "db graph replay blocks resolution artifact without resolver contract" {
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
-        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "sources":[{"artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -37606,8 +37606,8 @@ test "db graph replay ignores resolution artifacts bound to another source contr
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_a","mention_edge_type":"mentions",
-        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "sources":[{"artifact":"relations_a","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"}],
         \\  "artifact":{"name":"relations_a","kind":"asset","field":"relations_a","content_type":"application/json"}
         \\}
         ,
@@ -37617,8 +37617,8 @@ test "db graph replay ignores resolution artifacts bound to another source contr
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_b","mention_edge_type":"mentions",
-        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "sources":[{"artifact":"relations_b","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"}],
         \\  "artifact":{"name":"relations_b","kind":"asset","field":"relations_b","content_type":"application/json"}
         \\}
         ,
@@ -37668,8 +37668,8 @@ test "db materializes doc->entity mention edges as provenance and clears them on
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
-        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "sources":[{"artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -37783,8 +37783,8 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
-        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "sources":[{"artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -37908,8 +37908,8 @@ test "db does not materialize review-band resolution as canonical mention edges"
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
-        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "sources":[{"artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -37997,8 +37997,8 @@ test "db mention edge weight is fused from extractor trust and mention confidenc
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
-        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "sources":[{"artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -38051,8 +38051,8 @@ test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
-        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "sources":[{"artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -38117,8 +38117,8 @@ test "db graph hydration fails closed for a not-yet-promoted entity node" {
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
-        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "sources":[{"artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -38207,10 +38207,10 @@ test "db graph relation artifact materializer uses mapping templates" {
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.items[*]","format":"extraction_relation"},
-        \\  "nodes":{"source":"{{ _doc.key }}","target":"{{ _item.to }}"},
-        \\  "edge":{"type":"{{ _item.rel }}","weight":"{{ default _item.score 1.0 }}","metadata":{"evidence":"{{ _item.evidence }}","ordinal":"{{ _item_index }}","tenant":"{{ _doc.value.tenant_id }}"}},
-        \\  "context":{"doc_fields":["tenant_id"]},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.items[*]","format":"extraction_relation",
+        \\    "nodes":{"source":"{{ _doc.key }}","target":"{{ _item.to }}"},
+        \\    "edge":{"type":"{{ _item.rel }}","weight":"{{ default _item.score 1.0 }}","metadata":{"evidence":"{{ _item.evidence }}","ordinal":"{{ _item_index }}","tenant":"{{ _doc.value.tenant_id }}"}},
+        \\    "context":{"doc_fields":["tenant_id"]}}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -38254,9 +38254,9 @@ test "db graph relation artifact materializer resolves entity refs and artifact 
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_graph"},
-        \\  "nodes":{"source":"{{ _doc.key }}","target":"{{ _item.target.doc_ref.key }}"},
-        \\  "edge":{"type":"{{ _item.type }}","metadata":{"artifact":"{{ _artifact.name }}","content_type":"{{ _artifact.content_type }}","source_text":"{{ _item.source.text }}","target_text":"{{ _item.target.text }}"}},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_graph",
+        \\    "nodes":{"source":"{{ _doc.key }}","target":"{{ _item.target.doc_ref.key }}"},
+        \\    "edge":{"type":"{{ _item.type }}","metadata":{"artifact":"{{ _artifact.name }}","content_type":"{{ _artifact.content_type }}","source_text":"{{ _item.source.text }}","target_text":"{{ _item.target.text }}"}}}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -38300,7 +38300,7 @@ test "db graph relation artifact materializer replaces stale document edges" {
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -38346,7 +38346,7 @@ test "db graph relation artifact materializer deletes edges when asset source di
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -38396,7 +38396,7 @@ test "db graph artifact source lifecycle reuses and protects asset enrichments" 
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -38415,7 +38415,7 @@ test "db graph artifact source lifecycle reuses and protects asset enrichments" 
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -38522,7 +38522,7 @@ test "db graph artifact source reuses user enrichment and rejects incompatible s
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}]
         \\}
         ,
     });
@@ -38532,7 +38532,7 @@ test "db graph artifact source reuses user enrichment and rejects incompatible s
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json"}
         \\}
         ,
@@ -38554,7 +38554,7 @@ test "db graph source artifact deletion clears materialized graph edges" {
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -38604,7 +38604,7 @@ test "db graph artifact edges are visible to graph search queries" {
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -38657,8 +38657,8 @@ test "db graph artifact external node targets return ids without document hydrat
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "nodes":{"model":"external","target":"{{ _item.target.entity_id }}"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation",
+        \\    "nodes":{"model":"external","target":"{{ _item.target.entity_id }}"}}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -38717,8 +38717,8 @@ test "db async asset producer graph source materializes through replay" {
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "edge":{"metadata":{"artifact":"{{ _artifact.name }}","content_type":"{{ _artifact.content_type }}"}},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation",
+        \\    "edge":{"metadata":{"artifact":"{{ _artifact.name }}","content_type":"{{ _artifact.content_type }}"}}}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"target_doc","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"mock"}}}
         \\}
         ,
@@ -38769,8 +38769,8 @@ test "db async asset producer mention edges come from resolution artifacts" {
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]",
-        \\    "format":"extraction_relation","mention_edge_type":"mentions"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]",
+        \\    "format":"extraction_relation","mention_edge_type":"mentions"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"mock"}}}
         \\}
         ,
@@ -38861,7 +38861,7 @@ test "db graph artifact source replay catches up after reopen" {
             .kind = .graph,
             .config_json =
             \\{
-            \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+            \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
             \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
             \\}
             ,
@@ -39282,7 +39282,7 @@ test "db derived target advance does not skip unseen matching replay records" {
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -39292,7 +39292,7 @@ test "db derived target advance does not skip unseen matching replay records" {
         .kind = .graph,
         .config_json =
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
         \\}
         ,
@@ -42977,7 +42977,7 @@ test "db artifact repair records corrupt graph edge artifacts during replay" {
             .kind = .graph,
             .config_json =
             \\{
-            \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+            \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
             \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
             \\}
             ,
@@ -43037,7 +43037,7 @@ test "db artifact repair records corrupt graph source asset artifacts during rep
             .kind = .graph,
             .config_json =
             \\{
-            \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+            \\  "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
             \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
             \\}
             ,

@@ -3,6 +3,9 @@ import pytest
 from antfly import (
     ArtifactEmbeddingSource,
     GraphArtifactSource,
+    GraphContextMapping,
+    GraphEdgeMapping,
+    GraphNodeMapping,
     artifact_embedding_index_config,
     artifact_index_sources,
     graph_index_sources,
@@ -30,10 +33,19 @@ def test_multi_source_embedding_config_uses_automatic_vector_space() -> None:
 
 def test_graph_sources_preserve_path_and_format() -> None:
     sources = graph_index_sources(
-        GraphArtifactSource("relations_v1", path="$.relations[*]"),
+        GraphArtifactSource(
+            "relations_v1",
+            path="$.relations[*]",
+            nodes=GraphNodeMapping(source="{{source}}", target="{{target}}"),
+            edge=GraphEdgeMapping(type="{{relation}}", metadata={"origin": "extractor"}),
+            context=GraphContextMapping(doc_fields=("title", "url")),
+        ),
         GraphArtifactSource("graph_v1", path="$.graph", format="extraction_graph"),
     )
     assert sources[1]["format"] == "extraction_graph"
+    assert sources[0]["nodes"]["source"] == "{{source}}"
+    assert sources[0]["edge"]["metadata"] == {"origin": "extractor"}
+    assert sources[0]["context"]["doc_fields"] == ["title", "url"]
 
 
 def test_artifact_source_validation() -> None:

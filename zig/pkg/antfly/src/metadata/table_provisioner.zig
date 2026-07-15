@@ -57,6 +57,7 @@ pub const ProvisionSummary = struct {
 pub const ReconcileReplicaRootOptions = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     shard_db_adapter: ?shard_db_adapter_mod.ShardDbAdapter = null,
+    embedding_options: managed_embedder.InitOptions = .{},
 };
 
 fn provisioningDbOpenOptions() db_mod.OpenOptions {
@@ -180,7 +181,9 @@ pub fn reconcileReplicaRootWithOptions(
         defer db.close();
         summary.dbs_opened += 1;
         try applyTableSchemaJson(alloc, &db, table.schema_json);
-        const index_summary = try reconcileDbIndexes(alloc, &db, table.indexes_json);
+        const index_summary = try reconcileDbIndexesWithOptions(alloc, &db, table.indexes_json, .{
+            .embedding_options = options.embedding_options,
+        });
         summary.indexes_removed += index_summary.indexes_removed;
         summary.indexes_added += index_summary.indexes_added;
         summary.enrichments_added += index_summary.enrichments_added;
@@ -212,6 +215,7 @@ pub fn reconcileDbIndexes(
 
 pub const ReconcileDbIndexOptions = struct {
     drain_resolver_backfill: bool = true,
+    embedding_options: managed_embedder.InitOptions = .{},
 };
 
 fn dbIndexReconciliationCanMutate(db: *const db_mod.DB) bool {
@@ -229,7 +233,7 @@ pub fn reconcileDbIndexesWithOptions(
         for (desired_enrichments.items) |*cfg| cfg.deinit(alloc);
         desired_enrichments.deinit(alloc);
     }
-    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, &desired_enrichments);
+    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, options.embedding_options, &desired_enrichments);
     try indexes_api.validateArtifactEnrichmentConfigs(desired_enrichments.items);
     dedupeDesiredEnrichments(alloc, &desired_enrichments);
     indexes_api.sortArtifactEnrichmentsByDependency(desired_enrichments.items);
@@ -719,10 +723,11 @@ fn jsonValuesEqualIgnoringTopLevelEnrichments(a: std.json.Value, b: std.json.Val
 fn collectDesiredEnrichmentsFromJson(
     alloc: std.mem.Allocator,
     indexes_json: []const u8,
+    embedding_options: managed_embedder.InitOptions,
     out: *std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig),
 ) !void {
     {
-        const collected = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
+        const collected = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(alloc, indexes_json, embedding_options);
         errdefer db_mod.types.freeEnrichmentConfigs(alloc, collected);
         try out.appendSlice(alloc, collected);
         alloc.free(collected);
@@ -1129,6 +1134,9 @@ fn extractIndexConfigJsonForKind(
     if (value != .object) return try alloc.dupe(u8, "{}");
     switch (kind) {
         .dense_vector, .sparse_vector => return try managed_embedder.translateEmbeddingsIndexConfigJson(alloc, index_name, value),
+        .graph => if (value.object.get("source") != null or value.object.get("artifact") != null) {
+            return error.InvalidCreateTableRequest;
+        },
         else => {},
     }
 
@@ -1502,8 +1510,8 @@ test "table provisioner registers a resolver declared in the table index config"
     const indexes_json =
         \\{
         \\  "relations_graph":{"type":"graph",
-        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
+        \\    "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
+        \\    "enrichments":[{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}]},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
         \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}
@@ -1559,8 +1567,8 @@ test "table provisioner registers a resolver declared in the table index config"
     const bumped_indexes_json =
         \\{
         \\  "relations_graph":{"type":"graph",
-        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
+        \\    "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
+        \\    "enrichments":[{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}]},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
         \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":2}
@@ -1605,8 +1613,8 @@ test "table provisioner registers a resolver declared in the table index config"
     const removed_indexes_json =
         \\{
         \\  "relations_graph":{"type":"graph",
-        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
+        \\    "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
+        \\    "enrichments":[{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}]},
         \\  "resolvers":[]
         \\}
     ;
