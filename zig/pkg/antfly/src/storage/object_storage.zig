@@ -39,8 +39,9 @@ pub const Gcs = objectstore.Gcs;
 /// Thin wrapper for host-provided object storage callbacks.
 /// Hosts can provide an object-oriented blob implementation without exposing
 /// the underlying transport details to serverless or future external segment paths.
-/// Conditional writes must be atomic and report failed `if_none_match` or
-/// `if_match_etag` conditions as `error.PreconditionFailed`. Successful writes
+/// Conditional writes must be atomic. Conditional reads and writes must enforce
+/// `if_match_etag` and report a mismatch as `error.PreconditionFailed` without
+/// returning stale data. Failed `if_none_match` writes use the same error. Successful writes
 /// must become readable promptly; immutable manifest publication tolerates a
 /// short bounded visibility delay after a lost conditional-create race and then
 /// fails closed rather than assuming the winner's content.
@@ -168,6 +169,16 @@ test "host object storage delegates through callbacks" {
     var got = try storage.getObject("bucket", "docs/a.txt", .{});
     defer got.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("alpha", got.body);
+
+    try std.testing.expectError(
+        error.PreconditionFailed,
+        storage.getObject("bucket", "docs/a.txt", .{ .if_match_etag = "stale" }),
+    );
+    var metadata = try storage.statObject("bucket", "docs/a.txt");
+    defer metadata.deinit(std.testing.allocator);
+    var matched = try storage.getObject("bucket", "docs/a.txt", .{ .if_match_etag = metadata.etag.? });
+    defer matched.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("alpha", matched.body);
 
     var listed = try storage.listObjects("bucket", .{ .prefix = "docs/" });
     defer listed.deinit(std.testing.allocator);

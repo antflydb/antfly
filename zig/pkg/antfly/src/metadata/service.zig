@@ -9687,6 +9687,7 @@ test "metadata http projected clone helpers clean up on allocation failure" {
             const split_transitions = [_]transition_state.SplitTransitionRecord{
                 .{
                     .transition_id = 91,
+                    .attempt_epoch = 1,
                     .source_group_id = 11,
                     .destination_group_id = 12,
                     .phase = .prepare,

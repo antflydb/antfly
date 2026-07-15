@@ -25,6 +25,7 @@ const split_bootstrap_marker_key = "\x00\x00__metadata__:split_bootstrap_marker"
 
 pub const SplitBootstrapMarker = struct {
     transition_id: u64,
+    attempt_epoch: u64,
     source_group_id: u64,
     destination_group_id: u64,
     bootstrap_complete: bool,
@@ -152,26 +153,28 @@ pub fn loadSplitBootstrapMarker(alloc: Allocator, store: anytype) !?SplitBootstr
         error.NotFound => return null,
         else => return err,
     };
-    if (borrowed.len != 3 * @sizeOf(u64) + 1) return error.InvalidSplitBootstrapMarker;
-    const bootstrap_complete = switch (borrowed[24]) {
+    if (borrowed.len != 4 * @sizeOf(u64) + 1) return error.InvalidSplitBootstrapMarker;
+    const bootstrap_complete = switch (borrowed[32]) {
         0 => false,
         1 => true,
         else => return error.InvalidSplitBootstrapMarker,
     };
     return .{
         .transition_id = std.mem.readInt(u64, borrowed[0..8], .little),
-        .source_group_id = std.mem.readInt(u64, borrowed[8..16], .little),
-        .destination_group_id = std.mem.readInt(u64, borrowed[16..24], .little),
+        .attempt_epoch = std.mem.readInt(u64, borrowed[8..16], .little),
+        .source_group_id = std.mem.readInt(u64, borrowed[16..24], .little),
+        .destination_group_id = std.mem.readInt(u64, borrowed[24..32], .little),
         .bootstrap_complete = bootstrap_complete,
     };
 }
 
 pub fn saveSplitBootstrapMarker(store: anytype, marker: SplitBootstrapMarker) !void {
-    var buf: [3 * @sizeOf(u64) + 1]u8 = undefined;
+    var buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
     std.mem.writeInt(u64, buf[0..8], marker.transition_id, .little);
-    std.mem.writeInt(u64, buf[8..16], marker.source_group_id, .little);
-    std.mem.writeInt(u64, buf[16..24], marker.destination_group_id, .little);
-    buf[24] = @intFromBool(marker.bootstrap_complete);
+    std.mem.writeInt(u64, buf[8..16], marker.attempt_epoch, .little);
+    std.mem.writeInt(u64, buf[16..24], marker.source_group_id, .little);
+    std.mem.writeInt(u64, buf[24..32], marker.destination_group_id, .little);
+    buf[32] = @intFromBool(marker.bootstrap_complete);
     var runtime = try initRuntimeStore(std.heap.page_allocator, store);
     defer runtime.deinit();
     var txn = try runtime.store.beginWrite();
@@ -307,6 +310,7 @@ test "split bootstrap marker distinguishes reservation from completion" {
 
     try saveSplitBootstrapMarker(runtime, .{
         .transition_id = 41,
+        .attempt_epoch = 7,
         .source_group_id = 42,
         .destination_group_id = 43,
         .bootstrap_complete = false,
@@ -314,12 +318,14 @@ test "split bootstrap marker distinguishes reservation from completion" {
     const reserved = (try loadSplitBootstrapMarker(std.testing.allocator, runtime)) orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 41), reserved.transition_id);
+    try std.testing.expectEqual(@as(u64, 7), reserved.attempt_epoch);
     try std.testing.expectEqual(@as(u64, 42), reserved.source_group_id);
     try std.testing.expectEqual(@as(u64, 43), reserved.destination_group_id);
     try std.testing.expect(!reserved.bootstrap_complete);
 
     try saveSplitBootstrapMarker(runtime, .{
         .transition_id = 41,
+        .attempt_epoch = 7,
         .source_group_id = 42,
         .destination_group_id = 43,
         .bootstrap_complete = true,

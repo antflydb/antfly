@@ -720,6 +720,7 @@ const EncodedTransitionAction = struct {
         rollback_merge,
     },
     transition_id: u64,
+    attempt_epoch: u64 = 0,
     source_group_id: ?u64 = null,
     destination_group_id: ?u64 = null,
     donor_group_id: ?u64 = null,
@@ -733,8 +734,14 @@ const EncodedTransitionAction = struct {
 fn parseSplitTransitionRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_transition_state.SplitTransitionRecord {
     var parsed = try std.json.parseFromSlice(metadata_transition_state.SplitTransitionRecord, alloc, body, .{ .allocate = .alloc_always });
     defer parsed.deinit();
+    if (parsed.value.transition_id == 0 or parsed.value.attempt_epoch == 0 or
+        parsed.value.source_group_id == 0 or parsed.value.destination_group_id == 0)
+    {
+        return error.InvalidTransitionActionRequest;
+    }
     return .{
         .transition_id = parsed.value.transition_id,
+        .attempt_epoch = parsed.value.attempt_epoch,
         .source_group_id = parsed.value.source_group_id,
         .destination_group_id = parsed.value.destination_group_id,
         .phase = parsed.value.phase,
@@ -760,10 +767,21 @@ fn parseMergeTransitionRecord(alloc: std.mem.Allocator, body: []const u8) !metad
 fn parseTransitionAction(alloc: std.mem.Allocator, body: []const u8) !metadata_mod.TransitionAction {
     var parsed = try std.json.parseFromSlice(EncodedTransitionAction, alloc, body, .{ .allocate = .alloc_always });
     defer parsed.deinit();
+    switch (parsed.value.kind) {
+        .prepare_split_source,
+        .start_split_source,
+        .bootstrap_split_destination,
+        .catch_up_split_destination,
+        .finalize_split_source,
+        .rollback_split,
+        => if (parsed.value.attempt_epoch == 0) return error.InvalidTransitionActionRequest,
+        else => {},
+    }
     return switch (parsed.value.kind) {
         .prepare_split_source => .{
             .prepare_split_source = .{
                 .transition_id = parsed.value.transition_id,
+                .attempt_epoch = parsed.value.attempt_epoch,
                 .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
                 .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
                 .split_key = try alloc.dupe(u8, parsed.value.split_key orelse return error.InvalidTransitionActionRequest),
@@ -773,6 +791,7 @@ fn parseTransitionAction(alloc: std.mem.Allocator, body: []const u8) !metadata_m
         .start_split_source => .{
             .start_split_source = .{
                 .transition_id = parsed.value.transition_id,
+                .attempt_epoch = parsed.value.attempt_epoch,
                 .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
                 .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
             },
@@ -780,6 +799,7 @@ fn parseTransitionAction(alloc: std.mem.Allocator, body: []const u8) !metadata_m
         .bootstrap_split_destination => .{
             .bootstrap_split_destination = .{
                 .transition_id = parsed.value.transition_id,
+                .attempt_epoch = parsed.value.attempt_epoch,
                 .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
                 .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
                 .destination_base_uri = if (parsed.value.destination_base_uri) |value| try alloc.dupe(u8, value) else null,
@@ -788,6 +808,7 @@ fn parseTransitionAction(alloc: std.mem.Allocator, body: []const u8) !metadata_m
         .catch_up_split_destination => .{
             .catch_up_split_destination = .{
                 .transition_id = parsed.value.transition_id,
+                .attempt_epoch = parsed.value.attempt_epoch,
                 .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
                 .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
                 .destination_base_uri = if (parsed.value.destination_base_uri) |value| try alloc.dupe(u8, value) else null,
@@ -796,6 +817,7 @@ fn parseTransitionAction(alloc: std.mem.Allocator, body: []const u8) !metadata_m
         .finalize_split_source => .{
             .finalize_split_source = .{
                 .transition_id = parsed.value.transition_id,
+                .attempt_epoch = parsed.value.attempt_epoch,
                 .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
                 .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
             },
@@ -803,6 +825,7 @@ fn parseTransitionAction(alloc: std.mem.Allocator, body: []const u8) !metadata_m
         .rollback_split => .{
             .rollback_split = .{
                 .transition_id = parsed.value.transition_id,
+                .attempt_epoch = parsed.value.attempt_epoch,
                 .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
                 .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
             },
@@ -991,6 +1014,7 @@ test "internal group write routes reject mismatched shard execute requests" {
 test "internal group write routes allow source-hosted split destination actions" {
     const action = metadata_mod.TransitionAction{ .bootstrap_split_destination = .{
         .transition_id = 1,
+        .attempt_epoch = 1,
         .source_group_id = 7,
         .destination_group_id = 8,
     } };

@@ -252,6 +252,12 @@ test "metadata control loop proposes desired transitions through the service sea
         .destination_group_id = 103,
         .split_key = "doc:h",
     });
+    const desired_ranges = try loop.stateRef().tableManager().listRanges(std.testing.allocator);
+    defer loop.stateRef().tableManager().freeRanges(std.testing.allocator, desired_ranges);
+    const desired_source = for (desired_ranges) |record| {
+        if (record.group_id == 101) break record;
+    } else return error.MissingSourceRange;
+    try std.testing.expectEqual(@as(u64, 1), desired_source.split_attempt_epoch);
 
     var fake = FakeService{
         .tables = &tables,
@@ -259,7 +265,7 @@ test "metadata control loop proposes desired transitions through the service sea
     };
     const summary = try loop.reconcileOnce(&fake);
     try std.testing.expectEqual(@as(usize, 0), summary.table_upserts);
-    try std.testing.expectEqual(@as(usize, 0), summary.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), summary.range_upserts);
     try std.testing.expectEqual(@as(usize, 0), summary.placement_upserts);
     try std.testing.expectEqual(@as(usize, 1), summary.split_upserts);
     try std.testing.expectEqual(@as(usize, 1), fake.split_upserts);
@@ -671,6 +677,7 @@ test "metadata control loop rewrites desired topology after finalized split" {
     const split_records = [_]transition_state.SplitTransitionRecord{
         .{
             .transition_id = 8001,
+            .attempt_epoch = 1,
             .source_group_id = 101,
             .destination_group_id = 102,
             .phase = .finalizing,

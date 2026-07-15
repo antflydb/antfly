@@ -1036,6 +1036,7 @@ fn applyMergeObservationReadiness(
 fn cloneSplitRecord(alloc: std.mem.Allocator, record: transition_state.SplitTransitionRecord) !transition_state.SplitTransitionRecord {
     return .{
         .transition_id = record.transition_id,
+        .attempt_epoch = record.attempt_epoch,
         .source_group_id = record.source_group_id,
         .destination_group_id = record.destination_group_id,
         .phase = record.phase,
@@ -1149,6 +1150,7 @@ test "metadata state captures committed transitions and observations" {
             const out = try alloc.alloc(transition_state.SplitTransitionRecord, 1);
             out[0] = .{
                 .transition_id = 1,
+                .attempt_epoch = 1,
                 .source_group_id = 11,
                 .destination_group_id = 12,
                 .phase = .prepare,
@@ -1740,6 +1742,7 @@ test "metadata state prefers leader-qualified transition observation over follow
     const split_transitions = [_]transition_state.SplitTransitionRecord{
         .{
             .transition_id = 9101,
+            .attempt_epoch = 1,
             .source_group_id = 7101,
             .destination_group_id = 7102,
             .phase = .bootstrap_peer,

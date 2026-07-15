@@ -3365,6 +3365,7 @@ pub fn build(b: *std.Build) void {
             "objectstore-backed manifest store supports publish and list",
             "manifest head CAS verifies a stat ETag when GET omits it",
             "objectstore-backed manifest store resolves conditional create races by content",
+            "host object storage delegates through callbacks",
         },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
@@ -3451,6 +3452,7 @@ pub fn build(b: *std.Build) void {
         "split bootstrap marker distinguishes reservation from completion",
         "group state range scan is allocation-failure safe",
         "shard state store persists split lifecycle and ownership",
+        "shard state snapshot round trips split control state",
         "shard state store finalize split reclaims right-hand document range",
         "db merge coordinator opt-in applies configured receiver identity namespace",
         "db merge coordinator reapplies target namespace for persisted reassignment opt-in",

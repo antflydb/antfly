@@ -838,7 +838,7 @@ test "metadata http client round-trips server endpoints" {
             .{ .record = .{ .group_id = 10, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted }, .peer_node_ids = placement_peer_ids[0..] },
         };
         const split_transitions = [_]metadata_transition_state.SplitTransitionRecord{
-            .{ .transition_id = 9001, .source_group_id = 10, .destination_group_id = 12, .phase = .bootstrap_peer },
+            .{ .transition_id = 9001, .attempt_epoch = 1, .source_group_id = 10, .destination_group_id = 12, .phase = .bootstrap_peer },
         };
         const merge_transitions = [_]metadata_transition_state.MergeTransitionRecord{
             .{ .transition_id = 9010, .donor_group_id = 11, .receiver_group_id = 10, .phase = .prepare },

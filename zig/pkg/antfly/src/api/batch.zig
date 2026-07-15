@@ -145,11 +145,13 @@ fn parseBatchRequestWithOptions(
         const object = value.object;
         const kind_value = object.get("kind") orelse return error.InvalidBatchRequest;
         const transition_value = object.get("transition_id") orelse return error.InvalidBatchRequest;
+        const attempt_value = object.get("attempt_epoch") orelse return error.InvalidBatchRequest;
         const source_value = object.get("source_group_id") orelse return error.InvalidBatchRequest;
         const destination_value = object.get("destination_group_id") orelse return error.InvalidBatchRequest;
         const sequence_value = object.get("delta_sequence") orelse return error.InvalidBatchRequest;
         if (kind_value != .string) return error.InvalidBatchRequest;
         const transition_id = try parseInternalU64(transition_value);
+        const attempt_epoch = try parseInternalU64(attempt_value);
         const source_group_id = try parseInternalU64(source_value);
         const destination_group_id = try parseInternalU64(destination_value);
         const delta_sequence = try parseInternalU64(sequence_value);
@@ -167,10 +169,11 @@ fn parseBatchRequestWithOptions(
         } else "";
         checkpoint_start = try alloc.dupe(u8, range_start);
         checkpoint_end = try alloc.dupe(u8, range_end);
-        if (transition_id == 0) return error.InvalidBatchRequest;
+        if (transition_id == 0 or attempt_epoch == 0) return error.InvalidBatchRequest;
         break :checkpoint .{
             .kind = kind,
             .transition_id = transition_id,
+            .attempt_epoch = attempt_epoch,
             .source_group_id = source_group_id,
             .destination_group_id = destination_group_id,
             .range_start = checkpoint_start.?,
@@ -184,21 +187,24 @@ fn parseBatchRequestWithOptions(
         if (!allow_internal or value != .object) return error.InvalidBatchRequest;
         const object = value.object;
         const transition_value = object.get("transition_id") orelse return error.InvalidBatchRequest;
+        const attempt_value = object.get("attempt_epoch") orelse return error.InvalidBatchRequest;
         const source_value = object.get("source_group_id") orelse return error.InvalidBatchRequest;
         const destination_value = object.get("destination_group_id") orelse return error.InvalidBatchRequest;
         const table_value = object.get("namespace_table_id") orelse return error.InvalidBatchRequest;
         const shard_value = object.get("namespace_shard_id") orelse return error.InvalidBatchRequest;
         const range_value = object.get("namespace_range_id") orelse return error.InvalidBatchRequest;
         const transition_id = try parseInternalU64(transition_value);
+        const attempt_epoch = try parseInternalU64(attempt_value);
         const source_group_id = try parseInternalU64(source_value);
         const destination_group_id = try parseInternalU64(destination_value);
         const table_id = try parseInternalU64(table_value);
         const shard_id = try parseInternalU64(shard_value);
         const range_id = try parseInternalU64(range_value);
-        if (transition_id == 0 or source_group_id == 0 or destination_group_id == 0 or table_id == 0 or shard_id == 0 or range_id == 0)
+        if (transition_id == 0 or attempt_epoch == 0 or source_group_id == 0 or destination_group_id == 0 or table_id == 0 or shard_id == 0 or range_id == 0)
             return error.InvalidBatchRequest;
         break :replication .{
             .transition_id = transition_id,
+            .attempt_epoch = attempt_epoch,
             .source_group_id = source_group_id,
             .destination_group_id = destination_group_id,
             .identity_namespace = .{
@@ -217,11 +223,13 @@ fn parseBatchRequestWithOptions(
         const object = value.object;
         const kind_value = object.get("kind") orelse return error.InvalidBatchRequest;
         const transition_value = object.get("transition_id") orelse return error.InvalidBatchRequest;
+        const attempt_value = object.get("attempt_epoch") orelse return error.InvalidBatchRequest;
         const destination_value = object.get("destination_group_id") orelse return error.InvalidBatchRequest;
         if (kind_value != .string) return error.InvalidBatchRequest;
         const transition_id = try parseInternalU64(transition_value);
+        const attempt_epoch = try parseInternalU64(attempt_value);
         const destination_group_id = try parseInternalU64(destination_value);
-        if (transition_id == 0 or destination_group_id == 0) return error.InvalidBatchRequest;
+        if (transition_id == 0 or attempt_epoch == 0 or destination_group_id == 0) return error.InvalidBatchRequest;
         const kind = std.meta.stringToEnum(db_mod.types.SplitTransitionMutation.Kind, kind_value.string) orelse
             return error.InvalidBatchRequest;
         const split_key = if (object.get("split_key")) |item| key: {
@@ -233,6 +241,7 @@ fn parseBatchRequestWithOptions(
         break :transition .{
             .kind = kind,
             .transition_id = transition_id,
+            .attempt_epoch = attempt_epoch,
             .destination_group_id = destination_group_id,
             .split_key = transition_key.?,
         };
@@ -336,9 +345,10 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         try writer.writeAll("]");
     }
     if (req.split_checkpoint) |checkpoint| {
-        try writer.print(",\"_split_checkpoint\":{{\"kind\":{f},\"transition_id\":\"{d}\",\"source_group_id\":\"{d}\",\"destination_group_id\":\"{d}\",\"range_start\":{f},\"range_end\":{f},\"delta_sequence\":\"{d}\"}}", .{
+        try writer.print(",\"_split_checkpoint\":{{\"kind\":{f},\"transition_id\":\"{d}\",\"attempt_epoch\":\"{d}\",\"source_group_id\":\"{d}\",\"destination_group_id\":\"{d}\",\"range_start\":{f},\"range_end\":{f},\"delta_sequence\":\"{d}\"}}", .{
             std.json.fmt(@tagName(checkpoint.kind), .{}),
             checkpoint.transition_id,
+            checkpoint.attempt_epoch,
             checkpoint.source_group_id,
             checkpoint.destination_group_id,
             std.json.fmt(checkpoint.range_start, .{}),
@@ -347,8 +357,9 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         });
     }
     if (req.split_replication) |replication| {
-        try writer.print(",\"_split_replication\":{{\"transition_id\":\"{d}\",\"source_group_id\":\"{d}\",\"destination_group_id\":\"{d}\",\"namespace_table_id\":\"{d}\",\"namespace_shard_id\":\"{d}\",\"namespace_range_id\":\"{d}\"}}", .{
+        try writer.print(",\"_split_replication\":{{\"transition_id\":\"{d}\",\"attempt_epoch\":\"{d}\",\"source_group_id\":\"{d}\",\"destination_group_id\":\"{d}\",\"namespace_table_id\":\"{d}\",\"namespace_shard_id\":\"{d}\",\"namespace_range_id\":\"{d}\"}}", .{
             replication.transition_id,
+            replication.attempt_epoch,
             replication.source_group_id,
             replication.destination_group_id,
             replication.identity_namespace.table_id,
@@ -357,9 +368,10 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         });
     }
     if (req.split_transition) |transition| {
-        try writer.print(",\"_split_transition\":{{\"kind\":{f},\"transition_id\":\"{d}\",\"destination_group_id\":\"{d}\",\"split_key\":{f}}}", .{
+        try writer.print(",\"_split_transition\":{{\"kind\":{f},\"transition_id\":\"{d}\",\"attempt_epoch\":\"{d}\",\"destination_group_id\":\"{d}\",\"split_key\":{f}}}", .{
             std.json.fmt(@tagName(transition.kind), .{}),
             transition.transition_id,
+            transition.attempt_epoch,
             transition.destination_group_id,
             std.json.fmt(transition.split_key, .{}),
         });

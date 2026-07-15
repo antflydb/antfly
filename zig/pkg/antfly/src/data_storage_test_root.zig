@@ -43,8 +43,8 @@ test "db split sync coordinator allocates destination identity namespace" {
         const setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("split_prepare:7022:7022:doc:m") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_start:7022:7022:doc:m") },
+            .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("split_prepare:7022:1:7022:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_start:7022:1:7022:doc:m") },
         });
         defer std.testing.allocator.free(setup);
         try source.snapshotBuilder().applyBatch(.{
@@ -61,6 +61,7 @@ test "db split sync coordinator allocates destination identity namespace" {
     };
     var coord = try db_split_handoff.SyncCoordinator.init(std.testing.allocator, .{
         .transition_id = 7022,
+        .attempt_epoch = 1,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 7021,

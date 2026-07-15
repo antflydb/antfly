@@ -34,6 +34,7 @@ pub const TransitionPhase = enum {
 
 pub const SplitTransitionRecord = struct {
     transition_id: u64,
+    attempt_epoch: u64,
     source_group_id: u64,
     destination_group_id: u64,
     phase: TransitionPhase = .prepare,
@@ -278,6 +279,7 @@ fn observeLocalSplitTransition(
 
     var coord = try data.SplitSyncCoordinator.init(alloc, .{
         .transition_id = record.transition_id,
+        .attempt_epoch = record.attempt_epoch,
         .source_root_dir = source_root_dir,
         .dest_root_dir = dest_root_dir,
         .source_group_id = record.source_group_id,
@@ -370,6 +372,7 @@ test "transition state module compiles" {
 test "transition state derives heartbeat readiness for active phases" {
     const readiness = readinessForGroup(12, &[_]SplitTransitionRecord{.{
         .transition_id = 9001,
+        .attempt_epoch = 1,
         .source_group_id = 10,
         .destination_group_id = 12,
         .phase = .cutover_pending,
@@ -384,6 +387,7 @@ test "transition state derives heartbeat readiness for active phases" {
 test "transition state leaves readiness empty for unrelated groups" {
     const readiness = readinessForGroup(99, &[_]SplitTransitionRecord{.{
         .transition_id = 9001,
+        .attempt_epoch = 1,
         .source_group_id = 10,
         .destination_group_id = 12,
         .phase = .prepare,
@@ -419,7 +423,7 @@ test "transition state prefers observed local split readiness over metadata phas
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
         .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:132:132:doc:m") },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:132:1:132:doc:m") },
     });
     defer std.testing.allocator.free(prepare);
     try source.snapshotBuilder().applyBatch(.{
@@ -432,6 +436,7 @@ test "transition state prefers observed local split readiness over metadata phas
 
     var coord = try data.SplitSyncCoordinator.init(std.testing.allocator, .{
         .transition_id = 132,
+        .attempt_epoch = 1,
         .source_root_dir = source_root_dir,
         .dest_root_dir = dest_root_dir,
         .source_group_id = 131,
@@ -441,7 +446,7 @@ test "transition state prefers observed local split readiness over metadata phas
     defer if (coord_open) coord.deinit();
 
     const start = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:132:132:doc:m") },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:132:1:132:doc:m") },
     });
     defer std.testing.allocator.free(start);
     try coord.source.snapshotBuilder().applyBatch(.{
@@ -459,6 +464,7 @@ test "transition state prefers observed local split readiness over metadata phas
         132,
         &[_]SplitTransitionRecord{.{
             .transition_id = 1001,
+            .attempt_epoch = 1,
             .source_group_id = 131,
             .destination_group_id = 132,
             .phase = .bootstrap_peer,
@@ -482,6 +488,7 @@ test "transition state falls back to metadata observation when local pair is abs
         212,
         &[_]SplitTransitionRecord{.{
             .transition_id = 2001,
+            .attempt_epoch = 1,
             .source_group_id = 211,
             .destination_group_id = 212,
             .phase = .bootstrap_peer,

@@ -195,9 +195,11 @@ pub fn decodeSplitDeltaAlloc(alloc: Allocator, seq: u64, data: []const u8) !Spli
     const nd = std.mem.littleToNative(u32, @as(*align(1) const u32, @ptrCast(data[pos..][0..4])).*);
     pos += 4;
 
+    if (nw > (data.len - pos) / 8 or nd > (data.len - pos) / 4) return error.InvalidDelta;
     var writes = try alloc.alloc(OwnedKVPair, nw);
+    var writes_initialized: usize = 0;
     errdefer {
-        for (writes[0..nw]) |w| {
+        for (writes[0..writes_initialized]) |w| {
             alloc.free(w.key);
             alloc.free(w.value);
         }
@@ -205,29 +207,48 @@ pub fn decodeSplitDeltaAlloc(alloc: Allocator, seq: u64, data: []const u8) !Spli
     }
 
     for (0..nw) |idx| {
+        if (data.len - pos < 4) return error.InvalidDelta;
         const kl = std.mem.littleToNative(u32, @as(*align(1) const u32, @ptrCast(data[pos..][0..4])).*);
         pos += 4;
+        if (kl > data.len - pos) return error.InvalidDelta;
         const key = try alloc.dupe(u8, data[pos..][0..kl]);
         pos += kl;
+        if (data.len - pos < 4) {
+            alloc.free(key);
+            return error.InvalidDelta;
+        }
         const vl = std.mem.littleToNative(u32, @as(*align(1) const u32, @ptrCast(data[pos..][0..4])).*);
         pos += 4;
-        const val = try alloc.dupe(u8, data[pos..][0..vl]);
+        if (vl > data.len - pos) {
+            alloc.free(key);
+            return error.InvalidDelta;
+        }
+        const val = alloc.dupe(u8, data[pos..][0..vl]) catch |err| {
+            alloc.free(key);
+            return err;
+        };
         pos += vl;
         writes[idx] = .{ .key = key, .value = val };
+        writes_initialized += 1;
     }
 
     var del_list = try alloc.alloc([]u8, nd);
+    var deletes_initialized: usize = 0;
     errdefer {
-        for (del_list[0..nd]) |d| alloc.free(d);
+        for (del_list[0..deletes_initialized]) |d| alloc.free(d);
         alloc.free(del_list);
     }
 
     for (0..nd) |idx| {
+        if (data.len - pos < 4) return error.InvalidDelta;
         const kl = std.mem.littleToNative(u32, @as(*align(1) const u32, @ptrCast(data[pos..][0..4])).*);
         pos += 4;
+        if (kl > data.len - pos) return error.InvalidDelta;
         del_list[idx] = try alloc.dupe(u8, data[pos..][0..kl]);
         pos += kl;
+        deletes_initialized += 1;
     }
+    if (pos != data.len) return error.InvalidDelta;
 
     return .{
         .sequence = seq,

@@ -125,10 +125,11 @@ pub const TransitionService = struct {
     pub fn submitSplit(self: *TransitionService, record: metadata.SplitTransitionRecord) !void {
         _ = self.removeCompletedSplit(record.transition_id);
         if (findSplitIndex(self.pending_split.items, record.transition_id)) |index| {
+            const attempt_changed = self.pending_split.items[index].attempt_epoch != record.attempt_epoch;
             const phase_changed = self.pending_split.items[index].phase != record.phase;
             deinitSplitRecord(self.alloc, &self.pending_split.items[index]);
             self.pending_split.items[index] = try cloneSplitRecord(self.alloc, record);
-            if (phase_changed) _ = self.split_retries.remove(record.transition_id);
+            if (attempt_changed or phase_changed) _ = self.split_retries.remove(record.transition_id);
         } else {
             try self.pending_split.append(self.alloc, try cloneSplitRecord(self.alloc, record));
         }
@@ -490,6 +491,7 @@ fn findCompletedMergeIndex(records: []const metadata.MergeRuntimeObservation, tr
 fn cloneSplitRecord(alloc: std.mem.Allocator, record: metadata.SplitTransitionRecord) !metadata.SplitTransitionRecord {
     return .{
         .transition_id = record.transition_id,
+        .attempt_epoch = record.attempt_epoch,
         .source_group_id = record.source_group_id,
         .destination_group_id = record.destination_group_id,
         .phase = record.phase,
@@ -551,19 +553,19 @@ test "transition service steps split and merge queues through runtime" {
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data.SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !data.SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
 
-        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
+        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .prepare;
             self.status.source_split_phase = .prepare;
             return true;
         }
 
-        fn startSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn startSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .bootstrap_peer;
             self.status.source_split_phase = .splitting;
@@ -571,7 +573,7 @@ test "transition service steps split and merge queues through runtime" {
             return true;
         }
 
-        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .replay_deltas;
             self.status.bootstrapped = true;
@@ -580,7 +582,7 @@ test "transition service steps split and merge queues through runtime" {
             return true;
         }
 
-        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64) !usize {
+        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .cutover_ready;
             self.status.replay_caught_up = true;
@@ -590,7 +592,7 @@ test "transition service steps split and merge queues through runtime" {
             return 1;
         }
 
-        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .finalized;
             self.status.source_split_phase = .none;
@@ -598,7 +600,7 @@ test "transition service steps split and merge queues through runtime" {
             return true;
         }
 
-        fn rollbackSource(_: *anyopaque, _: u64, _: u64) !bool {
+        fn rollbackSource(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             return true;
         }
     };
@@ -683,6 +685,7 @@ test "transition service steps split and merge queues through runtime" {
 
     try svc.submitSplit(.{
         .transition_id = 1,
+        .attempt_epoch = 1,
         .source_group_id = 11,
         .destination_group_id = 12,
     });
@@ -720,11 +723,13 @@ test "transition service upserts and removes queued transitions by id" {
 
     try svc.submitSplit(.{
         .transition_id = 7,
+        .attempt_epoch = 1,
         .source_group_id = 1,
         .destination_group_id = 2,
     });
     try svc.submitSplit(.{
         .transition_id = 7,
+        .attempt_epoch = 1,
         .source_group_id = 1,
         .destination_group_id = 3,
         .phase = .replay_deltas,
@@ -773,6 +778,7 @@ test "transition service clears completed observations on resubmit and remove" {
     try std.testing.expect(svc.hasCompletedSplit(17));
     try svc.submitSplit(.{
         .transition_id = 17,
+        .attempt_epoch = 1,
         .source_group_id = 71,
         .destination_group_id = 72,
     });
@@ -842,12 +848,12 @@ test "transition service clones queued transition record strings" {
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data.SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !data.SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
 
-        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, split_key: []const u8, source_range_end: ?[]const u8) !bool {
+        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64, split_key: []const u8, source_range_end: ?[]const u8) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.last_split_key) |existing| std.testing.allocator.free(existing);
             if (self.last_source_range_end) |existing| std.testing.allocator.free(existing);
@@ -858,11 +864,11 @@ test "transition service clones queued transition record strings" {
             return true;
         }
 
-        fn unsupportedBool(_: *anyopaque, _: u64, _: u64) !bool {
+        fn unsupportedBool(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             return error.TestUnexpectedResult;
         }
 
-        fn unsupportedUsize(_: *anyopaque, _: u64, _: u64) !usize {
+        fn unsupportedUsize(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
             return error.TestUnexpectedResult;
         }
     };
@@ -938,6 +944,7 @@ test "transition service clones queued transition record strings" {
     defer std.testing.allocator.free(rollback_a);
     try svc.submitSplit(.{
         .transition_id = 17,
+        .attempt_epoch = 1,
         .source_group_id = 71,
         .destination_group_id = 72,
         .split_key = split_key_a,
@@ -951,6 +958,7 @@ test "transition service clones queued transition record strings" {
     defer std.testing.allocator.free(split_end_b);
     try svc.submitSplit(.{
         .transition_id = 17,
+        .attempt_epoch = 1,
         .source_group_id = 71,
         .destination_group_id = 73,
         .split_key = split_key_b,
@@ -1009,20 +1017,20 @@ test "transition service observes queued split and merge transitions through run
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data.SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !data.SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
 
-        fn unsupportedPrepare(_: *anyopaque, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
+        fn unsupportedPrepare(_: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
             return error.TestUnexpectedResult;
         }
 
-        fn unsupportedBool(_: *anyopaque, _: u64, _: u64) !bool {
+        fn unsupportedBool(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             return error.TestUnexpectedResult;
         }
 
-        fn unsupportedUsize(_: *anyopaque, _: u64, _: u64) !usize {
+        fn unsupportedUsize(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
             return error.TestUnexpectedResult;
         }
     };
@@ -1083,6 +1091,7 @@ test "transition service observes queued split and merge transitions through run
 
     try svc.submitSplit(.{
         .transition_id = 71,
+        .attempt_epoch = 1,
         .source_group_id = 11,
         .destination_group_id = 12,
     });
@@ -1132,7 +1141,7 @@ test "transition service steps real split coordinator from prepared source state
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:991:2302:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:991:1:2302:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -1144,6 +1153,7 @@ test "transition service steps real split coordinator from prepared source state
 
     var split = try transition_runtime.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 991,
+        .attempt_epoch = 1,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 2301,
@@ -1158,6 +1168,7 @@ test "transition service steps real split coordinator from prepared source state
 
     try svc.submitSplit(.{
         .transition_id = 991,
+        .attempt_epoch = 1,
         .source_group_id = 2301,
         .destination_group_id = 2302,
     });

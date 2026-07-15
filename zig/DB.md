@@ -1222,9 +1222,10 @@ replay or leadership changes.
 The source `RaftApplyStore` durably owns:
 
 - source split phase and split key
+- the source-local split attempt epoch allocated in committed range metadata
 - source delta sequence
 - destination group acknowledgement and applied delta sequence
-- terminal split tombstones keyed by source group and transition identity
+- one terminal split high-water mark per source group
 
 Source acknowledgements are metadata-only Raft entries. They bypass the
 document DB executor, are folded monotonically across the entire committed
@@ -1232,13 +1233,26 @@ apply batch, and are read only from `RaftApplyStore`. Destination checkpoint
 markers remain in the destination DB because they gate destination bootstrap;
 they are not a second source-progress authority.
 
-Finalize and rollback atomically persist a terminal tombstone before removing
-active split state. A delayed command with the same transition identity is
-validated against that tombstone and absorbed idempotently, including when it
-appears later in the same apply batch. A different transition identity may
-start normally. Tombstones are retained because transition IDs are stable
-idempotency identities rather than ordered epochs; comparing them numerically
-would reject valid transitions or admit stale ones after restart.
+Transition IDs remain opaque idempotency identities and are never ordered.
+Each accepted split allocates a monotonically increasing `attempt_epoch` from
+the source range record before runtime work is published. Every source command,
+destination checkpoint, bootstrap marker, and acknowledgement carries both
+values. This permits a new attempt after rollback even when deterministic
+planning chooses the same transition ID.
+
+Finalize and rollback atomically persist the terminal high-water mark before
+removing active split state. Commands below that epoch are stale and absorbed;
+commands at that epoch must match the terminal identity and outcome; a prepare
+at a higher epoch may begin the successor attempt. Keeping one record per source
+group bounds control-state growth without weakening replay fencing.
+
+Raft group snapshots are versioned and include the range, primary documents,
+active split state, delta sequence, pending deltas, source acknowledgement, and
+terminal high-water mark. Install validates control-key ownership, duplicate
+keys, framing, and encoded control values before atomically replacing document
+and control state. Publishing the snapshot's applied Raft index remains a
+separate state-machine step; partially installed split lifecycle state must
+never become visible.
 
 Transition observation reads only this already-open replicated control state.
 It does not open the live table DB, initialize indexes, or compete with the

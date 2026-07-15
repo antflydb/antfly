@@ -265,8 +265,8 @@ test "transition command validation rejects metadata group ids in data group fie
         .{ .remove_restore_progress = .{ .table_id = 1, .node_id = 1, .group_id = metadata_group_id } },
         .{ .upsert_range = .{ .group_id = metadata_group_id, .table_id = 1, .start_key = "" } },
         .{ .remove_range = .{ .group_id = metadata_group_id } },
-        .{ .upsert_split_transition = .{ .transition_id = 1, .source_group_id = metadata_group_id, .destination_group_id = 2 } },
-        .{ .upsert_split_transition = .{ .transition_id = 1, .source_group_id = 2, .destination_group_id = metadata_group_id } },
+        .{ .upsert_split_transition = .{ .transition_id = 1, .attempt_epoch = 1, .source_group_id = metadata_group_id, .destination_group_id = 2 } },
+        .{ .upsert_split_transition = .{ .transition_id = 1, .attempt_epoch = 1, .source_group_id = 2, .destination_group_id = metadata_group_id } },
         .{ .upsert_merge_transition = .{ .transition_id = 1, .donor_group_id = metadata_group_id, .receiver_group_id = 2 } },
         .{ .upsert_merge_transition = .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = metadata_group_id } },
         .{ .upsert_shuffle_join_lease = .{ .job_id = 1, .owner_group_id = metadata_group_id, .expires_at_ms = 1 } },
@@ -3458,6 +3458,7 @@ fn appendRangeRecord(
     try appendInt(alloc, out, u64, range_id);
     try appendInt(alloc, out, u64, record.doc_identity_shard_id);
     try appendInt(alloc, out, u64, record.doc_identity_range_id);
+    try appendInt(alloc, out, u64, record.split_attempt_epoch);
 }
 
 fn appendSplitTransitionRecord(
@@ -3465,7 +3466,13 @@ fn appendSplitTransitionRecord(
     out: *std.ArrayListUnmanaged(u8),
     record: metadata.SplitTransitionRecord,
 ) !void {
+    if (record.transition_id == 0 or record.attempt_epoch == 0 or
+        record.source_group_id == 0 or record.destination_group_id == 0)
+    {
+        return error.InvalidMetadataTransitionEncoding;
+    }
     try appendInt(alloc, out, u64, record.transition_id);
+    try appendInt(alloc, out, u64, record.attempt_epoch);
     try appendInt(alloc, out, u64, record.source_group_id);
     try appendInt(alloc, out, u64, record.destination_group_id);
     try out.append(alloc, @intFromEnum(record.phase));
@@ -3819,6 +3826,7 @@ fn readRangeRecord(
         try readInt(encoded, pos, u64)
     else
         0;
+    const split_attempt_epoch = try readInt(encoded, pos, u64);
     return .{
         .group_id = group_id,
         .range_id = if (range_id == 0) group_id else range_id,
@@ -3827,6 +3835,7 @@ fn readRangeRecord(
         .end_key = end_key,
         .doc_identity_shard_id = doc_identity_shard_id,
         .doc_identity_range_id = doc_identity_range_id,
+        .split_attempt_epoch = split_attempt_epoch,
         .restore_backup_id = restore_backup_id,
         .restore_location = restore_location,
         .restore_snapshot_path = restore_snapshot_path,
@@ -4059,16 +4068,21 @@ fn readSplitTransitionRecord(
     pos: *usize,
 ) !metadata.SplitTransitionRecord {
     const transition_id = try readInt(encoded, pos, u64);
+    const attempt_epoch = try readInt(encoded, pos, u64);
     const source_group_id = try readInt(encoded, pos, u64);
     const destination_group_id = try readInt(encoded, pos, u64);
+    if (transition_id == 0 or attempt_epoch == 0 or source_group_id == 0 or destination_group_id == 0)
+        return error.InvalidMetadataTransitionEncoding;
     if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
-    const phase: metadata.TransitionPhase = @enumFromInt(encoded[pos.*]);
+    const phase = std.enums.fromInt(metadata.TransitionPhase, encoded[pos.*]) orelse
+        return error.InvalidMetadataTransitionEncoding;
     pos.* += 1;
     const split_key = try readOptionalString(alloc, encoded, pos);
     const source_range_end = try readOptionalString(alloc, encoded, pos);
     const rollback_reason = try readOptionalString(alloc, encoded, pos);
     return .{
         .transition_id = transition_id,
+        .attempt_epoch = attempt_epoch,
         .source_group_id = source_group_id,
         .destination_group_id = destination_group_id,
         .phase = phase,
@@ -4337,6 +4351,7 @@ test "metadata raft apply store projects transition records from committed entri
     const split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_split_transition = .{
             .transition_id = 501,
+            .attempt_epoch = 1,
             .source_group_id = 21,
             .destination_group_id = 22,
             .phase = .bootstrap_peer,
@@ -4855,6 +4870,7 @@ test "metadata raft apply store rejects reserved data group ids in transition re
     const split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_split_transition = .{
             .transition_id = 501,
+            .attempt_epoch = 1,
             .source_group_id = 21,
             .destination_group_id = group_ids.main_metadata_group_id,
             .phase = .prepare,
@@ -5850,6 +5866,7 @@ test "metadata state machine projects transitions through metadata apply store" 
     const cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_split_transition = .{
             .transition_id = 701,
+            .attempt_epoch = 1,
             .source_group_id = 41,
             .destination_group_id = 42,
             .phase = .bootstrap_peer,
@@ -5966,6 +5983,7 @@ test "metadata apply store replay is idempotent when applied watermark lags WAL 
     const cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_split_transition = .{
             .transition_id = 902,
+            .attempt_epoch = 1,
             .source_group_id = 51,
             .destination_group_id = 52,
             .phase = .bootstrap_peer,

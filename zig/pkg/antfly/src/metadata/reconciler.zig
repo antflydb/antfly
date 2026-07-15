@@ -1898,6 +1898,7 @@ fn hasExcludedCurrentPeer(
 fn cloneSplitRecord(alloc: std.mem.Allocator, record: transition_state.SplitTransitionRecord) !transition_state.SplitTransitionRecord {
     return .{
         .transition_id = record.transition_id,
+        .attempt_epoch = record.attempt_epoch,
         .source_group_id = record.source_group_id,
         .destination_group_id = record.destination_group_id,
         .phase = record.phase,
@@ -2036,7 +2037,8 @@ fn rangeRecordsEqual(a: table_manager.RangeRecord, b: table_manager.RangeRecord)
         optionalBytesEqual(a.end_key, b.end_key) and
         std.mem.eql(u8, a.restore_backup_id, b.restore_backup_id) and
         std.mem.eql(u8, a.restore_location, b.restore_location) and
-        std.mem.eql(u8, a.restore_snapshot_path, b.restore_snapshot_path);
+        std.mem.eql(u8, a.restore_snapshot_path, b.restore_snapshot_path) and
+        a.split_attempt_epoch == b.split_attempt_epoch;
 }
 
 fn findTableRecord(records: []const table_manager.TableRecord, table_id: u64) ?table_manager.TableRecord {
@@ -2090,6 +2092,7 @@ fn cloneMergeRecord(alloc: std.mem.Allocator, record: transition_state.MergeTran
 
 fn splitRecordsEqual(a: transition_state.SplitTransitionRecord, b: transition_state.SplitTransitionRecord) bool {
     return a.transition_id == b.transition_id and
+        a.attempt_epoch == b.attempt_epoch and
         a.source_group_id == b.source_group_id and
         a.destination_group_id == b.destination_group_id and
         a.phase == b.phase and
@@ -5493,6 +5496,7 @@ test "metadata reconciler places completed split groups into cooldown" {
         .stores = &stores,
         .split_transitions = &[_]transition_state.SplitTransitionRecord{.{
             .transition_id = 43001,
+            .attempt_epoch = 1,
             .source_group_id = 4301,
             .destination_group_id = 4302,
             .phase = .finalized,
@@ -5732,6 +5736,7 @@ test "metadata reconciler ignores in-flight transition groups for automatic tran
         .stores = &stores,
         .split_transitions = &[_]transition_state.SplitTransitionRecord{.{
             .transition_id = 46001,
+            .attempt_epoch = 1,
             .source_group_id = 4601,
             .destination_group_id = 4603,
             .phase = .prepare,

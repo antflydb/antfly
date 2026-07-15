@@ -235,6 +235,7 @@ test "metadata transition driver steps split and merge through runtime interface
 
     var split = transition_state.SplitTransitionRecord{
         .transition_id = 1,
+        .attempt_epoch = 1,
         .source_group_id = 10,
         .destination_group_id = 11,
         .split_key = "doc:m",

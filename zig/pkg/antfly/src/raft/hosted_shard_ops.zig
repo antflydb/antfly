@@ -566,6 +566,7 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
 
     const observation = try hosted.adapter().observeSplit(.{
         .transition_id = 1,
+        .attempt_epoch = 1,
         .source_group_id = 77,
         .destination_group_id = 78,
     });
@@ -575,6 +576,7 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
     try hosted.adapter().execute(.{
         .prepare_split_source = .{
             .transition_id = 1,
+            .attempt_epoch = 1,
             .source_group_id = 77,
             .destination_group_id = 78,
             .split_key = "doc:m",

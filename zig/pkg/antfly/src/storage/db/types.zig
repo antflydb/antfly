@@ -118,6 +118,7 @@ pub const SplitReplicationCheckpoint = struct {
 
     kind: Kind,
     transition_id: u64,
+    attempt_epoch: u64,
     source_group_id: u64,
     destination_group_id: u64,
     range_start: []const u8 = "",
@@ -130,6 +131,7 @@ pub const SplitReplicationCheckpoint = struct {
 /// DB with the same namespace before the destination range is catalog-visible.
 pub const SplitReplicationContext = struct {
     transition_id: u64,
+    attempt_epoch: u64,
     source_group_id: u64,
     destination_group_id: u64,
     identity_namespace: doc_identity_mod.Namespace,
@@ -145,6 +147,7 @@ pub const SplitTransitionMutation = struct {
 
     kind: Kind,
     transition_id: u64,
+    attempt_epoch: u64,
     destination_group_id: u64,
     split_key: []const u8 = "",
 };

@@ -10201,6 +10201,7 @@ pub const ProvisionedTableWriteSource = struct {
                     try cached.db.setSplitDeltaFinalSeq(checkpoint.delta_sequence);
                     try cached.db.setSplitBootstrapMarker(.{
                         .transition_id = checkpoint.transition_id,
+                        .attempt_epoch = checkpoint.attempt_epoch,
                         .source_group_id = checkpoint.source_group_id,
                         .destination_group_id = checkpoint.destination_group_id,
                         .bootstrap_complete = true,
@@ -10248,6 +10249,7 @@ pub const ProvisionedTableWriteSource = struct {
                     try db.setSplitDeltaFinalSeq(checkpoint.delta_sequence);
                     try db.setSplitBootstrapMarker(.{
                         .transition_id = checkpoint.transition_id,
+                        .attempt_epoch = checkpoint.attempt_epoch,
                         .source_group_id = checkpoint.source_group_id,
                         .destination_group_id = checkpoint.destination_group_id,
                         .bootstrap_complete = true,
@@ -16737,6 +16739,7 @@ fn validateSplitReplicationForApply(req: db_mod.types.BatchRequest, group_id: u6
     if (req.split_checkpoint) |checkpoint| {
         if (checkpoint.kind != .destination or
             checkpoint.transition_id != replication.transition_id or
+            checkpoint.attempt_epoch != replication.attempt_epoch or
             checkpoint.source_group_id != replication.source_group_id or
             checkpoint.destination_group_id != replication.destination_group_id)
         {
@@ -16753,6 +16756,7 @@ fn validateOrEstablishSplitReplicationMarker(
 ) !void {
     if (try db.getSplitBootstrapMarker(alloc)) |marker| {
         if (marker.transition_id != replication.transition_id or
+            marker.attempt_epoch != replication.attempt_epoch or
             marker.source_group_id != replication.source_group_id or
             marker.destination_group_id != replication.destination_group_id)
         {
@@ -16762,6 +16766,7 @@ fn validateOrEstablishSplitReplicationMarker(
     }
     try db.setSplitBootstrapMarker(.{
         .transition_id = replication.transition_id,
+        .attempt_epoch = replication.attempt_epoch,
         .source_group_id = replication.source_group_id,
         .destination_group_id = replication.destination_group_id,
         .bootstrap_complete = false,

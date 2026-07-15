@@ -4161,12 +4161,12 @@ test "cluster simulation drives split transition actions deterministically" {
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data_mod.SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !data_mod.SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
 
-        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
+        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "prepare");
             self.status.phase = .prepare;
@@ -4174,7 +4174,7 @@ test "cluster simulation drives split transition actions deterministically" {
             return true;
         }
 
-        fn startSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn startSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "start");
             self.status = .{
@@ -4191,7 +4191,7 @@ test "cluster simulation drives split transition actions deterministically" {
             return true;
         }
 
-        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "bootstrap");
             self.status = .{
@@ -4208,7 +4208,7 @@ test "cluster simulation drives split transition actions deterministically" {
             return true;
         }
 
-        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64) !usize {
+        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "catchup");
             self.status = .{
@@ -4225,7 +4225,7 @@ test "cluster simulation drives split transition actions deterministically" {
             return 1;
         }
 
-        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "finalize");
             self.status = .{
@@ -4242,7 +4242,7 @@ test "cluster simulation drives split transition actions deterministically" {
             return true;
         }
 
-        fn rollbackSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn rollbackSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "rollback");
             self.status = .{
@@ -4269,6 +4269,7 @@ test "cluster simulation drives split transition actions deterministically" {
     const runtime = transition_runtime_mod.TransitionRuntime{ .split = split.iface() };
     var record = metadata_mod.SplitTransitionRecord{
         .transition_id = 9001,
+        .attempt_epoch = 1,
         .source_group_id = 101,
         .destination_group_id = 102,
     };
@@ -4318,12 +4319,12 @@ test "http host simulation drives queued split transitions through the service l
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data_mod.SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !data_mod.SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
 
-        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
+        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "prepare");
             self.status.phase = .prepare;
@@ -4331,7 +4332,7 @@ test "http host simulation drives queued split transitions through the service l
             return true;
         }
 
-        fn startSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn startSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "start");
             self.status.phase = .bootstrap_peer;
@@ -4341,7 +4342,7 @@ test "http host simulation drives queued split transitions through the service l
             return true;
         }
 
-        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "bootstrap");
             self.status.phase = .replay_deltas;
@@ -4351,7 +4352,7 @@ test "http host simulation drives queued split transitions through the service l
             return true;
         }
 
-        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64) !usize {
+        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "catchup");
             self.status.phase = .cutover_ready;
@@ -4362,7 +4363,7 @@ test "http host simulation drives queued split transitions through the service l
             return 1;
         }
 
-        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "finalize");
             self.status.phase = .finalized;
@@ -4371,7 +4372,7 @@ test "http host simulation drives queued split transitions through the service l
             return true;
         }
 
-        fn rollbackSource(_: *anyopaque, _: u64, _: u64) !bool {
+        fn rollbackSource(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             return true;
         }
     };
@@ -4404,6 +4405,7 @@ test "http host simulation drives queued split transitions through the service l
     try sim.apply(.{
         .upsert_split_transition = .{
             .transition_id = 9101,
+            .attempt_epoch = 1,
             .source_group_id = 101,
             .destination_group_id = 102,
         },
@@ -4484,12 +4486,12 @@ test "http host simulation rolls back and retries queued split transitions throu
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data_mod.SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !data_mod.SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
 
-        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
+        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "prepare");
             self.status.phase = .prepare;
@@ -4497,7 +4499,7 @@ test "http host simulation rolls back and retries queued split transitions throu
             return true;
         }
 
-        fn startSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn startSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "start");
             self.status.phase = .bootstrap_peer;
@@ -4507,7 +4509,7 @@ test "http host simulation rolls back and retries queued split transitions throu
             return true;
         }
 
-        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "bootstrap");
             self.status.phase = .cutover_ready;
@@ -4522,11 +4524,11 @@ test "http host simulation rolls back and retries queued split transitions throu
             return true;
         }
 
-        fn catchUpDestination(_: *anyopaque, _: u64, _: u64) !usize {
+        fn catchUpDestination(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
             return 0;
         }
 
-        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "finalize");
             self.status.phase = .finalized;
@@ -4535,7 +4537,7 @@ test "http host simulation rolls back and retries queued split transitions throu
             return true;
         }
 
-        fn rollbackSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn rollbackSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "rollback");
             self.status.phase = .rolled_back;
@@ -4577,6 +4579,7 @@ test "http host simulation rolls back and retries queued split transitions throu
     try sim.apply(.{
         .upsert_split_transition = .{
             .transition_id = 9151,
+            .attempt_epoch = 1,
             .source_group_id = 151,
             .destination_group_id = 152,
             .rollback_reason = "operator abort",
@@ -4593,6 +4596,7 @@ test "http host simulation rolls back and retries queued split transitions throu
     try sim.apply(.{
         .upsert_split_transition = .{
             .transition_id = 9151,
+            .attempt_epoch = 2,
             .source_group_id = 151,
             .destination_group_id = 152,
         },
@@ -4647,12 +4651,12 @@ test "http host simulation removes queued split transition mid-flight" {
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data_mod.SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !data_mod.SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
 
-        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
+        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "prepare");
             self.status.phase = .prepare;
@@ -4660,7 +4664,7 @@ test "http host simulation removes queued split transition mid-flight" {
             return true;
         }
 
-        fn startSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn startSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "start");
             self.status.phase = .bootstrap_peer;
@@ -4669,7 +4673,7 @@ test "http host simulation removes queued split transition mid-flight" {
             return true;
         }
 
-        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "bootstrap");
             self.status.phase = .replay_deltas;
@@ -4677,15 +4681,15 @@ test "http host simulation removes queued split transition mid-flight" {
             return true;
         }
 
-        fn catchUpDestination(_: *anyopaque, _: u64, _: u64) !usize {
+        fn catchUpDestination(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
             return 0;
         }
 
-        fn finalizeSource(_: *anyopaque, _: u64, _: u64) !bool {
+        fn finalizeSource(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             return true;
         }
 
-        fn rollbackSource(_: *anyopaque, _: u64, _: u64) !bool {
+        fn rollbackSource(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             return true;
         }
     };
@@ -4716,6 +4720,7 @@ test "http host simulation removes queued split transition mid-flight" {
     try sim.apply(.{
         .upsert_split_transition = .{
             .transition_id = 9152,
+            .attempt_epoch = 1,
             .source_group_id = 161,
             .destination_group_id = 162,
         },
@@ -4768,12 +4773,12 @@ test "http host simulation updates split transition to rollback mid-flight" {
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data_mod.SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !data_mod.SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
 
-        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
+        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "prepare");
             self.status.phase = .prepare;
@@ -4781,7 +4786,7 @@ test "http host simulation updates split transition to rollback mid-flight" {
             return true;
         }
 
-        fn startSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn startSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "start");
             self.status.phase = .bootstrap_peer;
@@ -4790,19 +4795,19 @@ test "http host simulation updates split transition to rollback mid-flight" {
             return true;
         }
 
-        fn bootstrapDestination(_: *anyopaque, _: u64, _: u64) !bool {
+        fn bootstrapDestination(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             return true;
         }
 
-        fn catchUpDestination(_: *anyopaque, _: u64, _: u64) !usize {
+        fn catchUpDestination(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
             return 0;
         }
 
-        fn finalizeSource(_: *anyopaque, _: u64, _: u64) !bool {
+        fn finalizeSource(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             return true;
         }
 
-        fn rollbackSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn rollbackSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "rollback");
             self.status.phase = .rolled_back;
@@ -4838,6 +4843,7 @@ test "http host simulation updates split transition to rollback mid-flight" {
     try sim.apply(.{
         .upsert_split_transition = .{
             .transition_id = 9153,
+            .attempt_epoch = 1,
             .source_group_id = 171,
             .destination_group_id = 172,
         },
@@ -4848,6 +4854,7 @@ test "http host simulation updates split transition to rollback mid-flight" {
     try sim.apply(.{
         .upsert_split_transition = .{
             .transition_id = 9153,
+            .attempt_epoch = 1,
             .source_group_id = 171,
             .destination_group_id = 172,
             .rollback_reason = "operator abort",
@@ -4882,7 +4889,7 @@ test "http host simulation drives queued split transitions through the service l
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9102:102:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9102:1:102:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -4894,6 +4901,7 @@ test "http host simulation drives queued split transitions through the service l
 
     var split = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9102,
+        .attempt_epoch = 1,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 101,
@@ -4920,6 +4928,7 @@ test "http host simulation drives queued split transitions through the service l
     try sim.apply(.{
         .upsert_split_transition = .{
             .transition_id = 9102,
+            .attempt_epoch = 1,
             .source_group_id = 101,
             .destination_group_id = 102,
         },
@@ -5137,12 +5146,12 @@ test "cluster simulation drives queued split transitions through service-owned m
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data_mod.SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !data_mod.SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
 
-        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
+        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "prepare");
             self.status.phase = .prepare;
@@ -5150,7 +5159,7 @@ test "cluster simulation drives queued split transitions through service-owned m
             return true;
         }
 
-        fn startSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn startSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "start");
             self.status.phase = .bootstrap_peer;
@@ -5160,7 +5169,7 @@ test "cluster simulation drives queued split transitions through service-owned m
             return true;
         }
 
-        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "bootstrap");
             self.status.phase = .replay_deltas;
@@ -5170,7 +5179,7 @@ test "cluster simulation drives queued split transitions through service-owned m
             return true;
         }
 
-        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64) !usize {
+        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "catchup");
             self.status.phase = .cutover_ready;
@@ -5181,7 +5190,7 @@ test "cluster simulation drives queued split transitions through service-owned m
             return 1;
         }
 
-        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "finalize");
             self.status.phase = .finalized;
@@ -5190,7 +5199,7 @@ test "cluster simulation drives queued split transitions through service-owned m
             return true;
         }
 
-        fn rollbackSource(_: *anyopaque, _: u64, _: u64) !bool {
+        fn rollbackSource(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             return true;
         }
     };
@@ -5239,6 +5248,7 @@ test "cluster simulation drives queued split transitions through service-owned m
     try cluster.node(0).apply(.{
         .upsert_split_transition = .{
             .transition_id = 9201,
+            .attempt_epoch = 1,
             .source_group_id = 401,
             .destination_group_id = 402,
         },
@@ -5284,7 +5294,7 @@ test "cluster simulation drives queued split transitions through service-owned m
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9201:402:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9201:1:402:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -5296,6 +5306,7 @@ test "cluster simulation drives queued split transitions through service-owned m
 
     var split = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9201,
+        .attempt_epoch = 1,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 401,
@@ -5333,7 +5344,8 @@ test "cluster simulation drives queued split transitions through service-owned m
 
     try cluster.node(0).apply(.{
         .upsert_split_transition = .{
-            .transition_id = 9202,
+            .transition_id = 9201,
+            .attempt_epoch = 1,
             .source_group_id = 401,
             .destination_group_id = 402,
         },
@@ -5391,7 +5403,7 @@ test "cluster simulation resumes queued split transitions after node restart wit
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9401:1702:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9401:1:1702:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -5407,6 +5419,7 @@ test "cluster simulation resumes queued split transitions after node restart wit
         const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
             .upsert_split_transition = .{
                 .transition_id = 9401,
+                .attempt_epoch = 1,
                 .source_group_id = 1701,
                 .destination_group_id = 1702,
                 .phase = .prepare,
@@ -5434,6 +5447,7 @@ test "cluster simulation resumes queued split transitions after node restart wit
 
     var split = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9401,
+        .attempt_epoch = 1,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 1701,
@@ -5556,7 +5570,7 @@ test "cluster simulation removes queued split transition mid-flight across node 
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9501:1902:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9501:1:1902:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -5572,6 +5586,7 @@ test "cluster simulation removes queued split transition mid-flight across node 
         const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
             .upsert_split_transition = .{
                 .transition_id = 9501,
+                .attempt_epoch = 1,
                 .source_group_id = 1901,
                 .destination_group_id = 1902,
                 .phase = .prepare,
@@ -5599,6 +5614,7 @@ test "cluster simulation removes queued split transition mid-flight across node 
 
     var split = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9501,
+        .attempt_epoch = 1,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 1901,
@@ -5675,9 +5691,13 @@ test "cluster simulation removes queued split transition mid-flight across node 
         try std.testing.expectEqual(@as(?[]u8, null), try dest.get(std.testing.allocator, "doc:t"));
     }
 
+    // Removing terminal metadata is not a cancellation protocol. Explicitly
+    // retire the source attempt before admitting its successor.
+    try std.testing.expect(try split.runtime().rollbackSource(9501, 1, 1901, 1902));
     split.deinit();
     split = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9502,
+        .attempt_epoch = 2,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 1901,
@@ -5687,9 +5707,12 @@ test "cluster simulation removes queued split transition mid-flight across node 
     try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
         .{ .upsert_split_transition = .{
             .transition_id = 9502,
+            .attempt_epoch = 2,
             .source_group_id = 1901,
             .destination_group_id = 1902,
             .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
         } },
     });
 
@@ -5697,12 +5720,25 @@ test "cluster simulation removes queued split transition mid-flight across node 
     while (rounds < 16) : (rounds += 1) {
         try cluster.stepAll();
         if (try cluster.node(0).describeSplitTransition(9502)) |state| {
-            try std.testing.expect(state.tag == .bootstrapping_destination or state.tag == .ready_to_finalize);
-            break;
+            switch (state.tag) {
+                .awaiting_source_start, .replay_blocked => continue,
+                .bootstrapping_destination, .ready_to_finalize => break,
+                else => return error.TestUnexpectedResult,
+            }
+        }
+        if (try cluster.node(0).observeSplitTransition(9502)) |observation| {
+            if (observation.status.phase == .finalized) break;
         }
     }
-    const retried_split = (try cluster.node(0).describeSplitTransition(9502)) orelse return error.TestExpectedEqual;
-    try std.testing.expect(retried_split.tag == .bootstrapping_destination or retried_split.tag == .ready_to_finalize);
+    if (try cluster.node(0).describeSplitTransition(9502)) |retried_split| {
+        try std.testing.expect(retried_split.tag == .awaiting_source_start or
+            retried_split.tag == .bootstrapping_destination or
+            retried_split.tag == .replay_blocked or
+            retried_split.tag == .ready_to_finalize);
+    } else {
+        const observation = (try cluster.node(0).observeSplitTransition(9502)) orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(data_mod.RangeTransitionPhase.finalized, observation.status.phase);
+    }
 }
 
 test "cluster simulation rolls back queued split transition mid-flight across node restart" {
@@ -5734,7 +5770,7 @@ test "cluster simulation rolls back queued split transition mid-flight across no
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9511:1912:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9511:1:1912:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -5750,6 +5786,7 @@ test "cluster simulation rolls back queued split transition mid-flight across no
         const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
             .upsert_split_transition = .{
                 .transition_id = 9511,
+                .attempt_epoch = 1,
                 .source_group_id = 1911,
                 .destination_group_id = 1912,
                 .phase = .prepare,
@@ -5777,6 +5814,7 @@ test "cluster simulation rolls back queued split transition mid-flight across no
 
     var split = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9511,
+        .attempt_epoch = 1,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 1911,
@@ -5836,6 +5874,7 @@ test "cluster simulation rolls back queued split transition mid-flight across no
     try cluster.node(0).applyCommittedTransitionCommands(1300, 2, &.{
         .{ .upsert_split_transition = .{
             .transition_id = 9511,
+            .attempt_epoch = 1,
             .source_group_id = 1911,
             .destination_group_id = 1912,
             .phase = .prepare,
@@ -5887,6 +5926,7 @@ test "cluster simulation rolls back queued split transition mid-flight across no
     split.deinit();
     split = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9511,
+        .attempt_epoch = 2,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 1911,
@@ -5896,6 +5936,7 @@ test "cluster simulation rolls back queued split transition mid-flight across no
     try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
         .{ .upsert_split_transition = .{
             .transition_id = 9511,
+            .attempt_epoch = 2,
             .source_group_id = 1911,
             .destination_group_id = 1912,
             .phase = .prepare,
@@ -5945,7 +5986,7 @@ test "cluster simulation survives repeated same-id split overwrites across resta
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9521:1922:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9521:1:1922:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -5961,6 +6002,7 @@ test "cluster simulation survives repeated same-id split overwrites across resta
         const cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
             .upsert_split_transition = .{
                 .transition_id = 9521,
+                .attempt_epoch = 1,
                 .source_group_id = 1921,
                 .destination_group_id = 1922,
                 .phase = .prepare,
@@ -5988,6 +6030,7 @@ test "cluster simulation survives repeated same-id split overwrites across resta
 
     var split = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9521,
+        .attempt_epoch = 1,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 1921,
@@ -6047,6 +6090,7 @@ test "cluster simulation survives repeated same-id split overwrites across resta
     try cluster.node(0).applyCommittedTransitionCommands(1300, 2, &.{
         .{ .upsert_split_transition = .{
             .transition_id = 9521,
+            .attempt_epoch = 1,
             .source_group_id = 1921,
             .destination_group_id = 1922,
             .phase = .prepare,
@@ -6059,6 +6103,7 @@ test "cluster simulation survives repeated same-id split overwrites across resta
     try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
         .{ .upsert_split_transition = .{
             .transition_id = 9521,
+            .attempt_epoch = 1,
             .source_group_id = 1921,
             .destination_group_id = 1922,
             .phase = .prepare,
@@ -6075,6 +6120,7 @@ test "cluster simulation survives repeated same-id split overwrites across resta
     split.deinit();
     split = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9521,
+        .attempt_epoch = 2,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 1921,
@@ -6084,6 +6130,7 @@ test "cluster simulation survives repeated same-id split overwrites across resta
     try cluster.node(0).applyCommittedTransitionCommands(1300, 4, &.{
         .{ .upsert_split_transition = .{
             .transition_id = 9521,
+            .attempt_epoch = 2,
             .source_group_id = 1921,
             .destination_group_id = 1922,
             .phase = .prepare,
@@ -7502,7 +7549,7 @@ test "cluster simulation isolates concurrent split removal and merge retry acros
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9701:1982:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9701:1:1982:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -7546,6 +7593,7 @@ test "cluster simulation isolates concurrent split removal and merge retry acros
         const split_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
             .upsert_split_transition = .{
                 .transition_id = 9701,
+                .attempt_epoch = 1,
                 .source_group_id = 1981,
                 .destination_group_id = 1982,
                 .phase = .prepare,
@@ -7583,6 +7631,7 @@ test "cluster simulation isolates concurrent split removal and merge retry acros
 
     var split = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9701,
+        .attempt_epoch = 1,
         .source_root_dir = split_src_root,
         .dest_root_dir = split_dst_root,
         .source_group_id = 1981,
@@ -7796,7 +7845,7 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-1\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-1\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9711:1992:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9711:1:1992:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -7840,6 +7889,7 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
         const split_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
             .upsert_split_transition = .{
                 .transition_id = 9711,
+                .attempt_epoch = 1,
                 .source_group_id = 1991,
                 .destination_group_id = 1992,
                 .phase = .prepare,
@@ -7877,6 +7927,7 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
 
     var split = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9711,
+        .attempt_epoch = 1,
         .source_root_dir = split_src_root,
         .dest_root_dir = split_dst_root,
         .source_group_id = 1991,
@@ -7952,6 +8003,7 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
         .{
             .upsert_split_transition = .{
                 .transition_id = 9711,
+                .attempt_epoch = 1,
                 .source_group_id = 1991,
                 .destination_group_id = 1992,
                 .phase = .prepare,
@@ -7989,6 +8041,7 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
     split.deinit();
     split = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9711,
+        .attempt_epoch = 2,
         .source_root_dir = split_src_root,
         .dest_root_dir = split_dst_root,
         .source_group_id = 1991,
@@ -7998,6 +8051,7 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
     try cluster.node(0).applyCommittedTransitionCommands(1300, 5, &.{
         .{ .upsert_split_transition = .{
             .transition_id = 9711,
+            .attempt_epoch = 2,
             .source_group_id = 1991,
             .destination_group_id = 1992,
             .phase = .prepare,
@@ -8088,7 +8142,7 @@ test "cluster simulation drives multiple concurrent real transition ids through 
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-a\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-a\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9801:2002:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9801:1:2002:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -8105,7 +8159,7 @@ test "cluster simulation drives multiple concurrent real transition ids through 
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:c={\"v\":\"left-b\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:u={\"v\":\"right-b\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9802:2004:doc:p") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9802:1:2004:doc:p") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -8147,6 +8201,7 @@ test "cluster simulation drives multiple concurrent real transition ids through 
         const split_a_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
             .upsert_split_transition = .{
                 .transition_id = 9801,
+                .attempt_epoch = 1,
                 .source_group_id = 2001,
                 .destination_group_id = 2002,
                 .phase = .prepare,
@@ -8156,6 +8211,7 @@ test "cluster simulation drives multiple concurrent real transition ids through 
         const split_b_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
             .upsert_split_transition = .{
                 .transition_id = 9802,
+                .attempt_epoch = 1,
                 .source_group_id = 2003,
                 .destination_group_id = 2004,
                 .phase = .prepare,
@@ -8194,6 +8250,7 @@ test "cluster simulation drives multiple concurrent real transition ids through 
 
     var split_a = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9801,
+        .attempt_epoch = 1,
         .source_root_dir = split_a_src_root,
         .dest_root_dir = split_a_dst_root,
         .source_group_id = 2001,
@@ -8202,6 +8259,7 @@ test "cluster simulation drives multiple concurrent real transition ids through 
     defer split_a.deinit();
     var split_b = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9802,
+        .attempt_epoch = 1,
         .source_root_dir = split_b_src_root,
         .dest_root_dir = split_b_dst_root,
         .source_group_id = 2003,
@@ -8218,8 +8276,8 @@ test "cluster simulation drives multiple concurrent real transition ids through 
 
     var multiplex = transition_runtime_mod.MultiplexedTransitionRuntime.init(std.testing.allocator);
     defer multiplex.deinit();
-    try multiplex.addSplit(9801, 2001, 2002, split_a.runtime());
-    try multiplex.addSplit(9802, 2003, 2004, split_b.runtime());
+    try multiplex.addSplit(9801, 1, 2001, 2002, split_a.runtime());
+    try multiplex.addSplit(9802, 1, 2003, 2004, split_b.runtime());
     try multiplex.addMerge(2005, 2006, merge.runtime());
 
     const configs = [_]ManagedHttpHostSimulationConfig{
@@ -8277,6 +8335,7 @@ test "cluster simulation drives multiple concurrent real transition ids through 
         .{
             .upsert_split_transition = .{
                 .transition_id = 9802,
+                .attempt_epoch = 1,
                 .source_group_id = 2003,
                 .destination_group_id = 2004,
                 .phase = .prepare,
@@ -8307,16 +8366,18 @@ test "cluster simulation drives multiple concurrent real transition ids through 
     split_b.deinit();
     split_b = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9802,
+        .attempt_epoch = 2,
         .source_root_dir = split_b_src_root,
         .dest_root_dir = split_b_dst_root,
         .source_group_id = 2003,
         .dest_group_id = 2004,
     });
-    try multiplex.addSplit(9802, 2003, 2004, split_b.runtime());
+    try multiplex.addSplit(9802, 2, 2003, 2004, split_b.runtime());
 
     try cluster.node(0).applyCommittedTransitionCommands(1300, 6, &.{
         .{ .upsert_split_transition = .{
             .transition_id = 9802,
+            .attempt_epoch = 2,
             .source_group_id = 2003,
             .destination_group_id = 2004,
             .phase = .prepare,
@@ -8406,7 +8467,7 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-a2\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-a2\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9811:2012:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9811:1:2012:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -8423,7 +8484,7 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:c={\"v\":\"left-b2\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:u={\"v\":\"right-b2\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9812:2014:doc:p") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:9812:1:2014:doc:p") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -8465,6 +8526,7 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
         const split_a_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
             .upsert_split_transition = .{
                 .transition_id = 9811,
+                .attempt_epoch = 1,
                 .source_group_id = 2011,
                 .destination_group_id = 2012,
                 .phase = .prepare,
@@ -8474,6 +8536,7 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
         const split_b_cmd = try metadata_mod.encodeTransitionCommand(std.testing.allocator, .{
             .upsert_split_transition = .{
                 .transition_id = 9812,
+                .attempt_epoch = 1,
                 .source_group_id = 2013,
                 .destination_group_id = 2014,
                 .phase = .prepare,
@@ -8512,6 +8575,7 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
 
     var split_a = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9811,
+        .attempt_epoch = 1,
         .source_root_dir = split_a_src_root,
         .dest_root_dir = split_a_dst_root,
         .source_group_id = 2011,
@@ -8520,6 +8584,7 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
     defer split_a.deinit();
     var split_b = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9812,
+        .attempt_epoch = 1,
         .source_root_dir = split_b_src_root,
         .dest_root_dir = split_b_dst_root,
         .source_group_id = 2013,
@@ -8536,8 +8601,8 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
 
     var multiplex = transition_runtime_mod.MultiplexedTransitionRuntime.init(std.testing.allocator);
     defer multiplex.deinit();
-    try multiplex.addSplit(9811, 2011, 2012, split_a.runtime());
-    try multiplex.addSplit(9812, 2013, 2014, split_b.runtime());
+    try multiplex.addSplit(9811, 1, 2011, 2012, split_a.runtime());
+    try multiplex.addSplit(9812, 1, 2013, 2014, split_b.runtime());
     try multiplex.addMerge(2015, 2016, merge.runtime());
 
     const configs = [_]ManagedHttpHostSimulationConfig{
@@ -8593,6 +8658,7 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
     try cluster.node(0).applyCommittedTransitionCommands(1300, 4, &.{
         .{ .upsert_split_transition = .{
             .transition_id = 9812,
+            .attempt_epoch = 1,
             .source_group_id = 2013,
             .destination_group_id = 2014,
             .phase = .prepare,
@@ -8604,6 +8670,7 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
     try cluster.node(0).applyCommittedTransitionCommands(1300, 5, &.{
         .{ .upsert_split_transition = .{
             .transition_id = 9812,
+            .attempt_epoch = 1,
             .source_group_id = 2013,
             .destination_group_id = 2014,
             .phase = .prepare,
@@ -8628,16 +8695,18 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
     split_b.deinit();
     split_b = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9812,
+        .attempt_epoch = 2,
         .source_root_dir = split_b_src_root,
         .dest_root_dir = split_b_dst_root,
         .source_group_id = 2013,
         .dest_group_id = 2014,
     });
-    try multiplex.addSplit(9812, 2013, 2014, split_b.runtime());
+    try multiplex.addSplit(9812, 2, 2013, 2014, split_b.runtime());
 
     try cluster.node(0).applyCommittedTransitionCommands(1300, 6, &.{
         .{ .upsert_split_transition = .{
             .transition_id = 9812,
+            .attempt_epoch = 2,
             .source_group_id = 2013,
             .destination_group_id = 2014,
             .phase = .prepare,
@@ -8653,16 +8722,18 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
     split_b.deinit();
     split_b = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9812,
+        .attempt_epoch = 2,
         .source_root_dir = split_b_src_root,
         .dest_root_dir = split_b_dst_root,
         .source_group_id = 2013,
         .dest_group_id = 2014,
     });
-    try multiplex.addSplit(9812, 2013, 2014, split_b.runtime());
+    try multiplex.addSplit(9812, 2, 2013, 2014, split_b.runtime());
 
     try cluster.node(0).apply(.{
         .upsert_split_transition = .{
             .transition_id = 9812,
+            .attempt_epoch = 2,
             .source_group_id = 2013,
             .destination_group_id = 2014,
             .split_key = "doc:p",

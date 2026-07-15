@@ -2932,7 +2932,7 @@ test "metadata http server serves status and filtered admin routes" {
                     },
                 })[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{
-                    .{ .transition_id = 9001, .source_group_id = 10, .destination_group_id = 12, .phase = .bootstrap_peer },
+                    .{ .transition_id = 9001, .attempt_epoch = 1, .source_group_id = 10, .destination_group_id = 12, .phase = .bootstrap_peer },
                 })[0..]),
                 .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{
                     .{ .transition_id = 9010, .donor_group_id = 11, .receiver_group_id = 10, .phase = .prepare },

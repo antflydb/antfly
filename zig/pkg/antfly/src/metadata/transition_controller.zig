@@ -119,6 +119,9 @@ pub const TransitionController = struct {
             .cutover_ready => .ready_to_finalize,
             .finalized => .finalized,
             .rolling_back => .rolling_back,
+            // No active source state is also how a new durable attempt is
+            // observed before prepare. The source epoch distinguishes it from
+            // the terminal predecessor when the prepare action is applied.
             .rolled_back => if (record.split_key != null) .awaiting_source_start else .rolled_back,
         };
     }
@@ -135,6 +138,7 @@ pub const TransitionController = struct {
                     if (record.split_key) |split_key| .{
                         .prepare_split_source = .{
                             .transition_id = record.transition_id,
+                            .attempt_epoch = record.attempt_epoch,
                             .source_group_id = record.source_group_id,
                             .destination_group_id = record.destination_group_id,
                             .split_key = split_key,
@@ -145,6 +149,7 @@ pub const TransitionController = struct {
                     .{
                         .start_split_source = .{
                             .transition_id = record.transition_id,
+                            .attempt_epoch = record.attempt_epoch,
                             .source_group_id = record.source_group_id,
                             .destination_group_id = record.destination_group_id,
                         },
@@ -155,6 +160,7 @@ pub const TransitionController = struct {
                 .action = .{
                     .bootstrap_split_destination = .{
                         .transition_id = record.transition_id,
+                        .attempt_epoch = record.attempt_epoch,
                         .source_group_id = record.source_group_id,
                         .destination_group_id = record.destination_group_id,
                     },
@@ -165,6 +171,7 @@ pub const TransitionController = struct {
                 .action = .{
                     .catch_up_split_destination = .{
                         .transition_id = record.transition_id,
+                        .attempt_epoch = record.attempt_epoch,
                         .source_group_id = record.source_group_id,
                         .destination_group_id = record.destination_group_id,
                     },
@@ -175,6 +182,7 @@ pub const TransitionController = struct {
                 .action = .{
                     .finalize_split_source = .{
                         .transition_id = record.transition_id,
+                        .attempt_epoch = record.attempt_epoch,
                         .source_group_id = record.source_group_id,
                         .destination_group_id = record.destination_group_id,
                     },
@@ -189,6 +197,7 @@ pub const TransitionController = struct {
                 .action = if (observation.status.phase == .rolled_back) .none else .{
                     .rollback_split = .{
                         .transition_id = record.transition_id,
+                        .attempt_epoch = record.attempt_epoch,
                         .source_group_id = record.source_group_id,
                         .destination_group_id = record.destination_group_id,
                     },
@@ -282,6 +291,7 @@ pub const TransitionController = struct {
 test "transition controller plans split start bootstrap and finalize actions" {
     const split_record = transition_state.SplitTransitionRecord{
         .transition_id = 10,
+        .attempt_epoch = 1,
         .source_group_id = 41,
         .destination_group_id = 42,
     };
@@ -490,6 +500,7 @@ test "transition controller preserves merge doc identity reassignment flag on fi
 test "transition controller describes split and merge execution states" {
     const split = TransitionController.describeSplit(.{
         .transition_id = 1,
+        .attempt_epoch = 1,
         .source_group_id = 10,
         .destination_group_id = 11,
     }, .{
