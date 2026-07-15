@@ -8719,18 +8719,36 @@ func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatus(ctx context.Contex
 	}
 	status, err := r.observeHAPrimaryStatusTyped(ctx, cluster, adminURL, ha)
 	if err != nil {
-		cluster.Status.HAStatus.PrimaryAdminReachable = false
-		cluster.Status.HAStatus.PrimaryAdminLastError = err.Error()
-		if statusCode, ok := adminsdk.HAStatusCode(err); ok {
-			cluster.Status.HAStatus.PrimaryAdminStatusCode = statusCode
-		} else {
-			cluster.Status.HAStatus.PrimaryAdminStatusCode = 0
+		haStatus := cluster.Status.HAStatus
+		now := r.haNow()
+		if haStatus.PrimaryAdminReachable || haStatus.PrimaryAdminUnreachableSince == nil {
+			since := metav1.NewTime(now)
+			haStatus.PrimaryAdminUnreachableSince = &since
+			haStatus.PrimaryAdminConsecutiveFailures = 1
+		} else if haStatus.PrimaryAdminConsecutiveFailures < math.MaxInt32 {
+			haStatus.PrimaryAdminConsecutiveFailures++
 		}
+		haStatus.PrimaryAdminReachable = false
+		haStatus.PrimaryAdminLastError = err.Error()
+		if statusCode, ok := adminsdk.HAStatusCode(err); ok {
+			haStatus.PrimaryAdminStatusCode = statusCode
+		} else {
+			haStatus.PrimaryAdminStatusCode = 0
+		}
+		minimumFailures, minimumDuration := haAutomaticFailoverFailureThresholds(ha)
+		haStatus.PrimaryAdminFailureThresholdMet =
+			haStatus.PrimaryAdminStatusCode != http.StatusUnauthorized &&
+				haStatus.PrimaryAdminConsecutiveFailures >= minimumFailures &&
+				haStatus.PrimaryAdminUnreachableSince != nil &&
+				now.Sub(haStatus.PrimaryAdminUnreachableSince.Time) >= minimumDuration
 		return err
 	}
 	cluster.Status.HAStatus.PrimaryAdminReachable = true
 	cluster.Status.HAStatus.PrimaryAdminLastError = ""
 	cluster.Status.HAStatus.PrimaryAdminStatusCode = 0
+	cluster.Status.HAStatus.PrimaryAdminConsecutiveFailures = 0
+	cluster.Status.HAStatus.PrimaryAdminUnreachableSince = nil
+	cluster.Status.HAStatus.PrimaryAdminFailureThresholdMet = false
 	cluster.Status.HAStatus.PrimaryLSN = status.PrimaryLSN
 	cluster.Status.HAStatus.Retention = status.Retention
 	cluster.Status.HAStatus.Standbys = status.Standbys

@@ -1661,6 +1661,17 @@ spec:
                       maximumLagLSN:
                         format: int64
                         type: integer
+                      minimumConsecutiveFailures:
+                        default: 3
+                        format: int32
+                        minimum: 2
+                        type: integer
+                      minimumUnreachableDurationSeconds:
+                        default: 30
+                        format: int32
+                        maximum: 3600
+                        minimum: 1
+                        type: integer
                       requireRemoteApply:
                         default: true
                         type: boolean
@@ -4910,12 +4921,20 @@ spec:
                           type: string
                       type: object
                     type: array
+                  primaryAdminConsecutiveFailures:
+                    format: int32
+                    type: integer
+                  primaryAdminFailureThresholdMet:
+                    type: boolean
                   primaryAdminLastError:
                     type: string
                   primaryAdminReachable:
                     type: boolean
                   primaryAdminStatusCode:
                     type: integer
+                  primaryAdminUnreachableSince:
+                    format: date-time
+                    type: string
                   primaryLSN:
                     format: int64
                     type: integer

@@ -3437,6 +3437,7 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	cluster.Status.HAStatus.PrimaryAdminReachable = false
 	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin connection refused"
 	cluster.Status.HAStatus.PrimaryAdminStatusCode = 0
+	cluster.Status.HAStatus.PrimaryAdminFailureThresholdMet = true
 	observedPrimaryLSN := cluster.Status.HAStatus.PrimaryLSN
 	cluster.Status.HAStatus.PrimaryLSN = 0
 	reconciler.updateHAStatusAndConditions(cluster)
@@ -5006,9 +5007,10 @@ func TestReconcileHAFencingLeaseRetargetsUnsafeHolder(t *testing.T) {
 		RouteSelector: haTestRouteSelector("standby-b"),
 	})
 	cluster.Status.HAStatus = &antflyv1.HAStatus{
-		PrimaryLSN:            12,
-		PrimaryAdminReachable: false,
-		PrimaryAdminLastError: "primary admin timeout",
+		PrimaryLSN:                      12,
+		PrimaryAdminReachable:           false,
+		PrimaryAdminLastError:           "primary admin timeout",
+		PrimaryAdminFailureThresholdMet: true,
 		Standbys: []antflyv1.HAStandbyStatus{{
 			Name:        "standby-a",
 			SlotName:    "standby-a",
@@ -5523,7 +5525,8 @@ func haTestRouteSelector(component string) map[string]string {
 
 func caughtUpHAStatus() *antflyv1.HAStatus {
 	return &antflyv1.HAStatus{
-		PrimaryLSN: 12,
+		PrimaryLSN:                      12,
+		PrimaryAdminFailureThresholdMet: true,
 		Standbys: []antflyv1.HAStandbyStatus{{
 			Name:              "standby-a",
 			SlotName:          "standby-a",

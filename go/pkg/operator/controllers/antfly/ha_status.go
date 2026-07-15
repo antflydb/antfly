@@ -3122,6 +3122,25 @@ func haAutomaticFailoverExecutionEnabled(ha *antflyv1.HighAvailabilitySpec) bool
 	return ha != nil && ha.Admin != nil && ha.Admin.ExecutePlannedActions
 }
 
+const (
+	defaultHAAutomaticFailoverMinimumConsecutiveFailures int32 = 3
+	defaultHAAutomaticFailoverMinimumUnreachableSeconds  int32 = 30
+)
+
+func haAutomaticFailoverFailureThresholds(ha *antflyv1.HighAvailabilitySpec) (int32, time.Duration) {
+	minimumFailures := defaultHAAutomaticFailoverMinimumConsecutiveFailures
+	minimumSeconds := defaultHAAutomaticFailoverMinimumUnreachableSeconds
+	if ha != nil && ha.AutomaticFailover != nil {
+		if ha.AutomaticFailover.MinimumConsecutiveFailures >= 2 {
+			minimumFailures = ha.AutomaticFailover.MinimumConsecutiveFailures
+		}
+		if ha.AutomaticFailover.MinimumUnreachableDurationSeconds >= 1 {
+			minimumSeconds = ha.AutomaticFailover.MinimumUnreachableDurationSeconds
+		}
+	}
+	return minimumFailures, time.Duration(minimumSeconds) * time.Second
+}
+
 func haAutomaticFailoverFencingAuthoritySupported(ha *antflyv1.HighAvailabilitySpec) bool {
 	return ha != nil &&
 		ha.AutomaticFailover != nil &&
@@ -3132,7 +3151,8 @@ func haPrimaryAdminUnavailable(status *antflyv1.HAStatus) bool {
 	if !haPrimaryAdminObservationFailed(status) {
 		return false
 	}
-	return status.PrimaryAdminStatusCode != http.StatusUnauthorized
+	return status.PrimaryAdminStatusCode != http.StatusUnauthorized &&
+		status.PrimaryAdminFailureThresholdMet
 }
 
 func haPrimaryAdminObservationFailed(status *antflyv1.HAStatus) bool {

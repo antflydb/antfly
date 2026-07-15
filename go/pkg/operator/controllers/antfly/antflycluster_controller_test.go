@@ -8844,6 +8844,59 @@ func TestObserveHAPrimaryAdminStatusRejectsMissingSDKFieldEvidence(t *testing.T)
 	g.Expect(cluster.Status.HAStatus.PrimaryLSN).To(Equal(uint64(0)))
 }
 
+func TestObserveHAPrimaryAdminStatusDebouncesTransientFailureBeforeAutomaticFailover(t *testing.T) {
+	g := NewWithT(t)
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	failing := true
+	reconciler := &AntflyClusterReconciler{
+		Now: func() time.Time { return now },
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if failing {
+				return nil, fmt.Errorf("transient primary admin timeout")
+			}
+			body := `{"schema_version":1,"snapshot":{"role":"primary","node_id":"primary-a","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[],"retention":{"primary_lsn":12,"oldest_restart_lsn":12,"retained_lsn_count":0,"retained_byte_count":0,"retained_age_ns":0,"active_slots":0,"reseed_recommended":0}}}`
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+	}
+	cluster := &antflyv1.AntflyCluster{Spec: antflyv1.AntflyClusterSpec{
+		HighAvailability: &antflyv1.HighAvailabilitySpec{
+			Mode:  antflyv1.HAModeHotStandby,
+			Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+			AutomaticFailover: &antflyv1.HAAutomaticFailoverPolicy{
+				Enabled:                           true,
+				FencingAuthority:                  antflyv1.HAFencingAuthorityKubernetesLease,
+				MinimumConsecutiveFailures:        3,
+				MinimumUnreachableDurationSeconds: 30,
+			},
+		},
+	}}
+
+	for attempt, advance := range []time.Duration{0, 10 * time.Second, 10 * time.Second} {
+		now = now.Add(advance)
+		g.Expect(reconciler.observeHAPrimaryAdminStatus(context.Background(), cluster)).NotTo(Succeed())
+		g.Expect(cluster.Status.HAStatus.PrimaryAdminConsecutiveFailures).To(Equal(int32(attempt + 1)))
+		g.Expect(cluster.Status.HAStatus.PrimaryAdminFailureThresholdMet).To(BeFalse())
+		g.Expect(haPrimaryAdminUnavailable(cluster.Status.HAStatus)).To(BeFalse())
+	}
+
+	now = now.Add(11 * time.Second)
+	g.Expect(reconciler.observeHAPrimaryAdminStatus(context.Background(), cluster)).NotTo(Succeed())
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminConsecutiveFailures).To(Equal(int32(4)))
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminFailureThresholdMet).To(BeTrue())
+	g.Expect(haPrimaryAdminUnavailable(cluster.Status.HAStatus)).To(BeTrue())
+
+	failing = false
+	g.Expect(reconciler.observeHAPrimaryAdminStatus(context.Background(), cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminReachable).To(BeTrue())
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminConsecutiveFailures).To(BeZero())
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminUnreachableSince).To(BeNil())
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminFailureThresholdMet).To(BeFalse())
+}
+
 func TestObserveHAPrimaryAdminStatusOmitsSyncRequiredForAllPolicy(t *testing.T) {
 	g := NewWithT(t)
 

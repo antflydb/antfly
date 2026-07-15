@@ -1093,6 +1093,24 @@ type HAAutomaticFailoverPolicy struct {
 	// MaximumLagLSN is the tolerated standby lag for automatic promotion.
 	// +optional
 	MaximumLagLSN uint64 `json:"maximumLagLSN,omitempty"`
+
+	// MinimumConsecutiveFailures is the number of consecutive primary admin
+	// observations that must fail before automatic failover may begin. This
+	// prevents one transient transport failure from reserving an irreversible
+	// fencing transaction.
+	// +kubebuilder:validation:Minimum=2
+	// +kubebuilder:default=3
+	// +optional
+	MinimumConsecutiveFailures int32 `json:"minimumConsecutiveFailures,omitempty"`
+
+	// MinimumUnreachableDurationSeconds is the minimum continuous primary admin
+	// outage required before automatic failover may begin. A successful probe
+	// resets the outage window and consecutive-failure count.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=3600
+	// +kubebuilder:default=30
+	// +optional
+	MinimumUnreachableDurationSeconds int32 `json:"minimumUnreachableDurationSeconds,omitempty"`
 }
 
 // MetadataNodesSpec defines the configuration for metadata nodes
@@ -1786,6 +1804,22 @@ type HAStatus struct {
 	// PrimaryAdminStatusCode records the latest typed /admin/v1 HA status-observation HTTP status code.
 	// +optional
 	PrimaryAdminStatusCode int `json:"primaryAdminStatusCode,omitempty"`
+
+	// PrimaryAdminConsecutiveFailures is the persisted number of consecutive
+	// failed primary admin observations in the current outage window.
+	// +optional
+	PrimaryAdminConsecutiveFailures int32 `json:"primaryAdminConsecutiveFailures,omitempty"`
+
+	// PrimaryAdminUnreachableSince records the first failed observation in the
+	// current uninterrupted outage window.
+	// +optional
+	PrimaryAdminUnreachableSince *metav1.Time `json:"primaryAdminUnreachableSince,omitempty"`
+
+	// PrimaryAdminFailureThresholdMet reports that both configured automatic
+	// failover debounce thresholds have been crossed. Candidate selection must
+	// never infer this from one transport error.
+	// +optional
+	PrimaryAdminFailureThresholdMet bool `json:"primaryAdminFailureThresholdMet,omitempty"`
 
 	// DesiredStandbyCount is the count requested by spec.highAvailability.
 	// +optional
