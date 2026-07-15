@@ -1578,6 +1578,115 @@ test "storage.ha seed activation gc requires the durable seeded-slot activation 
     try std.Io.Dir.cwd().access(std.testing.io, marker_path, .{});
 }
 
+test "storage.ha materialized activation gc deletes raw and live generations as one lifecycle pair" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const binding = ActivationBinding{
+        .topology_id = "topology-a",
+        .topology_generation = 3,
+        .node_id = "standby-a",
+        .target_pvc_name = "standby-a-data",
+        .target_pvc_uid = "pvc-uid-1",
+    };
+    const prepared = try prepareMaterializedTestStaging(alloc, root, "gen-z-current", testIdentity(), binding);
+    defer alloc.free(prepared.root);
+    const target_root = try std.fs.path.join(alloc, &.{ root, "target-paired-gc" });
+    defer alloc.free(target_root);
+    var activated = try activate(alloc, .{
+        .staging_root = prepared.root,
+        .target_root = target_root,
+        .expected = .{
+            .generation = "gen-z-current",
+            .slot_name = "standby-a",
+            .identity = testIdentity(),
+            .minimum_checkpoint_lsn = 11,
+            .binding = binding,
+            .capture_receipt_sha256 = &prepared.capture_receipt_sha256,
+        },
+        .binding = binding,
+        .materialization = .{ .target_local_node_id = 7, .target_replica_id = 1 },
+    });
+    defer activated.deinit(alloc);
+    var active = try std.json.parseFromSlice(ActivationReceipt, alloc, activated.active_receipt_json, .{});
+    defer active.deinit();
+
+    const checkpoint_path = try std.fs.path.join(alloc, &.{ root, "paired-gc-seeded-slot-activation.json" });
+    defer alloc.free(checkpoint_path);
+    const checkpoint_json = try std.json.Stringify.valueAlloc(alloc, .{
+        .schema_version = @as(i64, 1),
+        .action = .{
+            .action_id = "seeded_slot_activate:gen-z-current",
+            .action_kind = "seeded_slot_activate",
+            .target = "gen-z-current",
+            .state = "applied",
+            .node_id = "primary-a",
+        },
+        .slot_name = "standby-a",
+        .generation = "gen-z-current",
+        .manifest_id = active.value.manifest_id,
+        .timeline_id = @as(i64, @intCast(active.value.timeline_id)),
+        .checkpoint_lsn = @as(i64, @intCast(active.value.checkpoint_lsn)),
+        .seed_receipt_sha256 = active.value.seed_receipt_sha256,
+        .capture_receipt_sha256 = active.value.capture_receipt_sha256,
+        .manifest_sha256 = active.value.manifest_sha256,
+        .aggregate_sha256 = active.value.aggregate_sha256,
+    }, .{});
+    defer alloc.free(checkpoint_json);
+    {
+        var file = try std.Io.Dir.cwd().createFile(std.testing.io, checkpoint_path, .{ .truncate = true });
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, checkpoint_json);
+        try file.sync(std.testing.io);
+    }
+
+    const old_raw = try std.fs.path.join(alloc, &.{ target_root, generations_dir_name, "gen-a-old" });
+    defer alloc.free(old_raw);
+    const old_live = try std.fs.path.join(alloc, &.{ target_root, live_generations_dir_name, "gen-a-old" });
+    defer alloc.free(old_live);
+    try fs_paths.createDirPathPortable(std.testing.io, old_raw);
+    try fs_paths.createDirPathPortable(std.testing.io, old_live);
+    const old_raw_file = try std.fs.path.join(alloc, &.{ old_raw, "raw" });
+    defer alloc.free(old_raw_file);
+    const old_live_file = try std.fs.path.join(alloc, &.{ old_live, "live" });
+    defer alloc.free(old_live_file);
+    for ([_]struct { path: []const u8, body: []const u8 }{
+        .{ .path = old_raw_file, .body = "immutable-transport" },
+        .{ .path = old_live_file, .body = "mutable-runtime" },
+    }) |entry| {
+        var file = try std.Io.Dir.cwd().createFile(std.testing.io, entry.path, .{ .truncate = true });
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, entry.body);
+        try file.sync(std.testing.io);
+    }
+    try local_generation_gc.markEligible(alloc, .{
+        .root = target_root,
+        .scope = .target_activation,
+        .generation = "gen-a-old",
+        .slot_name = "standby-a",
+        .checkpoint_lsn = 1,
+        .checkpoint_bytes = "old-durable-seeded-slot-activation",
+    });
+
+    var pruned = try pruneActivatedGenerations(alloc, .{
+        .target_root = target_root,
+        .slot_activation_receipt_path = checkpoint_path,
+        .retain_generations = 1,
+    });
+    defer pruned.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), pruned.deleted_generations);
+    try expectPathMissing(std.testing.io, old_raw);
+    try expectPathMissing(std.testing.io, old_live);
+    const current_raw = try std.fs.path.join(alloc, &.{ target_root, generations_dir_name, "gen-z-current" });
+    defer alloc.free(current_raw);
+    const current_live = try std.fs.path.join(alloc, &.{ target_root, live_generations_dir_name, "gen-z-current" });
+    defer alloc.free(current_live);
+    try std.Io.Dir.cwd().access(std.testing.io, current_raw, .{});
+    try std.Io.Dir.cwd().access(std.testing.io, current_live, .{});
+}
+
 test "storage.ha seed activation binds startup evidence and revalidates installed bytes on restart" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
