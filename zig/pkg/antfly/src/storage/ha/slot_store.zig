@@ -21,6 +21,7 @@
 //! base-backup layers exist.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Crc32 = std.hash.Crc32;
 const wal_mod = @import("../wal.zig");
@@ -123,17 +124,31 @@ const EventView = struct {
 
 pub const OpenOptions = struct {
     wal_options: wal_mod.WalOptions = .{},
+    update_progress_before_read_hook: if (builtin.is_test) ?UpdateProgressBeforeReadHook else void = if (builtin.is_test) null else {},
+};
+
+/// Deterministic test seam for exercising the admission-to-persist window in
+/// standby progress updates. Production callers leave this unset.
+pub const UpdateProgressBeforeReadHook = struct {
+    ptr: *anyopaque,
+    run_fn: *const fn (ptr: *anyopaque) anyerror!void,
+
+    pub fn run(self: UpdateProgressBeforeReadHook) !void {
+        try self.run_fn(self.ptr);
+    }
 };
 
 pub const SlotStore = struct {
     alloc: Allocator,
     wal: wal_mod.WAL,
     slots: std.ArrayListUnmanaged(OwnedSlot) = .empty,
+    update_progress_before_read_hook: if (builtin.is_test) ?UpdateProgressBeforeReadHook else void = if (builtin.is_test) null else {},
 
     pub fn open(alloc: Allocator, path: [*:0]const u8, options: OpenOptions) !SlotStore {
         var store = SlotStore{
             .alloc = alloc,
             .wal = try wal_mod.WAL.open(path, options.wal_options),
+            .update_progress_before_read_hook = options.update_progress_before_read_hook,
         };
         errdefer store.close();
         try store.replay();
@@ -166,6 +181,9 @@ pub const SlotStore = struct {
         applied_lsn: u64,
         safe_read_lsn: u64,
     ) !void {
+        if (comptime builtin.is_test) {
+            if (self.update_progress_before_read_hook) |hook| try hook.run();
+        }
         const current = self.get(name) orelse return error.SlotNotFound;
         if (current.lifecycle == .seeding) return error.SlotSeeding;
         if (received_lsn < current.received_lsn) return error.InvalidSlotProgress;

@@ -25,6 +25,8 @@ const platform_sync = @import("antfly_platform").sync;
 const admin_api = @import("../../admin/mod.zig");
 const http_common = @import("../../common/http/http_common.zig");
 const ha_admin = @import("admin.zig");
+const http_internal = @import("http_internal.zig");
+const internal_api = @import("../../internal/mod.zig");
 const admin_cli = @import("admin_cli.zig");
 const admin_exec = @import("admin_exec.zig");
 const backup_manifest = @import("backup_manifest.zig");
@@ -211,10 +213,9 @@ pub const Server = struct {
             if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
             return try self.handleAdminLifecycleReceipts(req);
         }
-        if (self.auth.state_mutex) |mutex| {
-            platform_sync.lockYielding(mutex);
-            defer mutex.unlock();
-        }
+        const state_mutex = self.auth.state_mutex;
+        if (state_mutex) |mutex| platform_sync.lockYielding(mutex);
+        defer if (state_mutex) |mutex| mutex.unlock();
         defer if (self.auth.state_changed) |hook| hook.run();
         switch (req.method) {
             .GET => {
@@ -2763,6 +2764,128 @@ test "storage.ha http admin marks former primary slot for typed reseed" {
 
     const slot = primary.slot("primary-a") orelse return error.TestExpectedEqual;
     try std.testing.expect(slot.reseed_required);
+}
+
+test "storage.ha reseed serialization survives a concurrent admitted status update and replay" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "rejoin-reseed-status-race");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+    const reseed_body =
+        "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":3,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}";
+
+    const InterleaveProbe = struct {
+        mutex: *std.atomic.Mutex,
+        admin_server: ?*Server = null,
+        reseed_body: []const u8,
+        internal_saw_lock: bool = false,
+        admin_saw_lock: bool = false,
+        admin_called: bool = false,
+        admin_status: u16 = 0,
+        admin_reported_reseed: bool = false,
+
+        fn runReseed(self: *@This()) !void {
+            const server = self.admin_server orelse return error.TestExpectedEqual;
+            var response = try server.handle(.{
+                .method = .POST,
+                .uri = admin_api.routes.ha_rejoin_reseed,
+                .content_type = "application/json",
+                .body = self.reseed_body,
+            });
+            defer response.deinit(server.alloc);
+            self.admin_called = true;
+            self.admin_status = response.status;
+            self.admin_reported_reseed = std.mem.indexOf(u8, response.body, "\"reseed_required\":true") != null;
+        }
+
+        fn beforeProgressRead(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const acquired = self.mutex.tryLock();
+            self.internal_saw_lock = !acquired;
+            if (!acquired) return;
+            self.mutex.unlock();
+
+            // Reproduce the E2E ordering deterministically: the standby status
+            // request was admitted while the slot was healthy, then reseed is
+            // durably marked before that admitted progress update reads and
+            // rewrites the full slot state.
+            try self.runReseed();
+        }
+
+        fn stateChanged(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const acquired = self.mutex.tryLock();
+            self.admin_saw_lock = !acquired;
+            if (acquired) self.mutex.unlock();
+        }
+    };
+
+    var state_mutex: std.atomic.Mutex = .unlocked;
+    var probe = InterleaveProbe{
+        .mutex = &state_mutex,
+        .reseed_body = reseed_body,
+    };
+    var live_reseed_required = false;
+    var status_reported_reseed = false;
+    {
+        var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{
+            .slot_store_options = .{
+                .update_progress_before_read_hook = .{
+                    .ptr = &probe,
+                    .run_fn = InterleaveProbe.beforeProgressRead,
+                },
+            },
+        });
+        defer primary.close();
+        try primary.createSlot("primary-a", 0);
+
+        var admin_server = Server.initWithOptions(alloc, .{
+            .primary = &primary,
+            .primary_node_id = "standby-a",
+        }, .{
+            .state_mutex = &state_mutex,
+            .state_changed = .{
+                .ptr = &probe,
+                .run_fn = InterleaveProbe.stateChanged,
+            },
+        });
+        defer admin_server.deinit();
+        probe.admin_server = &admin_server;
+
+        var internal_server = http_internal.Server.initWithOptions(alloc, &primary, .{ .state_mutex = &state_mutex });
+        var status_update = try internal_server.handle(.{
+            .method = .POST,
+            .uri = internal_api.routes.ha_replication_status,
+            .body = "{\"slot_name\":\"primary-a\",\"timeline_id\":1,\"received_lsn\":0,\"applied_lsn\":0,\"safe_read_lsn\":0}",
+        });
+        defer status_update.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), status_update.status);
+
+        // With correct serialization the hook cannot re-enter the admin route;
+        // apply the reseed after the status request releases the mutex.
+        if (!probe.admin_called) try probe.runReseed();
+
+        try std.testing.expectEqual(@as(u16, 200), probe.admin_status);
+        try std.testing.expect(probe.admin_reported_reseed);
+        live_reseed_required = (primary.slot("primary-a") orelse return error.TestExpectedEqual).reseed_required;
+
+        var status = try admin_server.handle(.{
+            .method = .GET,
+            .uri = admin_api.routes.ha_primary_status,
+        });
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), status.status);
+        status_reported_reseed = std.mem.indexOf(u8, status.body, "\"reseed_required\":true") != null;
+    }
+
+    var reopened = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer reopened.close();
+    const replay_reseed_required = (reopened.slot("primary-a") orelse return error.TestExpectedEqual).reseed_required;
+    try std.testing.expect(replay_reseed_required);
+    try std.testing.expect(live_reseed_required);
+    try std.testing.expect(status_reported_reseed);
+    try std.testing.expect(probe.internal_saw_lock);
+    try std.testing.expect(probe.admin_saw_lock);
 }
 
 test "storage.ha http admin rejects typed former primary reseed on node without primary context" {

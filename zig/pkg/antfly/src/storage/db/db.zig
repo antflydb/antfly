@@ -23410,7 +23410,8 @@ fn mirrorHAReplayPayloadCommitContext(ctx: *const BatchExecutionContext, payload
     const mirror = ctx.ha_async_effect_mirror orelse return;
     const transition_mutex = mirror.transition_mutex;
     if (transition_mutex) |mutex| lockAtomic(mutex);
-    defer if (transition_mutex) |mutex| mutex.unlock();
+    var transition_locked = transition_mutex != null;
+    defer if (transition_locked) transition_mutex.?.unlock();
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
@@ -23426,7 +23427,18 @@ fn mirrorHAReplayPayloadCommitContext(ctx: *const BatchExecutionContext, payload
         if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
         break :blk lsn;
     };
+    // Standby status acknowledgements use the same runtime transition mutex.
+    // Release it while waiting for remote progress, then reacquire it to make
+    // the final client acknowledgement linearizable with fencing.
+    if (transition_mutex) |mutex| {
+        mutex.unlock();
+        transition_locked = false;
+    }
     try evaluateHAMirrorCommitGate(mirror, lsn);
+    if (transition_mutex) |mutex| {
+        lockAtomic(mutex);
+        transition_locked = true;
+    }
     // Authority can expire while a synchronous replication wait is in flight.
     // Recheck before returning success while the transition mutex is still held
     // so a stale writer can never acknowledge an already-replicated mutation.
@@ -23456,7 +23468,8 @@ fn mirrorHABatchMutationCommitContext(ctx: *const BatchExecutionContext, request
     const mirror = ctx.ha_async_batch_mirror orelse return;
     const transition_mutex = mirror.transition_mutex;
     if (transition_mutex) |mutex| lockAtomic(mutex);
-    defer if (transition_mutex) |mutex| mutex.unlock();
+    var transition_locked = transition_mutex != null;
+    defer if (transition_locked) transition_mutex.?.unlock();
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
@@ -23472,7 +23485,15 @@ fn mirrorHABatchMutationCommitContext(ctx: *const BatchExecutionContext, request
         if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
         break :blk lsn;
     };
+    if (transition_mutex) |mutex| {
+        mutex.unlock();
+        transition_locked = false;
+    }
     try evaluateHAMirrorCommitGate(mirror, lsn);
+    if (transition_mutex) |mutex| {
+        lockAtomic(mutex);
+        transition_locked = true;
+    }
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
 }
 
@@ -23499,7 +23520,8 @@ fn mirrorHASchemaMetadataCommitContext(ctx: *const BatchExecutionContext, table_
     const mirror = ctx.ha_async_metadata_mirror orelse return;
     const transition_mutex = mirror.transition_mutex;
     if (transition_mutex) |mutex| lockAtomic(mutex);
-    defer if (transition_mutex) |mutex| mutex.unlock();
+    var transition_locked = transition_mutex != null;
+    defer if (transition_locked) transition_mutex.?.unlock();
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
@@ -23515,7 +23537,15 @@ fn mirrorHASchemaMetadataCommitContext(ctx: *const BatchExecutionContext, table_
         if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
         break :blk lsn;
     };
+    if (transition_mutex) |mutex| {
+        mutex.unlock();
+        transition_locked = false;
+    }
     try evaluateHAMirrorCommitGate(mirror, lsn);
+    if (transition_mutex) |mutex| {
+        lockAtomic(mutex);
+        transition_locked = true;
+    }
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
 }
 
@@ -48588,7 +48618,7 @@ test "storage.ha db session sync wait satisfies remote apply through standby DB 
     try std.testing.expectEqualStrings("{\"title\":\"remote-apply\"}", found.json);
 }
 
-test "storage.ha db rejects acknowledgement when write authority expires during remote apply wait" {
+test "storage.ha db allows progress but rejects acknowledgement when fenced during remote apply wait" {
     const alloc = std.testing.allocator;
 
     var primary_db_path_buf: [256]u8 = undefined;
@@ -48630,40 +48660,32 @@ test "storage.ha db rejects acknowledgement when write authority expires during 
     });
     defer standby_db.close();
 
-    const AuthorityClock = struct {
-        var now_ns: u64 = 1;
-
-        fn now() u64 {
-            return now_ns;
-        }
-    };
-    AuthorityClock.now_ns = 1;
-    defer AuthorityClock.now_ns = 1;
-
-    var public_gate = ha_public_gate_state_mod.State{ .monotonic_now_fn = AuthorityClock.now };
+    var public_gate = ha_public_gate_state_mod.State{};
     public_gate.configurePrimary(&primary, false);
-    public_gate.requireExternalAuthority();
-    public_gate.publishExternalAuthorityUntil(true, 2);
 
     var transition_mutex: std.atomic.Mutex = .unlocked;
-    const ExpiringRemoteApplyWait = struct {
+    const FencingRemoteApplyWait = struct {
         session: HASessionSyncWait,
         transition_mutex: *std.atomic.Mutex,
+        public_gate: *ha_public_gate_state_mod.State,
         calls: u64 = 0,
 
         fn wait(ctx: *anyopaque, primary_arg: *ha_primary_mod.Primary, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
-            // The write's transition lock must cover both the replication wait
-            // and the final authority decision.
-            try std.testing.expect(!self.transition_mutex.tryLock());
+            // Remote progress must be able to enter while the client waits;
+            // authority is serialized again for the final acknowledgement.
+            try std.testing.expect(self.transition_mutex.tryLock());
+            self.transition_mutex.unlock();
             try HASessionSyncWait.wait(&self.session, primary_arg, target_lsn, policy);
-            // Deterministically cross the authority deadline only after the
-            // standby has durably applied the mutation.
-            AuthorityClock.now_ns = 2;
+            // Fence only after remote apply. The final client gate must observe
+            // this transition after reacquiring the same mutex.
+            lockAtomic(self.transition_mutex);
+            self.public_gate.publishPrimaryFence(true);
+            self.transition_mutex.unlock();
         }
     };
-    var wait_state = ExpiringRemoteApplyWait{
+    var wait_state = FencingRemoteApplyWait{
         .session = .{
             .alloc = alloc,
             .slot_name = "standby-a",
@@ -48672,6 +48694,7 @@ test "storage.ha db rejects acknowledgement when write authority expires during 
             .apply_fn = DB.applyHAReplicationRecordCallback,
         },
         .transition_mutex = &transition_mutex,
+        .public_gate = &public_gate,
     };
     const standby_names = [_][]const u8{"standby-a"};
     var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
@@ -48685,21 +48708,21 @@ test "storage.ha db rejects acknowledgement when write authority expires during 
                 .failure_policy = .block,
             },
             .sync_wait_ctx = &wait_state,
-            .sync_wait_fn = ExpiringRemoteApplyWait.wait,
+            .sync_wait_fn = FencingRemoteApplyWait.wait,
         },
         .ha_write_gate = .{ .shared = .{ .state = &public_gate } },
         .start_index_workers = false,
     });
     defer primary_db.close();
 
-    try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, primary_db.batch(.{
+    try std.testing.expectError(error.HAFencedPrimary, primary_db.batch(.{
         .writes = &.{.{ .key = "doc:authority-expired", .value = "{\"title\":\"replicated-but-not-acknowledged\"}" }},
         .sync_level = .write,
     }));
     try std.testing.expectEqual(@as(u64, 1), wait_state.calls);
 
-    // The mutation committed locally and reached remote apply before authority
-    // expired, but the stale client receives an error rather than success.
+    // The mutation committed locally and reached remote apply before fencing,
+    // but the stale client receives an error rather than success.
     var local = (try primary_db.lookup(alloc, "doc:authority-expired", .{})) orelse return error.TestExpectedEqual;
     defer local.deinit(alloc);
     try std.testing.expectEqualStrings("{\"title\":\"replicated-but-not-acknowledged\"}", local.json);
