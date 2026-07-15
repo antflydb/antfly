@@ -1602,6 +1602,10 @@ test "ha cmd artifact parses offline seed activation target and identity" {
         "standby-a-data",
         "--target-pvc-uid",
         "pvc-uid-1",
+        "--target-local-node-id",
+        "77",
+        "--target-replica-id",
+        "9",
     });
     defer options.deinit(alloc);
     try std.testing.expectEqual(ArtifactAction.activate, options.action);
@@ -1612,6 +1616,8 @@ test "ha cmd artifact parses offline seed activation target and identity" {
     try std.testing.expectEqualStrings("topology-a", options.binding.topology_id.?);
     try std.testing.expectEqual(@as(u64, 3), options.binding.topology_generation.?);
     try std.testing.expectEqualStrings("pvc-uid-1", options.binding.target_pvc_uid.?);
+    try std.testing.expect(@hasField(ArtifactOptions, "target_local_node_id"));
+    try std.testing.expect(@hasField(ArtifactOptions, "target_replica_id"));
 }
 
 test "ha cmd artifact accepts portable publish and restore topology pvc binding" {
