@@ -478,6 +478,8 @@ pub const AlgebraicIndexStats = struct {
     unknown_remote_groups: ?i64 = null,
     /// Source artifact stream used to materialize graph edges.
     source_artifact: ?std.json.Value = null,
+    /// All source artifact streams used to materialize graph edges, in configured order.
+    source_artifacts: ?[]const std.json.Value = null,
     /// Graph resolver replay diagnostics.
     resolver_replay: ?std.json.Value = null,
     /// Artifact resolution replay diagnostics.
@@ -2662,6 +2664,8 @@ pub const EnrichmentConfig = struct {
     source_artifact_name: ?[]const u8 = null,
     /// Expected embedding dimension for embedding enrichments.
     expected_dims: ?i64 = null,
+    /// Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producer models to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed. Dimensions are always validated independently.
+    vector_space: ?[]const u8 = null,
     /// Chunk size for chunk enrichments.
     chunk_size: ?i64 = null,
     /// Chunk overlap for chunk enrichments.
@@ -3720,6 +3724,8 @@ pub const GraphIndexStats = struct {
     catch_up_target_sequence: ?i64 = null,
     /// Graph source artifact materialization status.
     source_artifact: ?std.json.Value = null,
+    /// Materialization status for every configured graph source artifact.
+    source_artifacts: ?[]const std.json.Value = null,
     /// Resolver replay diagnostics for graph materialization.
     resolver_replay: ?std.json.Value = null,
     async_indexing: ?std.json.Value = null,

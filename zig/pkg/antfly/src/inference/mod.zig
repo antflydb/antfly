@@ -94,6 +94,7 @@ test "managed embedder multi-source embedding translation" {
     try managed_embedder.testMultiSourceEmbeddingTranslation();
     try managed_embedder.testMultiSourceSparseEmbeddingTranslation();
     try managed_embedder.testInvalidMultiSourceEmbeddingConfigs();
+    try managed_embedder.testVectorSpaceCompatibility();
 }
 
 test "query embedding cache owns results and coalesces misses" {

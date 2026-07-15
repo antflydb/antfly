@@ -823,6 +823,7 @@ fn enrichmentConfigsEqual(a: db_mod.types.EnrichmentConfig, b: db_mod.types.Enri
         std.mem.eql(u8, a.template, b.template) and
         std.mem.eql(u8, a.source_artifact_name, b.source_artifact_name) and
         a.expected_dims == b.expected_dims and
+        std.mem.eql(u8, a.vector_space, b.vector_space) and
         a.chunk_size == b.chunk_size and
         a.chunk_overlap == b.chunk_overlap and
         std.mem.eql(u8, a.chunker_json, b.chunker_json) and

@@ -167,6 +167,11 @@ components:
           type: integer
           minimum: 0
           description: "Expected embedding dimension for embedding enrichments."
+        vector_space:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          minLength: 1
+          description: "Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producer models to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed. Dimensions are always validated independently."
         chunk_size:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -203,6 +208,8 @@ components:
         sources:
           type: array
           minItems: 1
+          maxItems: 64
+          uniqueItems: true
           items:
             $ref: "#/components/schemas/ArtifactIndexSource"
           x-go-type-skip-optional-pointer: true
@@ -448,6 +455,8 @@ components:
         sources:
           type: array
           minItems: 1
+          maxItems: 64
+          uniqueItems: true
           items:
             $ref: "#/components/schemas/ArtifactIndexSource"
           x-go-type-skip-optional-pointer: true
@@ -1140,6 +1149,13 @@ components:
           type: object
           additionalProperties: true
           description: "Source artifact stream used to materialize graph edges."
+        source_artifacts:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: "All source artifact streams used to materialize graph edges, in configured order."
         resolver_replay:
           x-go-type-skip-optional-pointer: true
           type: object
@@ -1278,6 +1294,8 @@ components:
         sources:
           type: array
           minItems: 1
+          maxItems: 64
+          uniqueItems: true
           items:
             $ref: "#/components/schemas/GraphIndexSource"
           x-go-type-skip-optional-pointer: true
@@ -1457,6 +1475,13 @@ components:
           type: object
           additionalProperties: true
           description: "Graph source artifact materialization status."
+        source_artifacts:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: "Materialization status for every configured graph source artifact."
         resolver_replay:
           x-go-type-skip-optional-pointer: true
           type: object

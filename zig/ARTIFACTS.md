@@ -449,12 +449,19 @@ another. Full-text and graph indexes likewise union every selected terminal
 artifact stream.
 
 All sources in one index must have the same dense dimension and must inhabit a
-compatible vector space. The index has one distance metric and one query
-embedder, so mixing unrelated models in one `sources` list is invalid even when
-their dimensions happen to match. Each source must resolve to a matching
-`kind: embedding` enrichment. Producer input remains defined only on that
-enrichment (`source_artifact_name`, `field`, or `template`); it is not repeated
-on the index.
+compatible vector space. `vector_space` is optional. When every source omits
+it, Antfly compares the effective semantic embedder configuration (including
+provider, model, dense/sparse mode, dimensions, multimodal mode, input type,
+and truncation) and rejects incompatible producers. Operational settings such
+as credentials, endpoints, and rate limits do not change vector-space
+identity. To combine intentionally compatible but distinct producers, every
+source must declare the same non-empty `vector_space`. Explicit and implicit
+modes cannot be mixed, and dimensions are validated even when an explicit
+identifier matches. The identifier is an application-stable compatibility
+assertion, not a display label. Each source must resolve to a matching `kind:
+embedding` enrichment. Producer input remains defined only on that enrichment
+(`source_artifact_name`, `field`, or `template`); it is not repeated on the
+index.
 
 For vector indexes, `sources` is mutually exclusive with direct managed
 `field`/`template`/`chunker` configuration and `external: true`; it is supported
@@ -541,6 +548,13 @@ asset enrichment. The graph index root does not expose an `execution` block yet,
 because graph edge materialization and replay batching are not wired to a public
 policy. Asset/extractor execution policy controls model calls that produce
 relations.
+
+When multiple graph sources emit the same logical edge key, source array order
+is precedence order: the first source owns the visible payload. Antfly retains
+the other manifests, so deleting or changing the winning source immediately
+restores the next source's payload without rescanning per edge. State variants
+within one source use a stable state-key order as the final tie-breaker. This
+policy is independent of ingestion/update order.
 
 ```json
 {

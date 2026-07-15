@@ -1,0 +1,134 @@
+"""Validated helpers for artifact-backed index configuration."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+MAX_ARTIFACT_SOURCES = 64
+
+
+def _validate_artifacts(artifacts: Sequence[object]) -> None:
+    if not artifacts:
+        raise ValueError("at least one artifact source is required")
+    if len(artifacts) > MAX_ARTIFACT_SOURCES:
+        raise ValueError(f"at most {MAX_ARTIFACT_SOURCES} artifact sources are allowed")
+    seen: set[str] = set()
+    for index, artifact in enumerate(artifacts):
+        if not isinstance(artifact, str) or not artifact:
+            raise ValueError(f"artifacts[{index}] is required")
+        if artifact in seen:
+            raise ValueError(f"duplicate artifact source {artifact!r}")
+        seen.add(artifact)
+
+
+def artifact_index_sources(*artifacts: str) -> list[dict[str, str]]:
+    """Build the shared artifact-only source shape for full-text/vector indexes."""
+
+    _validate_artifacts(artifacts)
+    return [{"artifact": artifact} for artifact in artifacts]
+
+
+def graph_index_sources(*sources: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Validate graph sources while preserving source-specific path and format."""
+
+    copied = [dict(source) for source in sources]
+    _validate_artifacts([source.get("artifact", "") for source in copied])
+    for index, source in enumerate(copied):
+        if source.get("format") not in (None, "extraction_relation", "extraction_graph"):
+            raise ValueError(f"sources[{index}].format is invalid")
+    return copied
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactEmbeddingSource:
+    """One embedding enrichment and the artifact name consumed by an index."""
+
+    artifact: str
+    source_artifact: str | None = None
+    field: str = "text"
+    template: str | None = None
+
+
+def _model_dict(value: Mapping[str, Any] | Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        result = to_dict()
+        if isinstance(result, dict):
+            return result
+    raise TypeError("embedder must be a mapping or generated SDK model")
+
+
+def artifact_embedding_index_config(
+    name: str,
+    *,
+    sources: Sequence[ArtifactEmbeddingSource],
+    embedder: Mapping[str, Any] | Any,
+    dimension: int | None = None,
+    sparse: bool = False,
+    distance_metric: str | None = None,
+    vector_space: str | None = None,
+) -> dict[str, Any]:
+    """Build one vector-index config plus its embedding enrichments.
+
+    Omitting ``vector_space`` selects Antfly's automatic semantic-producer
+    validation. Set it only to assert compatibility across distinct producers.
+    """
+
+    if not name:
+        raise ValueError("index name is required")
+    _validate_artifacts([source.artifact for source in sources])
+    if sparse and dimension is not None:
+        raise ValueError("dimension must be omitted for sparse embedding indexes")
+    if sparse and distance_metric is not None:
+        raise ValueError("distance_metric must be omitted for sparse embedding indexes")
+    if dimension is not None and (isinstance(dimension, bool) or dimension <= 0):
+        raise ValueError("dimension must be a positive integer")
+
+    embedder_config = _model_dict(embedder)
+    if not isinstance(embedder_config.get("provider"), str) or not embedder_config["provider"]:
+        raise ValueError("embedder.provider is required")
+    if distance_metric not in (None, "l2_squared", "inner_product", "cosine"):
+        raise ValueError("distance_metric is invalid")
+
+    enrichments: list[dict[str, Any]] = []
+    for index, source in enumerate(sources):
+        if not source.field and not source.template:
+            raise ValueError(f"sources[{index}] requires field or template")
+        if source.source_artifact == "":
+            raise ValueError(f"sources[{index}].source_artifact cannot be empty")
+        enrichment: dict[str, Any] = {
+            "name": source.artifact,
+            "kind": "embedding",
+        }
+        if source.field:
+            enrichment["field"] = source.field
+        if source.template is not None:
+            enrichment["template"] = source.template
+        if source.source_artifact is not None:
+            enrichment["source_artifact_name"] = source.source_artifact
+        if dimension is not None:
+            enrichment["expected_dims"] = dimension
+        if vector_space is not None:
+            if not vector_space:
+                raise ValueError("vector_space cannot be empty when provided")
+            enrichment["vector_space"] = vector_space
+        enrichments.append(enrichment)
+
+    result: dict[str, Any] = {
+        "name": name,
+        "type": "embeddings",
+        "sources": artifact_index_sources(*(source.artifact for source in sources)),
+        "enrichments": enrichments,
+        "embedder": embedder_config,
+    }
+    if sparse:
+        result["sparse"] = True
+    if dimension is not None:
+        result["dimension"] = dimension
+    if distance_metric is not None:
+        result["distance_metric"] = distance_metric
+    return result

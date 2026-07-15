@@ -446,6 +446,7 @@ fn artifactEnrichmentConfigsEqual(a: db_mod.types.EnrichmentConfig, b: db_mod.ty
         std.mem.eql(u8, a.template, b.template) and
         std.mem.eql(u8, a.source_artifact_name, b.source_artifact_name) and
         a.expected_dims == b.expected_dims and
+        std.mem.eql(u8, a.vector_space, b.vector_space) and
         a.chunk_size == b.chunk_size and
         a.chunk_overlap == b.chunk_overlap and
         std.mem.eql(u8, a.chunker_json, b.chunker_json) and
@@ -781,7 +782,7 @@ fn appendIndexStatus(
     else
         false;
     const graph_source_status = if (index_type == .graph)
-        graphSourceStatus(config)
+        graphSourcesStatus(config)
     else
         null;
     const coverage_generation = if (index_type == .embeddings)
@@ -936,30 +937,13 @@ const GraphSourceStatus = struct {
     format: []const u8 = "extraction_relation",
 };
 
-fn graphSourceStatus(config: std.json.Value) ?GraphSourceStatus {
-    if (config != .object) return null;
-    if (config.object.get("sources")) |sources| {
-        if (sources != .array or sources.array.items.len == 0) return null;
-        const first = sources.array.items[0];
-        if (first != .object) return null;
-        const artifact = first.object.get("artifact") orelse return null;
-        if (artifact != .string or artifact.string.len == 0) return null;
-        return .{
-            .artifact = artifact.string,
-            .path = if (first.object.get("path")) |value| switch (value) {
-                .string => value.string,
-                else => "",
-            } else "",
-            .format = if (first.object.get("format")) |value| switch (value) {
-                .string => value.string,
-                else => "extraction_relation",
-            } else "extraction_relation",
-        };
-    }
-    const source = config.object.get("source") orelse return null;
+const GraphSourcesStatus = struct {
+    sources: []const std.json.Value = &.{},
+    legacy: ?GraphSourceStatus = null,
+};
+
+fn graphSourceStatusFromValue(source: std.json.Value) ?GraphSourceStatus {
     if (source != .object) return null;
-    const kind = source.object.get("kind") orelse return null;
-    if (kind != .string or !std.mem.eql(u8, kind.string, "artifact")) return null;
     const artifact = source.object.get("artifact") orelse return null;
     if (artifact != .string or artifact.string.len == 0) return null;
     return .{
@@ -973,6 +957,54 @@ fn graphSourceStatus(config: std.json.Value) ?GraphSourceStatus {
             else => "extraction_relation",
         } else "extraction_relation",
     };
+}
+
+fn graphSourcesStatus(config: std.json.Value) ?GraphSourcesStatus {
+    if (config != .object) return null;
+    if (config.object.get("sources")) |sources| {
+        if (sources != .array or sources.array.items.len == 0) return null;
+        return .{ .sources = sources.array.items };
+    }
+    const source = config.object.get("source") orelse return null;
+    if (source != .object) return null;
+    const kind = source.object.get("kind") orelse return null;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "artifact")) return null;
+    const artifact = source.object.get("artifact") orelse return null;
+    if (artifact != .string or artifact.string.len == 0) return null;
+    return .{ .legacy = .{
+        .artifact = artifact.string,
+        .path = if (source.object.get("path")) |value| switch (value) {
+            .string => value.string,
+            else => "",
+        } else "",
+        .format = if (source.object.get("format")) |value| switch (value) {
+            .string => value.string,
+            else => "extraction_relation",
+        } else "extraction_relation",
+    } };
+}
+
+fn appendGraphSourceStatusObject(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    source: GraphSourceStatus,
+    materialization_pending: bool,
+) !void {
+    try out.append(alloc, '{');
+    try appendJsonString(alloc, out, "name");
+    try out.append(alloc, ':');
+    try appendJsonString(alloc, out, source.artifact);
+    try out.append(alloc, ',');
+    try appendJsonString(alloc, out, "path");
+    try out.append(alloc, ':');
+    try appendJsonString(alloc, out, source.path);
+    try out.append(alloc, ',');
+    try appendJsonString(alloc, out, "format");
+    try out.append(alloc, ':');
+    try appendJsonString(alloc, out, source.format);
+    try out.appendSlice(alloc, ",\"materialization_pending\":");
+    try out.appendSlice(alloc, if (materialization_pending) "true" else "false");
+    try out.append(alloc, '}');
 }
 
 fn indexTypeName(index_type: ApiIndexType) []const u8 {
@@ -1103,7 +1135,7 @@ fn appendIndexRuntimeStatus(
     embeddings_sparse: bool,
     coverage_generation: u64,
     coverage_config_hash: u64,
-    graph_source_status: ?GraphSourceStatus,
+    graph_source_status: ?GraphSourcesStatus,
     expected_group_ids: []const u64,
     local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
     status_lookup: *const RuntimeStatusLookup,
@@ -2208,7 +2240,7 @@ fn appendSingleIndexRuntimeStatus(
     embeddings_sparse: bool,
     coverage_generation: u64,
     coverage_config_hash: u64,
-    graph_source_status: ?GraphSourceStatus,
+    graph_source_status: ?GraphSourcesStatus,
     async_indexing: db_mod.types.AsyncIndexingStats,
     enrichment: ?db_mod.types.EnrichmentStats,
     resolution: ?db_mod.types.ReplayStageStats,
@@ -2419,22 +2451,30 @@ fn appendSingleIndexRuntimeStatus(
         try out.appendSlice(alloc, ",\"result_nodes\":");
         try appendIntValue(alloc, out, item.algebraic_graph_traversal_result_node_count);
         try out.appendSlice(alloc, "}}");
-        if (graph_source_status) |source| {
-            try out.appendSlice(alloc, ",\"source_artifact\":{");
-            try appendJsonString(alloc, out, "name");
-            try out.append(alloc, ':');
-            try appendJsonString(alloc, out, source.artifact);
-            try out.append(alloc, ',');
-            try appendJsonString(alloc, out, "path");
-            try out.append(alloc, ':');
-            try appendJsonString(alloc, out, source.path);
-            try out.append(alloc, ',');
-            try appendJsonString(alloc, out, "format");
-            try out.append(alloc, ':');
-            try appendJsonString(alloc, out, source.format);
-            try out.appendSlice(alloc, ",\"materialization_pending\":");
-            try out.appendSlice(alloc, if (catch_up_active or replay_catch_up_required) "true" else "false");
-            try out.append(alloc, '}');
+        if (graph_source_status) |status| {
+            const materialization_pending = catch_up_active or replay_catch_up_required;
+            try out.appendSlice(alloc, ",\"source_artifacts\":[");
+            var first = true;
+            var compatibility_source: ?GraphSourceStatus = status.legacy;
+            for (status.sources) |source_value| {
+                const source = graphSourceStatusFromValue(source_value) orelse continue;
+                if (compatibility_source == null) compatibility_source = source;
+                if (!first) try out.append(alloc, ',');
+                first = false;
+                try appendGraphSourceStatusObject(alloc, out, source, materialization_pending);
+            }
+            if (status.legacy) |source| {
+                if (!first) try out.append(alloc, ',');
+                try appendGraphSourceStatusObject(alloc, out, source, materialization_pending);
+            }
+            try out.append(alloc, ']');
+
+            // Keep the singular field for compatibility while exposing every
+            // configured source in source_artifacts.
+            if (compatibility_source) |source| {
+                try out.appendSlice(alloc, ",\"source_artifact\":");
+                try appendGraphSourceStatusObject(alloc, out, source, materialization_pending);
+            }
         }
     }
     if (index_type == .algebraic) try appendAlgebraicIndexStatsFields(alloc, out, item);
@@ -3457,7 +3497,7 @@ test "index encoders expose graph artifact source materialization status" {
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"relations_graph\":{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\"}}}",
+            .indexes_json = "{\"relations_graph\":{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\"},{\"artifact\":\"entity_graph_v1\",\"path\":\"$.graph\",\"format\":\"extraction_graph\"}]}}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -3470,6 +3510,8 @@ test "index encoders expose graph artifact source materialization status" {
     const encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "relations_graph", &local_status)).?;
     defer alloc.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_artifact\":{\"name\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\",\"materialization_pending\":true}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_artifacts\":[{\"name\":\"relations_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "{\"name\":\"entity_graph_v1\",\"path\":\"$.graph\",\"format\":\"extraction_graph\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"shard_status\":{\"7\":{") != null);
 }
 

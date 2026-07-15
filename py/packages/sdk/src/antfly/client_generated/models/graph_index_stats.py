@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from ..models.graph_index_stats_resolution import GraphIndexStatsResolution
     from ..models.graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
     from ..models.graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
+    from ..models.graph_index_stats_source_artifacts_item import GraphIndexStatsSourceArtifactsItem
 
 
 T = TypeVar("T", bound="GraphIndexStats")
@@ -51,6 +52,8 @@ class GraphIndexStats:
         catch_up_applied_sequence (int | Unset):
         catch_up_target_sequence (int | Unset):
         source_artifact (GraphIndexStatsSourceArtifact | Unset): Graph source artifact materialization status.
+        source_artifacts (list[GraphIndexStatsSourceArtifactsItem] | Unset): Materialization status for every configured
+            graph source artifact.
         resolver_replay (GraphIndexStatsResolverReplay | Unset): Resolver replay diagnostics for graph materialization.
         async_indexing (GraphIndexStatsAsyncIndexing | Unset):
         projection_checkpoint_status (str | Unset): Durable projection checkpoint status: clean, rebuilding, degraded,
@@ -105,6 +108,7 @@ class GraphIndexStats:
     catch_up_applied_sequence: int | Unset = UNSET
     catch_up_target_sequence: int | Unset = UNSET
     source_artifact: GraphIndexStatsSourceArtifact | Unset = UNSET
+    source_artifacts: list[GraphIndexStatsSourceArtifactsItem] | Unset = UNSET
     resolver_replay: GraphIndexStatsResolverReplay | Unset = UNSET
     async_indexing: GraphIndexStatsAsyncIndexing | Unset = UNSET
     projection_checkpoint_status: str | Unset = UNSET
@@ -181,6 +185,13 @@ class GraphIndexStats:
         source_artifact: dict[str, Any] | Unset = UNSET
         if not isinstance(self.source_artifact, Unset):
             source_artifact = self.source_artifact.to_dict()
+
+        source_artifacts: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.source_artifacts, Unset):
+            source_artifacts = []
+            for source_artifacts_item_data in self.source_artifacts:
+                source_artifacts_item = source_artifacts_item_data.to_dict()
+                source_artifacts.append(source_artifacts_item)
 
         resolver_replay: dict[str, Any] | Unset = UNSET
         if not isinstance(self.resolver_replay, Unset):
@@ -289,6 +300,8 @@ class GraphIndexStats:
             field_dict["catch_up_target_sequence"] = catch_up_target_sequence
         if source_artifact is not UNSET:
             field_dict["source_artifact"] = source_artifact
+        if source_artifacts is not UNSET:
+            field_dict["source_artifacts"] = source_artifacts
         if resolver_replay is not UNSET:
             field_dict["resolver_replay"] = resolver_replay
         if async_indexing is not UNSET:
@@ -345,6 +358,7 @@ class GraphIndexStats:
         from ..models.graph_index_stats_resolution import GraphIndexStatsResolution
         from ..models.graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
         from ..models.graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
+        from ..models.graph_index_stats_source_artifacts_item import GraphIndexStatsSourceArtifactsItem
 
         d = dict(src_dict)
         index_type = GraphIndexStatsIndexType(d.pop("index_type"))
@@ -404,6 +418,15 @@ class GraphIndexStats:
             source_artifact = UNSET
         else:
             source_artifact = GraphIndexStatsSourceArtifact.from_dict(_source_artifact)
+
+        _source_artifacts = d.pop("source_artifacts", UNSET)
+        source_artifacts: list[GraphIndexStatsSourceArtifactsItem] | Unset = UNSET
+        if _source_artifacts is not UNSET:
+            source_artifacts = []
+            for source_artifacts_item_data in _source_artifacts:
+                source_artifacts_item = GraphIndexStatsSourceArtifactsItem.from_dict(source_artifacts_item_data)
+
+                source_artifacts.append(source_artifacts_item)
 
         _resolver_replay = d.pop("resolver_replay", UNSET)
         resolver_replay: GraphIndexStatsResolverReplay | Unset
@@ -499,6 +522,7 @@ class GraphIndexStats:
             catch_up_applied_sequence=catch_up_applied_sequence,
             catch_up_target_sequence=catch_up_target_sequence,
             source_artifact=source_artifact,
+            source_artifacts=source_artifacts,
             resolver_replay=resolver_replay,
             async_indexing=async_indexing,
             projection_checkpoint_status=projection_checkpoint_status,

@@ -71,6 +71,8 @@ const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
     pub const sim = struct {};
 };
 
+pub const max_artifact_sources = 64;
+
 fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     if (!builtin.link_libc) return null;
     return std.c.getenv(name);
@@ -7599,13 +7601,38 @@ pub const IndexManager = struct {
                     }
                 }
                 var first_multi_source_embedding: ?*const enrichment_catalog.EnrichmentConfig = null;
+                var multi_source_chunk_backing: ?bool = null;
+                var multi_source_vector_space: ?[]const u8 = null;
+                var multi_source_has_implicit_vector_space = false;
                 for (dense_cfg.embedding_names) |embedding_name| {
                     const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
                     if (embedding_cfg.expected_dims > 0 and embedding_cfg.expected_dims != dense_cfg.dims) return error.InvalidIndexConfig;
+                    if (dense_cfg.embedding_names.len > 1) {
+                        if (embedding_cfg.vector_space.len == 0) {
+                            multi_source_has_implicit_vector_space = true;
+                        } else {
+                            if (multi_source_vector_space) |expected| {
+                                if (!std.mem.eql(u8, expected, embedding_cfg.vector_space)) return error.InvalidIndexConfig;
+                            } else {
+                                multi_source_vector_space = embedding_cfg.vector_space;
+                            }
+                        }
+                    }
+                    const chunk_backed = embedding_cfg.source_artifact_name.len > 0;
+                    if (multi_source_chunk_backing) |expected| {
+                        if (expected != chunk_backed) return error.InvalidIndexConfig;
+                    } else {
+                        multi_source_chunk_backing = chunk_backed;
+                    }
                     if (first_multi_source_embedding == null and embedding_cfg.source_artifact_name.len > 0) {
                         first_multi_source_embedding = embedding_cfg;
                     }
                 }
+                // Compatibility is either fully automatic (all vector_space
+                // values omitted) or an explicit assertion shared by every
+                // source. Mixing the two modes would make the contract
+                // ambiguous and is rejected.
+                if (multi_source_has_implicit_vector_space and multi_source_vector_space != null) return error.InvalidIndexConfig;
 
                 const path = try self.activeIndexPath(cfg.name);
                 defer self.alloc.free(path);
@@ -7730,10 +7757,35 @@ pub const IndexManager = struct {
                     self.getEnrichment(.embedding, cfg.name)
                 else
                     null;
+                var first_multi_source_embedding: ?*const enrichment_catalog.EnrichmentConfig = null;
+                var multi_source_chunk_backing: ?bool = null;
+                var multi_source_vector_space: ?[]const u8 = null;
+                var multi_source_has_implicit_vector_space = false;
                 for (sparse_cfg.embedding_names) |embedding_name| {
                     const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
                     if (embedding_cfg.expected_dims != 0) return error.InvalidIndexConfig;
+                    if (sparse_cfg.embedding_names.len > 1) {
+                        if (embedding_cfg.vector_space.len == 0) {
+                            multi_source_has_implicit_vector_space = true;
+                        } else {
+                            if (multi_source_vector_space) |expected| {
+                                if (!std.mem.eql(u8, expected, embedding_cfg.vector_space)) return error.InvalidIndexConfig;
+                            } else {
+                                multi_source_vector_space = embedding_cfg.vector_space;
+                            }
+                        }
+                    }
+                    const chunk_backed = embedding_cfg.source_artifact_name.len > 0;
+                    if (multi_source_chunk_backing) |expected| {
+                        if (expected != chunk_backed) return error.InvalidIndexConfig;
+                    } else {
+                        multi_source_chunk_backing = chunk_backed;
+                    }
+                    if (first_multi_source_embedding == null and embedding_cfg.source_artifact_name.len > 0) {
+                        first_multi_source_embedding = embedding_cfg;
+                    }
                 }
+                if (multi_source_has_implicit_vector_space and multi_source_vector_space != null) return error.InvalidIndexConfig;
 
                 const path = try self.activeIndexPath(cfg.name);
                 defer self.alloc.free(path);
@@ -7766,6 +7818,8 @@ pub const IndexManager = struct {
                         const chunk_cfg = resolveChunkGenerator(self, generator);
                         break :blk if (generatorHasChunking(chunk_cfg)) try self.alloc.dupe(u8, chunk_cfg.artifact_name) else null;
                     } else if (referenced_embedding) |embedding_cfg|
+                        if (embedding_cfg.source_artifact_name.len > 0) try self.alloc.dupe(u8, embedding_cfg.source_artifact_name) else null
+                    else if (first_multi_source_embedding) |embedding_cfg|
                         if (embedding_cfg.source_artifact_name.len > 0) try self.alloc.dupe(u8, embedding_cfg.source_artifact_name) else null
                     else
                         null,
@@ -8147,6 +8201,7 @@ pub const IndexManager = struct {
                 !std.mem.eql(u8, existing.source_template, cfg.source_template) or
                 !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 existing.expected_dims != cfg.expected_dims or
+                !std.mem.eql(u8, existing.vector_space, cfg.vector_space) or
                 !std.mem.eql(u8, existing.execution_json, cfg.execution_json))
             {
                 return error.ConflictingEnrichmentConfig;
@@ -13899,6 +13954,7 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         .source_template = if (cfg.template.len > 0) try alloc.dupe(u8, cfg.template) else "",
         .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
         .expected_dims = cfg.expected_dims,
+        .vector_space = if (cfg.vector_space.len > 0) try alloc.dupe(u8, cfg.vector_space) else "",
         .chunk_size = cfg.chunk_size,
         .chunk_overlap = cfg.chunk_overlap,
         .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
@@ -13916,6 +13972,7 @@ fn internalEnrichmentConfigsEqual(a: enrichment_catalog.EnrichmentConfig, b: enr
         std.mem.eql(u8, a.source_template, b.source_template) and
         std.mem.eql(u8, a.source_artifact_name, b.source_artifact_name) and
         a.expected_dims == b.expected_dims and
+        std.mem.eql(u8, a.vector_space, b.vector_space) and
         a.chunk_size == b.chunk_size and
         a.chunk_overlap == b.chunk_overlap and
         std.mem.eql(u8, a.chunker_json, b.chunker_json) and
@@ -13945,6 +14002,7 @@ fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentConfig
         .template = if (cfg.source_template.len > 0) try alloc.dupe(u8, cfg.source_template) else "",
         .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
         .expected_dims = cfg.expected_dims,
+        .vector_space = if (cfg.vector_space.len > 0) try alloc.dupe(u8, cfg.vector_space) else "",
         .chunk_size = cfg.chunk_size,
         .chunk_overlap = cfg.chunk_overlap,
         .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
@@ -13997,7 +14055,7 @@ fn isIndexExecutionNamespace(name: []const u8) bool {
 
 fn parseArtifactSourcesAlloc(alloc: Allocator, root: std.json.ObjectMap) ![][]u8 {
     const sources_value = root.get("sources") orelse return &.{};
-    if (sources_value != .array or sources_value.array.items.len == 0) return error.InvalidIndexConfig;
+    if (sources_value != .array or sources_value.array.items.len == 0 or sources_value.array.items.len > max_artifact_sources) return error.InvalidIndexConfig;
     const sources = try alloc.alloc([]u8, sources_value.array.items.len);
     var initialized: usize = 0;
     errdefer {
@@ -14811,7 +14869,7 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
 
 fn parseGraphArtifactSources(alloc: Allocator, root: std.json.Value) ![]GraphArtifactSource {
     const sources_value = root.object.get("sources") orelse return &.{};
-    if (sources_value != .array or sources_value.array.items.len == 0) return error.InvalidIndexConfig;
+    if (sources_value != .array or sources_value.array.items.len == 0 or sources_value.array.items.len > max_artifact_sources) return error.InvalidIndexConfig;
     if (root.object.get("path") != null or root.object.get("format") != null or root.object.get("mention_edge_type") != null or
         root.object.get("nodes") != null or root.object.get("edge") != null or root.object.get("context") != null)
     {

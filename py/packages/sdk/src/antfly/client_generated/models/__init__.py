@@ -25,6 +25,7 @@ from .algebraic_index_stats_promotion import AlgebraicIndexStatsPromotion
 from .algebraic_index_stats_resolution import AlgebraicIndexStatsResolution
 from .algebraic_index_stats_resolver_replay import AlgebraicIndexStatsResolverReplay
 from .algebraic_index_stats_source_artifact import AlgebraicIndexStatsSourceArtifact
+from .algebraic_index_stats_source_artifacts_item import AlgebraicIndexStatsSourceArtifactsItem
 from .analyses import Analyses
 from .analyses_result import AnalysesResult
 from .answer_agent_result import AnswerAgentResult
@@ -267,6 +268,7 @@ from .graph_index_stats_promotion import GraphIndexStatsPromotion
 from .graph_index_stats_resolution import GraphIndexStatsResolution
 from .graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
 from .graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
+from .graph_index_stats_source_artifacts_item import GraphIndexStatsSourceArtifactsItem
 from .graph_node_selector import GraphNodeSelector
 from .graph_query import GraphQuery
 from .graph_query_params import GraphQueryParams
@@ -695,6 +697,7 @@ __all__ = (
     "AlgebraicIndexStatsResolution",
     "AlgebraicIndexStatsResolverReplay",
     "AlgebraicIndexStatsSourceArtifact",
+    "AlgebraicIndexStatsSourceArtifactsItem",
     "Analyses",
     "AnalysesResult",
     "AnswerAgentResult",
@@ -935,6 +938,7 @@ __all__ = (
     "GraphIndexStatsResolution",
     "GraphIndexStatsResolverReplay",
     "GraphIndexStatsSourceArtifact",
+    "GraphIndexStatsSourceArtifactsItem",
     "GraphNodeSelector",
     "GraphQuery",
     "GraphQueryParams",

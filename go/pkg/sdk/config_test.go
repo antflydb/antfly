@@ -32,6 +32,7 @@ func TestNewArtifactEmbeddingIndexConfig(t *testing.T) {
 	}
 
 	idx, err := NewArtifactEmbeddingIndexConfig("document_vectors", ArtifactEmbeddingIndexConfig{
+		VectorSpace: "test:dense-v1",
 		Sources: []ArtifactEmbeddingSource{{
 			ArtifactName:       "document_chunk_dense_v1",
 			SourceArtifactName: "document_chunks_v1",
@@ -109,6 +110,7 @@ func TestNewArtifactEmbeddingIndexConfigSupportsMultipleSources(t *testing.T) {
 		t.Fatalf("NewEmbedderConfig failed: %v", err)
 	}
 	idx, err := NewArtifactEmbeddingIndexConfig("document_vectors", ArtifactEmbeddingIndexConfig{
+		VectorSpace: "test:dense-v1",
 		Sources: []ArtifactEmbeddingSource{
 			{ArtifactName: "title_dense_v1", SourceArtifactName: "title_chunks_v1"},
 			{ArtifactName: "body_dense_v1", SourceArtifactName: "body_chunks_v1"},
@@ -135,20 +137,68 @@ func TestNewArtifactEmbeddingIndexConfigSupportsMultipleSources(t *testing.T) {
 	}
 }
 
-func TestGraphIndexConfigUsesPerSourcePathAndFormat(t *testing.T) {
-	idx, err := NewIndexConfig("knowledge_graph", GraphIndexConfig{
-		Sources: []GraphIndexSource{
-			{
-				Artifact: "title_relations_v1",
-				Path:     "$.relations[*]",
-				Format:   GraphIndexSourceFormatExtractionRelation,
-			},
-			{
-				Artifact: "entity_graph_v1",
-				Path:     "$.graph",
-				Format:   GraphIndexSourceFormatExtractionGraph,
-			},
+func TestNewArtifactEmbeddingIndexConfigAllowsAutomaticVectorSpace(t *testing.T) {
+	embedder, err := NewEmbedderConfig(AntflyEmbedderConfig{Model: "antflydb/clipclap"})
+	if err != nil {
+		t.Fatalf("NewEmbedderConfig failed: %v", err)
+	}
+	idx, err := NewArtifactEmbeddingIndexConfig("document_vectors", ArtifactEmbeddingIndexConfig{
+		Sources: []ArtifactEmbeddingSource{
+			{ArtifactName: "title_dense_v1", SourceField: "title"},
+			{ArtifactName: "body_dense_v1", SourceField: "body"},
 		},
+		ExpectedDims: 384,
+		Embedder:     *embedder,
+	})
+	if err != nil {
+		t.Fatalf("NewArtifactEmbeddingIndexConfig failed: %v", err)
+	}
+	data, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatalf("marshal index config: %v", err)
+	}
+	if string(data) == "" || json.Valid(data) == false {
+		t.Fatalf("invalid index JSON: %s", data)
+	}
+	if string(data) != "" && containsJSONField(data, "vector_space") {
+		t.Fatalf("vector_space should be omitted for automatic validation: %s", data)
+	}
+}
+
+func containsJSONField(data []byte, field string) bool {
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		return false
+	}
+	enrichments, _ := body["enrichments"].([]any)
+	for _, raw := range enrichments {
+		if enrichment, ok := raw.(map[string]any); ok {
+			if _, exists := enrichment[field]; exists {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func TestGraphIndexConfigUsesPerSourcePathAndFormat(t *testing.T) {
+	graphSources, err := NewGraphIndexSources(
+		GraphIndexSource{
+			Artifact: "title_relations_v1",
+			Path:     "$.relations[*]",
+			Format:   GraphIndexSourceFormatExtractionRelation,
+		},
+		GraphIndexSource{
+			Artifact: "entity_graph_v1",
+			Path:     "$.graph",
+			Format:   GraphIndexSourceFormatExtractionGraph,
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewGraphIndexSources failed: %v", err)
+	}
+	idx, err := NewIndexConfig("knowledge_graph", GraphIndexConfig{
+		Sources: graphSources,
 	})
 	if err != nil {
 		t.Fatalf("NewIndexConfig failed: %v", err)
@@ -188,6 +238,19 @@ func TestNewArtifactIndexSources(t *testing.T) {
 	}
 	if _, err := NewArtifactIndexSources("body_chunks_v1", "body_chunks_v1"); err == nil {
 		t.Fatal("duplicate artifact sources should fail")
+	}
+}
+
+func TestArtifactIndexHelpersRejectInvalidEnums(t *testing.T) {
+	if _, err := NewGraphIndexSources(GraphIndexSource{Artifact: "relations_v1", Format: "unknown"}); err == nil {
+		t.Fatal("invalid graph source format should fail")
+	}
+	if _, err := NewArtifactEmbeddingIndexConfig("vectors", ArtifactEmbeddingIndexConfig{
+		Sources:        []ArtifactEmbeddingSource{{ArtifactName: "dense_v1"}},
+		Embedder:       EmbedderConfig{Provider: "antfly"},
+		DistanceMetric: "unknown",
+	}); err == nil {
+		t.Fatal("invalid distance metric should fail")
 	}
 }
 

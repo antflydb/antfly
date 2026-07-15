@@ -176,6 +176,7 @@ pub const QueryTemplateError = error{
 const default_pacing_burst: u32 = 1;
 const pacing_safety_margin_ns: u64 = 50 * std.time.ns_per_ms;
 const max_embedding_request_timeout_ms: u64 = 30_000;
+const max_embedding_index_sources = 64;
 const query_cache_secret_refresh_interval_ns: u64 = std.time.ns_per_s;
 const dimension_probe_text = "antfly embedding dimension probe";
 
@@ -467,33 +468,78 @@ fn releaseEntryRequestPacer(alloc: std.mem.Allocator, maybe_scope_key: ?[]u8) vo
     alloc.free(scope_key);
 }
 
-fn managedEmbeddingApiKeyIdentityHash(entry: *const ManagedEmbeddingEntry) u64 {
-    if (entry.api_key) |api_key| return api_key.identityHash();
-    return 0;
-}
-
 fn managedEmbeddingEntriesEquivalentForLookup(
     lhs: *const ManagedEmbeddingEntry,
     rhs: *const ManagedEmbeddingEntry,
 ) bool {
+    // Only properties that can change the mathematical embedding space
+    // participate here. Credentials, deployment endpoints, pacing, and other
+    // execution settings may differ without changing vector semantics.
     return lhs.provider == rhs.provider and
         lhs.dimensions == rhs.dimensions and
         lhs.sparse == rhs.sparse and
         lhs.multimodal == rhs.multimodal and
-        lhs.requests_per_minute == rhs.requests_per_minute and
-        lhs.burst == rhs.burst and
-        (lhs.antfly_provider != null) == (rhs.antfly_provider != null) and
-        managedEmbeddingApiKeyIdentityHash(lhs) == managedEmbeddingApiKeyIdentityHash(rhs) and
         std.mem.eql(u8, lhs.model, rhs.model) and
-        std.mem.eql(u8, lhs.base_url, rhs.base_url) and
-        std.mem.eql(u8, lhs.region, rhs.region) and
         std.mem.eql(u8, lhs.input_type, rhs.input_type) and
         std.mem.eql(u8, lhs.truncate, rhs.truncate);
+}
+
+const VectorSpaceMap = std.StringHashMapUnmanaged([]const u8);
+
+fn collectEmbeddingVectorSpaces(value: std.json.Value, spaces: *VectorSpaceMap, alloc: std.mem.Allocator) !void {
+    switch (value) {
+        .object => |object| {
+            if (object.get("enrichments")) |enrichments| {
+                if (enrichments != .array) return error.InvalidManagedEmbeddingIndex;
+                for (enrichments.array.items) |enrichment| {
+                    if (enrichment != .object) return error.InvalidManagedEmbeddingIndex;
+                    const kind = enrichment.object.get("kind") orelse continue;
+                    if (kind != .string or !std.mem.eql(u8, kind.string, "embedding")) continue;
+                    const name = enrichment.object.get("name") orelse return error.InvalidManagedEmbeddingIndex;
+                    if (name != .string or name.string.len == 0) return error.InvalidManagedEmbeddingIndex;
+                    const vector_space = if (enrichment.object.get("vector_space")) |space| blk: {
+                        if (space != .string or space.string.len == 0) return error.InvalidManagedEmbeddingIndex;
+                        break :blk space.string;
+                    } else "";
+                    const gop = try spaces.getOrPut(alloc, name.string);
+                    if (gop.found_existing) {
+                        if (!std.mem.eql(u8, gop.value_ptr.*, vector_space)) return error.InvalidManagedEmbeddingIndex;
+                    } else {
+                        gop.value_ptr.* = vector_space;
+                    }
+                }
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+                try collectEmbeddingVectorSpaces(entry.value_ptr.*, spaces, alloc);
+            }
+        },
+        .array => |array| for (array.items) |item| try collectEmbeddingVectorSpaces(item, spaces, alloc),
+        else => {},
+    }
+}
+
+fn validateEntryVectorSpaceMode(entry: *const ManagedEmbeddingEntry, spaces: *const VectorSpaceMap) !void {
+    var explicit_space: ?[]const u8 = null;
+    var has_implicit = false;
+    for (entry.embedding_names) |name| {
+        const vector_space: []const u8 = if (spaces.get(name)) |value| value else &.{};
+        if (vector_space.len == 0) {
+            has_implicit = true;
+        } else if (explicit_space) |expected| {
+            if (!std.mem.eql(u8, expected, vector_space)) return error.InvalidManagedEmbeddingIndex;
+        } else {
+            explicit_space = vector_space;
+        }
+    }
+    if (has_implicit and explicit_space != null) return error.InvalidManagedEmbeddingIndex;
 }
 
 fn validateManagedEmbeddingLookupName(
     alloc: std.mem.Allocator,
     names: *std.StringHashMapUnmanaged(*const ManagedEmbeddingEntry),
+    vector_spaces: *const VectorSpaceMap,
     name: []const u8,
     entry: *const ManagedEmbeddingEntry,
 ) !void {
@@ -502,17 +548,32 @@ fn validateManagedEmbeddingLookupName(
         gop.value_ptr.* = entry;
         return;
     }
+    // Dimensions and dense/sparse representation are never overridable.
+    if (gop.value_ptr.*.dimensions != entry.dimensions or gop.value_ptr.*.sparse != entry.sparse) {
+        return error.InvalidManagedEmbeddingIndex;
+    }
+    // A non-empty vector_space is an explicit application assertion that the
+    // producers are compatible. With no assertion, Antfly proves compatibility
+    // by comparing their effective semantic embedder configuration.
+    if (vector_spaces.get(name)) |vector_space| {
+        if (vector_space.len > 0) return;
+    }
     if (!managedEmbeddingEntriesEquivalentForLookup(gop.value_ptr.*, entry)) return error.InvalidManagedEmbeddingIndex;
 }
 
-fn validateManagedEmbeddingLookupNames(alloc: std.mem.Allocator, entries: []const ManagedEmbeddingEntry) !void {
+fn validateManagedEmbeddingLookupNames(
+    alloc: std.mem.Allocator,
+    entries: []const ManagedEmbeddingEntry,
+    vector_spaces: *const VectorSpaceMap,
+) !void {
     var names = std.StringHashMapUnmanaged(*const ManagedEmbeddingEntry).empty;
     defer names.deinit(alloc);
 
     for (entries) |*entry| {
-        try validateManagedEmbeddingLookupName(alloc, &names, entry.index_name, entry);
-        if (entry.embedding_name.len > 0) try validateManagedEmbeddingLookupName(alloc, &names, entry.embedding_name, entry);
-        for (entry.embedding_names) |name| try validateManagedEmbeddingLookupName(alloc, &names, name, entry);
+        try validateEntryVectorSpaceMode(entry, vector_spaces);
+        try validateManagedEmbeddingLookupName(alloc, &names, vector_spaces, entry.index_name, entry);
+        if (entry.embedding_name.len > 0) try validateManagedEmbeddingLookupName(alloc, &names, vector_spaces, entry.embedding_name, entry);
+        for (entry.embedding_names) |name| try validateManagedEmbeddingLookupName(alloc, &names, vector_spaces, name, entry);
     }
 }
 
@@ -575,7 +636,10 @@ pub const ManagedEmbedder = struct {
             const managed = try parseManagedEmbeddingEntry(alloc, entry.key_ptr.*, entry.value_ptr.*, options) orelse continue;
             try entries.append(alloc, managed);
         }
-        try validateManagedEmbeddingLookupNames(alloc, entries.items);
+        var vector_spaces = VectorSpaceMap.empty;
+        defer vector_spaces.deinit(alloc);
+        try collectEmbeddingVectorSpaces(root, &vector_spaces, alloc);
+        try validateManagedEmbeddingLookupNames(alloc, entries.items, &vector_spaces);
 
         var pacer_scope_keys = std.ArrayListUnmanaged([]u8).empty;
         errdefer {
@@ -1013,6 +1077,7 @@ pub fn translateEmbeddingsIndexConfigJson(
 }
 
 fn validateEmbeddingIndexSources(sources: []const indexes_openapi.ArtifactIndexSource) !void {
+    if (sources.len > max_embedding_index_sources) return error.InvalidCreateTableRequest;
     for (sources, 0..) |source, i| {
         if (source.artifact.len == 0) return error.InvalidCreateTableRequest;
         for (sources[0..i]) |previous| {
@@ -2832,6 +2897,55 @@ test "managed embedder rejects conflicting embedding name aliases" {
         \\  "document_vectors_secondary":{"type":"embeddings","field":"embedding","embedding_name":"document_chunk_dense_v1","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/other"}}
         \\}
     , local.provider()));
+}
+
+pub fn testVectorSpaceCompatibility() !void {
+    {
+        var managed = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+            \\{
+            \\  "primary":{"type":"embeddings","field":"embedding","embedding_name":"shared_dense_v1","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"https://first.example/v1","api_key":"credential-a","requests_per_minute":100}},
+            \\  "secondary":{"type":"embeddings","field":"embedding","embedding_name":"shared_dense_v1","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"https://second.example/v1","api_key":"credential-b","requests_per_minute":200}}
+            \\}
+        );
+        defer managed.deinit();
+        try std.testing.expect(managed.findEntry("shared_dense_v1") != null);
+    }
+
+    var local = TestLocalDenseProvider{ .dimensions = 3 };
+    {
+        var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
+            \\{
+            \\  "primary":{"type":"embeddings","sources":[{"artifact":"shared_dense_v1"}],"dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-a"},"enrichments":[{"name":"shared_dense_v1","kind":"embedding","field":"body","vector_space":"acme:dense-v1"}]},
+            \\  "secondary":{"type":"embeddings","sources":[{"artifact":"shared_dense_v1"}],"dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-b"},"enrichments":[{"name":"shared_dense_v1","kind":"embedding","field":"body","vector_space":"acme:dense-v1"}]}
+            \\}
+        , local.provider());
+        defer managed.deinit();
+        try std.testing.expect(managed.findEntry("shared_dense_v1") != null);
+    }
+
+    try std.testing.expectError(error.InvalidManagedEmbeddingIndex, ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
+        \\{
+        \\  "primary":{"type":"embeddings","sources":[{"artifact":"shared_dense_v1"}],"dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-a"},"enrichments":[{"name":"shared_dense_v1","kind":"embedding","field":"body","vector_space":"acme:dense-v1"}]},
+        \\  "secondary":{"type":"embeddings","sources":[{"artifact":"shared_dense_v1"}],"dimension":4,"embedder":{"provider":"antfly","model":"antflydb/model-b"},"enrichments":[{"name":"shared_dense_v1","kind":"embedding","field":"body","vector_space":"acme:dense-v1"}]}
+        \\}
+    , local.provider()));
+
+    try std.testing.expectError(error.InvalidManagedEmbeddingIndex, ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
+        \\{
+        \\  "combined":{"type":"embeddings","sources":[{"artifact":"title_dense_v1"},{"artifact":"body_dense_v1"}],"dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-a"},"enrichments":[{"name":"title_dense_v1","kind":"embedding","field":"title","vector_space":"acme:dense-v1"},{"name":"body_dense_v1","kind":"embedding","field":"body"}]}
+        \\}
+    , local.provider()));
+
+    try std.testing.expectError(error.InvalidManagedEmbeddingIndex, ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
+        \\{
+        \\  "primary":{"type":"embeddings","field":"embedding","embedding_name":"implicit_dense_v1","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-a"}},
+        \\  "secondary":{"type":"embeddings","field":"embedding","embedding_name":"implicit_dense_v1","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/model-b"}}
+        \\}
+    , local.provider()));
+}
+
+test "managed embedder enforces automatic and explicit vector space compatibility" {
+    try testVectorSpaceCompatibility();
 }
 
 test "managed embedder rejects index name and embedding name collisions with different configs" {

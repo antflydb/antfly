@@ -78,6 +78,13 @@ export type {
   TranscribeResponse,
 } from "./inference-types.js";
 export { logLevels, logStyles } from "./inference-types.js";
+export {
+  artifactEmbeddingIndexConfig,
+  artifactIndexSources,
+  graphIndexSources,
+  type ArtifactEmbeddingIndexOptions,
+  type ArtifactEmbeddingSourceConfig,
+} from "./index-config.js";
 // Re-export the generated types for advanced users
 export type { components, operations, paths } from "./public-api.js";
 export type { components as query_components } from "./query.js";
@@ -180,6 +187,7 @@ export type {
   // Embedding types
   Embedding,
   EmbeddingsIndexConfig,
+  EnrichmentConfig,
   // Eval types
   EvalConfig,
   EvalResult,

@@ -7489,6 +7489,8 @@ export interface components {
             source_artifact_name?: string;
             /** @description Expected embedding dimension for embedding enrichments. */
             expected_dims?: number;
+            /** @description Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producer models to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed. Dimensions are always validated independently. */
+            vector_space?: string;
             /** @description Chunk size for chunk enrichments. */
             chunk_size?: number;
             /** @description Chunk overlap for chunk enrichments. */
@@ -9370,6 +9372,10 @@ export interface components {
             source_artifact?: {
                 [key: string]: unknown;
             };
+            /** @description Materialization status for every configured graph source artifact. */
+            source_artifacts?: {
+                [key: string]: unknown;
+            }[];
             /** @description Resolver replay diagnostics for graph materialization. */
             resolver_replay?: {
                 [key: string]: unknown;
@@ -9606,6 +9612,10 @@ export interface components {
             source_artifact?: {
                 [key: string]: unknown;
             };
+            /** @description All source artifact streams used to materialize graph edges, in configured order. */
+            source_artifacts?: {
+                [key: string]: unknown;
+            }[];
             /** @description Graph resolver replay diagnostics. */
             resolver_replay?: {
                 [key: string]: unknown;
