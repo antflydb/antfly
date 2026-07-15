@@ -302,9 +302,8 @@ pub const RaftApplyStore = struct {
                     self.alloc.free(range.start);
                     self.alloc.free(range.end);
                 },
-                .prepare_split => |prepare| self.alloc.free(prepare.split_key),
-                .start_split => |start| self.alloc.free(start.split_key),
-                .acknowledge_split, .finalize_split, .rollback_split => {},
+                .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| self.alloc.free(transition.split_key),
+                .acknowledge_split => {},
             };
             self.alloc.free(metadata.operations);
         }
@@ -446,9 +445,8 @@ pub const RaftApplyStore = struct {
                     alloc.free(range.start);
                     alloc.free(range.end);
                 },
-                .prepare_split => |prepare| alloc.free(prepare.split_key),
-                .start_split => |start| alloc.free(start.split_key),
-                .acknowledge_split, .finalize_split, .rollback_split => {},
+                .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| alloc.free(transition.split_key),
+                .acknowledge_split => {},
             };
             operations.deinit(alloc);
         }
@@ -509,6 +507,14 @@ pub const RaftApplyStore = struct {
         return std.mem.readInt(u64, key[prefix_len..][0..8], .big);
     }
 
+    fn parseSplitTransition(alloc: std.mem.Allocator, payload: []const u8) !shard_state_store.SplitTransition {
+        const sep = std.mem.indexOfScalar(u8, payload, ':') orelse return error.InvalidAppliedDataRange;
+        return .{
+            .new_shard_id = try std.fmt.parseInt(u64, payload[0..sep], 10),
+            .split_key = try alloc.dupe(u8, payload[sep + 1 ..]),
+        };
+    }
+
     fn parseDataOperation(alloc: std.mem.Allocator, data: []const u8) !?DataOperation {
         if (std.mem.startsWith(u8, data, "range:")) {
             const payload = data["range:".len..];
@@ -533,30 +539,18 @@ pub const RaftApplyStore = struct {
             return error.InvalidAppliedDataRange;
         }
         if (std.mem.startsWith(u8, data, "split_prepare:")) {
-            const payload = data["split_prepare:".len..];
-            if (std.mem.indexOfScalar(u8, payload, ':')) |sep| {
-                return .{ .prepare_split = .{
-                    .new_shard_id = try std.fmt.parseInt(u64, payload[0..sep], 10),
-                    .split_key = try alloc.dupe(u8, payload[sep + 1 ..]),
-                } };
-            }
-            return error.InvalidAppliedDataRange;
+            return .{ .prepare_split = try parseSplitTransition(alloc, data["split_prepare:".len..]) };
         }
         if (std.mem.startsWith(u8, data, "split_start:")) {
-            const payload = data["split_start:".len..];
-            if (std.mem.indexOfScalar(u8, payload, ':')) |sep| {
-                return .{ .start_split = .{
-                    .new_shard_id = try std.fmt.parseInt(u64, payload[0..sep], 10),
-                    .split_key = try alloc.dupe(u8, payload[sep + 1 ..]),
-                } };
-            }
-            return error.InvalidAppliedDataRange;
+            return .{ .start_split = try parseSplitTransition(alloc, data["split_start:".len..]) };
         }
-        if (std.mem.eql(u8, data, "split_finalize") or std.mem.eql(u8, data, "finalize_split")) {
-            return .finalize_split;
+        if (std.mem.startsWith(u8, data, "split_finalize:") or std.mem.startsWith(u8, data, "finalize_split:")) {
+            const prefix_len = if (std.mem.startsWith(u8, data, "split_finalize:")) "split_finalize:".len else "finalize_split:".len;
+            return .{ .finalize_split = try parseSplitTransition(alloc, data[prefix_len..]) };
         }
-        if (std.mem.eql(u8, data, "split_rollback") or std.mem.eql(u8, data, "rollback_split")) {
-            return .rollback_split;
+        if (std.mem.startsWith(u8, data, "split_rollback:") or std.mem.startsWith(u8, data, "rollback_split:")) {
+            const prefix_len = if (std.mem.startsWith(u8, data, "split_rollback:")) "split_rollback:".len else "rollback_split:".len;
+            return .{ .rollback_split = try parseSplitTransition(alloc, data[prefix_len..]) };
         }
         if (std.mem.startsWith(u8, data, "put:")) {
             const payload = data["put:".len..];
@@ -618,8 +612,22 @@ pub const RaftApplyStore = struct {
                     .split_key = split_key,
                 } });
             },
-            .finalize => try operations.append(alloc, .finalize_split),
-            .rollback => try operations.append(alloc, .rollback_split),
+            .finalize, .rollback => {
+                const split_key = try alloc.dupe(u8, transition.split_key);
+                errdefer alloc.free(split_key);
+                const operation: shard_state_store.DataOperation = switch (transition.kind) {
+                    .finalize => .{ .finalize_split = .{
+                        .new_shard_id = transition.destination_group_id,
+                        .split_key = split_key,
+                    } },
+                    .rollback => .{ .rollback_split = .{
+                        .new_shard_id = transition.destination_group_id,
+                        .split_key = split_key,
+                    } },
+                    else => unreachable,
+                };
+                try operations.append(alloc, operation);
+            },
         };
         if (decoded.batch.req.split_checkpoint) |checkpoint| {
             if (checkpoint.kind == .source_ack) {
@@ -1239,6 +1247,75 @@ test "data raft apply store recovers exact split replay after injected projectio
     defer shard_state_store.freeSplitState(std.testing.allocator, split_state);
     try std.testing.expectEqual(shard_mod.SplitPhase.prepare, split_state.phase);
     try std.testing.expectEqualStrings("doc:m", split_state.split_key);
+}
+
+test "data raft apply store rejects mismatched terminal split identity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-terminal-identity", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+
+    const prepare = try data_raft_batch.encode(std.testing.allocator, "docs", .{
+        .split_transition = .{ .kind = .prepare, .destination_group_id = 222, .split_key = "doc:m" },
+    });
+    defer std.testing.allocator.free(prepare);
+    const start = try data_raft_batch.encode(std.testing.allocator, "docs", .{
+        .split_transition = .{ .kind = .start, .destination_group_id = 222, .split_key = "doc:m" },
+    });
+    defer std.testing.allocator.free(start);
+    const setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = prepare },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = start },
+    });
+    defer std.testing.allocator.free(setup);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 221,
+        .commit_index = 3,
+        .entries_bytes = setup,
+    });
+
+    const wrong_rollback = try data_raft_batch.encode(std.testing.allocator, "docs", .{
+        .split_transition = .{ .kind = .rollback, .destination_group_id = 223, .split_key = "doc:m" },
+    });
+    defer std.testing.allocator.free(wrong_rollback);
+    const wrong_rollback_entry = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = wrong_rollback },
+    });
+    defer std.testing.allocator.free(wrong_rollback_entry);
+    try std.testing.expectError(error.ConflictingSplitTransition, store.snapshotBuilder().applyBatch(.{
+        .group_id = 221,
+        .commit_index = 4,
+        .entries_bytes = wrong_rollback_entry,
+    }));
+
+    const wrong_ack = try data_raft_batch.encode(std.testing.allocator, "docs", .{
+        .split_checkpoint = .{
+            .kind = .source_ack,
+            .source_group_id = 221,
+            .destination_group_id = 223,
+            .delta_sequence = 0,
+        },
+    });
+    defer std.testing.allocator.free(wrong_ack);
+    const wrong_ack_entry = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = wrong_ack },
+    });
+    defer std.testing.allocator.free(wrong_ack_entry);
+    try std.testing.expectError(error.ConflictingSplitTransition, store.snapshotBuilder().applyBatch(.{
+        .group_id = 221,
+        .commit_index = 4,
+        .entries_bytes = wrong_ack_entry,
+    }));
+
+    const state = (try store.currentSplitState(std.testing.allocator, 221)) orelse return error.MissingSplitState;
+    defer shard_state_store.freeSplitState(std.testing.allocator, state);
+    try std.testing.expectEqual(shard_mod.SplitPhase.splitting, state.phase);
+    try std.testing.expectEqual(@as(u64, 222), state.new_shard_id);
 }
 
 test "data raft apply store seeds pre-raft snapshots once at reserved index zero" {

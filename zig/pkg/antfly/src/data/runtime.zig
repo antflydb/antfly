@@ -69,6 +69,113 @@ fn decodeSplitDeltaDocumentKeyAlloc(alloc: std.mem.Allocator, internal_key: []co
     return try alloc.dupe(u8, logical_key[sep + 1 ..]);
 }
 
+const ReplicatedSplitTransitionPlan = enum { propose, idempotent };
+
+fn planReplicatedSplitTransition(
+    state: ?antfly.data.storage.shard_state_store.AppliedSplitState,
+    destination_group_id: u64,
+    kind: antfly.db.types.SplitTransitionMutation.Kind,
+    split_key: []const u8,
+) !ReplicatedSplitTransitionPlan {
+    const current = state orelse return switch (kind) {
+        .prepare => .propose,
+        .start => error.SplitInProgress,
+        .finalize, .rollback => .idempotent,
+    };
+
+    switch (kind) {
+        .prepare => switch (current.phase) {
+            .none => return .propose,
+            .rolling_back => return error.SplitInProgress,
+            .prepare, .splitting, .finalizing => {
+                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, destination_group_id, split_key);
+                return .idempotent;
+            },
+        },
+        .start => switch (current.phase) {
+            .prepare => {
+                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, destination_group_id, split_key);
+                return .propose;
+            },
+            .splitting, .finalizing => {
+                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, destination_group_id, split_key);
+                return .idempotent;
+            },
+            .none, .rolling_back => return error.SplitInProgress,
+        },
+        .finalize => switch (current.phase) {
+            .splitting, .finalizing => {
+                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, destination_group_id, split_key);
+                return .propose;
+            },
+            .none => return .idempotent,
+            .prepare, .rolling_back => return error.SplitInProgress,
+        },
+        .rollback => switch (current.phase) {
+            .prepare, .splitting, .finalizing, .rolling_back => {
+                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, destination_group_id, split_key);
+                return .propose;
+            },
+            .none => return .idempotent,
+        },
+    }
+}
+
+fn validateReplicatedSplitTransfer(
+    state: antfly.data.storage.shard_state_store.AppliedSplitState,
+    destination_group_id: u64,
+) !void {
+    try antfly.data.storage.shard_state_store.validateSplitIdentity(state, destination_group_id, null);
+    if (state.phase != .splitting and state.phase != .finalizing) return error.SplitInProgress;
+}
+
+fn validateReplicatedSplitObservation(
+    state: antfly.data.storage.shard_state_store.AppliedSplitState,
+    destination_group_id: u64,
+) !void {
+    if (state.phase == .none) return;
+    try antfly.data.storage.shard_state_store.validateSplitIdentity(state, destination_group_id, null);
+}
+
+test "data runtime replicated split policy is identity and phase aware" {
+    const State = antfly.data.storage.shard_state_store.AppliedSplitState;
+    var state = State{
+        .phase = .prepare,
+        .split_key = "doc:m",
+        .new_shard_id = 42,
+        .original_range_end = "doc:z",
+    };
+
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(null, 42, .prepare, "doc:m"));
+    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(null, 42, .start, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(null, 42, .finalize, ""));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(null, 42, .rollback, ""));
+
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(state, 42, .prepare, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 42, .start, "doc:m"));
+    try std.testing.expectError(error.ConflictingSplitTransition, planReplicatedSplitTransition(state, 43, .start, "doc:m"));
+    try std.testing.expectError(error.ConflictingSplitTransition, planReplicatedSplitTransition(state, 42, .start, "doc:n"));
+
+    state.phase = .splitting;
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(state, 42, .start, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 42, .finalize, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 42, .rollback, "doc:m"));
+    try std.testing.expectError(error.ConflictingSplitTransition, planReplicatedSplitTransition(state, 43, .finalize, "doc:m"));
+    try validateReplicatedSplitTransfer(state, 42);
+    try std.testing.expectError(error.ConflictingSplitTransition, validateReplicatedSplitTransfer(state, 43));
+
+    state.phase = .none;
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 43, .prepare, "doc:n"));
+    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(state, 42, .start, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(state, 42, .rollback, "doc:m"));
+    try std.testing.expectError(error.SplitInProgress, validateReplicatedSplitTransfer(state, 42));
+
+    state.phase = .rolling_back;
+    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(state, 42, .prepare, "doc:m"));
+    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(state, 42, .start, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 42, .rollback, "doc:m"));
+}
+
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
     bind_host: ?[]const u8 = null,
@@ -4499,8 +4606,13 @@ pub const DataServer = struct {
         defer self.alloc.free(source_root_dir);
         try self.ensureSplitSourceApplyStoreSeeded(source_root_dir, source_group_id);
         const source_store = self.localTransitionApplyStore() orelse return error.MissingSplitSourceStore;
+        const source_state = (try source_store.currentSplitState(self.alloc, source_group_id)) orelse return error.SplitInProgress;
+        defer antfly.data.storage.shard_state_store.freeSplitState(self.alloc, source_state);
+        try validateReplicatedSplitTransfer(source_state, destination_group_id);
+
         const handoff = try source_store.captureSplitHandoff(self.alloc, source_group_id);
         defer antfly.data.storage.shard_state_store.freeHandoff(self.alloc, handoff);
+        try validateReplicatedSplitTransfer(handoff.split_state, destination_group_id);
         const table_name = (try self.tableNameForLocalGroupAlloc(source_group_id)) orelse return error.UnknownGroup;
         defer self.alloc.free(table_name);
         const replication = try self.splitReplicationContext(source_group_id, destination_group_id);
@@ -4537,24 +4649,11 @@ pub const DataServer = struct {
         const source_state = try source_store.currentSplitState(self.alloc, source_group_id);
         defer if (source_state) |state| antfly.data.storage.shard_state_store.freeSplitState(self.alloc, state);
 
-        const effective_split_key = if (kind == .start and split_key.len == 0 and source_state != null)
+        const effective_split_key = if (kind != .prepare and split_key.len == 0 and source_state != null)
             source_state.?.split_key
         else
             split_key;
-        switch (kind) {
-            .prepare => if (source_state) |state| {
-                if (std.mem.eql(u8, state.split_key, effective_split_key) and
-                    state.new_shard_id == destination_group_id) return;
-                return error.ConflictingSplitTransition;
-            },
-            .start => if (source_state) |state| {
-                if (state.phase != .prepare) {
-                    if (std.mem.eql(u8, state.split_key, effective_split_key) and state.new_shard_id == destination_group_id) return;
-                    return error.ConflictingSplitTransition;
-                }
-            } else return error.SplitInProgress,
-            .finalize, .rollback => if (source_state == null) return,
-        }
+        if (try planReplicatedSplitTransition(source_state, destination_group_id, kind, effective_split_key) == .idempotent) return;
 
         const table_name = (try self.tableNameForLocalGroupAlloc(source_group_id)) orelse return error.UnknownGroup;
         defer self.alloc.free(table_name);
@@ -4579,6 +4678,7 @@ pub const DataServer = struct {
         defer self.alloc.free(table_name);
         const source_state = (try source_store.currentSplitState(self.alloc, source_group_id)) orelse return error.SplitInProgress;
         defer antfly.data.storage.shard_state_store.freeSplitState(self.alloc, source_state);
+        try validateReplicatedSplitTransfer(source_state, destination_group_id);
         const replication = try self.splitReplicationContext(source_group_id, destination_group_id);
         const source_seq = try source_store.currentSplitDeltaSequence(self.alloc, source_group_id);
         const source_ack = try self.splitProgressForSource(source_group_id, destination_group_id);
@@ -4773,6 +4873,7 @@ pub const DataServer = struct {
         const source_store = self.localTransitionApplyStore() orelse return error.MissingSplitSourceStore;
         const source_state = try source_store.currentSplitState(self.alloc, source_group_id);
         defer if (source_state) |state| antfly.data.storage.shard_state_store.freeSplitState(self.alloc, state);
+        if (source_state) |state| try validateReplicatedSplitObservation(state, destination_group_id);
         const acknowledgement = try source_store.currentSplitAcknowledgement(self.alloc, source_group_id);
         const bootstrapped = if (acknowledgement) |ack| ack.destination_group_id == destination_group_id else false;
         return antfly.data.storage.range_transition.deriveSplitStatus(

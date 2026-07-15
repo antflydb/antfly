@@ -112,7 +112,7 @@ fn validateConfiguredDestinationIdentityNamespace(expected: ?doc_identity.Namesp
 
 fn validateActiveSplitDestination(state: shard_state_store.AppliedSplitState, destination_group_id: u64) !void {
     if (state.phase == .none) return;
-    if (state.new_shard_id != destination_group_id) return error.ConflictingSplitTransition;
+    try shard_state_store.validateSplitIdentity(state, destination_group_id, null);
 }
 
 pub const MergeConfig = struct {
@@ -515,6 +515,9 @@ pub const SyncCoordinator = struct {
 
     pub fn reopenDestination(self: *SyncCoordinator) !void {
         if (self.dest.owned_db == null) return error.BorrowedSplitDestinationDb;
+        const source_state = try self.source.currentSplitState(self.alloc, self.source_group_id);
+        defer if (source_state) |state| shard_state_store.freeSplitState(self.alloc, state);
+        if (source_state) |state| try self.validateActiveState(state);
         self.dest.deinit();
         self.dest = try Destination.init(self.alloc, self.dest_cfg);
     }
@@ -620,14 +623,15 @@ pub const SyncCoordinator = struct {
     }
 
     pub fn status(self: *SyncCoordinator) !SplitSyncStatus {
+        const source_state = try self.source.currentSplitState(self.alloc, self.source_group_id);
+        defer if (source_state) |state| shard_state_store.freeSplitState(self.alloc, state);
+        if (source_state) |state| try self.validateActiveState(state);
+
         const bootstrap_marker = try self.dest.db.getSplitBootstrapMarker(self.alloc);
         const bootstrapped = if (bootstrap_marker) |marker|
             marker.source_group_id == self.source_group_id and marker.destination_group_id == self.dest_group_id
         else
             false;
-        const source_state = try self.source.currentSplitState(self.alloc, self.source_group_id);
-        defer if (source_state) |state| shard_state_store.freeSplitState(self.alloc, state);
-        if (source_state) |state| try self.validateActiveState(state);
         const source_phase = if (source_state) |state| state.phase else null;
         const source_seq = try self.source.currentSplitDeltaSequence(self.alloc, self.source_group_id);
         const dest_seq = try self.dest.appliedDeltaSequence(self.alloc);
@@ -651,7 +655,12 @@ pub const SyncCoordinator = struct {
     pub fn finalizeSource(self: *SyncCoordinator) !bool {
         const transition_status = try self.status();
         if (transition_status.phase != .cutover_ready) return false;
-        try self.applySourceControlEntry("finalize_split");
+        const source_state = (try self.source.currentSplitState(self.alloc, self.source_group_id)) orelse return false;
+        defer shard_state_store.freeSplitState(self.alloc, source_state);
+        try self.validateActiveState(source_state);
+        const op = try std.fmt.allocPrint(self.alloc, "finalize_split:{d}:{s}", .{ self.dest_group_id, source_state.split_key });
+        defer self.alloc.free(op);
+        try self.applySourceControlEntry(op);
         return true;
     }
 
@@ -661,7 +670,12 @@ pub const SyncCoordinator = struct {
             .prepare, .bootstrap_peer, .replay_deltas, .rolling_back => {},
             else => return false,
         }
-        try self.applySourceControlEntry("rollback_split");
+        const source_state = (try self.source.currentSplitState(self.alloc, self.source_group_id)) orelse return false;
+        defer shard_state_store.freeSplitState(self.alloc, source_state);
+        try self.validateActiveState(source_state);
+        const op = try std.fmt.allocPrint(self.alloc, "rollback_split:{d}:{s}", .{ self.dest_group_id, source_state.split_key });
+        defer self.alloc.free(op);
+        try self.applySourceControlEntry(op);
         return true;
     }
 
@@ -1802,6 +1816,7 @@ test "db split coordinator rejects mismatched active transition destination" {
         try std.testing.expectError(error.ConflictingSplitTransition, coord.finalizeSource());
         try std.testing.expectError(error.ConflictingSplitTransition, coord.rollbackSource());
         try std.testing.expectError(error.ConflictingSplitTransition, coord.syncOnce());
+        try std.testing.expectError(error.ConflictingSplitTransition, coord.reopenDestination());
     }
 
     try std.testing.expectError(error.ConflictingSplitTransition, SyncCoordinator.init(std.testing.allocator, .{
