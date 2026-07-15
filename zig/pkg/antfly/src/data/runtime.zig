@@ -17395,26 +17395,28 @@ test "data server wires configured HA executors into API server" {
         fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
     };
 
-    const nonce = platform_time.monotonicNs();
-    const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-log-{d}", .{nonce});
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const fixture_root_rel = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-ha-executors", .{tmp.sub_path});
+    defer alloc.free(fixture_root_rel);
+    const capture_fixture_root = try std.fs.path.resolve(alloc, &.{ cwd, fixture_root_rel });
+    defer alloc.free(capture_fixture_root);
+
+    const primary_log_raw = try std.fs.path.join(alloc, &.{ capture_fixture_root, "primary.log" });
     defer alloc.free(primary_log_raw);
     const primary_log = try alloc.dupeZ(u8, primary_log_raw);
     defer alloc.free(primary_log);
-    const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-slots-{d}", .{nonce});
+    const primary_slots_raw = try std.fs.path.join(alloc, &.{ capture_fixture_root, "primary-slots" });
     defer alloc.free(primary_slots_raw);
     const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
     defer alloc.free(primary_slots);
-    const restore_jobs_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-restore-jobs-{d}", .{nonce});
+    const restore_jobs_path = try std.fs.path.join(alloc, &.{ capture_fixture_root, "restore-jobs" });
     defer alloc.free(restore_jobs_path);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    const capture_fixture_root_rel = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-seed-capture-{d}", .{nonce});
-    defer alloc.free(capture_fixture_root_rel);
-    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
-    defer alloc.free(cwd);
-    const capture_fixture_root = try std.fs.path.resolve(alloc, &.{ cwd, capture_fixture_root_rel });
-    defer alloc.free(capture_fixture_root);
     const replica_root = try std.fs.path.join(alloc, &.{ capture_fixture_root, "replicas" });
     defer alloc.free(replica_root);
     const replica_db_path = try std.fs.path.join(alloc, &.{ replica_root, "group-1/table-db" });
