@@ -1864,6 +1864,7 @@ fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
         error.HAPromotedPrimarySlotsMissing,
         error.HAStandbyOwnershipRequired,
         error.HAStandbyOwnerMismatch,
+        error.HAStandbyStateChanged,
         error.PromotedLogMismatch,
         error.PromotedProgressMismatch,
         error.LsmRootWriterAlreadyOpen,
@@ -2947,10 +2948,14 @@ pub const DataServer = struct {
         defer self.ha_state_mutex.unlock();
         const ctx = self.ha_cfg.admin_context orelse return error.HAStandbyNotConfigured;
         const standby = ctx.standby orelse return error.HAStandbyNotConfigured;
-        return .{
-            .identity = standby.identity,
-            .requested_lsn = standby.nextReceiveLsn(),
+        _ = standby.promotedPrimaryHandoff() catch |err| switch (err) {
+            error.StandbyNotPromoted, error.PromotionNotApplied => return .{
+                .identity = standby.identity,
+                .requested_lsn = standby.nextReceiveLsn(),
+            },
+            else => return err,
         };
+        return error.HAStandbyStateChanged;
     }
 
     fn runHAStandbyReplicationRound(self: *DataServer) !void {
@@ -17575,6 +17580,7 @@ test "data server wires configured HA executors into API server" {
         .api_server_cfg = .{
             .restore_job_store_path = restore_jobs_path,
             .extension_package_store_dir = extension_store_root,
+            .admin_bearer_token = "runtime-secret-token",
         },
         .ha = .{
             .admin_context = .{
@@ -18035,7 +18041,7 @@ test "data server wires configured HA executors into API server" {
     try health.metricsWriter().writeMetrics(&writer);
     const metrics = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_runtime_configured 1\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_slot_count 3\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_slot_count 4\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_retention_retained_age_ns 0\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_retention_active_slots 0\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_retention_reseed_recommended 1\n") != null);
@@ -19158,7 +19164,7 @@ test "data server HA replication network wait leaves state mutex available" {
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            self.server.runHAStandbyReplicationRound() catch |err| {
+            self.server.runRound() catch |err| {
                 self.err = err;
             };
         }
@@ -19263,8 +19269,20 @@ test "data server HA replication network wait leaves state mutex available" {
 
     try std.testing.expect(mutex_available);
     try std.testing.expect(promotion_err == null);
-    const replication_err = replication_thread.err orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(error.HAStandbyStateChanged, replication_err);
+    try std.testing.expect(replication_thread.err == null);
+    try std.testing.expectEqual(@as(u64, 1), server.ha_standby_replication_failure_count.load(.acquire));
+
+    // A round that begins after the durable promotion but before runtime
+    // adoption must not issue another pull against the former primary.
+    try std.testing.expectError(
+        error.HAStandbyStateChanged,
+        server.replicateHAStandbyAvailable(
+            primary_internal.executor(),
+            "http://primary.internal.test",
+            "standby-a",
+            .{ .verify_upstream = false },
+        ),
+    );
 }
 
 test "data server promotion rewires live HTTP internal HA executor" {
@@ -19358,6 +19376,9 @@ test "data server promotion rewires live HTTP internal HA executor" {
 
     var server = DataServer.initFromLocalMetadataSources(alloc, .{
         .replica_root_dir = replica_root,
+        .api_server_cfg = .{
+            .admin_bearer_token = "runtime-secret-token",
+        },
         .ha = .{
             .admin_context = .{
                 .standby = if (standby) |*handle| handle else null,
@@ -19383,9 +19404,34 @@ test "data server promotion rewires live HTTP internal HA executor" {
     var before = try server.http_server.?.handle(.{
         .method = .GET,
         .uri = antfly.internal.routes.ha_replication_identify,
+        .authorization = "Bearer runtime-secret-token",
     });
     defer before.deinit(server.http_server.?.alloc);
     try std.testing.expectEqual(@as(u16, 404), before.status);
+
+    // The durable promotion can become visible between a replication round's
+    // adoption check and its fetch snapshot. The fetch must stop locally
+    // instead of pulling timeline-2 progress from the former timeline-1
+    // primary and converting its rejection into a fatal HTTP error.
+    const rejecting_executor = struct {
+        fn execute(
+            _: *anyopaque,
+            response_alloc: std.mem.Allocator,
+            _: antfly.common.http.HttpRequest,
+        ) anyerror!antfly.common.http.HttpResponse {
+            return .{
+                .status = 400,
+                .body = try response_alloc.dupe(u8, "ReplicationStartAheadOfPrimary"),
+            };
+        }
+    };
+    try std.testing.expectError(
+        error.HAStandbyStateChanged,
+        server.replicateHAStandbyAvailable(.{
+            .ptr = undefined,
+            .vtable = &.{ .execute = rejecting_executor.execute },
+        }, "http://former-primary.internal.test", "standby-a", .{ .verify_upstream = false }),
+    );
 
     try server.runHAStandbyReplicationRound();
     try std.testing.expect(standby == null);
@@ -19404,6 +19450,7 @@ test "data server promotion rewires live HTTP internal HA executor" {
     var write_check = try server.http_server.?.handle(.{
         .method = .POST,
         .uri = antfly.admin.routes.ha_write_check,
+        .authorization = "Bearer runtime-secret-token",
         .content_type = "application/json",
         .body = "{\"role\":\"standby\",\"expected_identity\":{\"cluster_id\":100,\"shard_id\":77,\"table_id\":7,\"timeline_id\":2,\"epoch\":2}}",
     });
@@ -19416,6 +19463,7 @@ test "data server promotion rewires live HTTP internal HA executor" {
     var owner_job_check = try server.http_server.?.handle(.{
         .method = .POST,
         .uri = antfly.admin.routes.ha_owner_job_check,
+        .authorization = "Bearer runtime-secret-token",
         .content_type = "application/json",
         .body = "{\"role\":\"standby\",\"kind\":\"retention_advance\",\"expected_identity\":{\"cluster_id\":100,\"shard_id\":77,\"table_id\":7,\"timeline_id\":2,\"epoch\":2}}",
     });
@@ -19427,9 +19475,11 @@ test "data server promotion rewires live HTTP internal HA executor" {
     var internal_resp = try server.http_server.?.handle(.{
         .method = .GET,
         .uri = antfly.internal.routes.ha_replication_identify,
+        .authorization = "Bearer runtime-secret-token",
     });
     defer internal_resp.deinit(server.http_server.?.alloc);
-    try std.testing.expectEqual(@as(u16, 403), internal_resp.status);
+    try std.testing.expectEqual(@as(u16, 200), internal_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, internal_resp.body, "\"timeline_id\":2") != null);
 }
 
 test "data server promotion open failure preserves retryable standby" {
