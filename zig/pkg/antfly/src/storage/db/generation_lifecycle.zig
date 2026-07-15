@@ -13,12 +13,36 @@ const fs_paths = @import("../../common/fs_paths.zig");
 const background_runtime = @import("../background_runtime.zig");
 
 const Allocator = std.mem.Allocator;
-const publication_marker_name = ".antfly-generation-publication-v1";
-const publication_marker_data = "antfly_generation_publication_v1\n";
+const publication_marker_name = ".antfly-generation-publication-v2";
+const publication_marker_tmp_name = ".antfly-generation-publication-v2.tmp";
+const max_publication_marker_bytes = 4096;
 const publication_lock_suffix = ".antfly-generation.lock";
 const preparation_lock_suffix = ".antfly-generation-prepare.lock";
 const retired_cleanup_lock_name = ".antfly-generation-cleanup.lock";
 const max_reconciled_paths = 8192;
+
+const PublicationPhase = enum {
+    prepared,
+    committed,
+};
+
+const PublicationMarker = struct {
+    version: u8 = 2,
+    phase: PublicationPhase,
+    retained_name: []const u8,
+    had_live_generation: bool,
+};
+
+const OwnedPublicationMarker = struct {
+    phase: PublicationPhase,
+    retained_name: []u8,
+    had_live_generation: bool,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.retained_name);
+        self.* = undefined;
+    }
+};
 
 fn publicationLockPathAlloc(alloc: Allocator, canonical_path: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}{s}", .{ canonical_path, publication_lock_suffix });
@@ -720,7 +744,6 @@ fn beginStagingGeneration(
     if (pathExists(io, staging_path)) return error.GenerationStagingCollision;
     try fs_paths.createDirPathPortable(io, staging_path);
     errdefer std.Io.Dir.cwd().deleteTree(io, staging_path) catch {};
-    try writePublicationMarker(alloc, io, staging_path);
     return .{
         .alloc = alloc,
         .manager = manager,
@@ -789,16 +812,20 @@ pub const StagedGeneration = struct {
         if (self.closed or self.published) return error.InvalidGenerationTransition;
         try self.manager.validateExclusive(self.transition_id, self.live_path);
 
-        if (!self.sealed) try self.seal();
-
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         if (!pathExists(io, self.staging_path)) return error.GenerationStagingMissing;
         const parent = std.fs.path.dirname(self.live_path) orelse if (std.fs.path.isAbsolute(self.live_path)) "/" else ".";
+        const had_live_generation = pathExists(io, self.live_path);
+        try writePublicationMarker(self.alloc, io, self.staging_path, .{
+            .phase = .prepared,
+            .retained_name = std.fs.path.basename(self.staging_path),
+            .had_live_generation = had_live_generation,
+        });
+        if (!self.sealed) try self.seal();
         try fs_paths.syncDirPortable(io, parent);
 
-        const had_live_generation = pathExists(io, self.live_path);
         if (had_live_generation) {
             if (!exchangeDirectoriesAtomicSentinel(self.live_path_z, self.staging_path_z)) {
                 return error.AtomicGenerationExchangeUnavailable;
@@ -831,6 +858,11 @@ pub const StagedGeneration = struct {
         defer io_impl.deinit();
         const io = io_impl.io();
         const parent = std.fs.path.dirname(self.live_path) orelse if (std.fs.path.isAbsolute(self.live_path)) "/" else ".";
+        try writePublicationMarker(self.alloc, io, self.live_path, .{
+            .phase = .committed,
+            .retained_name = std.fs.path.basename(self.staging_path),
+            .had_live_generation = self.had_live_generation,
+        });
         if (self.publication_outcome.? == .durable) {
             _ = clearPublicationMarker(self.alloc, io, self.live_path);
             if (self.had_live_generation) {
@@ -909,24 +941,55 @@ fn publicationMarkerPathAlloc(alloc: Allocator, root: []const u8) ![]u8 {
     return try std.fs.path.join(alloc, &.{ root, publication_marker_name });
 }
 
-fn writePublicationMarker(alloc: Allocator, io: std.Io, root: []const u8) !void {
-    const marker_path = try publicationMarkerPathAlloc(alloc, root);
-    defer alloc.free(marker_path);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = marker_path, .data = publication_marker_data });
+fn publicationMarkerTmpPathAlloc(alloc: Allocator, root: []const u8) ![]u8 {
+    return try std.fs.path.join(alloc, &.{ root, publication_marker_tmp_name });
 }
 
-fn hasPublicationMarker(alloc: Allocator, io: std.Io, root: []const u8) !bool {
+fn writePublicationMarker(alloc: Allocator, io: std.Io, root: []const u8, marker: PublicationMarker) !void {
+    const encoded = try std.json.Stringify.valueAlloc(alloc, marker, .{});
+    defer alloc.free(encoded);
+    if (encoded.len > max_publication_marker_bytes) return error.InvalidGenerationPublicationMarker;
     const marker_path = try publicationMarkerPathAlloc(alloc, root);
     defer alloc.free(marker_path);
-    const marker = std.Io.Dir.cwd().readFileAlloc(io, marker_path, alloc, .limited(publication_marker_data.len + 1)) catch |err| switch (err) {
+    const tmp_path = try publicationMarkerTmpPathAlloc(alloc, root);
+    defer alloc.free(tmp_path);
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    {
+        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
+        defer file.close(io);
+        var writer_buffer: [1024]u8 = undefined;
+        var writer = file.writer(io, &writer_buffer);
+        try writer.interface.writeAll(encoded);
+        try writer.end();
+        try file.sync(io);
+    }
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), marker_path, io);
+    try fs_paths.syncDirPortable(io, root);
+}
+
+fn readPublicationMarker(alloc: Allocator, io: std.Io, root: []const u8) !?OwnedPublicationMarker {
+    const marker_path = try publicationMarkerPathAlloc(alloc, root);
+    defer alloc.free(marker_path);
+    const encoded = std.Io.Dir.cwd().readFileAlloc(io, marker_path, alloc, .limited(max_publication_marker_bytes)) catch |err| switch (err) {
         // NotDir: the live root is a file (e.g. an Antfly Lite *.aflite
         // database), so a marker can never exist beneath it.
-        error.FileNotFound, error.NotDir => return false,
+        error.FileNotFound, error.NotDir => return null,
         else => return err,
     };
-    defer alloc.free(marker);
-    if (!std.mem.eql(u8, marker, publication_marker_data)) return error.InvalidGenerationPublicationMarker;
-    return true;
+    defer alloc.free(encoded);
+    var parsed = std.json.parseFromSlice(PublicationMarker, alloc, encoded, .{ .allocate = .alloc_always }) catch
+        return error.InvalidGenerationPublicationMarker;
+    defer parsed.deinit();
+    if (parsed.value.version != 2 or parsed.value.retained_name.len == 0 or
+        std.mem.indexOfAny(u8, parsed.value.retained_name, "/\\") != null)
+    {
+        return error.InvalidGenerationPublicationMarker;
+    }
+    return .{
+        .phase = parsed.value.phase,
+        .retained_name = try alloc.dupe(u8, parsed.value.retained_name),
+        .had_live_generation = parsed.value.had_live_generation,
+    };
 }
 
 fn clearPublicationMarker(alloc: Allocator, io: std.Io, root: []const u8) bool {
@@ -1051,6 +1114,50 @@ fn isGeneratedStageName(name: []const u8, prefix: []const u8) bool {
     return true;
 }
 
+fn retainedGenerationPathAlloc(
+    alloc: Allocator,
+    live_path: []const u8,
+    retained_name: []const u8,
+) ![]u8 {
+    const parent = std.fs.path.dirname(live_path) orelse if (std.fs.path.isAbsolute(live_path)) "/" else ".";
+    const live_name = std.fs.path.basename(live_path);
+    const stage_prefix = try std.fmt.allocPrint(alloc, "{s}.restore-stage-", .{live_name});
+    defer alloc.free(stage_prefix);
+    if (!isGeneratedStageName(retained_name, stage_prefix)) return error.InvalidGenerationPublicationMarker;
+    return try std.fs.path.join(alloc, &.{ parent, retained_name });
+}
+
+fn rollbackPreparedPublishedGeneration(
+    alloc: Allocator,
+    io: std.Io,
+    live_path: []const u8,
+    marker: OwnedPublicationMarker,
+) !void {
+    const retained_path = try retainedGenerationPathAlloc(alloc, live_path, marker.retained_name);
+    defer alloc.free(retained_path);
+    const parent = std.fs.path.dirname(live_path) orelse if (std.fs.path.isAbsolute(live_path)) "/" else ".";
+
+    if (marker.had_live_generation) {
+        if (!pathExists(io, retained_path)) return error.GenerationRollbackRootMissing;
+        var retained_marker = try readPublicationMarker(alloc, io, retained_path);
+        defer if (retained_marker) |*value| value.deinit(alloc);
+        if (retained_marker != null) return error.InvalidGenerationRollbackRoot;
+        const live_path_z = try alloc.dupeZ(u8, live_path);
+        defer alloc.free(live_path_z);
+        const retained_path_z = try alloc.dupeZ(u8, retained_path);
+        defer alloc.free(retained_path_z);
+        if (!exchangeDirectoriesAtomicSentinel(live_path_z, retained_path_z)) {
+            return error.AtomicGenerationExchangeUnavailable;
+        }
+    } else {
+        if (pathExists(io, retained_path)) return error.GenerationStagingCollision;
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), live_path, std.Io.Dir.cwd(), retained_path, io);
+    }
+    if (syncPublishedParent(io, parent) == .durability_uncertain) {
+        return error.GenerationRollbackDurabilityUncertain;
+    }
+}
+
 fn cleanupStagedGenerations(
     alloc: Allocator,
     io: std.Io,
@@ -1084,10 +1191,12 @@ fn cleanupStagedGenerations(
         const stale_path = try std.fs.path.join(alloc, &.{ parent, entry.name });
         var stale_path_owned = true;
         defer if (stale_path_owned) alloc.free(stale_path);
-        const has_marker = hasPublicationMarker(alloc, io, stale_path) catch |err| {
+        var marker = readPublicationMarker(alloc, io, stale_path) catch |err| {
             std.log.warn("stale generation marker validation deferred path={s} err={s}", .{ stale_path, @errorName(err) });
             continue;
         };
+        defer if (marker) |*value| value.deinit(alloc);
+        const has_marker = marker != null;
         if (scheduler != null) {
             std.log.info("scheduling stale generation cleanup path={s} marker={}", .{ stale_path, has_marker });
         } else {
@@ -1114,13 +1223,22 @@ fn reconcilePublishedGeneration(
     scheduler: ?CleanupScheduler,
     deferred_cleanup: *std.ArrayListUnmanaged([]u8),
 ) !bool {
-    if (try hasPublicationMarker(alloc, io, live_path)) {
+    var marker = try readPublicationMarker(alloc, io, live_path);
+    defer if (marker) |*value| value.deinit(alloc);
+    if (marker) |value| {
         const parent = std.fs.path.dirname(live_path) orelse if (std.fs.path.isAbsolute(live_path)) "/" else ".";
-        if (builtin.is_test and test_fail_reconciliation_sync) {
-            test_fail_reconciliation_sync = false;
-            return error.GenerationDurabilityUncertain;
+        switch (value.phase) {
+            .prepared => try rollbackPreparedPublishedGeneration(alloc, io, live_path, value),
+            .committed => {
+                const retained_path = try retainedGenerationPathAlloc(alloc, live_path, value.retained_name);
+                defer alloc.free(retained_path);
+                if (builtin.is_test and test_fail_reconciliation_sync) {
+                    test_fail_reconciliation_sync = false;
+                    return error.GenerationDurabilityUncertain;
+                }
+                fs_paths.syncDirPortable(io, parent) catch return error.GenerationDurabilityUncertain;
+            },
         }
-        fs_paths.syncDirPortable(io, parent) catch return error.GenerationDurabilityUncertain;
     }
 
     cleanupStagedGenerations(alloc, io, live_path, scheduler, deferred_cleanup) catch |err| {
@@ -1623,6 +1741,106 @@ test "prepared generation publication rolls back before serving admission" {
     const restored = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(16));
     defer alloc.free(restored);
     try std.testing.expectEqualStrings("old", restored);
+}
+
+test "prepared generation reconciliation rolls back an exchanged candidate" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-crash-live", .{tmp.sub_path});
+    defer alloc.free(live_path);
+    const live_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
+    defer alloc.free(live_value_path);
+    try fs_paths.createDirPathPortable(std.testing.io, live_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = live_value_path, .data = "previous" });
+
+    var manager = Manager.init(alloc);
+    defer manager.deinit();
+    var transition = try manager.beginExclusive(live_path);
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+    const staged_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{staged.path()});
+    defer alloc.free(staged_value_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = staged_value_path, .data = "candidate" });
+
+    try std.testing.expectEqual(PublicationOutcome.durable, try staged.publishPrepared());
+    try std.testing.expect(try reconcilePublishedGenerationExclusive(alloc, std.testing.io, live_path, null));
+    staged.published = false;
+    staged.preserve_retired = false;
+    staged.had_live_generation = false;
+    staged.publication_outcome = null;
+
+    const restored = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(32));
+    defer alloc.free(restored);
+    try std.testing.expectEqualStrings("previous", restored);
+    try std.testing.expect(!pathExists(std.testing.io, staged.path()));
+}
+
+test "prepared first generation reconciliation removes an unvalidated candidate" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-first-live", .{tmp.sub_path});
+    defer alloc.free(live_path);
+
+    var manager = Manager.init(alloc);
+    defer manager.deinit();
+    var transition = try manager.beginExclusive(live_path);
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+    const staged_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{staged.path()});
+    defer alloc.free(staged_value_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = staged_value_path, .data = "candidate" });
+
+    try std.testing.expectEqual(PublicationOutcome.durable, try staged.publishPrepared());
+    try std.testing.expect(try reconcilePublishedGenerationExclusive(alloc, std.testing.io, live_path, null));
+    staged.published = false;
+    staged.preserve_retired = false;
+    staged.publication_outcome = null;
+
+    try std.testing.expect(!pathExists(std.testing.io, live_path));
+    try std.testing.expect(!pathExists(std.testing.io, staged.path()));
+}
+
+test "committed generation reconciliation preserves the validated candidate" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/committed-crash-live", .{tmp.sub_path});
+    defer alloc.free(live_path);
+    const live_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
+    defer alloc.free(live_value_path);
+    try fs_paths.createDirPathPortable(std.testing.io, live_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = live_value_path, .data = "previous" });
+
+    var manager = Manager.init(alloc);
+    defer manager.deinit();
+    var transition = try manager.beginExclusive(live_path);
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+    const staged_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{staged.path()});
+    defer alloc.free(staged_value_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = staged_value_path, .data = "candidate" });
+
+    try std.testing.expectEqual(PublicationOutcome.durable, try staged.publishPrepared());
+    try writePublicationMarker(alloc, std.testing.io, live_path, .{
+        .phase = .committed,
+        .retained_name = std.fs.path.basename(staged.path()),
+        .had_live_generation = true,
+    });
+    staged.publication_committed = true;
+    try std.testing.expect(try reconcilePublishedGenerationExclusive(alloc, std.testing.io, live_path, null));
+
+    const published = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(32));
+    defer alloc.free(published);
+    try std.testing.expectEqualStrings("candidate", published);
+    try std.testing.expect(!pathExists(std.testing.io, staged.path()));
 }
 
 test "published generation reports post-commit sync failure without returning an error" {

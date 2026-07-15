@@ -223,6 +223,7 @@ pub const RaftApplyStore = struct {
         store: *RaftApplyStore,
         previous: [batch_shard_count]std.AutoHashMapUnmanaged(u64, void),
         next_exact: [batch_shard_count]std.AutoHashMapUnmanaged(u64, void),
+        retire_candidates: [batch_shard_count]std.AutoHashMapUnmanaged(u64, void),
         active: bool = true,
 
         /// Commits exact placement only after the Raft host has reconciled.
@@ -234,7 +235,10 @@ pub const RaftApplyStore = struct {
                 const admitted_union = shard.active_groups;
                 shard.active_groups = self.next_exact[shard_index];
                 self.next_exact[shard_index] = admitted_union;
-                self.store.retireInactiveGroupsLocked(shard);
+                var candidates = self.retire_candidates[shard_index].keyIterator();
+                while (candidates.next()) |group_id| {
+                    self.store.closeRetiredGroupIfDrainedLocked(shard, group_id.*);
+                }
                 shard.mutex.unlock(io);
             }
             self.finish();
@@ -255,6 +259,7 @@ pub const RaftApplyStore = struct {
         fn finish(self: *@This()) void {
             for (&self.previous) |*groups| groups.deinit(self.store.alloc);
             for (&self.next_exact) |*groups| groups.deinit(self.store.alloc);
+            for (&self.retire_candidates) |*groups| groups.deinit(self.store.alloc);
             self.active = false;
             self.store.placement_transition_mutex.unlock();
         }
@@ -291,6 +296,7 @@ pub const RaftApplyStore = struct {
         }
 
         var previous = [_]std.AutoHashMapUnmanaged(u64, void){.empty} ** batch_shard_count;
+        errdefer for (&previous) |*groups| groups.deinit(self.alloc);
         for (&self.batch_shards, 0..) |*shard, shard_index| {
             shard.mutex.lockUncancelable(io);
             previous[shard_index] = shard.active_groups;
@@ -299,7 +305,60 @@ pub const RaftApplyStore = struct {
             shard.placement_filter_enabled = true;
             shard.mutex.unlock(io);
         }
-        return .{ .store = self, .previous = previous, .next_exact = next_exact };
+
+        // Once conservative admission is published, no new group outside the
+        // union can enter a shard. Build a deduplicated retirement set while
+        // holding only that shard's mutex. An allocation failure leaves the
+        // safe union admitted, exactly like an aborted host reconciliation.
+        var retire_candidates = [_]std.AutoHashMapUnmanaged(u64, void){.empty} ** batch_shard_count;
+        errdefer for (&retire_candidates) |*groups| groups.deinit(self.alloc);
+        for (&self.batch_shards, 0..) |*shard, shard_index| {
+            shard.mutex.lockUncancelable(io);
+            const upper_bound = std.math.add(
+                usize,
+                @intCast(shard.active_groups.count()),
+                std.math.add(usize, @intCast(shard.stores.count()), @intCast(shard.batches.count())) catch {
+                    shard.mutex.unlock(io);
+                    return error.OutOfMemory;
+                },
+            ) catch {
+                shard.mutex.unlock(io);
+                return error.OutOfMemory;
+            };
+            const candidate_capacity = std.math.cast(@TypeOf(shard.active_groups.count()), upper_bound) orelse {
+                shard.mutex.unlock(io);
+                return error.OutOfMemory;
+            };
+            retire_candidates[shard_index].ensureTotalCapacity(self.alloc, candidate_capacity) catch |err| {
+                shard.mutex.unlock(io);
+                return err;
+            };
+            var active = shard.active_groups.keyIterator();
+            while (active.next()) |group_id| {
+                if (!next_exact[shard_index].contains(group_id.*)) {
+                    retire_candidates[shard_index].putAssumeCapacity(group_id.*, {});
+                }
+            }
+            var stores = shard.stores.keyIterator();
+            while (stores.next()) |group_id| {
+                if (!next_exact[shard_index].contains(group_id.*)) {
+                    retire_candidates[shard_index].putAssumeCapacity(group_id.*, {});
+                }
+            }
+            var batches = shard.batches.keyIterator();
+            while (batches.next()) |group_id| {
+                if (!next_exact[shard_index].contains(group_id.*)) {
+                    retire_candidates[shard_index].putAssumeCapacity(group_id.*, {});
+                }
+            }
+            shard.mutex.unlock(io);
+        }
+        return .{
+            .store = self,
+            .previous = previous,
+            .next_exact = next_exact,
+            .retire_candidates = retire_candidates,
+        };
     }
 
     /// Convenience for initialization and tests without an external host
@@ -307,32 +366,6 @@ pub const RaftApplyStore = struct {
     pub fn retainActiveGroups(self: *RaftApplyStore, group_ids: []const u64) !void {
         var transition = try self.beginActiveGroupTransition(group_ids);
         transition.commit();
-    }
-
-    fn retireInactiveGroupsLocked(self: *RaftApplyStore, shard: *BatchShard) void {
-        // Remove one entry at a time after dropping each map iterator. This is
-        // allocation-free and topology changes are rare relative to applies.
-        while (true) {
-            var stale_group_id: ?u64 = null;
-            var stores = shard.stores.keyIterator();
-            while (stores.next()) |group_id| {
-                if (!shard.active_groups.contains(group_id.*) and !groupStorePinnedLocked(shard, group_id.*)) {
-                    stale_group_id = group_id.*;
-                    break;
-                }
-            }
-            if (stale_group_id == null) {
-                var batches = shard.batches.keyIterator();
-                while (batches.next()) |group_id| {
-                    if (!shard.active_groups.contains(group_id.*) and !groupStorePinnedLocked(shard, group_id.*)) {
-                        stale_group_id = group_id.*;
-                        break;
-                    }
-                }
-            }
-            const group_id = stale_group_id orelse break;
-            self.closeRetiredGroupIfDrainedLocked(shard, group_id);
-        }
     }
 
     fn cachedGroupStoreCount(self: *RaftApplyStore) usize {
@@ -2447,6 +2480,55 @@ test "data raft apply placement transition retains union on abort and retires wi
     try std.testing.expect(shard.active_groups.contains(1 + batch_shard_count));
     try std.testing.expect(!shard.stores.contains(1));
     shard.mutex.unlock(store.io_impl.io());
+}
+
+test "data raft apply placement transition retires high cardinality summaries in one pass" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/placement-transition-scale", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var store = try RaftApplyStore.init(failing.allocator(), .{ .root_dir = root });
+    defer store.deinit();
+
+    var group_ids: [2048]u64 = undefined;
+    for (&group_ids, 1..) |*group_id, value| {
+        group_id.* = value;
+        const shard = store.batchShard(group_id.*);
+        shard.mutex.lockUncancelable(store.io_impl.io());
+        shard.batches.put(store.alloc, group_id.*, .{
+            .commit_index = 0,
+            .entry_count = 0,
+            .normal_entry_count = 0,
+            .admin_entry_count = 0,
+            .last_entry_term = 0,
+            .last_entry_index = 0,
+        }) catch |err| {
+            shard.mutex.unlock(store.io_impl.io());
+            return err;
+        };
+        shard.mutex.unlock(store.io_impl.io());
+    }
+    try store.retainActiveGroups(&group_ids);
+
+    var transition = try store.beginActiveGroupTransition(&.{});
+    var candidate_count: usize = 0;
+    for (&transition.retire_candidates) |*candidates| candidate_count += @intCast(candidates.count());
+    try std.testing.expectEqual(group_ids.len, candidate_count);
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    transition.commit();
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+
+    for (&store.batch_shards) |*shard| {
+        shard.mutex.lockUncancelable(store.io_impl.io());
+        const remaining = shard.batches.count();
+        shard.mutex.unlock(store.io_impl.io());
+        try std.testing.expectEqual(@as(usize, 0), remaining);
+    }
 }
 
 test "data apply store replay is idempotent when applied watermark lags WAL state" {

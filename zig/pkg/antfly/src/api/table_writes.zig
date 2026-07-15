@@ -17032,6 +17032,7 @@ fn tableIdentityNamespaceForRangeId(
 }
 
 const RaftSnapshotCatalogContract = struct {
+    metadata_group_id: u64,
     table_id: u64,
     table_name: []u8,
     schema_json: []u8,
@@ -17048,6 +17049,7 @@ const RaftSnapshotCatalogContract = struct {
 
     fn publicationContract(self: *const @This()) metadata_api.CatalogPublicationContract {
         return .{
+            .metadata_group_id = self.metadata_group_id,
             .table_id = self.table_id,
             .table_name = self.table_name,
             .schema_json = self.schema_json,
@@ -17079,6 +17081,7 @@ fn captureRaftSnapshotCatalogContract(
     errdefer alloc.free(indexes_json);
     const owned_range = try metadata_table_manager.cloneRange(alloc, range.*);
     return .{
+        .metadata_group_id = snapshot.status.metadata_group_id,
         .table_id = expected_table_id,
         .table_name = table_name,
         .schema_json = schema_json,

@@ -98,11 +98,12 @@ uses an exact group read-cache admission fence. Table-wide drop, schema, index,
 and restore transitions wait for every group preparation and retain table-wide
 epochs.
 
-The install's catalog inputs form one explicit contract: table identity, table
-name, schema, index catalog, range topology, and document-identity namespace are
-captured after group admission. The snapshot's encoded range must match that
-catalog range. Staging owns only this compact contract, not the complete admin
-snapshot, so its memory cost is independent of cluster catalog size. After
+The install's catalog inputs form one explicit contract: metadata Raft group
+identity, table identity, table name, schema, index catalog, range topology,
+and document-identity namespace are captured after group admission. The
+snapshot's encoded range must match that catalog range. Staging owns only this
+compact contract, not the complete admin snapshot, so its memory cost is
+independent of cluster catalog size. After
 serving leases drain, the candidate is atomically exchanged into the filesystem
 but remains outside serving admission. The catalog source then performs a Raft
 linearizable read; followers forward ReadIndex to the metadata leader and wait
@@ -200,10 +201,14 @@ makes the new generation visible, publication returns either `durable` or
 admission bookkeeping in both cases. A post-commit sync failure must never enter
 the pre-commit abort or metadata-drop path. It is reported as committed with
 durability pending, while raft bootstrap remains inactive. Every staged
-candidate contains a publication marker that moves into the live root at
-commit. DB open reconciles that marker by syncing the parent namespace,
+candidate contains a durable two-phase publication record that moves into the
+live root during the namespace exchange. A `prepared` record names the exact
+retained sibling and causes startup to atomically restore that prior generation;
+this covers process death after exchange but before catalog validation. Catalog
+validation durably changes the record to `committed` before admission advances.
+DB open completes committed publication by syncing the parent namespace,
 submitting retained or abandoned sibling generations to the runtime cleanup
-lane, and clearing the marker before the root is admitted. Cleanup failures
+lane, and clearing the record before the root is admitted. Cleanup failures
 leave the generated sibling name as durable retry debt for a later exclusive
 transition or process reconciliation; they do not block read admission. Every
 open DB retains a shared generation lease and a shared filesystem publication

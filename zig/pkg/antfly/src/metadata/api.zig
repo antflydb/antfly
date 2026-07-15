@@ -162,6 +162,7 @@ pub const AdminSnapshot = struct {
 /// Metadata replicas compare this after a linearizable read so the network and
 /// allocation cost is independent of the cluster-wide catalog size.
 pub const CatalogPublicationContract = struct {
+    metadata_group_id: u64,
     table_id: u64,
     table_name: []const u8,
     schema_json: []const u8,
@@ -169,6 +170,7 @@ pub const CatalogPublicationContract = struct {
     range: table_manager.RangeRecord,
 
     pub fn matches(self: @This(), snapshot: *const AdminSnapshot) bool {
+        if (snapshot.status.metadata_group_id != self.metadata_group_id) return false;
         var table_match = false;
         for (snapshot.tables) |table| {
             if (table.table_id != self.table_id) continue;

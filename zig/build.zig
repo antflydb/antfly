@@ -3455,6 +3455,7 @@ pub fn build(b: *std.Build) void {
         "data raft snapshot staging blocks only the target group",
         "data raft apply store bounds and retires resource-managed group owners",
         "data raft apply placement transition retains union on abort and retires without allocation",
+        "data raft apply placement transition retires high cardinality summaries in one pass",
         "split bootstrap marker distinguishes reservation from completion",
         "group state range scan is allocation-failure safe",
         "shard state store persists split lifecycle and ownership",
@@ -4685,6 +4686,9 @@ pub fn build(b: *std.Build) void {
             "provisioned Raft snapshot install publishes a fenced group generation",
             "provisioned Raft snapshot install rejects a changed catalog contract",
             "prepared generation publication rolls back before serving admission",
+            "prepared generation reconciliation rolls back an exchanged candidate",
+            "prepared first generation reconciliation removes an unvalidated candidate",
+            "committed generation reconciliation preserves the validated candidate",
         },
     });
     const run_api_table_writes_production_regression_tests = b.addRunArtifact(api_table_writes_production_regression_tests);

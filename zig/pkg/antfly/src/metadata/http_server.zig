@@ -3104,6 +3104,7 @@ test "metadata http server serves status and filtered admin routes" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot_resp.body, "\"replication_source_statuses\"") != null);
 
     const publication_body = try std.json.Stringify.valueAlloc(std.testing.allocator, metadata_api.CatalogPublicationContract{
+        .metadata_group_id = 77,
         .table_id = 1,
         .table_name = "docs",
         .schema_json = "",
@@ -3118,7 +3119,24 @@ test "metadata http server serves status and filtered admin routes" {
     });
     defer publication_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 204), publication_resp.status);
+    const foreign_group_publication_body = try std.json.Stringify.valueAlloc(std.testing.allocator, metadata_api.CatalogPublicationContract{
+        .metadata_group_id = 78,
+        .table_id = 1,
+        .table_name = "docs",
+        .schema_json = "",
+        .indexes_json = "{}",
+        .range = .{ .group_id = 10, .table_id = 1, .start_key = "doc:a", .end_key = "doc:m" },
+    }, .{});
+    defer std.testing.allocator.free(foreign_group_publication_body);
+    var foreign_group_publication_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.internal_catalog_publication_check,
+        .body = foreign_group_publication_body,
+    });
+    defer foreign_group_publication_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), foreign_group_publication_resp.status);
     const stale_publication_body = try std.json.Stringify.valueAlloc(std.testing.allocator, metadata_api.CatalogPublicationContract{
+        .metadata_group_id = 77,
         .table_id = 1,
         .table_name = "docs",
         .schema_json = "",
