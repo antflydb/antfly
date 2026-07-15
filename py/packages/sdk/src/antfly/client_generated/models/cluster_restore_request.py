@@ -4,7 +4,6 @@ from collections.abc import Mapping
 from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
-from attrs import field as _attrs_field
 
 from ..models.cluster_restore_request_restore_mode import ClusterRestoreRequestRestoreMode
 from ..types import UNSET, Unset
@@ -20,26 +19,31 @@ class ClusterRestoreRequest:
              Example: cluster-backup-2025-01-15.
         location (str): Storage location where the backup is stored.
              Example: s3://mybucket/antfly-backups/cluster/2025-01-15.
+        connection (str): Required configured `external_io` connection with the `restore.read` capability.
         table_names (list[str] | Unset): Optional list of tables to restore. If omitted, all tables in the backup are
-            restored.
+            restored,
+            up to the cluster restore limit of 4096 tables. Larger backups must be restored
+            in explicit batches of at most 256 tables.
              Example: ['users', 'products'].
         restore_mode (ClusterRestoreRequestRestoreMode | Unset): How to handle existing tables:
             - `fail_if_exists`: Abort if any table already exists (default)
             - `skip_if_exists`: Skip existing tables, restore others
-            - `overwrite`: Drop and recreate existing tables
+            - `overwrite`: Atomically replace existing table generations after staging and validation
              Default: ClusterRestoreRequestRestoreMode.FAIL_IF_EXISTS. Example: skip_if_exists.
     """
 
     backup_id: str
     location: str
+    connection: str
     table_names: list[str] | Unset = UNSET
     restore_mode: ClusterRestoreRequestRestoreMode | Unset = ClusterRestoreRequestRestoreMode.FAIL_IF_EXISTS
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         backup_id = self.backup_id
 
         location = self.location
+
+        connection = self.connection
 
         table_names: list[str] | Unset = UNSET
         if not isinstance(self.table_names, Unset):
@@ -50,11 +54,12 @@ class ClusterRestoreRequest:
             restore_mode = self.restore_mode.value
 
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
+
         field_dict.update(
             {
                 "backup_id": backup_id,
                 "location": location,
+                "connection": connection,
             }
         )
         if table_names is not UNSET:
@@ -71,6 +76,8 @@ class ClusterRestoreRequest:
 
         location = d.pop("location")
 
+        connection = d.pop("connection")
+
         table_names = cast(list[str], d.pop("table_names", UNSET))
 
         _restore_mode = d.pop("restore_mode", UNSET)
@@ -83,25 +90,9 @@ class ClusterRestoreRequest:
         cluster_restore_request = cls(
             backup_id=backup_id,
             location=location,
+            connection=connection,
             table_names=table_names,
             restore_mode=restore_mode,
         )
 
-        cluster_restore_request.additional_properties = d
         return cluster_restore_request
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties

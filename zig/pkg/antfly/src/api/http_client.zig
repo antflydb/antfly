@@ -1408,6 +1408,17 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !BatchResponse {
+        return self.fetchGroupBatchWithTimeout(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupBatchWithTimeout(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !BatchResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -1423,12 +1434,16 @@ pub const ApiHttpClient = struct {
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
+            .timeout_ms = timeout_ms,
             .body = body,
         });
         defer resp.deinit(self.alloc);
         if (resp.status != 201) {
             if (resp.status == 409) return remoteGroupConflictError(resp.body);
+            if (resp.status == 404) return error.UnknownGroup;
             if (resp.status == 503) return error.LeaderUnavailable;
+            const preview = resp.body[0..@min(resp.body.len, 256)];
+            std.log.warn("internal group batch returned unexpected status={} uri={s} body={s}", .{ resp.status, uri, preview });
             return error.UnexpectedHttpStatus;
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -2008,6 +2023,7 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.GroupLeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -2247,6 +2263,7 @@ const EncodedTransitionAction = struct {
     allow_doc_identity_reassignment: bool = false,
     split_key: ?[]const u8 = null,
     source_range_end: ?[]const u8 = null,
+    destination_base_uri: ?[]const u8 = null,
 };
 
 fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.TransitionAction) ![]u8 {
@@ -2271,12 +2288,14 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
             .transition_id = op.transition_id,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
+            .destination_base_uri = op.destination_base_uri,
         },
         .catch_up_split_destination => |op| .{
             .kind = .catch_up_split_destination,
             .transition_id = op.transition_id,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
+            .destination_base_uri = op.destination_base_uri,
         },
         .finalize_split_source => |op| .{
             .kind = .finalize_split_source,
@@ -2449,7 +2468,7 @@ fn isDocIdentityNamespaceMismatchConflictMessage(body: []const u8) bool {
 
 fn remoteGroupConflictError(body: []const u8) anyerror {
     if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;
-    if (std.mem.eql(u8, body, "TopologyChanged")) return error.TopologyChanged;
+    if (std.mem.eql(u8, body, "TopologyChanged") or std.mem.eql(u8, body, "topology changed")) return error.TopologyChanged;
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
     if (std.mem.eql(u8, body, "repair cancelled")) return error.Canceled;
     return error.UnexpectedHttpStatus;
@@ -2573,6 +2592,7 @@ test "api http client preserves group doc identity conflicts" {
 
     conflict_executor.body = "topology changed";
     try std.testing.expectError(error.TopologyChanged, client.fetchGroupVectorWorker(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.TopologyChanged, client.fetchGroupBatch(base_uri, 7, "docs", "{}"));
 
     conflict_executor.status = 503;
     conflict_executor.body = "write unavailable";

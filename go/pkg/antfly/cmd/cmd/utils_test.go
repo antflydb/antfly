@@ -104,6 +104,33 @@ chains:
 	})
 }
 
+func TestValidateStorageConfigShapeRejectsRemovedTopLevelBackends(t *testing.T) {
+	require.Error(t, validateStorageConfigShape(map[string]any{
+		"engine": "local",
+		"local":  map[string]any{"base_dir": "antflydb"},
+		"data":   "local",
+	}))
+	require.NoError(t, validateStorageConfigShape(map[string]any{
+		"engine": "local",
+		"local": map[string]any{
+			"base_dir": "antflydb",
+			"data":     "local",
+			"metadata": "local",
+		},
+	}))
+	require.Error(t, validateStorageConfigShape(map[string]any{
+		"engine": "lite",
+		"lite":   map[string]any{"path": "data.aflite", "unknown": true},
+	}))
+	require.Error(t, validateStorageConfigShape(map[string]any{
+		"engine": "local",
+		"local": map[string]any{
+			"base_dir": "antflydb",
+			"s3":       map[string]any{"bucket": "bucket", "unknown": true},
+		},
+	}))
+}
+
 // TestParseConfigGenerators is the true integration test - it calls parseConfig() directly.
 // This test will FAIL on main (bug present) and PASS on the fix branch.
 func TestParseConfigGenerators(t *testing.T) {
@@ -174,8 +201,8 @@ func TestParseConfigDefaults(t *testing.T) {
 
 	// Viper-level defaults for storage backends (these keys don't map to struct
 	// fields via JSON tags, but are available via viper for other consumers).
-	require.Equal(t, "local", v.GetString("storage.keyvalue"))
-	require.Equal(t, "local", v.GetString("storage.metadatakv"))
+	require.Equal(t, "local", v.GetString("storage.local.data"))
+	require.Equal(t, "local", v.GetString("storage.local.metadata"))
 }
 
 func TestParseConfigSplitSettings(t *testing.T) {
@@ -355,7 +382,7 @@ func TestParseConfigCommandSpecificMetadataValidation(t *testing.T) {
 		require.Equal(t, defaultInferenceAPIURL, config.Inference.ApiUrl)
 	})
 
-	t.Run("swarm_does_not_require_user_metadata", func(t *testing.T) {
+	t.Run("standalone_does_not_require_user_metadata", func(t *testing.T) {
 		v := viper.New()
 		v.SetConfigType("yaml")
 		require.NoError(t, v.ReadConfig(strings.NewReader(`{}`)))
@@ -381,6 +408,25 @@ metadata:
 		})
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "invalid metadata node ID")
+	})
+
+	t.Run("lite_storage_does_not_receive_local_defaults", func(t *testing.T) {
+		v := viper.New()
+		v.SetConfigType("yaml")
+		require.NoError(t, v.ReadConfig(strings.NewReader(`
+deployment_mode: standalone
+storage:
+  engine: lite
+  lite:
+    path: ./data.antfly.aflite
+`)))
+
+		config, err := parseConfigWithOptions(v, parseConfigOptions{
+			RequireMetadata: false,
+		})
+		require.NoError(t, err)
+		require.Equal(t, common.StorageEngineLite, config.Storage.Engine)
+		require.Empty(t, config.Storage.Local.BaseDir)
 	})
 }
 

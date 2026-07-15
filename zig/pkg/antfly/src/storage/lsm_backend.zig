@@ -1391,6 +1391,7 @@ pub const Backend = struct {
     pub fn close(self: *Backend) void {
         self.closing.store(true, .release);
         self.background_executor.drain();
+        self.waitForGenerationReadersToDrain();
         self.releaseTrackedResourceUsage();
         recovery_mod.close(Backend, self);
     }
@@ -1400,6 +1401,16 @@ pub const Backend = struct {
         self.background_executor.drain();
         self.releaseTrackedResourceUsage();
         recovery_mod.abandon(Backend, self);
+    }
+
+    fn waitForGenerationReadersToDrain(self: *Backend) void {
+        while (true) {
+            const locked = runtime_mod.lockBackend(Backend, self);
+            const active_readers = self.active_readers;
+            runtime_mod.unlockBackend(Backend, self, locked);
+            if (active_readers == 0) return;
+            platform.time.yieldBriefly();
+        }
     }
 
     pub fn acquireRootLockState(self: *Backend, create_if_missing: bool) !void {
@@ -1587,6 +1598,9 @@ pub const Backend = struct {
     }
 
     pub fn snapshotWriteStats(self: *const Backend) WriteStats {
+        const mutable = @constCast(self);
+        const locked = runtime_mod.lockBackend(Backend, mutable);
+        defer runtime_mod.unlockBackend(Backend, mutable, locked);
         return self.write_stats;
     }
 
@@ -3312,7 +3326,10 @@ pub const Backend = struct {
 
         var durable_next_run_id: u64 = 0;
         var durable_runs = std.ArrayListUnmanaged(Run).empty;
-        defer durable_runs.deinit(self.allocator);
+        defer {
+            for (durable_runs.items) |*run| run.deinit(self.allocator);
+            durable_runs.deinit(self.allocator);
+        }
         var durable_obsolete = std.ArrayListUnmanaged(ObsoletePath).empty;
         defer {
             for (durable_obsolete.items) |*obsolete| obsolete.deinit(self.allocator);
@@ -12459,6 +12476,40 @@ test "lsm backend reuses mutable read snapshot until writes invalidate it" {
     try std.testing.expectEqualStrings("B", try read_c.get(.{ .name = "docs" }, "doc:b"));
     try std.testing.expect(backend.mutable_read_snapshot != null);
     try std.testing.expect(first_snapshot != backend.mutable_read_snapshot.?);
+}
+
+test "lsm backend close drains generation readers before teardown" {
+    const CloseState = struct {
+        backend: *Backend,
+        started: std.atomic.Value(bool) = .init(false),
+        finished: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            self.backend.close();
+            self.finished.store(true, .release);
+        }
+    };
+
+    var backend = Backend.init(std.testing.allocator, .{});
+    var read = try backend.beginRead();
+    var read_released = false;
+    var state = CloseState{ .backend = &backend };
+    var thread = try std.Thread.spawn(.{}, CloseState.run, .{&state});
+    var thread_joined = false;
+    defer if (!thread_joined) thread.join();
+    defer if (!read_released) read.abort();
+
+    while (!state.started.load(.acquire)) platform.time.yieldBriefly();
+    for (0..10) |_| platform.time.yieldBriefly();
+    try std.testing.expect(!state.finished.load(.acquire));
+    try std.testing.expectError(error.BackendClosing, backend.beginRead());
+
+    read.abort();
+    read_released = true;
+    thread.join();
+    thread_joined = true;
+    try std.testing.expect(state.finished.load(.acquire));
 }
 
 test "lsm backend resource manager accounts pinned mutable read snapshots" {

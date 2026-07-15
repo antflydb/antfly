@@ -1310,6 +1310,47 @@ func TestValidateUpdate_StorageClassImmutable(t *testing.T) {
 	}
 }
 
+func TestValidateUpdate_StorageEngineImmutable(t *testing.T) {
+	old := baseStandaloneCluster()
+	old.Spec.Storage.Engine = "local"
+
+	updated := old.DeepCopy()
+	updated.Spec.Storage.Engine = "lite"
+	updated.Spec.Storage.LiteFileName = "antfly.aflite"
+
+	err := updated.ValidateUpdate(old)
+	if err == nil || !strings.Contains(err.Error(), "spec.storage.engine") {
+		t.Fatalf("expected storage engine immutability error, got: %v", err)
+	}
+}
+
+func TestValidateUpdate_StorageEngineDefaultEqualsLocal(t *testing.T) {
+	old := baseStandaloneCluster()
+	old.Spec.Storage.Engine = ""
+
+	updated := old.DeepCopy()
+	updated.Spec.Storage.Engine = "local"
+
+	if err := updated.ValidateUpdate(old); err != nil {
+		t.Fatalf("expected default engine and local to be equivalent, got: %v", err)
+	}
+}
+
+func TestValidateUpdate_LiteFileNameImmutable(t *testing.T) {
+	old := baseStandaloneCluster()
+	old.Spec.Storage.Engine = "lite"
+	old.Spec.Storage.LiteFileName = ""
+
+	updated := old.DeepCopy()
+	updated.Spec.Storage.Engine = "lite"
+	updated.Spec.Storage.LiteFileName = "production.aflite"
+
+	err := updated.ValidateUpdate(old)
+	if err == nil || !strings.Contains(err.Error(), "spec.storage.liteFileName") {
+		t.Fatalf("expected Lite filename immutability error, got: %v", err)
+	}
+}
+
 func TestValidateUpdate_StorageSizeIncreaseAllowed(t *testing.T) {
 	old := baseCluster()
 	old.Spec.Storage.DataStorage = "1Gi"
@@ -1336,19 +1377,19 @@ func TestValidateUpdate_StorageSizeDecreaseRejected(t *testing.T) {
 	}
 }
 
-func TestValidateUpdate_SwarmStorageSizeDecreaseRejected(t *testing.T) {
-	old := baseSwarmCluster()
-	old.Spec.Storage.SwarmStorage = "2Gi"
+func TestValidateUpdate_StandaloneStorageSizeDecreaseRejected(t *testing.T) {
+	old := baseStandaloneCluster()
+	old.Spec.Storage.StandaloneStorage = "2Gi"
 
-	new := baseSwarmCluster()
-	new.Spec.Storage.SwarmStorage = "1Gi"
+	new := baseStandaloneCluster()
+	new.Spec.Storage.StandaloneStorage = "1Gi"
 
 	err := new.ValidateUpdate(old)
 	if err == nil {
-		t.Fatal("expected error when decreasing swarm storage size")
+		t.Fatal("expected error when decreasing standalone storage size")
 	}
-	if !strings.Contains(err.Error(), "swarmStorage") {
-		t.Fatalf("expected swarmStorage error, got: %v", err)
+	if !strings.Contains(err.Error(), "standaloneStorage") {
+		t.Fatalf("expected standaloneStorage error, got: %v", err)
 	}
 }
 
@@ -1383,7 +1424,7 @@ func TestValidateCreate_StorageAutoGrowValid(t *testing.T) {
 	}
 }
 
-func TestValidateCreate_ProductTierRequiresExplicitClusteredShape(t *testing.T) {
+func TestValidateCreate_ProductTierRequiresExplicitDistributedShape(t *testing.T) {
 	cluster := baseCluster()
 	cluster.Spec.ProductTier = &ProductTierSpec{
 		Name:      "pro",
@@ -1401,7 +1442,7 @@ func TestValidateCreate_ProductTierRequiresExplicitClusteredShape(t *testing.T) 
 	}
 }
 
-func TestValidateCreate_ProductTierValidClusteredShape(t *testing.T) {
+func TestValidateCreate_ProductTierValidDistributedShape(t *testing.T) {
 	cluster := baseCluster()
 	cluster.Spec.ProductTier = &ProductTierSpec{
 		Name:         "pro",
@@ -1641,19 +1682,19 @@ func TestValidateUpdate_PVCRetentionPolicyMutable(t *testing.T) {
 	}
 }
 
-func TestDefault_SwarmDefaults(t *testing.T) {
+func TestDefault_StandaloneDefaults(t *testing.T) {
 	cluster := &AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "swarm-cluster",
+			Name:      "standalone-cluster",
 			Namespace: "default",
 		},
 		Spec: AntflyClusterSpec{
-			Mode:  ClusterModeSwarm,
-			Image: "antfly:latest",
-			Swarm: &SwarmSpec{},
+			Mode:       ClusterModeStandalone,
+			Image:      "antfly:latest",
+			Standalone: &StandaloneSpec{},
 			Storage: StorageSpec{
-				StorageClass: "standard",
-				SwarmStorage: "1Gi",
+				StorageClass:      "standard",
+				StandaloneStorage: "1Gi",
 			},
 			Config: "{}",
 		},
@@ -1661,78 +1702,128 @@ func TestDefault_SwarmDefaults(t *testing.T) {
 
 	cluster.Default()
 
-	if cluster.Spec.Mode != ClusterModeSwarm {
-		t.Fatalf("expected swarm mode to remain set, got %q", cluster.Spec.Mode)
+	if cluster.Spec.Mode != ClusterModeStandalone {
+		t.Fatalf("expected standalone mode to remain set, got %q", cluster.Spec.Mode)
 	}
-	if cluster.Spec.Swarm.Replicas != 1 {
-		t.Fatalf("expected default swarm replicas=1, got %d", cluster.Spec.Swarm.Replicas)
+	if cluster.Spec.Storage.Engine != "local" || cluster.Spec.Storage.LiteFileName != "" {
+		t.Fatalf("expected local storage defaults without Lite-only fields, got engine=%q file=%q", cluster.Spec.Storage.Engine, cluster.Spec.Storage.LiteFileName)
 	}
-	if cluster.Spec.Swarm.NodeID != 1 {
-		t.Fatalf("expected default swarm nodeID=1, got %d", cluster.Spec.Swarm.NodeID)
+	if cluster.Spec.Standalone.Replicas != 1 {
+		t.Fatalf("expected default standalone replicas=1, got %d", cluster.Spec.Standalone.Replicas)
 	}
-	if cluster.Spec.Swarm.MetadataAPI.Port != 8080 {
-		t.Fatalf("expected default swarm metadata API port 8080, got %d", cluster.Spec.Swarm.MetadataAPI.Port)
+	if cluster.Spec.Standalone.NodeID != 1 {
+		t.Fatalf("expected default standalone nodeID=1, got %d", cluster.Spec.Standalone.NodeID)
 	}
-	if cluster.Spec.Swarm.MetadataRaft.Port != 9017 {
-		t.Fatalf("expected default swarm metadata raft port 9017, got %d", cluster.Spec.Swarm.MetadataRaft.Port)
+	if cluster.Spec.Standalone.MetadataAPI.Port != 8080 {
+		t.Fatalf("expected default standalone metadata API port 8080, got %d", cluster.Spec.Standalone.MetadataAPI.Port)
 	}
-	if cluster.Spec.Swarm.StoreAPI.Port != 12380 {
-		t.Fatalf("expected default swarm store API port 12380, got %d", cluster.Spec.Swarm.StoreAPI.Port)
+	if cluster.Spec.Standalone.MetadataRaft.Port != 9017 {
+		t.Fatalf("expected default standalone metadata raft port 9017, got %d", cluster.Spec.Standalone.MetadataRaft.Port)
 	}
-	if cluster.Spec.Swarm.StoreRaft.Port != 9021 {
-		t.Fatalf("expected default swarm store raft port 9021, got %d", cluster.Spec.Swarm.StoreRaft.Port)
+	if cluster.Spec.Standalone.StoreAPI.Port != 12380 {
+		t.Fatalf("expected default standalone store API port 12380, got %d", cluster.Spec.Standalone.StoreAPI.Port)
 	}
-	if cluster.Spec.Swarm.Health.Port != 4200 {
-		t.Fatalf("expected default swarm health port 4200, got %d", cluster.Spec.Swarm.Health.Port)
+	if cluster.Spec.Standalone.StoreRaft.Port != 9021 {
+		t.Fatalf("expected default standalone store raft port 9021, got %d", cluster.Spec.Standalone.StoreRaft.Port)
 	}
-	if cluster.Spec.Swarm.Inference == nil {
+	if cluster.Spec.Standalone.Health.Port != 4200 {
+		t.Fatalf("expected default standalone health port 4200, got %d", cluster.Spec.Standalone.Health.Port)
+	}
+	if cluster.Spec.Standalone.Inference == nil {
 		t.Fatal("expected default inference configuration to be populated")
 	}
-	if !cluster.Spec.Swarm.Inference.Enabled {
-		t.Fatal("expected inference to default enabled for swarm mode")
+	if !cluster.Spec.Standalone.Inference.Enabled {
+		t.Fatal("expected inference to default enabled for standalone mode")
 	}
-	if cluster.Spec.Swarm.Inference.APIURL != "http://0.0.0.0:11433" {
-		t.Fatalf("expected default inference API URL, got %q", cluster.Spec.Swarm.Inference.APIURL)
+	if cluster.Spec.Standalone.Inference.APIURL != "http://0.0.0.0:11433" {
+		t.Fatalf("expected default inference API URL, got %q", cluster.Spec.Standalone.Inference.APIURL)
 	}
 }
 
-func TestValidateCreate_ValidSwarm(t *testing.T) {
-	cluster := baseSwarmCluster()
+func TestDefault_StandaloneLiteDefaultsFileName(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.Storage.Engine = "lite"
+	cluster.Spec.Storage.LiteFileName = ""
+	cluster.Default()
+	if cluster.Spec.Storage.LiteFileName != "antfly.aflite" {
+		t.Fatalf("expected Lite filename default, got %q", cluster.Spec.Storage.LiteFileName)
+	}
+}
+
+func TestValidateCreate_ValidStandalone(t *testing.T) {
+	cluster := baseStandaloneCluster()
 
 	if err := cluster.ValidateCreate(); err != nil {
-		t.Fatalf("expected valid swarm cluster to pass validation, got: %v", err)
+		t.Fatalf("expected valid standalone cluster to pass validation, got: %v", err)
 	}
 }
 
-func TestValidateCreate_SwarmRequiresStorage(t *testing.T) {
-	cluster := baseSwarmCluster()
-	cluster.Spec.Storage.SwarmStorage = ""
+func TestValidateCreate_StandaloneRequiresStorage(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.Storage.StandaloneStorage = ""
 
 	err := cluster.ValidateCreate()
 	if err == nil {
-		t.Fatal("expected error when swarm storage is missing")
+		t.Fatal("expected error when standalone storage is missing")
 	}
-	if !strings.Contains(err.Error(), "spec.storage.swarmStorage") {
-		t.Fatalf("expected swarm storage validation error, got: %v", err)
+	if !strings.Contains(err.Error(), "spec.storage.standaloneStorage") {
+		t.Fatalf("expected standalone storage validation error, got: %v", err)
 	}
 }
 
-func TestValidateCreate_SwarmRejectsClusteredFields(t *testing.T) {
-	cluster := baseSwarmCluster()
+func TestValidateCreate_StandaloneAcceptsTypedLiteStorage(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.Storage.Engine = "lite"
+	cluster.Spec.Storage.LiteFileName = "data.aflite"
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected typed standalone Lite storage to pass admission, got: %v", err)
+	}
+}
+
+func TestValidateCreate_StandaloneRejectsUnsafeLiteFileName(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.Storage.Engine = "lite"
+	cluster.Spec.Storage.LiteFileName = "../data.aflite"
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "liteFileName") {
+		t.Fatalf("expected safe Lite basename validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_StandaloneLocalRejectsLiteFileName(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.Storage.Engine = "local"
+	cluster.Spec.Storage.LiteFileName = "data.aflite"
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "liteFileName") {
+		t.Fatalf("expected tagged storage validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_DistributedRejectsLiteStorage(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.Storage.Engine = "lite"
+	cluster.Spec.Storage.LiteFileName = "data.aflite"
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "spec.storage.engine") {
+		t.Fatalf("expected clustered Lite storage validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_StandaloneRejectsDistributedFields(t *testing.T) {
+	cluster := baseStandaloneCluster()
 	cluster.Spec.MetadataNodes.Replicas = 3
 
 	err := cluster.ValidateCreate()
 	if err == nil {
-		t.Fatal("expected error when clustered fields are set in swarm mode")
+		t.Fatal("expected error when clustered fields are set in standalone mode")
 	}
 	if !strings.Contains(err.Error(), "spec.metadataNodes.replicas") {
 		t.Fatalf("expected clustered field validation error, got: %v", err)
 	}
 }
 
-func TestValidateCreate_SwarmRejectsInvalidInferenceURL(t *testing.T) {
-	cluster := baseSwarmCluster()
-	cluster.Spec.Swarm.Inference = &SwarmInferenceSpec{
+func TestValidateCreate_StandaloneRejectsInvalidInferenceURL(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.Standalone.Inference = &StandaloneInferenceSpec{
 		Enabled: true,
 		APIURL:  "localhost:11433",
 	}
@@ -1741,7 +1832,7 @@ func TestValidateCreate_SwarmRejectsInvalidInferenceURL(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for invalid inference API URL")
 	}
-	if !strings.Contains(err.Error(), "spec.swarm.inference.apiURL") {
+	if !strings.Contains(err.Error(), "spec.standalone.inference.apiURL") {
 		t.Fatalf("expected inference URL validation error, got: %v", err)
 	}
 }
@@ -1772,8 +1863,8 @@ func TestValidateUpdate_ModeImmutable(t *testing.T) {
 	oldCluster := baseCluster()
 
 	newCluster := oldCluster.DeepCopy()
-	newCluster.Spec.Mode = ClusterModeSwarm
-	newCluster.Spec.Swarm = &SwarmSpec{
+	newCluster.Spec.Mode = ClusterModeStandalone
+	newCluster.Spec.Standalone = &StandaloneSpec{
 		Replicas:     1,
 		NodeID:       1,
 		MetadataAPI:  APISpec{Port: 8080},
@@ -1781,7 +1872,7 @@ func TestValidateUpdate_ModeImmutable(t *testing.T) {
 		StoreAPI:     APISpec{Port: 12380},
 		StoreRaft:    APISpec{Port: 9021},
 		Health:       APISpec{Port: 4200},
-		Inference: &SwarmInferenceSpec{
+		Inference: &StandaloneInferenceSpec{
 			Enabled: true,
 			APIURL:  "http://0.0.0.0:11433",
 		},
@@ -1789,13 +1880,13 @@ func TestValidateUpdate_ModeImmutable(t *testing.T) {
 	newCluster.Spec.MetadataNodes = MetadataNodesSpec{}
 	newCluster.Spec.DataNodes = DataNodesSpec{}
 	newCluster.Spec.Storage = StorageSpec{
-		StorageClass: "standard",
-		SwarmStorage: "1Gi",
+		StorageClass:      "standard",
+		StandaloneStorage: "1Gi",
 	}
 
 	err := newCluster.ValidateUpdate(oldCluster)
 	if err == nil {
-		t.Fatal("expected error when changing mode from Clustered to Swarm")
+		t.Fatal("expected error when changing mode from Distributed to Standalone")
 	}
 	if !strings.Contains(err.Error(), "spec.mode") {
 		t.Fatalf("expected immutable mode validation error, got: %v", err)
@@ -1803,7 +1894,7 @@ func TestValidateUpdate_ModeImmutable(t *testing.T) {
 }
 
 func TestValidateCreate_HighAvailabilityHotStandbyValid(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Admin: &HAAdminSpec{
@@ -1844,7 +1935,7 @@ func TestValidateCreate_HighAvailabilityHotStandbyValid(t *testing.T) {
 }
 
 func TestValidateCreate_HighAvailabilityAllowsEmptyDisabledConfig(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{}
 
 	if err := cluster.ValidateCreate(); err != nil {
@@ -1858,7 +1949,7 @@ func TestValidateCreate_HighAvailabilityAllowsEmptyDisabledConfig(t *testing.T) 
 }
 
 func TestValidateCreate_HighAvailabilityRejectsManagedConfigWithoutHotStandbyMode(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Standbys: []HAStandbySpec{{Name: "standby-a"}},
 		Admin: &HAAdminSpec{
@@ -1886,7 +1977,7 @@ func TestValidateCreate_HighAvailabilityRejectsManagedConfigWithoutHotStandbyMod
 }
 
 func TestValidateCreate_HighAvailabilityAllowsExecutableActionsWithoutEveryStandbyAdminURL(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Admin: &HAAdminSpec{
@@ -1913,7 +2004,7 @@ func TestValidateCreate_HighAvailabilityAllowsExecutableActionsWithoutEveryStand
 }
 
 func TestValidateCreate_HighAvailabilityRejectsAdminExecutionWithoutIdentity(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Admin: &HAAdminSpec{
@@ -1935,7 +2026,7 @@ func TestValidateCreate_HighAvailabilityRejectsAdminExecutionWithoutIdentity(t *
 }
 
 func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	backoffLimit := int32(-1)
 	timeoutSeconds := int64(0)
 	ttlSecondsAfterFinished := int32(-10)
@@ -1968,7 +2059,7 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 }
 
 func TestValidateCreate_HighAvailabilityRejectsPaddedAdminURLs(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Admin: &HAAdminSpec{
@@ -2010,7 +2101,7 @@ func TestValidateCreate_HighAvailabilityRejectsPaddedAdminURLs(t *testing.T) {
 }
 
 func TestValidateCreate_HighAvailabilityRejectsAdminURLsWithHiddenWhitespace(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Admin: &HAAdminSpec{
@@ -2052,7 +2143,7 @@ func TestValidateCreate_HighAvailabilityRejectsAdminURLsWithHiddenWhitespace(t *
 }
 
 func TestValidateCreate_HighAvailabilityRejectsInvalidAdminTokenEnvVar(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Admin: &HAAdminSpec{
@@ -2090,7 +2181,7 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminTokenEnvVar(t *testin
 }
 
 func TestValidateCreate_HighAvailabilityRejectsWhitespacePaddedIdentityFields(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Standbys: []HAStandbySpec{{
@@ -2132,7 +2223,7 @@ func TestValidateCreate_HighAvailabilityRejectsWhitespacePaddedIdentityFields(t 
 }
 
 func TestValidateCreate_HighAvailabilityRejectsInvalidIdentifiers(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Standbys: []HAStandbySpec{{
@@ -2174,7 +2265,7 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidIdentifiers(t *testing.T) 
 }
 
 func TestValidateCreate_HighAvailabilityRuntimeRequiresIdentityAndNodeID(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Runtime: &HARuntimeSpec{
@@ -2192,7 +2283,7 @@ func TestValidateCreate_HighAvailabilityRuntimeRequiresIdentityAndNodeID(t *test
 	}
 }
 
-func TestValidateCreate_HighAvailabilityRuntimeRequiresSwarmMode(t *testing.T) {
+func TestValidateCreate_HighAvailabilityRuntimeRequiresStandaloneMode(t *testing.T) {
 	cluster := baseCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
@@ -2210,15 +2301,15 @@ func TestValidateCreate_HighAvailabilityRuntimeRequiresSwarmMode(t *testing.T) {
 
 	err := cluster.ValidateCreate()
 	if err == nil {
-		t.Fatal("expected HA runtime configuration outside swarm mode to be rejected")
+		t.Fatal("expected HA runtime configuration outside standalone mode to be rejected")
 	}
-	if !strings.Contains(err.Error(), "runtime is only supported when spec.mode=Swarm") {
-		t.Fatalf("expected HA runtime swarm-mode validation error, got: %v", err)
+	if !strings.Contains(err.Error(), "runtime is only supported when spec.mode=Standalone") {
+		t.Fatalf("expected HA runtime standalone-mode validation error, got: %v", err)
 	}
 }
 
 func TestValidateCreate_HighAvailabilityRuntimeNodeIDMustMatchRoleIdentity(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Identity: &HAReplicationIdentitySpec{
@@ -2258,7 +2349,7 @@ func TestValidateCreate_HighAvailabilityRuntimeNodeIDMustMatchRoleIdentity(t *te
 }
 
 func TestValidateCreate_HighAvailabilityRejectsWhitespaceFormerPrimaryLogPath(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Identity: &HAReplicationIdentitySpec{
@@ -2284,7 +2375,7 @@ func TestValidateCreate_HighAvailabilityRejectsWhitespaceFormerPrimaryLogPath(t 
 }
 
 func TestValidateCreate_HighAvailabilityRejectsPaddedRuntimePaths(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Identity: &HAReplicationIdentitySpec{
@@ -2345,7 +2436,7 @@ func TestValidateCreate_HighAvailabilityRejectsPaddedRuntimePaths(t *testing.T) 
 }
 
 func TestValidateCreate_HighAvailabilityRejectsRelativeOrNonNormalizedRuntimePaths(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Identity: &HAReplicationIdentitySpec{
@@ -2406,7 +2497,7 @@ func TestValidateCreate_HighAvailabilityRejectsRelativeOrNonNormalizedRuntimePat
 }
 
 func TestValidateCreate_HighAvailabilityRejectsInvalidRuntimeAdminTokenEnvVar(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Identity: &HAReplicationIdentitySpec{
@@ -2441,7 +2532,7 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidRuntimeAdminTokenEnvVar(t 
 }
 
 func TestValidateCreate_HighAvailabilityRuntimeAdminTokenRequiresPodEnvSource(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Identity: &HAReplicationIdentitySpec{
@@ -2461,22 +2552,22 @@ func TestValidateCreate_HighAvailabilityRuntimeAdminTokenRequiresPodEnvSource(t 
 	if err == nil {
 		t.Fatal("expected runtime admin token without pod env source to be rejected")
 	}
-	if !strings.Contains(err.Error(), "adminTokenSecretRef or spec.swarm.envFrom") {
+	if !strings.Contains(err.Error(), "adminTokenSecretRef or spec.standalone.envFrom") {
 		t.Fatalf("expected runtime admin token source validation error, got: %v", err)
 	}
 
-	cluster.Spec.Swarm.EnvFrom = []corev1.EnvFromSource{{
+	cluster.Spec.Standalone.EnvFrom = []corev1.EnvFromSource{{
 		SecretRef: &corev1.SecretEnvSource{
 			LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
 		},
 	}}
 	if err := cluster.ValidateCreate(); err != nil {
-		t.Fatalf("expected runtime admin token to accept spec.swarm.envFrom token source, got: %v", err)
+		t.Fatalf("expected runtime admin token to accept spec.standalone.envFrom token source, got: %v", err)
 	}
 }
 
 func TestValidateCreate_HighAvailabilityRuntimeAdminTokenAcceptsSecretRef(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Identity: &HAReplicationIdentitySpec{
@@ -2580,7 +2671,7 @@ func TestValidateCreate_HighAvailabilityRuntimeAdminTokenAcceptsSecretRef(t *tes
 }
 
 func TestValidateCreate_HighAvailabilityRejectsInvalidStandbyRuntimeReplicationSource(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Identity: &HAReplicationIdentitySpec{
@@ -2628,7 +2719,7 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidStandbyRuntimeReplicationS
 }
 
 func TestValidateCreate_HighAvailabilityRejectsAutomaticFailoverWithoutDesiredStandbyAdminURL(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Admin: &HAAdminSpec{
@@ -2664,7 +2755,7 @@ func TestValidateCreate_HighAvailabilityRejectsAutomaticFailoverWithoutDesiredSt
 }
 
 func TestValidateCreate_HighAvailabilityRejectsInvalidRouteSelector(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Standbys: []HAStandbySpec{{
@@ -2685,7 +2776,7 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidRouteSelector(t *testing.T
 }
 
 func TestValidateCreate_HighAvailabilityRequiresFencingForAutomaticFailover(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Admin: &HAAdminSpec{
@@ -2720,7 +2811,7 @@ func TestValidateCreate_HighAvailabilityRequiresFencingForAutomaticFailover(t *t
 
 func TestValidateCreate_HighAvailabilityRejectsAutomaticFailoverWithoutRouteSelector(t *testing.T) {
 	disabled := false
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Admin: &HAAdminSpec{
@@ -2757,7 +2848,7 @@ func TestValidateCreate_HighAvailabilityRejectsAutomaticFailoverWithoutRouteSele
 }
 
 func TestValidateCreate_HighAvailabilityRejectsAutomaticFailoverWithoutExecutionPrerequisites(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Standbys: []HAStandbySpec{
@@ -2780,7 +2871,7 @@ func TestValidateCreate_HighAvailabilityRejectsAutomaticFailoverWithoutExecution
 }
 
 func TestValidateCreate_HighAvailabilityRejectsUnsupportedAutomaticFencingAuthority(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Admin: &HAAdminSpec{
@@ -2814,7 +2905,7 @@ func TestValidateCreate_HighAvailabilityRejectsUnsupportedAutomaticFencingAuthor
 }
 
 func TestValidateCreate_HighAvailabilityAllowsDefaultAsyncSyncPolicy(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Standbys: []HAStandbySpec{
@@ -2833,7 +2924,7 @@ func TestValidateCreate_HighAvailabilityAllowsDefaultAsyncSyncPolicy(t *testing.
 }
 
 func TestValidateCreate_HighAvailabilityRejectsAsyncSyncOnlyFields(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Standbys: []HAStandbySpec{
@@ -2865,7 +2956,7 @@ func TestValidateCreate_HighAvailabilityRejectsAsyncSyncOnlyFields(t *testing.T)
 }
 
 func TestValidateCreate_HighAvailabilitySyncStandbysMustBeDeclared(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Standbys: []HAStandbySpec{
@@ -2890,7 +2981,7 @@ func TestValidateCreate_HighAvailabilitySyncStandbysMustBeDeclared(t *testing.T)
 
 func TestValidateCreate_HighAvailabilitySyncStandbysMustBeDesired(t *testing.T) {
 	disabled := false
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Standbys: []HAStandbySpec{
@@ -2914,7 +3005,7 @@ func TestValidateCreate_HighAvailabilitySyncStandbysMustBeDesired(t *testing.T) 
 }
 
 func TestValidateCreate_HighAvailabilitySyncAllRequiresNoExplicitRequiredCount(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Standbys: []HAStandbySpec{
@@ -2943,7 +3034,7 @@ func TestValidateCreate_HighAvailabilitySyncAllRequiresNoExplicitRequiredCount(t
 }
 
 func TestValidateCreate_HighAvailabilityRejectsDuplicateSlotIdentities(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Standbys: []HAStandbySpec{
@@ -2962,7 +3053,7 @@ func TestValidateCreate_HighAvailabilityRejectsDuplicateSlotIdentities(t *testin
 }
 
 func TestValidateCreate_HighAvailabilityRejectsUnsatisfiableSyncCardinality(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Standbys: []HAStandbySpec{
@@ -2990,7 +3081,7 @@ func TestValidateCreate_HighAvailabilityRejectsUnsatisfiableSyncCardinality(t *t
 }
 
 func TestValidateCreate_HighAvailabilityRejectsAutomaticFailoverWithoutStandbys(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		AutomaticFailover: &HAAutomaticFailoverPolicy{
@@ -3009,7 +3100,7 @@ func TestValidateCreate_HighAvailabilityRejectsAutomaticFailoverWithoutStandbys(
 }
 
 func TestValidateCreate_HighAvailabilityRejectsIncompleteIdentity(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Standbys: []HAStandbySpec{
@@ -3034,7 +3125,7 @@ func TestValidateCreate_HighAvailabilityRejectsIncompleteIdentity(t *testing.T) 
 }
 
 func TestValidateCreate_HighAvailabilityRejectsIncompleteSeedPaths(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Standbys: []HAStandbySpec{{
@@ -3053,7 +3144,7 @@ func TestValidateCreate_HighAvailabilityRejectsIncompleteSeedPaths(t *testing.T)
 }
 
 func TestValidateCreate_HighAvailabilityRejectsPaddedSeedPaths(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Standbys: []HAStandbySpec{{
@@ -3078,7 +3169,7 @@ func TestValidateCreate_HighAvailabilityRejectsPaddedSeedPaths(t *testing.T) {
 }
 
 func TestValidateCreate_HighAvailabilityRejectsRelativeOrNonNormalizedSeedPaths(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Standbys: []HAStandbySpec{{
@@ -3103,7 +3194,7 @@ func TestValidateCreate_HighAvailabilityRejectsRelativeOrNonNormalizedSeedPaths(
 }
 
 func TestValidateCreate_HighAvailabilityRejectsArmedSlotDropForDesiredStandby(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Standbys: []HAStandbySpec{{
@@ -3122,7 +3213,7 @@ func TestValidateCreate_HighAvailabilityRejectsArmedSlotDropForDesiredStandby(t 
 }
 
 func TestValidateCreate_HighAvailabilityAdminJobPodSpecValidation(t *testing.T) {
-	cluster := baseSwarmCluster()
+	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Admin: &HAAdminSpec{
@@ -3182,16 +3273,16 @@ func baseCluster() *AntflyCluster {
 	}
 }
 
-func baseSwarmCluster() *AntflyCluster {
+func baseStandaloneCluster() *AntflyCluster {
 	return &AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-swarm-cluster",
+			Name:      "test-standalone-cluster",
 			Namespace: "default",
 		},
 		Spec: AntflyClusterSpec{
-			Mode:  ClusterModeSwarm,
+			Mode:  ClusterModeStandalone,
 			Image: "antfly:latest",
-			Swarm: &SwarmSpec{
+			Standalone: &StandaloneSpec{
 				Replicas:     1,
 				NodeID:       1,
 				Resources:    ResourceSpec{CPU: "500m", Memory: "1Gi"},
@@ -3200,14 +3291,14 @@ func baseSwarmCluster() *AntflyCluster {
 				StoreAPI:     APISpec{Port: 12380},
 				StoreRaft:    APISpec{Port: 9021},
 				Health:       APISpec{Port: 4200},
-				Inference: &SwarmInferenceSpec{
+				Inference: &StandaloneInferenceSpec{
 					Enabled: true,
 					APIURL:  "http://0.0.0.0:11433",
 				},
 			},
 			Storage: StorageSpec{
-				StorageClass: "standard",
-				SwarmStorage: "1Gi",
+				StorageClass:      "standard",
+				StandaloneStorage: "1Gi",
 			},
 			Config: "{}",
 		},

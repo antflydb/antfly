@@ -1,0 +1,122 @@
+# Go SDK CI workflow
+# Validates the supported pure-Go client without building the deprecated Go server.
+
+name: Go SDK Tests
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "go/pkg/sdk/**"
+      - "go/pkg/generating/**"
+      - "go/pkg/libaf/**"
+      - "specs/openapi/**"
+      - "scripts/join_public_openapi.py"
+      - "scripts/pyproject.toml"
+      - "scripts/uv.lock"
+      - "openapi.yaml"
+      - "Makefile"
+      - ".github/workflows/antfly-sdk-go.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "go/pkg/sdk/**"
+      - "go/pkg/generating/**"
+      - "go/pkg/libaf/**"
+      - "specs/openapi/**"
+      - "scripts/join_public_openapi.py"
+      - "scripts/pyproject.toml"
+      - "scripts/uv.lock"
+      - "openapi.yaml"
+      - "Makefile"
+      - ".github/workflows/antfly-sdk-go.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  GO_VERSION: "1.26.4"
+
+jobs:
+  sdk:
+    runs-on: arc-antfly-standard
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: |
+            go/pkg/sdk/go.sum
+            go/pkg/generating/go.sum
+            go/pkg/libaf/go.sum
+
+      - name: Install race detector toolchain
+        shell: bash
+        run: |
+          if command -v gcc >/dev/null 2>&1; then
+            exit 0
+          fi
+          sudo_cmd=""
+          if command -v sudo >/dev/null 2>&1; then
+            sudo_cmd="sudo"
+          fi
+          $sudo_cmd apt-get update
+          $sudo_cmd apt-get install --yes --no-install-recommends gcc libc6-dev
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Verify generated OpenAPI client
+        run: |
+          uv run --project scripts --locked python scripts/join_public_openapi.py openapi.yaml
+          (cd go/pkg/sdk && GOWORK=off go generate ./...)
+          status="$(git status --porcelain -- \
+            openapi.yaml \
+            go/pkg/sdk/oapi/client.gen.go \
+            go/pkg/sdk/admin/oapi/client.gen.go \
+            go/pkg/sdk/oapi/validate.go \
+            go/pkg/sdk/query/query.gen.go)"
+          if [ -n "$status" ]; then
+            echo "$status"
+            git diff -- \
+              openapi.yaml \
+              go/pkg/sdk/oapi/client.gen.go \
+              go/pkg/sdk/admin/oapi/client.gen.go \
+              go/pkg/sdk/oapi/validate.go \
+              go/pkg/sdk/query/query.gen.go
+            exit 1
+          fi
+
+      - name: Verify module tidiness
+        working-directory: go/pkg/sdk
+        run: |
+          GOWORK=off go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Vet
+        working-directory: go/pkg/sdk
+        run: GOWORK=off go vet ./...
+
+      - name: Test
+        working-directory: go/pkg/sdk
+        env:
+          CGO_ENABLED: "0"
+        run: GOWORK=off go test -count=1 ./...
+
+      - name: Test with race detector
+        working-directory: go/pkg/sdk
+        env:
+          # The race runtime is a CGO-backed build mode even though the SDK's
+          # normal test job deliberately verifies a pure-Go build above.
+          CGO_ENABLED: "1"
+        run: GOWORK=off go test -race -count=1 ./...

@@ -1204,7 +1204,7 @@ Status as of 2026-05-19:
   Default dynamic schema-less string fields now emit the same exact
   `field.keyword` companion as the no-schema mapper, which lets public
   structured term filters resolve through the full-text postings in provisioned
-  swarm tables instead of widening vector search. Dense and sparse native
+  standalone tables instead of widening vector search. Dense and sparse native
   constraint derivation also intersects `req.full_text` result doc sets before
   vector scoring, so the public hybrid guardrail's text + metadata + exclusion
   shape constrains HBC candidates rather than relying only on result
@@ -1639,10 +1639,10 @@ Status as of 2026-05-19:
   changes did not materially improve the pathological local DOCID setup: a
   10k deferred/full-text+sparse run with `--bulk-load` still spent about
   `86.9s` loading, including about `69.4s` in primary `store_write_ns`, while
-  sparse replay stayed around `140ms`. Public swarm guardrail comparisons show
+  sparse replay stayed around `140ms`. Public standalone guardrail comparisons show
   that this is not representative of the normal public write path: dense 100k
-  swarm loading took about `32.4s` to insert and `67.3s` through index
-  visibility, and schema-less hybrid 10k swarm loading took about `2.1s` to
+  standalone loading took about `32.4s` to insert and `67.3s` through index
+  visibility, and schema-less hybrid 10k standalone loading took about `2.1s` to
   insert and `8.4s` through index visibility. The next DOCID profiling step is
   therefore primary-store/direct-ingest instrumentation for the local benchmark
   path: record whether direct bulk append is used or why it falls back, split

@@ -66,31 +66,31 @@ func TestE2E_Sparse(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	// Start swarm with Antfly inference so the SPLADE model is loaded.
-	t.Log("Starting Antfly swarm with Antfly inference...")
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{})
-	defer swarm.Cleanup()
+	// Start standalone with Antfly inference so the SPLADE model is loaded.
+	t.Log("Starting Antfly standalone with Antfly inference...")
+	standalone := startAntflyStandaloneWithOptions(t, ctx, StandaloneOptions{})
+	defer standalone.Cleanup()
 
 	inferenceURL := GetInferenceURL()
-	require.NotEmpty(t, inferenceURL, "Antfly inference URL should be set after swarm start")
+	require.NotEmpty(t, inferenceURL, "Antfly inference URL should be set after standalone start")
 
 	t.Run("SparseSearch", func(t *testing.T) {
-		testSparseSearch(t, ctx, swarm, inferenceURL)
+		testSparseSearch(t, ctx, standalone, inferenceURL)
 	})
 
 	t.Run("HybridSearch", func(t *testing.T) {
-		testHybridSearch(t, ctx, swarm, inferenceURL)
+		testHybridSearch(t, ctx, standalone, inferenceURL)
 	})
 
 	t.Run("SparseImport", func(t *testing.T) {
-		testSparseImport(t, ctx, swarm, inferenceURL)
+		testSparseImport(t, ctx, standalone, inferenceURL)
 	})
 }
 
 // testSparseSearch creates a table with a sparse_v0 index, inserts documents,
 // waits for SPLADE enrichment, and verifies that sparse search returns
 // semantically relevant results.
-func testSparseSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, inferenceURL string) {
+func testSparseSearch(t *testing.T, ctx context.Context, standalone *StandaloneInstance, inferenceURL string) {
 	t.Helper()
 
 	tableName := "sparse_search_test"
@@ -117,14 +117,14 @@ func testSparseSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, i
 	require.NoError(t, err)
 
 	// -- Create table --
-	err = swarm.Client.CreateTable(ctx, tableName, antfly.CreateTableRequest{
+	err = standalone.Client.CreateTable(ctx, tableName, antfly.CreateTableRequest{
 		NumShards: 1,
 		Indexes: map[string]antfly.IndexConfig{
 			"sparse": sparseIndexConfig,
 		},
 	})
 	require.NoError(t, err, "Failed to create table with sparse index")
-	waitForShardsReady(t, ctx, swarm.Client, tableName, 30*time.Second)
+	waitForShardsReady(t, ctx, standalone.Client, tableName, 30*time.Second)
 	t.Log("Table created with sparse_v0 index")
 
 	// -- Insert documents --
@@ -151,7 +151,7 @@ func testSparseSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, i
 		},
 	}
 
-	_, err = swarm.Client.Batch(ctx, tableName, antfly.BatchRequest{
+	_, err = standalone.Client.Batch(ctx, tableName, antfly.BatchRequest{
 		Inserts:   docs,
 		SyncLevel: antfly.SyncLevelFullIndex,
 	})
@@ -159,10 +159,10 @@ func testSparseSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, i
 	t.Logf("Inserted %d documents", len(docs))
 
 	// -- Wait for sparse enrichment --
-	waitForSparseEmbeddings(t, ctx, swarm.Client, tableName, "sparse", len(docs), 5*time.Minute)
+	waitForSparseEmbeddings(t, ctx, standalone.Client, tableName, "sparse", len(docs), 5*time.Minute)
 
 	// -- Sparse search --
-	results, err := swarm.Client.Query(ctx, antfly.QueryRequest{
+	results, err := standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table:          tableName,
 		SemanticSearch: "What is machine learning?",
 		Indexes:        []string{"sparse"},
@@ -197,7 +197,7 @@ func testSparseSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, i
 // testHybridSearch creates a table with both dense (aknn_v0) and sparse
 // (sparse_v0) indexes to verify three-way hybrid search (BM25 + dense + sparse)
 // with RRF fusion.
-func testHybridSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, inferenceURL string) {
+func testHybridSearch(t *testing.T, ctx context.Context, standalone *StandaloneInstance, inferenceURL string) {
 	t.Helper()
 
 	tableName := "hybrid_search_test"
@@ -254,7 +254,7 @@ func testHybridSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, i
 	require.NoError(t, err)
 
 	// -- Create table with both indexes --
-	err = swarm.Client.CreateTable(ctx, tableName, antfly.CreateTableRequest{
+	err = standalone.Client.CreateTable(ctx, tableName, antfly.CreateTableRequest{
 		NumShards: 1,
 		Indexes: map[string]antfly.IndexConfig{
 			"dense":  denseIndexConfig,
@@ -262,7 +262,7 @@ func testHybridSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, i
 		},
 	})
 	require.NoError(t, err, "Failed to create table with hybrid indexes")
-	waitForShardsReady(t, ctx, swarm.Client, tableName, 30*time.Second)
+	waitForShardsReady(t, ctx, standalone.Client, tableName, 30*time.Second)
 	t.Log("Table created with dense + sparse indexes")
 
 	// -- Insert documents --
@@ -285,7 +285,7 @@ func testHybridSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, i
 		},
 	}
 
-	_, err = swarm.Client.Batch(ctx, tableName, antfly.BatchRequest{
+	_, err = standalone.Client.Batch(ctx, tableName, antfly.BatchRequest{
 		Inserts:   docs,
 		SyncLevel: antfly.SyncLevelFullIndex,
 	})
@@ -293,11 +293,11 @@ func testHybridSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, i
 	t.Logf("Inserted %d documents", len(docs))
 
 	// -- Wait for both dense and sparse enrichment --
-	waitForEmbeddings(t, ctx, swarm.Client, tableName, "dense", len(docs), 5*time.Minute)
-	waitForSparseEmbeddings(t, ctx, swarm.Client, tableName, "sparse", len(docs), 5*time.Minute)
+	waitForEmbeddings(t, ctx, standalone.Client, tableName, "dense", len(docs), 5*time.Minute)
+	waitForSparseEmbeddings(t, ctx, standalone.Client, tableName, "sparse", len(docs), 5*time.Minute)
 
 	// -- Hybrid search (dense + sparse via RRF) --
-	results, err := swarm.Client.Query(ctx, antfly.QueryRequest{
+	results, err := standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table:          tableName,
 		SemanticSearch: "How do search engines combine different retrieval methods?",
 		Indexes:        []string{"dense", "sparse"},
@@ -328,7 +328,7 @@ func testHybridSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, i
 
 // testSparseImport tests importing pre-computed sparse embeddings via the
 // _embeddings field, bypassing the SPLADE enrichment pipeline.
-func testSparseImport(t *testing.T, ctx context.Context, swarm *SwarmInstance, inferenceURL string) {
+func testSparseImport(t *testing.T, ctx context.Context, standalone *StandaloneInstance, inferenceURL string) {
 	t.Helper()
 
 	tableName := "sparse_import_test"
@@ -353,14 +353,14 @@ func testSparseImport(t *testing.T, ctx context.Context, swarm *SwarmInstance, i
 	})
 	require.NoError(t, err)
 
-	err = swarm.Client.CreateTable(ctx, tableName, antfly.CreateTableRequest{
+	err = standalone.Client.CreateTable(ctx, tableName, antfly.CreateTableRequest{
 		NumShards: 1,
 		Indexes: map[string]antfly.IndexConfig{
 			"sparse": sparseIndexConfig,
 		},
 	})
 	require.NoError(t, err, "Failed to create table for sparse import test")
-	waitForShardsReady(t, ctx, swarm.Client, tableName, 30*time.Second)
+	waitForShardsReady(t, ctx, standalone.Client, tableName, 30*time.Second)
 	t.Log("Table created for sparse import test")
 
 	// -- Insert documents with pre-computed sparse embeddings --
@@ -396,7 +396,7 @@ func testSparseImport(t *testing.T, ctx context.Context, swarm *SwarmInstance, i
 		},
 	}
 
-	_, err = swarm.Client.Batch(ctx, tableName, antfly.BatchRequest{
+	_, err = standalone.Client.Batch(ctx, tableName, antfly.BatchRequest{
 		Inserts:   docs,
 		SyncLevel: antfly.SyncLevelFullIndex,
 	})
@@ -404,11 +404,11 @@ func testSparseImport(t *testing.T, ctx context.Context, swarm *SwarmInstance, i
 	t.Logf("Inserted %d documents with pre-computed sparse embeddings", len(docs))
 
 	// Wait for the imported sparse embeddings to be indexed.
-	waitForSparseEmbeddings(t, ctx, swarm.Client, tableName, "sparse", len(docs), 3*time.Minute)
+	waitForSparseEmbeddings(t, ctx, standalone.Client, tableName, "sparse", len(docs), 3*time.Minute)
 
 	// -- Verify search works with imported embeddings --
 	// Use a text query (goes through SPLADE) to search against imported vectors.
-	results, err := swarm.Client.Query(ctx, antfly.QueryRequest{
+	results, err := standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table:          tableName,
 		SemanticSearch: "alpha topic first",
 		Indexes:        []string{"sparse"},

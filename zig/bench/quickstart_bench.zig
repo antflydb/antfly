@@ -45,7 +45,7 @@ const semantic_index_name = "semantic_idx";
 
 const BenchMode = enum {
     micro,
-    swarm_wiki,
+    standalone_wiki,
 };
 
 const PublicSyncLevel = enum {
@@ -72,7 +72,7 @@ const PublicSyncLevel = enum {
     }
 };
 
-const SwarmWikiConfig = struct {
+const StandaloneWikiConfig = struct {
     mode: BenchMode = .micro,
     dataset_path: []const u8 = "/Users/ajroetker/go/src/github.com/antflydb/antfly/wiki-articles-10k-v001.json",
     docs: usize = 10_000,
@@ -81,7 +81,7 @@ const SwarmWikiConfig = struct {
     dims: usize = 512,
     model: []const u8 = "antflydb/clipclap",
     models_dir: []const u8 = "/Users/ajroetker/.termite/models",
-    swarm_binary: []const u8 = "./zig-out/bin/antfly",
+    standalone_binary: []const u8 = "./zig-out/bin/antfly",
     bind_host: []const u8 = "127.0.0.1",
     bind_port: u16 = 0,
     health_port: u16 = 0,
@@ -736,8 +736,8 @@ fn printStats(s: Stats) void {
 pub fn main(init: std.process.Init) !void {
     const alloc = std.heap.c_allocator;
     const cfg = try parseQuickstartBenchArgs(init.minimal.args);
-    if (cfg.mode == .swarm_wiki) {
-        try runSwarmWikiBench(alloc, init.io, cfg);
+    if (cfg.mode == .standalone_wiki) {
+        try runStandaloneWikiBench(alloc, init.io, cfg);
         return;
     }
 
@@ -828,8 +828,8 @@ fn runMicroQuickstartBench(alloc: std.mem.Allocator) !void {
     print("    5K postings inverted read, 10K-doc 3-term BM25 WAND.\n", .{});
 }
 
-fn parseQuickstartBenchArgs(args_in: std.process.Args) !SwarmWikiConfig {
-    var cfg = SwarmWikiConfig{};
+fn parseQuickstartBenchArgs(args_in: std.process.Args) !StandaloneWikiConfig {
+    var cfg = StandaloneWikiConfig{};
     var args = std.process.Args.Iterator.init(args_in);
     _ = args.next() orelse return cfg;
     while (args.next()) |arg| {
@@ -837,8 +837,8 @@ fn parseQuickstartBenchArgs(args_in: std.process.Args) !SwarmWikiConfig {
             const raw = args.next() orelse return error.InvalidArgument;
             if (std.mem.eql(u8, raw, "micro")) {
                 cfg.mode = .micro;
-            } else if (std.mem.eql(u8, raw, "swarm-wiki")) {
-                cfg.mode = .swarm_wiki;
+            } else if (std.mem.eql(u8, raw, "standalone-wiki")) {
+                cfg.mode = .standalone_wiki;
             } else {
                 return error.InvalidArgument;
             }
@@ -857,8 +857,8 @@ fn parseQuickstartBenchArgs(args_in: std.process.Args) !SwarmWikiConfig {
             cfg.model = args.next() orelse return error.InvalidArgument;
         } else if (std.mem.eql(u8, arg, "--models-dir")) {
             cfg.models_dir = args.next() orelse return error.InvalidArgument;
-        } else if (std.mem.eql(u8, arg, "--swarm-binary")) {
-            cfg.swarm_binary = args.next() orelse return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--standalone-binary")) {
+            cfg.standalone_binary = args.next() orelse return error.InvalidArgument;
         } else if (std.mem.eql(u8, arg, "--host")) {
             cfg.bind_host = args.next() orelse return error.InvalidArgument;
         } else if (std.mem.eql(u8, arg, "--port")) {
@@ -882,7 +882,7 @@ fn parseQuickstartBenchArgs(args_in: std.process.Args) !SwarmWikiConfig {
     return cfg;
 }
 
-fn runSwarmWikiBench(alloc: std.mem.Allocator, io: std.Io, input_cfg: SwarmWikiConfig) !void {
+fn runStandaloneWikiBench(alloc: std.mem.Allocator, io: std.Io, input_cfg: StandaloneWikiConfig) !void {
     var cfg = input_cfg;
     if (cfg.docs == 0 or cfg.batch_size == 0 or cfg.dims == 0) return error.InvalidArgument;
 
@@ -897,11 +897,11 @@ fn runSwarmWikiBench(alloc: std.mem.Allocator, io: std.Io, input_cfg: SwarmWikiC
     const cwd = try std.process.currentPathAlloc(io, alloc);
     defer alloc.free(cwd);
 
-    var child = try spawnWikiSwarm(alloc, io, cwd, cfg, root_path[0..root_path.len]);
+    var child = try spawnWikiStandalone(alloc, io, cwd, cfg, root_path[0..root_path.len]);
     const child_pid = child.id orelse return error.UnexpectedProcessExit;
     var child_live = true;
     defer if (child_live) {
-        terminateWikiSwarm(io, &child);
+        terminateWikiStandalone(io, &child);
     };
 
     const base_uri = try std.fmt.allocPrint(alloc, "http://{s}:{d}/db/v1", .{ cfg.bind_host, cfg.bind_port });
@@ -924,7 +924,7 @@ fn runSwarmWikiBench(alloc: std.mem.Allocator, io: std.Io, input_cfg: SwarmWikiC
     const loaded = try loadWikiDataset(alloc, io, &client, base_uri, cfg, child_pid, health_uri, metrics_uri, status_uri);
     const load_ns = nanotime() - load_started;
     print(
-        "quickstart_wiki_swarm load complete dataset={s} docs={d} batch_size={d} sync_level={s} load_s={d:.2}\n",
+        "quickstart_wiki_standalone load complete dataset={s} docs={d} batch_size={d} sync_level={s} load_s={d:.2}\n",
         .{
             cfg.dataset_path,
             loaded,
@@ -942,7 +942,7 @@ fn runSwarmWikiBench(alloc: std.mem.Allocator, io: std.Io, input_cfg: SwarmWikiC
     const rss = sampleRssBytes(alloc, io, child_pid) catch 0;
 
     print(
-        "quickstart_wiki_swarm dataset={s} docs={d} batch_size={d} sync_level={s} dims={d} model={s} load_s={d:.2} index_wait_s={d:.2} query_count={d} avg_query_ms={d:.2} max_query_ms={d:.2} rss_mb={d:.2} visible={d} total_indexed={d} enrichment={d}/{d} replay={d}/{d} runtime_fresh={any}\n",
+        "quickstart_wiki_standalone dataset={s} docs={d} batch_size={d} sync_level={s} dims={d} model={s} load_s={d:.2} index_wait_s={d:.2} query_count={d} avg_query_ms={d:.2} max_query_ms={d:.2} rss_mb={d:.2} visible={d} total_indexed={d} enrichment={d}/{d} replay={d}/{d} runtime_fresh={any}\n",
         .{
             cfg.dataset_path,
             loaded,
@@ -967,20 +967,20 @@ fn runSwarmWikiBench(alloc: std.mem.Allocator, io: std.Io, input_cfg: SwarmWikiC
     );
 
     child_live = false;
-    terminateWikiSwarm(io, &child);
+    terminateWikiStandalone(io, &child);
 }
 
-fn terminateWikiSwarm(io: std.Io, child: *std.process.Child) void {
+fn terminateWikiStandalone(io: std.Io, child: *std.process.Child) void {
     const pid = child.id orelse return;
     std.posix.kill(pid, .TERM) catch {};
     _ = child.wait(io) catch {};
 }
 
-fn spawnWikiSwarm(
+fn spawnWikiStandalone(
     alloc: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
-    cfg: SwarmWikiConfig,
+    cfg: StandaloneWikiConfig,
     root_path: []const u8,
 ) !std.process.Child {
     const bind_port_arg = try std.fmt.allocPrint(alloc, "{d}", .{cfg.bind_port});
@@ -996,8 +996,8 @@ fn spawnWikiSwarm(
 
     return try std.process.spawn(io, .{
         .argv = &.{
-            cfg.swarm_binary,
-            "swarm",
+            cfg.standalone_binary,
+            "standalone",
             "--host",
             cfg.bind_host,
             "--port",
@@ -1026,7 +1026,7 @@ fn createWikiTableAndIndex(
     alloc: std.mem.Allocator,
     client: *WikiHttpClient,
     base_uri: []const u8,
-    cfg: SwarmWikiConfig,
+    cfg: StandaloneWikiConfig,
 ) !void {
     const table_body = "{\"num_shards\":1,\"description\":\"quickstart wiki antfly benchmark\"}";
     const table_path = try std.fmt.allocPrint(alloc, "/tables/{s}", .{table_name});
@@ -1055,7 +1055,7 @@ fn loadWikiDataset(
     io: std.Io,
     client: *WikiHttpClient,
     base_uri: []const u8,
-    cfg: SwarmWikiConfig,
+    cfg: StandaloneWikiConfig,
     pid: std.process.Child.Id,
     health_uri: []const u8,
     metrics_uri: []const u8,
@@ -1082,7 +1082,7 @@ fn loadWikiDataset(
         if (line.len == 0) continue;
 
         var parsed = std.json.parseFromSlice(WikiArticle, alloc, line, .{ .ignore_unknown_fields = true }) catch |err| {
-            print("quickstart_wiki_swarm skipping malformed line={d} err={s}\n", .{ loaded + 1, @errorName(err) });
+            print("quickstart_wiki_standalone skipping malformed line={d} err={s}\n", .{ loaded + 1, @errorName(err) });
             continue;
         };
         defer parsed.deinit();
@@ -1101,7 +1101,7 @@ fn loadWikiDataset(
             const rss = sampleRssBytes(alloc, io, pid) catch 0;
             const visibility = fetchWikiVisibility(alloc, base_uri) catch WikiVisibility{};
             print(
-                "quickstart_wiki_swarm load progress docs={d}/{d} rss_mb={d:.2} visible={d} indexed={d} enrichment={d}/{d} replay={d}/{d}\n",
+                "quickstart_wiki_standalone load progress docs={d}/{d} rss_mb={d:.2} visible={d} indexed={d} enrichment={d}/{d} replay={d}/{d}\n",
                 .{
                     loaded,
                     cfg.docs,
@@ -1165,7 +1165,7 @@ fn waitForWikiIndexReady(
         sleepMs(500);
     }
     print(
-        "quickstart_wiki_swarm index wait timeout visible={d} indexed={d} enrichment={d}/{d} enrichment_pending={d} enrichment_retrying={any} enrichment_failed={any} replay={d}/{d} catch_up={any} publish_pending={any} backfill_active={any} progress={d:.3}\n",
+        "quickstart_wiki_standalone index wait timeout visible={d} indexed={d} enrichment={d}/{d} enrichment_pending={d} enrichment_retrying={any} enrichment_failed={any} replay={d}/{d} catch_up={any} publish_pending={any} backfill_active={any} progress={d:.3}\n",
         .{
             last.visibleDocs(),
             last.total_indexed,
@@ -1240,7 +1240,7 @@ const WikiQueryStats = struct {
     }
 };
 
-fn runWikiQueries(alloc: std.mem.Allocator, client: *WikiHttpClient, base_uri: []const u8, cfg: SwarmWikiConfig) !WikiQueryStats {
+fn runWikiQueries(alloc: std.mem.Allocator, client: *WikiHttpClient, base_uri: []const u8, cfg: StandaloneWikiConfig) !WikiQueryStats {
     const queries = [_][]const u8{
         "history of science and mathematics",
         "ancient cities and architecture",
@@ -1257,7 +1257,7 @@ fn runWikiQueries(alloc: std.mem.Allocator, client: *WikiHttpClient, base_uri: [
             var resp = try client.postJson(uri, body);
             defer resp.deinit(alloc);
             if (resp.status != 200) {
-                print("quickstart_wiki_swarm query status={d} body={s}\n", .{ resp.status, resp.body });
+                print("quickstart_wiki_standalone query status={d} body={s}\n", .{ resp.status, resp.body });
                 return error.UnexpectedHttpStatus;
             }
             const elapsed = nanotime() - started;
@@ -1295,7 +1295,7 @@ fn postJsonExpect(
     for (expected_statuses) |status| {
         if (resp.status == status) return try alloc.dupe(u8, resp.body);
     }
-    print("quickstart_wiki_swarm unexpected status={d} uri={s} body={s}\n", .{ resp.status, uri, resp.body });
+    print("quickstart_wiki_standalone unexpected status={d} uri={s} body={s}\n", .{ resp.status, uri, resp.body });
     return error.UnexpectedHttpStatus;
 }
 

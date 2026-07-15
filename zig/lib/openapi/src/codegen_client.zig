@@ -229,6 +229,11 @@ pub const ClientGenerator = struct {
                 try sig.print(self.arena, ", body: {s}", .{bt});
             }
 
+            for (params.header) |p| {
+                const pname = try naming.zigFieldName(self.arena, p.name);
+                try sig.print(self.arena, ", {s}: {s}[]const u8", .{ pname, if (p.required) "" else "?" });
+            }
+
             // Query params struct
             if (params.query.len > 0) {
                 try sig.print(self.arena, ", params: {s}", .{try shared.queryParamsTypeName(self.arena, op_id)});
@@ -259,13 +264,28 @@ pub const ClientGenerator = struct {
             try self.w.line("defer self.allocator.free(json_body);", .{});
         }
 
+        if (params.header.len > 0) {
+            try self.w.line("var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;", .{});
+            try self.w.line("defer request_headers.deinit(self.allocator);", .{});
+            try self.w.line("if (self.auth_header) |header| try request_headers.append(self.allocator, header);", .{});
+            for (params.header) |p| {
+                const pname = try naming.zigFieldName(self.arena, p.name);
+                if (p.required) {
+                    try self.w.line("try request_headers.append(self.allocator, .{{ \"{s}\", {s} }});", .{ p.name, pname });
+                } else {
+                    try self.w.line("if ({s}) |value| try request_headers.append(self.allocator, .{{ \"{s}\", value }});", .{ pname, p.name });
+                }
+            }
+        }
+
         // Make request
+        const headers_expr = if (params.header.len > 0) "request_headers.items" else "self.authHeaders()";
         if (is_binary_request) {
-            try self.w.line("var resp = try self.http.{s}(url, .{{ .body = body, .headers = self.authHeaders() }});", .{http_method});
+            try self.w.line("var resp = try self.http.{s}(url, .{{ .body = body, .headers = {s} }});", .{ http_method, headers_expr });
         } else if (body_type != null) {
-            try self.w.line("var resp = try self.http.{s}(url, .{{ .json = json_body, .headers = self.authHeaders() }});", .{http_method});
+            try self.w.line("var resp = try self.http.{s}(url, .{{ .json = json_body, .headers = {s} }});", .{ http_method, headers_expr });
         } else {
-            try self.w.line("var resp = try self.http.{s}(url, .{{ .headers = self.authHeaders() }});", .{http_method});
+            try self.w.line("var resp = try self.http.{s}(url, .{{ .headers = {s} }});", .{ http_method, headers_expr });
         }
 
         // Return response

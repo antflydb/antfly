@@ -24,13 +24,13 @@ pub const ContentSecurityConfig = struct {
 pub const HTTPCredentialConfig = struct {
     /// Base URL prefix this credential applies to.
     base_url: ?[]const u8 = null,
-    /// HTTP headers to include. Supports keystore syntax (e.g., "${secret:token}").
+    /// HTTP headers to include. Supports secret-store references (e.g., "${secret:token}").
     headers: ?std.json.ArrayHashMap([]const u8) = null,
     /// Security overrides for this credential.
     security: ?ContentSecurityConfig = null,
 };
 
-/// Configuration for remote content fetching (remotePDF, remoteMedia, remoteText templates). Consolidates S3 credentials and security settings separate from backup storage. **Credential Resolution Order:** 1. Explicit `credentials="name"` parameter in template 2. First credential where `buckets` glob pattern matches URL's bucket 3. `default_s3` credential 4. Legacy fallback: `storage.s3` credentials (backward compatibility)
+/// Configuration for remote content fetching (remotePDF, remoteMedia, remoteText templates). Consolidates S3 credentials and security settings separate from backup storage. **Credential Resolution Order:** 1. Explicit `credentials="name"` parameter in template 2. First credential where `buckets` glob pattern matches URL's bucket 3. `default_s3` credential
 pub const RemoteContentConfig = struct {
     /// Global security defaults for remote content operations.
     security: ?ContentSecurityConfig = null,

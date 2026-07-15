@@ -29,7 +29,7 @@ import (
 var _ ShardIndex = (*LocalIndex)(nil)
 
 // LocalIndex implements ShardIndex by calling a shard directly in-process,
-// bypassing HTTP. Used in swarm mode where metadata and store share a process.
+// bypassing HTTP. Used in standalone mode where metadata and store share a process.
 type LocalIndex struct {
 	shard         types.ID
 	searcher      ShardSearcher
@@ -45,7 +45,7 @@ func (l *LocalIndex) WithFieldFilter(ff *FieldFilter) ShardIndex {
 }
 
 // MakeLocalIndexesForShards creates LocalIndex objects for each shard, using
-// the given ShardSearcher for direct in-process search (swarm mode).
+// the given ShardSearcher for direct in-process search (standalone mode).
 // The returned indexes have no FieldFilter; call WithFieldFilter on the
 // collection to set per-query field projections.
 func MakeLocalIndexesForShards(

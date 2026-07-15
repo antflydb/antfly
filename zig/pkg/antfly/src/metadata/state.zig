@@ -904,13 +904,15 @@ fn overlayRestoreReadiness(
         const range = findRangeForGroup(ranges, status.group_id) orelse continue;
         const table = findTableForId(tables, range.table_id) orelse continue;
         const restore_backup_id = restoreBackupIdForRange(range, table) orelse continue;
-        status.restore_pending = groupRestorePending(table.table_id, restore_backup_id, placement_intents, restore_progresses, status.group_id);
+        const restore_location = if (range.restore_location.len > 0) range.restore_location else table.restore_location;
+        status.restore_pending = groupRestorePending(table.table_id, restore_backup_id, restore_location, placement_intents, restore_progresses, status.group_id);
     }
 }
 
 fn groupRestorePending(
     table_id: u64,
     restore_backup_id: []const u8,
+    restore_location: []const u8,
     placement_intents: []const raft_reconciler.PlacementIntent,
     restore_progresses: []const metadata_table_manager.RestoreProgressRecord,
     group_id: u64,
@@ -920,7 +922,7 @@ fn groupRestorePending(
     for (placement_intents) |intent| {
         if (intent.record.group_id != group_id) continue;
         expected += 1;
-        if (findRestoreProgress(restore_progresses, table_id, intent.record.local_node_id, group_id, restore_backup_id)) |progress| {
+        if (findRestoreProgress(restore_progresses, table_id, intent.record.local_node_id, group_id, restore_backup_id, restore_location)) |progress| {
             if (!progress.runtime_repair_complete) continue;
             restored += 1;
         }
@@ -963,12 +965,14 @@ fn findRestoreProgress(
     node_id: u64,
     group_id: u64,
     backup_id: []const u8,
+    location: []const u8,
 ) ?metadata_table_manager.RestoreProgressRecord {
     for (records) |record| {
         if (record.table_id != table_id) continue;
         if (record.node_id != node_id) continue;
         if (record.group_id != group_id) continue;
         if (!std.mem.eql(u8, record.backup_id, backup_id)) continue;
+        if (!std.mem.eql(u8, record.location, location)) continue;
         return record;
     }
     return null;
@@ -2058,7 +2062,7 @@ test "metadata state marks restore-pending groups as not yet ready" {
         .{ .record = .{ .group_id = 8801, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .persisted }, .peer_node_ids = &.{1} },
     };
     const restore_progresses = [_]metadata_table_manager.RestoreProgressRecord{
-        .{ .table_id = 88, .node_id = 1, .group_id = 8801, .backup_id = "snap1" },
+        .{ .table_id = 88, .node_id = 1, .group_id = 8801, .backup_id = "snap1", .location = "file:///tmp/backups" },
     };
     const stores = [_]metadata_table_manager.StoreRecord{
         .{

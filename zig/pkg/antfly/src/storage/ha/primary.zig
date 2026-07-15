@@ -151,14 +151,54 @@ pub const Primary = struct {
         var primary = try Primary.open(alloc, log_path, slot_store_path, handoff.identity, options);
         errdefer primary.close();
 
-        if (primary.lastLsn() != handoff.switch_lsn) return error.PromotedLogMismatch;
-        var switch_entry = (try primary.log.entryAt(alloc, handoff.switch_lsn)) orelse return error.MissingPromotionSwitch;
+        try validatePromotedLog(alloc, &primary.log, handoff);
+
+        return primary;
+    }
+
+    /// Converts the promoted standby's live receive-log owner into the primary
+    /// log owner. The slot store is opened and the handoff is fully validated
+    /// before consuming `standby`, so every error leaves the standby usable.
+    pub fn adoptPromotedStandby(
+        alloc: Allocator,
+        standby: *standby_mod.Standby,
+        slot_store_path: [*:0]const u8,
+        handoff: standby_mod.PromotionHandoff,
+        options: OpenOptions,
+    ) !Primary {
+        if (handoff.switch_lsn == 0) return error.InvalidPromotionHandoff;
+        if (handoff.next_lsn != handoff.switch_lsn + 1) return error.InvalidPromotionHandoff;
+        if (!std.meta.eql(standby.identity, handoff.identity)) return error.InvalidPromotionHandoff;
+
+        var slots = try slot_store.SlotStore.open(alloc, slot_store_path, options.slot_store_options);
+        errdefer slots.close();
+        try validatePromotedLog(alloc, &standby.receive_log, handoff);
+
+        const standby_alloc = standby.alloc;
+        standby.progress_wal.close();
+        const log = standby.receive_log;
+        standby_alloc.free(standby.progress_wal_path);
+        standby_alloc.free(standby.receive_log_path);
+        standby.* = undefined;
+        return .{
+            .alloc = alloc,
+            .identity = handoff.identity,
+            .log = log,
+            .slots = slots,
+        };
+    }
+
+    fn validatePromotedLog(
+        alloc: Allocator,
+        log: *replication_log.ReplicationLog,
+        handoff: standby_mod.PromotionHandoff,
+    ) !void {
+        if (log.lastLsn() != handoff.switch_lsn) return error.PromotedLogMismatch;
+        var switch_entry = (try log.entryAt(alloc, handoff.switch_lsn)) orelse return error.MissingPromotionSwitch;
         defer switch_entry.deinit(alloc);
         if (switch_entry.record.kind != .timeline_switch) return error.MissingPromotionSwitch;
         try validateRecordIdentity(handoff.identity, switch_entry.record);
-        if (primary.nextLsn() != handoff.next_lsn) return error.PromotedLogMismatch;
-
-        return primary;
+        if (log.nextLsn() != handoff.next_lsn) return error.PromotedLogMismatch;
     }
 
     pub fn close(self: *Primary) void {

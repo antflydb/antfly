@@ -146,6 +146,8 @@ fn groupStatusEqual(
         lhs.local_leader == rhs.local_leader and
         lhs.local_voter == rhs.local_voter and
         lhs.voter_count == rhs.voter_count and
+        lhs.voter_set_known == rhs.voter_set_known and
+        std.mem.eql(u8, &lhs.voter_set_fingerprint, &rhs.voter_set_fingerprint) and
         lhs.joint_consensus == rhs.joint_consensus and
         lhs.transition_pending == rhs.transition_pending and
         lhs.replay_required == rhs.replay_required and
@@ -205,6 +207,13 @@ fn runtimeStatusEqual(
             left.edge_count != right.edge_count or
             left.node_count != right.node_count or
             left.root_node != right.root_node or
+            left.coverage_produced_count != right.coverage_produced_count or
+            left.coverage_skipped_count != right.coverage_skipped_count or
+            left.coverage_terminal_failed_count != right.coverage_terminal_failed_count or
+            left.coverage_generation != right.coverage_generation or
+            left.coverage_config_hash != right.coverage_config_hash or
+            left.coverage_identity_ready != right.coverage_identity_ready or
+            left.coverage_summary_ready != right.coverage_summary_ready or
             left.backfill_active != right.backfill_active or
             left.backfill_progress_millis != right.backfill_progress_millis or
             left.replay_applied_sequence != right.replay_applied_sequence or
@@ -445,6 +454,37 @@ test "store observer coalesces status heartbeat timestamps" {
     try std.testing.expect(!observationChangesRecord(existing, observation));
 
     observation.group_statuses = stale_groups[0..];
+    try std.testing.expect(observationChangesRecord(existing, observation));
+}
+
+test "metadata store observer detects exact voter set changes at a stable count" {
+    const original_fingerprint = table_manager.voterSetFingerprint(&.{ 101, 102, 103 }, null);
+    const changed_fingerprint = table_manager.voterSetFingerprint(&.{ 101, 102, 104 }, null);
+    var existing_groups = [_]table_manager.GroupStatusReport{.{
+        .group_id = 101,
+        .local_voter = true,
+        .voter_count = 3,
+        .voter_set_known = true,
+        .voter_set_fingerprint = original_fingerprint,
+    }};
+    var changed_groups = [_]table_manager.GroupStatusReport{.{
+        .group_id = 101,
+        .local_voter = true,
+        .voter_count = 3,
+        .voter_set_known = true,
+        .voter_set_fingerprint = changed_fingerprint,
+    }};
+    const existing = table_manager.StoreRecord{
+        .store_id = 21,
+        .node_id = 101,
+        .role = "data",
+        .group_statuses = existing_groups[0..],
+    };
+    const observation = StoreObservation{
+        .store_id = 21,
+        .group_statuses = changed_groups[0..],
+    };
+
     try std.testing.expect(observationChangesRecord(existing, observation));
 }
 

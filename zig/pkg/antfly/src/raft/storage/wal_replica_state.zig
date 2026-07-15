@@ -23,7 +23,7 @@ const storage_iface = raft_engine.runtime.storage_iface;
 const magic: u32 = 0x41524654; // ARFT
 const version: u32 = 2;
 const delta_magic: u32 = 0x4152444c; // ARDL
-const delta_version: u32 = 1;
+const delta_version: u32 = 2;
 const applied_watermark_magic: u32 = 0x4152574d; // ARWM
 const applied_watermark_version: u32 = 1;
 
@@ -240,6 +240,11 @@ pub const WalReplicaState = struct {
             if (snapshot.metadata.index > self.applied_index) self.applied_index = snapshot.metadata.index;
         }
         if (ready.hard_state) |hard_state| self.store.setHardState(hard_state);
+        if (ready.conf_state) |conf_state| {
+            try self.store.setConfState(conf_state);
+            self.stats.conf_state_updates += 1;
+            self.stats.conf_state_persist_calls += 1;
+        }
         if (ready.entries.len > 0) try self.store.append(ready.entries);
         if (diagnostics) |diag| diag.storage_apply_elapsed_ns += elapsedSince(storage_apply_started_ns);
 
@@ -584,6 +589,9 @@ pub const WalReplicaState = struct {
         try appendInt(u32, self.alloc, &buffer, @intCast(ready.entries.len));
         for (ready.entries) |entry| try encodeEntry(self.alloc, &buffer, entry);
 
+        try appendBool(self.alloc, &buffer, ready.conf_state != null);
+        if (ready.conf_state) |conf_state| try encodeConfState(self.alloc, &buffer, conf_state);
+
         return try buffer.toOwnedSlice(self.alloc);
     }
 
@@ -643,6 +651,11 @@ pub const WalReplicaState = struct {
                     defer raft_engine.core.types.freeEntries(self.alloc, entries);
                     for (entries) |*entry| entry.* = try decodeEntry(self.alloc, bytes, &cursor);
                     try self.store.append(entries);
+                }
+                if (try readBool(bytes, &cursor)) {
+                    var conf_state = try decodeConfState(self.alloc, bytes, &cursor);
+                    defer conf_state.deinit(self.alloc);
+                    try self.store.setConfState(conf_state);
                 }
             },
             .conf_state => {
@@ -834,6 +847,7 @@ test "wal replica state persists ready updates across reopen" {
             raft_engine.core.types.freeEntries(std.testing.allocator, @constCast(ready.entries));
         }
         ready.hard_state = .{ .current_term = 2, .voted_for = 3, .commit_index = 1 };
+        ready.conf_state = .{ .voters = @constCast((&[_]u64{ 1, 2, 3 })[0..]) };
         ready.entries = try std.testing.allocator.dupe(raft_engine.core.Entry, &[_]raft_engine.core.Entry{
             .{ .term = 2, .index = 1, .entry_type = .normal, .data = try std.testing.allocator.dupe(u8, "wal") },
         });
@@ -847,6 +861,7 @@ test "wal replica state persists ready updates across reopen" {
         defer initial.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(u64, 2), initial.hard_state.current_term);
         try std.testing.expectEqual(@as(?u64, 3), initial.hard_state.voted_for);
+        try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, initial.conf_state.voters);
         try std.testing.expectEqual(@as(u64, 1), try reopened.storage().lastIndex());
     }
 }

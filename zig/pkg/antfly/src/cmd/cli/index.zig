@@ -17,36 +17,69 @@ const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
-    var table_name: ?[]const u8 = null;
-    var index_name: ?[]const u8 = null;
-    var subcommand: ?[]const u8 = null;
+    var command_args = args.*;
+    const route = parseRoute(args.*);
+    const tbl = route.table_name orelse cli.fatal("--table is required for index commands", .{});
 
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            table_name = args.next();
-        } else if (std.mem.eql(u8, arg, "--index") or std.mem.eql(u8, arg, "-i")) {
-            index_name = args.next();
-        } else if (std.mem.eql(u8, arg, "create") or std.mem.eql(u8, arg, "drop") or
-            std.mem.eql(u8, arg, "list") or std.mem.eql(u8, arg, "get"))
-        {
-            subcommand = arg;
-            break;
-        }
-    }
-
-    const tbl = table_name orelse cli.fatal("--table is required for index commands", .{});
-
-    if (subcommand) |cmd| {
-        if (std.mem.eql(u8, cmd, "create")) return createIndex(allocator, client, tbl, args);
-        if (std.mem.eql(u8, cmd, "drop")) return dropIndex(client, tbl, index_name, args);
+    if (route.subcommand) |cmd| {
+        if (std.mem.eql(u8, cmd, "create")) return createIndex(allocator, client, tbl, &command_args);
+        if (std.mem.eql(u8, cmd, "drop")) return dropIndex(client, tbl, route.index_name, &command_args);
         if (std.mem.eql(u8, cmd, "list")) return listIndexes(allocator, io, client, tbl);
-        if (std.mem.eql(u8, cmd, "get")) return getIndex(allocator, io, client, tbl, index_name, args);
+        if (std.mem.eql(u8, cmd, "get")) return getIndex(allocator, io, client, tbl, route.index_name, &command_args);
     }
 
-    if (index_name) |idx| {
+    if (route.index_name) |idx| {
         return getIndexByName(allocator, io, client, tbl, idx);
     }
     return listIndexes(allocator, io, client, tbl);
+}
+
+const Route = struct {
+    table_name: ?[]const u8 = null,
+    index_name: ?[]const u8 = null,
+    subcommand: ?[]const u8 = null,
+};
+
+fn parseRoute(iterator: std.process.Args.Iterator) Route {
+    var args = iterator;
+    var route: Route = .{};
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
+            route.table_name = args.next();
+        } else if (std.mem.eql(u8, arg, "--index") or std.mem.eql(u8, arg, "-i")) {
+            route.index_name = args.next();
+        } else if (std.mem.eql(u8, arg, "--type") or std.mem.eql(u8, arg, "--field") or
+            std.mem.eql(u8, arg, "--template") or std.mem.eql(u8, arg, "--embedder") or
+            std.mem.eql(u8, arg, "--generator") or std.mem.eql(u8, arg, "--chunker"))
+        {
+            _ = args.next();
+        } else if (std.mem.eql(u8, arg, "create") or std.mem.eql(u8, arg, "drop") or
+            std.mem.eql(u8, arg, "list") or std.mem.eql(u8, arg, "get"))
+        {
+            if (route.subcommand == null) route.subcommand = arg;
+        }
+    }
+    return route;
+}
+
+test "index route accepts flags before and after the action" {
+    var documented_argv = [_][*:0]const u8{ "list", "--table", "wikipedia" };
+    const documented = parseRoute(std.process.Args.Iterator.init(.{ .vector = documented_argv[0..] }));
+    try std.testing.expectEqualStrings("list", documented.subcommand.?);
+    try std.testing.expectEqualStrings("wikipedia", documented.table_name.?);
+
+    var legacy_argv = [_][*:0]const u8{ "--table", "wikipedia", "list" };
+    const legacy = parseRoute(std.process.Args.Iterator.init(.{ .vector = legacy_argv[0..] }));
+    try std.testing.expectEqualStrings("list", legacy.subcommand.?);
+    try std.testing.expectEqualStrings("wikipedia", legacy.table_name.?);
+
+    var value_argv = [_][*:0]const u8{ "create", "--table", "docs", "--type", "list" };
+    const value = parseRoute(std.process.Args.Iterator.init(.{ .vector = value_argv[0..] }));
+    try std.testing.expectEqualStrings("create", value.subcommand.?);
+
+    var flags_first_argv = [_][*:0]const u8{ "--table", "docs", "--type", "list", "create" };
+    const flags_first = parseRoute(std.process.Args.Iterator.init(.{ .vector = flags_first_argv[0..] }));
+    try std.testing.expectEqualStrings("create", flags_first.subcommand.?);
 }
 
 fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient, table_name: []const u8, args: *std.process.Args.Iterator) !void {

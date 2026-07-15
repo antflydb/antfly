@@ -47,13 +47,13 @@ See the [Downloads page](/docs/downloads) for a complete Docker Compose setup wi
 Pull a multimodal embedding model for text and image search. [Antfly inference](/docs/guides/inference) is Antfly's built-in ML inference engine — it runs quantized models locally for fast inference, no external APIs needed.
 
 ```bash
-antfly inference pull antflydb/clipclap:gguf:Q4_K_M
+antfly inference pull antflydb/clipclap:gguf:Q4_K
 ```
 
-Start Antfly in swarm mode:
+Start Antfly in standalone mode:
 
 ```bash
-antfly swarm 2>&1 | tee "antfly.log"
+antfly standalone 2>&1 | tee "antfly.log"
 ```
 
 If you installed with Homebrew, you can run Antfly as a service instead:
@@ -63,7 +63,7 @@ brew services start antfly
 ```
 
 <Callout type="info">
-Swarm mode starts metadata, data nodes, and Antfly inference in a single process — ideal for local development. You can also access the [web dashboard](/docs/guides/dashboard) at `http://localhost:8080` to manage tables, run queries, and monitor your cluster.
+Standalone mode starts metadata, data nodes, and Antfly inference in a single process — ideal for local development. You can also access the [web dashboard](/docs/guides/dashboard) at `http://localhost:8080` to manage tables, run queries, and monitor your cluster.
 </Callout>
 
 ## Download Sample Data
@@ -676,7 +676,7 @@ antfly inference pull --variants i8 mixedbread-ai/mxbai-rerank-base-v1
 ```
 
 <Callout type="info">
-If Antfly doesn't detect the new model, restart `antfly swarm`.
+If Antfly doesn't detect the new model, restart `antfly standalone`.
 </Callout>
 
 <Tabs defaultValue="cli">
@@ -831,11 +831,11 @@ Search by visual content using ClipClap, a multimodal embedding model that under
 ### Confirm the ClipClap model is available
 
 ```bash
-antfly inference pull antflydb/clipclap:gguf:Q4_K_M
+antfly inference pull antflydb/clipclap:gguf:Q4_K
 ```
 
 <Callout type="info">
-If Antfly doesn't detect the new model, restart `antfly swarm`.
+If Antfly doesn't detect the new model, restart `antfly standalone`.
 </Callout>
 
 ### Add an image index to your table

@@ -183,6 +183,9 @@ func (r *AntflyRestoreReconciler) buildRestoreJob(restore *antflyv1.AntflyRestor
 		"--backup-id", restore.Spec.Source.BackupID,
 		"--location", restore.Spec.Source.Location,
 	}
+	if restore.Spec.Source.Connection != "" {
+		args = append(args, "--connection", restore.Spec.Source.Connection)
+	}
 
 	// Add restore mode
 	restoreMode := string(restore.Spec.RestoreMode)

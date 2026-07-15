@@ -57,7 +57,7 @@ def sync_detailed(
 ) -> Response[Error | SecretList]:
     """List secrets status
 
-     List all configured secret names and their status (keystore, env var, or both).
+     List all configured secret names and their status (secret-store file, env var, or both).
     Never returns secret values — only names and configuration status.
 
     Raises:
@@ -83,7 +83,7 @@ def sync(
 ) -> Error | SecretList | None:
     """List secrets status
 
-     List all configured secret names and their status (keystore, env var, or both).
+     List all configured secret names and their status (secret-store file, env var, or both).
     Never returns secret values — only names and configuration status.
 
     Raises:
@@ -105,7 +105,7 @@ async def asyncio_detailed(
 ) -> Response[Error | SecretList]:
     """List secrets status
 
-     List all configured secret names and their status (keystore, env var, or both).
+     List all configured secret names and their status (secret-store file, env var, or both).
     Never returns secret values — only names and configuration status.
 
     Raises:
@@ -129,7 +129,7 @@ async def asyncio(
 ) -> Error | SecretList | None:
     """List secrets status
 
-     List all configured secret names and their status (keystore, env var, or both).
+     List all configured secret names and their status (secret-store file, env var, or both).
     Never returns secret values — only names and configuration status.
 
     Raises:

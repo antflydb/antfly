@@ -23,7 +23,7 @@ class ForeignSource:
         type_ (ForeignSourceType): Type of the foreign data source. Currently only "postgres" is supported.
              Example: postgres.
         dsn (str): Data source name (connection string) for the foreign database.
-            Supports `${secret:key_name}` references that resolve from the Antfly keystore
+            Supports `${secret:key_name}` references that resolve from the Antfly secret store
             or environment variables.
              Example: ${secret:pg_dsn}.
         postgres_table (str): Name of the table or view in the foreign PostgreSQL database to query.

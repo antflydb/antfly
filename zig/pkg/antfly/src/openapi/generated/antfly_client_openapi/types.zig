@@ -867,15 +867,19 @@ pub const BackupInfo = struct {
 };
 
 pub const BackupListResponse = struct {
-    /// List of available backups
+    /// One page of available backups in stable manifest-key order.
     backups: []const BackupInfo,
+    /// Opaque continuation cursor. Omitted when no additional backups remain.
+    next_cursor: ?[]const u8 = null,
 };
 
 pub const BackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
+    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: `file:///logical/path` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
     location: []const u8,
+    /// ID of a configured `external_io` connection. Required for every network API backup and restore. Object locations enforce bucket and prefix scopes; filesystem URI paths resolve beneath the connection root.
+    connection: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
     format: ?[]const u8 = null,
 };
@@ -1316,11 +1320,13 @@ pub const ClassificationTransformationResult = struct {
 pub const ClusterBackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
+    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: `file:///logical/path` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
     location: []const u8,
+    /// Required configured `external_io` connection with the `backup.write` capability.
+    connection: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
     format: ?[]const u8 = null,
-    /// Optional list of tables to backup. If omitted, all tables are backed up.
+    /// Optional list of tables to backup. If omitted, all tables are backed up, up to the cluster backup limit of 4096 tables. Requests above that limit fail before any table backup is created.
     table_names: ?[]const []const u8 = null,
 };
 
@@ -1444,9 +1450,11 @@ pub const ClusterRestoreRequest = struct {
     backup_id: []const u8,
     /// Storage location where the backup is stored.
     location: []const u8,
-    /// Optional list of tables to restore. If omitted, all tables in the backup are restored.
+    /// Required configured `external_io` connection with the `restore.read` capability.
+    connection: []const u8,
+    /// Optional list of tables to restore. If omitted, all tables in the backup are restored, up to the cluster restore limit of 4096 tables. Larger backups must be restored in explicit batches of at most 256 tables.
     table_names: ?[]const []const u8 = null,
-    /// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Drop and recreate existing tables
+    /// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Atomically replace existing table generations after staging and validation
     restore_mode: ?[]const u8 = null,
 };
 
@@ -1463,9 +1471,10 @@ pub const ClusterStatus = struct {
     message: ?[]const u8 = null,
     /// Indicates whether authentication is enabled for the cluster
     auth_enabled: ?bool = null,
-    /// Indicates whether the cluster is running in single-node swarm mode
-    swarm_mode: ?bool = null,
+    /// Runtime deployment topology
+    deployment_mode: ?[]const u8 = null,
     secret_store: ?SecretStoreStatus = null,
+    storage: ?StorageRuntimeStatus = null,
 };
 
 pub const ClusterTopology = struct {
@@ -1474,9 +1483,10 @@ pub const ClusterTopology = struct {
     message: ?[]const u8 = null,
     /// Indicates whether authentication is enabled for the cluster
     auth_enabled: ?bool = null,
-    /// Indicates whether the cluster is running in single-node swarm mode
-    swarm_mode: ?bool = null,
+    /// Runtime deployment topology
+    deployment_mode: ?[]const u8 = null,
     secret_store: ?SecretStoreStatus = null,
+    storage: ?StorageRuntimeStatus = null,
     data: ClusterDataStatus,
 };
 
@@ -1664,7 +1674,7 @@ pub const ConnectionKind = enum {
     }
 };
 
-/// Connection status. "connected" means a live probe or listing succeeded, "error" means the probe failed (see the error field), "configured" means the connection is present but was not probed, and "unsupported" means no probe is available for this connection kind or provider.
+/// Connection status. "connected" means a live probe or listing succeeded, "error" means the probe failed (see the error field), "configured" means the connection is present but was not probed, and "unsupported" means no probe is available for this connection kind or provider. For S3, connected means an authenticated HeadBucket request succeeded for every explicitly allowlisted bucket. It verifies bucket discovery permission, not mutation permissions such as PutObject.
 pub const ConnectionStatus = enum {
     connected,
     @"error",
@@ -1796,11 +1806,11 @@ pub const Credentials = struct {
     endpoint: ?[]const u8 = null,
     /// Enable SSL/TLS for S3 connections (default: true for AWS, false for local MinIO)
     use_ssl: ?bool = null,
-    /// AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID environment variable if not set.
+    /// AWS access key ID. Supports secret-store references. Falls back to AWS_ACCESS_KEY_ID when not set.
     access_key_id: ?[]const u8 = null,
-    /// AWS secret access key. Supports keystore syntax for secret lookup. Falls back to AWS_SECRET_ACCESS_KEY environment variable if not set.
+    /// AWS secret access key. Supports secret-store references. Falls back to AWS_SECRET_ACCESS_KEY when not set.
     secret_access_key: ?[]const u8 = null,
-    /// Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup.
+    /// Optional AWS session token for temporary credentials. Supports secret-store references.
     session_token: ?[]const u8 = null,
 };
 
@@ -1857,6 +1867,142 @@ pub const DateRangeStringQuery = struct {
     field: ?[]const u8 = null,
     boost: ?Boost = null,
     datetime_parser: ?[]const u8 = null,
+};
+
+/// A structured reason why the coverage projection cannot be treated as globally complete.
+pub const DerivedCoverageObservationIncompleteReason = enum {
+    runtime_unavailable,
+    missing_group,
+    unknown_group,
+    remote_unknown_group,
+    stale_group,
+    summary_unavailable,
+    config_mismatch,
+    counter_mismatch,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .runtime_unavailable => "runtime_unavailable",
+            .missing_group => "missing_group",
+            .unknown_group => "unknown_group",
+            .remote_unknown_group => "remote_unknown_group",
+            .stale_group => "stale_group",
+            .summary_unavailable => "summary_unavailable",
+            .config_mismatch => "config_mismatch",
+            .counter_mismatch => "counter_mismatch",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "runtime_unavailable", .runtime_unavailable },
+            .{ "missing_group", .missing_group },
+            .{ "unknown_group", .unknown_group },
+            .{ "remote_unknown_group", .remote_unknown_group },
+            .{ "stale_group", .stale_group },
+            .{ "summary_unavailable", .summary_unavailable },
+            .{ "config_mismatch", .config_mismatch },
+            .{ "counter_mismatch", .counter_mismatch },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// How generation-scoped source outcomes determine derived-index completeness.
+pub const DerivedCoveragePolicy = enum {
+    strict,
+    partial,
+    best_effort,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .strict => "strict",
+            .partial => "partial",
+            .best_effort => "best_effort",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "strict", .strict },
+            .{ "partial", .partial },
+            .{ "best_effort", .best_effort },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const DerivedCoverageStatus = struct {
+    policy: DerivedCoverageStatusPolicy,
+    /// Whether every expected shard contributed a fresh, configuration-compatible observation with valid outcome cardinality.
+    observation_complete: bool,
+    /// Empty when observation_complete is true; otherwise identifies every known reason the projection is incomplete.
+    observation_incomplete_reasons: []const DerivedCoverageObservationIncompleteReason,
+    /// Versioned semantic configuration fingerprint encoded as fixed-width hexadecimal. Non-semantic execution tuning does not affect it.
+    config_fingerprint: []const u8,
+    /// Whether all observed shard-local coverage summaries were read atomically and completely.
+    summary_ready: bool,
+    /// Freshly observed shard groups reporting a different semantic configuration fingerprint.
+    config_mismatch_group_count: i64,
+    /// Source documents observed across fresh shard reports. This is the exact table total only when observation_complete is true; otherwise it is a lower bound and all outcome counts are partial observations.
+    source_total: i64,
+    /// Source documents with a durable produced outcome for this index generation.
+    produced: i64,
+    /// Source documents intentionally producing no indexable output.
+    skipped: i64,
+    /// Source documents whose generation failed non-retryably.
+    terminal_failed: i64,
+    /// Raw terminal source outcomes counted by the configured policy. This may exceed source_total only while observation_complete is false with counter_mismatch.
+    covered: i64,
+    /// Source documents without a policy-accepted terminal outcome. Null when observations are incomplete and the global value is unknown.
+    pending: ?i64,
+    /// Whether observations are complete, replay has reached its target, and every observed source has an outcome accepted by the policy.
+    complete: bool,
+    /// Whether coverage is complete without terminal failures.
+    healthy: bool,
+    /// Whether coverage is complete under best_effort but includes terminal failures.
+    degraded: bool,
+};
+
+pub const DerivedCoverageStatusPolicy = enum {
+    strict,
+    partial,
+    best_effort,
+    external,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .strict => "strict",
+            .partial => "partial",
+            .best_effort => "best_effort",
+            .external => "external",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "strict", .strict },
+            .{ "partial", .partial },
+            .{ "best_effort", .best_effort },
+            .{ "external", .external },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const DisjunctionQuery = struct {
@@ -2350,6 +2496,8 @@ pub const Embedding = std.json.Value;
 
 /// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
 pub const EmbeddingsIndexConfig = struct {
+    /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
+    coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
@@ -2432,8 +2580,10 @@ pub const EmbeddingsIndexStats = struct {
     backfill_items_processed: ?i64 = null,
     /// Operational readiness state such as ready, running, retrying, or failed.
     backfill_state: ?[]const u8 = null,
-    /// Number of documents visible to the index.
+    /// Number of physical vectors or sparse entries visible to the index; chunked indexes may contain multiple entries per source document.
     doc_count: ?i64 = null,
+    /// Generation-scoped source-document coverage, separate from physical index cardinality.
+    coverage: ?DerivedCoverageStatus = null,
     /// Documents currently visible to queries.
     query_visible_doc_count: ?i64 = null,
     published_doc_count: ?i64 = null,
@@ -3164,7 +3314,7 @@ pub const ForeignColumn = struct {
 pub const ForeignSource = struct {
     /// Type of the foreign data source. Currently only "postgres" is supported.
     type: []const u8,
-    /// Data source name (connection string) for the foreign database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables.
+    /// Data source name (connection string) for the foreign database. Supports `${secret:key_name}` references that resolve from the Antfly secret store or environment variables.
     dsn: []const u8,
     /// Name of the table or view in the foreign PostgreSQL database to query.
     postgres_table: []const u8,
@@ -3760,6 +3910,8 @@ pub const IndexConfig = struct {
     enrichments: ?[]const EnrichmentConfig = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
+    /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
+    coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
@@ -3816,6 +3968,10 @@ pub const IndexConfig = struct {
         }
         if (self.mem_only) |value| {
             try jw.objectField("mem_only");
+            try jw.write(value);
+        }
+        if (self.coverage_policy) |value| {
+            try jw.objectField("coverage_policy");
             try jw.write(value);
         }
         if (self.external) |value| {
@@ -4183,6 +4339,8 @@ pub const InferenceConfig = struct {
     max_loaded_models: ?i64 = null,
     /// Number of concurrent inference pipelines per model. Each pipeline loads a copy of the model, so higher values use more memory but allow more concurrent requests. Note: pool_size multiplies per-model memory independently of max_loaded_models.
     pool_size: ?i64 = null,
+    /// Native generator prompt KV cache settings.
+    prompt_cache: ?InferencePromptCacheConfig = null,
     /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Antfly inference tries entries in order and uses the first available backend+device combination that supports the model. **Examples**: - `["native", "onnx", "xla"]` - Try backends with auto device detection - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
     backend_priority: ?[]const InferenceBackendPriorityEntry = null,
     /// Maximum number of concurrent inference requests allowed. Additional requests will be queued up to max_queue_size. Set to 0 for unlimited (default).
@@ -4197,7 +4355,7 @@ pub const InferenceConfig = struct {
     max_memory_mb: ?i64 = null,
     /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map use the default strategy based on keep_alive: - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle) - If keep_alive="0": eager loading (load at startup, never unload) When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
     model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Whether the dashboard should show model download commands. Defaults to true for standalone/swarm mode. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
+    /// Whether the dashboard should show model download commands. Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
     allow_downloads: ?bool = null,
     log: ?InferenceschemasConfig = null,
 };
@@ -4524,6 +4682,10 @@ pub const InferenceGenerateRequest = struct {
     cache_dtype: ?[]const u8 = null,
     /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
     cache_compaction_ratio: ?f32 = null,
+    /// inference-native prompt prefix cache namespace key. Requests with the same key can reuse matching prompt-prefix KV on the same node. Required to enable prompt caching; requests without a key are never cached.
+    prompt_cache_key: ?[]const u8 = null,
+    /// inference-native prompt prefix cache control. False bypasses prompt cache for this request.
+    prompt_cache: ?bool = null,
     backend: ?InferenceModelBackend = null,
     /// inference-native graph execution mode. `eager` keeps the direct runtime path when possible. `compiled` runs inference graph planning, partitioning, and backend executor attachment.
     mode: ?[]const u8 = null,
@@ -4562,6 +4724,8 @@ pub const InferenceGenerateUsage = struct {
     completion_tokens: i64,
     /// Total tokens used (prompt + completion)
     total_tokens: i64,
+    /// Prompt tokens served from inference-native prefix KV cache
+    cached_prompt_tokens: ?i64 = null,
 };
 
 pub const InferenceImageURL = ImageURL;
@@ -4869,6 +5033,20 @@ pub const InferencePredictorsResponse = struct {
     object: []const u8,
     /// Traditional ML predictors keyed by predictor name.
     predictors: std.json.ArrayHashMap(InferencePredictorInfo),
+};
+
+/// Native generator prompt KV cache configuration.
+pub const InferencePromptCacheConfig = struct {
+    /// Enable inference-native prompt KV cache reuse for generator requests.
+    enabled: ?bool = null,
+    /// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup and is the scalable production mode. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
+    mode: ?[]const u8 = null,
+    /// Node-wide target for live prompt-cache entries. The runtime divides it across participating model caches and evicts using estimated metadata and logical host/device KV bytes. Backend allocators may retain reusable capacity, so this is not a hard cap on process or accelerator memory.
+    max_bytes_mb: ?i64 = null,
+    /// Minimum prompt length eligible for prompt KV caching.
+    min_tokens: ?i64 = null,
+    /// Idle time-to-live for prompt KV cache entries. Refreshed on every cache hit, so only entries left unused for this duration expire.
+    ttl_ms: ?i64 = null,
 };
 
 /// Inference provider type for a connection.
@@ -6382,9 +6560,9 @@ pub const QueryRequest = struct {
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?std.json.Value = null,
-    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. Use `embedding_template` for multimodal queries.
+    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
-    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. Use this when you want to embed multimodal content (images, PDFs, etc.) instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - Fetches and extracts content from PDFs - `remoteText url=<url>` - Fetches and includes remote text content **Examples**: - PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
+    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed multimodal content (images, PDFs, etc.) instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - Fetches and extracts content from PDFs - `remoteText url=<url>` - Fetches and includes remote text content **Examples**: - PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
     embedding_template: ?[]const u8 = null,
     /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
     indexes: ?[]const []const u8 = null,
@@ -6406,7 +6584,7 @@ pub const QueryRequest = struct {
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,
-    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504.
+    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
     timeout_ms: ?i64 = null,
     /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
     order_by: ?[]const SortField = null,
@@ -6579,7 +6757,7 @@ pub const ReplicationRoute = struct {
 pub const ReplicationSource = struct {
     /// Type of the replication source. Currently only "postgres" is supported.
     type: []const u8,
-    /// Data source name (connection string) for the PostgreSQL database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables. Requires `wal_level=logical` on the source.
+    /// Data source name (connection string) for the PostgreSQL database. Supports `${secret:key_name}` references that resolve from the Antfly secret store or environment variables. Requires `wal_level=logical` on the source.
     dsn: []const u8,
     /// Name of the table in the PostgreSQL database to replicate from.
     postgres_table: []const u8,
@@ -6739,13 +6917,45 @@ pub const ResourceType = enum {
     }
 };
 
-pub const RestoreRequest = struct {
-    /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
+pub const RestoreJob = struct {
+    /// Opaque durable restore-job identifier. Clients must not parse it as a number.
+    job_id: []const u8,
+    attempt_id: i64,
+    scope: []const u8,
+    table_name: ?[]const u8 = null,
     backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
+    phase: []const u8,
+    cancel_requested: bool,
+    /// Number of tables whose generation publication is visible but whose parent-directory durability could not be confirmed.
+    durability_pending_table_count: i64,
+    /// Number of table restore intents durably published. Published tables are adopted, not republished, after failover.
+    published_table_count: i64,
+    /// Number of published tables whose placement replicas completed restore and whose completion checkpoint is durable.
+    completed_table_count: i64,
+    /// Requested table count when known before execution.
+    total_table_count: ?i64 = null,
+    /// Bounded terminal result. A committed result with durability pending means publication is visible but parent-directory durability was not confirmed. Cluster restores report aggregate triggered, committed, durability-pending, skipped, and failed table counts plus a bounded sample of failure details. `failure_details_truncated` indicates that additional failures or part of a long failure detail were omitted. Any failed or durability-pending table makes the job phase `failed`; inspect this result for partial progress and use a new idempotency key when retrying a changed request.
+    result: ?std.json.Value = null,
+    @"error": ?[]const u8 = null,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    /// Unix epoch milliseconds after which this terminal job record and its idempotency key may be removed. Omitted while the job is nonterminal.
+    expires_at_ms: ?i64 = null,
+};
+
+pub const RestoreJobList = struct {
+    jobs: []const RestoreJob,
+    /// Opaque newest-first continuation cursor. A page can be empty and still include a cursor when authorization or filters exclude a bounded scan window. Omitted when the retained scan is exhausted.
+    next_cursor: ?[]const u8 = null,
+};
+
+pub const RestoreRequest = struct {
+    /// Identifier of the published backup to restore.
+    backup_id: []const u8,
+    /// Storage location containing the backup. The server detects the native or portable format from the published manifest and artifact.
     location: []const u8,
-    /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
-    format: ?[]const u8 = null,
+    /// ID of a configured `external_io` connection with `restore.read`. Object locations enforce bucket and prefix scopes; filesystem URI paths resolve beneath the connection root.
+    connection: []const u8,
 };
 
 /// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes.
@@ -6884,9 +7094,9 @@ pub const RetrievalQueryRequest = struct {
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?std.json.Value = null,
-    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. Use `embedding_template` for multimodal queries.
+    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
-    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. Use this when you want to embed multimodal content (images, PDFs, etc.) instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - Fetches and extracts content from PDFs - `remoteText url=<url>` - Fetches and includes remote text content **Examples**: - PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
+    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed multimodal content (images, PDFs, etc.) instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - Fetches and extracts content from PDFs - `remoteText url=<url>` - Fetches and includes remote text content **Examples**: - PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
     embedding_template: ?[]const u8 = null,
     /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
     indexes: ?[]const []const u8 = null,
@@ -6908,7 +7118,7 @@ pub const RetrievalQueryRequest = struct {
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,
-    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504.
+    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
     timeout_ms: ?i64 = null,
     /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
     order_by: ?[]const SortField = null,
@@ -7170,13 +7380,13 @@ pub const SecretList = struct {
 
 /// Source of the secret configuration
 pub const SecretStatus = enum {
-    configured_keystore,
+    configured_file,
     configured_env,
     configured_both,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
-            .configured_keystore => "configured_keystore",
+            .configured_file => "configured_file",
             .configured_env => "configured_env",
             .configured_both => "configured_both",
         };
@@ -7189,7 +7399,7 @@ pub const SecretStatus = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "configured_keystore", .configured_keystore },
+            .{ "configured_file", .configured_file },
             .{ "configured_env", .configured_env },
             .{ "configured_both", .configured_both },
         });
@@ -7204,7 +7414,7 @@ pub const SecretStoreStatus = struct {
 };
 
 pub const SecretWriteRequest = struct {
-    /// Secret value (stored encrypted, never returned)
+    /// Secret value (stored in the configured protected secret store and never returned)
     value: []const u8,
 };
 
@@ -7374,6 +7584,21 @@ pub const SortProfile = struct {
     sort_rejection_detail: ?[]const u8 = null,
     /// Sort field associated with the rejection when safe to expose.
     sort_rejection_field: ?[]const u8 = null,
+};
+
+pub const StorageMaintenanceCapabilities = struct {
+    check: bool,
+    compact: bool,
+    vacuum: bool,
+    online: bool,
+    asynchronous: bool,
+};
+
+pub const StorageRuntimeStatus = struct {
+    engine: []const u8,
+    format: ?[]const u8 = null,
+    fsync: ?bool = null,
+    maintenance: StorageMaintenanceCapabilities,
 };
 
 pub const StorageStatus = struct {

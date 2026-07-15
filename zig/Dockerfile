@@ -80,4 +80,4 @@ USER antfly
 EXPOSE 8080 11433 4200
 
 ENTRYPOINT ["/antfly"]
-CMD ["swarm"]
+CMD ["standalone"]

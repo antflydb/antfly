@@ -89,20 +89,20 @@ Use product-area names for test files. Do not use migration labels like `*_parit
   - backend-gated remote cluster round-trip coverage for `s3://` and `gs://`
 - `test_extensions.py`
   - full-suite MemoryAF extension package projection from `extensions/memoryaf`
-  - swarm and distributed extension lifecycle dry-run coverage
-  - swarm install plus scoped `/mcp/v1/extensions/memoryaf` tool listing coverage
+  - standalone and distributed extension lifecycle dry-run coverage
+  - standalone install plus scoped `/mcp/v1/extensions/memoryaf` tool listing coverage
 ## Harnesses
 
 - `serverless_api`
   - serverless-oriented fixture
-  - can auto-start `./zig-out/bin/antfly swarm`
+  - can auto-start `./zig-out/bin/antfly standalone`
 - `stateful_api`
   - stateful API fixture
   - intended to run against either Go or Zig implementations
-  - when auto-starting Zig locally, it launches `antfly swarm`
+  - when auto-starting Zig locally, it launches `antfly standalone`
   - configured with `ANTFLY_STATEFUL_URL`
   - optional `ANTFLY_STATEFUL_API_ROOT`
-  - use `/db/v1` for Go Antfly; local Zig `antfly swarm` serves stateful routes at the root
+  - use `/db/v1` for Go Antfly; local Zig `antfly standalone` serves stateful routes at the root
 
 ## Shared vs Serverless-Specific
 
@@ -165,7 +165,7 @@ Compared with `../antfly/e2e`, the biggest missing areas are:
 - replication and CDC
   - Go sources: `cdc_replication_test.go`, remaining CDC parts of `foreign_table_test.go`
   - Zig now has `test_cdc.py` covering snapshot import, logical-stream
-    insert/update/delete, and restart/resume on the unified `swarm` path; the
+    insert/update/delete, and restart/resume on the unified `standalone` path; the
     remaining gap is stricter exported-snapshot cutover semantics and broader
     CDC parity depth
 - cluster-management behavior

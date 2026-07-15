@@ -128,14 +128,14 @@ func (sa *SecretsApi) ListSecrets(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// PutSecret stores a secret in the keystore. Only available in swarm mode.
+// PutSecret stores a secret in the keystore. Only available in standalone mode.
 func (sa *SecretsApi) PutSecret(w http.ResponseWriter, r *http.Request, key string) {
 	if !sa.ms.ensureAuth(w, r, usermgr.ResourceTypeUser, "*", usermgr.PermissionTypeAdmin) {
 		return
 	}
 
-	if !sa.ms.config.SwarmMode {
-		errorResponse(w, "Secret management via API is only available in swarm (single-node) mode. Configure secrets using environment variables, Kubernetes secrets, or the CLI on each node.", http.StatusServiceUnavailable)
+	if !sa.ms.config.IsStandalone() {
+		errorResponse(w, "Secret management via API is only available in standalone (single-node) mode. Configure secrets using environment variables, Kubernetes secrets, or the CLI on each node.", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -202,14 +202,14 @@ func (sa *SecretsApi) PutSecret(w http.ResponseWriter, r *http.Request, key stri
 	}
 }
 
-// DeleteSecret removes a secret from the keystore. Only available in swarm mode.
+// DeleteSecret removes a secret from the keystore. Only available in standalone mode.
 func (sa *SecretsApi) DeleteSecret(w http.ResponseWriter, r *http.Request, key string) {
 	if !sa.ms.ensureAuth(w, r, usermgr.ResourceTypeUser, "*", usermgr.PermissionTypeAdmin) {
 		return
 	}
 
-	if !sa.ms.config.SwarmMode {
-		errorResponse(w, "Secret management via API is only available in swarm (single-node) mode. Configure secrets using environment variables, Kubernetes secrets, or the CLI on each node.", http.StatusServiceUnavailable)
+	if !sa.ms.config.IsStandalone() {
+		errorResponse(w, "Secret management via API is only available in standalone (single-node) mode. Configure secrets using environment variables, Kubernetes secrets, or the CLI on each node.", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -234,22 +234,22 @@ func (sa *SecretsApi) DeleteSecret(w http.ResponseWriter, r *http.Request, key s
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// getOrCreateKeystore returns the global keystore, creating one if needed in swarm mode.
+// getOrCreateKeystore returns the global keystore, creating one if needed in standalone mode.
 func (sa *SecretsApi) getOrCreateKeystore() *secrets.Keystore {
 	ks := secrets.GetGlobalKeystore()
 	if ks != nil {
 		return ks
 	}
 
-	// Auto-create keystore in swarm mode
-	if !sa.ms.config.SwarmMode {
+	// Auto-create keystore in standalone mode
+	if !sa.ms.config.IsStandalone() {
 		return nil
 	}
 
 	keystorePath := sa.ms.config.GetBaseDir() + "/keystore"
 	password := generateKeystorePassword()
 
-	sa.logger.Info("Auto-creating keystore for swarm mode",
+	sa.logger.Info("Auto-creating keystore for standalone mode",
 		zap.String("path", keystorePath))
 	sa.logger.Warn("Generated keystore password — note it for future use",
 		zap.String("password", password))

@@ -1,6 +1,6 @@
 # Antfly Quickstart Demo
 # Usage: vhs quickstart.tape
-# Requires: antfly binary in PATH, models pre-downloaded, swarm running on :8080
+# Requires: antfly binary in PATH, models pre-downloaded, standalone running on :8080
 
 Output quickstart.gif
 

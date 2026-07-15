@@ -52,7 +52,7 @@ func TestE2E_ClusteredMetadataBootstrapsWithAuth(t *testing.T) {
 		nodeID := types.ID(id)
 		cfg := CreateTestConfig(t, t.TempDir(), nodeID)
 		cfg.EnableAuth = true
-		cfg.SwarmMode = false
+		cfg.DeploymentMode = common.ConfigDeploymentModeDistributed
 		cfg.ReplicationFactor = 1
 		cfg.Metadata.OrchestrationUrls = apiURLs
 

@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const metadata_mod = @import("mod.zig");
 const service = @import("service.zig");
 const transition_state = @import("transition_state.zig");
@@ -23,6 +24,7 @@ const api_table_catalog = @import("../api/table_catalog.zig");
 const api_table_reads = @import("../api/table_reads.zig");
 const api_table_router = @import("../api/table_router.zig");
 const api_table_writes = @import("../api/table_writes.zig");
+const restore_jobs = @import("../api/restore_jobs.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const raft = @import("../raft/mod.zig");
 const raft_host = @import("../raft/host.zig");
@@ -56,6 +58,8 @@ pub const MetadataServer = struct {
     owned_public_http_server: ?*public_api_http_server.ApiHttpServer = null,
     owned_admin_mux: ?*MetadataAdminMux = null,
     owned_admin_listener: ?*raft_transport.StdHttpListener = null,
+    restore_supervisor_owner_id: u64 = 0,
+    restore_supervisor_stop: std.atomic.Value(bool) = .init(false),
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -120,6 +124,12 @@ pub const MetadataServer = struct {
         };
 
         if (cfg.admin_listener) |listener_cfg| {
+            // The request allocator must share identity with the process
+            // allocator used by DB internals (c_allocator when libc is
+            // linked): request-scoped results adopt buffers allocated by
+            // DB-owned components (index metadata, table record clones), so a
+            // distinct allocator identity here turns those adoptions into
+            // cross-allocator frees that corrupt the heap.
             const admin_http_server = try alloc.create(metadata_http_server.MetadataHttpServer);
             admin_http_server.* = metadata_http_server.MetadataHttpServer.init(
                 alloc,
@@ -149,7 +159,8 @@ pub const MetadataServer = struct {
                 data_router,
                 svc.raft.host.http_host.request_executor,
             );
-            _ = public_write_source.withBackendRuntime(try svc.ensureBackendRuntime());
+            const backend_runtime = try svc.ensureBackendRuntime();
+            _ = public_write_source.withBackendRuntime(backend_runtime);
             _ = public_write_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
             _ = public_write_source.withSecretStore(cfg.api_server_cfg.secret_store);
             _ = public_write_source.withRemoteContent(cfg.api_server_cfg.remote_content);
@@ -158,29 +169,36 @@ pub const MetadataServer = struct {
             var api_server_cfg = cfg.api_server_cfg;
             api_server_cfg.shard_ops = if (owned_hosted_shard_ops) |ops| ops.adapter() else null;
             api_server_cfg.shard_db_adapter = owned_hosted_shard_db.?.adapter();
+            api_server_cfg.backend_runtime = backend_runtime;
+            api_server_cfg.restore_execution_guard = .{
+                .ptr = svc,
+                .is_current = metadataRestoreLeadershipIsCurrent,
+            };
 
             const public_http_server = try alloc.create(public_api_http_server.ApiHttpServer);
-            public_http_server.* = public_api_http_server.ApiHttpServer.init(
+            public_http_server.* = public_api_http_server.ApiHttpServer.initWithProcessRequestAllocator(
                 alloc,
                 api_server_cfg,
                 public_api_http_server.StatusSource.fromMetadataHttpService(svc),
                 public_read_source.source(),
                 public_write_source.source(),
             );
+            try public_http_server.attachReplicatedRestoreJobStore(metadataRestoreJobPersistence(svc));
             owned_public_http_server = public_http_server;
 
             const mux = try alloc.create(MetadataAdminMux);
             mux.* = .{
                 .admin = admin_http_server,
                 .public_api = public_http_server,
+                .svc = svc,
             };
             owned_admin_mux = mux;
 
             const listener = try alloc.create(raft_transport.StdHttpListener);
             listener.* = if (svc.apiIoImpl()) |io_impl|
-                raft_transport.StdHttpListener.initShared(alloc, listener_cfg, mux.executor(), io_impl)
+                raft_transport.StdHttpListener.initShared(public_http_server.alloc, listener_cfg, mux.executor(), io_impl)
             else
-                raft_transport.StdHttpListener.init(alloc, listener_cfg, mux.executor());
+                raft_transport.StdHttpListener.init(public_http_server.alloc, listener_cfg, mux.executor());
             owned_admin_listener = listener;
         }
 
@@ -200,6 +218,7 @@ pub const MetadataServer = struct {
     }
 
     pub fn deinit(self: *MetadataServer) void {
+        self.stopRestoreSupervisor();
         if (self.owned_admin_listener) |listener| {
             listener.deinit();
             self.alloc.destroy(listener);
@@ -240,12 +259,70 @@ pub const MetadataServer = struct {
                 std.log.err("metadata server start failed step=admin_listener_start err={}", .{err});
                 return err;
             };
+            errdefer listener.stop();
+        }
+        if (self.owned_admin_mux != null) {
+            const runtime = try self.svc.ensureBackendRuntime();
+            if (runtime.threaded_jobs != null and runtime.io() != null) {
+                self.restore_supervisor_stop.store(false, .release);
+                self.restore_supervisor_owner_id = runtime.allocOwnerId();
+                errdefer self.restore_supervisor_owner_id = 0;
+                try runtime.durable_jobs.submit(.{
+                    .owner_id = self.restore_supervisor_owner_id,
+                    .class = .maintenance,
+                    .ptr = self,
+                    .run = restoreSupervisorRun,
+                    .deinit = restoreSupervisorDeinit,
+                });
+            }
         }
     }
 
     pub fn stop(self: *MetadataServer) void {
         if (self.owned_admin_listener) |listener| listener.stop();
+        self.stopRestoreSupervisor();
         self.svc.stop();
+    }
+
+    fn restoreSupervisorRun(ptr: *anyopaque) !void {
+        const self: *MetadataServer = @ptrCast(@alignCast(ptr));
+        const io = (try self.svc.ensureBackendRuntime()).io() orelse return error.AsyncRestoreUnavailable;
+        var last_unexpected_error: ?anyerror = null;
+        while (!self.restore_supervisor_stop.load(.acquire)) {
+            if (self.owned_admin_mux) |mux| {
+                if (mux.ensureRestoreLeadershipIfLocalLeader()) |local_leader| {
+                    if (local_leader) {
+                        if (mux.public_api.pollRestoreJobsOnce()) |_| {
+                            last_unexpected_error = null;
+                        } else |err| {
+                            if (last_unexpected_error == null or last_unexpected_error.? != err)
+                                std.log.err("metadata restore dispatch retry failed err={s}", .{@errorName(err)});
+                            last_unexpected_error = err;
+                        }
+                    } else {
+                        last_unexpected_error = null;
+                    }
+                } else |err| switch (err) {
+                    error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout => last_unexpected_error = null,
+                    else => {
+                        if (last_unexpected_error == null or last_unexpected_error.? != err)
+                            std.log.err("metadata restore supervisor failed err={s}", .{@errorName(err)});
+                        last_unexpected_error = err;
+                    },
+                }
+            }
+            io.sleep(std.Io.Duration.fromMilliseconds(250), .awake) catch return;
+        }
+    }
+
+    fn restoreSupervisorDeinit(_: *anyopaque) void {}
+
+    fn stopRestoreSupervisor(self: *MetadataServer) void {
+        self.restore_supervisor_stop.store(true, .release);
+        if (self.restore_supervisor_owner_id != 0) {
+            if (self.svc.backend_runtime) |runtime| runtime.durable_jobs.closeOwner(self.restore_supervisor_owner_id);
+        }
+        self.restore_supervisor_owner_id = 0;
     }
 
     pub fn baseUri(self: *MetadataServer, alloc: std.mem.Allocator) ![]u8 {
@@ -325,6 +402,9 @@ pub const MetadataServer = struct {
 const MetadataAdminMux = struct {
     admin: *metadata_http_server.MetadataHttpServer,
     public_api: *public_api_http_server.ApiHttpServer,
+    svc: *service.MetadataHttpService,
+    restore_leadership_mutex: std.atomic.Mutex = .unlocked,
+    restore_leadership_term: u64 = 0,
 
     fn executor(self: *MetadataAdminMux) http_common.RequestExecutor {
         return .{
@@ -335,8 +415,44 @@ const MetadataAdminMux = struct {
 
     fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *MetadataAdminMux = @ptrCast(@alignCast(ptr));
-        if (isPublicApiRequest(req.uri)) return try self.public_api.handle(req);
+        if (isPublicApiRequest(req.uri)) {
+            if (isRestoreApiRequest(req.uri)) {
+                const local_leader = self.ensureRestoreLeadershipIfLocalLeader() catch |err| switch (err) {
+                    error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout => {
+                        return try public_api_http_server.metadataNotLeaderResponse(alloc);
+                    },
+                    else => return err,
+                };
+                // Mutations and collection reads stay leader-serialized. A
+                // follower can refresh one replicated job by key, but it has
+                // no linearizable snapshot for collection pagination.
+                if (!local_leader and (req.method != .GET or isRestoreJobCollectionRequest(req.uri)))
+                    return try public_api_http_server.metadataNotLeaderResponse(alloc);
+            }
+            var response = self.public_api.handle(req) catch |err| switch (err) {
+                error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout => try public_api_http_server.metadataNotLeaderResponse(alloc),
+                else => return err,
+            };
+            if (response.owner_allocator == null) response.owner_allocator = self.public_api.alloc;
+            return response;
+        }
         return try self.admin.executor().execute(alloc, req);
+    }
+
+    fn ensureRestoreLeadershipIfLocalLeader(self: *MetadataAdminMux) !bool {
+        const term = self.svc.localMetadataLeadershipTerm() orelse {
+            platform_sync.lockYielding(&self.restore_leadership_mutex);
+            self.restore_leadership_term = 0;
+            self.restore_leadership_mutex.unlock();
+            return false;
+        };
+        platform_sync.lockYielding(&self.restore_leadership_mutex);
+        defer self.restore_leadership_mutex.unlock();
+        if (self.restore_leadership_term == term) return true;
+        try self.svc.ensureLinearizableRead();
+        try self.public_api.prepareRestoreLeadership(term);
+        self.restore_leadership_term = term;
+        return true;
     }
 
     fn isPublicApiRequest(uri: []const u8) bool {
@@ -344,7 +460,111 @@ const MetadataAdminMux = struct {
             std.mem.startsWith(u8, uri, "/db/v1/") or
             std.mem.startsWith(u8, uri, "/db/v1?");
     }
+
+    fn isRestoreApiRequest(uri: []const u8) bool {
+        const path = if (std.mem.indexOfScalar(u8, uri, '?')) |query| uri[0..query] else uri;
+        if (std.mem.eql(u8, path, "/db/v1/restore") or
+            std.mem.eql(u8, path, "/db/v1/restore/jobs") or
+            std.mem.startsWith(u8, path, "/db/v1/restore/jobs/")) return true;
+        return std.mem.startsWith(u8, path, "/db/v1/tables/") and std.mem.endsWith(u8, path, "/restore");
+    }
+
+    fn isRestoreJobCollectionRequest(uri: []const u8) bool {
+        const path = if (std.mem.indexOfScalar(u8, uri, '?')) |query| uri[0..query] else uri;
+        return std.mem.eql(u8, path, "/db/v1/restore/jobs");
+    }
 };
+
+fn metadataRestoreJobPersistence(svc: *service.MetadataHttpService) restore_jobs.ReplicatedPersistence {
+    return .{ .ptr = svc, .vtable = &.{
+        .load = metadataRestoreJobLoad,
+        .get = metadataRestoreJobGet,
+        .put = metadataRestoreJobPut,
+        .delete = metadataRestoreJobDelete,
+        .delete_many = metadataRestoreJobDeleteMany,
+    } };
+}
+
+fn metadataRestoreJobGet(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    const local_leader = svc.localMetadataLeadershipTerm() != null;
+    if (local_leader) try svc.ensureLinearizableRead();
+    const store = svc.projectedStore() orelse {
+        if (!local_leader) return error.NotLeader;
+        return error.MissingMetadataStore;
+    };
+    const value = try store.getRestoreJobValue(alloc, svc.metadata_group_id, key);
+    // A follower cannot distinguish "not committed here yet" from "does not
+    // exist". Fail retryably until the record is visible instead of leaking a
+    // load-balancer-dependent 404 for a durable job accepted by the leader.
+    if (value == null and !local_leader) return error.NotLeader;
+    return value;
+}
+
+fn metadataRestoreJobLoad(ptr: *anyopaque, alloc: std.mem.Allocator) ![]restore_jobs.ReplicatedPersistence.OwnedRow {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const rows = try store.listRestoreJobRows(alloc, svc.metadata_group_id);
+    defer store.freeRestoreJobRows(alloc, rows);
+    const out = try alloc.alloc(restore_jobs.ReplicatedPersistence.OwnedRow, rows.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |row| {
+            alloc.free(row.key);
+            alloc.free(row.value);
+        }
+        alloc.free(out);
+    }
+    for (rows, 0..) |row, i| {
+        out[i] = .{ .key = try alloc.dupe(u8, row.key), .value = try alloc.dupe(u8, row.value) };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn metadataRestoreJobPut(ptr: *anyopaque, key: []const u8, value: []const u8) !void {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    try svc.proposeTransitionCommand(.{ .upsert_restore_job = .{ .key = key, .value = value } });
+    // `propose` only admits the command to the local Raft node. A successful
+    // job mutation must not become visible to the HTTP caller until a read
+    // barrier proves that this proposal is committed and applied locally.
+    try svc.ensureLinearizableRead();
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const committed = (try store.getRestoreJobValue(svc.alloc, svc.metadata_group_id, key)) orelse
+        return error.RestoreJobCommitNotApplied;
+    defer svc.alloc.free(committed);
+    if (!std.mem.eql(u8, committed, value)) return error.RestoreJobCommitNotApplied;
+}
+
+fn metadataRestoreJobDelete(ptr: *anyopaque, key: []const u8) !void {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    try svc.proposeTransitionCommand(.{ .remove_restore_job = .{ .key = key } });
+    try svc.ensureLinearizableRead();
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    if (try store.getRestoreJobValue(svc.alloc, svc.metadata_group_id, key)) |committed| {
+        svc.alloc.free(committed);
+        return error.RestoreJobCommitNotApplied;
+    }
+}
+
+fn metadataRestoreJobDeleteMany(ptr: *anyopaque, keys: []const []const u8) !void {
+    if (keys.len == 0) return;
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    try svc.proposeTransitionCommand(.{ .remove_restore_jobs = .{ .keys = keys } });
+    try svc.ensureLinearizableRead();
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    for (keys) |key| {
+        if (try store.getRestoreJobValue(svc.alloc, svc.metadata_group_id, key)) |committed| {
+            svc.alloc.free(committed);
+            return error.RestoreJobCommitNotApplied;
+        }
+    }
+}
+
+fn metadataRestoreLeadershipIsCurrent(ptr: *anyopaque, leadership_term: u64) bool {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return svc.localMetadataLeadershipTerm() == leadership_term;
+}
 
 fn metadataStoreGroupRouter(svc: *service.MetadataHttpService) api_table_router.HostedGroupRouter {
     return .{
@@ -979,6 +1199,7 @@ test "metadata admin mux maps admin not leader through metadata executor" {
     var mux = MetadataAdminMux{
         .admin = &admin,
         .public_api = undefined,
+        .svc = undefined,
     };
 
     var response = try mux.executor().execute(std.testing.allocator, .{
@@ -1095,4 +1316,25 @@ test "metadata admin mux routes public db v1 requests through public api server"
     });
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 401), response.status);
+
+    try std.testing.expectError(
+        error.NotLeader,
+        metadataRestoreJobGet(server.svc, std.testing.allocator, "\x00\x00__api_restore_jobs__:0000000000000001"),
+    );
+
+    var list_response = try server.owned_admin_mux.?.executor().execute(std.testing.allocator, .{
+        .method = .GET,
+        .uri = "/db/v1/restore/jobs",
+    });
+    defer list_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), list_response.status);
+
+    // Point reads may proceed to authorization on a follower because the
+    // replicated persistence adapter refreshes the requested key directly.
+    var item_response = try server.owned_admin_mux.?.executor().execute(std.testing.allocator, .{
+        .method = .GET,
+        .uri = "/db/v1/restore/jobs/1",
+    });
+    defer item_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 401), item_response.status);
 }

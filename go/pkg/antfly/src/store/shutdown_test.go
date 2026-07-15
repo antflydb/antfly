@@ -145,7 +145,7 @@ func TestStopRaftGroup_ConcurrentStops(t *testing.T) {
 
 func TestStartRaftGroup_FailedSplitStartPreservesInitArchive(t *testing.T) {
 	s := newTestStore(t)
-	s.antflyConfig.SwarmMode = true
+	s.antflyConfig.DeploymentMode = common.ConfigDeploymentModeStandalone
 
 	shardID := types.ID(42)
 	snapID := common.SplitArchive(shardID)

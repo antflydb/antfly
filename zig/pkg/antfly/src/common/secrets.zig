@@ -16,13 +16,14 @@ const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const fs_paths = @import("fs_paths.zig");
+const platform_time = @import("../platform/time.zig");
 
 const c_env = if (builtin.link_libc and builtin.os.tag != .windows) struct {
     extern "c" var environ: [*:null]?[*:0]u8;
 } else struct {};
 
 pub const SecretStatus = enum {
-    configured_keystore,
+    configured_file,
     configured_env,
     configured_both,
 };
@@ -233,11 +234,13 @@ pub const FileStore = struct {
     entries: std.StringArrayHashMapUnmanaged(StoredSecret) = .{},
     observed_metadata: ?FileMetadata = null,
     generation_value: u64 = 0,
+    generation_snapshot: std.atomic.Value(u64) = .init(0),
     last_reload_failed: bool = false,
     reload_success_count: u64 = 0,
     reload_failure_count: u64 = 0,
     last_success_ns: u64 = 0,
     last_failure_ns: u64 = 0,
+    next_throttled_refresh_ns: std.atomic.Value(u64) = .init(0),
 
     pub fn init(alloc: std.mem.Allocator, path: []const u8) !FileStore {
         var store = FileStore{
@@ -287,6 +290,11 @@ pub const FileStore = struct {
         return self.generationLocked();
     }
 
+    pub fn generationFast(self: *FileStore) u64 {
+        if (self.fallbacks.len == 0) return self.generation_snapshot.load(.acquire);
+        return self.generation();
+    }
+
     pub fn reloadFailed(self: *FileStore) bool {
         self.lock();
         defer self.unlock();
@@ -321,6 +329,27 @@ pub const FileStore = struct {
         var changed = try self.refreshIfChangedLocked();
         for (self.fallbacks) |*fallback| {
             changed = (try fallback.refreshIfChanged()) or changed;
+        }
+        return changed;
+    }
+
+    /// Refresh at most once per interval. The atomic fast path avoids taking
+    /// the store lock or issuing a stat syscall on every cache lookup.
+    pub fn refreshIfChangedThrottled(self: *FileStore, interval_ns: u64) !bool {
+        if (interval_ns == 0) return try self.refreshIfChanged();
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns < self.next_throttled_refresh_ns.load(.acquire)) return false;
+
+        self.lock();
+        defer self.unlock();
+        const locked_now_ns = platform_time.monotonicNs();
+        if (locked_now_ns < self.next_throttled_refresh_ns.load(.acquire)) return false;
+        self.next_throttled_refresh_ns.store(locked_now_ns +| interval_ns, .release);
+        errdefer self.next_throttled_refresh_ns.store(0, .release);
+
+        var changed = try self.refreshIfChangedLocked();
+        for (self.fallbacks) |*fallback| {
+            changed = (try fallback.refreshIfChangedThrottled(interval_ns)) or changed;
         }
         return changed;
     }
@@ -371,19 +400,23 @@ pub const FileStore = struct {
             next.deinit(self.alloc);
         }
 
-        const gop = try next.getOrPut(self.alloc, key);
         const now_ns = nowNs();
-        if (gop.found_existing) {
-            self.alloc.free(gop.value_ptr.value);
-            gop.value_ptr.value = try self.alloc.dupe(u8, value);
-            gop.value_ptr.updated_at_ns = now_ns;
-        } else {
-            gop.key_ptr.* = try self.alloc.dupe(u8, key);
-            gop.value_ptr.* = .{
-                .value = try self.alloc.dupe(u8, value),
+        if (next.getPtr(key)) |existing| {
+            const new_value = try self.alloc.dupe(u8, value);
+            self.alloc.free(existing.value);
+            existing.value = new_value;
+            existing.updated_at_ns = now_ns;
+        } else insert: {
+            const new_key = try self.alloc.dupe(u8, key);
+            errdefer self.alloc.free(new_key);
+            const new_value = try self.alloc.dupe(u8, value);
+            errdefer self.alloc.free(new_value);
+            try next.put(self.alloc, new_key, .{
+                .value = new_value,
                 .created_at_ns = now_ns,
                 .updated_at_ns = now_ns,
-            };
+            });
+            break :insert;
         }
         try self.persistEntries(&next);
         try self.replaceEntriesAfterLocalWriteLocked(&next);
@@ -592,6 +625,7 @@ pub const FileStore = struct {
         self.replaceEntriesLocked(&next);
         self.observed_metadata = metadata;
         self.generation_value +%= 1;
+        self.generation_snapshot.store(self.generation_value, .release);
         self.markReloadHealthyLocked(true);
         return true;
     }
@@ -627,6 +661,7 @@ pub const FileStore = struct {
         self.replaceEntriesLocked(next);
         self.observed_metadata = try statFileMetadata(self.path);
         self.generation_value +%= 1;
+        self.generation_snapshot.store(self.generation_value, .release);
         self.markReloadHealthyLocked(true);
     }
 
@@ -699,14 +734,16 @@ fn loadEntriesFromFile(alloc: std.mem.Allocator, path: []const u8) !std.StringAr
 
     for (parsed.value.secrets) |item| {
         try validateKey(item.key);
-        const gop = try entries.getOrPut(alloc, item.key);
-        if (gop.found_existing) continue;
-        gop.key_ptr.* = try alloc.dupe(u8, item.key);
-        gop.value_ptr.* = .{
-            .value = try alloc.dupe(u8, item.value),
+        if (entries.contains(item.key)) return error.DuplicateSecretKey;
+        const key = try alloc.dupe(u8, item.key);
+        errdefer alloc.free(key);
+        const value = try alloc.dupe(u8, item.value);
+        errdefer alloc.free(value);
+        try entries.put(alloc, key, .{
+            .value = value,
             .created_at_ns = item.created_at_ns orelse 0,
             .updated_at_ns = item.updated_at_ns orelse item.created_at_ns orelse 0,
-        };
+        });
     }
 
     return entries;
@@ -862,7 +899,7 @@ fn describeStored(alloc: std.mem.Allocator, key: []const u8, stored: StoredSecre
     const has_env = hasEnvVar(env_var);
     return .{
         .key = try alloc.dupe(u8, key),
-        .status = if (has_env) .configured_both else .configured_keystore,
+        .status = if (has_env) .configured_both else .configured_file,
         .env_var = env_var,
         .created_at = if (stored.created_at_ns > 0) try formatTimestampOwned(alloc, stored.created_at_ns) else null,
         .updated_at = if (stored.updated_at_ns > 0) try formatTimestampOwned(alloc, stored.updated_at_ns) else null,
@@ -973,26 +1010,44 @@ fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
+    var tmp_exists = false;
+    defer if (tmp_exists) deleteFileWithIo(io, tmp_path) catch {};
 
     {
-        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
+        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true, .exclusive = true });
+        tmp_exists = true;
         defer file.close(io);
+        if (builtin.os.tag != .windows and builtin.os.tag != .wasi and builtin.os.tag != .freestanding) {
+            try file.setPermissions(io, @enumFromInt(0o600));
+        }
         var buf: [4096]u8 = undefined;
         var writer = file.writer(io, &buf);
         try writer.interface.writeAll(contents);
         try writer.end();
+        try file.sync(io);
     }
 
-    std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io) catch |err| {
-        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
-        return err;
-    };
+    if (std.fs.path.isAbsolute(path)) {
+        try std.Io.Dir.renameAbsolute(tmp_path, path, io);
+    } else {
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+    }
+    tmp_exists = false;
+    try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".");
 }
 
 fn deleteFile(path: []const u8) !void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
-    try std.Io.Dir.cwd().deleteFile(io_impl.io(), path);
+    try deleteFileWithIo(io_impl.io(), path);
+}
+
+fn deleteFileWithIo(io: std.Io, path: []const u8) !void {
+    if (std.fs.path.isAbsolute(path)) {
+        try std.Io.Dir.deleteFileAbsolute(io, path);
+    } else {
+        try std.Io.Dir.cwd().deleteFile(io, path);
+    }
 }
 
 fn nowNs() u64 {
@@ -1021,8 +1076,14 @@ test "file secret store persists values and overlays env status" {
 
     var entry = try store.put(alloc, "openai.api_key", "abc123");
     defer entry.deinit(alloc);
-    try std.testing.expectEqual(SecretStatus.configured_keystore, entry.status);
+    try std.testing.expectEqual(SecretStatus.configured_file, entry.status);
     try std.testing.expectEqualStrings("OPENAI_API_KEY", entry.env_var.?);
+    if (builtin.os.tag != .windows and builtin.os.tag != .wasi and builtin.os.tag != .freestanding) {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_only });
+        defer file.close(std.testing.io);
+        const stat = try file.stat(std.testing.io);
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o077);
+    }
 
     const stored = try store.getOwned(alloc, "openai.api_key");
     defer if (stored) |value| alloc.free(value);
@@ -1052,6 +1113,7 @@ test "file secret store reloads valid external replacements including deletions"
     var store = try FileStore.init(alloc, path);
     defer store.deinit();
     const initial_generation = store.generation();
+    try std.testing.expectEqual(initial_generation, store.generationFast());
 
     const first = try store.getOwned(alloc, "openai.api_key");
     defer if (first) |value| alloc.free(value);
@@ -1069,6 +1131,31 @@ test "file secret store reloads valid external replacements including deletions"
     const deleted = try store.getOwned(alloc, "deleted.dynamic_secret");
     defer if (deleted) |value| alloc.free(value);
     try std.testing.expectEqual(@as(?[]u8, null), deleted);
+}
+
+test "file secret store throttles cache-key freshness checks" {
+    const alloc = std.testing.allocator;
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/test-secrets-throttle-{d}.json", .{nowNs()});
+    defer alloc.free(path);
+    defer deleteFile(path) catch {};
+
+    try writeFileAtomically(path,
+        \\{"secrets":[{"key":"openai.api_key","value":"first","created_at_ns":1,"updated_at_ns":1}]}
+    );
+    var store = try FileStore.init(alloc, path);
+    defer store.deinit();
+    const initial_generation = store.generation();
+    try std.testing.expect(!(try store.refreshIfChangedThrottled(std.time.ns_per_hour)));
+
+    try writeFileAtomically(path,
+        \\{"secrets":[{"key":"openai.api_key","value":"second-longer","created_at_ns":1,"updated_at_ns":2}]}
+    );
+    try std.testing.expect(!(try store.refreshIfChangedThrottled(std.time.ns_per_hour)));
+    try std.testing.expectEqual(initial_generation, store.generation());
+
+    try std.testing.expect(try store.refreshIfChanged());
+    try std.testing.expectEqual(initial_generation + 1, store.generation());
+    try std.testing.expectEqual(initial_generation + 1, store.generationFast());
 }
 
 test "file secret store keeps last known good snapshot for malformed and missing files" {

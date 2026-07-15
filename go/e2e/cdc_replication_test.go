@@ -34,9 +34,9 @@ func TestCDCReplication(t *testing.T) {
 
 	ctx := testContext(t, 5*time.Minute)
 
-	// Start a single Antfly swarm for all sub-tests
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
-	t.Cleanup(swarm.Cleanup)
+	// Start a single Antfly standalone for all sub-tests
+	standalone := startAntflyStandaloneWithOptions(t, ctx, StandaloneOptions{DisableInference: true})
+	t.Cleanup(standalone.Cleanup)
 
 	t.Run("Passthrough", func(t *testing.T) {
 		pgTable := "antfly_cdc_e2e_passthrough"
@@ -62,7 +62,7 @@ func TestCDCReplication(t *testing.T) {
 
 		// Create Antfly table with replication source (passthrough mode — no on_update/on_delete)
 		t.Log("Creating Antfly table with CDC replication source (passthrough)...")
-		err = swarm.Client.CreateTable(ctx, antflyTable, antfly.CreateTableRequest{
+		err = standalone.Client.CreateTable(ctx, antflyTable, antfly.CreateTableRequest{
 			NumShards: 1,
 			ReplicationSources: []antfly.ReplicationSource{
 				{
@@ -74,7 +74,7 @@ func TestCDCReplication(t *testing.T) {
 			},
 		})
 		require.NoError(t, err, "creating Antfly table with CDC source")
-		waitForShardsReady(t, ctx, swarm.Client, antflyTable, 30*time.Second)
+		waitForShardsReady(t, ctx, standalone.Client, antflyTable, 30*time.Second)
 
 		// INSERT rows into PG
 		t.Log("Inserting rows into PostgreSQL...")
@@ -91,12 +91,12 @@ func TestCDCReplication(t *testing.T) {
 		t.Log("Waiting for CDC replication...")
 		for _, key := range []string{"user-1", "user-2", "user-3"} {
 			require.NoError(t,
-				waitForKeyAvailable(t, ctx, swarm.Client, antflyTable, key, 30*time.Second),
+				waitForKeyAvailable(t, ctx, standalone.Client, antflyTable, key, 30*time.Second),
 				"key %s not replicated", key)
 		}
 
 		// Verify document content
-		doc, err := swarm.Client.LookupKey(ctx, antflyTable, "user-1")
+		doc, err := standalone.Client.LookupKey(ctx, antflyTable, "user-1")
 		require.NoError(t, err)
 		require.Equal(t, "Alice", doc["name"], "expected name=Alice")
 		require.Equal(t, "alice@example.com", doc["email"], "expected email")
@@ -109,7 +109,7 @@ func TestCDCReplication(t *testing.T) {
 
 		// Wait for update to propagate
 		require.NoError(t,
-			waitForFieldValue(t, ctx, swarm.Client, antflyTable, "user-1", "email", "alice-new@example.com", 30*time.Second),
+			waitForFieldValue(t, ctx, standalone.Client, antflyTable, "user-1", "email", "alice-new@example.com", 30*time.Second),
 			"UPDATE not replicated")
 		t.Log("UPDATE replicated successfully")
 
@@ -122,7 +122,7 @@ func TestCDCReplication(t *testing.T) {
 		// The document still exists but fields should be removed.
 		// Wait for a field to disappear.
 		require.NoError(t,
-			waitForFieldGone(t, ctx, swarm.Client, antflyTable, "user-3", "name", 30*time.Second),
+			waitForFieldGone(t, ctx, standalone.Client, antflyTable, "user-3", "name", 30*time.Second),
 			"DELETE (auto $unset) not replicated")
 		t.Log("DELETE (auto $unset) replicated successfully")
 
@@ -151,7 +151,7 @@ func TestCDCReplication(t *testing.T) {
 
 		// Create Antfly table with custom on_update and on_delete transforms
 		t.Log("Creating Antfly table with custom CDC transforms...")
-		err = swarm.Client.CreateTable(ctx, antflyTable, antfly.CreateTableRequest{
+		err = standalone.Client.CreateTable(ctx, antflyTable, antfly.CreateTableRequest{
 			NumShards: 1,
 			ReplicationSources: []antfly.ReplicationSource{
 				{
@@ -171,7 +171,7 @@ func TestCDCReplication(t *testing.T) {
 			},
 		})
 		require.NoError(t, err, "creating Antfly table with custom transforms")
-		waitForShardsReady(t, ctx, swarm.Client, antflyTable, 30*time.Second)
+		waitForShardsReady(t, ctx, standalone.Client, antflyTable, 30*time.Second)
 
 		time.Sleep(3 * time.Second)
 
@@ -184,11 +184,11 @@ func TestCDCReplication(t *testing.T) {
 
 		// Wait for document
 		require.NoError(t,
-			waitForKeyAvailable(t, ctx, swarm.Client, antflyTable, "t-1", 30*time.Second),
+			waitForKeyAvailable(t, ctx, standalone.Client, antflyTable, "t-1", 30*time.Second),
 			"key t-1 not replicated")
 
 		// Verify custom transforms applied
-		doc, err := swarm.Client.LookupKey(ctx, antflyTable, "t-1")
+		doc, err := standalone.Client.LookupKey(ctx, antflyTable, "t-1")
 		require.NoError(t, err)
 		require.Equal(t, "Alice", doc["name"], "on_update should set name from {{user_name}}")
 		require.Equal(t, "alice@example.com", doc["email"], "on_update should set email from {{user_email}}")
@@ -206,11 +206,11 @@ func TestCDCReplication(t *testing.T) {
 
 		// Wait for active=false
 		require.NoError(t,
-			waitForFieldValue(t, ctx, swarm.Client, antflyTable, "t-1", "active", false, 30*time.Second),
+			waitForFieldValue(t, ctx, standalone.Client, antflyTable, "t-1", "active", false, 30*time.Second),
 			"on_delete soft-delete not replicated")
 
 		// Document should still exist with name intact
-		doc, err = swarm.Client.LookupKey(ctx, antflyTable, "t-1")
+		doc, err = standalone.Client.LookupKey(ctx, antflyTable, "t-1")
 		require.NoError(t, err)
 		require.Equal(t, "Alice", doc["name"], "soft-delete should preserve other fields")
 		t.Log("Custom transform test passed: soft-delete working")
@@ -239,7 +239,7 @@ func TestCDCReplication(t *testing.T) {
 
 		// Create Antfly table with $delete_document on_delete
 		t.Log("Creating Antfly table with $delete_document on_delete...")
-		err = swarm.Client.CreateTable(ctx, antflyTable, antfly.CreateTableRequest{
+		err = standalone.Client.CreateTable(ctx, antflyTable, antfly.CreateTableRequest{
 			NumShards: 1,
 			ReplicationSources: []antfly.ReplicationSource{
 				{
@@ -254,7 +254,7 @@ func TestCDCReplication(t *testing.T) {
 			},
 		})
 		require.NoError(t, err, "creating Antfly table")
-		waitForShardsReady(t, ctx, swarm.Client, antflyTable, 30*time.Second)
+		waitForShardsReady(t, ctx, standalone.Client, antflyTable, 30*time.Second)
 
 		time.Sleep(3 * time.Second)
 
@@ -267,10 +267,10 @@ func TestCDCReplication(t *testing.T) {
 
 		// Wait for document to appear
 		require.NoError(t,
-			waitForKeyAvailable(t, ctx, swarm.Client, antflyTable, "d-1", 30*time.Second),
+			waitForKeyAvailable(t, ctx, standalone.Client, antflyTable, "d-1", 30*time.Second),
 			"key d-1 not replicated")
 
-		doc, err := swarm.Client.LookupKey(ctx, antflyTable, "d-1")
+		doc, err := standalone.Client.LookupKey(ctx, antflyTable, "d-1")
 		require.NoError(t, err)
 		require.Equal(t, "hello", doc["value"])
 		t.Log("Document d-1 replicated successfully")
@@ -282,7 +282,7 @@ func TestCDCReplication(t *testing.T) {
 
 		// Wait for document to be gone
 		require.NoError(t,
-			waitForKeyGone(t, ctx, swarm.Client, antflyTable, "d-1", 30*time.Second),
+			waitForKeyGone(t, ctx, standalone.Client, antflyTable, "d-1", 30*time.Second),
 			"$delete_document did not remove Antfly document")
 		t.Log("$delete_document test passed: document fully removed")
 
@@ -313,19 +313,19 @@ func TestCDCReplication(t *testing.T) {
 
 		// Create the two target Antfly tables first (routes target existing tables)
 		t.Log("Creating target Antfly tables for route fan-out...")
-		err = swarm.Client.CreateTable(ctx, antflyPremium, antfly.CreateTableRequest{NumShards: 1})
+		err = standalone.Client.CreateTable(ctx, antflyPremium, antfly.CreateTableRequest{NumShards: 1})
 		require.NoError(t, err, "creating premium table")
-		waitForShardsReady(t, ctx, swarm.Client, antflyPremium, 30*time.Second)
+		waitForShardsReady(t, ctx, standalone.Client, antflyPremium, 30*time.Second)
 
-		err = swarm.Client.CreateTable(ctx, antflyFree, antfly.CreateTableRequest{NumShards: 1})
+		err = standalone.Client.CreateTable(ctx, antflyFree, antfly.CreateTableRequest{NumShards: 1})
 		require.NoError(t, err, "creating free table")
-		waitForShardsReady(t, ctx, swarm.Client, antflyFree, 30*time.Second)
+		waitForShardsReady(t, ctx, standalone.Client, antflyFree, 30*time.Second)
 
 		// Create a "router" table that owns the replication source with routes
 		// The router table itself won't receive data — the routes fan out to the targets.
 		antflyRouter := "cdc_routes_router"
 		t.Log("Creating router Antfly table with CDC routes...")
-		err = swarm.Client.CreateTable(ctx, antflyRouter, antfly.CreateTableRequest{
+		err = standalone.Client.CreateTable(ctx, antflyRouter, antfly.CreateTableRequest{
 			NumShards: 1,
 			ReplicationSources: []antfly.ReplicationSource{
 				{
@@ -347,7 +347,7 @@ func TestCDCReplication(t *testing.T) {
 			},
 		})
 		require.NoError(t, err, "creating router table with CDC routes")
-		waitForShardsReady(t, ctx, swarm.Client, antflyRouter, 30*time.Second)
+		waitForShardsReady(t, ctx, standalone.Client, antflyRouter, 30*time.Second)
 
 		time.Sleep(3 * time.Second)
 
@@ -367,29 +367,29 @@ func TestCDCReplication(t *testing.T) {
 		t.Log("Waiting for route fan-out replication...")
 		for _, key := range []string{"r-1", "r-3"} {
 			require.NoError(t,
-				waitForKeyAvailable(t, ctx, swarm.Client, antflyPremium, key, 30*time.Second),
+				waitForKeyAvailable(t, ctx, standalone.Client, antflyPremium, key, 30*time.Second),
 				"premium key %s not replicated", key)
 		}
 
 		// Verify free users land in the free table
 		for _, key := range []string{"r-2", "r-4"} {
 			require.NoError(t,
-				waitForKeyAvailable(t, ctx, swarm.Client, antflyFree, key, 30*time.Second),
+				waitForKeyAvailable(t, ctx, standalone.Client, antflyFree, key, 30*time.Second),
 				"free key %s not replicated", key)
 		}
 
 		// Verify premium users are NOT in the free table
-		doc, err := swarm.Client.LookupKey(ctx, antflyFree, "r-1")
+		doc, err := standalone.Client.LookupKey(ctx, antflyFree, "r-1")
 		require.Error(t, err, "premium user r-1 should not be in free table")
 		_ = doc
 
 		// Verify free users are NOT in the premium table
-		doc, err = swarm.Client.LookupKey(ctx, antflyPremium, "r-2")
+		doc, err = standalone.Client.LookupKey(ctx, antflyPremium, "r-2")
 		require.Error(t, err, "free user r-2 should not be in premium table")
 		_ = doc
 
 		// Verify document content
-		doc, err = swarm.Client.LookupKey(ctx, antflyPremium, "r-1")
+		doc, err = standalone.Client.LookupKey(ctx, antflyPremium, "r-1")
 		require.NoError(t, err)
 		require.Equal(t, "Alice", doc["name"])
 		require.Equal(t, "premium", doc["tier"])
@@ -402,7 +402,7 @@ func TestCDCReplication(t *testing.T) {
 
 		// After the UPDATE, r-2 should appear in premium table
 		require.NoError(t,
-			waitForKeyAvailable(t, ctx, swarm.Client, antflyPremium, "r-2", 30*time.Second),
+			waitForKeyAvailable(t, ctx, standalone.Client, antflyPremium, "r-2", 30*time.Second),
 			"r-2 should appear in premium table after tier change")
 		t.Log("Route fan-out UPDATE test passed")
 
@@ -431,7 +431,7 @@ func TestCDCReplication(t *testing.T) {
 
 		// Create Antfly table with publication_filter: only status='active' rows
 		t.Log("Creating Antfly table with publication_filter...")
-		err = swarm.Client.CreateTable(ctx, antflyTable, antfly.CreateTableRequest{
+		err = standalone.Client.CreateTable(ctx, antflyTable, antfly.CreateTableRequest{
 			NumShards: 1,
 			ReplicationSources: []antfly.ReplicationSource{
 				{
@@ -444,7 +444,7 @@ func TestCDCReplication(t *testing.T) {
 			},
 		})
 		require.NoError(t, err, "creating Antfly table with publication_filter")
-		waitForShardsReady(t, ctx, swarm.Client, antflyTable, 30*time.Second)
+		waitForShardsReady(t, ctx, standalone.Client, antflyTable, 30*time.Second)
 
 		time.Sleep(3 * time.Second)
 
@@ -463,12 +463,12 @@ func TestCDCReplication(t *testing.T) {
 		t.Log("Waiting for filtered replication...")
 		for _, key := range []string{"pf-1", "pf-3"} {
 			require.NoError(t,
-				waitForKeyAvailable(t, ctx, swarm.Client, antflyTable, key, 30*time.Second),
+				waitForKeyAvailable(t, ctx, standalone.Client, antflyTable, key, 30*time.Second),
 				"active key %s not replicated", key)
 		}
 
 		// Verify content
-		doc, err := swarm.Client.LookupKey(ctx, antflyTable, "pf-1")
+		doc, err := standalone.Client.LookupKey(ctx, antflyTable, "pf-1")
 		require.NoError(t, err)
 		require.Equal(t, "Alice", doc["name"])
 		require.Equal(t, "active", doc["status"])
@@ -476,7 +476,7 @@ func TestCDCReplication(t *testing.T) {
 		// Wait a bit and verify inactive row did NOT appear
 		// (PG publication WHERE clause should have excluded it)
 		time.Sleep(5 * time.Second)
-		_, err = swarm.Client.LookupKey(ctx, antflyTable, "pf-2")
+		_, err = standalone.Client.LookupKey(ctx, antflyTable, "pf-2")
 		require.Error(t, err, "inactive row pf-2 should not be replicated (publication_filter)")
 		t.Log("Publication filter test passed: only active rows replicated")
 

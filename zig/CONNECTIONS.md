@@ -335,6 +335,23 @@ Credentials and headers must not be returned by default. If the UI needs to
 show that a secret reference exists, expose a redacted secret-ref summary behind
 an explicit `connection.secret_ref:read` permission.
 
+For backup and restore connections, object-store credential references are
+resolved when an operation or live probe starts rather than expanded into
+long-lived plaintext at node startup. Secret rotation consequently applies to
+new backup, restore, and probe clients without a restart. Each client retains
+one consistent snapshot for its lifetime, and a probe cache key includes only a
+cryptographic digest of the resolved credential material. Primary object
+storage resolves its snapshot at bootstrap; dynamic AWS credential sources
+refresh in place, while rotating static primary keys requires a controlled
+restart. Connection capabilities and bucket/prefix scopes remain config-owned
+authorization and are never sourced from the secret store.
+
+Live probes use bounded fanout on the server's shared `std.Io` runtime. S3,
+GCS, and credential-refresh transports borrow that runtime rather than creating
+one threaded scheduler per connection. This keeps probe cost proportional to
+active network work and the configured worker bound, even when many buckets and
+credential domains are registered.
+
 ### CDC
 
 CDC connections describe change-stream sources. Postgres is the first provider.

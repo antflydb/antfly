@@ -110,6 +110,42 @@ pub const DocumentTransform = struct {
     upsert: bool = false,
 };
 
+pub const SplitReplicationCheckpoint = struct {
+    pub const Kind = enum {
+        destination,
+        source_ack,
+    };
+
+    kind: Kind,
+    source_group_id: u64,
+    destination_group_id: u64,
+    range_start: []const u8 = "",
+    range_end: []const u8 = "",
+    delta_sequence: u64,
+};
+
+/// Identity inherited by an unpublished split destination. Every replicated
+/// destination batch carries this context so all replicas create the physical
+/// DB with the same namespace before the destination range is catalog-visible.
+pub const SplitReplicationContext = struct {
+    source_group_id: u64,
+    destination_group_id: u64,
+    identity_namespace: doc_identity_mod.Namespace,
+};
+
+pub const SplitTransitionMutation = struct {
+    pub const Kind = enum {
+        prepare,
+        start,
+        finalize,
+        rollback,
+    };
+
+    kind: Kind,
+    destination_group_id: u64,
+    split_key: []const u8 = "",
+};
+
 pub const BatchRequest = struct {
     writes: []const BatchWrite = &.{},
     deletes: []const []const u8 = &.{},
@@ -119,6 +155,12 @@ pub const BatchRequest = struct {
     predicates: []const TransactionVersionPredicate = &.{},
     timestamp_ns: u64 = 0,
     sync_level: SyncLevel = .write,
+    /// Internal data-Raft transition state. Public batch parsing never sets it.
+    split_checkpoint: ?SplitReplicationCheckpoint = null,
+    /// Internal identity context for writes to an unpublished split destination.
+    split_replication: ?SplitReplicationContext = null,
+    /// Internal source lifecycle mutation. It must be ordered with data writes.
+    split_transition: ?SplitTransitionMutation = null,
 };
 
 pub const GraphEdgeWrite = struct {
@@ -152,6 +194,9 @@ pub const IndexConfig = struct {
     kind: IndexKind,
     config_json: []const u8,
     coverage_generation: u64 = 0,
+    // Internal semantic identity, validated and computed once when the config
+    // enters the catalog. It is derived metadata and is not serialized.
+    coverage_config_fingerprint: ?u64 = null,
 
     pub fn clone(alloc: Allocator, cfg: IndexConfig) !IndexConfig {
         return .{
@@ -159,6 +204,7 @@ pub const IndexConfig = struct {
             .kind = cfg.kind,
             .config_json = try alloc.dupe(u8, cfg.config_json),
             .coverage_generation = cfg.coverage_generation,
+            .coverage_config_fingerprint = cfg.coverage_config_fingerprint,
         };
     }
 
@@ -1846,6 +1892,9 @@ pub const VisibilityStats = struct {
 };
 
 pub const DBStats = struct {
+    /// Canonical live primary-document cardinality from durable identity metadata.
+    /// Unlike doc_count, this is independent of derived index fan-out.
+    source_doc_count: u64 = 0,
     doc_count: u64 = 0,
     index_count: u32 = 0,
     indexes: []DBIndexStats = &.{},
@@ -2129,8 +2178,16 @@ pub const DBIndexStats = struct {
     edge_count: u64 = 0,
     node_count: u64 = 0,
     root_node: u64 = 0,
+    coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,
+    // Stable across shard-local marker generations for the same stored config.
+    coverage_config_hash: u64 = 0,
+    coverage_summary_ready: bool = true,
+    // Internal identity used while collecting stats. These fields are not part
+    // of the public status contract.
+    coverage_generation: u64 = 0,
+    coverage_identity_ready: bool = false,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
     enrichment_failed: bool = false,

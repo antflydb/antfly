@@ -3,7 +3,7 @@
 ## Repository Layout
 
 ```
-go/pkg/antfly/cmd/          CLI entry point (cobra subcommands: swarm, store, metadata, query, load, etc.)
+go/pkg/antfly/cmd/          CLI entry point (cobra subcommands: standalone, store, metadata, query, load, etc.)
 go/pkg/antfly/src/
   metadata/          Metadata server (API, Raft, schema management, retrieval agents)
   store/             Storage nodes (shards, indexes, queries, transactions)
@@ -86,13 +86,13 @@ Run `make help` for the full list. Key targets:
 
 ## Running Locally
 
-### Swarm Mode (Single Process)
+### Standalone Mode (Single Process)
 
 Runs metadata, storage, and Antfly inference together:
 
 ```bash
 cd go/pkg/antfly
-go run ./cmd swarm
+go run ./cmd standalone
 ```
 
 Dashboard at `http://localhost:8080`. Antfly inference auto-discovers models from `~/.antfly/inference/models/`.
@@ -211,11 +211,11 @@ Example configs live in `configs/`:
 
 | File | Description |
 |------|-------------|
-| `config-no-tls.yaml` | Local development without TLS |
-| `config-tls.yaml` | TLS-enabled configuration |
-| `config-s3-example.yaml` | S3 storage backend |
-| `config-s3-minio-local.yaml` | Local MinIO for S3 testing |
-| `config-secrets-example.yaml` | Secrets / keystore usage |
+| `config-no-tls.json` | Local development without TLS |
+| `config-tls.json` | TLS-enabled configuration |
+| `config-s3-example.json` | Serverless S3 storage with named connections and multi-bucket lanes |
+| `config-s3-minio-local.json` | Serverless object storage on local MinIO |
+| `config-secrets-example.json` | Secrets / keystore usage |
 
 ## Releasing
 

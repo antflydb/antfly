@@ -34,20 +34,20 @@ func TestLinearMerge_IdempotentSync(t *testing.T) {
 
 	ctx := testContext(t, 2*time.Minute)
 
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
-	t.Cleanup(swarm.Cleanup)
+	standalone := startAntflyStandaloneWithOptions(t, ctx, StandaloneOptions{DisableInference: true})
+	t.Cleanup(standalone.Cleanup)
 
 	tableName := "test_idempotent_sync"
 
 	// Create table
 	t.Log("Creating table...")
-	err := swarm.Client.CreateTable(ctx, tableName, antfly.CreateTableRequest{
+	err := standalone.Client.CreateTable(ctx, tableName, antfly.CreateTableRequest{
 		NumShards: 1,
 	})
 	require.NoError(t, err)
 
 	// Wait for shards to be ready
-	waitForShardsReady(t, ctx, swarm.Client, tableName, 30*time.Second)
+	waitForShardsReady(t, ctx, standalone.Client, tableName, 30*time.Second)
 
 	// Prepare test data - simulate documents from docsaf
 	// These are documents WITHOUT _timestamp field (as they would come from docsaf)
@@ -74,7 +74,7 @@ func TestLinearMerge_IdempotentSync(t *testing.T) {
 
 	// FIRST SYNC - all documents should be inserted
 	t.Log("=== First Sync ===")
-	result1, err := swarm.Client.LinearMerge(ctx, tableName, antfly.LinearMergeRequest{
+	result1, err := standalone.Client.LinearMerge(ctx, tableName, antfly.LinearMergeRequest{
 		Records:      testRecords,
 		LastMergedId: "",
 		DryRun:       false,
@@ -98,7 +98,7 @@ func TestLinearMerge_IdempotentSync(t *testing.T) {
 	// but the stored documents DO have _timestamp (added by the system).
 	// The hash comparison should ignore _timestamp, so these should be skipped.
 	t.Log("=== Second Sync (Idempotent) ===")
-	result2, err := swarm.Client.LinearMerge(ctx, tableName, antfly.LinearMergeRequest{
+	result2, err := standalone.Client.LinearMerge(ctx, tableName, antfly.LinearMergeRequest{
 		Records:      testRecords,
 		LastMergedId: "",
 		DryRun:       false,
@@ -139,7 +139,7 @@ func TestLinearMerge_IdempotentSync(t *testing.T) {
 		},
 	}
 
-	result3, err := swarm.Client.LinearMerge(ctx, tableName, antfly.LinearMergeRequest{
+	result3, err := standalone.Client.LinearMerge(ctx, tableName, antfly.LinearMergeRequest{
 		Records:      modifiedRecords,
 		LastMergedId: "",
 		DryRun:       false,

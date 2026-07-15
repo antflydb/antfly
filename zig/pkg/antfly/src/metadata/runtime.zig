@@ -158,7 +158,7 @@ const ResolvedPaths = struct {
 /// Backs the metadata server's health/metrics endpoints. Exposes local raft
 /// host metrics and managed-service metrics as Prometheus text, and reports
 /// readiness from a cached, constant-time probe flag. Shared by the standalone
-/// metadata runtime and the swarm runtime so both expose the same metric set.
+/// metadata runtime and the standalone runtime so both expose the same metric set.
 pub const HealthSource = struct {
     server: *Server,
 
@@ -208,6 +208,7 @@ pub const HealthSource = struct {
         try append(writer, "antfly_raft_backup_bootstrap_attempts_total", "counter", "Total backup bootstrap attempts", @intCast(host_metrics.backup_bootstrap_attempts));
         try append(writer, "antfly_raft_backup_bootstrap_failures_total", "counter", "Total backup bootstrap failures", @intCast(host_metrics.backup_bootstrap_failures));
         try append(writer, "antfly_raft_backup_bootstrap_successes_total", "counter", "Total backup bootstrap successes", @intCast(host_metrics.backup_bootstrap_successes));
+        try append(writer, "antfly_raft_backup_bootstrap_durability_pending_total", "counter", "Total backup bootstraps awaiting generation durability confirmation", @intCast(host_metrics.backup_bootstrap_durability_pending));
         try append(writer, "antfly_raft_async_send_enqueued_total", "counter", "Total raft frames enqueued for async HTTP send", host_metrics.async_send_enqueued);
         try append(writer, "antfly_raft_async_send_failed_total", "counter", "Total async raft HTTP send failures before retry or drop", host_metrics.async_send_failed);
         try append(writer, "antfly_raft_async_send_retried_total", "counter", "Total async raft HTTP frames requeued for retry", host_metrics.async_send_retried);

@@ -7,14 +7,14 @@ This directory contains end-to-end (e2e) tests for Antfly that test the full sys
 ### `TestE2E_RetrievalAgent_DocsEval`
 
 A comprehensive e2e test that:
-1. Starts Antfly in swarm mode programmatically (metadata + store + antfly inference servers)
+1. Starts Antfly in standalone mode programmatically (metadata + store + antfly inference servers)
 2. Indexes real Antfly documentation using docsaf library (~2,500 document sections)
 3. Creates table with hybrid search (BM25 + embeddings) and waits for enrichment
 4. Executes 8 retrieval agent queries with semantic search and reasoning
 5. Validates answer quality using LLM-as-judge evaluation (faithfulness, relevance, completeness)
 
 **What it tests:**
-- Swarm mode startup and initialization (metadata + store + antfly inference servers)
+- Standalone mode startup and initialization (metadata + store + antfly inference servers)
 - Document indexing pipeline (docsaf → LinearMerge)
 - Hybrid search (BM25 full-text + vector embeddings)
 - Embedding enrichment with Antfly inference chunking service
@@ -187,9 +187,9 @@ Simply open the Markdown files in any text editor or Markdown viewer. The report
 
 ### Key Functions
 
-**Swarm Management:**
-- `startAntflySwarm()` - Start metadata + store servers with dynamic ports
-- `SwarmInstance.Cleanup()` - Graceful shutdown and cleanup
+**Standalone Management:**
+- `startAntflyStandalone()` - Start metadata + store servers with dynamic ports
+- `StandaloneInstance.Cleanup()` - Graceful shutdown and cleanup
 
 **Document Indexing:**
 - `indexAntflyDocs()` - Index documentation using docsaf library
@@ -228,7 +228,7 @@ Test queries in `test_queries.json` ask questions about:
 - Build process
 - Docsaf tool
 - Hybrid search
-- Swarm mode
+- Standalone mode
 - Table creation
 
 ## Validation Criteria
@@ -295,8 +295,8 @@ ollama serve
 
 ```
 === RUN   TestE2E_RetrievalAgent_DocsEval
-    docsaf_test.go:426: Starting Antfly swarm...
-    docsaf_test.go:156: Swarm started successfully
+    docsaf_test.go:426: Starting Antfly standalone...
+    docsaf_test.go:156: Standalone started successfully
     docsaf_test.go:436: Indexing Antfly documentation...
     docsaf_test.go:210: Found 156 document sections
     docsaf_test.go:227: Linear merge results: upserted=156, skipped=0, deleted=0
@@ -321,7 +321,7 @@ PASS
 ## Contributing
 
 When adding new e2e tests:
-1. Follow existing patterns (swarm startup, cleanup, validation)
+1. Follow existing patterns (standalone startup, cleanup, validation)
 2. Use `t.TempDir()` for temporary directories
 3. Use dynamic port allocation (`GetFreePort()`)
 4. Add proper cleanup with `defer`

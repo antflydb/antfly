@@ -565,7 +565,7 @@ pub const MultiRaft = struct {
         if (!grp.hasReady()) return false;
 
         const ready_build_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-        const ready = grp.ready();
+        var ready = grp.ready();
         if (diagnostics) |diag| diag.ready_build_elapsed_ns = clock.elapsedSinceNs(ready_build_start_ns);
         if (ready.isEmpty()) return false;
 
@@ -644,6 +644,10 @@ pub const MultiRaft = struct {
         defer if (snapshot_started) {
             self.hooks.snapshot_throttle.?.endSnapshot(group_id);
         };
+
+        if (try grp.applyCommittedConfChanges(ready.committed_entries)) {
+            ready.conf_state = grp.status().conf_state;
+        }
 
         const persist_ready_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         if (ready.requiresPersistence()) {

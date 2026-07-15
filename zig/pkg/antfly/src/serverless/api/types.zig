@@ -445,7 +445,7 @@ pub const RuntimeStorageTarget = struct {
 
 pub const RuntimeStatusResult = struct {
     role: RuntimeRole,
-    swarm_mode: bool = false,
+    combined_mode: bool = false,
     tick_interval_ms: u64,
     validated: bool,
     publish_enabled: bool = true,

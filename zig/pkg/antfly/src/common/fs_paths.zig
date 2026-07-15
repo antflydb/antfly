@@ -112,6 +112,29 @@ pub fn syncFileAndParentPortable(io: anytype, path: []const u8) !void {
     try syncDirPortable(io, parent);
 }
 
+pub fn pathsReferToSameExistingFile(allocator: std.mem.Allocator, io: anytype, a: []const u8, b: []const u8) !bool {
+    const a_real = realPathAlloc(allocator, io, a) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
+    defer allocator.free(a_real);
+
+    const b_real = realPathAlloc(allocator, io, b) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
+    defer allocator.free(b_real);
+
+    return std.mem.eql(u8, a_real, b_real);
+}
+
+fn realPathAlloc(allocator: std.mem.Allocator, io: anytype, path: []const u8) ![:0]u8 {
+    if (std.fs.path.isAbsolute(path)) {
+        return try std.Io.Dir.realPathFileAbsoluteAlloc(io, path, allocator);
+    }
+    return try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator);
+}
+
 test "syncDirPortable opens a real directory fd" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -141,6 +164,24 @@ test "createDirPathPortable creates absolute nested directories" {
 
     var dir = try std.Io.Dir.openDirAbsolute(io_impl.io(), path, .{});
     defer dir.close(io_impl.io());
+}
+
+test "pathsReferToSameExistingFile resolves aliases" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+
+    const relative = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(relative);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), relative, std.testing.allocator);
+    defer std.testing.allocator.free(absolute);
+    const aliased = try std.fmt.allocPrint(std.testing.allocator, "./{s}", .{relative});
+    defer std.testing.allocator.free(aliased);
+
+    try std.testing.expect(try pathsReferToSameExistingFile(std.testing.allocator, io_impl.io(), absolute, aliased));
+    try std.testing.expect(!try pathsReferToSameExistingFile(std.testing.allocator, io_impl.io(), absolute, "missing"));
 }
 
 fn createDirAbsolutePortable(path: []const u8) !void {

@@ -20,7 +20,7 @@ class ClusterRestoreResponse:
     """
     Attributes:
         tables (list[TableRestoreStatus]): Status of each table restore
-        status (ClusterRestoreResponseStatus): Overall restore status Example: triggered.
+        status (ClusterRestoreResponseStatus): Overall restore status Example: completed.
     """
 
     tables: list[TableRestoreStatus]

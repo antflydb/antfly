@@ -64,6 +64,7 @@ pub const InMemoryDiskBatcher = struct {
 
         if (ready.snapshot) |snapshot| try store.applySnapshot(snapshot);
         if (ready.hard_state) |hard_state| store.setHardState(hard_state);
+        if (ready.conf_state) |conf_state| try store.setConfState(conf_state);
         if (ready.entries.len > 0) try store.append(ready.entries);
     }
 

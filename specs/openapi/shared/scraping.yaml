@@ -80,7 +80,7 @@ components:
           description: Base URL prefix this credential applies to.
         headers:
           type: object
-          description: HTTP headers to include. Supports keystore syntax (e.g., "${secret:token}").
+          description: HTTP headers to include. Supports secret-store references (e.g., "${secret:token}").
           additionalProperties:
             type: string
         security:
@@ -97,7 +97,6 @@ components:
         1. Explicit `credentials="name"` parameter in template
         2. First credential where `buckets` glob pattern matches URL's bucket
         3. `default_s3` credential
-        4. Legacy fallback: `storage.s3` credentials (backward compatibility)
       properties:
         security:
           $ref: '#/components/schemas/ContentSecurityConfig'

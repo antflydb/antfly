@@ -219,7 +219,7 @@ func ensureCLIPModel(t *testing.T, modelsDir string) string {
 // 1. Downloads CLIP model if not present
 // 2. Starts a fake S3 server and uploads test images
 // 3. Configures RemoteContent.S3 credentials pointing to fake S3
-// 4. Starts Antfly swarm with Antfly inference and CLIP model
+// 4. Starts Antfly standalone with Antfly inference and CLIP model
 // 5. Creates a table with an index using {{remoteMedia url=image_url}} template
 // 6. Inserts documents with S3 URLs
 // 7. Verifies documents are indexed and searchable
@@ -270,7 +270,7 @@ func TestRemoteContentWithCLIP(t *testing.T) {
 	})
 	t.Log("Configured remote content with fake S3 credentials")
 
-	// Step 4: Start Antfly swarm with Antfly inference
+	// Step 4: Start Antfly standalone with Antfly inference
 	db.DefaultPebbleCacheSizeMB = 16 // Reduce memory usage
 
 	logger := GetTestLogger(t)
@@ -309,8 +309,8 @@ func TestRemoteContentWithCLIP(t *testing.T) {
 	CleanupAntflyData(t, dataDir, nodeID)
 
 	// Create context for servers
-	swarmCtx, swarmCancel := context.WithCancel(ctx)
-	defer swarmCancel()
+	standaloneCtx, standaloneCancel := context.WithCancel(ctx)
+	defer standaloneCancel()
 
 	// Create readiness channels
 	metadataReadyC := make(chan struct{})
@@ -319,7 +319,7 @@ func TestRemoteContentWithCLIP(t *testing.T) {
 
 	// Start Antfly inference server
 	go inferenceRuntime.RunAsTermite(
-		swarmCtx,
+		standaloneCtx,
 		logger.Named("antfly inference"),
 		config.Inference,
 		inferenceReadyC,
@@ -342,7 +342,7 @@ func TestRemoteContentWithCLIP(t *testing.T) {
 
 	go func() {
 		metadata.RunAsMetadataServer(
-			swarmCtx,
+			standaloneCtx,
 			logger.Named("metadata"),
 			config,
 			&store.StoreInfo{
@@ -360,7 +360,7 @@ func TestRemoteContentWithCLIP(t *testing.T) {
 	// Start store server
 	go func() {
 		store.RunAsStore(
-			swarmCtx,
+			standaloneCtx,
 			logger.Named("store"),
 			config,
 			&store.StoreInfo{
@@ -398,7 +398,7 @@ func TestRemoteContentWithCLIP(t *testing.T) {
 	client, err := antfly.NewAntflyClient(apiURL, httpClient)
 	require.NoError(t, err)
 
-	t.Log("Swarm started successfully")
+	t.Log("Standalone started successfully")
 
 	// Step 5: Create table with CLIP embedding index
 	tableName := "remote_content_test"
@@ -603,7 +603,7 @@ func createTestAudioWAV(t *testing.T, sampleRate int, durationSec float64, frequ
 // This test:
 // 1. Downloads CLIP and CLAP models if not present
 // 2. Starts a fake S3 server and uploads test images and audio
-// 3. Starts Antfly swarm with Antfly inference serving both models
+// 3. Starts Antfly standalone with Antfly inference serving both models
 // 4. Creates a table with two indexes: image_embeddings (CLIP) and audio_embeddings (CLAP)
 // 5. Inserts documents with S3 URLs for images and audio
 // 6. Queries both indexes and verifies results
@@ -660,7 +660,7 @@ func TestRemoteContentWithCLIPAndCLAP(t *testing.T) {
 		DefaultS3: "test",
 	})
 
-	// Step 4: Start Antfly swarm with Antfly inference
+	// Step 4: Start Antfly standalone with Antfly inference
 	db.DefaultPebbleCacheSizeMB = 16
 
 	logger := GetTestLogger(t)
@@ -693,14 +693,14 @@ func TestRemoteContentWithCLIPAndCLAP(t *testing.T) {
 
 	CleanupAntflyData(t, dataDir, nodeID)
 
-	swarmCtx, swarmCancel := context.WithCancel(ctx)
-	defer swarmCancel()
+	standaloneCtx, standaloneCancel := context.WithCancel(ctx)
+	defer standaloneCancel()
 
 	metadataReadyC := make(chan struct{})
 	storeReadyC := make(chan struct{})
 	inferenceReadyC := make(chan struct{})
 
-	go inferenceRuntime.RunAsTermite(swarmCtx, logger.Named("antfly inference"), config.Inference, inferenceReadyC)
+	go inferenceRuntime.RunAsTermite(standaloneCtx, logger.Named("antfly inference"), config.Inference, inferenceReadyC)
 
 	select {
 	case <-inferenceReadyC:
@@ -714,12 +714,12 @@ func TestRemoteContentWithCLIPAndCLAP(t *testing.T) {
 	peers := common.Peers{{ID: nodeID, URL: metadataRaftURL}}
 
 	go func() {
-		metadata.RunAsMetadataServer(swarmCtx, logger.Named("metadata"), config,
+		metadata.RunAsMetadataServer(standaloneCtx, logger.Named("metadata"), config,
 			&store.StoreInfo{ID: nodeID, RaftURL: metadataRaftURL, ApiURL: metadataAPIURL},
 			peers, false, metadataReadyC, nil)
 	}()
 	go func() {
-		store.RunAsStore(swarmCtx, logger.Named("store"), config,
+		store.RunAsStore(standaloneCtx, logger.Named("store"), config,
 			&store.StoreInfo{ID: nodeID, ApiURL: storeAPIURL, RaftURL: storeRaftURL},
 			"", storeReadyC, nil)
 	}()
@@ -743,7 +743,7 @@ func TestRemoteContentWithCLIPAndCLAP(t *testing.T) {
 	httpClient := &http.Client{Timeout: 5 * time.Minute}
 	client, err := antfly.NewAntflyClient(apiURL, httpClient)
 	require.NoError(t, err)
-	t.Log("Swarm started successfully")
+	t.Log("Standalone started successfully")
 
 	// Step 5: Create table with CLIP and CLAP indexes
 	tableName := "multimodal_test"
@@ -929,7 +929,7 @@ func TestRemoteContentWithCLIPAndCLAP(t *testing.T) {
 	t.Log("Test completed - CLIP image and CLAP audio remote content from S3 embedded and queried successfully")
 }
 
-// TestRemoteContentCredentialResolution tests credential resolution without starting the full swarm.
+// TestRemoteContentCredentialResolution tests credential resolution without starting the full standalone.
 // This is a lighter-weight test that verifies the configuration system works correctly.
 func TestRemoteContentCredentialResolution(t *testing.T) {
 	skipInShortMode(t)

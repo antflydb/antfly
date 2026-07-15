@@ -2,7 +2,7 @@
 
 ## Goal
 
-Antfly-zig needs a small local secrets store for swarm mode. The store backs the
+Antfly-zig needs a small local secrets store for standalone mode. The store backs the
 `/secrets` API, resolves `${secret:key}` references in configuration, and lets
 operators keep provider credentials out of ordinary config files.
 
@@ -103,7 +103,7 @@ the file itself must be protected by filesystem permissions.
 
 Startup:
 
-1. Swarm runtime resolves the store path, normally `<base>/secrets.json`.
+1. Standalone runtime resolves the store path, normally `<base>/secrets.json`.
 2. `FileStore.init(alloc, path)` duplicates the path and calls `load()`.
 3. `load()` reads and parses the JSON file if it exists.
 4. Parsed entries are copied into `entries`.
@@ -137,7 +137,7 @@ The `/secrets` API is wired through:
 - `zig/pkg/antfly/src/api/http_server.zig`
 - `zig/pkg/antfly/src/api/httpx_handler.zig`
 
-In swarm mode those handlers receive `ApiHttpServerConfig.secret_store`. In
+In standalone mode those handlers receive `ApiHttpServerConfig.secret_store`. In
 multi-node mode the store is absent and secret management writes return 503.
 
 ## Environment Fallback

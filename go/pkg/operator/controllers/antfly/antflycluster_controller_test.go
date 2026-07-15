@@ -34,6 +34,249 @@ import (
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
+func TestEffectiveTopologyModeFailsClosedForUnknownStoredMode(t *testing.T) {
+	cluster := &antflyv1.AntflyCluster{Spec: antflyv1.AntflyClusterSpec{Mode: antflyv1.ClusterMode("RemovedMode")}}
+	if got := effectiveTopologyMode(cluster); got != topologyModeInvalid {
+		t.Fatalf("expected invalid topology for unknown stored mode, got %q", got)
+	}
+}
+
+func TestTopologySafetyRejectsUnexpectedOwnedStatefulSet(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := antflyv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	controller := true
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default", UID: types.UID("cluster-uid")},
+		Spec:       antflyv1.AntflyClusterSpec{Mode: antflyv1.ClusterModeStandalone},
+	}
+	oldWorkload := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+		Name:      "example-old-topology",
+		Namespace: "default",
+		Labels:    map[string]string{"app.kubernetes.io/instance": "example"},
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: antflyv1.GroupVersion.String(), Kind: "AntflyCluster", Name: cluster.Name,
+			UID: cluster.UID, Controller: &controller,
+		}},
+	}}
+	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, oldWorkload).Build()}
+	err := reconciler.ensureTopologyResourcesMatchMode(context.Background(), cluster, topologyModeStandalone)
+	if err == nil || !strings.Contains(err.Error(), "migrate or remove") {
+		t.Fatalf("expected explicit migration safety error, got %v", err)
+	}
+}
+
+func TestTopologySafetyRejectsUnownedCanonicalStatefulSet(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := antflyv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default", UID: types.UID("cluster-uid")},
+		Spec:       antflyv1.AntflyClusterSpec{Mode: antflyv1.ClusterModeStandalone},
+	}
+	conflict := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+		Name: "example-standalone", Namespace: "default",
+	}}
+	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, conflict).Build()}
+	err := reconciler.ensureTopologyResourcesMatchMode(context.Background(), cluster, topologyModeStandalone)
+	if err == nil || !strings.Contains(err.Error(), "not controlled by AntflyCluster UID") {
+		t.Fatalf("expected canonical-name ownership collision, got %v", err)
+	}
+}
+
+func TestCleanupDeletesUIDBoundPVCFromOwnedStatefulSet(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	controller := true
+	replicas := int32(1)
+	cluster := &antflyv1.AntflyCluster{ObjectMeta: metav1.ObjectMeta{
+		Name: "example", Namespace: "default", UID: types.UID("cluster-uid"),
+	}}
+	historical := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example-historical", Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: antflyv1.GroupVersion.String(), Kind: "AntflyCluster", Name: cluster.Name,
+				UID: cluster.UID, Controller: &controller,
+			}},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{
+				ObjectMeta: metav1.ObjectMeta{Name: "database"},
+			}},
+		},
+	}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "database-example-historical-0", Namespace: "default",
+		Labels: map[string]string{labelClusterUID: string(cluster.UID)},
+	}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, historical, pvc).Build()
+	reconciler := &AntflyClusterReconciler{Client: client}
+	result, err := reconciler.cleanupStorageResources(context.Background(), cluster)
+	if err != nil || result != nil {
+		t.Fatalf("cleanup failed: result=%v err=%v", result, err)
+	}
+	err = client.Get(context.Background(), types.NamespacedName{Name: pvc.Name, Namespace: pvc.Namespace}, &corev1.PersistentVolumeClaim{})
+	if !errors.IsNotFound(err) {
+		t.Fatalf("expected UID-bound PVC to be deleted, got %v", err)
+	}
+}
+
+func TestCleanupDoesNotDeleteUnownedCanonicalNameStatefulSet(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cluster := &antflyv1.AntflyCluster{ObjectMeta: metav1.ObjectMeta{
+		Name: "example", Namespace: "default", UID: types.UID("cluster-uid"),
+	}}
+	unowned := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+		Name: "example-data", Namespace: "default",
+	}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, unowned).Build()
+	reconciler := &AntflyClusterReconciler{Client: client}
+	result, err := reconciler.cleanupStorageResources(context.Background(), cluster)
+	if err != nil || result != nil {
+		t.Fatalf("cleanup failed: result=%v err=%v", result, err)
+	}
+	err = client.Get(context.Background(), types.NamespacedName{Name: unowned.Name, Namespace: unowned.Namespace}, &appsv1.StatefulSet{})
+	if err != nil {
+		t.Fatalf("unowned canonical-name StatefulSet was deleted: %v", err)
+	}
+}
+
+func TestCleanupDoesNotTreatInstanceLabelAsOwnership(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cluster := &antflyv1.AntflyCluster{ObjectMeta: metav1.ObjectMeta{
+		Name: "example", Namespace: "default", UID: types.UID("cluster-uid"),
+	}}
+	foreign := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+		Name: "another-application", Namespace: "default",
+		Labels: map[string]string{"app.kubernetes.io/instance": cluster.Name},
+	}}
+	foreignPVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "foreign-data", Namespace: "default",
+		Labels: map[string]string{"app.kubernetes.io/instance": cluster.Name},
+	}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, foreign, foreignPVC).Build()
+	reconciler := &AntflyClusterReconciler{Client: client}
+	result, err := reconciler.cleanupStorageResources(context.Background(), cluster)
+	if err != nil || result != nil {
+		t.Fatalf("cleanup failed: result=%v err=%v", result, err)
+	}
+	if err := client.Get(context.Background(), types.NamespacedName{Name: foreign.Name, Namespace: foreign.Namespace}, &appsv1.StatefulSet{}); err != nil {
+		t.Fatalf("label-only StatefulSet was deleted: %v", err)
+	}
+	if err := client.Get(context.Background(), types.NamespacedName{Name: foreignPVC.Name, Namespace: foreignPVC.Namespace}, &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatalf("label-only PVC was deleted: %v", err)
+	}
+}
+
+func TestCleanupFailsClosedBeforeDeletingAnyPVCWithoutUIDOwnership(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cluster := &antflyv1.AntflyCluster{ObjectMeta: metav1.ObjectMeta{
+		Name: "example", Namespace: "default", UID: types.UID("cluster-uid"),
+	}}
+	labeled := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "standalone-storage-example-standalone-0", Namespace: "default",
+		Labels: map[string]string{
+			"app.kubernetes.io/instance": cluster.Name,
+			labelClusterUID:              string(cluster.UID),
+		},
+	}}
+	unlabeled := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "data-storage-example-data-0", Namespace: "default",
+	}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, labeled, unlabeled).Build()
+	reconciler := &AntflyClusterReconciler{Client: client}
+	result, err := reconciler.cleanupStorageResources(context.Background(), cluster)
+	if result != nil || err == nil || !strings.Contains(err.Error(), labelClusterUID) {
+		t.Fatalf("expected UID ownership failure: result=%v err=%v", result, err)
+	}
+	for _, name := range []string{labeled.Name, unlabeled.Name} {
+		err := client.Get(context.Background(), types.NamespacedName{Name: name, Namespace: cluster.Namespace}, &corev1.PersistentVolumeClaim{})
+		if err != nil {
+			t.Fatalf("PVC %s was deleted before ownership preflight completed: %v", name, err)
+		}
+	}
+}
+
+func TestCleanupFailsClosedOnConflictingDiscoveredPVCLabel(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	controller := true
+	cluster := &antflyv1.AntflyCluster{ObjectMeta: metav1.ObjectMeta{
+		Name: "example", Namespace: "default", UID: types.UID("cluster-uid"),
+	}}
+	historical := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example-historical", Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: antflyv1.GroupVersion.String(), Kind: "AntflyCluster", Name: cluster.Name,
+				UID: cluster.UID, Controller: &controller,
+			}},
+		},
+		Spec: appsv1.StatefulSetSpec{VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{
+			ObjectMeta: metav1.ObjectMeta{Name: "database"},
+		}}},
+	}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "database-example-historical-0", Namespace: "default",
+		Labels: map[string]string{
+			"app.kubernetes.io/instance": "another-cluster",
+			labelClusterUID:              string(cluster.UID),
+		},
+	}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, historical, pvc).Build()
+	reconciler := &AntflyClusterReconciler{Client: client}
+	result, err := reconciler.cleanupStorageResources(context.Background(), cluster)
+	if result != nil || err == nil || !strings.Contains(err.Error(), "refusing PVC cleanup") {
+		t.Fatalf("expected fail-closed ownership conflict, result=%v err=%v", result, err)
+	}
+	if err := client.Get(context.Background(), types.NamespacedName{Name: pvc.Name, Namespace: pvc.Namespace}, &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatalf("conflicting PVC was deleted: %v", err)
+	}
+	if err := client.Get(context.Background(), types.NamespacedName{Name: historical.Name, Namespace: historical.Namespace}, &appsv1.StatefulSet{}); err != nil {
+		t.Fatalf("historical StatefulSet was deleted before PVC preflight completed: %v", err)
+	}
+	// A second reconcile must fail closed in exactly the same way; this catches
+	// orphaning bugs where the first attempt deletes the workload that supplied
+	// the non-canonical claim prefix.
+	result, err = reconciler.cleanupStorageResources(context.Background(), cluster)
+	if result != nil || err == nil || !strings.Contains(err.Error(), "refusing PVC cleanup") {
+		t.Fatalf("expected retry to preserve fail-closed conflict, result=%v err=%v", result, err)
+	}
+}
+
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
@@ -7602,7 +7845,7 @@ func baseClusterWithInferenceSpec() *antflyv1.AntflyCluster {
 	}
 }
 
-func TestApplyDefaults_SwarmDefaults(t *testing.T) {
+func TestApplyDefaults_StandaloneDefaults(t *testing.T) {
 	g := NewWithT(t)
 
 	s := runtime.NewScheme()
@@ -7616,33 +7859,33 @@ func TestApplyDefaults_SwarmDefaults(t *testing.T) {
 
 	cluster := &antflyv1.AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-swarm",
+			Name:      "test-standalone",
 			Namespace: "default",
 		},
 		Spec: antflyv1.AntflyClusterSpec{
-			Mode:  antflyv1.ClusterModeSwarm,
-			Image: "antfly:latest",
-			Swarm: &antflyv1.SwarmSpec{},
+			Mode:       antflyv1.ClusterModeStandalone,
+			Image:      "antfly:latest",
+			Standalone: &antflyv1.StandaloneSpec{},
 			Storage: antflyv1.StorageSpec{
-				StorageClass: "standard",
-				SwarmStorage: "1Gi",
+				StorageClass:      "standard",
+				StandaloneStorage: "1Gi",
 			},
 		},
 	}
 
 	reconciler.applyDefaults(cluster)
 
-	g.Expect(cluster.Spec.Swarm).ToNot(BeNil())
-	g.Expect(cluster.Spec.Swarm.Replicas).To(Equal(int32(1)))
-	g.Expect(cluster.Spec.Swarm.NodeID).To(Equal(int32(1)))
-	g.Expect(cluster.Spec.Swarm.MetadataAPI.Port).To(Equal(int32(8080)))
-	g.Expect(cluster.Spec.Swarm.MetadataRaft.Port).To(Equal(int32(9017)))
-	g.Expect(cluster.Spec.Swarm.StoreAPI.Port).To(Equal(int32(12380)))
-	g.Expect(cluster.Spec.Swarm.StoreRaft.Port).To(Equal(int32(9021)))
-	g.Expect(cluster.Spec.Swarm.Health.Port).To(Equal(int32(4200)))
-	g.Expect(cluster.Spec.Swarm.Inference).ToNot(BeNil())
-	g.Expect(cluster.Spec.Swarm.Inference.Enabled).To(BeTrue())
-	g.Expect(cluster.Spec.Swarm.Inference.APIURL).To(Equal("http://0.0.0.0:11433"))
+	g.Expect(cluster.Spec.Standalone).ToNot(BeNil())
+	g.Expect(cluster.Spec.Standalone.Replicas).To(Equal(int32(1)))
+	g.Expect(cluster.Spec.Standalone.NodeID).To(Equal(int32(1)))
+	g.Expect(cluster.Spec.Standalone.MetadataAPI.Port).To(Equal(int32(8080)))
+	g.Expect(cluster.Spec.Standalone.MetadataRaft.Port).To(Equal(int32(9017)))
+	g.Expect(cluster.Spec.Standalone.StoreAPI.Port).To(Equal(int32(12380)))
+	g.Expect(cluster.Spec.Standalone.StoreRaft.Port).To(Equal(int32(9021)))
+	g.Expect(cluster.Spec.Standalone.Health.Port).To(Equal(int32(4200)))
+	g.Expect(cluster.Spec.Standalone.Inference).ToNot(BeNil())
+	g.Expect(cluster.Spec.Standalone.Inference.Enabled).To(BeTrue())
+	g.Expect(cluster.Spec.Standalone.Inference.APIURL).To(Equal("http://0.0.0.0:11433"))
 }
 
 func TestReconcilePVCExpansionReportsInProgress(t *testing.T) {
@@ -7849,12 +8092,12 @@ func TestUpdateRolloutConditionReportsBlockedRevision(t *testing.T) {
 	reconciler := &AntflyClusterReconciler{}
 	replicas := int32(1)
 	sts := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-swarm", Generation: 2},
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-standalone", Generation: 2},
 		Spec:       appsv1.StatefulSetSpec{Replicas: &replicas},
 		Status: appsv1.StatefulSetStatus{
 			ObservedGeneration: 2,
-			CurrentRevision:    "swarm-old",
-			UpdateRevision:     "swarm-new",
+			CurrentRevision:    "standalone-old",
+			UpdateRevision:     "standalone-new",
 			UpdatedReplicas:    0,
 			ReadyReplicas:      0,
 		},
@@ -7866,7 +8109,7 @@ func TestUpdateRolloutConditionReportsBlockedRevision(t *testing.T) {
 	g.Expect(cond).NotTo(BeNil())
 	g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 	g.Expect(cond.Reason).To(Equal(antflyv1.ReasonRolloutBlocked))
-	g.Expect(cond.Message).To(ContainSubstring("test-cluster-swarm has 0/1 updated replicas"))
+	g.Expect(cond.Message).To(ContainSubstring("test-cluster-standalone has 0/1 updated replicas"))
 }
 
 func TestRepairBlockedStatefulSetRolloutDeletesStaleUnhealthyPod(t *testing.T) {
@@ -7933,7 +8176,7 @@ func TestRepairBlockedStatefulSetRolloutDeletesStaleUnhealthyPod(t *testing.T) {
 	g.Expect(errors.IsNotFound(err)).To(BeTrue())
 }
 
-func TestRepairBlockedStatefulSetRolloutsDeletesStaleUnhealthySwarmPod(t *testing.T) {
+func TestRepairBlockedStatefulSetRolloutsDeletesStaleUnhealthyStandalonePod(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()
 	s := runtime.NewScheme()
@@ -7944,12 +8187,12 @@ func TestRepairBlockedStatefulSetRolloutsDeletesStaleUnhealthySwarmPod(t *testin
 	cluster := &antflyv1.AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
 		Spec: antflyv1.AntflyClusterSpec{
-			Mode: antflyv1.ClusterModeSwarm,
+			Mode: antflyv1.ClusterModeStandalone,
 		},
 	}
 	replicas := int32(1)
 	sts := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-swarm", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-standalone", Namespace: "default"},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas: &replicas,
 			Template: corev1.PodTemplateSpec{
@@ -7959,18 +8202,18 @@ func TestRepairBlockedStatefulSetRolloutsDeletesStaleUnhealthySwarmPod(t *testin
 			},
 		},
 		Status: appsv1.StatefulSetStatus{
-			UpdateRevision:  "swarm-new",
+			UpdateRevision:  "standalone-new",
 			UpdatedReplicas: 0,
 		},
 	}
 	staleUnreadyPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            "test-cluster-swarm-0",
+			Name:            "test-cluster-standalone-0",
 			Namespace:       "default",
 			OwnerReferences: []metav1.OwnerReference{statefulSetOwnerRef(sts.Name)},
 			Labels: mergeStringMaps(
-				serviceSelectorLabels("test-cluster", "swarm"),
-				map[string]string{"controller-revision-hash": "swarm-old"},
+				serviceSelectorLabels("test-cluster", "standalone"),
+				map[string]string{"controller-revision-hash": "standalone-old"},
 			),
 		},
 		Spec: corev1.PodSpec{
@@ -8395,6 +8638,7 @@ func TestReconcileCancelsDataScaleDownWhenOrdinalDesiredAgain(t *testing.T) {
 			Replicas: 5,
 		},
 	}
+	g.Expect(controllerutil.SetControllerReference(cluster, dataSts, s)).To(Succeed())
 	client := fake.NewClientBuilder().
 		WithScheme(s).
 		WithStatusSubresource(cluster).
@@ -8483,6 +8727,7 @@ func TestReconcileWaitsForDataScaleDownCancellationRecovery(t *testing.T) {
 		Spec:       appsv1.StatefulSetSpec{Replicas: &dataReplicas},
 		Status:     appsv1.StatefulSetStatus{Replicas: 5},
 	}
+	g.Expect(controllerutil.SetControllerReference(cluster, dataSts, s)).To(Succeed())
 	client := fake.NewClientBuilder().
 		WithScheme(s).
 		WithStatusSubresource(cluster).
@@ -8565,6 +8810,7 @@ func TestReconcileFinalizesDataScaleDownAfterStatefulSetShrinks(t *testing.T) {
 		Spec:       appsv1.StatefulSetSpec{Replicas: &dataReplicas},
 		Status:     appsv1.StatefulSetStatus{Replicas: 4},
 	}
+	g.Expect(controllerutil.SetControllerReference(cluster, dataSts, s)).To(Succeed())
 	client := fake.NewClientBuilder().
 		WithScheme(s).
 		WithStatusSubresource(cluster).
@@ -8647,6 +8893,7 @@ func TestReconcileRetriesFailedDataScaleDownFinalization(t *testing.T) {
 		Spec:       appsv1.StatefulSetSpec{Replicas: &dataReplicas},
 		Status:     appsv1.StatefulSetStatus{Replicas: 4},
 	}
+	g.Expect(controllerutil.SetControllerReference(cluster, dataSts, s)).To(Succeed())
 	client := fake.NewClientBuilder().
 		WithScheme(s).
 		WithStatusSubresource(cluster).
@@ -8726,6 +8973,7 @@ func TestReconcileKeepsFailedDataScaleDownFinalizationFailure(t *testing.T) {
 		Spec:       appsv1.StatefulSetSpec{Replicas: &dataReplicas},
 		Status:     appsv1.StatefulSetStatus{Replicas: 4},
 	}
+	g.Expect(controllerutil.SetControllerReference(cluster, dataSts, s)).To(Succeed())
 	client := fake.NewClientBuilder().
 		WithScheme(s).
 		WithStatusSubresource(cluster).
@@ -8763,7 +9011,7 @@ func TestHTTPClientDefaultHasTimeout(t *testing.T) {
 	g.Expect(reconciler.httpClient().Timeout).To(Equal(10 * time.Second))
 }
 
-func TestUpdateProductTierStatusReportsClusteredShape(t *testing.T) {
+func TestUpdateProductTierStatusReportsDistributedShape(t *testing.T) {
 	g := NewWithT(t)
 	reconciler := &AntflyClusterReconciler{}
 	cluster := &antflyv1.AntflyCluster{
@@ -8806,7 +9054,7 @@ func TestUpdateProductTierStatusReportsClusteredShape(t *testing.T) {
 
 	g.Expect(cluster.Status.ProductTierStatus).NotTo(BeNil())
 	g.Expect(cluster.Status.ProductTierStatus.Name).To(Equal("pro"))
-	g.Expect(cluster.Status.ProductTierStatus.Mode).To(Equal(antflyv1.ClusterModeClustered))
+	g.Expect(cluster.Status.ProductTierStatus.Mode).To(Equal(antflyv1.ClusterModeDistributed))
 	g.Expect(cluster.Status.ProductTierStatus.MetadataResources).To(Equal("cpu=500m memory=1Gi"))
 	g.Expect(cluster.Status.ProductTierStatus.DataStorage).To(Equal("100Gi"))
 	g.Expect(cluster.Status.ProductTierStatus.DataAutoscaling).To(Equal("enabled min=3 max=8"))
@@ -9366,7 +9614,7 @@ func TestGenerateCompleteConfig(t *testing.T) {
 	g.Expect(config["max_shards_per_table"]).To(Equal(float64(0)))
 }
 
-func TestGenerateCompleteConfig_Swarm(t *testing.T) {
+func TestGenerateCompleteConfig_Standalone(t *testing.T) {
 	g := NewWithT(t)
 
 	s := runtime.NewScheme()
@@ -9378,16 +9626,11 @@ func TestGenerateCompleteConfig_Swarm(t *testing.T) {
 		Scheme: s,
 	}
 
-	cluster := baseSwarmControllerCluster()
+	cluster := baseStandaloneControllerCluster()
 	cluster.Spec.Config = `{
-	  "replication_factor": 3,
-	  "swarm_mode": false,
-	  "storage": {
-	    "s3": {
-	      "bucket": "test-bucket"
-	    }
-	  }
-	}`
+		  "replication_factor": 3,
+		  "deployment_mode": "distributed"
+		}`
 
 	configJSON, err := reconciler.generateCompleteConfig(cluster)
 	g.Expect(err).NotTo(HaveOccurred())
@@ -9396,24 +9639,70 @@ func TestGenerateCompleteConfig_Swarm(t *testing.T) {
 	err = json.Unmarshal([]byte(configJSON), &config)
 	g.Expect(err).NotTo(HaveOccurred())
 
-	g.Expect(config["swarm_mode"]).To(Equal(true))
+	g.Expect(config["deployment_mode"]).To(Equal("standalone"))
 	g.Expect(config["replication_factor"]).To(Equal(float64(1)))
 	g.Expect(config["default_shards_per_table"]).To(Equal(float64(1)))
 	g.Expect(config["disable_shard_alloc"]).To(Equal(true))
 
 	storage, ok := config["storage"].(map[string]any)
 	g.Expect(ok).To(BeTrue())
+	g.Expect(storage["engine"]).To(Equal("local"))
 	localStorage, ok := storage["local"].(map[string]any)
 	g.Expect(ok).To(BeTrue())
 	g.Expect(localStorage["base_dir"]).To(Equal("/antflydb"))
-	_, hasS3 := storage["s3"]
-	g.Expect(hasS3).To(BeTrue(), "expected user-provided S3 storage config to be preserved")
 
 	metadata, ok := config["metadata"].(map[string]any)
 	g.Expect(ok).To(BeTrue())
 	orchestrationURLs, ok := metadata["orchestration_urls"].(map[string]any)
 	g.Expect(ok).To(BeTrue())
-	g.Expect(orchestrationURLs["1"]).To(Equal("http://test-swarm-swarm.default.svc.cluster.local:8080"))
+	g.Expect(orchestrationURLs["1"]).To(Equal("http://test-standalone-standalone.default.svc.cluster.local:8080"))
+}
+
+func TestGenerateCompleteConfig_StandaloneRejectsRawStorageOverride(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).Build(),
+		Scheme: s,
+	}
+	cluster := baseStandaloneControllerCluster()
+	cluster.Spec.Config = `{"storage":{"engine":"lite","lite":{"path":"/antflydb/data.aflite"}}}`
+
+	_, err := reconciler.generateCompleteConfig(cluster)
+	g.Expect(err).To(MatchError(ContainSubstring("spec.config.storage is operator-managed")))
+}
+
+func TestGenerateCompleteConfig_RejectsInvalidTypedStorageWithoutAdmission(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).Build(), Scheme: s}
+	cluster := baseStandaloneControllerCluster()
+	cluster.Spec.Storage.Engine = "object"
+
+	_, err := reconciler.generateCompleteConfig(cluster)
+	g.Expect(err).To(MatchError(ContainSubstring("spec.storage.engine must be local or lite")))
+}
+
+func TestGenerateCompleteConfig_StandaloneLite(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).Build(), Scheme: s}
+	cluster := baseStandaloneControllerCluster()
+	cluster.Spec.Storage.Engine = "lite"
+	cluster.Spec.Storage.LiteFileName = "production.aflite"
+
+	configJSON, err := reconciler.generateCompleteConfig(cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	var config map[string]any
+	g.Expect(json.Unmarshal([]byte(configJSON), &config)).To(Succeed())
+	storage := config["storage"].(map[string]any)
+	g.Expect(storage["engine"]).To(Equal("lite"))
+	lite := storage["lite"].(map[string]any)
+	g.Expect(lite["path"]).To(Equal("/antflydb/production.aflite"))
+	g.Expect(lite["fsync"]).To(BeTrue())
 }
 
 func TestGenerateCompleteConfig_ManagedInferenceAPIURL(t *testing.T) {
@@ -9473,7 +9762,7 @@ func TestGenerateCompleteConfig_ManagedInferenceAPIURL(t *testing.T) {
 	g.Expect(inferenceConfig["models_dir"]).To(Equal("/models"))
 }
 
-func TestReconcileServices_SwarmCreatesSwarmAndPublicAPI(t *testing.T) {
+func TestReconcileServices_StandaloneCreatesStandaloneAndPublicAPI(t *testing.T) {
 	g := NewWithT(t)
 
 	s := runtime.NewScheme()
@@ -9482,7 +9771,7 @@ func TestReconcileServices_SwarmCreatesSwarmAndPublicAPI(t *testing.T) {
 	err = corev1.AddToScheme(s)
 	g.Expect(err).NotTo(HaveOccurred())
 
-	cluster := baseSwarmControllerCluster()
+	cluster := baseStandaloneControllerCluster()
 	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
 
 	reconciler := &AntflyClusterReconciler{
@@ -9494,24 +9783,24 @@ func TestReconcileServices_SwarmCreatesSwarmAndPublicAPI(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 
 	publicSvc := &corev1.Service{}
-	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-public-api", Namespace: "default"}, publicSvc)
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-public-api", Namespace: "default"}, publicSvc)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(publicSvc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", "swarm"))
+	g.Expect(publicSvc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", "standalone"))
 	g.Expect(publicSvc.Spec.Ports).To(HaveLen(1))
 	g.Expect(publicSvc.Spec.Ports[0].TargetPort.IntValue()).To(Equal(8080))
 
-	swarmSvc := &corev1.Service{}
-	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, swarmSvc)
+	standaloneSvc := &corev1.Service{}
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, standaloneSvc)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(swarmSvc.Spec.Ports).To(HaveLen(5))
+	g.Expect(standaloneSvc.Spec.Ports).To(HaveLen(5))
 
-	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-metadata", Namespace: "default"}, &corev1.Service{})
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-metadata", Namespace: "default"}, &corev1.Service{})
 	g.Expect(errors.IsNotFound(err)).To(BeTrue())
-	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-data", Namespace: "default"}, &corev1.Service{})
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-data", Namespace: "default"}, &corev1.Service{})
 	g.Expect(errors.IsNotFound(err)).To(BeTrue())
 }
 
-func TestCreatePublicAPIService_ClusteredTargetsMetadataAPI(t *testing.T) {
+func TestCreatePublicAPIService_DistributedTargetsMetadataAPI(t *testing.T) {
 	g := NewWithT(t)
 
 	enabled := true
@@ -9550,7 +9839,7 @@ func TestReconcileServices_PublicAPIUsesHAPromotedRouteSelector(t *testing.T) {
 	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
 	g.Expect(corev1.AddToScheme(s)).To(Succeed())
 
-	cluster := baseSwarmControllerCluster()
+	cluster := baseStandaloneControllerCluster()
 	cluster.Spec.HighAvailability = &antflyv1.HighAvailabilitySpec{
 		Mode: antflyv1.HAModeHotStandby,
 		Standbys: []antflyv1.HAStandbySpec{{
@@ -9558,7 +9847,7 @@ func TestReconcileServices_PublicAPIUsesHAPromotedRouteSelector(t *testing.T) {
 			RouteSelector: map[string]string{
 				"app.kubernetes.io/name":      "antfly-database",
 				"app.kubernetes.io/component": "standby-a",
-				"app.kubernetes.io/instance":  "test-swarm-standby-a",
+				"app.kubernetes.io/instance":  "test-standalone-standby-a",
 			},
 		}},
 	}
@@ -9576,7 +9865,7 @@ func TestReconcileServices_PublicAPIUsesHAPromotedRouteSelector(t *testing.T) {
 	g.Expect(reconciler.reconcileServices(context.Background(), cluster)).To(Succeed())
 
 	publicSvc := &corev1.Service{}
-	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-public-api", Namespace: "default"}, publicSvc)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-public-api", Namespace: "default"}, publicSvc)).To(Succeed())
 	g.Expect(publicSvc.Spec.Selector).To(Equal(cluster.Spec.HighAvailability.Standbys[0].RouteSelector))
 	g.Expect(publicSvc.Annotations).To(HaveKeyWithValue(haPrimaryRouteTargetAnnotation, "standby-a"))
 	g.Expect(publicSvc.Annotations).To(HaveKeyWithValue(haPrimaryRouteFenceAuthorityAnnotation, string(antflyv1.HAFencingAuthorityKubernetesLease)))
@@ -9597,10 +9886,10 @@ func TestReconcileServices_PublicAPIClearsStaleHARouteAnnotationsWhenHAManagemen
 	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
 	g.Expect(corev1.AddToScheme(s)).To(Succeed())
 
-	cluster := baseSwarmControllerCluster()
+	cluster := baseStandaloneControllerCluster()
 	service := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-swarm-public-api",
+			Name:      "test-standalone-public-api",
 			Namespace: "default",
 			Annotations: map[string]string{
 				haPrimaryRouteTargetAnnotation:          "standby-a",
@@ -9622,8 +9911,8 @@ func TestReconcileServices_PublicAPIClearsStaleHARouteAnnotationsWhenHAManagemen
 	g.Expect(reconciler.reconcileServices(context.Background(), cluster)).To(Succeed())
 
 	publicSvc := &corev1.Service{}
-	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-public-api", Namespace: "default"}, publicSvc)).To(Succeed())
-	g.Expect(publicSvc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", "swarm"))
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-public-api", Namespace: "default"}, publicSvc)).To(Succeed())
+	g.Expect(publicSvc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", "standalone"))
 	g.Expect(publicSvc.Annotations).To(HaveKeyWithValue("antfly.io/custom", "preserve"))
 	g.Expect(publicSvc.Annotations).NotTo(HaveKey(haPrimaryRouteTargetAnnotation))
 	g.Expect(publicSvc.Annotations).NotTo(HaveKey(haPrimaryRouteFenceAuthorityAnnotation))
@@ -9631,7 +9920,7 @@ func TestReconcileServices_PublicAPIClearsStaleHARouteAnnotationsWhenHAManagemen
 	g.Expect(publicSvc.Annotations).NotTo(HaveKey(haPrimaryRouteSelectorAnnotation))
 }
 
-func TestReconcileSwarmStatefulSetMountsSecretStore(t *testing.T) {
+func TestReconcileStandaloneStatefulSetMountsSecretStore(t *testing.T) {
 	g := NewWithT(t)
 
 	s := runtime.NewScheme()
@@ -9639,7 +9928,7 @@ func TestReconcileSwarmStatefulSetMountsSecretStore(t *testing.T) {
 	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
 	g.Expect(corev1.AddToScheme(s)).To(Succeed())
 
-	cluster := baseSwarmControllerCluster()
+	cluster := baseStandaloneControllerCluster()
 	cluster.Spec.SecretStore = &antflyv1.SecretStoreSpec{
 		SecretName: "cloud-secrets-config",
 		Key:        "secrets.json",
@@ -9652,11 +9941,11 @@ func TestReconcileSwarmStatefulSetMountsSecretStore(t *testing.T) {
 		Scheme: s,
 	}
 
-	err := reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)
+	err := reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 
 	sts := &appsv1.StatefulSet{}
-	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, sts)
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, sts)
 	g.Expect(err).NotTo(HaveOccurred())
 
 	container := sts.Spec.Template.Spec.Containers[0]
@@ -9685,7 +9974,7 @@ func TestReconcileSwarmStatefulSetMountsSecretStore(t *testing.T) {
 	}))
 }
 
-func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
+func TestReconcileStandaloneStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	g := NewWithT(t)
 
 	s := runtime.NewScheme()
@@ -9693,7 +9982,7 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
 	g.Expect(corev1.AddToScheme(s)).To(Succeed())
 
-	cluster := baseSwarmControllerCluster()
+	cluster := baseStandaloneControllerCluster()
 	cluster.Spec.HighAvailability = &antflyv1.HighAvailabilitySpec{
 		Mode: antflyv1.HAModeHotStandby,
 		Identity: &antflyv1.HAReplicationIdentitySpec{
@@ -9729,16 +10018,16 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
 	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
 
-	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
 	sts := &appsv1.StatefulSet{}
-	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, sts)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, sts)).To(Succeed())
 	primaryArgs := sts.Spec.Template.Spec.Containers[0].Args[0]
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-log '/antflydb/ha/primary.wal'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-slots '/antflydb/ha/slots'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-node-id 'primary-a'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-fence-wal '/antflydb/ha/fence.wal'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-former-primary-log '/antflydb/ha/primary.wal'`))
-	g.Expect(primaryArgs).To(ContainSubstring(`--ha-admin-token-env 'ANTFLY_HA_ADMIN_TOKEN'`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--admin-token-env 'ANTFLY_HA_ADMIN_TOKEN'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-retention-max-lag-lsn 50`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-retention-max-retained-bytes 4096`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-retention-max-retained-age-ns 1000000`))
@@ -9782,15 +10071,15 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 			SlotName:     "standby-a",
 		},
 	}
-	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
-	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, sts)).To(Succeed())
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, sts)).To(Succeed())
 	standbyArgs := sts.Spec.Template.Spec.Containers[0].Args[0]
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-log '/antflydb/custom/standby.wal'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-progress '/antflydb/custom/progress.wal'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-node-id 'standby-a'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-fence-wal '/antflydb/custom/fence.wal'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-former-primary-log '/antflydb/custom/former-primary.wal'`))
-	g.Expect(standbyArgs).To(ContainSubstring(`--ha-admin-token-env 'CUSTOM_HA_ADMIN_TOKEN'`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--admin-token-env 'CUSTOM_HA_ADMIN_TOKEN'`))
 	g.Expect(standbyArgs).NotTo(ContainSubstring(`--ha-retention-max-lag-lsn`))
 	g.Expect(standbyArgs).NotTo(ContainSubstring(`--ha-retention-max-retained-bytes`))
 	g.Expect(standbyArgs).NotTo(ContainSubstring(`--ha-retention-max-retained-age-ns`))
@@ -9808,10 +10097,10 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	}))
 }
 
-func TestSwarmHAArgsOmitsRequiredForAllSyncPolicy(t *testing.T) {
+func TestStandaloneHAArgsOmitsRequiredForAllSyncPolicy(t *testing.T) {
 	g := NewWithT(t)
 
-	args := swarmHAArgs(&antflyv1.HighAvailabilitySpec{
+	args := standaloneHAArgs(&antflyv1.HighAvailabilitySpec{
 		Mode: antflyv1.HAModeHotStandby,
 		Identity: &antflyv1.HAReplicationIdentitySpec{
 			ClusterID:        100,
@@ -9837,10 +10126,10 @@ func TestSwarmHAArgsOmitsRequiredForAllSyncPolicy(t *testing.T) {
 	g.Expect(args).NotTo(ContainSubstring(`--ha-sync-required`))
 }
 
-func TestSwarmHAArgsShellQuotesRuntimeValues(t *testing.T) {
+func TestStandaloneHAArgsShellQuotesRuntimeValues(t *testing.T) {
 	g := NewWithT(t)
 
-	args := swarmHAArgs(&antflyv1.HighAvailabilitySpec{
+	args := standaloneHAArgs(&antflyv1.HighAvailabilitySpec{
 		Mode: antflyv1.HAModeHotStandby,
 		Identity: &antflyv1.HAReplicationIdentitySpec{
 			ClusterID:        100,
@@ -9956,7 +10245,7 @@ func TestReconcileSplitStatefulSetsMountSecretStore(t *testing.T) {
 	}
 }
 
-func TestUpdateStatus_Swarm(t *testing.T) {
+func TestUpdateStatus_Standalone(t *testing.T) {
 	g := NewWithT(t)
 
 	s := runtime.NewScheme()
@@ -9967,10 +10256,10 @@ func TestUpdateStatus_Swarm(t *testing.T) {
 	err = corev1.AddToScheme(s)
 	g.Expect(err).NotTo(HaveOccurred())
 
-	cluster := baseSwarmControllerCluster()
-	swarmSts := &appsv1.StatefulSet{
+	cluster := baseStandaloneControllerCluster()
+	standaloneSts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-swarm-swarm",
+			Name:      "test-standalone-standalone",
 			Namespace: "default",
 		},
 		Status: appsv1.StatefulSetStatus{
@@ -9979,9 +10268,9 @@ func TestUpdateStatus_Swarm(t *testing.T) {
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-swarm-swarm-0",
+			Name:      "test-standalone-standalone-0",
 			Namespace: "default",
-			Labels:    serviceSelectorLabels("test-swarm", "swarm"),
+			Labels:    serviceSelectorLabels("test-standalone", "standalone"),
 		},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning,
@@ -9992,7 +10281,7 @@ func TestUpdateStatus_Swarm(t *testing.T) {
 	client := fake.NewClientBuilder().
 		WithScheme(s).
 		WithStatusSubresource(cluster).
-		WithObjects(cluster, swarmSts, pod).
+		WithObjects(cluster, standaloneSts, pod).
 		Build()
 
 	reconciler := &AntflyClusterReconciler{
@@ -10004,17 +10293,17 @@ func TestUpdateStatus_Swarm(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 
 	updated := &antflyv1.AntflyCluster{}
-	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm", Namespace: "default"}, updated)
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-standalone", Namespace: "default"}, updated)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(updated.Status.Mode).To(Equal(antflyv1.ClusterModeSwarm))
+	g.Expect(updated.Status.Mode).To(Equal(antflyv1.ClusterModeStandalone))
 	g.Expect(updated.Status.ReadyReplicas).To(Equal(int32(1)))
-	g.Expect(updated.Status.SwarmNodesReady).To(Equal(int32(1)))
+	g.Expect(updated.Status.StandaloneNodesReady).To(Equal(int32(1)))
 	g.Expect(updated.Status.Phase).To(Equal("Running"))
-	g.Expect(updated.Status.SwarmStatus).ToNot(BeNil())
-	g.Expect(updated.Status.SwarmStatus.Ready).To(BeTrue())
-	g.Expect(updated.Status.SwarmStatus.PodName).To(Equal("test-swarm-swarm-0"))
-	g.Expect(updated.Status.SwarmStatus.PodIP).To(Equal("10.0.0.10"))
-	g.Expect(updated.Status.SwarmStatus.ObservedConfigHash).ToNot(BeEmpty())
+	g.Expect(updated.Status.StandaloneStatus).ToNot(BeNil())
+	g.Expect(updated.Status.StandaloneStatus.Ready).To(BeTrue())
+	g.Expect(updated.Status.StandaloneStatus.PodName).To(Equal("test-standalone-standalone-0"))
+	g.Expect(updated.Status.StandaloneStatus.PodIP).To(Equal("10.0.0.10"))
+	g.Expect(updated.Status.StandaloneStatus.ObservedConfigHash).ToNot(BeEmpty())
 }
 
 func TestDetectSidecarInjectionStatus_ScopedToClusterInstance(t *testing.T) {
@@ -10026,14 +10315,14 @@ func TestDetectSidecarInjectionStatus_ScopedToClusterInstance(t *testing.T) {
 	err = corev1.AddToScheme(s)
 	g.Expect(err).NotTo(HaveOccurred())
 
-	cluster := baseSwarmControllerCluster()
+	cluster := baseStandaloneControllerCluster()
 	clusterPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-swarm-swarm-0",
+			Name:      "test-standalone-standalone-0",
 			Namespace: "default",
 			Labels: map[string]string{
 				"app.kubernetes.io/name":     "antfly-database",
-				"app.kubernetes.io/instance": "test-swarm",
+				"app.kubernetes.io/instance": "test-standalone",
 			},
 		},
 		Status: corev1.PodStatus{
@@ -10046,7 +10335,7 @@ func TestDetectSidecarInjectionStatus_ScopedToClusterInstance(t *testing.T) {
 	}
 	otherClusterPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "other-cluster-swarm-0",
+			Name:      "other-cluster-standalone-0",
 			Namespace: "default",
 			Labels: map[string]string{
 				"app.kubernetes.io/name":     "antfly-database",
@@ -10411,19 +10700,19 @@ func TestContainsVolumeAffinityMessage(t *testing.T) {
 	g.Expect(containsVolumeAffinityMessage("")).To(BeFalse())
 }
 
-func baseSwarmControllerCluster() *antflyv1.AntflyCluster {
+func baseStandaloneControllerCluster() *antflyv1.AntflyCluster {
 	enabled := true
 	serviceType := corev1.ServiceTypeClusterIP
 
 	return &antflyv1.AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-swarm",
+			Name:      "test-standalone",
 			Namespace: "default",
 		},
 		Spec: antflyv1.AntflyClusterSpec{
-			Mode:  antflyv1.ClusterModeSwarm,
+			Mode:  antflyv1.ClusterModeStandalone,
 			Image: "antfly:latest",
-			Swarm: &antflyv1.SwarmSpec{
+			Standalone: &antflyv1.StandaloneSpec{
 				Replicas:     1,
 				NodeID:       1,
 				Resources:    antflyv1.ResourceSpec{CPU: "500m", Memory: "1Gi"},
@@ -10432,14 +10721,14 @@ func baseSwarmControllerCluster() *antflyv1.AntflyCluster {
 				StoreAPI:     antflyv1.APISpec{Port: 12380},
 				StoreRaft:    antflyv1.APISpec{Port: 9021},
 				Health:       antflyv1.APISpec{Port: 4200},
-				Inference: &antflyv1.SwarmInferenceSpec{
+				Inference: &antflyv1.StandaloneInferenceSpec{
 					Enabled: true,
 					APIURL:  "http://0.0.0.0:11433",
 				},
 			},
 			Storage: antflyv1.StorageSpec{
-				StorageClass: "standard",
-				SwarmStorage: "1Gi",
+				StorageClass:      "standard",
+				StandaloneStorage: "1Gi",
 			},
 			PublicAPI: &antflyv1.PublicAPIConfig{
 				Enabled:     &enabled,

@@ -119,8 +119,8 @@ pub const RaftNdjsonTraceLogger = struct {
                 self.writeSyntheticSelfAppendResp(event, noop_index) catch {};
                 self.pushPendingSelfAck(noop_index);
             },
-            .replicate => {
-                // Client proposal: engine fires .replicate after appending.
+            .replicate, .change_conf => {
+                // Proposal events fire after appending.
                 // Post-append state: last_index already includes the new entry.
                 self.writeSyntheticSelfAppendResp(event, event.last_index) catch {};
                 self.pushPendingSelfAck(event.last_index);
@@ -190,6 +190,20 @@ pub const RaftNdjsonTraceLogger = struct {
             try w.print(",\"commit\":{d}", .{msg.commit_index});
             try w.print(",\"reject\":{}", .{msg.reject});
             try w.writeAll("}");
+        }
+
+        if (event.event_type == .change_conf) {
+            try w.writeAll(",\"prop\":{\"cc\":{\"changes\":[");
+            for (event.conf_changes, 0..) |change, i| {
+                if (i != 0) try w.writeAll(",");
+                try w.print("{{\"action\":\"{s}\",\"nid\":\"{d}\"}}", .{
+                    confChangeActionString(change.change_type),
+                    change.node_id,
+                });
+            }
+            try w.writeAll("],\"transition\":\"");
+            try w.writeAll(@tagName(event.conf_transition));
+            try w.writeAll("\"}}");
         }
 
         try w.writeAll("}}\n");
@@ -401,6 +415,8 @@ pub const RaftNdjsonTraceLogger = struct {
             .become_candidate => try w.writeAll("BecomeCandidate"),
             .become_leader => try w.writeAll("BecomeLeader"),
             .replicate => try w.writeAll("Replicate"),
+            .change_conf => try w.writeAll("ChangeConf"),
+            .apply_conf_change => try w.writeAll("ApplyConfChange"),
             .send_message => {
                 if (event.message) |msg| {
                     switch (msg.msg_type) {
@@ -434,6 +450,14 @@ pub const RaftNdjsonTraceLogger = struct {
                 }
             },
         }
+    }
+
+    fn confChangeActionString(change_type: core.types.ConfChangeType) []const u8 {
+        return switch (change_type) {
+            .add_node => "AddNewServer",
+            .remove_node => "RemoveServer",
+            .add_learner_node => "AddLearner",
+        };
     }
 };
 
@@ -531,4 +555,28 @@ test "raft trace logger emits valid ndjson" {
     try std.testing.expect(std.mem.indexOf(u8, output, "\"tag\":\"trace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"name\":\"InitState\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"nid\":\"1\"") != null);
+
+    const changes = [_]core.types.ConfChangeSingle{.{
+        .change_type = .remove_node,
+        .node_id = 3,
+    }};
+    var change_event = event;
+    change_event.event_type = .change_conf;
+    change_event.role = .leader;
+    change_event.leader_id = 1;
+    change_event.last_index = 1;
+    change_event.conf_changes = changes[0..];
+    trace_logger.traceLogger().traceEvent(&change_event);
+
+    const change_output = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, change_output, "\"name\":\"ChangeConf\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, change_output, "\"action\":\"RemoveServer\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, change_output, "\"nid\":\"3\"") != null);
+
+    var lines = std.mem.splitScalar(u8, change_output, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
+        parsed.deinit();
+    }
 }

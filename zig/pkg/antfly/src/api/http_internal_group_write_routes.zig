@@ -287,6 +287,9 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             },
             error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => {
+                return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable");
+            },
             error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
             else => return err,
         };
@@ -295,7 +298,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
 
     if (routes.Routes.matchGroupBatch(path)) |batch_route| {
         const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-        var batch_req = batch_api.parseBatchRequest(ctx.alloc, req.body) catch |err| switch (err) {
+        var batch_req = batch_api.parseInternalBatchRequest(ctx.alloc, req.body) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid batch request"),
             error.ValueTooLong => return try http_route_helpers.textResponse(ctx.alloc, 413, "value too large"),
             else => return err,
@@ -309,6 +312,9 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         _ = (writes.batchGroupLocal(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid batch request"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => {
+                return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable");
+            },
             else => return err,
         }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         const result = batch_req.result();
@@ -721,6 +727,7 @@ const EncodedTransitionAction = struct {
     allow_doc_identity_reassignment: bool = false,
     split_key: ?[]const u8 = null,
     source_range_end: ?[]const u8 = null,
+    destination_base_uri: ?[]const u8 = null,
 };
 
 fn parseSplitTransitionRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_transition_state.SplitTransitionRecord {
@@ -775,6 +782,7 @@ fn parseTransitionAction(alloc: std.mem.Allocator, body: []const u8) !metadata_m
                 .transition_id = parsed.value.transition_id,
                 .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
                 .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
+                .destination_base_uri = if (parsed.value.destination_base_uri) |value| try alloc.dupe(u8, value) else null,
             },
         },
         .catch_up_split_destination => .{
@@ -782,6 +790,7 @@ fn parseTransitionAction(alloc: std.mem.Allocator, body: []const u8) !metadata_m
                 .transition_id = parsed.value.transition_id,
                 .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
                 .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
+                .destination_base_uri = if (parsed.value.destination_base_uri) |value| try alloc.dupe(u8, value) else null,
             },
         },
         .finalize_split_source => .{
@@ -1286,6 +1295,8 @@ fn freeTransitionActionOwned(alloc: std.mem.Allocator, action: *metadata_mod.Tra
             alloc.free(op.split_key);
             if (op.source_range_end) |value| alloc.free(value);
         },
+        .bootstrap_split_destination => |op| if (op.destination_base_uri) |value| alloc.free(@constCast(value)),
+        .catch_up_split_destination => |op| if (op.destination_base_uri) |value| alloc.free(@constCast(value)),
         else => {},
     }
     action.* = undefined;

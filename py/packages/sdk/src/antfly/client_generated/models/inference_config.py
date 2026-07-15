@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ..models.inference_content_security_config import InferenceContentSecurityConfig
     from ..models.inference_credentials import InferenceCredentials
     from ..models.inference_model_ref import InferenceModelRef
+    from ..models.inference_prompt_cache_config import InferencePromptCacheConfig
     from ..models.inferenceschemas_config import InferenceschemasConfig
 
 
@@ -57,6 +58,7 @@ class InferenceConfig:
             concurrent requests. Note: pool_size multiplies per-model memory
             independently of max_loaded_models.
              Default: 1. Example: 1.
+        prompt_cache (InferencePromptCacheConfig | Unset): Native generator prompt KV cache configuration.
         backend_priority (list[str] | Unset): Backend priority order for model loading with optional device specifiers.
             Format: `backend` or `backend:device` where device defaults to `auto`.
 
@@ -105,7 +107,7 @@ class InferenceConfig:
             This allows mixing eager and lazy models in the same pool.
              Example: {'BAAI/bge-small-en-v1.5': 'eager', 'mirth/chonky-mmbert-small-multilingual-1': 'lazy'}.
         allow_downloads (bool | Unset): Whether the dashboard should show model download commands.
-            Defaults to true for standalone/swarm mode. Set to false in managed
+            Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed
             deployments (e.g., Kubernetes operator) where models are managed externally.
              Default: True.
         log (InferenceschemasConfig | Unset): Logging configuration for inference services
@@ -120,6 +122,7 @@ class InferenceConfig:
     keep_alive: str | Unset = "5m"
     max_loaded_models: int | Unset = 0
     pool_size: int | Unset = 1
+    prompt_cache: InferencePromptCacheConfig | Unset = UNSET
     backend_priority: list[str] | Unset = UNSET
     max_concurrent_requests: int | Unset = 0
     max_queue_size: int | Unset = 0
@@ -153,6 +156,10 @@ class InferenceConfig:
         max_loaded_models = self.max_loaded_models
 
         pool_size = self.pool_size
+
+        prompt_cache: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.prompt_cache, Unset):
+            prompt_cache = self.prompt_cache.to_dict()
 
         backend_priority: list[str] | Unset = UNSET
         if not isinstance(self.backend_priority, Unset):
@@ -206,6 +213,8 @@ class InferenceConfig:
             field_dict["max_loaded_models"] = max_loaded_models
         if pool_size is not UNSET:
             field_dict["pool_size"] = pool_size
+        if prompt_cache is not UNSET:
+            field_dict["prompt_cache"] = prompt_cache
         if backend_priority is not UNSET:
             field_dict["backend_priority"] = backend_priority
         if max_concurrent_requests is not UNSET:
@@ -233,6 +242,7 @@ class InferenceConfig:
         from ..models.inference_content_security_config import InferenceContentSecurityConfig
         from ..models.inference_credentials import InferenceCredentials
         from ..models.inference_model_ref import InferenceModelRef
+        from ..models.inference_prompt_cache_config import InferencePromptCacheConfig
         from ..models.inferenceschemas_config import InferenceschemasConfig
 
         d = dict(src_dict)
@@ -263,6 +273,13 @@ class InferenceConfig:
         max_loaded_models = d.pop("max_loaded_models", UNSET)
 
         pool_size = d.pop("pool_size", UNSET)
+
+        _prompt_cache = d.pop("prompt_cache", UNSET)
+        prompt_cache: InferencePromptCacheConfig | Unset
+        if isinstance(_prompt_cache, Unset):
+            prompt_cache = UNSET
+        else:
+            prompt_cache = InferencePromptCacheConfig.from_dict(_prompt_cache)
 
         backend_priority = cast(list[str], d.pop("backend_priority", UNSET))
 
@@ -309,6 +326,7 @@ class InferenceConfig:
             keep_alive=keep_alive,
             max_loaded_models=max_loaded_models,
             pool_size=pool_size,
+            prompt_cache=prompt_cache,
             backend_priority=backend_priority,
             max_concurrent_requests=max_concurrent_requests,
             max_queue_size=max_queue_size,

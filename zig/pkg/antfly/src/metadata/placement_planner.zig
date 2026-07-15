@@ -82,13 +82,38 @@ pub const PlacementPlanner = struct {
         current_intents: []const raft_reconciler.PlacementIntent,
         candidate_domains: []const CandidateDomain,
     ) ![]raft_reconciler.PlacementIntent {
+        return try self.planAllIntentsWithCurrentAndDomainsAndProvisioningRanges(
+            manager,
+            candidate_node_ids,
+            current_intents,
+            candidate_domains,
+            &.{},
+        );
+    }
+
+    pub fn planAllIntentsWithCurrentAndDomainsAndProvisioningRanges(
+        self: *const PlacementPlanner,
+        manager: *table_manager.TableManager,
+        candidate_node_ids: []const u64,
+        current_intents: []const raft_reconciler.PlacementIntent,
+        candidate_domains: []const CandidateDomain,
+        provisioning_ranges: []const table_manager.RangeRecord,
+    ) ![]raft_reconciler.PlacementIntent {
         if (candidate_node_ids.len == 0) return error.MissingCandidateNodes;
 
         const tables = try manager.listTables(self.alloc);
         defer manager.freeTables(self.alloc, tables);
-        const ranges = try manager.listRanges(self.alloc);
-        defer manager.freeRanges(self.alloc, ranges);
-        std.mem.sort(table_manager.RangeRecord, ranges, current_intents, struct {
+        const owned_ranges = try manager.listRanges(self.alloc);
+        var ranges = std.ArrayListUnmanaged(table_manager.RangeRecord).fromOwnedSlice(owned_ranges);
+        defer {
+            for (ranges.items) |range| table_manager.freeRange(self.alloc, range);
+            ranges.deinit(self.alloc);
+        }
+        for (provisioning_ranges) |range| {
+            if (containsRangeGroup(ranges.items, range.group_id)) continue;
+            try ranges.append(self.alloc, try table_manager.cloneRange(self.alloc, range));
+        }
+        std.mem.sort(table_manager.RangeRecord, ranges.items, current_intents, struct {
             fn lessThan(current: []const raft_reconciler.PlacementIntent, a: table_manager.RangeRecord, b: table_manager.RangeRecord) bool {
                 const a_has_current = findCurrentIntent(current, a.group_id, null) != null;
                 const b_has_current = findCurrentIntent(current, b.group_id, null) != null;
@@ -108,7 +133,7 @@ pub const PlacementPlanner = struct {
         var pair_by_nodes = std.AutoHashMapUnmanaged(u128, usize).empty;
         defer pair_by_nodes.deinit(self.alloc);
 
-        for (ranges) |range| {
+        for (ranges.items) |range| {
             const table = findTable(tables, range.table_id) orelse return error.UnknownTable;
             const replica_count = @min(@as(usize, table.desired_replica_count), countEligibleCandidates(candidate_node_ids, candidate_domains, table.placement_role));
             if (replica_count == 0) continue;
@@ -209,6 +234,13 @@ pub const PlacementPlanner = struct {
         alloc.free(intents);
     }
 };
+
+fn containsRangeGroup(ranges: []const table_manager.RangeRecord, group_id: u64) bool {
+    for (ranges) |range| {
+        if (range.group_id == group_id) return true;
+    }
+    return false;
+}
 
 pub const CandidateDomain = struct {
     node_id: u64,

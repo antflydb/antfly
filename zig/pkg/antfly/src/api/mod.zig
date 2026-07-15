@@ -50,6 +50,7 @@ pub const distributed_join = @import("distributed_join.zig");
 pub const distributed_graph = @import("distributed_graph.zig");
 pub const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
 pub const repair_jobs = @import("repair_jobs.zig");
+pub const restore_jobs = @import("restore_jobs.zig");
 pub const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
 pub const http_internal_group_write_routes = @import("http_internal_group_write_routes.zig");
 pub const http_internal_group_join_routes = @import("http_internal_group_join_routes.zig");
@@ -83,6 +84,10 @@ pub const HostedProvisionedTableWriteSource = table_writes.HostedProvisionedTabl
 pub const HostedGroupRouter = table_router.HostedGroupRouter;
 pub const ApiHttpServer = http_server.ApiHttpServer;
 pub const ApiHttpClient = http_client.ApiHttpClient;
+
+test "api restore jobs module compiles" {
+    _ = restore_jobs;
+}
 
 test "public index contract exposes runtime status metadata" {
     try openapi_contract.expectPublicIndexRuntimeStatusMetadata();

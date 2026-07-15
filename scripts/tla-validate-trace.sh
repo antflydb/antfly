@@ -82,8 +82,8 @@ validate_one() {
     preprocessed="$(mktemp)"
     preprocess_trace "${trace}" "${preprocessed}"
 
-    local state_dir="${STATEDIR}/${name}"
-    mkdir -p "${state_dir}"
+    local state_dir
+    state_dir="$(mktemp -d "${STATEDIR}/${name}.XXXXXX")"
 
     if env JSON="${preprocessed}" "${TLA_JAVA}" -XX:+UseParallelGC \
         -cp "${TLA2TOOLS}:${COMMUNITY_MODULES}" \
@@ -95,7 +95,11 @@ validate_one() {
         return 0
     else
         echo "FAIL ${trace}"
-        echo "  TLC output: ${state_dir}/tlc.log"
+        echo "----- TLC summary: ${trace} -----"
+        grep -E '^(Error:|[0-9]+ states generated|The depth|Trace exploration spec path:|Finished in )' "${state_dir}/tlc.log" || true
+        echo "----- TLC final context: ${trace} -----"
+        tail -n 160 "${state_dir}/tlc.log"
+        echo "----- end TLC output: ${trace} -----"
         rm -f "${preprocessed}"
         return 1
     fi
@@ -113,18 +117,24 @@ else
     export -f validate_one preprocess_trace
     export TLA_JAVA TLA2TOOLS COMMUNITY_MODULES SPEC CONFIG STATEDIR SKIP_SORT
 
-    results="$(mktemp)"
+    results="${STATEDIR}/results"
     printf '%s\n' "${trace_files[@]}" | \
         xargs -P "${PARALLEL}" -I{} bash -c '
-            if validate_one "$1"; then
-                echo "pass"
+            trace="$1"
+            trace_output="$(mktemp "${STATEDIR}/validation-output.XXXXXX")"
+            if validate_one "${trace}" > "${trace_output}" 2>&1; then
+                printf "pass\t%s\t%s\n" "${trace}" "${trace_output}"
             else
-                echo "fail"
+                printf "fail\t%s\t%s\n" "${trace}" "${trace_output}"
             fi
-        ' -- {} >> "${results}"
+        ' -- {} > "${results}"
 
-    passed=$(grep -c "^pass$" "${results}" || true)
-    failed=$(grep -c "^fail$" "${results}" || true)
+    passed=$(grep -c $'^pass\t' "${results}" || true)
+    failed=$(grep -c $'^fail\t' "${results}" || true)
+    while IFS=$'\t' read -r status trace trace_output; do
+        cat "${trace_output}"
+        rm -f "${trace_output}"
+    done < "${results}"
     rm -f "${results}"
 fi
 

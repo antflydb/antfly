@@ -28,6 +28,19 @@ pub const Config = struct {
     backend: Backend = runtime_backend.defaultExecutorBackend(),
 };
 
+/// Process-local hook used by composed runtimes to replace a filesystem DB
+/// open with another storage implementation. The options pointer is opaque here
+/// to keep the executor layer independent of the DB module; DB.open is the sole
+/// caller and passes a `*db.OpenOptions`.
+pub const DbOpenConfigurator = struct {
+    ptr: *anyopaque,
+    configure_fn: *const fn (ptr: *anyopaque, path: []const u8, options: *anyopaque) anyerror!void,
+
+    pub fn configure(self: @This(), path: []const u8, options: anytype) !void {
+        try self.configure_fn(self.ptr, path, @ptrCast(options));
+    }
+};
+
 pub const DurableJobLane = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -101,6 +114,7 @@ pub const BackendRuntime = struct {
     inline_jobs: InlineDurableJobLane = .{},
     threaded_jobs: ?*ThreadedDurableJobLane = null,
     durable_jobs: DurableJobLane,
+    db_open_configurator: ?DbOpenConfigurator = null,
 
     pub fn init(alloc: Allocator, config: Config) !BackendRuntime {
         try runtime_backend.ensureExecutorBackendAvailable(config.backend);

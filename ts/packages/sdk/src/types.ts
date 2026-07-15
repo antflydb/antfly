@@ -62,7 +62,9 @@ export interface QueryHitsTotalFormatOptions {
 }
 
 /** Returns structured hit-count metadata, including whether the value is exact. */
-export function queryResultHitsTotal(result: QueryResult | null | undefined): QueryHitsTotal | undefined {
+export function queryResultHitsTotal(
+  result: QueryResult | null | undefined
+): QueryHitsTotal | undefined {
   return result?.hits?.total ?? undefined;
 }
 
@@ -77,14 +79,16 @@ export function queryHitsTotalValue(total: QueryHitsTotal | null | undefined): n
 }
 
 /** Returns true for exact totals, false for lower-bound totals, and undefined when absent. */
-export function queryHitsTotalIsExact(total: QueryHitsTotal | null | undefined): boolean | undefined {
+export function queryHitsTotalIsExact(
+  total: QueryHitsTotal | null | undefined
+): boolean | undefined {
   return total == null ? undefined : total.relation === "exact";
 }
 
 /** Formats hit-count metadata without losing lower-bound semantics. */
 export function formatQueryHitsTotal(
   total: QueryHitsTotal | null | undefined,
-  options: QueryHitsTotalFormatOptions = {},
+  options: QueryHitsTotalFormatOptions = {}
 ): string | undefined {
   if (total == null) return undefined;
   const singular = options.singular ?? "hit";
@@ -196,6 +200,8 @@ export type PermissionType = components["schemas"]["PermissionType"];
 // Backup/Restore types
 export type BackupRequest = components["schemas"]["BackupRequest"];
 export type RestoreRequest = components["schemas"]["RestoreRequest"];
+export type ClusterRestoreRequest = components["schemas"]["ClusterRestoreRequest"];
+export type RestoreJob = components["schemas"]["RestoreJob"];
 
 // Lookup/Scan types
 export type ScanKeysRequest = Omit<components["schemas"]["ScanKeysRequest"], "filter_query"> & {

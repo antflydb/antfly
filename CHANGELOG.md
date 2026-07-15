@@ -25,7 +25,7 @@ All notable changes to Antfly will be documented in this file.
 
 #### Highlights
 
-- **Faster Swarm Mode** — local shard bypass eliminates network hops and JSON serialization for single-node deployments, significantly reducing query latency
+- **Faster Standalone Mode** — local shard bypass eliminates network hops and JSON serialization for single-node deployments, significantly reducing query latency
 - **Smarter Vector Search** — automatic reranking and size-aware search effort tuning deliver better recall out of the box
 - **Friendlier Errors** — LLM generation failures now return clear, actionable error messages with appropriate HTTP status codes
 - **Automatic Shard Management** — Antfly now automatically splits large shards and merges underutilized ones, keeping cluster performance balanced without manual intervention
@@ -35,7 +35,7 @@ All notable changes to Antfly will be documented in this file.
 
 - Automatic shard split policy keeps individual shards from growing too large
 - Online shard merges consolidate underutilized shards without downtime
-- Local shard bypass skips HTTP and serialization overhead in swarm mode
+- Local shard bypass skips HTTP and serialization overhead in standalone mode
 - Single-shard fast path and index caching speed up common query patterns
 - Automatic reranking for HBC vector search improves recall without configuration
 - Size-aware search effort defaults adapt to index size automatically

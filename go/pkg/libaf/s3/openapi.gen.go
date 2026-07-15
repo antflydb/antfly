@@ -17,16 +17,16 @@ import (
 
 // Credentials defines model for Credentials.
 type Credentials struct {
-	// AccessKeyId AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID environment variable if not set.
+	// AccessKeyId AWS access key ID. Supports secret-store references. Falls back to AWS_ACCESS_KEY_ID when not set.
 	AccessKeyId string `json:"access_key_id,omitempty,omitzero"`
 
 	// Endpoint S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
 	Endpoint string `json:"endpoint,omitempty,omitzero"`
 
-	// SecretAccessKey AWS secret access key. Supports keystore syntax for secret lookup. Falls back to AWS_SECRET_ACCESS_KEY environment variable if not set.
+	// SecretAccessKey AWS secret access key. Supports secret-store references. Falls back to AWS_SECRET_ACCESS_KEY when not set.
 	SecretAccessKey string `json:"secret_access_key,omitempty,omitzero"`
 
-	// SessionToken Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup.
+	// SessionToken Optional AWS session token for temporary credentials. Supports secret-store references.
 	SessionToken string `json:"session_token,omitempty,omitzero"`
 
 	// UseSsl Enable SSL/TLS for S3 connections (default: true for AWS, false for local MinIO)
@@ -36,15 +36,15 @@ type Credentials struct {
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"H4sIAAAAAAAC/6RUwW7bMAz9FYKXdIDjpchpvgVpBhTrUGAqUOxkKAqTaJFFQaK7ekX+fbCcLVnry7Yb",
-	"ST+a7z0SekHDTWBPXhJWL5jMnhqdw2WkDXmx2uU0RA4UxVLOtDGUUn2grrabvrChZKINYtljhYtHBQME",
-	"DtTB7U0Jqg2Bo+RCEo4EqfOin2HLERKZSAKO+dCGEj5q5xKstTmAMCweVb1YLldK1Z9WX+vbGyD/ZCP7",
-	"hrzAk45Wrx2B3YJngURSYoH0rJvgCCvsuI3Tgcz0QN3UbrBA6UL/LUm0fofHAslvAlsvb7Wo+bT3SIvt",
-	"p/zCwRWVu7KASZqXutE/2OvvqTTcTIAjTBwb7facpPowm80mWeRn62/v3/3B7XUzFthYf0d+J3usrkd4",
-	"Dk7VZ//HzT8Zet7B/y5ArZZfVg8Xe/iHJQxDLnaBowJTsuxr4QP5t+Luc6AdDCozFjI26xBqAkcdOzDn",
-	"8/0r7WO085TpwGiEcpuoTskNZLe6dYKVxJaKV9xXPnuk1N37hzuVZ6s5GPaeTA9JcHXqr6Dvz4jFoypg",
-	"q10a0nxY51M6cVkzO9Iej8ffJV5/IyN47EvWb3nssEG3su9NMrqvgfabCzp9uLW7NuaPvTFiJdui5nDx",
-	"OoDKjwYW+EQxDf+elbPyuveGA3kdLFY4L2flHAsMWvYJK986d/wZAAD//6Vz+aV/BAAA",
+	"H4sIAAAAAAAC/5yTQWsbPRCG/8owF+eD9X4OPnVvxnEhNCVQBUJPiyyPbdVajZBmm7rB/71Im9ZustDS",
+	"mzT7SvvMw+gZDXeBPXlJ2DxjMnvqdFkuI23Ii9WubEPkQFEslZ02hlJqD3Rs7SYXNpRMtEEse2xw8ahg",
+	"iMCBjnB7U4PqQ+AoCRKZSDJNwpEg0pYieUOphvfauQRrbQ4gDItH1S6Wy5VS7YfV5/b2Bp725MGzQCKp",
+	"sUL6prvgCBs8ch+nw/+mBzpO7QYrlGPI35JE63d4qpD8JrD18hZXzadZgxa7dgQ/c3BF9a6uYJLmte70",
+	"d/b6KdWGuwlwhIljo92ekzTvZrPZBLYc4aP1t/f//cb2+jBW2Fl/R34ne2yuRzgHQe1Z8bjfIXah+d8c",
+	"q9Xy0+rhQvWfPL/cfdaNoz2kZNm3wgfyb/nvy0I7GBopWSjZolGoCxx1PII5D+FftDcGW+6eDhwjoH2i",
+	"NiU3IG517wQbiT1Vr4hXXufZUOru/4c7VSjVHAx7TyZHEly9nG8gny+JxaOqYKtdGrZlYs4z8sKyZnak",
+	"PZ5Ov0q8/kJG8JRL1m95bGJB97LPaozONdB+c4GTl1u762P5mMWIlaJFzeHiZYMqDx4r/EoxDXfP6ll9",
+	"nd1wIK+DxQbn9ayeY4VByz5h43vnTj8CAAD//0F/Cgg7BAAA",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

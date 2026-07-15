@@ -86,7 +86,7 @@ func TestHAAdminTokenSecretInjectionManifestsAreAligned(t *testing.T) {
 		t.Fatal("ANTFLY_HA_ADMIN_TOKEN Secret key ref must be optional for deployments without HA admin automation")
 	}
 
-	rawExample, err := os.ReadFile("../examples/ha-hot-standby-swarm.yaml")
+	rawExample, err := os.ReadFile("../examples/ha-hot-standby-standalone.yaml")
 	if err != nil {
 		t.Fatalf("read HA example manifest: %v", err)
 	}
