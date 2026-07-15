@@ -423,6 +423,20 @@ fn textBatchByteStats(texts: []const []const u8) TextBatchByteStats {
     return stats;
 }
 
+fn contentPartsByteStats(parts: []const template.ContentPart) TextBatchByteStats {
+    var stats = TextBatchByteStats{};
+    for (parts) |part| {
+        const bytes = switch (part) {
+            .text => |value| value.len,
+            .media_url => |value| value.len,
+            .binary => |value| value.data.len,
+        };
+        stats.total_bytes += bytes;
+        stats.max_bytes = @max(stats.max_bytes, bytes);
+    }
+    return stats;
+}
+
 fn boundedTextBatchEnd(texts: []const []const u8, start: usize, max_items: usize, max_bytes: usize) usize {
     var end = start;
     var bytes: usize = 0;
@@ -507,6 +521,15 @@ fn runtimeStatusSnapshot(runtime: *EnrichmentRuntime) enrichment_state.RuntimeSt
         .retryable_error_count = runtime.retryable_error_count,
         .fatal_error_count = runtime.fatal_error_count,
         .skipped_source_count = runtime.skipped_source_count,
+        .embed_batches_started = runtime.embed_batches_started,
+        .embed_batches_completed = runtime.embed_batches_completed,
+        .embed_items_started = runtime.embed_items_started,
+        .embed_items_completed = runtime.embed_items_completed,
+        .last_embed_batch_items = runtime.last_embed_batch_items,
+        .last_embed_batch_bytes = runtime.last_embed_batch_bytes,
+        .last_embed_batch_max_bytes = runtime.last_embed_batch_max_bytes,
+        .last_embed_batch_ns = runtime.last_embed_batch_ns,
+        .total_embed_ns = runtime.total_embed_ns,
         .retrying = runtime.retrying,
         .worker_failed = runtime.worker_failed,
     };
@@ -523,6 +546,15 @@ fn restorePersistedRuntimeStatus(runtime: anytype, persisted_status: enrichment_
     runtime.retryable_error_count = persisted_status.retryable_error_count;
     runtime.fatal_error_count = persisted_status.fatal_error_count;
     runtime.skipped_source_count = persisted_status.skipped_source_count;
+    runtime.embed_batches_started = persisted_status.embed_batches_started;
+    runtime.embed_batches_completed = persisted_status.embed_batches_completed;
+    runtime.embed_items_started = persisted_status.embed_items_started;
+    runtime.embed_items_completed = persisted_status.embed_items_completed;
+    runtime.last_embed_batch_items = persisted_status.last_embed_batch_items;
+    runtime.last_embed_batch_bytes = persisted_status.last_embed_batch_bytes;
+    runtime.last_embed_batch_max_bytes = persisted_status.last_embed_batch_max_bytes;
+    runtime.last_embed_batch_ns = persisted_status.last_embed_batch_ns;
+    runtime.total_embed_ns = persisted_status.total_embed_ns;
     runtime.retrying = persisted_status.retrying and !persisted_status.worker_failed;
     runtime.worker_failed = persisted_status.worker_failed;
     runtime.target_sequence = @max(runtime.applied_sequence, persisted_status.target_sequence);
@@ -536,6 +568,15 @@ test "enrichment runtime restore preserves retry target across restart" {
         retryable_error_count: u64 = 0,
         fatal_error_count: u64 = 0,
         skipped_source_count: u64 = 0,
+        embed_batches_started: u64 = 0,
+        embed_batches_completed: u64 = 0,
+        embed_items_started: u64 = 0,
+        embed_items_completed: u64 = 0,
+        last_embed_batch_items: u64 = 0,
+        last_embed_batch_bytes: u64 = 0,
+        last_embed_batch_max_bytes: u64 = 0,
+        last_embed_batch_ns: u64 = 0,
+        total_embed_ns: u64 = 0,
         retrying: bool = false,
         worker_failed: bool = false,
     }{};
@@ -545,6 +586,15 @@ test "enrichment runtime restore preserves retry target across restart" {
         .error_count = 2,
         .retryable_error_count = 2,
         .fatal_error_count = 0,
+        .embed_batches_started = 4,
+        .embed_batches_completed = 3,
+        .embed_items_started = 12,
+        .embed_items_completed = 10,
+        .last_embed_batch_items = 2,
+        .last_embed_batch_bytes = 64,
+        .last_embed_batch_max_bytes = 40,
+        .last_embed_batch_ns = 200,
+        .total_embed_ns = 900,
         .retrying = true,
         .worker_failed = false,
     });
@@ -552,6 +602,8 @@ test "enrichment runtime restore preserves retry target across restart" {
     try std.testing.expectEqual(@as(u64, 9), runtime.target_sequence);
     try std.testing.expectEqual(@as(u64, 2), runtime.error_count);
     try std.testing.expectEqual(@as(u64, 2), runtime.retryable_error_count);
+    try std.testing.expectEqual(@as(u64, 3), runtime.embed_batches_completed);
+    try std.testing.expectEqual(@as(u64, 900), runtime.total_embed_ns);
     try std.testing.expect(runtime.retrying);
     try std.testing.expect(!runtime.worker_failed);
 }
@@ -564,6 +616,15 @@ test "enrichment runtime restore does not resume persisted fatal failure" {
         retryable_error_count: u64 = 0,
         fatal_error_count: u64 = 0,
         skipped_source_count: u64 = 0,
+        embed_batches_started: u64 = 0,
+        embed_batches_completed: u64 = 0,
+        embed_items_started: u64 = 0,
+        embed_items_completed: u64 = 0,
+        last_embed_batch_items: u64 = 0,
+        last_embed_batch_bytes: u64 = 0,
+        last_embed_batch_max_bytes: u64 = 0,
+        last_embed_batch_ns: u64 = 0,
+        total_embed_ns: u64 = 0,
         retrying: bool = false,
         worker_failed: bool = false,
     }{};
@@ -5837,7 +5898,14 @@ fn processDenseEmbedding(
         if (source_parts) |parts| {
             defer template.freeContentParts(runtime.alloc, parts);
 
-            const vector = try embedDensePartsWithRetry(dense_embedder, runtime, embedding_artifact_name, parts, request.expected_dims);
+            const part_stats = contentPartsByteStats(parts);
+            noteEmbedBatchStarted(runtime, 1, part_stats.total_bytes, part_stats.max_bytes);
+            const embed_started_ns = runtime.config.clock.nowRealtimeNs();
+            const vector = embedDensePartsWithRetry(dense_embedder, runtime, embedding_artifact_name, parts, request.expected_dims) catch |err| {
+                noteEmbedBatchFinished(runtime, 1, part_stats.total_bytes, part_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+                return err;
+            };
+            noteEmbedBatchFinished(runtime, 1, part_stats.total_bytes, part_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
             defer runtime.alloc.free(vector);
 
             try writeEmbeddingArtifact(runtime, .{
@@ -5881,7 +5949,13 @@ fn processDenseEmbedding(
         return;
     }
 
-    const vector = try embedDenseWithRetry(dense_embedder, runtime, embedding_artifact_name, source_text, request.expected_dims);
+    noteEmbedBatchStarted(runtime, 1, source_text.len, source_text.len);
+    const embed_started_ns = runtime.config.clock.nowRealtimeNs();
+    const vector = embedDenseWithRetry(dense_embedder, runtime, embedding_artifact_name, source_text, request.expected_dims) catch |err| {
+        noteEmbedBatchFinished(runtime, 1, source_text.len, source_text.len, elapsedNsSince(runtime, embed_started_ns), false);
+        return err;
+    };
+    noteEmbedBatchFinished(runtime, 1, source_text.len, source_text.len, elapsedNsSince(runtime, embed_started_ns), true);
     defer runtime.alloc.free(vector);
 
     try writeEmbeddingArtifact(runtime, .{
@@ -5982,7 +6056,13 @@ fn processSparseEmbedding(
         return;
     }
 
-    var sparse = try embedSparseWithRetry(sparse_embedder, runtime, embedding_artifact_name, source_text);
+    noteEmbedBatchStarted(runtime, 1, source_text.len, source_text.len);
+    const embed_started_ns = runtime.config.clock.nowRealtimeNs();
+    var sparse = embedSparseWithRetry(sparse_embedder, runtime, embedding_artifact_name, source_text) catch |err| {
+        noteEmbedBatchFinished(runtime, 1, source_text.len, source_text.len, elapsedNsSince(runtime, embed_started_ns), false);
+        return err;
+    };
+    noteEmbedBatchFinished(runtime, 1, source_text.len, source_text.len, elapsedNsSince(runtime, embed_started_ns), true);
     defer sparse.deinit(runtime.alloc);
     try writeSparseEmbeddingArtifact(runtime, request.doc_key, embedding_artifact_name, source_hash, sparse.indices, sparse.values);
     try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);

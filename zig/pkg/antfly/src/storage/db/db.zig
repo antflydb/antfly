@@ -10398,8 +10398,18 @@ pub const DB = struct {
             .error_count = status.error_count,
             .retryable_error_count = status.retryable_error_count,
             .fatal_error_count = status.fatal_error_count,
+            .skipped_source_count = status.skipped_source_count,
             .retrying = status.retrying,
             .worker_failed = status.worker_failed,
+            .embed_batches_started = status.embed_batches_started,
+            .embed_batches_completed = status.embed_batches_completed,
+            .embed_items_started = status.embed_items_started,
+            .embed_items_completed = status.embed_items_completed,
+            .last_embed_batch_items = status.last_embed_batch_items,
+            .last_embed_batch_bytes = status.last_embed_batch_bytes,
+            .last_embed_batch_max_bytes = status.last_embed_batch_max_bytes,
+            .last_embed_batch_ns = status.last_embed_batch_ns,
+            .total_embed_ns = status.total_embed_ns,
         };
     }
 
