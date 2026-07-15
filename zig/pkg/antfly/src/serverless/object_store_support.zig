@@ -166,3 +166,20 @@ pub const OpenedObjectStore = struct {
         self.* = undefined;
     }
 };
+
+test "storage.ha cleanup object store does not create a missing bucket while opening deletion authority" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try std.testing.expect(!(try client.bucketExists("missing-ha-bucket")));
+
+    var opened = try OpenedObjectStore.initWithExistingClient(
+        alloc,
+        client,
+        "missing-ha-bucket",
+        "instances/instance-a/ha-seeds/",
+    );
+    defer opened.deinit();
+    try std.testing.expect(!(try client.bucketExists("missing-ha-bucket")));
+}

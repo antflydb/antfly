@@ -1763,6 +1763,49 @@ test "ha cmd artifact parses lifecycle-gated source and target generation gc act
     try std.testing.expectEqual(@as(usize, 1), target.protected_generations.len);
 }
 
+test "ha cmd artifact parses exact controller-authorized seed prefix deletion" {
+    const alloc = std.testing.allocator;
+    var options = try parseArtifactArgs(alloc, &.{
+        "delete-prefix",
+        "--location",
+        "s3://ha-bucket/instances/instance-a/ha-seeds/",
+        "--operation-id",
+        "ha-seed-delete-0123456789abcdef0123456789abcdef",
+        "--retry-token",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--instance-id",
+        "instance-a",
+        "--topology-id",
+        "topology-a",
+        "--topology-generation",
+        "7",
+        "--prefix-sha256",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "--credentials-secret-name",
+        "instance-a-ha-seed-store",
+        "--delete-all",
+        "--request-sha256",
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    });
+    defer options.deinit(alloc);
+    try std.testing.expectEqual(ArtifactAction.delete_prefix, options.action);
+    try std.testing.expectEqualStrings("instance-a", options.cleanup.instance_id.?);
+    try std.testing.expectEqualStrings("topology-a", options.cleanup.topology_id.?);
+    try std.testing.expectEqual(@as(u64, 7), options.cleanup.topology_generation.?);
+    try std.testing.expect(options.cleanup.delete_all);
+
+    try std.testing.expectError(error.SeedArtifactFlagNotAllowedForAction, parseArtifactArgs(alloc, &.{
+        "delete-prefix",
+        "--generation",
+        "seed-a",
+    }));
+    try std.testing.expectError(error.DuplicateSeedArtifactFlag, parseArtifactArgs(alloc, &.{
+        "delete-prefix",
+        "--delete-all",
+        "--delete-all",
+    }));
+}
+
 test "ha cmd artifact rejects flags that the selected action would ignore" {
     const alloc = std.testing.allocator;
 
