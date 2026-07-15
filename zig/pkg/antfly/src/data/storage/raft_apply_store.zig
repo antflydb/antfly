@@ -508,10 +508,20 @@ pub const RaftApplyStore = struct {
     }
 
     fn parseSplitTransition(alloc: std.mem.Allocator, payload: []const u8) !shard_state_store.SplitTransition {
-        const sep = std.mem.indexOfScalar(u8, payload, ':') orelse return error.InvalidAppliedDataRange;
+        const transition_sep = std.mem.indexOfScalar(u8, payload, ':') orelse return error.InvalidAppliedDataRange;
+        const destination_start = transition_sep + 1;
+        const destination_rel_sep = std.mem.indexOfScalar(u8, payload[destination_start..], ':') orelse
+            return error.InvalidAppliedDataRange;
+        const destination_sep = destination_start + destination_rel_sep;
+        const transition_id = try std.fmt.parseInt(u64, payload[0..transition_sep], 10);
+        const destination_group_id = try std.fmt.parseInt(u64, payload[destination_start..destination_sep], 10);
+        const split_key = payload[destination_sep + 1 ..];
+        if (transition_id == 0 or destination_group_id == 0 or split_key.len == 0)
+            return error.InvalidAppliedDataRange;
         return .{
-            .new_shard_id = try std.fmt.parseInt(u64, payload[0..sep], 10),
-            .split_key = try alloc.dupe(u8, payload[sep + 1 ..]),
+            .transition_id = transition_id,
+            .new_shard_id = destination_group_id,
+            .split_key = try alloc.dupe(u8, split_key),
         };
     }
 
@@ -600,6 +610,7 @@ pub const RaftApplyStore = struct {
                 const split_key = try alloc.dupe(u8, transition.split_key);
                 errdefer alloc.free(split_key);
                 try operations.append(alloc, .{ .prepare_split = .{
+                    .transition_id = transition.transition_id,
                     .new_shard_id = transition.destination_group_id,
                     .split_key = split_key,
                 } });
@@ -608,6 +619,7 @@ pub const RaftApplyStore = struct {
                 const split_key = try alloc.dupe(u8, transition.split_key);
                 errdefer alloc.free(split_key);
                 try operations.append(alloc, .{ .start_split = .{
+                    .transition_id = transition.transition_id,
                     .new_shard_id = transition.destination_group_id,
                     .split_key = split_key,
                 } });
@@ -617,10 +629,12 @@ pub const RaftApplyStore = struct {
                 errdefer alloc.free(split_key);
                 const operation: shard_state_store.DataOperation = switch (transition.kind) {
                     .finalize => .{ .finalize_split = .{
+                        .transition_id = transition.transition_id,
                         .new_shard_id = transition.destination_group_id,
                         .split_key = split_key,
                     } },
                     .rollback => .{ .rollback_split = .{
+                        .transition_id = transition.transition_id,
                         .new_shard_id = transition.destination_group_id,
                         .split_key = split_key,
                     } },
@@ -632,6 +646,7 @@ pub const RaftApplyStore = struct {
         if (decoded.batch.req.split_checkpoint) |checkpoint| {
             if (checkpoint.kind == .source_ack) {
                 try operations.append(alloc, .{ .acknowledge_split = .{
+                    .transition_id = checkpoint.transition_id,
                     .destination_group_id = checkpoint.destination_group_id,
                     .delta_sequence = checkpoint.delta_sequence,
                 } });
@@ -999,8 +1014,8 @@ test "data raft apply store captures split handoff and replays destination delta
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b=left-0") },
         .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t=right-0") },
-        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:90:doc:m") },
-        .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:90:doc:m") },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:90:90:doc:m") },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:90:90:doc:m") },
         .{ .term = 1, .index = 6, .entry_type = .normal, .data = @constCast("put:doc:u=right-1") },
     });
     defer std.testing.allocator.free(setup);
@@ -1062,7 +1077,7 @@ test "data raft apply store parses colon-delimited range keys correctly" {
     const encoded = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:m={\"v\":1}") },
-        .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("split_prepare:192:doc:n") },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("split_prepare:192:192:doc:n") },
     });
     defer std.testing.allocator.free(encoded);
 
@@ -1094,29 +1109,45 @@ test "data raft apply store persists split destination acknowledgements" {
     var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
     defer store.deinit();
 
+    const setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("split_prepare:201:202:doc:m") },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("split_start:201:202:doc:m") },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("put:doc:x={}") },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("put:doc:y={}") },
+    });
+    defer std.testing.allocator.free(setup);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 201,
+        .commit_index = 5,
+        .entries_bytes = setup,
+    });
+
     const batch = try data_raft_batch.encode(std.testing.allocator, "docs", .{
         .split_checkpoint = .{
             .kind = .source_ack,
+            .transition_id = 201,
             .source_group_id = 201,
             .destination_group_id = 202,
-            .delta_sequence = 9,
+            .delta_sequence = 1,
         },
     });
     defer std.testing.allocator.free(batch);
     const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 1, .entry_type = .normal, .data = batch },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = batch },
     });
     defer std.testing.allocator.free(entries);
 
     try store.snapshotBuilder().applyBatch(.{
         .group_id = 201,
-        .commit_index = 1,
+        .commit_index = 6,
         .entries_bytes = entries,
     });
     const acknowledgement = (try store.currentSplitAcknowledgement(std.testing.allocator, 201)) orelse
         return error.MissingSplitAcknowledgement;
+    try std.testing.expectEqual(@as(u64, 201), acknowledgement.transition_id);
     try std.testing.expectEqual(@as(u64, 202), acknowledgement.destination_group_id);
-    try std.testing.expectEqual(@as(u64, 9), acknowledgement.delta_sequence);
+    try std.testing.expectEqual(@as(u64, 1), acknowledgement.delta_sequence);
 }
 
 test "data raft apply store skips persisted split commands in overlapping replay" {
@@ -1131,6 +1162,7 @@ test "data raft apply store skips persisted split commands in overlapping replay
     const prepare = try data_raft_batch.encode(std.testing.allocator, "docs", .{
         .split_transition = .{
             .kind = .prepare,
+            .transition_id = 211,
             .destination_group_id = 212,
             .split_key = "doc:m",
         },
@@ -1139,6 +1171,7 @@ test "data raft apply store skips persisted split commands in overlapping replay
     const start = try data_raft_batch.encode(std.testing.allocator, "docs", .{
         .split_transition = .{
             .kind = .start,
+            .transition_id = 211,
             .destination_group_id = 212,
             .split_key = "doc:m",
         },
@@ -1185,6 +1218,7 @@ test "data raft apply store recovers exact split replay after injected projectio
     const prepare = try data_raft_batch.encode(std.testing.allocator, "docs", .{
         .split_transition = .{
             .kind = .prepare,
+            .transition_id = 221,
             .destination_group_id = 222,
             .split_key = "doc:m",
         },
@@ -1260,11 +1294,11 @@ test "data raft apply store rejects mismatched terminal split identity" {
     defer store.deinit();
 
     const prepare = try data_raft_batch.encode(std.testing.allocator, "docs", .{
-        .split_transition = .{ .kind = .prepare, .destination_group_id = 222, .split_key = "doc:m" },
+        .split_transition = .{ .kind = .prepare, .transition_id = 221, .destination_group_id = 222, .split_key = "doc:m" },
     });
     defer std.testing.allocator.free(prepare);
     const start = try data_raft_batch.encode(std.testing.allocator, "docs", .{
-        .split_transition = .{ .kind = .start, .destination_group_id = 222, .split_key = "doc:m" },
+        .split_transition = .{ .kind = .start, .transition_id = 221, .destination_group_id = 222, .split_key = "doc:m" },
     });
     defer std.testing.allocator.free(start);
     const setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
@@ -1280,7 +1314,7 @@ test "data raft apply store rejects mismatched terminal split identity" {
     });
 
     const wrong_rollback = try data_raft_batch.encode(std.testing.allocator, "docs", .{
-        .split_transition = .{ .kind = .rollback, .destination_group_id = 223, .split_key = "doc:m" },
+        .split_transition = .{ .kind = .rollback, .transition_id = 221, .destination_group_id = 223, .split_key = "doc:m" },
     });
     defer std.testing.allocator.free(wrong_rollback);
     const wrong_rollback_entry = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
@@ -1296,6 +1330,7 @@ test "data raft apply store rejects mismatched terminal split identity" {
     const wrong_ack = try data_raft_batch.encode(std.testing.allocator, "docs", .{
         .split_checkpoint = .{
             .kind = .source_ack,
+            .transition_id = 221,
             .source_group_id = 221,
             .destination_group_id = 223,
             .delta_sequence = 0,

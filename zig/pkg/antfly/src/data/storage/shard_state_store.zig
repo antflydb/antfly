@@ -29,6 +29,7 @@ pub const SplitDelta = shard_mod.SplitDelta;
 
 pub const AppliedSplitState = struct {
     phase: SplitPhase,
+    transition_id: u64,
     split_key: []const u8,
     new_shard_id: u64,
     original_range_end: []const u8,
@@ -59,17 +60,20 @@ pub const DataOperation = union(enum) {
 };
 
 pub const SplitTransition = struct {
+    transition_id: u64,
     new_shard_id: u64,
     split_key: []u8,
 };
 
 pub const SplitAcknowledgement = struct {
+    transition_id: u64,
     destination_group_id: u64,
     delta_sequence: u64,
 };
 
-pub fn validateSplitIdentity(state: AppliedSplitState, destination_group_id: u64, split_key: ?[]const u8) !void {
-    if (state.new_shard_id != destination_group_id) return error.ConflictingSplitTransition;
+pub fn validateSplitIdentity(state: AppliedSplitState, transition_id: u64, destination_group_id: u64, split_key: ?[]const u8) !void {
+    if (state.transition_id != transition_id or state.new_shard_id != destination_group_id)
+        return error.ConflictingSplitTransition;
     if (split_key) |expected| {
         if (!std.mem.eql(u8, state.split_key, expected)) return error.ConflictingSplitTransition;
     }
@@ -217,10 +221,11 @@ pub fn currentSplitAcknowledgement(store: *docstore.DocStore, alloc: std.mem.All
         else => return err,
     };
     defer alloc.free(raw);
-    if (raw.len != 16) return error.InvalidSplitAcknowledgement;
+    if (raw.len != 24) return error.InvalidSplitAcknowledgement;
     return .{
-        .destination_group_id = std.mem.readInt(u64, raw[0..8], .little),
-        .delta_sequence = std.mem.readInt(u64, raw[8..16], .little),
+        .transition_id = std.mem.readInt(u64, raw[0..8], .little),
+        .destination_group_id = std.mem.readInt(u64, raw[8..16], .little),
+        .delta_sequence = std.mem.readInt(u64, raw[16..24], .little),
     };
 }
 
@@ -552,7 +557,8 @@ pub fn appendOperationEffects(
         .prepare_split => |prepare| {
             if (split_state) |state| {
                 const already_prepared = switch (state.phase) {
-                    .prepare, .splitting, .finalizing => state.new_shard_id == prepare.new_shard_id and
+                    .prepare, .splitting, .finalizing => state.transition_id == prepare.transition_id and
+                        state.new_shard_id == prepare.new_shard_id and
                         std.mem.eql(u8, state.split_key, prepare.split_key),
                     .none, .rolling_back => false,
                 };
@@ -580,6 +586,7 @@ pub fn appendOperationEffects(
             errdefer alloc.free(owned_original_end);
             split_state = .{
                 .phase = .prepare,
+                .transition_id = prepare.transition_id,
                 .split_key = owned_split_key,
                 .new_shard_id = prepare.new_shard_id,
                 .original_range_end = owned_original_end,
@@ -603,7 +610,8 @@ pub fn appendOperationEffects(
         .start_split => |start| {
             if (split_state) |state| {
                 const already_started = switch (state.phase) {
-                    .splitting, .finalizing => state.new_shard_id == start.new_shard_id and
+                    .splitting, .finalizing => state.transition_id == start.transition_id and
+                        state.new_shard_id == start.new_shard_id and
                         std.mem.eql(u8, state.split_key, start.split_key),
                     .none, .prepare, .rolling_back => false,
                 };
@@ -619,8 +627,7 @@ pub fn appendOperationEffects(
                 .original_range_end = state.original_range_end,
             } else null;
             try shard_mod.validateStartSplit(shard_split_state, start.split_key);
-            if (split_state.?.new_shard_id != start.new_shard_id)
-                return error.ConflictingSplitTransition;
+            try validateSplitIdentity(split_state.?, start.transition_id, start.new_shard_id, start.split_key);
 
             split_state.?.phase = .splitting;
 
@@ -664,20 +671,30 @@ pub fn appendOperationEffects(
         },
         .acknowledge_split => |acknowledgement| {
             const state = split_state orelse return error.SplitInProgress;
-            try validateSplitIdentity(state, acknowledgement.destination_group_id, null);
+            try validateSplitIdentity(state, acknowledgement.transition_id, acknowledgement.destination_group_id, null);
             if (state.phase != .splitting and state.phase != .finalizing) return error.SplitInProgress;
+            if (try currentSplitAcknowledgement(store, alloc, group_id)) |current| {
+                if (current.transition_id != acknowledgement.transition_id or
+                    current.destination_group_id != acknowledgement.destination_group_id)
+                    return error.ConflictingSplitTransition;
+                if (acknowledgement.delta_sequence <= current.delta_sequence) continue;
+            }
+            const source_delta_sequence = try currentSplitDeltaSequence(store, alloc, group_id);
+            if (acknowledgement.delta_sequence > source_delta_sequence)
+                return error.SplitAcknowledgementAheadOfSource;
             const acknowledgement_key = try groupSplitAcknowledgementKeyAlloc(alloc, group_id);
             errdefer alloc.free(acknowledgement_key);
             removeOwnedWriteByKey(alloc, writes, acknowledgement_key);
             removeDeleteByKey(alloc, deletes, acknowledgement_key);
-            const value = try alloc.alloc(u8, 16);
+            const value = try alloc.alloc(u8, 24);
             errdefer alloc.free(value);
-            std.mem.writeInt(u64, value[0..8], acknowledgement.destination_group_id, .little);
-            std.mem.writeInt(u64, value[8..16], acknowledgement.delta_sequence, .little);
+            std.mem.writeInt(u64, value[0..8], acknowledgement.transition_id, .little);
+            std.mem.writeInt(u64, value[8..16], acknowledgement.destination_group_id, .little);
+            std.mem.writeInt(u64, value[16..24], acknowledgement.delta_sequence, .little);
             try writes.append(alloc, .{ .key = acknowledgement_key, .value = value });
         },
         .finalize_split => |finalize| {
-            if (split_state) |state| try validateSplitIdentity(state, finalize.new_shard_id, finalize.split_key);
+            if (split_state) |state| try validateSplitIdentity(state, finalize.transition_id, finalize.new_shard_id, finalize.split_key);
             const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
                 .phase = state.phase,
                 .split_key = state.split_key,
@@ -703,7 +720,7 @@ pub fn appendOperationEffects(
             split_state = null;
         },
         .rollback_split => |rollback| {
-            if (split_state) |state| try validateSplitIdentity(state, rollback.new_shard_id, rollback.split_key);
+            if (split_state) |state| try validateSplitIdentity(state, rollback.transition_id, rollback.new_shard_id, rollback.split_key);
             const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
                 .phase = state.phase,
                 .split_key = state.split_key,
@@ -989,11 +1006,13 @@ fn encodeGroupStateSnapshot(alloc: std.mem.Allocator, byte_range: AppliedDataRan
 }
 
 fn encodeSplitState(state: AppliedSplitState, buf: []u8) ![]const u8 {
-    const total_len = 1 + 8 + 4 + state.split_key.len + 4 + state.original_range_end.len;
+    const total_len = 1 + 8 + 8 + 4 + state.split_key.len + 4 + state.original_range_end.len;
     if (total_len > buf.len) return error.SplitStateTooLarge;
     var pos: usize = 0;
     buf[pos] = @intFromEnum(state.phase);
     pos += 1;
+    std.mem.writeInt(u64, buf[pos..][0..8], state.transition_id, .little);
+    pos += 8;
     std.mem.writeInt(u64, buf[pos..][0..8], state.new_shard_id, .little);
     pos += 8;
     std.mem.writeInt(u32, buf[pos..][0..4], @intCast(state.split_key.len), .little);
@@ -1008,10 +1027,12 @@ fn encodeSplitState(state: AppliedSplitState, buf: []u8) ![]const u8 {
 }
 
 fn decodeSplitStateAlloc(alloc: std.mem.Allocator, encoded: []const u8) !AppliedSplitState {
-    if (encoded.len < 1 + 8 + 4 + 4) return error.InvalidSplitState;
+    if (encoded.len < 1 + 8 + 8 + 4 + 4) return error.InvalidSplitState;
     var pos: usize = 0;
     const phase: SplitPhase = @enumFromInt(encoded[pos]);
     pos += 1;
+    const transition_id = std.mem.readInt(u64, encoded[pos..][0..8], .little);
+    pos += 8;
     const new_shard_id = std.mem.readInt(u64, encoded[pos..][0..8], .little);
     pos += 8;
     const split_key_len = std.mem.readInt(u32, encoded[pos..][0..4], .little);
@@ -1026,6 +1047,7 @@ fn decodeSplitStateAlloc(alloc: std.mem.Allocator, encoded: []const u8) !Applied
     const original_range_end = try alloc.dupe(u8, encoded[pos .. pos + original_range_end_len]);
     return .{
         .phase = phase,
+        .transition_id = transition_id,
         .split_key = split_key,
         .new_shard_id = new_shard_id,
         .original_range_end = original_range_end,
@@ -1166,7 +1188,7 @@ test "shard state store persists split lifecycle and ownership" {
     deletes.clearRetainingCapacity();
 
     const prepare_ops = [_]DataOperation{
-        .{ .prepare_split = .{ .new_shard_id = 42, .split_key = @constCast("doc:m") } },
+        .{ .prepare_split = .{ .transition_id = 41, .new_shard_id = 42, .split_key = @constCast("doc:m") } },
     };
     try appendOperationEffects(&store, std.testing.allocator, 23, &prepare_ops, &writes, &deletes);
     try putOwnedBatch(&store, std.testing.allocator, writes.items, deletes.items);
@@ -1185,14 +1207,14 @@ test "shard state store persists split lifecycle and ownership" {
     try std.testing.expectEqual(@as(usize, 0), writes.items.len);
     try std.testing.expectEqual(@as(usize, 0), deletes.items.len);
     const conflicting_prepare = [_]DataOperation{
-        .{ .prepare_split = .{ .new_shard_id = 43, .split_key = @constCast("doc:m") } },
+        .{ .prepare_split = .{ .transition_id = 41, .new_shard_id = 43, .split_key = @constCast("doc:m") } },
     };
     try std.testing.expectError(
         error.ConflictingSplitTransition,
         appendOperationEffects(&store, std.testing.allocator, 23, &conflicting_prepare, &writes, &deletes),
     );
     const conflicting_start = [_]DataOperation{
-        .{ .start_split = .{ .new_shard_id = 43, .split_key = @constCast("doc:m") } },
+        .{ .start_split = .{ .transition_id = 41, .new_shard_id = 43, .split_key = @constCast("doc:m") } },
     };
     try std.testing.expectError(
         error.ConflictingSplitTransition,
@@ -1200,7 +1222,7 @@ test "shard state store persists split lifecycle and ownership" {
     );
 
     const start_ops = [_]DataOperation{
-        .{ .start_split = .{ .new_shard_id = 42, .split_key = @constCast("doc:m") } },
+        .{ .start_split = .{ .transition_id = 41, .new_shard_id = 42, .split_key = @constCast("doc:m") } },
     };
     try appendOperationEffects(&store, std.testing.allocator, 23, &start_ops, &writes, &deletes);
     try putOwnedBatch(&store, std.testing.allocator, writes.items, deletes.items);
@@ -1217,28 +1239,28 @@ test "shard state store persists split lifecycle and ownership" {
         appendOperationEffects(&store, std.testing.allocator, 23, &conflicting_start, &writes, &deletes),
     );
     const conflicting_finalize = [_]DataOperation{
-        .{ .finalize_split = .{ .new_shard_id = 43, .split_key = @constCast("doc:m") } },
+        .{ .finalize_split = .{ .transition_id = 41, .new_shard_id = 43, .split_key = @constCast("doc:m") } },
     };
     try std.testing.expectError(
         error.ConflictingSplitTransition,
         appendOperationEffects(&store, std.testing.allocator, 23, &conflicting_finalize, &writes, &deletes),
     );
     const conflicting_rollback = [_]DataOperation{
-        .{ .rollback_split = .{ .new_shard_id = 43, .split_key = @constCast("doc:m") } },
+        .{ .rollback_split = .{ .transition_id = 41, .new_shard_id = 43, .split_key = @constCast("doc:m") } },
     };
     try std.testing.expectError(
         error.ConflictingSplitTransition,
         appendOperationEffects(&store, std.testing.allocator, 23, &conflicting_rollback, &writes, &deletes),
     );
     const conflicting_acknowledgement = [_]DataOperation{
-        .{ .acknowledge_split = .{ .destination_group_id = 43, .delta_sequence = 0 } },
+        .{ .acknowledge_split = .{ .transition_id = 41, .destination_group_id = 43, .delta_sequence = 0 } },
     };
     try std.testing.expectError(
         error.ConflictingSplitTransition,
         appendOperationEffects(&store, std.testing.allocator, 23, &conflicting_acknowledgement, &writes, &deletes),
     );
     const acknowledgement_ops = [_]DataOperation{
-        .{ .acknowledge_split = .{ .destination_group_id = 42, .delta_sequence = 0 } },
+        .{ .acknowledge_split = .{ .transition_id = 41, .destination_group_id = 42, .delta_sequence = 0 } },
     };
     try appendOperationEffects(&store, std.testing.allocator, 23, &acknowledgement_ops, &writes, &deletes);
     try putOwnedBatch(&store, std.testing.allocator, writes.items, deletes.items);
@@ -1248,7 +1270,49 @@ test "shard state store persists split lifecycle and ownership" {
     deletes.clearRetainingCapacity();
     const acknowledgement = (try currentSplitAcknowledgement(&store, std.testing.allocator, 23)) orelse
         return error.MissingSplitAcknowledgement;
+    try std.testing.expectEqual(@as(u64, 41), acknowledgement.transition_id);
     try std.testing.expectEqual(@as(u64, 42), acknowledgement.destination_group_id);
+
+    const delta_sequence_key = try groupSplitDeltaSeqKeyAlloc(std.testing.allocator, 23);
+    defer std.testing.allocator.free(delta_sequence_key);
+    var delta_sequence_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &delta_sequence_bytes, 2, .little);
+    try store.put(delta_sequence_key, &delta_sequence_bytes);
+
+    const advanced_acknowledgement = [_]DataOperation{
+        .{ .acknowledge_split = .{ .transition_id = 41, .destination_group_id = 42, .delta_sequence = 2 } },
+    };
+    try appendOperationEffects(&store, std.testing.allocator, 23, &advanced_acknowledgement, &writes, &deletes);
+    try putOwnedBatch(&store, std.testing.allocator, writes.items, deletes.items);
+    freeOwnedWrites(std.testing.allocator, &writes);
+    writes = .empty;
+    for (deletes.items) |key| std.testing.allocator.free(key);
+    deletes.clearRetainingCapacity();
+
+    const stale_acknowledgement = [_]DataOperation{
+        .{ .acknowledge_split = .{ .transition_id = 41, .destination_group_id = 42, .delta_sequence = 1 } },
+    };
+    try appendOperationEffects(&store, std.testing.allocator, 23, &stale_acknowledgement, &writes, &deletes);
+    try std.testing.expectEqual(@as(usize, 0), writes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), deletes.items.len);
+    const retained_acknowledgement = (try currentSplitAcknowledgement(&store, std.testing.allocator, 23)) orelse
+        return error.MissingSplitAcknowledgement;
+    try std.testing.expectEqual(@as(u64, 2), retained_acknowledgement.delta_sequence);
+
+    const future_acknowledgement = [_]DataOperation{
+        .{ .acknowledge_split = .{ .transition_id = 41, .destination_group_id = 42, .delta_sequence = 3 } },
+    };
+    try std.testing.expectError(
+        error.SplitAcknowledgementAheadOfSource,
+        appendOperationEffects(&store, std.testing.allocator, 23, &future_acknowledgement, &writes, &deletes),
+    );
+    const stale_incarnation_acknowledgement = [_]DataOperation{
+        .{ .acknowledge_split = .{ .transition_id = 40, .destination_group_id = 42, .delta_sequence = 2 } },
+    };
+    try std.testing.expectError(
+        error.ConflictingSplitTransition,
+        appendOperationEffects(&store, std.testing.allocator, 23, &stale_incarnation_acknowledgement, &writes, &deletes),
+    );
 
     const narrowed_range = try currentRange(&store, std.testing.allocator, 23);
     defer range_state.freeRange(std.testing.allocator, narrowed_range);
@@ -1261,7 +1325,7 @@ test "shard state store persists split lifecycle and ownership" {
     try std.testing.expectError(error.KeyOutOfRange, appendOperationEffects(&store, std.testing.allocator, 23, &out_of_range_put, &writes, &deletes));
 
     const rollback_ops = [_]DataOperation{
-        .{ .rollback_split = .{ .new_shard_id = 42, .split_key = @constCast("doc:m") } },
+        .{ .rollback_split = .{ .transition_id = 41, .new_shard_id = 42, .split_key = @constCast("doc:m") } },
     };
     try appendOperationEffects(&store, std.testing.allocator, 23, &rollback_ops, &writes, &deletes);
     try putOwnedBatch(&store, std.testing.allocator, writes.items, deletes.items);
@@ -1311,9 +1375,9 @@ test "shard state store finalize split reclaims right-hand document range" {
     deletes.clearRetainingCapacity();
 
     const split_ops = [_]DataOperation{
-        .{ .prepare_split = .{ .new_shard_id = 77, .split_key = @constCast("doc:m") } },
-        .{ .start_split = .{ .new_shard_id = 77, .split_key = @constCast("doc:m") } },
-        .{ .finalize_split = .{ .new_shard_id = 77, .split_key = @constCast("doc:m") } },
+        .{ .prepare_split = .{ .transition_id = 76, .new_shard_id = 77, .split_key = @constCast("doc:m") } },
+        .{ .start_split = .{ .transition_id = 76, .new_shard_id = 77, .split_key = @constCast("doc:m") } },
+        .{ .finalize_split = .{ .transition_id = 76, .new_shard_id = 77, .split_key = @constCast("doc:m") } },
     };
     try appendOperationEffects(&store, std.testing.allocator, 31, &split_ops, &writes, &deletes);
     try putOwnedBatch(&store, std.testing.allocator, writes.items, deletes.items);
@@ -1360,8 +1424,8 @@ test "shard state store records and replays split deltas" {
 
     const setup_ops = [_]DataOperation{
         .{ .set_range = .{ .start = @constCast("doc:a"), .end = @constCast("doc:z") } },
-        .{ .prepare_split = .{ .new_shard_id = 88, .split_key = @constCast("doc:m") } },
-        .{ .start_split = .{ .new_shard_id = 88, .split_key = @constCast("doc:m") } },
+        .{ .prepare_split = .{ .transition_id = 87, .new_shard_id = 88, .split_key = @constCast("doc:m") } },
+        .{ .start_split = .{ .transition_id = 87, .new_shard_id = 88, .split_key = @constCast("doc:m") } },
     };
     try appendOperationEffects(&src, std.testing.allocator, 41, &setup_ops, &writes, &deletes);
     try putOwnedBatch(&src, std.testing.allocator, writes.items, deletes.items);
@@ -1435,8 +1499,8 @@ test "shard state store captures right-hand split handoff and filters delta catc
         .{ .set_range = .{ .start = @constCast("doc:a"), .end = @constCast("doc:z") } },
         .{ .put = .{ .key = @constCast("doc:b"), .value = @constCast("left-0") } },
         .{ .put = .{ .key = @constCast("doc:t"), .value = @constCast("right-0") } },
-        .{ .prepare_split = .{ .new_shard_id = 89, .split_key = @constCast("doc:m") } },
-        .{ .start_split = .{ .new_shard_id = 89, .split_key = @constCast("doc:m") } },
+        .{ .prepare_split = .{ .transition_id = 88, .new_shard_id = 89, .split_key = @constCast("doc:m") } },
+        .{ .start_split = .{ .transition_id = 88, .new_shard_id = 89, .split_key = @constCast("doc:m") } },
         .{ .put = .{ .key = @constCast("doc:u"), .value = @constCast("right-1") } },
     };
     try appendOperationEffects(&src, std.testing.allocator, 51, &setup_ops, &writes, &deletes);

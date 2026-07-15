@@ -73,6 +73,7 @@ fn leanSimHttpAllocator() std.mem.Allocator {
 
 const SimSplitRuntime = struct {
     const Entry = struct {
+        transition_id: u64,
         source_group_id: u64,
         destination_group_id: u64,
         coord: ?*data_mod.SplitSyncCoordinator = null,
@@ -114,12 +115,13 @@ const SimSplitRuntime = struct {
         };
     }
 
-    fn entryFor(self: *@This(), source_group_id: u64, destination_group_id: u64) *Entry {
+    fn entryFor(self: *@This(), transition_id: u64, source_group_id: u64, destination_group_id: u64) *Entry {
         for (self.entries[0..self.len]) |*entry| {
-            if (entry.source_group_id == source_group_id and entry.destination_group_id == destination_group_id) return entry;
+            if (entry.transition_id == transition_id and entry.source_group_id == source_group_id and entry.destination_group_id == destination_group_id) return entry;
         }
         std.debug.assert(self.len < self.entries.len);
         self.entries[self.len] = .{
+            .transition_id = transition_id,
             .source_group_id = source_group_id,
             .destination_group_id = destination_group_id,
         };
@@ -136,7 +138,7 @@ const SimSplitRuntime = struct {
         }
     }
 
-    fn observeStatus(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) !data_mod.SplitTransitionStatus {
+    fn observeStatus(ptr: *anyopaque, transition_id: u64, source_group_id: u64, destination_group_id: u64) !data_mod.SplitTransitionStatus {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.replica_root_dir != null) {
             const alloc = std.heap.page_allocator;
@@ -149,6 +151,7 @@ const SimSplitRuntime = struct {
             try ensureSourceApplyStoreSeeded(alloc, source_root_dir, source_group_id);
 
             const status = try data_mod.storage.observeSplitStatus(alloc, .{
+                .transition_id = transition_id,
                 .source_root_dir = source_root_dir,
                 .dest_root_dir = destination_root_dir,
                 .source_group_id = source_group_id,
@@ -170,34 +173,34 @@ const SimSplitRuntime = struct {
                 .dest_delta_sequence = status.dest_delta_sequence,
             };
         }
-        return self.entryFor(source_group_id, destination_group_id).status;
+        return self.entryFor(transition_id, source_group_id, destination_group_id).status;
     }
 
-    fn prepareSource(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64, split_key: []const u8, source_range_end: ?[]const u8) !bool {
+    fn prepareSource(ptr: *anyopaque, transition_id: u64, source_group_id: u64, destination_group_id: u64, split_key: []const u8, source_range_end: ?[]const u8) !bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.replica_root_dir != null) {
-            return try self.withCoordinator(source_group_id, destination_group_id, struct {
+            return try self.withCoordinator(transition_id, source_group_id, destination_group_id, struct {
                 fn call(coord: *data_mod.SplitSyncCoordinator, key: []const u8, range_end: ?[]const u8) !bool {
                     return try coord.prepareSourceSplit(key, range_end);
                 }
             }.call, .{ split_key, source_range_end });
         }
-        const entry = self.entryFor(source_group_id, destination_group_id);
+        const entry = self.entryFor(transition_id, source_group_id, destination_group_id);
         entry.status.phase = .prepare;
         entry.status.source_split_phase = .prepare;
         return true;
     }
 
-    fn startSource(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) !bool {
+    fn startSource(ptr: *anyopaque, transition_id: u64, source_group_id: u64, destination_group_id: u64) !bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.replica_root_dir != null) {
-            return try self.withCoordinator(source_group_id, destination_group_id, struct {
+            return try self.withCoordinator(transition_id, source_group_id, destination_group_id, struct {
                 fn call(coord: *data_mod.SplitSyncCoordinator) !bool {
                     return try coord.startSourceSplit();
                 }
             }.call, .{});
         }
-        const entry = self.entryFor(source_group_id, destination_group_id);
+        const entry = self.entryFor(transition_id, source_group_id, destination_group_id);
         entry.status.phase = .bootstrap_peer;
         entry.status.source_split_phase = .splitting;
         entry.status.replay_required = true;
@@ -205,32 +208,32 @@ const SimSplitRuntime = struct {
         return true;
     }
 
-    fn bootstrapDestination(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) !bool {
+    fn bootstrapDestination(ptr: *anyopaque, transition_id: u64, source_group_id: u64, destination_group_id: u64) !bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.replica_root_dir != null) {
-            return try self.withCoordinator(source_group_id, destination_group_id, struct {
+            return try self.withCoordinator(transition_id, source_group_id, destination_group_id, struct {
                 fn call(coord: *data_mod.SplitSyncCoordinator) !bool {
                     return try coord.ensureBootstrapped();
                 }
             }.call, .{});
         }
-        const entry = self.entryFor(source_group_id, destination_group_id);
+        const entry = self.entryFor(transition_id, source_group_id, destination_group_id);
         entry.status.phase = .replay_deltas;
         entry.status.bootstrapped = true;
         entry.status.dest_delta_sequence = entry.status.source_delta_sequence;
         return true;
     }
 
-    fn catchUpDestination(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) !usize {
+    fn catchUpDestination(ptr: *anyopaque, transition_id: u64, source_group_id: u64, destination_group_id: u64) !usize {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.replica_root_dir != null) {
-            return try self.withCoordinator(source_group_id, destination_group_id, struct {
+            return try self.withCoordinator(transition_id, source_group_id, destination_group_id, struct {
                 fn call(coord: *data_mod.SplitSyncCoordinator) !usize {
                     return try coord.catchUp();
                 }
             }.call, .{});
         }
-        const entry = self.entryFor(source_group_id, destination_group_id);
+        const entry = self.entryFor(transition_id, source_group_id, destination_group_id);
         entry.status.phase = .cutover_ready;
         entry.status.replay_caught_up = true;
         entry.status.cutover_ready = true;
@@ -239,36 +242,36 @@ const SimSplitRuntime = struct {
         return 1;
     }
 
-    fn finalizeSource(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) !bool {
+    fn finalizeSource(ptr: *anyopaque, transition_id: u64, source_group_id: u64, destination_group_id: u64) !bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.replica_root_dir != null) {
-            const finalized = try (try self.withCoordinator(source_group_id, destination_group_id, struct {
+            const finalized = try (try self.withCoordinator(transition_id, source_group_id, destination_group_id, struct {
                 fn call(coord: *data_mod.SplitSyncCoordinator) !bool {
                     return try coord.finalizeSource();
                 }
             }.call, .{}));
-            if (finalized) self.releaseCoordinator(self.entryFor(source_group_id, destination_group_id));
+            if (finalized) self.releaseCoordinator(self.entryFor(transition_id, source_group_id, destination_group_id));
             return finalized;
         }
-        const entry = self.entryFor(source_group_id, destination_group_id);
+        const entry = self.entryFor(transition_id, source_group_id, destination_group_id);
         entry.status.phase = .finalized;
         entry.status.source_split_phase = .none;
         entry.status.replay_required = false;
         return true;
     }
 
-    fn rollbackSource(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) !bool {
+    fn rollbackSource(ptr: *anyopaque, transition_id: u64, source_group_id: u64, destination_group_id: u64) !bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.replica_root_dir != null) {
-            const rolled_back = try (try self.withCoordinator(source_group_id, destination_group_id, struct {
+            const rolled_back = try (try self.withCoordinator(transition_id, source_group_id, destination_group_id, struct {
                 fn call(coord: *data_mod.SplitSyncCoordinator) !bool {
                     return try coord.rollbackSource();
                 }
             }.call, .{}));
-            if (rolled_back) self.releaseCoordinator(self.entryFor(source_group_id, destination_group_id));
+            if (rolled_back) self.releaseCoordinator(self.entryFor(transition_id, source_group_id, destination_group_id));
             return rolled_back;
         }
-        const entry = self.entryFor(source_group_id, destination_group_id);
+        const entry = self.entryFor(transition_id, source_group_id, destination_group_id);
         entry.status.phase = .rolled_back;
         entry.status.source_split_phase = .none;
         entry.status.replay_required = false;
@@ -277,12 +280,13 @@ const SimSplitRuntime = struct {
 
     fn withCoordinator(
         self: *@This(),
+        transition_id: u64,
         source_group_id: u64,
         destination_group_id: u64,
         comptime Func: anytype,
         args: anytype,
     ) !@typeInfo(@TypeOf(Func)).@"fn".return_type.? {
-        const entry = self.entryFor(source_group_id, destination_group_id);
+        const entry = self.entryFor(transition_id, source_group_id, destination_group_id);
         if (entry.coord == null) {
             const alloc = std.heap.page_allocator;
             const replica_root_dir = self.replica_root_dir orelse return error.UnsupportedOperation;
@@ -300,6 +304,7 @@ const SimSplitRuntime = struct {
                 dest_db_options.identity_namespace = namespace;
             }
             coord.* = try data_mod.SplitSyncCoordinator.init(alloc, .{
+                .transition_id = transition_id,
                 .source_root_dir = source_root_dir,
                 .dest_root_dir = destination_root_dir,
                 .source_group_id = source_group_id,
@@ -432,10 +437,10 @@ test "metadata sim split runtime preserves source identity namespace" {
     defer runtime.deinit();
     var split = runtime.iface();
 
-    try std.testing.expect(try split.prepareSource(701, 702, "doc:m", "doc:z"));
-    try std.testing.expect(try split.startSource(701, 702));
-    try std.testing.expect(try split.bootstrapDestination(701, 702));
-    _ = try split.catchUpDestination(701, 702);
+    try std.testing.expect(try split.prepareSource(7001, 701, 702, "doc:m", "doc:z"));
+    try std.testing.expect(try split.startSource(7001, 701, 702));
+    try std.testing.expect(try split.bootstrapDestination(7001, 701, 702));
+    _ = try split.catchUpDestination(7001, 701, 702);
 
     var dest = try db_mod.DB.open(alloc, destination_root_dir, .{
         .open_mode = .query_readonly,

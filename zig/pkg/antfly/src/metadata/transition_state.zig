@@ -277,6 +277,7 @@ fn observeLocalSplitTransition(
     if (!try pathExists(alloc, source_root_dir) or !try pathExists(alloc, dest_root_dir)) return null;
 
     var coord = try data.SplitSyncCoordinator.init(alloc, .{
+        .transition_id = record.transition_id,
         .source_root_dir = source_root_dir,
         .dest_root_dir = dest_root_dir,
         .source_group_id = record.source_group_id,
@@ -418,7 +419,7 @@ test "transition state prefers observed local split readiness over metadata phas
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
         .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:132:doc:m") },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:132:132:doc:m") },
     });
     defer std.testing.allocator.free(prepare);
     try source.snapshotBuilder().applyBatch(.{
@@ -430,6 +431,7 @@ test "transition state prefers observed local split readiness over metadata phas
     source_open = false;
 
     var coord = try data.SplitSyncCoordinator.init(std.testing.allocator, .{
+        .transition_id = 132,
         .source_root_dir = source_root_dir,
         .dest_root_dir = dest_root_dir,
         .source_group_id = 131,
@@ -439,7 +441,7 @@ test "transition state prefers observed local split readiness over metadata phas
     defer if (coord_open) coord.deinit();
 
     const start = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:132:doc:m") },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:132:132:doc:m") },
     });
     defer std.testing.allocator.free(start);
     try coord.source.snapshotBuilder().applyBatch(.{

@@ -73,6 +73,7 @@ const ReplicatedSplitTransitionPlan = enum { propose, idempotent };
 
 fn planReplicatedSplitTransition(
     state: ?antfly.data.storage.shard_state_store.AppliedSplitState,
+    transition_id: u64,
     destination_group_id: u64,
     kind: antfly.db.types.SplitTransitionMutation.Kind,
     split_key: []const u8,
@@ -88,24 +89,24 @@ fn planReplicatedSplitTransition(
             .none => return .propose,
             .rolling_back => return error.SplitInProgress,
             .prepare, .splitting, .finalizing => {
-                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, destination_group_id, split_key);
+                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, transition_id, destination_group_id, split_key);
                 return .idempotent;
             },
         },
         .start => switch (current.phase) {
             .prepare => {
-                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, destination_group_id, split_key);
+                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, transition_id, destination_group_id, split_key);
                 return .propose;
             },
             .splitting, .finalizing => {
-                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, destination_group_id, split_key);
+                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, transition_id, destination_group_id, split_key);
                 return .idempotent;
             },
             .none, .rolling_back => return error.SplitInProgress,
         },
         .finalize => switch (current.phase) {
             .splitting, .finalizing => {
-                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, destination_group_id, split_key);
+                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, transition_id, destination_group_id, split_key);
                 return .propose;
             },
             .none => return .idempotent,
@@ -113,7 +114,7 @@ fn planReplicatedSplitTransition(
         },
         .rollback => switch (current.phase) {
             .prepare, .splitting, .finalizing, .rolling_back => {
-                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, destination_group_id, split_key);
+                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, transition_id, destination_group_id, split_key);
                 return .propose;
             },
             .none => return .idempotent,
@@ -123,57 +124,61 @@ fn planReplicatedSplitTransition(
 
 fn validateReplicatedSplitTransfer(
     state: antfly.data.storage.shard_state_store.AppliedSplitState,
+    transition_id: u64,
     destination_group_id: u64,
 ) !void {
-    try antfly.data.storage.shard_state_store.validateSplitIdentity(state, destination_group_id, null);
+    try antfly.data.storage.shard_state_store.validateSplitIdentity(state, transition_id, destination_group_id, null);
     if (state.phase != .splitting and state.phase != .finalizing) return error.SplitInProgress;
 }
 
 fn validateReplicatedSplitObservation(
     state: antfly.data.storage.shard_state_store.AppliedSplitState,
+    transition_id: u64,
     destination_group_id: u64,
 ) !void {
     if (state.phase == .none) return;
-    try antfly.data.storage.shard_state_store.validateSplitIdentity(state, destination_group_id, null);
+    try antfly.data.storage.shard_state_store.validateSplitIdentity(state, transition_id, destination_group_id, null);
 }
 
 test "data runtime replicated split policy is identity and phase aware" {
     const State = antfly.data.storage.shard_state_store.AppliedSplitState;
     var state = State{
         .phase = .prepare,
+        .transition_id = 41,
         .split_key = "doc:m",
         .new_shard_id = 42,
         .original_range_end = "doc:z",
     };
 
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(null, 42, .prepare, "doc:m"));
-    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(null, 42, .start, "doc:m"));
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(null, 42, .finalize, ""));
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(null, 42, .rollback, ""));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(null, 41, 42, .prepare, "doc:m"));
+    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(null, 41, 42, .start, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(null, 41, 42, .finalize, ""));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(null, 41, 42, .rollback, ""));
 
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(state, 42, .prepare, "doc:m"));
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 42, .start, "doc:m"));
-    try std.testing.expectError(error.ConflictingSplitTransition, planReplicatedSplitTransition(state, 43, .start, "doc:m"));
-    try std.testing.expectError(error.ConflictingSplitTransition, planReplicatedSplitTransition(state, 42, .start, "doc:n"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(state, 41, 42, .prepare, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 41, 42, .start, "doc:m"));
+    try std.testing.expectError(error.ConflictingSplitTransition, planReplicatedSplitTransition(state, 40, 42, .start, "doc:m"));
+    try std.testing.expectError(error.ConflictingSplitTransition, planReplicatedSplitTransition(state, 41, 43, .start, "doc:m"));
+    try std.testing.expectError(error.ConflictingSplitTransition, planReplicatedSplitTransition(state, 41, 42, .start, "doc:n"));
 
     state.phase = .splitting;
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(state, 42, .start, "doc:m"));
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 42, .finalize, "doc:m"));
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 42, .rollback, "doc:m"));
-    try std.testing.expectError(error.ConflictingSplitTransition, planReplicatedSplitTransition(state, 43, .finalize, "doc:m"));
-    try validateReplicatedSplitTransfer(state, 42);
-    try std.testing.expectError(error.ConflictingSplitTransition, validateReplicatedSplitTransfer(state, 43));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(state, 41, 42, .start, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 41, 42, .finalize, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 41, 42, .rollback, "doc:m"));
+    try std.testing.expectError(error.ConflictingSplitTransition, planReplicatedSplitTransition(state, 41, 43, .finalize, "doc:m"));
+    try validateReplicatedSplitTransfer(state, 41, 42);
+    try std.testing.expectError(error.ConflictingSplitTransition, validateReplicatedSplitTransfer(state, 40, 42));
 
     state.phase = .none;
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 43, .prepare, "doc:n"));
-    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(state, 42, .start, "doc:m"));
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(state, 42, .rollback, "doc:m"));
-    try std.testing.expectError(error.SplitInProgress, validateReplicatedSplitTransfer(state, 42));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 42, 43, .prepare, "doc:n"));
+    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(state, 41, 42, .start, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.idempotent, try planReplicatedSplitTransition(state, 41, 42, .rollback, "doc:m"));
+    try std.testing.expectError(error.SplitInProgress, validateReplicatedSplitTransfer(state, 41, 42));
 
     state.phase = .rolling_back;
-    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(state, 42, .prepare, "doc:m"));
-    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(state, 42, .start, "doc:m"));
-    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 42, .rollback, "doc:m"));
+    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(state, 41, 42, .prepare, "doc:m"));
+    try std.testing.expectError(error.SplitInProgress, planReplicatedSplitTransition(state, 41, 42, .start, "doc:m"));
+    try std.testing.expectEqual(ReplicatedSplitTransitionPlan.propose, try planReplicatedSplitTransition(state, 41, 42, .rollback, "doc:m"));
 }
 
 const CliConfig = struct {
@@ -4166,6 +4171,14 @@ pub const DataServer = struct {
         self.markLocalSplitKeyCacheDirty();
         switch (kind) {
             .data => self.markLocalGroupDataChanged(),
+            .runtime_reconciled => {
+                // Reconciliation updates indexes inside the current root.
+                // Invalidate the status plane and report immediately, but do
+                // not rotate root generations or retire the live writer.
+                self.invalidateLocalGroupStatusCache();
+                self.markStoreStatusDirtyImmediate();
+                self.reportStoreStatusAfterStructuralChange(table_name);
+            },
             .structural => {
                 self.invalidateLocalGroupStatusCache();
                 if (self.data_raft_apply) |apply_sm| {
@@ -4257,6 +4270,7 @@ pub const DataServer = struct {
         self.runtime_status_dirty.store(true, .release);
         switch (kind) {
             .data => self.provisioned_startup_catch_up_dirty.store(true, .release),
+            .runtime_reconciled => {},
             .structural => {
                 self.clearProvisionedStartupCatchUpBackoffs();
                 self.provisioned_startup_catch_up_dirty.store(true, .release);
@@ -4488,11 +4502,11 @@ pub const DataServer = struct {
         if (self.data_raft != null) {
             lockAtomic(&self.local_transition_mutex);
             defer self.local_transition_mutex.unlock();
-            return .{ .status = try self.observeReplicatedSplit(record.source_group_id, record.destination_group_id) };
+            return .{ .status = try self.observeReplicatedSplit(record.transition_id, record.source_group_id, record.destination_group_id) };
         }
         lockAtomic(&self.local_transition_mutex);
         defer self.local_transition_mutex.unlock();
-        return .{ .status = try self.observeLocalSplit(record.source_group_id, record.destination_group_id) };
+        return .{ .status = try self.observeLocalSplit(record.transition_id, record.source_group_id, record.destination_group_id) };
     }
 
     fn lockLocalTransition(self: *DataServer) void {
@@ -4521,15 +4535,15 @@ pub const DataServer = struct {
         if (self.data_raft != null) {
             lockAtomic(&self.local_transition_mutex);
             defer self.local_transition_mutex.unlock();
-            try self.replicateSplitSourceTransition(op.source_group_id, op.destination_group_id, .prepare, op.split_key);
+            try self.replicateSplitSourceTransition(op.transition_id, op.source_group_id, op.destination_group_id, .prepare, op.split_key);
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .prepare_split_source = op });
         } else {
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
-            var runtime = try self.initLocalSplitRuntime(op.source_group_id, op.destination_group_id);
+            var runtime = try self.initLocalSplitRuntime(op.transition_id, op.source_group_id, op.destination_group_id);
             defer runtime.deinit();
-            _ = try runtime.runtime().prepareSource(op.source_group_id, op.destination_group_id, op.split_key, op.source_range_end);
+            _ = try runtime.runtime().prepareSource(op.transition_id, op.source_group_id, op.destination_group_id, op.split_key, op.source_range_end);
         }
         self.invalidateLocalGroupStatusCache();
     }
@@ -4539,15 +4553,15 @@ pub const DataServer = struct {
         if (self.data_raft != null) {
             lockAtomic(&self.local_transition_mutex);
             defer self.local_transition_mutex.unlock();
-            try self.replicateSplitSourceTransition(op.source_group_id, op.destination_group_id, .start, "");
+            try self.replicateSplitSourceTransition(op.transition_id, op.source_group_id, op.destination_group_id, .start, "");
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .start_split_source = op });
         } else {
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
-            var runtime = try self.initLocalSplitRuntime(op.source_group_id, op.destination_group_id);
+            var runtime = try self.initLocalSplitRuntime(op.transition_id, op.source_group_id, op.destination_group_id);
             defer runtime.deinit();
-            _ = try runtime.runtime().startSource(op.source_group_id, op.destination_group_id);
+            _ = try runtime.runtime().startSource(op.transition_id, op.source_group_id, op.destination_group_id);
         }
         self.invalidateLocalGroupStatusCache();
     }
@@ -4558,6 +4572,7 @@ pub const DataServer = struct {
             lockAtomic(&self.local_transition_mutex);
             defer self.local_transition_mutex.unlock();
             try self.replicateSplitBootstrap(
+                op.transition_id,
                 op.source_group_id,
                 op.destination_group_id,
                 op.destination_base_uri orelse return error.MissingDestinationRoute,
@@ -4567,9 +4582,9 @@ pub const DataServer = struct {
         } else {
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
-            var runtime = try self.initLocalSplitRuntime(op.source_group_id, op.destination_group_id);
+            var runtime = try self.initLocalSplitRuntime(op.transition_id, op.source_group_id, op.destination_group_id);
             defer runtime.deinit();
-            _ = try runtime.runtime().bootstrapDestination(op.source_group_id, op.destination_group_id);
+            _ = try runtime.runtime().bootstrapDestination(op.transition_id, op.source_group_id, op.destination_group_id);
         }
         self.invalidateLocalGroupStatusCache();
     }
@@ -4580,6 +4595,7 @@ pub const DataServer = struct {
             lockAtomic(&self.local_transition_mutex);
             defer self.local_transition_mutex.unlock();
             try self.replicateSplitCatchUp(
+                op.transition_id,
                 op.source_group_id,
                 op.destination_group_id,
                 op.destination_base_uri orelse return error.MissingDestinationRoute,
@@ -4589,15 +4605,16 @@ pub const DataServer = struct {
         } else {
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
-            var runtime = try self.initLocalSplitRuntime(op.source_group_id, op.destination_group_id);
+            var runtime = try self.initLocalSplitRuntime(op.transition_id, op.source_group_id, op.destination_group_id);
             defer runtime.deinit();
-            _ = try runtime.runtime().catchUpDestination(op.source_group_id, op.destination_group_id);
+            _ = try runtime.runtime().catchUpDestination(op.transition_id, op.source_group_id, op.destination_group_id);
         }
         self.invalidateLocalGroupStatusCache();
     }
 
     fn replicateSplitBootstrap(
         self: *DataServer,
+        transition_id: u64,
         source_group_id: u64,
         destination_group_id: u64,
         destination_base_uri: []const u8,
@@ -4608,14 +4625,14 @@ pub const DataServer = struct {
         const source_store = self.localTransitionApplyStore() orelse return error.MissingSplitSourceStore;
         const source_state = (try source_store.currentSplitState(self.alloc, source_group_id)) orelse return error.SplitInProgress;
         defer antfly.data.storage.shard_state_store.freeSplitState(self.alloc, source_state);
-        try validateReplicatedSplitTransfer(source_state, destination_group_id);
+        try validateReplicatedSplitTransfer(source_state, transition_id, destination_group_id);
 
         const handoff = try source_store.captureSplitHandoff(self.alloc, source_group_id);
         defer antfly.data.storage.shard_state_store.freeHandoff(self.alloc, handoff);
-        try validateReplicatedSplitTransfer(handoff.split_state, destination_group_id);
+        try validateReplicatedSplitTransfer(handoff.split_state, transition_id, destination_group_id);
         const table_name = (try self.tableNameForLocalGroupAlloc(source_group_id)) orelse return error.UnknownGroup;
         defer self.alloc.free(table_name);
-        const replication = try self.splitReplicationContext(source_group_id, destination_group_id);
+        const replication = try self.splitReplicationContext(transition_id, source_group_id, destination_group_id);
 
         const max_writes_per_batch: usize = 128;
         var offset: usize = 0;
@@ -4637,6 +4654,7 @@ pub const DataServer = struct {
 
     fn replicateSplitSourceTransition(
         self: *DataServer,
+        transition_id: u64,
         source_group_id: u64,
         destination_group_id: u64,
         kind: antfly.db.types.SplitTransitionMutation.Kind,
@@ -4653,7 +4671,7 @@ pub const DataServer = struct {
             source_state.?.split_key
         else
             split_key;
-        if (try planReplicatedSplitTransition(source_state, destination_group_id, kind, effective_split_key) == .idempotent) return;
+        if (try planReplicatedSplitTransition(source_state, transition_id, destination_group_id, kind, effective_split_key) == .idempotent) return;
 
         const table_name = (try self.tableNameForLocalGroupAlloc(source_group_id)) orelse return error.UnknownGroup;
         defer self.alloc.free(table_name);
@@ -4661,6 +4679,7 @@ pub const DataServer = struct {
             .sync_level = .write,
             .split_transition = .{
                 .kind = kind,
+                .transition_id = transition_id,
                 .destination_group_id = destination_group_id,
                 .split_key = effective_split_key,
             },
@@ -4669,6 +4688,7 @@ pub const DataServer = struct {
 
     fn replicateSplitCatchUp(
         self: *DataServer,
+        transition_id: u64,
         source_group_id: u64,
         destination_group_id: u64,
         destination_base_uri: []const u8,
@@ -4678,10 +4698,10 @@ pub const DataServer = struct {
         defer self.alloc.free(table_name);
         const source_state = (try source_store.currentSplitState(self.alloc, source_group_id)) orelse return error.SplitInProgress;
         defer antfly.data.storage.shard_state_store.freeSplitState(self.alloc, source_state);
-        try validateReplicatedSplitTransfer(source_state, destination_group_id);
-        const replication = try self.splitReplicationContext(source_group_id, destination_group_id);
+        try validateReplicatedSplitTransfer(source_state, transition_id, destination_group_id);
+        const replication = try self.splitReplicationContext(transition_id, source_group_id, destination_group_id);
         const source_seq = try source_store.currentSplitDeltaSequence(self.alloc, source_group_id);
-        const source_ack = try self.splitProgressForSource(source_group_id, destination_group_id);
+        const source_ack = try self.splitProgressForSource(transition_id, source_group_id, destination_group_id);
         const after_seq = if (source_ack) |ack| ack else 0;
         const deltas = try source_store.listSplitDeltasAfter(self.alloc, source_group_id, after_seq);
         defer antfly.shard.freeDeltas(self.alloc, deltas);
@@ -4735,6 +4755,7 @@ pub const DataServer = struct {
             .sync_level = .write,
             .split_checkpoint = .{
                 .kind = .destination,
+                .transition_id = replication.transition_id,
                 .source_group_id = source_group_id,
                 .destination_group_id = destination_group_id,
                 .range_start = byte_range.start,
@@ -4746,6 +4767,7 @@ pub const DataServer = struct {
             .sync_level = .write,
             .split_checkpoint = .{
                 .kind = .source_ack,
+                .transition_id = replication.transition_id,
                 .source_group_id = source_group_id,
                 .destination_group_id = destination_group_id,
                 .delta_sequence = delta_sequence,
@@ -4777,11 +4799,13 @@ pub const DataServer = struct {
 
     fn splitReplicationContext(
         self: *DataServer,
+        transition_id: u64,
         source_group_id: u64,
         destination_group_id: u64,
     ) !antfly.db.types.SplitReplicationContext {
         if (source_group_id == destination_group_id) return error.InvalidBatchRequest;
         return .{
+            .transition_id = transition_id,
             .source_group_id = source_group_id,
             .destination_group_id = destination_group_id,
             .identity_namespace = (try self.identityNamespaceForLocalGroup(source_group_id)) orelse
@@ -4794,15 +4818,15 @@ pub const DataServer = struct {
         if (self.data_raft != null) {
             lockAtomic(&self.local_transition_mutex);
             defer self.local_transition_mutex.unlock();
-            try self.replicateSplitSourceTransition(op.source_group_id, op.destination_group_id, .finalize, "");
+            try self.replicateSplitSourceTransition(op.transition_id, op.source_group_id, op.destination_group_id, .finalize, "");
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .finalize_split_source = op });
         } else {
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
-            var runtime = try self.initLocalSplitRuntime(op.source_group_id, op.destination_group_id);
+            var runtime = try self.initLocalSplitRuntime(op.transition_id, op.source_group_id, op.destination_group_id);
             defer runtime.deinit();
-            _ = try runtime.runtime().finalizeSource(op.source_group_id, op.destination_group_id);
+            _ = try runtime.runtime().finalizeSource(op.transition_id, op.source_group_id, op.destination_group_id);
         }
         self.invalidateLocalGroupStatusCache();
     }
@@ -4812,20 +4836,20 @@ pub const DataServer = struct {
         if (self.data_raft != null) {
             lockAtomic(&self.local_transition_mutex);
             defer self.local_transition_mutex.unlock();
-            try self.replicateSplitSourceTransition(op.source_group_id, op.destination_group_id, .rollback, "");
+            try self.replicateSplitSourceTransition(op.transition_id, op.source_group_id, op.destination_group_id, .rollback, "");
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .rollback_split = op });
         } else {
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
-            var runtime = try self.initLocalSplitRuntime(op.source_group_id, op.destination_group_id);
+            var runtime = try self.initLocalSplitRuntime(op.transition_id, op.source_group_id, op.destination_group_id);
             defer runtime.deinit();
-            _ = try runtime.runtime().rollbackSource(op.source_group_id, op.destination_group_id);
+            _ = try runtime.runtime().rollbackSource(op.transition_id, op.source_group_id, op.destination_group_id);
         }
         self.invalidateLocalGroupStatusCache();
     }
 
-    fn initLocalSplitRuntime(self: *DataServer, source_group_id: u64, destination_group_id: u64) !antfly.raft.SplitCoordinatorRuntime {
+    fn initLocalSplitRuntime(self: *DataServer, transition_id: u64, source_group_id: u64, destination_group_id: u64) !antfly.raft.SplitCoordinatorRuntime {
         const source_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, source_group_id);
         defer self.alloc.free(source_root_dir);
         const dest_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, destination_group_id);
@@ -4837,6 +4861,7 @@ pub const DataServer = struct {
         errdefer if (dest_lease) |lease| lease.release();
         dest_db_options.identity_namespace = destination_namespace;
         return try antfly.raft.SplitCoordinatorRuntime.init(self.alloc, .{
+            .transition_id = transition_id,
             .source_root_dir = source_root_dir,
             .dest_root_dir = dest_root_dir,
             .source_group_id = source_group_id,
@@ -4847,7 +4872,7 @@ pub const DataServer = struct {
         });
     }
 
-    fn observeLocalSplit(self: *DataServer, source_group_id: u64, destination_group_id: u64) !antfly.data.SplitTransitionStatus {
+    fn observeLocalSplit(self: *DataServer, transition_id: u64, source_group_id: u64, destination_group_id: u64) !antfly.data.SplitTransitionStatus {
         const source_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, source_group_id);
         defer self.alloc.free(source_root_dir);
         try self.ensureSplitSourceApplyStoreSeeded(source_root_dir, source_group_id);
@@ -4856,6 +4881,7 @@ pub const DataServer = struct {
         defer if (source_lease) |lease| lease.release();
         const progress_db = if (source_lease) |lease| lease.db else return error.MissingSplitProgressStore;
         return try antfly.data.storage.observeSplitStatus(self.alloc, .{
+            .transition_id = transition_id,
             .source_root_dir = source_root_dir,
             .dest_root_dir = "",
             .source_group_id = source_group_id,
@@ -4866,16 +4892,19 @@ pub const DataServer = struct {
         });
     }
 
-    fn observeReplicatedSplit(self: *DataServer, source_group_id: u64, destination_group_id: u64) !antfly.data.SplitTransitionStatus {
+    fn observeReplicatedSplit(self: *DataServer, transition_id: u64, source_group_id: u64, destination_group_id: u64) !antfly.data.SplitTransitionStatus {
         const source_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, source_group_id);
         defer self.alloc.free(source_root_dir);
         try self.ensureSplitSourceApplyStoreSeeded(source_root_dir, source_group_id);
         const source_store = self.localTransitionApplyStore() orelse return error.MissingSplitSourceStore;
         const source_state = try source_store.currentSplitState(self.alloc, source_group_id);
         defer if (source_state) |state| antfly.data.storage.shard_state_store.freeSplitState(self.alloc, state);
-        if (source_state) |state| try validateReplicatedSplitObservation(state, destination_group_id);
+        if (source_state) |state| try validateReplicatedSplitObservation(state, transition_id, destination_group_id);
         const acknowledgement = try source_store.currentSplitAcknowledgement(self.alloc, source_group_id);
-        const bootstrapped = if (acknowledgement) |ack| ack.destination_group_id == destination_group_id else false;
+        const bootstrapped = if (acknowledgement) |ack|
+            ack.transition_id == transition_id and ack.destination_group_id == destination_group_id
+        else
+            false;
         return antfly.data.storage.range_transition.deriveSplitStatus(
             if (source_state) |state| state.phase else null,
             bootstrapped,
@@ -4884,12 +4913,14 @@ pub const DataServer = struct {
         );
     }
 
-    fn splitProgressForSource(self: *DataServer, source_group_id: u64, destination_group_id: u64) !?u64 {
+    fn splitProgressForSource(self: *DataServer, transition_id: u64, source_group_id: u64, destination_group_id: u64) !?u64 {
         const namespace = try self.identityNamespaceForLocalGroup(source_group_id);
         const lease = (try self.leaseTransitionDbForTableGroup(source_group_id, source_group_id, namespace)) orelse return null;
         defer lease.release();
         const marker = (try lease.db.getSplitBootstrapMarker(self.alloc)) orelse return null;
-        if (marker.source_group_id != source_group_id or marker.destination_group_id != destination_group_id) return null;
+        if (marker.transition_id != transition_id or marker.source_group_id != source_group_id or marker.destination_group_id != destination_group_id)
+            return null;
+        if (!marker.bootstrap_complete) return null;
         return try lease.db.getSplitDeltaFinalSeq(self.alloc);
     }
 
@@ -10516,6 +10547,7 @@ test "data raft source split lifecycle commands bypass document db apply" {
     try std.testing.expect(!batchRequiresDocumentDbApply(.{
         .split_transition = .{
             .kind = .prepare,
+            .transition_id = 7001,
             .destination_group_id = 7002,
             .split_key = "doc:m",
         },
@@ -10523,6 +10555,7 @@ test "data raft source split lifecycle commands bypass document db apply" {
     try std.testing.expect(batchRequiresDocumentDbApply(.{
         .split_checkpoint = .{
             .kind = .source_ack,
+            .transition_id = 7001,
             .source_group_id = 7001,
             .destination_group_id = 7002,
             .delta_sequence = 1,
@@ -14923,6 +14956,31 @@ test "data runtime data changes mark provisioned startup catch-up dirty" {
 
     try std.testing.expect(server.runtime_status_dirty.load(.acquire));
     try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
+}
+
+test "data runtime reconciled changes invalidate status without scheduling root catch-up" {
+    var server: DataServer = .{
+        .alloc = std.testing.allocator,
+        .provisioned_storage = undefined,
+        .read_source = undefined,
+        .write_source = undefined,
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+
+    const generation_before = server.local_group_status_generation.load(.monotonic);
+    server.store_status_dirty.store(false, .release);
+    server.runtime_status_dirty.store(false, .release);
+    server.provisioned_startup_catch_up_dirty.store(false, .release);
+
+    DataServer.onLocalTableChanged(&server, "docs", .runtime_reconciled);
+
+    try std.testing.expect(server.store_status_dirty.load(.acquire));
+    try std.testing.expect(server.runtime_status_dirty.load(.acquire));
+    try std.testing.expect(!server.provisioned_startup_catch_up_dirty.load(.acquire));
+    try std.testing.expectEqual(generation_before + 1, server.local_group_status_generation.load(.monotonic));
 }
 
 test "data runtime structural changes preserve writer-published runtime status and schedule catch-up" {
