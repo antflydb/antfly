@@ -2785,11 +2785,18 @@ test "stop publishes synchronized listener-thread shutdown" {
     try std.testing.expectEqual(@as(u8, 2), server.shutdown_mode.load(.acquire));
     try std.testing.expect(server.listener == null);
 
+    // The running flag belongs to an already-started listener and is cleared
+    // when that listener observes the stop. Exercise the distinct
+    // stop-before-listen race with a server that has not started yet.
+    var not_started = Server.init(allocator, std.testing.io);
+    defer not_started.deinit();
+    not_started.stop();
+
     // A concurrent owner may call stop before the listener thread reaches
     // listen(). That late listen must not resurrect the server.
-    try server.listen();
-    try std.testing.expect(!server.running);
-    try std.testing.expect(server.listener == null);
+    try not_started.listen();
+    try std.testing.expect(!not_started.running);
+    try std.testing.expect(not_started.listener == null);
 }
 
 test "requestStop only publishes synchronized listener-thread work" {
