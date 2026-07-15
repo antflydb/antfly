@@ -108,6 +108,19 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 		if statefulSet.Status.Replicas != 0 || statefulSet.Status.CurrentReplicas != 0 || statefulSet.Status.ReadyReplicas != 0 {
 			return nil
 		}
+		if action.LastAttemptAt == nil {
+			// The standby observation earlier in this reconciliation may predate
+			// the final old-writer exit by a few milliseconds. Checkpoint the first
+			// exact absence observation and require another reconciliation before
+			// freezing the boundary; that next pass refreshes candidate applied/safe
+			// LSNs strictly after the former writer was proven gone.
+			now := metav1.NewTime(r.haNow())
+			action.LastAttemptAt = &now
+			if err := r.persistHAActionPlanBarrier(ctx, cluster); err != nil {
+				return fmt.Errorf("isolate former primary: persist pod-absence barrier: %w", err)
+			}
+			return errHAStatusCheckpointed
+		}
 
 		boundary, ok := haIsolatedPromotionBoundary(cluster.Status.HAStatus, *action)
 		if !ok {

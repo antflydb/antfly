@@ -3896,8 +3896,14 @@ func TestReconcileHAFormerPrimaryIsolationStopsOldWriterBeforeCandidateFence(t *
 	observedSTS.Status = appsv1.StatefulSetStatus{}
 	reconciler = testHAReconciler(t, cluster, observedSTS, lease.DeepCopy())
 	reconciler.Now = func() time.Time { return now }
+	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); !errors.Is(err, errHAStatusCheckpointed) {
+		t.Fatalf("expected pod-absence checkpoint before boundary freeze, got %v", err)
+	}
+	if haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, 1) {
+		t.Fatal("candidate fence passed before a post-isolation standby observation could refresh the durable tail")
+	}
 	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); err != nil {
-		t.Fatalf("complete physical isolation: %v", err)
+		t.Fatalf("complete physical isolation after post-absence observation: %v", err)
 	}
 	action := cluster.Status.HAStatus.PlannedActions[0]
 	if action.AdminJobPhase != haAdminJobPhaseSucceeded || action.AdminJobName != haKubernetesPhysicalFenceName || action.TargetLSN != 12 {
