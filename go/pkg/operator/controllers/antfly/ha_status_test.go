@@ -3988,9 +3988,9 @@ func TestPhysicalIsolationReceiptRejectsForgedPartialAndStaleEvidence(t *testing
 		"watchdog fence latency differs from receipt": func(a *antflyv1.HAPlannedActionStatus) {
 			a.PhysicalIsolationReceipt.WatchdogProof.MaxFenceLatencyMS++
 		},
-		"watchdog proof predates its maximum fence latency": func(a *antflyv1.HAPlannedActionStatus) {
-			stale := metav1.NewTime(a.PhysicalIsolationReceipt.LeaseTransferTime.Add(-11 * time.Second))
-			a.PhysicalIsolationReceipt.WatchdogProof.RuntimeObservedAt = stale
+		"watchdog proof was observed after transfer": func(a *antflyv1.HAPlannedActionStatus) {
+			future := metav1.NewTime(a.PhysicalIsolationReceipt.LeaseTransferTime.Add(time.Second))
+			a.PhysicalIsolationReceipt.WatchdogProof.RuntimeObservedAt = future
 		},
 		"receipt fence latency differs from configuration": func(a *antflyv1.HAPlannedActionStatus) {
 			a.PhysicalIsolationReceipt.WatchdogMaxFenceLatencyMS++
@@ -4051,6 +4051,20 @@ func TestPhysicalIsolationReceiptRejectsForgedPartialAndStaleEvidence(t *testing
 	lease.Generation = int64(action.FenceGeneration)
 	if err := validateCurrentPhysicalIsolationObjects(cluster, &action, exact, lease, scope); err == nil {
 		t.Fatal("metadata.generation substituted for the missing Lease transition fencing token")
+	}
+}
+
+func TestPhysicalIsolationReceiptAcceptsOlderExactProcessSelfFencePromise(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	cluster, action := validPhysicalIsolationReceiptFixture(now)
+	// The default automatic-failover debounce is 30 seconds while the default
+	// watchdog maximum fence latency is 10 seconds. Once the primary admin
+	// endpoint is unreachable, the exact-process proof cannot refresh. Its age
+	// is therefore not an authority claim: it is a durable promise that this
+	// same process self-fences within the recorded maximum after Lease transfer.
+	action.PhysicalIsolationReceipt.WatchdogProof.RuntimeObservedAt = metav1.NewTime(now.Add(-31 * time.Second))
+	if !haPhysicalIsolationSucceededWithEvidence(cluster, action) {
+		t.Fatal("default 30s failover debounce rejected an older exact-process self-fence promise")
 	}
 }
 

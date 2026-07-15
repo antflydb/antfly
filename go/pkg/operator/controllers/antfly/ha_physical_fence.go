@@ -345,7 +345,7 @@ func haBindPhysicalIsolationWatchdogProof(cluster *antflyv1.AntflyCluster, actio
 		!isLowerHexDigest(proof.ProcessBootID) || proof.ObservedLeaseTransitions <= 0 ||
 		proof.MaxFenceLatencyMS <= 0 || proof.MaxFenceLatencyMS != receipt.WatchdogMaxFenceLatencyMS ||
 		uint64(proof.ObservedLeaseTransitions)+1 != action.FenceGeneration || proof.ObservedAt.IsZero() ||
-		!haWatchdogProofFreshBeforeTransfer(proof.ObservedAt, receipt.LeaseTransferTime, proof.MaxFenceLatencyMS) {
+		!haWatchdogProofObservedBeforeTransfer(proof.ObservedAt, receipt.LeaseTransferTime) {
 		return nil
 	}
 	for i := range pods.Items {
@@ -655,7 +655,7 @@ func haPhysicalIsolationWatchdogProofStructurallyValid(action antflyv1.HAPlanned
 		strings.TrimSpace(proof.ContainerID) == "" || proof.ContainerStartedAt.IsZero() || !isLowerHexDigest(proof.ProcessBootID) ||
 		proof.MaxFenceLatencyMS <= 0 || proof.MaxFenceLatencyMS != receipt.WatchdogMaxFenceLatencyMS ||
 		proof.ObservedLeaseTransitions <= 0 || uint64(proof.ObservedLeaseTransitions)+1 != receipt.LeaseGeneration ||
-		proof.RuntimeObservedAt.IsZero() || !haWatchdogProofFreshBeforeTransfer(proof.RuntimeObservedAt, receipt.LeaseTransferTime, proof.MaxFenceLatencyMS) ||
+		proof.RuntimeObservedAt.IsZero() || !haWatchdogProofObservedBeforeTransfer(proof.RuntimeObservedAt, receipt.LeaseTransferTime) ||
 		proof.RuntimeObservedAt.Before(&proof.ContainerStartedAt) {
 		return false
 	}
@@ -667,12 +667,11 @@ func haPhysicalIsolationWatchdogProofStructurallyValid(action antflyv1.HAPlanned
 	return false
 }
 
-func haWatchdogProofFreshBeforeTransfer(observedAt, transferAt metav1.Time, maxFenceLatencyMS int32) bool {
-	if observedAt.IsZero() || transferAt.IsZero() || maxFenceLatencyMS <= 0 {
+func haWatchdogProofObservedBeforeTransfer(observedAt, transferAt metav1.Time) bool {
+	if observedAt.IsZero() || transferAt.IsZero() {
 		return false
 	}
-	age := transferAt.Sub(observedAt.Time)
-	return age > 0 && age <= time.Duration(maxFenceLatencyMS)*time.Millisecond
+	return observedAt.Before(&transferAt)
 }
 
 func haIsolatedPromotionBoundary(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) (uint64, bool) {
