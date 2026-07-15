@@ -1929,6 +1929,30 @@ test "storage.ha http client round trips typed safety operations" {
     try std.testing.expect(reseed.parsed.value.reseed.?.base_backup_required);
 }
 
+test "storage.ha http client accepts authoritative former primary tail in rejoin assessment" {
+    const alloc = std.testing.allocator;
+    var executor = StaticJsonExecutor{
+        .body =
+        \\{"schema_version":1,"action":{"action_id":"rejoin_assess:primary-a","action_kind":"rejoin_assess","target":"primary-a","state":"assessed","node_id":"primary-a"},"assessment":{"action":"reject_unfenced","reason":"no_fence","former_node_id":"primary-a","target_timeline_id":1,"target_epoch":1,"parent_cluster_id":100,"parent_shard_id":10,"parent_table_id":20,"parent_timeline_id":1,"parent_epoch":1,"required_lsn":0,"fork_lsn":4,"former_last_lsn":4,"retained_from_lsn":8,"forced":false,"data_loss_discarded":false}}
+        ,
+    };
+    var client = Client.init(alloc, executor.executor());
+
+    // The controller observation may be stale in either direction. The local
+    // former-primary endpoint reports its durable tail as the authority.
+    var response = try client.assessRejoin("http://ha-admin.test", .{
+        .node_id = "primary-a",
+        .identity = testAdminIdentity(),
+        .last_lsn = 12,
+        .retained_from_lsn = 8,
+        .allow_rewind_after_forced_promotion = false,
+        .receipt = null,
+    });
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 4), response.parsed.value.assessment.former_last_lsn);
+    try std.testing.expectEqual(response.parsed.value.assessment.former_last_lsn, response.parsed.value.assessment.fork_lsn);
+}
+
 test "storage.ha http client rejects mismatched rejoin admin responses" {
     const alloc = std.testing.allocator;
     {
