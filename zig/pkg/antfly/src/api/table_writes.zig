@@ -6865,9 +6865,10 @@ pub const ProvisionedTableWriteSource = struct {
             var cached = leased;
             defer cached.deinit(alloc);
             if (cached.entry) |entry| {
+                lockAtomic(&self.local_db_mutex);
+                defer self.local_db_mutex.unlock();
                 try self.finishEntryAutoBulkIngestForForegroundVisibility(cached.cache.?, entry);
             }
-            try drainManagedDbBeforeClose(cached.db);
             return cached.db.findMedianKey(alloc) catch |err| switch (err) {
                 error.NotFound => null,
                 else => err,
@@ -6878,9 +6879,10 @@ pub const ProvisionedTableWriteSource = struct {
             var cached = try self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, lsm_root_generation, table_name, .default_async, null, null, null);
             defer cached.deinit(alloc);
             if (cached.entry) |entry| {
+                lockAtomic(&self.local_db_mutex);
+                defer self.local_db_mutex.unlock();
                 try self.finishEntryAutoBulkIngestForForegroundVisibility(cache, entry);
             }
-            try drainManagedDbBeforeClose(cached.db);
             const median = cached.db.findMedianKey(alloc) catch |err| switch (err) {
                 error.NotFound => return null,
                 else => return err,

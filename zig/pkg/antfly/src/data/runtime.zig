@@ -6018,7 +6018,30 @@ pub const DataServer = struct {
                         continue;
                     }
 
-                    var db = try antfly.public_api.table_writes.openManagedDbForStatusWithIndexesJsonAndCache(
+                    // Split/merge runtimes can own a destination or source
+                    // root outside the ordinary request/startup writer caches.
+                    // Status collection is observational and must never race
+                    // that owner by opening another DB. Snapshot/transition
+                    // metadata is sufficient until the runtime publishes a
+                    // fresh status after the transition boundary.
+                    if (groupHasActiveTransition(group_id, split_transitions, merge_transitions)) {
+                        try reports.append(alloc, try collectLocalGroupStatusWithoutDb(
+                            alloc,
+                            replica_root_dir,
+                            group_id,
+                            group_leadership_source,
+                            group_membership_source,
+                            stores,
+                            merged_group_statuses,
+                            split_transitions,
+                            merge_transitions,
+                            split_observations,
+                            merge_observations,
+                        ));
+                        continue;
+                    }
+
+                    var db = antfly.public_api.table_writes.openManagedDbForStatusWithIndexesJsonAndCache(
                         alloc,
                         db_path,
                         table.indexes_json,
@@ -6027,7 +6050,29 @@ pub const DataServer = struct {
                         self.provisioned_storage.visibleRootGenerationForGroup(group_id),
                         &self.provisioned_storage.resource_manager,
                         try self.ensureBackendRuntime(),
-                    );
+                    ) catch |err| switch (err) {
+                        // A transition or foreground owner can appear after the
+                        // cache probe. Preserve the complete status refresh and
+                        // report conservative metadata rather than turning an
+                        // expected ownership race into stale node routing.
+                        error.LsmRootWriterAlreadyOpen, error.TableReadChurn => {
+                            try reports.append(alloc, try collectLocalGroupStatusWithoutDb(
+                                alloc,
+                                replica_root_dir,
+                                group_id,
+                                group_leadership_source,
+                                group_membership_source,
+                                stores,
+                                merged_group_statuses,
+                                split_transitions,
+                                merge_transitions,
+                                split_observations,
+                                merge_observations,
+                            ));
+                            continue;
+                        },
+                        else => return err,
+                    };
                     defer db.close();
                     try reports.append(alloc, try collectLocalGroupStatusFromDb(
                         alloc,
@@ -6048,7 +6093,24 @@ pub const DataServer = struct {
                 }
             }
 
-            try reports.append(alloc, try collectLocalGroupStatus(
+            if (groupHasActiveTransition(group_id, split_transitions, merge_transitions)) {
+                try reports.append(alloc, try collectLocalGroupStatusWithoutDb(
+                    alloc,
+                    replica_root_dir,
+                    group_id,
+                    group_leadership_source,
+                    group_membership_source,
+                    stores,
+                    merged_group_statuses,
+                    split_transitions,
+                    merge_transitions,
+                    split_observations,
+                    merge_observations,
+                ));
+                continue;
+            }
+
+            const report = collectLocalGroupStatus(
                 alloc,
                 db_path,
                 replica_root_dir,
@@ -6067,7 +6129,23 @@ pub const DataServer = struct {
                 merge_transitions,
                 split_observations,
                 merge_observations,
-            ));
+            ) catch |err| switch (err) {
+                error.LsmRootWriterAlreadyOpen, error.TableReadChurn => try collectLocalGroupStatusWithoutDb(
+                    alloc,
+                    replica_root_dir,
+                    group_id,
+                    group_leadership_source,
+                    group_membership_source,
+                    stores,
+                    merged_group_statuses,
+                    split_transitions,
+                    merge_transitions,
+                    split_observations,
+                    merge_observations,
+                ),
+                else => return err,
+            };
+            try reports.append(alloc, report);
         }
 
         return try reports.toOwnedSlice(alloc);
@@ -10457,6 +10535,82 @@ fn collectLocalGroupStatusFromRuntimeStatus(
     };
 }
 
+fn groupHasActiveTransition(
+    group_id: u64,
+    split_transitions: []const antfly.metadata.SplitTransitionRecord,
+    merge_transitions: []const antfly.metadata.MergeTransitionRecord,
+) bool {
+    for (split_transitions) |record| {
+        if (!transitionPhaseActive(record.phase)) continue;
+        if (record.source_group_id == group_id or record.destination_group_id == group_id) return true;
+    }
+    for (merge_transitions) |record| {
+        if (!transitionPhaseActive(record.phase)) continue;
+        if (record.donor_group_id == group_id or record.receiver_group_id == group_id) return true;
+    }
+    return false;
+}
+
+fn transitionPhaseActive(phase: antfly.metadata.transition_state.TransitionPhase) bool {
+    return switch (phase) {
+        .finalized, .rolled_back => false,
+        else => true,
+    };
+}
+
+/// Build an ownership-safe control-plane report without opening the DB root.
+/// Active transitions already publish durable readiness sidecars, while the
+/// merged/store snapshots retain the most recent size and document facts.
+/// Live Raft sources always override routing fields so a conservative data
+/// snapshot cannot make leader discovery stale.
+fn collectLocalGroupStatusWithoutDb(
+    alloc: std.mem.Allocator,
+    replica_root_dir: []const u8,
+    group_id: u64,
+    group_leadership_source: ?GroupLeadershipSource,
+    group_membership_source: ?GroupMembershipSource,
+    snapshot_stores: []const antfly.metadata.StoreRecord,
+    merged_group_statuses: []const antfly.metadata.reconciler.MergedGroupStatus,
+    split_transitions: []const antfly.metadata.SplitTransitionRecord,
+    merge_transitions: []const antfly.metadata.MergeTransitionRecord,
+    split_observations: []const antfly.metadata.transition_state.SplitObservationRecord,
+    merge_observations: []const antfly.metadata.transition_state.MergeObservationRecord,
+) !antfly.metadata.table_manager.GroupStatusReport {
+    var report = latestSnapshotGroupStatus(snapshot_stores, group_id) orelse
+        collectRaftOnlyLocalGroupStatus(group_id, group_leadership_source, group_membership_source) orelse
+        antfly.metadata.table_manager.GroupStatusReport{ .group_id = group_id };
+
+    if (findMergedSnapshotGroupStatus(merged_group_statuses, group_id)) |merged| {
+        report.doc_count = merged.doc_count;
+        report.disk_bytes = merged.disk_bytes;
+        report.empty = merged.empty;
+        if (merged.created_at_millis != 0) report.created_at_millis = merged.created_at_millis;
+    }
+    if (report.created_at_millis == 0) {
+        report.created_at_millis = platform_clock.Clock.real().nowRealtimeMs();
+    }
+    report.updated_at_millis = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+
+    const readiness = try deriveLocalGroupReadiness(
+        alloc,
+        replica_root_dir,
+        group_id,
+        snapshot_stores,
+        merged_group_statuses,
+        split_transitions,
+        merge_transitions,
+        split_observations,
+        merge_observations,
+    );
+    report.transition_pending = readiness.transition_pending;
+    report.replay_required = readiness.replay_required;
+    report.replay_caught_up = readiness.replay_caught_up;
+    report.cutover_ready = readiness.cutover_ready;
+    report.reads_ready_after_cutover = readiness.reads_ready_after_cutover;
+    overlayLiveRaftGroupStatus(&report, group_leadership_source, group_membership_source);
+    return report;
+}
+
 fn deriveLocalGroupReadiness(
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
@@ -13261,6 +13415,126 @@ test "data runtime live local group status skips the active startup group on a c
     try std.testing.expectEqual(@as(usize, 1), reports.len);
     try std.testing.expectEqual(@as(u64, 88), reports[0].group_id);
     try std.testing.expectEqual(@as(u64, 1), reports[0].doc_count);
+}
+
+test "data runtime local group status does not open roots owned by transitions" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-transition-owned-status", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
+    defer alloc.free(db_path);
+
+    // Model a split runtime that owns this root outside the ordinary request
+    // and startup caches. Status collection must use transition/snapshot facts
+    // without opening a competing DB.
+    var transition_owner = try antfly.db.DB.open(alloc, db_path, .{});
+    defer transition_owner.close();
+    try transition_owner.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    const Membership = struct {
+        fn iface() GroupMembershipSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .membership = membership },
+            };
+        }
+
+        fn membership(_: *anyopaque, group_id: u64) GroupMembership {
+            return .{
+                .local_voter = group_id == 77,
+                .voter_count = if (group_id == 77) 3 else 0,
+                .voter_set_known = group_id == 77,
+            };
+        }
+    };
+
+    const tables = [_]antfly.metadata.table_manager.TableRecord{.{
+        .table_id = 7,
+        .name = "docs",
+        .placement_role = "data",
+    }};
+    const ranges = [_]antfly.metadata.table_manager.RangeRecord{.{
+        .group_id = 77,
+        .table_id = 7,
+        .start_key = "",
+        .end_key = null,
+    }};
+    const stores = [_]antfly.metadata.table_manager.StoreRecord{.{
+        .store_id = 19,
+        .node_id = 9,
+        .live = true,
+        .health_class = "healthy",
+    }};
+    const merged = [_]antfly.metadata.reconciler.MergedGroupStatus{.{
+        .group_id = 77,
+        .doc_count = 17,
+        .disk_bytes = 4096,
+        .empty = false,
+        .transition_pending = true,
+    }};
+    const transitions = [_]antfly.metadata.SplitTransitionRecord{.{
+        .transition_id = 77001,
+        .source_group_id = 77,
+        .destination_group_id = 88,
+        .phase = .prepare,
+        .split_key = "doc:m",
+    }};
+    const group_ids = [_]u64{77};
+
+    const reports = try server.collectLiveLocalGroupStatusesWithSources(
+        alloc,
+        replica_root_dir,
+        &group_ids,
+        &tables,
+        &ranges,
+        null,
+        Membership.iface(),
+        &stores,
+        &merged,
+        &transitions,
+        &.{},
+        &.{},
+        &.{},
+    );
+    defer antfly.metadata.table_manager.freeGroupStatuses(alloc, reports);
+
+    try std.testing.expectEqual(@as(usize, 1), reports.len);
+    try std.testing.expectEqual(@as(u64, 77), reports[0].group_id);
+    try std.testing.expectEqual(@as(u64, 17), reports[0].doc_count);
+    try std.testing.expectEqual(@as(u64, 4096), reports[0].disk_bytes);
+    try std.testing.expect(reports[0].transition_pending);
+    try std.testing.expect(reports[0].local_voter);
+    try std.testing.expectEqual(@as(u16, 3), reports[0].voter_count);
+
+    var finalized = transitions;
+    finalized[0].phase = .finalized;
+    try std.testing.expect(!groupHasActiveTransition(77, &finalized, &.{}));
 }
 
 test "data runtime store status cold miss schedules a nonblocking refresh" {

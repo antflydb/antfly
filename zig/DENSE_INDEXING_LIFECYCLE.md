@@ -27,8 +27,8 @@ Implemented in the current tree:
   delete-then-rewrite batches are normalized to their final state before the
   counter delta is calculated. The old helper that deleted artifacts in a
   separate transaction has been removed
-- dense replay distinguishes a genuinely missing source artifact from an
-  artifact removed by a later document deletion. A stale upsert whose source
+- dense and sparse replay distinguish a genuinely missing source artifact from
+  an artifact removed by a later document deletion. A stale upsert whose source
   document is already absent advances without creating repair debt; a missing
   or corrupt artifact for a live source document still fails closed
 - explicit generation rebuilds for dense, sparse, graph, and full-text indexes
@@ -121,6 +121,15 @@ Implemented in the current tree:
   gate, preserving replica determinism. The normal path performs one combined
   `ResourceManager` pressure check per distinct manager and only scans the
   exact group/table writer cache after hard replay pressure is present
+- control-plane group status never cold-opens a root participating in an active
+  split or merge. It reports durable transition readiness plus the most recent
+  merged/store snapshot and live Raft routing; an ownership race detected after
+  the cache probe falls back to the same non-opening path instead of aborting
+  the complete node status refresh
+- split-key discovery borrows the existing managed writer and reads primary
+  keys without draining enrichment or derived-index maintenance. It finalizes
+  only a pending primary-store auto-bulk boundary needed for primary visibility;
+  full replay/index draining remains reserved for a DB that is actually closing
 - mutable LSM snapshots have generation-specific reader references, so an old
   replay scan cannot retain unrelated later snapshots; write transactions keep
   backend-close fencing without pinning versions unless they open a cursor

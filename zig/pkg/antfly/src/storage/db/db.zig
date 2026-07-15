@@ -28227,11 +28227,10 @@ fn sparseEmbeddingArtifactRepairReason(
     return null;
 }
 
-fn embeddingWriteSourceDocumentExists(
+fn replaySourceDocumentExists(
     ctx: *const AsyncContext,
-    write: mapper.DenseEmbeddingWrite,
+    source_doc_key: []const u8,
 ) !bool {
-    const source_doc_key = write.parent_doc_key orelse write.doc_key;
     const store_key = try replayDocumentStoreKeyAlloc(ctx.alloc, source_doc_key);
     defer ctx.alloc.free(store_key);
     const raw = ctx.store.get(ctx.alloc, store_key) catch |err| switch (err) {
@@ -28240,6 +28239,13 @@ fn embeddingWriteSourceDocumentExists(
     };
     ctx.alloc.free(raw);
     return true;
+}
+
+fn denseEmbeddingWriteSourceDocumentExists(
+    ctx: *const AsyncContext,
+    write: mapper.DenseEmbeddingWrite,
+) !bool {
+    return try replaySourceDocumentExists(ctx, write.parent_doc_key orelse write.doc_key);
 }
 
 fn filterAndRecordDenseEmbeddingArtifactRepairIssuesForReplay(
@@ -28259,7 +28265,7 @@ fn filterAndRecordDenseEmbeddingArtifactRepairIssuesForReplay(
             // corruption: advance past the stale upsert and let the following
             // delete record remove any indexed value. This also prevents TTL
             // cleanup from wedging replay on an artifact it correctly removed.
-            if (reason == .missing_artifact and !try embeddingWriteSourceDocumentExists(ctx, write)) {
+            if (reason == .missing_artifact and !try denseEmbeddingWriteSourceDocumentExists(ctx, write)) {
                 try removed_indices.append(ctx.alloc, write_idx);
                 continue;
             }
@@ -28289,18 +28295,45 @@ fn filterAndRecordDenseEmbeddingArtifactRepairIssuesForReplay(
     owned.allocation_len = kept.len;
 }
 
-fn recordSparseEmbeddingArtifactRepairIssuesForReplay(
+fn filterAndRecordSparseEmbeddingArtifactRepairIssuesForReplay(
     ctx: *const AsyncContext,
     index_name: []const u8,
-    writes: []const mapper.SparseEmbeddingWrite,
+    owned: *OwnedSparseEmbeddingWrites,
     sequence: u64,
 ) !void {
-    for (writes) |write| {
+    var removed_indices = std.ArrayListUnmanaged(usize).empty;
+    defer removed_indices.deinit(ctx.alloc);
+    for (owned.writes, 0..) |write, write_idx| {
         const artifact_key = write.artifact_key orelse continue;
         if (try sparseEmbeddingArtifactRepairReason(ctx, artifact_key)) |reason| {
+            // Sparse artifact cleanup follows the same primary/journal
+            // ordering as dense cleanup. If a later delete already removed
+            // both the source and artifact, this stale upsert is superseded;
+            // the later delete record remains responsible for index removal.
+            if (reason == .missing_artifact and !try replaySourceDocumentExists(ctx, write.doc_key)) {
+                try removed_indices.append(ctx.alloc, write_idx);
+                continue;
+            }
             try recordEmbeddingArtifactRepairIssueContext(ctx, index_name, artifact_key, sequence, reason);
         }
     }
+    if (removed_indices.items.len == 0) return;
+
+    const kept_len = owned.writes.len - removed_indices.items.len;
+    const kept = try owned.alloc.alloc(mapper.SparseEmbeddingWrite, kept_len);
+    var kept_idx: usize = 0;
+    var removed_idx: usize = 0;
+    for (owned.writes, 0..) |write, write_idx| {
+        if (removed_idx < removed_indices.items.len and removed_indices.items[removed_idx] == write_idx) {
+            removed_idx += 1;
+            continue;
+        }
+        kept[kept_idx] = write;
+        kept_idx += 1;
+    }
+    if (owned.allocation_len > 0) owned.alloc.free(owned.writes.ptr[0..owned.allocation_len]);
+    owned.writes = kept;
+    owned.allocation_len = kept.len;
 }
 
 fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, profile: ?*BatchProfile) !void {
@@ -28418,7 +28451,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             );
             defer sparse_embeddings.deinit();
             if (emit_sparse_write_profile) sparse_collect_embedding_ns = monotonicTimeNs() - sparse_collect_embedding_start_ns;
-            try recordSparseEmbeddingArtifactRepairIssuesForReplay(ctx, index_ref.name, sparse_embeddings.writes, batch.sequence);
+            try filterAndRecordSparseEmbeddingArtifactRepairIssuesForReplay(ctx, index_ref.name, &sparse_embeddings, batch.sequence);
             try ctx.index_manager.validateSparseEmbeddingArtifactsByName(ctx.store, index_ref.name, sparse_embeddings.writes);
 
             const sparse_delete_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
@@ -28889,11 +28922,12 @@ const OwnedSparseEmbeddingWrites = struct {
     alloc: Allocator,
     owned_doc_keys: []const []const u8 = &.{},
     writes: []mapper.SparseEmbeddingWrite = &.{},
+    allocation_len: usize = 0,
 
     fn deinit(self: *@This()) void {
         for (self.owned_doc_keys) |doc_key| self.alloc.free(@constCast(doc_key));
         if (self.owned_doc_keys.len > 0) self.alloc.free(self.owned_doc_keys);
-        if (self.writes.len > 0) self.alloc.free(self.writes);
+        if (self.allocation_len > 0) self.alloc.free(self.writes.ptr[0..self.allocation_len]);
         self.* = undefined;
     }
 };
@@ -29582,10 +29616,14 @@ fn collectSparseEmbeddingWritesForArtifacts(
         doc_key = doc_key[0..0];
     }
 
+    const writes = try filtered.toOwnedSlice(alloc);
+    errdefer if (writes.len > 0) alloc.free(writes);
+    const owned_keys = try owned_doc_keys.toOwnedSlice(alloc);
     return .{
         .alloc = alloc,
-        .owned_doc_keys = try owned_doc_keys.toOwnedSlice(alloc),
-        .writes = try filtered.toOwnedSlice(alloc),
+        .owned_doc_keys = owned_keys,
+        .writes = writes,
+        .allocation_len = writes.len,
     };
 }
 
@@ -29658,10 +29696,14 @@ fn collectSparseEmbeddingWritesForBatch(
     }
     try appendSparseEmbeddingWritesForArtifacts(alloc, index_manager, &filtered, &owned_doc_keys, artifact_keys, index_name);
 
+    const writes = try filtered.toOwnedSlice(alloc);
+    errdefer if (writes.len > 0) alloc.free(writes);
+    const owned_keys = try owned_doc_keys.toOwnedSlice(alloc);
     return .{
         .alloc = alloc,
-        .owned_doc_keys = try owned_doc_keys.toOwnedSlice(alloc),
-        .writes = try filtered.toOwnedSlice(alloc),
+        .owned_doc_keys = owned_keys,
+        .writes = writes,
+        .allocation_len = writes.len,
     };
 }
 
@@ -54008,6 +54050,50 @@ test "db replay applies sparse embeddings from artifact payloads" {
     var sparse_index = reopened.core.index_manager.sparseIndex("sp_v1").?.index;
     const stats = sparse_index.stats();
     try std.testing.expectEqual(@as(u64, 1), stats.doc_count);
+}
+
+test "db replay skips a missing sparse artifact after its source document was deleted" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var appended_sequence: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "sp_v1",
+            .kind = .sparse_vector,
+            .config_json = "{\"field\":\"sparse_embedding\"}",
+        });
+
+        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:deleted", "sp_v1");
+        defer alloc.free(artifact_key);
+        appended_sequence = try appendDerivedBatchRecord(&db, .{
+            .sparse_embeddings = &.{.{
+                .index_name = "sp_v1",
+                .doc_key = "doc:deleted",
+                .artifact_key = artifact_key,
+                .indices = &.{1},
+                .values = &.{1.0},
+            }},
+        });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const issues = try reopened.listEmbeddingArtifactRepairIssues(alloc, "sp_v1", 0);
+    defer types.freeEmbeddingArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 0), issues.len);
+    try std.testing.expectEqual(appended_sequence, try reopened.core.loadAppliedSequence(alloc, "sp_v1"));
+    try std.testing.expectEqual(@as(u64, 0), reopened.core.index_manager.sparseIndex("sp_v1").?.index.stats().doc_count);
 }
 
 test "db replay blocks and preserves corrupt sparse embedding artifacts" {
