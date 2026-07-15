@@ -4950,12 +4950,17 @@ fn populateType1EncodingFallbacks(
 }
 
 fn parseType1LocalSubrsAlloc(alloc: Allocator, bytes: []const u8, len_iv: i64) ![][]u8 {
-    const scanner_result = parseType1LocalSubrsLexAlloc(alloc, bytes, len_iv) catch null;
-    if (scanner_result) |subrs| {
+    // Type 1 programs conventionally store Subrs as length-prefixed binary
+    // data after RD/-|. Running the general PDF lexer over that arbitrary
+    // binary can spend minutes attempting to tokenize a small embedded font.
+    // Prefer the format-aware parser and retain the lexer only for unusual
+    // string-encoded programs.
+    const rd_result = parseType1LocalSubrsRdAlloc(alloc, bytes, len_iv) catch null;
+    if (rd_result) |subrs| {
         if (subrs.len > 0) return subrs;
         alloc.free(subrs);
     }
-    return try parseType1LocalSubrsRdAlloc(alloc, bytes, len_iv);
+    return try parseType1LocalSubrsLexAlloc(alloc, bytes, len_iv);
 }
 
 fn parseType1LocalSubrsLexAlloc(alloc: Allocator, bytes: []const u8, len_iv: i64) ![][]u8 {
@@ -5009,12 +5014,12 @@ fn parseType1GlyphsAlloc(
     first_char: usize,
     widths: []const syntax.Object,
 ) ![]Type1Glyph {
-    const scanner_result = parseType1GlyphsLexAlloc(alloc, bytes, len_iv, font_obj, code_to_name, first_char, widths) catch null;
-    if (scanner_result) |glyphs| {
+    const rd_result = parseType1GlyphsRdAlloc(alloc, bytes, len_iv, font_obj, code_to_name, first_char, widths) catch null;
+    if (rd_result) |glyphs| {
         if (glyphs.len > 0) return glyphs;
         alloc.free(glyphs);
     }
-    return try parseType1GlyphsRdAlloc(alloc, bytes, len_iv, font_obj, code_to_name, first_char, widths);
+    return try parseType1GlyphsLexAlloc(alloc, bytes, len_iv, font_obj, code_to_name, first_char, widths);
 }
 
 fn parseType1GlyphsLexAlloc(
@@ -5126,7 +5131,15 @@ fn parseType1LocalSubrsRdAlloc(alloc: Allocator, bytes: []const u8, len_iv: i64)
         if (i >= bytes.len) break;
         if (matchType1Word(bytes, i, "/CharStrings")) break;
         if (!matchType1Word(bytes, i, "dup")) {
-            _ = readType1BareToken(bytes, &i);
+            const before = i;
+            if (bytes[i] == '/') {
+                _ = readType1NameToken(bytes, &i);
+            } else {
+                _ = readType1BareToken(bytes, &i);
+            }
+            // Keep tolerant scanning forward even when the current byte is a
+            // delimiter that neither token helper consumes.
+            if (i == before) i += 1;
             continue;
         }
         i += 3;
@@ -5181,8 +5194,13 @@ fn parseType1GlyphsRdAlloc(
         skipType1WhitespaceAndComments(bytes, &i);
         if (i >= bytes.len) break;
         if (!matchType1Word(bytes, i, "dup")) {
-            const tok = readType1BareToken(bytes, &i) orelse break;
-            if (std.mem.eql(u8, tok, "end")) break;
+            const before = i;
+            if (bytes[i] == '/') {
+                _ = readType1NameToken(bytes, &i);
+            } else if (readType1BareToken(bytes, &i)) |tok| {
+                if (std.mem.eql(u8, tok, "end")) break;
+            }
+            if (i == before) i += 1;
             continue;
         }
         i += 3;
@@ -13195,4 +13213,36 @@ test "reader assigns knockout transparency form group flag" {
     try std.testing.expect(runs[0].group_id != null);
     try std.testing.expect(runs[0].group_isolated);
     try std.testing.expect(runs[0].group_knockout);
+}
+
+test "type1 RD parsers advance across slash and binary delimiters" {
+    const alloc = std.testing.allocator;
+    const program =
+        "/Subrs 1 array\n" ++
+        "/Notice (embedded font) def\n" ++
+        "dup 0 3 RD abc NP\n" ++
+        "/CharStrings 1 dict dup begin\n" ++
+        "/Private 1 def\n" ++
+        "dup /A 3 RD xyz ND\n" ++
+        "end\n";
+
+    const subrs = try parseType1LocalSubrsAlloc(alloc, program, -1);
+    defer {
+        for (subrs) |subr| alloc.free(subr);
+        if (subrs.len > 0) alloc.free(subrs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), subrs.len);
+    try std.testing.expectEqualStrings("abc", subrs[0]);
+
+    var code_to_name = [_]?[]const u8{null} ** 256;
+    code_to_name['A'] = "A";
+    const empty_font = syntax.Object{ .dict = &.{} };
+    const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, &empty_font, &code_to_name, 0, &.{});
+    defer {
+        for (glyphs) |*glyph| glyph.deinit(alloc);
+        if (glyphs.len > 0) alloc.free(glyphs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), glyphs.len);
+    try std.testing.expectEqual(@as(u8, 'A'), glyphs[0].code);
+    try std.testing.expectEqualStrings("xyz", glyphs[0].charstring);
 }
