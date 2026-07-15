@@ -758,6 +758,11 @@ pub const Store = struct {
                     self.alloc.free(delete_key);
                     continue;
                 };
+                const active_key = activeJobKey(self.alloc, parsed.value.job_id) catch continue;
+                durable_delete_keys.append(self.alloc, active_key) catch {
+                    self.alloc.free(active_key);
+                    continue;
+                };
             }
         }
         if (durable_delete_keys.items.len > 0) {
@@ -817,6 +822,9 @@ pub const Store = struct {
     fn storeEncodedLocked(self: *Store, job_id: u64, encoded: []const u8, next_job_id: ?u64) !void {
         const owned = try self.alloc.dupe(u8, encoded);
         errdefer self.alloc.free(owned);
+        var parsed = try std.json.parseFromSlice(JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (parsed.value.job_id != job_id) return error.InvalidRepairJobState;
         // Reserve the process-local cache slot before committing the durable
         // state. Once the store write succeeds, publishing the matching cache
         // value cannot fail and leave scheduler metadata out of sync.
@@ -824,17 +832,29 @@ pub const Store = struct {
         if (self.opened_store) |opened| {
             const key = try jobKey(self.alloc, job_id);
             defer self.alloc.free(key);
+            const active_key = try activeJobKey(self.alloc, job_id);
+            defer self.alloc.free(active_key);
+            var writes: [3]docstore_mod.KVPair = undefined;
+            var write_count: usize = 0;
+            writes[write_count] = .{ .key = key, .value = encoded };
+            write_count += 1;
             if (next_job_id) |next| {
                 const durable_next = @max(next, self.next_job_id);
                 const next_raw = try encodeNextJobId(self.alloc, durable_next);
                 defer self.alloc.free(next_raw);
-                const writes = [_]docstore_mod.KVPair{
-                    .{ .key = key, .value = encoded },
-                    .{ .key = next_job_id_key, .value = next_raw },
-                };
-                try opened.docstore.putBatch(&writes, &.{});
+                writes[write_count] = .{ .key = next_job_id_key, .value = next_raw };
+                write_count += 1;
+            }
+            if (!isTerminalPhase(parsed.value.phase)) {
+                // The active index duplicates the compact job record so restart
+                // performs one ordered prefix scan rather than N random reads or
+                // a scan over retained terminal history. Both records commit in
+                // the same DocStore batch.
+                writes[write_count] = .{ .key = active_key, .value = encoded };
+                write_count += 1;
+                try opened.docstore.putBatch(writes[0..write_count], &.{});
             } else {
-                try opened.docstore.put(key, encoded);
+                try opened.docstore.putBatch(writes[0..write_count], &.{active_key});
             }
         }
         if (self.jobs.fetchPutAssumeCapacity(job_id, owned)) |old| self.alloc.free(old.value);
@@ -856,7 +876,7 @@ pub const Store = struct {
 
     fn recoverPersistedJobsLocked(self: *Store, opened: *OpenedStore) !void {
         var recovered_max_job_id: u64 = 0;
-        const results = try opened.docstore.scanPrefix(self.alloc, job_key_prefix);
+        const results = try opened.docstore.scanPrefix(self.alloc, active_job_key_prefix);
         defer docstore_mod.DocStore.freeResults(self.alloc, results);
         for (results) |kv| {
             var parsed = std.json.parseFromSlice(JobState, self.alloc, kv.value, .{ .ignore_unknown_fields = true }) catch continue;
@@ -907,7 +927,18 @@ pub const Store = struct {
             if (was_running or durable_cancel) {
                 const key = try jobKey(self.alloc, parsed.value.job_id);
                 defer self.alloc.free(key);
-                try opened.docstore.put(key, cached);
+                const active_key = try activeJobKey(self.alloc, parsed.value.job_id);
+                defer self.alloc.free(active_key);
+                try opened.docstore.putBatch(&.{
+                    .{ .key = key, .value = cached },
+                    .{ .key = active_key, .value = cached },
+                }, &.{});
+            } else if (isTerminalPhase(parsed.value.phase)) {
+                // Self-heal an impossible/stale marker without making startup
+                // fail; job state remains authoritative.
+                const active_key = try activeJobKey(self.alloc, parsed.value.job_id);
+                defer self.alloc.free(active_key);
+                try opened.docstore.putBatch(&.{}, &.{active_key});
             }
             if (durable_cancel) {
                 const enqueued = try self.enqueuePendingCancelLocked(parsed.value.job_id);
@@ -1023,6 +1054,13 @@ fn jobKey(alloc: std.mem.Allocator, job_id: u64) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}{d}", .{ job_key_prefix, job_id });
 }
 
+fn activeJobKey(alloc: std.mem.Allocator, job_id: u64) ![]u8 {
+    const key = try alloc.alloc(u8, active_job_key_prefix.len + @sizeOf(u64));
+    @memcpy(key[0..active_job_key_prefix.len], active_job_key_prefix);
+    std.mem.writeInt(u64, key[active_job_key_prefix.len..][0..8], job_id, .big);
+    return key;
+}
+
 fn encodeNextJobId(alloc: std.mem.Allocator, next_job_id: u64) ![]u8 {
     const out = try alloc.alloc(u8, @sizeOf(u64));
     std.mem.writeInt(u64, out[0..8], next_job_id, .big);
@@ -1051,6 +1089,7 @@ fn persistNextJobId(store: *docstore_mod.DocStore, alloc: std.mem.Allocator, nex
 
 const job_key_prefix = "__api_table_repair_jobs__:";
 const next_job_id_key = "__api_table_repair_jobs_meta__:next_job_id";
+const active_job_key_prefix = "__api_table_repair_jobs_active__:";
 const durable_cleanup_interval_ms: u64 = 60_000;
 const durable_cleanup_scan_limit: usize = 128;
 
@@ -1287,6 +1326,7 @@ test "named index repair cancellation restarts its durable traversal after job s
     defer alloc.free(path);
 
     var job_id: u64 = 0;
+    var terminal_job_id: u64 = 0;
     {
         const opened = try alloc.create(OpenedStore);
         errdefer alloc.destroy(opened);
@@ -1311,6 +1351,14 @@ test "named index repair cancellation restarts its durable traversal after job s
         job_id = parsed_running.value.job_id;
         const cancelling = try store.requestCancel(alloc, parsed_running.value);
         defer alloc.free(cancelling);
+
+        const terminal_started = try store.startJob(alloc, "docs", .{ .target = "artifact" });
+        defer alloc.free(terminal_started);
+        var parsed_terminal_started = try std.json.parseFromSlice(JobState, alloc, terminal_started, .{ .ignore_unknown_fields = true });
+        defer parsed_terminal_started.deinit();
+        terminal_job_id = parsed_terminal_started.value.job_id;
+        const terminal = try store.markPhase(alloc, parsed_terminal_started.value, .succeeded, null);
+        defer alloc.free(terminal);
     }
 
     {
@@ -1320,6 +1368,13 @@ test "named index repair cancellation restarts its durable traversal after job s
         var store = Store.init(alloc, .{});
         defer store.deinit();
         try store.attachOpenedStore(opened);
+
+        // Restart scans only the fixed-width active index. Retained terminal
+        // history remains lazy and does not consume startup I/O or cache space.
+        try std.testing.expectEqual(@as(usize, 1), store.jobs.count());
+        const active = try opened.docstore.scanPrefix(alloc, active_job_key_prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, active);
+        try std.testing.expectEqual(@as(usize, 1), active.len);
 
         const recovered = (try store.loadJobAlloc(alloc, job_id)) orelse return error.TestUnexpectedResult;
         defer alloc.free(recovered);
@@ -1332,6 +1387,10 @@ test "named index repair cancellation restarts its durable traversal after job s
         try std.testing.expect(requiresDurableCancel(parsed.value));
         const pending = (try store.nextPendingDurableCancelAlloc(alloc)).?;
         defer alloc.free(pending);
+
+        const terminal = (try store.loadJobAlloc(alloc, terminal_job_id)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(terminal);
+        try std.testing.expectEqual(@as(usize, 2), store.jobs.count());
     }
 }
 

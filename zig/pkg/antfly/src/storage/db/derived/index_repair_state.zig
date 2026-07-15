@@ -36,6 +36,10 @@ pub const Trigger = enum(u8) {
     /// resumed under the new identity; a fresh generation is rebuilt while
     /// the affected index remains unavailable.
     root_generation_rebuild = 3,
+    /// The serving dense generation does not have the same artifact cardinality
+    /// as the authoritative source counter. A healthy serving generation stays
+    /// available while a replacement is reconstructed and validated.
+    artifact_coverage_mismatch = 4,
 };
 
 pub const Phase = enum(u8) {

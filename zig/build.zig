@@ -4930,6 +4930,8 @@ pub fn build(b: *std.Build) void {
             "db document artifact child range batch atomically tracks dense artifact counters",
             "db ttl delete callback atomically removes dense artifacts and updates repair counters",
             "db replay skips a missing dense artifact after its source document was deleted",
+            "db dense artifact surplus uses serving generation replacement",
+            "db dense artifact planner does not let stale status override authoritative counter",
             "db dense artifact counter bootstrap combines snapshot with concurrent write delta",
             "db dense artifact counter bootstrap restarts from a fresh snapshot",
             "db dense artifact counter bootstrap fences stale concurrent attempt",

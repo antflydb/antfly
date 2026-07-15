@@ -70,10 +70,19 @@ Implemented in the current tree:
   and ordinary writes do not wake the repair scanner
 - a validated replacement is activated atomically while any prior healthy
   generation remains available
-- artifact-backed dense coverage is an exact cardinality invariant at snapshot,
-  replay advancement, and final fenced activation boundaries. A deficit may be
-  filled in place; a surplus forces a reset or rejects shadow activation because
-  replaying live artifacts cannot remove an unknown stale vector
+- artifact-backed dense coverage uses the durable source counter as the
+  authoritative cardinality invariant at snapshot, replay advancement, and final
+  fenced activation boundaries. A separately committed status snapshot is only
+  a bootstrap fallback when that counter is absent; it can never override a
+  present counter after a crash. A deficit may be filled in place. A surplus or
+  reset-class anomaly durably schedules a shadow-generation rebuild, leaving the
+  published generation queryable until fenced pointer swap; shadow activation
+  rejects either deficit or surplus. Cardinality detects missing/additional
+  entries but is not a cryptographic proof of key-set identity. Key-set
+  correctness derives from constructing an empty shadow exclusively from the
+  stable source snapshot plus fenced replay; adding a per-write cryptographic
+  digest is not justified unless fault injection demonstrates an equal-count
+  substitution that bypasses the index backend's own integrity checks
 - activation durably records and retains the previous root until the new clean
   checkpoint is published; a missing or corrupt pointer-selected generation
   fails closed and rolls back to that retained predecessor when one is valid
@@ -1483,9 +1492,10 @@ Operator actions follow these rules:
   owner is signalled before the control waits for group-operation serialization,
   allowing an active rebuild to yield at its next durable boundary. Only after
   the traversal completes does the job become `cancelled`; resumption remains
-  an explicit operator action. A durable FIFO of unfinished cancellation jobs
-  lets the API maintenance supervisor redispatch them automatically after a
-  process restart without scanning the complete job store
+  an explicit operator action. Every nonterminal job is mirrored atomically into
+  a fixed-width, job-ID-ordered active-job index. Restart scans only that bounded
+  index, reconstructs the unfinished-cancellation FIFO in creation order, and
+  leaves retained terminal history lazily loaded
 - a transient cancellation pass failure preserves `cancel_requested`, cursor,
   and accumulated results, then enters durable exponential backoff. The FIFO
   inspects a bounded window from a process-local round-robin cursor, advancing
