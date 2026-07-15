@@ -496,6 +496,11 @@ fn fontCorruptionScore(text_raw: []const u8) f64 {
 }
 
 pub fn preferOcrText(embedded: OcrQuality, ocr: OcrQuality) bool {
+    // A trivial OCR response must never erase a substantial embedded
+    // candidate. This can otherwise happen when both candidates have one
+    // quality failure (for example embedded `.garbled` versus OCR
+    // `.too_short`) and the ratio tie-breakers favor the one-character OCR.
+    if (ocr.too_short and !embedded.too_short) return false;
     if (embedded.needsFallback() != ocr.needsFallback()) return !ocr.needsFallback();
     if (embedded.failureCount() != ocr.failureCount()) return ocr.failureCount() < embedded.failureCount();
     if (embedded.replacement_char_ratio != ocr.replacement_char_ratio) return ocr.replacement_char_ratio < embedded.replacement_char_ratio;
@@ -3336,6 +3341,10 @@ test "OCR text selection retains embedded text on ties and chooses a better tran
     const ocr = assessOcrQuality("A faithfully transcribed table page with readable headings and enough ordinary English content to pass all quality checks.", config);
     try std.testing.expect(preferOcrText(embedded, ocr));
     try std.testing.expect(!preferOcrText(ocr, ocr));
+    const trivial_ocr = assessOcrQuality("-", config);
+    try std.testing.expect(trivial_ocr.too_short);
+    try std.testing.expect(!embedded.too_short);
+    try std.testing.expect(!preferOcrText(embedded, trivial_ocr));
 }
 
 test "OCR options parse configurable thresholds resolution model and explicit prompt" {
