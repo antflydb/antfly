@@ -12529,7 +12529,7 @@ pub const DB = struct {
     fn overlayRuntimeStatusRuntimeOnly(self: *DB, runtime_stats: *types.DBStats) void {
         runtime_stats.async_indexing = self.snapshotAsyncIndexingStats();
         runtime_stats.enrichment = if (self.enrichment_runtime) |runtime|
-            runtime.stats()
+            enrichment_runtime_mod.statsIncludingPersistedTelemetry(runtime) catch runtime.stats()
         else
             self.persistedEnrichmentStats() catch runtime_stats.enrichment;
         runtime_stats.resolution = self.resolutionStageStats();
@@ -12752,7 +12752,10 @@ pub const DB = struct {
                 .async_indexing = self.snapshotAsyncIndexingStats(),
                 .doc_set_planning = self.snapshotDocSetPlanningStats(),
                 .visibility = self.snapshotVisibilityStats(),
-                .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+                .enrichment = if (self.enrichment_runtime) |runtime|
+                    enrichment_runtime_mod.statsIncludingPersistedTelemetry(runtime) catch runtime.stats()
+                else
+                    .{},
                 .resolution = self.resolutionStageStats(),
                 .promotion = self.promotionStageStats(),
                 .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
@@ -13035,7 +13038,10 @@ pub const DB = struct {
             .doc_identity = identity_stats,
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .visibility = self.snapshotVisibilityStats(),
-            .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+            .enrichment = if (self.enrichment_runtime) |runtime|
+                try enrichment_runtime_mod.statsIncludingPersistedTelemetry(runtime)
+            else
+                .{},
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
             .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
@@ -13229,7 +13235,10 @@ pub const DB = struct {
             .doc_identity = identity_stats,
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .visibility = self.snapshotVisibilityStats(),
-            .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else try self.persistedEnrichmentStats(),
+            .enrichment = if (self.enrichment_runtime) |runtime|
+                try enrichment_runtime_mod.statsIncludingPersistedTelemetry(runtime)
+            else
+                try self.persistedEnrichmentStats(),
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
             .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
@@ -18904,6 +18913,12 @@ fn appendDocumentUnitChunkWrites(
         defer arena_state.deinit();
         const scratch = arena_state.allocator();
 
+        var embedding_inputs = std.ArrayListUnmanaged(DocumentUnitChunkEmbeddingInput).empty;
+        defer {
+            for (embedding_inputs.items) |input| alloc.free(input.chunk_key);
+            embedding_inputs.deinit(alloc);
+        }
+
         for (chunks) |chunk| {
             if (!chunk.isText()) continue;
             const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
@@ -18915,6 +18930,10 @@ fn appendDocumentUnitChunkWrites(
             try artifact_writes.append(alloc, .{
                 .key = try alloc.dupe(u8, chunk_key),
                 .value = try alloc.dupe(u8, payload),
+            });
+            try embedding_inputs.append(alloc, .{
+                .chunk_key = try alloc.dupe(u8, chunk_key),
+                .text = chunk.text.?,
             });
 
             if (text_indexes.len > 0) {
@@ -18937,26 +18956,45 @@ fn appendDocumentUnitChunkWrites(
                 });
             }
 
-            try appendDocumentUnitChunkDenseEmbeddingWrites(alloc, db, doc_key, chunk_key, entry.name, entry.source_field, chunk, artifact_writes, dense_embeddings);
-            try appendDocumentUnitChunkSparseEmbeddingWrites(alloc, db, chunk_key, entry.name, chunk, artifact_writes, sparse_embeddings);
-
             _ = arena_state.reset(.retain_capacity);
         }
+
+        try appendDocumentUnitChunkDenseEmbeddingWrites(alloc, db, doc_key, entry.name, entry.source_field, embedding_inputs.items, artifact_writes, dense_embeddings);
+        try appendDocumentUnitChunkSparseEmbeddingWrites(alloc, db, entry.name, embedding_inputs.items, artifact_writes, sparse_embeddings);
     }
+}
+
+const DocumentUnitChunkEmbeddingInput = struct {
+    chunk_key: []u8,
+    text: []const u8,
+};
+
+fn documentUnitEmbeddingBatchEnd(inputs: []const DocumentUnitChunkEmbeddingInput, start: usize, max_items: usize, max_bytes: usize) usize {
+    var end = start;
+    var bytes: usize = 0;
+    while (end < inputs.len and end - start < max_items) : (end += 1) {
+        const next_bytes = bytes +| inputs[end].text.len;
+        if (end > start and next_bytes > max_bytes) break;
+        bytes = next_bytes;
+        if (bytes >= max_bytes) {
+            end += 1;
+            break;
+        }
+    }
+    return @max(start + 1, end);
 }
 
 fn appendDocumentUnitChunkDenseEmbeddingWrites(
     alloc: Allocator,
     db: *DB,
     doc_key: []const u8,
-    chunk_key: []const u8,
     chunk_artifact_name: []const u8,
     source_field: []const u8,
-    chunk: chunker_mod.Chunk,
+    inputs: []const DocumentUnitChunkEmbeddingInput,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
 ) !void {
-    const chunk_text = chunk.text orelse return;
+    if (inputs.len == 0) return;
     const runtime = db.enrichment_runtime orelse return;
     const dense_embedder = runtime.config.dense_embedder orelse return;
 
@@ -18972,34 +19010,54 @@ fn appendDocumentUnitChunkDenseEmbeddingWrites(
         }
         if (consumer_indexes.len == 0) continue;
 
-        const vector = try dense_embedder.embedDense(alloc, entry.name, chunk_text, entry.expected_dims);
-        defer alloc.free(vector);
-        const artifact_key = try appendEmbeddingArtifactWrite(
-            alloc,
-            artifact_writes,
-            chunk_key,
-            doc_key,
-            entry.name,
-            source_field,
-            chunk_key,
-            enrichment_artifact_codec.hashSource(chunk_text),
-            vector,
-        );
-        defer alloc.free(artifact_key);
-        try appendDerivedDenseEmbeddingForConsumers(alloc, dense_embeddings, chunk_key, doc_key, artifact_key, vector, consumer_indexes);
+        const max_batch_items = enrichment_types.executionBatchItemsOrDefault(alloc, entry.execution_json, generatedEmbedBatchItems());
+        const max_batch_bytes = enrichment_types.executionBatchBytesOrDefault(alloc, entry.execution_json, generatedEmbedBatchBytes());
+        var start: usize = 0;
+        while (start < inputs.len) {
+            const end = documentUnitEmbeddingBatchEnd(inputs, start, max_batch_items, max_batch_bytes);
+            const batch_inputs = inputs[start..end];
+            const texts = try alloc.alloc([]const u8, batch_inputs.len);
+            defer alloc.free(texts);
+            for (batch_inputs, 0..) |input, i| texts[i] = input.text;
+            const byte_stats = embeddingTextBatchByteStats(texts);
+            const started_ns = enrichment_runtime_mod.beginEmbedBatch(runtime, texts.len, byte_stats.total_bytes, byte_stats.max_bytes);
+            const vectors = dense_embedder.embedDenseBatch(alloc, entry.name, texts, entry.expected_dims) catch |err| {
+                enrichment_runtime_mod.finishEmbedBatch(runtime, texts.len, byte_stats.total_bytes, byte_stats.max_bytes, started_ns, false);
+                return err;
+            };
+            enrichment_runtime_mod.finishEmbedBatch(runtime, texts.len, byte_stats.total_bytes, byte_stats.max_bytes, started_ns, true);
+            defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
+            if (vectors.len != batch_inputs.len) return error.InvalidEmbeddingResponse;
+
+            for (batch_inputs, vectors) |input, vector| {
+                const artifact_key = try appendEmbeddingArtifactWrite(
+                    alloc,
+                    artifact_writes,
+                    input.chunk_key,
+                    doc_key,
+                    entry.name,
+                    source_field,
+                    input.chunk_key,
+                    enrichment_artifact_codec.hashSource(input.text),
+                    vector,
+                );
+                defer alloc.free(artifact_key);
+                try appendDerivedDenseEmbeddingForConsumers(alloc, dense_embeddings, input.chunk_key, doc_key, artifact_key, vector, consumer_indexes);
+            }
+            start = end;
+        }
     }
 }
 
 fn appendDocumentUnitChunkSparseEmbeddingWrites(
     alloc: Allocator,
     db: *DB,
-    chunk_key: []const u8,
     chunk_artifact_name: []const u8,
-    chunk: chunker_mod.Chunk,
+    inputs: []const DocumentUnitChunkEmbeddingInput,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
 ) !void {
-    const chunk_text = chunk.text orelse return;
+    if (inputs.len == 0) return;
     const runtime = db.enrichment_runtime orelse return;
     const sparse_embedder = runtime.config.sparse_embedder orelse return;
 
@@ -19015,19 +19073,40 @@ fn appendDocumentUnitChunkSparseEmbeddingWrites(
         }
         if (consumer_indexes.len == 0) continue;
 
-        var sparse = try sparse_embedder.embedSparse(alloc, entry.name, chunk_text);
-        defer sparse.deinit(alloc);
-        const artifact_key = try appendSparseEmbeddingArtifactWrite(
-            alloc,
-            artifact_writes,
-            chunk_key,
-            entry.name,
-            enrichment_artifact_codec.hashSource(chunk_text),
-            sparse.indices,
-            sparse.values,
-        );
-        defer alloc.free(artifact_key);
-        try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, chunk_key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
+        const max_batch_items = enrichment_types.executionBatchItemsOrDefault(alloc, entry.execution_json, generatedEmbedBatchItems());
+        const max_batch_bytes = enrichment_types.executionBatchBytesOrDefault(alloc, entry.execution_json, generatedEmbedBatchBytes());
+        var start: usize = 0;
+        while (start < inputs.len) {
+            const end = documentUnitEmbeddingBatchEnd(inputs, start, max_batch_items, max_batch_bytes);
+            const batch_inputs = inputs[start..end];
+            const texts = try alloc.alloc([]const u8, batch_inputs.len);
+            defer alloc.free(texts);
+            for (batch_inputs, 0..) |input, i| texts[i] = input.text;
+            const byte_stats = embeddingTextBatchByteStats(texts);
+            const started_ns = enrichment_runtime_mod.beginEmbedBatch(runtime, texts.len, byte_stats.total_bytes, byte_stats.max_bytes);
+            const sparse_batch = sparse_embedder.embedSparseBatch(alloc, entry.name, texts) catch |err| {
+                enrichment_runtime_mod.finishEmbedBatch(runtime, texts.len, byte_stats.total_bytes, byte_stats.max_bytes, started_ns, false);
+                return err;
+            };
+            enrichment_runtime_mod.finishEmbedBatch(runtime, texts.len, byte_stats.total_bytes, byte_stats.max_bytes, started_ns, true);
+            defer embedder_mod.freeSparseEmbeddingBatch(alloc, sparse_batch);
+            if (sparse_batch.len != batch_inputs.len) return error.InvalidEmbeddingResponse;
+
+            for (batch_inputs, sparse_batch) |input, sparse| {
+                const artifact_key = try appendSparseEmbeddingArtifactWrite(
+                    alloc,
+                    artifact_writes,
+                    input.chunk_key,
+                    entry.name,
+                    enrichment_artifact_codec.hashSource(input.text),
+                    sparse.indices,
+                    sparse.values,
+                );
+                defer alloc.free(artifact_key);
+                try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, input.chunk_key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
+            }
+            start = end;
+        }
     }
 }
 
@@ -30962,6 +31041,46 @@ const CountingDenseEmbedder = struct {
             .dense_embed_fn = embedDense,
             .deinit_fn = null,
         };
+    }
+};
+
+const BatchCountingDenseEmbedder = struct {
+    deterministic: embedder_mod.DeterministicDenseEmbedder = .{},
+    single_calls: usize = 0,
+    batch_calls: usize = 0,
+    batch_items: usize = 0,
+    max_batch_items: usize = 0,
+
+    fn interface(self: *@This()) embedder_mod.DenseEmbedder {
+        return .{
+            .ptr = self,
+            .dense_embed_fn = embedDense,
+            .dense_embed_batch_fn = embedDenseBatch,
+        };
+    }
+
+    fn embedDense(ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) ![]f32 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.single_calls += 1;
+        return try embedder_mod.DeterministicDenseEmbedder.embedDense(&self.deterministic, alloc, embedding_name, text, dims);
+    }
+
+    fn embedDenseBatch(ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.batch_calls += 1;
+        self.batch_items += texts.len;
+        self.max_batch_items = @max(self.max_batch_items, texts.len);
+        const vectors = try alloc.alloc([]const f32, texts.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (vectors[0..initialized]) |vector| alloc.free(@constCast(vector));
+            alloc.free(vectors);
+        }
+        for (texts, 0..) |text, i| {
+            vectors[i] = try embedder_mod.DeterministicDenseEmbedder.embedDense(&self.deterministic, alloc, embedding_name, text, dims);
+            initialized += 1;
+        }
+        return vectors;
     }
 };
 
@@ -43209,6 +43328,69 @@ fn testSourceDocumentJsonAlloc(alloc: Allocator, url: []const u8, sha256: []cons
         "{{\"_type\":\"source_document\",\"url\":\"{s}\",\"filename\":\"doc.html\",\"mime_type\":\"text/html\",\"sha256\":\"{s}\",\"file_type\":\"document\"}}",
         .{ url, sha256 },
     );
+}
+
+test "db document extraction batches materialized chunk embeddings" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var counting = BatchCountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = counting.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 16,
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunk_dense_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+        .execution = .{ .batch_items = 8, .batch_bytes = 65536 },
+    });
+    try db.addIndex(.{
+        .name = "document_vectors",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), counting.single_calls);
+    try std.testing.expect(counting.batch_calls > 0);
+    try std.testing.expect(counting.batch_items > 1);
+    try std.testing.expect(counting.max_batch_items > 1);
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.enrichment.embed_batches_completed > 0);
+    try std.testing.expect(stats.enrichment.embed_items_completed > 1);
+    try std.testing.expect(stats.enrichment.total_embed_ns > 0);
 }
 
 test "db document extraction state round-trips binary chunk keys beyond one byte ids" {

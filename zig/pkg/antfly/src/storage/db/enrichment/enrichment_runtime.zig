@@ -426,6 +426,25 @@ pub fn persistStatus(runtime: *EnrichmentRuntime) !void {
     try saveRuntimeStatusWithRetry(runtime, scope_name, status);
 }
 
+pub fn statsIncludingPersistedTelemetry(runtime: *EnrichmentRuntime) !types.EnrichmentStats {
+    var live = runtime.stats();
+    const persisted = try enrichment_state.loadRuntimeStatus(runtime.alloc, runtime.store, scope_name);
+    const use_persisted_last = persisted.embed_batches_completed > live.embed_batches_completed or
+        persisted.total_embed_ns > live.total_embed_ns;
+    live.embed_batches_started = @max(live.embed_batches_started, persisted.embed_batches_started);
+    live.embed_batches_completed = @max(live.embed_batches_completed, persisted.embed_batches_completed);
+    live.embed_items_started = @max(live.embed_items_started, persisted.embed_items_started);
+    live.embed_items_completed = @max(live.embed_items_completed, persisted.embed_items_completed);
+    live.total_embed_ns = @max(live.total_embed_ns, persisted.total_embed_ns);
+    if (use_persisted_last) {
+        live.last_embed_batch_items = persisted.last_embed_batch_items;
+        live.last_embed_batch_bytes = persisted.last_embed_batch_bytes;
+        live.last_embed_batch_max_bytes = persisted.last_embed_batch_max_bytes;
+        live.last_embed_batch_ns = persisted.last_embed_batch_ns;
+    }
+    return live;
+}
+
 const TextBatchByteStats = struct {
     total_bytes: usize = 0,
     max_bytes: usize = 0,

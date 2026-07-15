@@ -169,6 +169,10 @@ pub fn loadRuntimeStatus(alloc: Allocator, store: anytype, scope: []const u8) !R
     };
     const raw = try alloc.dupe(u8, borrowed);
     defer alloc.free(raw);
+    return try decodeRuntimeStatus(raw);
+}
+
+fn decodeRuntimeStatus(raw: []const u8) !RuntimeStatus {
     if (raw.len != runtime_status_v1_len and raw.len != runtime_status_v2_len and raw.len != runtime_status_v3_len) return error.InvalidEnrichmentState;
     var status = RuntimeStatus{
         .target_sequence = std.mem.readInt(u64, raw[0..8], .little),
@@ -198,27 +202,50 @@ pub fn loadRuntimeStatus(alloc: Allocator, store: anytype, scope: []const u8) !R
 pub fn saveRuntimeStatus(store: anytype, scope: []const u8, status: RuntimeStatus) !void {
     const key = try runtimeStatusKey(std.heap.page_allocator, scope);
     defer std.heap.page_allocator.free(key);
-    var buf: [runtime_status_v3_len]u8 = undefined;
-    std.mem.writeInt(u64, buf[0..8], status.target_sequence, .little);
-    std.mem.writeInt(u64, buf[8..16], status.error_count, .little);
-    std.mem.writeInt(u64, buf[16..24], status.retryable_error_count, .little);
-    std.mem.writeInt(u64, buf[24..32], status.fatal_error_count, .little);
-    std.mem.writeInt(u64, buf[32..40], status.skipped_source_count, .little);
-    std.mem.writeInt(u64, buf[40..48], status.embed_batches_started, .little);
-    std.mem.writeInt(u64, buf[48..56], status.embed_batches_completed, .little);
-    std.mem.writeInt(u64, buf[56..64], status.embed_items_started, .little);
-    std.mem.writeInt(u64, buf[64..72], status.embed_items_completed, .little);
-    std.mem.writeInt(u64, buf[72..80], status.last_embed_batch_items, .little);
-    std.mem.writeInt(u64, buf[80..88], status.last_embed_batch_bytes, .little);
-    std.mem.writeInt(u64, buf[88..96], status.last_embed_batch_max_bytes, .little);
-    std.mem.writeInt(u64, buf[96..104], status.last_embed_batch_ns, .little);
-    std.mem.writeInt(u64, buf[104..112], status.total_embed_ns, .little);
-    buf[112] = if (status.retrying) 1 else 0;
-    buf[113] = if (status.worker_failed) 1 else 0;
     var runtime = try initRuntimeStore(std.heap.page_allocator, store);
     defer runtime.deinit();
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
+
+    var merged = status;
+    const existing_raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (existing_raw) |raw| {
+        const existing = try decodeRuntimeStatus(raw);
+        const keep_existing_last = existing.embed_batches_completed > merged.embed_batches_completed or
+            existing.total_embed_ns > merged.total_embed_ns;
+        merged.embed_batches_started = @max(merged.embed_batches_started, existing.embed_batches_started);
+        merged.embed_batches_completed = @max(merged.embed_batches_completed, existing.embed_batches_completed);
+        merged.embed_items_started = @max(merged.embed_items_started, existing.embed_items_started);
+        merged.embed_items_completed = @max(merged.embed_items_completed, existing.embed_items_completed);
+        merged.total_embed_ns = @max(merged.total_embed_ns, existing.total_embed_ns);
+        if (keep_existing_last) {
+            merged.last_embed_batch_items = existing.last_embed_batch_items;
+            merged.last_embed_batch_bytes = existing.last_embed_batch_bytes;
+            merged.last_embed_batch_max_bytes = existing.last_embed_batch_max_bytes;
+            merged.last_embed_batch_ns = existing.last_embed_batch_ns;
+        }
+    }
+
+    var buf: [runtime_status_v3_len]u8 = undefined;
+    std.mem.writeInt(u64, buf[0..8], merged.target_sequence, .little);
+    std.mem.writeInt(u64, buf[8..16], merged.error_count, .little);
+    std.mem.writeInt(u64, buf[16..24], merged.retryable_error_count, .little);
+    std.mem.writeInt(u64, buf[24..32], merged.fatal_error_count, .little);
+    std.mem.writeInt(u64, buf[32..40], merged.skipped_source_count, .little);
+    std.mem.writeInt(u64, buf[40..48], merged.embed_batches_started, .little);
+    std.mem.writeInt(u64, buf[48..56], merged.embed_batches_completed, .little);
+    std.mem.writeInt(u64, buf[56..64], merged.embed_items_started, .little);
+    std.mem.writeInt(u64, buf[64..72], merged.embed_items_completed, .little);
+    std.mem.writeInt(u64, buf[72..80], merged.last_embed_batch_items, .little);
+    std.mem.writeInt(u64, buf[80..88], merged.last_embed_batch_bytes, .little);
+    std.mem.writeInt(u64, buf[88..96], merged.last_embed_batch_max_bytes, .little);
+    std.mem.writeInt(u64, buf[96..104], merged.last_embed_batch_ns, .little);
+    std.mem.writeInt(u64, buf[104..112], merged.total_embed_ns, .little);
+    buf[112] = if (merged.retrying) 1 else 0;
+    buf[113] = if (merged.worker_failed) 1 else 0;
     try txn.put(key, &buf);
     try txn.commit();
 }
@@ -376,6 +403,42 @@ test "enrichment runtime status persists source target sequence" {
     try std.testing.expectEqual(@as(u64, 13), loaded.total_embed_ns);
     try std.testing.expect(loaded.retrying);
     try std.testing.expect(!loaded.worker_failed);
+}
+
+test "enrichment runtime status rejects stale telemetry regression" {
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    try saveRuntimeStatus(runtime, "generated", .{
+        .target_sequence = 2,
+        .embed_batches_started = 5,
+        .embed_batches_completed = 4,
+        .embed_items_started = 20,
+        .embed_items_completed = 16,
+        .last_embed_batch_items = 4,
+        .last_embed_batch_bytes = 400,
+        .last_embed_batch_max_bytes = 120,
+        .last_embed_batch_ns = 30,
+        .total_embed_ns = 100,
+    });
+    try saveRuntimeStatus(runtime, "generated", .{
+        .target_sequence = 3,
+    });
+
+    const loaded = try loadRuntimeStatus(std.testing.allocator, runtime, "generated");
+    try std.testing.expectEqual(@as(u64, 3), loaded.target_sequence);
+    try std.testing.expectEqual(@as(u64, 5), loaded.embed_batches_started);
+    try std.testing.expectEqual(@as(u64, 4), loaded.embed_batches_completed);
+    try std.testing.expectEqual(@as(u64, 20), loaded.embed_items_started);
+    try std.testing.expectEqual(@as(u64, 16), loaded.embed_items_completed);
+    try std.testing.expectEqual(@as(u64, 4), loaded.last_embed_batch_items);
+    try std.testing.expectEqual(@as(u64, 400), loaded.last_embed_batch_bytes);
+    try std.testing.expectEqual(@as(u64, 120), loaded.last_embed_batch_max_bytes);
+    try std.testing.expectEqual(@as(u64, 30), loaded.last_embed_batch_ns);
+    try std.testing.expectEqual(@as(u64, 100), loaded.total_embed_ns);
 }
 
 test "enrichment runtime status reads legacy v1 and v2 records" {
