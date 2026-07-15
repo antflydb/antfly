@@ -9191,11 +9191,15 @@ func haWatchdogProofFromAdmin(raw *adminsdk.HALeaseWatchdogProof, cluster *antfl
 	if raw.AuthorityGranted {
 		const responseSafetyMarginMS = int64(250)
 		rttMS := int64((rtt + time.Millisecond - 1) / time.Millisecond)
-		if raw.AuthorityRemainingMs == 0 || raw.AuthorityRemainingMs > math.MaxInt32 ||
-			int64(raw.AuthorityRemainingMs) <= rttMS+responseSafetyMarginMS {
+		if raw.AuthorityRemainingMs == 0 || raw.AuthorityRemainingMs > math.MaxInt32 {
 			return nil, fmt.Errorf("HA Lease watchdog authority expired or has insufficient margin after admin response RTT")
 		}
-		authorityRemainingMS = int32(int64(raw.AuthorityRemainingMs) - rttMS - responseSafetyMarginMS)
+		remainingMS := int64(raw.AuthorityRemainingMs) // #nosec G115 -- rejected above unless the unsigned value is at most MaxInt32.
+		remainingMS -= rttMS + responseSafetyMarginMS
+		if remainingMS <= 0 {
+			return nil, fmt.Errorf("HA Lease watchdog authority expired or has insufficient margin after admin response RTT")
+		}
+		authorityRemainingMS = int32(remainingMS) // #nosec G115 -- raw and adjusted values are bounded above and below before conversion.
 	} else if raw.AuthorityRemainingMs != 0 {
 		return nil, fmt.Errorf("HA Lease watchdog denied authority but reported a nonzero authority remainder")
 	}
@@ -9223,8 +9227,8 @@ func haWatchdogProofFromAdmin(raw *adminsdk.HALeaseWatchdogProof, cluster *antfl
 		ObservedHolderNodeID:     strings.TrimSpace(raw.ObservedHolderNodeId),
 		PodUID:                   strings.TrimSpace(raw.PodUid),
 		ProcessBootID:            strings.TrimSpace(raw.ProcessBootId),
-		ObservedLeaseTransitions: int32(raw.ObservedLeaseTransitions),
-		MaxFenceLatencyMS:        int32(raw.MaxFenceLatencyMs),
+		ObservedLeaseTransitions: int32(raw.ObservedLeaseTransitions), // #nosec G115 -- the proof is rejected above unless it is in (0, MaxInt32].
+		MaxFenceLatencyMS:        expectedMaxFenceLatencyMS,
 		// Anchor process identity at request start. A response delayed across a
 		// same-Pod container restart must not be combined with the replacement
 		// container's Kubernetes identity by the later uncached Pod check.
@@ -9492,8 +9496,12 @@ func (r *AntflyClusterReconciler) haCurrentLeaseAuthorizesRoute(ctx context.Cont
 		return false, err
 	}
 	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != strings.TrimSpace(nodeID) ||
-		lease.Spec.LeaseTransitions == nil || uint64(*lease.Spec.LeaseTransitions) != generation ||
+		lease.Spec.LeaseTransitions == nil || *lease.Spec.LeaseTransitions <= 0 ||
 		lease.Annotations[haFencingLeaseAnnotationTopologyID] != haFencingLeaseTopologyID(cluster) {
+		return false, nil
+	}
+	observedGeneration := uint64(*lease.Spec.LeaseTransitions) // #nosec G115 -- non-positive Kubernetes Lease transitions are rejected above.
+	if observedGeneration != generation {
 		return false, nil
 	}
 	ready, _ := haLeaseFenceReady(lease, generation, r.haNow())
@@ -9508,6 +9516,10 @@ func (r *AntflyClusterReconciler) haPromotedRuntimeWatchdogReady(ctx context.Con
 	}
 	proof := cluster.Status.HAStatus.PrimaryWatchdogProof
 	lease := cluster.Spec.HighAvailability.Runtime.FencingLease
+	if proof.ObservedLeaseTransitions <= 0 {
+		return false, nil
+	}
+	observedLeaseTransitions := uint64(proof.ObservedLeaseTransitions) // #nosec G115 -- non-positive persisted proof transitions are rejected above.
 	expectedMaxFenceLatencyMS := int32(10_000)
 	if lease.WatchdogGraceSeconds > 0 {
 		expectedMaxFenceLatencyMS = lease.WatchdogGraceSeconds * 1000
@@ -9523,7 +9535,7 @@ func (r *AntflyClusterReconciler) haPromotedRuntimeWatchdogReady(ctx context.Con
 			proof.PodUID != "" && proof.ProcessBootID != "" &&
 			proof.LeaseName == strings.TrimSpace(lease.Name) && proof.LeaseNamespace == cluster.Namespace &&
 			proof.TopologyID == strings.TrimSpace(lease.TopologyID) &&
-			uint64(proof.ObservedLeaseTransitions) == fenceGeneration) {
+			observedLeaseTransitions == fenceGeneration) {
 		return false, nil
 	}
 

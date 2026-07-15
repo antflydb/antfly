@@ -53,6 +53,24 @@ func TestHAPrimaryRouteRequiresFreshUncachedRuntimeAndLeaseProof(t *testing.T) {
 		t.Fatalf("fresh exact uncached Lease rejected: ready=%v err=%v", ready, err)
 	}
 
+	negativeTransition := int32(-1)
+	negativeLease := currentLease.DeepCopy()
+	negativeLease.Spec.LeaseTransitions = &negativeTransition
+	reconciler.BoundaryReader = fake.NewClientBuilder().WithScheme(scheme).WithObjects(currentPod.DeepCopy(), negativeLease).Build()
+	ready, err = reconciler.haCurrentLeaseAuthorizesRoute(context.Background(), cluster, "standby-a", 4)
+	if err != nil || ready {
+		t.Fatalf("negative Lease transition wrapped into route authority: ready=%v err=%v", ready, err)
+	}
+	negativeProof := validRouteWatchdogProof(now)
+	negativeProof.ObservedLeaseTransitions = -1
+	cluster.Status.HAStatus.PrimaryWatchdogProof = negativeProof
+	reconciler.BoundaryReader = fake.NewClientBuilder().WithScheme(scheme).WithObjects(currentPod.DeepCopy(), currentLease.DeepCopy()).Build()
+	ready, err = reconciler.haPromotedRuntimeWatchdogReady(context.Background(), cluster, "standby-a", 4)
+	if err != nil || ready {
+		t.Fatalf("negative runtime transition wrapped into route authority: ready=%v err=%v", ready, err)
+	}
+	cluster.Status.HAStatus.PrimaryWatchdogProof = validRouteWatchdogProof(now)
+
 	// A stale cache still says the promoted node holds the Lease. The safety
 	// boundary sees a later holder and must win.
 	staleBoundaryLease := currentLease.DeepCopy()
@@ -194,6 +212,34 @@ func TestHAWatchdogAuthorityProofSubtractsDelayedResponseRTT(t *testing.T) {
 	}
 	if !proof.ObservedAt.Time.Equal(started) {
 		t.Fatalf("SAFETY: proof was anchored after the request and can be combined with a same-Pod replacement process: %s", proof.ObservedAt.Time)
+	}
+}
+
+func TestHAWatchdogAuthorityProofRejectsSignedRangeViolations(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	raw := &adminsdk.HALeaseWatchdogProof{
+		CapabilityVersion:        1,
+		Active:                   true,
+		AuthorityGranted:         true,
+		AuthorityRemainingMs:     ^uint64(0),
+		LeaseName:                "topology-ha-fence",
+		LeaseNamespace:           "default",
+		StableTopologyId:         "topology-anchor-uid",
+		LocalNodeId:              "standby-a",
+		ObservedHolderNodeId:     "standby-a",
+		PodUid:                   "promoted-pod-uid",
+		ProcessBootId:            strings.Repeat("a", 64),
+		ObservedLeaseTransitions: 4,
+		MaxFenceLatencyMs:        10_000,
+	}
+	now := time.Date(2026, 7, 15, 16, 0, 0, 0, time.UTC)
+	if _, err := haWatchdogProofFromAdmin(raw, cluster, "standby-a", true, now, now); err == nil {
+		t.Fatal("out-of-range authority remainder was accepted")
+	}
+	raw.AuthorityRemainingMs = 10_000
+	raw.ObservedLeaseTransitions = uint64(^uint32(0))
+	if _, err := haWatchdogProofFromAdmin(raw, cluster, "standby-a", true, now, now); err == nil {
+		t.Fatal("out-of-range Lease transition was accepted")
 	}
 }
 
