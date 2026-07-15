@@ -409,6 +409,15 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
     }
 }
 
+pub fn beginEmbedBatch(runtime: *EnrichmentRuntime, items: usize, bytes: usize, max_bytes: usize) u64 {
+    noteEmbedBatchStarted(runtime, items, bytes, max_bytes);
+    return runtime.config.clock.nowRealtimeNs();
+}
+
+pub fn finishEmbedBatch(runtime: *EnrichmentRuntime, items: usize, bytes: usize, max_bytes: usize, started_ns: u64, success: bool) void {
+    noteEmbedBatchFinished(runtime, items, bytes, max_bytes, elapsedNsSince(runtime, started_ns), success);
+}
+
 const TextBatchByteStats = struct {
     total_bytes: usize = 0,
     max_bytes: usize = 0,

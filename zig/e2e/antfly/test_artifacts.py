@@ -1113,6 +1113,26 @@ def test_artifact_backed_chunk_embeddings_are_semantic_searchable(stateful_api, 
                 .get("total_indexed")
                 == 2
                 and index.get("status", {}).get("query_visible_doc_count") == 2
+                and index.get("status", {}).get("coverage", {}).get("source_total")
+                == 2
+                and index.get("status", {}).get("coverage", {}).get("produced")
+                == 2
+                and index.get("status", {})
+                .get("coverage", {})
+                .get("observation_complete")
+                is True
+                and index.get("status", {}).get("coverage", {}).get("complete")
+                is True
+                and index.get("status", {}).get("coverage", {}).get("healthy")
+                is True
+                and index.get("status", {})
+                .get("enrichment_runtime", {})
+                .get("embed_batches_completed", 0)
+                > 0
+                and index.get("status", {})
+                .get("enrichment_runtime", {})
+                .get("total_embed_ns", 0)
+                > 0
             )
             else None
         ),
@@ -1124,6 +1144,10 @@ def test_artifact_backed_chunk_embeddings_are_semantic_searchable(stateful_api, 
         indent=2,
         sort_keys=True,
     )
+    assert final_index["status"]["coverage"]["source_total"] == 2
+    assert final_index["status"]["coverage"]["produced"] == 2
+    assert final_index["status"]["coverage"]["healthy"] is True
+    assert final_index["status"]["enrichment_runtime"]["total_embed_ns"] > 0
 
     alpha_semantic = wait_until(
         lambda: (
