@@ -270,14 +270,18 @@ fn requiredBackend(backend: BackendType) []const BackendType {
 /// this binary or cannot create direct inference sessions.
 pub fn validateRequiredBackend() !void {
     const order = requiredBackendOrder() orelse return;
-    return validateRequiredBackendOrder(order);
+    validateRequiredBackendOrder(order) catch |err| {
+        if (order.len == 1) {
+            std.log.err("required inference backend {s} is unavailable in this build", .{@tagName(order[0])});
+        }
+        return err;
+    };
 }
 
 fn validateRequiredBackendOrder(order: []const BackendType) !void {
     if (order.len != 1) return error.InvalidRequiredBackend;
     const backend = order[0];
     if (!backend.available() or !backend.supportsDirectSessionLoad()) {
-        std.log.err("required inference backend {s} is unavailable in this build", .{@tagName(backend)});
         return error.RequiredBackendUnavailable;
     }
 }

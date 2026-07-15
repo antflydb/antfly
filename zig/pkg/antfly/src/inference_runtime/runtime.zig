@@ -208,7 +208,7 @@ fn parseInferenceFileConfig(alloc: std.mem.Allocator, raw: []const u8) !common_c
         .object => |object| object,
         else => return error.InvalidConfig,
     };
-    for (.{ "backend_priority", "model_strategies", "embedder_models_dir", "chunker_models_dir", "reranker_models_dir" }) |key| {
+    inline for (.{ "backend_priority", "model_strategies", "embedder_models_dir", "chunker_models_dir", "reranker_models_dir" }) |key| {
         if (source.contains(key)) return error.InvalidConfig;
     }
 
