@@ -1948,6 +1948,79 @@ func TestValidateCreate_HighAvailabilityHotStandbyValid(t *testing.T) {
 	}
 }
 
+func TestValidateCreate_HighAvailabilityAutomaticFailoverRequiresNoLossDurability(t *testing.T) {
+	base := baseStandaloneCluster()
+	base.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode:  HAModeHotStandby,
+		Admin: &HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081", ExecutePlannedActions: true},
+		Standbys: []HAStandbySpec{{
+			Name:          "standby-a",
+			AdminURL:      "http://standby-a-ha.default.svc:8081",
+			RouteSelector: map[string]string{"app.kubernetes.io/instance": "standby-a"},
+		}},
+		Identity: &HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 1, Epoch: 1, CurrentPrimaryID: "primary-a"},
+		AutomaticFailover: &HAAutomaticFailoverPolicy{
+			Enabled:          true,
+			FencingAuthority: HAFencingAuthorityKubernetesLease,
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:          HADurabilityModeRemoteApply,
+			Required:      1,
+			StandbyNames:  []string{"standby-a"},
+			FailurePolicy: HAFailurePolicyBlock,
+		},
+	}
+	if err := base.ValidateCreate(); err != nil {
+		t.Fatalf("expected no-loss automatic failover baseline to be valid: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*HighAvailabilitySpec)
+		message string
+	}{
+		{
+			name: "async",
+			mutate: func(ha *HighAvailabilitySpec) {
+				ha.SyncPolicy = &HASyncPolicy{Mode: HADurabilityModeAsync}
+			},
+			message: "automaticFailover requires syncPolicy.mode RemoteApply",
+		},
+		{
+			name: "remote write",
+			mutate: func(ha *HighAvailabilitySpec) {
+				ha.SyncPolicy.Mode = HADurabilityModeRemoteWrite
+			},
+			message: "automaticFailover requires syncPolicy.mode RemoteApply",
+		},
+		{
+			name: "degrade to async",
+			mutate: func(ha *HighAvailabilitySpec) {
+				ha.SyncPolicy.FailurePolicy = HAFailurePolicyDegradeToAsync
+			},
+			message: "automaticFailover requires syncPolicy.failurePolicy Block or FailClosed",
+		},
+		{
+			name: "remote apply opt out",
+			mutate: func(ha *HighAvailabilitySpec) {
+				value := false
+				ha.AutomaticFailover.RequireRemoteApply = &value
+			},
+			message: "automaticFailover.requireRemoteApply must be true",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cluster := base.DeepCopy()
+			tc.mutate(cluster.Spec.HighAvailability)
+			err := cluster.ValidateCreate()
+			if err == nil || !strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("expected %q rejection, got %v", tc.message, err)
+			}
+		})
+	}
+}
+
 func TestValidateCreate_HighAvailabilityAllowsEmptyDisabledConfig(t *testing.T) {
 	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{}

@@ -1474,8 +1474,13 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		if ha.Identity == nil {
 			errors = append(errors, "spec.highAvailability.automaticFailover requires spec.highAvailability.identity")
 		}
-		if failover.requireRemoteApplyOrDefault() && ha.SyncPolicy != nil && ha.SyncPolicy.modeOrDefault() == HADurabilityModeRemoteWrite {
-			errors = append(errors, "spec.highAvailability.automaticFailover.requireRemoteApply requires syncPolicy.mode RemoteApply or Async")
+		if !failover.requireRemoteApplyOrDefault() {
+			errors = append(errors, "spec.highAvailability.automaticFailover.requireRemoteApply must be true for no-loss automatic failover")
+		}
+		if ha.SyncPolicy == nil || ha.SyncPolicy.modeOrDefault() != HADurabilityModeRemoteApply {
+			errors = append(errors, "spec.highAvailability.automaticFailover requires syncPolicy.mode RemoteApply")
+		} else if ha.SyncPolicy.FailurePolicy == HAFailurePolicyDegradeToAsync {
+			errors = append(errors, "spec.highAvailability.automaticFailover requires syncPolicy.failurePolicy Block or FailClosed")
 		}
 	}
 
