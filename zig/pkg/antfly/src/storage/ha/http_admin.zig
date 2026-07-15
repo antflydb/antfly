@@ -132,6 +132,15 @@ pub const Server = struct {
     };
 
     pub const AuthOptions = struct {
+        pub const LeaseWatchdogProofSource = struct {
+            ptr: *const anyopaque,
+            snapshot_fn: *const fn (ptr: *const anyopaque) ?admin_api.HALeaseWatchdogProof,
+
+            pub fn snapshot(self: LeaseWatchdogProofSource) ?admin_api.HALeaseWatchdogProof {
+                return self.snapshot_fn(self.ptr);
+            }
+        };
+
         pub const LifecycleReceipts = struct {
             capture_root: ?[]const u8 = null,
             activation_root: ?[]const u8 = null,
@@ -146,6 +155,7 @@ pub const Server = struct {
         state_mutex: ?*std.atomic.Mutex = null,
         seed_capture: ?SeedCaptureHook = null,
         lifecycle_receipts: ?LifecycleReceipts = null,
+        lease_watchdog_proof: ?LeaseWatchdogProofSource = null,
         primary_fence_started: ?StateChangedHook = null,
         state_changed: ?StateChangedHook = null,
     };
@@ -349,7 +359,11 @@ pub const Server = struct {
         const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
         const response = admin_api.HAPrimaryStatusResponse{
             .schema_version = 1,
-            .snapshot = try adminPrimarySnapshot(self.alloc, snapshot, node_id),
+            .snapshot = blk: {
+                var result = try adminPrimarySnapshot(self.alloc, snapshot, node_id);
+                result.lease_watchdog = if (self.auth.lease_watchdog_proof) |source| source.snapshot() else null;
+                break :blk result;
+            },
         };
         defer self.alloc.free(response.snapshot.slots);
         return try self.handleTypedJson(response);

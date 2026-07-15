@@ -23,6 +23,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -4918,7 +4919,7 @@ func TestObserveHAFencingStatusReportsMissingKubernetesLease(t *testing.T) {
 	}
 }
 
-func TestReconcileHAFencingLeaseSkipsWhilePrimaryAdminReachable(t *testing.T) {
+func TestReconcileHAFencingLeaseAuthorizesHealthyPrimaryBeforeFailover(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 	cluster.Spec.HighAvailability.SyncPolicy = &antflyv1.HASyncPolicy{
 		Mode:         antflyv1.HADurabilityModeRemoteApply,
@@ -4934,8 +4935,14 @@ func TestReconcileHAFencingLeaseSkipsWhilePrimaryAdminReachable(t *testing.T) {
 
 	lease := &coordinationv1.Lease{}
 	err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease)
-	if !apierrors.IsNotFound(err) {
-		t.Fatalf("expected no fencing lease while primary admin remains observable, got lease=%#v err=%v", lease, err)
+	if err != nil {
+		t.Fatalf("expected healthy-primary authority Lease, got lease=%#v err=%v", lease, err)
+	}
+	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != "primary-a" {
+		t.Fatalf("expected healthy primary holder, got %#v", lease.Spec.HolderIdentity)
+	}
+	if lease.Spec.LeaseTransitions == nil || *lease.Spec.LeaseTransitions != 1 {
+		t.Fatalf("expected initial authority generation 1, got %#v", lease.Spec.LeaseTransitions)
 	}
 }
 
@@ -5614,6 +5621,10 @@ func haClusterWithAutomaticKubernetesLeaseFailover() *antflyv1.AntflyCluster {
 		PrimaryURL:            "http://primary-ha.default.svc:8081",
 		ExecutePlannedActions: true,
 	}
+	cluster.Spec.HighAvailability.Runtime = &antflyv1.HARuntimeSpec{
+		Role:   antflyv1.HARuntimeRolePrimary,
+		NodeID: "primary-a",
+	}
 	cluster.Spec.HighAvailability.Standbys[0].AdminURL = "http://standby-a-ha.default.svc:8081"
 	cluster.Spec.HighAvailability.Standbys[0].RouteSelector = haTestRouteSelector("standby-a")
 	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{
@@ -5714,6 +5725,9 @@ func testHAReconciler(t *testing.T, objects ...client.Object) *AntflyClusterReco
 	}
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add core scheme: %v", err)
+	}
+	if err := rbacv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add rbac scheme: %v", err)
 	}
 	return &AntflyClusterReconciler{
 		Client: clientfake.NewClientBuilder().

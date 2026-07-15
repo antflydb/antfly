@@ -3019,6 +3019,10 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 	if standalone == nil {
 		return fmt.Errorf("spec.standalone is required when spec.mode=Standalone")
 	}
+	runtimeServiceAccountName, err := r.reconcileHARuntimeLeaseRBAC(ctx, cluster)
+	if err != nil {
+		return err
+	}
 	replicas := standalone.Replicas
 	if replicas == 0 {
 		replicas = 1
@@ -3107,7 +3111,7 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 		},
 	}
 
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, statefulSet, func() error {
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, statefulSet, func() error {
 		if err := validateAndSetStandaloneStorageIdentity(statefulSet, cluster); err != nil {
 			return err
 		}
@@ -3157,7 +3161,7 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 				Annotations: podAnnotations,
 			},
 			Spec: corev1.PodSpec{
-				ServiceAccountName: cluster.Spec.ServiceAccountName,
+				ServiceAccountName: runtimeServiceAccountName,
 				SecurityContext:    antflyPodSecurityContext(),
 				InitContainers: []corev1.Container{
 					r.buildStorageInitContainer("standalone-storage"),
@@ -3168,7 +3172,7 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 						Image:           cluster.Spec.Image,
 						ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
 						EnvFrom:         envFromSources,
-						Env:             append(append(secretStoreEnv(cluster.Spec.SecretStore), haRuntimeAdminTokenEnv(cluster.Spec.HighAvailability)...), haPodUIDEnv()...),
+						Env:             append(append(append(secretStoreEnv(cluster.Spec.SecretStore), haRuntimeAdminTokenEnv(cluster.Spec.HighAvailability)...), haPodUIDEnv()...), haRuntimeLeaseEnv(cluster)...),
 						Ports: []corev1.ContainerPort{
 							{
 								Name:          "metadata-api",

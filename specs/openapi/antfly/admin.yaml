@@ -2233,6 +2233,50 @@ components:
         durability:
           nullable: true
           $ref: "#/components/schemas/HADurabilityDecision"
+        lease_watchdog:
+          nullable: true
+          $ref: "#/components/schemas/HALeaseWatchdogProof"
+    HALeaseWatchdogProof:
+      type: object
+      additionalProperties: false
+      required:
+        - capability_version
+        - active
+        - lease_name
+        - lease_namespace
+        - stable_topology_id
+        - holder_node_id
+        - pod_uid
+        - process_boot_id
+        - observed_lease_transitions
+      properties:
+        capability_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        active:
+          type: boolean
+        lease_name:
+          type: string
+          minLength: 1
+        lease_namespace:
+          type: string
+          minLength: 1
+        stable_topology_id:
+          type: string
+          minLength: 1
+        holder_node_id:
+          $ref: "#/components/schemas/HANodeID"
+        pod_uid:
+          type: string
+          minLength: 1
+        process_boot_id:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        observed_lease_transitions:
+          type: integer
+          format: uint64
+          minimum: 1
     HAStandbySnapshot:
       type: object
       required:

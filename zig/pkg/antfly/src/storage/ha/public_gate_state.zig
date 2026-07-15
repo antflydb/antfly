@@ -39,6 +39,8 @@ pub const State = struct {
     received_lsn: std.atomic.Value(u64) = .init(0),
     applied_lsn: std.atomic.Value(u64) = .init(0),
     safe_read_lsn: std.atomic.Value(u64) = .init(0),
+    external_authority_required: std.atomic.Value(bool) = .init(false),
+    external_authority_granted: std.atomic.Value(bool) = .init(false),
     primary: ?*const primary_mod.Primary = null,
 
     pub fn configureStandby(self: *State, progress: standby_mod.Progress) void {
@@ -84,13 +86,41 @@ pub const State = struct {
 
         var current = self.role.load(.acquire);
         while (current != @intFromEnum(Role.fenced_primary)) {
+            const desired = if (self.external_authority_required.load(.acquire) and
+                !self.external_authority_granted.load(.acquire))
+                @intFromEnum(Role.transitioning)
+            else
+                @intFromEnum(Role.primary);
             current = self.role.cmpxchgWeak(
                 current,
-                @intFromEnum(Role.primary),
+                desired,
                 .release,
                 .acquire,
             ) orelse return;
         }
+    }
+
+    /// Require a separately observed write-authority proof. Primary public
+    /// traffic closes immediately and remains closed until the first proof;
+    /// standby read-only behavior is unchanged while it waits for ownership.
+    pub fn requireExternalAuthority(self: *State) void {
+        self.external_authority_granted.store(false, .release);
+        self.external_authority_required.store(true, .release);
+        if (self.currentRole() == .primary) self.role.store(@intFromEnum(Role.transitioning), .release);
+    }
+
+    pub fn publishExternalAuthority(self: *State, granted: bool) void {
+        if (!self.external_authority_required.load(.acquire)) return;
+        self.external_authority_granted.store(granted, .release);
+        if (!granted) return;
+        if (self.primary != null and self.currentRole() == .transitioning) {
+            self.role.store(@intFromEnum(Role.primary), .release);
+        }
+    }
+
+    pub fn externalAuthorityGranted(self: *const State) bool {
+        return !self.external_authority_required.load(.acquire) or
+            self.external_authority_granted.load(.acquire);
     }
 
     pub fn currentGeneration(self: *const State) u64 {
@@ -112,6 +142,10 @@ pub const State = struct {
     }
 
     pub fn checkRead(self: *const State, request: read_gate.Request) !void {
+        // Losing an external fencing authority closes the entire public data
+        // plane, including stale reads.  Administrative repair/status routes
+        // are separate from this gate and remain available for recovery.
+        if (!self.externalAuthorityGranted()) return error.HAReadRequiresPrimary;
         switch (self.currentRole()) {
             .disabled, .primary => return,
             // A fence removes authority; it does not make the retained local
@@ -174,7 +208,7 @@ pub const State = struct {
         }
     }
 
-    fn currentRole(self: *const State) Role {
+    pub fn currentRole(self: *const State) Role {
         return @enumFromInt(self.role.load(.acquire));
     }
 
@@ -287,4 +321,37 @@ test "storage.ha public gate state never clears an observed primary fence" {
 
     try std.testing.expectError(error.HAFencedPrimary, state.checkWrite(null));
     try std.testing.expect(!state.ownerJobsCanRun());
+}
+
+test "storage.ha public gate requires external authority before primary opens" {
+    var state = State{};
+    var primary: primary_mod.Primary = undefined;
+    state.configurePrimary(&primary, false);
+    state.requireExternalAuthority();
+
+    try std.testing.expectEqual(Role.transitioning, state.currentRole());
+    try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, state.checkWrite(null));
+    try std.testing.expectError(error.HAReadRequiresPrimary, state.checkRead(.{ .consistency = .stale_ok }));
+
+    state.publishExternalAuthority(true);
+    try std.testing.expectEqual(Role.primary, state.currentRole());
+    try std.testing.expect(state.externalAuthorityGranted());
+    try state.checkRead(.{ .consistency = .primary });
+
+    state.publishPrimaryFence(true);
+    state.publishExternalAuthority(true);
+    try std.testing.expectEqual(Role.fenced_primary, state.currentRole());
+    try std.testing.expectError(error.HAFencedPrimary, state.checkWrite(null));
+}
+
+test "storage.ha standby can preauthorize before in-place promotion" {
+    var state = State{};
+    state.configureStandby(.{});
+    state.requireExternalAuthority();
+    state.publishExternalAuthority(true);
+    try std.testing.expectEqual(Role.standby, state.currentRole());
+
+    var primary: primary_mod.Primary = undefined;
+    state.publishPrimary(&primary, false);
+    try std.testing.expectEqual(Role.primary, state.currentRole());
 }

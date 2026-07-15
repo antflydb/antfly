@@ -1541,6 +1541,9 @@ pub const DataServerHAConfig = struct {
     seed_activation_root: ?[]const u8 = null,
     /// Kubernetes pod identity attached to durable lifecycle evidence.
     pod_uid: ?[]const u8 = null,
+    /// Runtime-originated evidence that this exact process is actively
+    /// enforcing the shared Kubernetes Lease authority.
+    lease_watchdog_proof: ?antfly.ha.http_admin.Server.AuthOptions.LeaseWatchdogProofSource = null,
     /// Optional storage-specific producer for an immutable logical snapshot.
     /// DataServer still validates and packages the result; providers cannot
     /// select the published generation root or bypass the mutation barrier.
@@ -3735,6 +3738,7 @@ pub const DataServer = struct {
                         .role = if (ctx.primary != null) .primary else if (ctx.standby != null) .standby else .unknown,
                         .pod_uid = self.ha_cfg.pod_uid,
                     } else null,
+                    .lease_watchdog_proof = self.ha_cfg.lease_watchdog_proof,
                     .primary_fence_started = .{
                         .ptr = self,
                         .run_fn = DataServer.haPrimaryFenceStartedCallback,

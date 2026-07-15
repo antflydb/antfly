@@ -22,6 +22,7 @@ pub const HAFenceReceipt = types.HAFenceReceipt;
 pub const HAFenceResponse = types.HAFenceResponse;
 pub const HAIdentifier = types.HAIdentifier;
 pub const HAIdentity = types.HAIdentity;
+pub const HALeaseWatchdogProof = types.HALeaseWatchdogProof;
 pub const HANodeID = types.HANodeID;
 pub const HAOwnerJobCheckResponse = types.HAOwnerJobCheckResponse;
 pub const HAOwnerJobDecision = types.HAOwnerJobDecision;

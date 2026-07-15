@@ -32,6 +32,7 @@ pub const ReadCheckRequest = openapi.ReadCheckRequest;
 pub const WriteCheckRequest = openapi.WriteCheckRequest;
 pub const OwnerJobCheckRequest = openapi.OwnerJobCheckRequest;
 pub const HAIdentity = openapi.HAIdentity;
+pub const HALeaseWatchdogProof = openapi.HALeaseWatchdogProof;
 pub const FenceAcquireRequest = openapi.FenceAcquireRequest;
 pub const HAFenceReceipt = openapi.HAFenceReceipt;
 pub const PromotionAssessRequest = openapi.PromotionAssessRequest;

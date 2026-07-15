@@ -43,6 +43,8 @@ const antfarm_asset_roots = [_][]const u8{
     "/usr/share/antfly/antfarm",
     "antfarm",
 };
+const ha_lease_poll_interval_ns: u64 = 2 * std.time.ns_per_s;
+const ha_lease_request_timeout_ms: u32 = 1_000;
 
 var termination_requested: std.atomic.Value(bool) = .init(false);
 
@@ -162,6 +164,165 @@ const CliConfig = struct {
     }
 };
 
+const RuntimeLeaseWatchdog = struct {
+    watchdog: antfly.ha.kubernetes_lease_watchdog.Watchdog,
+    executor: antfly.common.http.StdHttpExecutor,
+    uri: []u8,
+    token_path: []const u8,
+    lease_name: []const u8,
+    lease_namespace: []const u8,
+    stable_topology_id: []const u8,
+    node_id: []const u8,
+    pod_uid: []const u8,
+    process_boot_id: [64]u8,
+    proof_active: std.atomic.Value(bool) = .init(false),
+    proof_transitions: std.atomic.Value(u64) = .init(0),
+    sentinel_persisted: bool = false,
+    next_poll_ns: u64 = 0,
+
+    fn initFromEnv(
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        env: *const std.process.Environ.Map,
+        cli: CliConfig,
+        pod_uid: ?[]const u8,
+        validated_new_generation: bool,
+    ) !?RuntimeLeaseWatchdog {
+        const lease_name = env.get("ANTFLY_HA_LEASE_NAME") orelse return null;
+        const namespace = env.get("ANTFLY_HA_LEASE_NAMESPACE") orelse return error.HALeaseNamespaceMissing;
+        const host = env.get("KUBERNETES_SERVICE_HOST") orelse return error.HALeaseAPIHostMissing;
+        const port = env.get("KUBERNETES_SERVICE_PORT_HTTPS") orelse env.get("KUBERNETES_SERVICE_PORT") orelse return error.HALeaseAPIPortMissing;
+        const grace_raw = env.get("ANTFLY_HA_LEASE_GRACE_MS") orelse return error.HALeaseGraceMissing;
+        const sentinel_path = env.get("ANTFLY_HA_LEASE_SENTINEL_PATH") orelse return error.HALeaseSentinelMissing;
+        const topology_id = env.get("ANTFLY_HA_LEASE_TOPOLOGY_ID") orelse return error.HALeaseTopologyIDMissing;
+        const resolved_pod_uid = pod_uid orelse return error.HALeasePodUIDMissing;
+        const node_id = cli.ha_primary_node_id orelse cli.ha_standby_node_id orelse return error.HALeaseNodeIDMissing;
+        const grace_ms = std.fmt.parseInt(u64, grace_raw, 10) catch return error.HALeaseGraceInvalid;
+        if (grace_ms == 0 or grace_ms > 30_000) return error.HALeaseGraceInvalid;
+        const data_generation = cli.ha_startup_generation orelse "initial";
+        const scope = antfly.ha.kubernetes_lease_watchdog.Scope{
+            .topology_id = topology_id,
+            .node_id = node_id,
+            .data_generation = data_generation,
+        };
+        const sentinel_generation = try antfly.ha.kubernetes_lease_watchdog.loadSentinelGenerationAlloc(alloc, io, sentinel_path);
+        defer if (sentinel_generation) |generation| alloc.free(generation);
+        var entropy: [32]u8 = undefined;
+        std.crypto.random.bytes(&entropy);
+        const process_boot_id = std.fmt.bytesToHex(entropy, .lower);
+        var executor = antfly.common.http.StdHttpExecutor.init(alloc, .{
+            .max_response_bytes = 256 * 1024,
+            .keep_alive = false,
+        });
+        errdefer executor.deinit();
+        try antfly.ha.kubernetes_lease_watchdog.configureKubernetesCA(
+            &executor,
+            env.get("ANTFLY_HA_LEASE_CA_PATH") orelse antfly.ha.kubernetes_lease_watchdog.service_account_ca_path,
+        );
+        return .{
+            .watchdog = try .init(.{
+                .scope = scope,
+                .grace_ns = grace_ms * std.time.ns_per_ms,
+                .sentinel_path = sentinel_path,
+            }, sentinel_generation, validated_new_generation),
+            .executor = executor,
+            .uri = try antfly.ha.kubernetes_lease_watchdog.leaseURLAlloc(alloc, host, port, namespace, lease_name),
+            .token_path = env.get("ANTFLY_HA_LEASE_TOKEN_PATH") orelse antfly.ha.kubernetes_lease_watchdog.service_account_token_path,
+            .lease_name = lease_name,
+            .lease_namespace = namespace,
+            .stable_topology_id = topology_id,
+            .node_id = node_id,
+            .pod_uid = resolved_pod_uid,
+            .process_boot_id = process_boot_id,
+            .sentinel_persisted = sentinel_generation != null and std.mem.eql(u8, sentinel_generation.?, data_generation),
+        };
+    }
+
+    fn proofSource(self: *const RuntimeLeaseWatchdog) antfly.ha.http_admin.Server.AuthOptions.LeaseWatchdogProofSource {
+        return .{ .ptr = self, .snapshot_fn = proofSnapshot };
+    }
+
+    fn proofSnapshot(ptr: *const anyopaque) ?antfly.admin.HALeaseWatchdogProof {
+        const self: *const RuntimeLeaseWatchdog = @ptrCast(@alignCast(ptr));
+        return .{
+            .capability_version = 1,
+            .active = self.proof_active.load(.acquire),
+            .lease_name = self.lease_name,
+            .lease_namespace = self.lease_namespace,
+            .stable_topology_id = self.stable_topology_id,
+            .holder_node_id = self.node_id,
+            .pod_uid = self.pod_uid,
+            .process_boot_id = &self.process_boot_id,
+            .observed_lease_transitions = @intCast(self.proof_transitions.load(.acquire)),
+        };
+    }
+
+    fn deinit(self: *RuntimeLeaseWatchdog, alloc: std.mem.Allocator) void {
+        self.executor.deinit();
+        alloc.free(self.uri);
+        self.* = undefined;
+    }
+
+    fn poll(
+        self: *RuntimeLeaseWatchdog,
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        data_server: *antfly.data.runtime.DataServer,
+    ) !void {
+        const monotonic_ns = platform_time.monotonicNs();
+        if (monotonic_ns < self.next_poll_ns) return;
+        self.next_poll_ns = monotonic_ns +| ha_lease_poll_interval_ns;
+        const body = antfly.ha.kubernetes_lease_watchdog.fetchLeaseAlloc(
+            alloc,
+            io,
+            self.executor.executor(),
+            self.uri,
+            self.token_path,
+            ha_lease_request_timeout_ms,
+        ) catch {
+            return try self.applyDecision(alloc, io, data_server, self.watchdog.noteAPIFailure(monotonic_ns));
+        };
+        defer alloc.free(body);
+        const decision = self.watchdog.observe(
+            alloc,
+            body,
+            platform_time.realtimeNs(),
+            monotonic_ns,
+        ) catch {
+            return try self.applyDecision(alloc, io, data_server, self.watchdog.noteAPIFailure(monotonic_ns));
+        };
+        try self.applyDecision(alloc, io, data_server, decision);
+    }
+
+    fn applyDecision(
+        self: *RuntimeLeaseWatchdog,
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        data_server: *antfly.data.runtime.DataServer,
+        decision: antfly.ha.kubernetes_lease_watchdog.Decision,
+    ) !void {
+        switch (decision) {
+            .waiting, .grace => {},
+            .authorized => {
+                self.proof_transitions.store(self.watchdog.last_generation, .release);
+                self.proof_active.store(true, .release);
+                data_server.ha_public_gate_state.publishExternalAuthority(true);
+            },
+            .fence => {
+                platform_sync.lockYielding(&data_server.ha_state_mutex);
+                defer data_server.ha_state_mutex.unlock();
+                self.proof_active.store(false, .release);
+                data_server.ha_public_gate_state.publishExternalAuthority(false);
+                data_server.ha_public_gate_state.publishPrimaryFence(true);
+                if (!self.sentinel_persisted) {
+                    try self.watchdog.persistFence(alloc, io);
+                    self.sentinel_persisted = true;
+                }
+            },
+        }
+    }
+};
+
 const ResolvedPaths = struct {
     replica_root_dir: []u8,
     replica_catalog_path: []u8,
@@ -203,6 +364,10 @@ const StandaloneHealthSource = struct {
 
     fn checkReady(ptr: *anyopaque) bool {
         const self: *StandaloneHealthSource = @ptrCast(@alignCast(ptr));
+        switch (self.data_server.ha_public_gate_state.currentRole()) {
+            .transitioning, .fenced_primary => return false,
+            .disabled, .standby, .primary => {},
+        }
         if (self.data_server.http_server) |*api_server| {
             if (api_server.storageMaintenanceExclusiveActive()) return false;
         }
@@ -1451,6 +1616,15 @@ pub fn runFromIterator(
     defer if (admin_bearer_token) |token| alloc.free(token);
     const ha_pod_uid = try resolveHAPodUID(alloc);
     defer if (ha_pod_uid) |pod_uid| alloc.free(pod_uid);
+    var ha_lease_watchdog = try RuntimeLeaseWatchdog.initFromEnv(
+        alloc,
+        setup_io.io(),
+        &init.environ_map,
+        cli,
+        ha_pod_uid,
+        ha_startup_checkpoint_lsn != null,
+    );
+    defer if (ha_lease_watchdog) |*watchdog| watchdog.deinit(alloc);
 
     // Initialize DataServer without starting its listener — the unified
     // httpx.Server will serve the public API instead.
@@ -1503,6 +1677,7 @@ pub fn runFromIterator(
             .seed_capture_root = cli.ha_seed_capture_root,
             .seed_activation_root = cli.ha_startup_target_root,
             .pod_uid = ha_pod_uid,
+            .lease_watchdog_proof = if (ha_lease_watchdog) |*watchdog| watchdog.proofSource() else null,
             .internal_primary = if (ha_primary) |*primary| primary else null,
             .primary_retention_policy = ha_retention_policy,
             .primary_sync_policy = ha_sync_policy.policy,
@@ -1511,6 +1686,18 @@ pub fn runFromIterator(
         .backend_runtime = node_backend_runtime.ptr(),
     }, local_metadata.catalogSource(), local_metadata.statusSource());
     defer data_server.deinit();
+
+    if (ha_lease_watchdog) |*watchdog| {
+        data_server.ha_public_gate_state.requireExternalAuthority();
+        if (watchdog.watchdog.latched) {
+            data_server.ha_public_gate_state.publishPrimaryFence(true);
+        } else {
+            // The public listener is not created until this bounded first
+            // authority attempt has completed. Failure leaves the primary
+            // gate closed and is retried from the main runtime loop.
+            try watchdog.poll(alloc, setup_io.io(), &data_server);
+        }
+    }
 
     antfly_node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(&data_server.provisioned_storage.resource_manager);
     data_server.setAntflyProvider(localAntflyProvider(&antfly_node));
@@ -1605,6 +1792,7 @@ pub fn runFromIterator(
     };
     while (!termination_requested.load(.acquire)) {
         if (unified_lifecycle.runtimeFailure()) |err| return err;
+        if (ha_lease_watchdog) |*watchdog| try watchdog.poll(alloc, setup_io.io(), &data_server);
         data_server.runRound() catch |err| switch (err) {
             error.LsmRootWriterAlreadyOpen, error.WriterLocked => std.log.warn("standalone data round skipped err={}", .{err}),
             else => return err,

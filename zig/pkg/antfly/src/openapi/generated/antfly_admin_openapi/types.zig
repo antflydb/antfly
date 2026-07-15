@@ -147,6 +147,18 @@ pub const HAIdentity = struct {
     epoch: i64,
 };
 
+pub const HALeaseWatchdogProof = struct {
+    capability_version: i64,
+    active: bool,
+    lease_name: []const u8,
+    lease_namespace: []const u8,
+    stable_topology_id: []const u8,
+    holder_node_id: HANodeID,
+    pod_uid: []const u8,
+    process_boot_id: []const u8,
+    observed_lease_transitions: i64,
+};
+
 /// Stable HA node id.
 pub const HANodeID = []const u8;
 
@@ -174,6 +186,7 @@ pub const HAPrimarySnapshot = struct {
     slots: []const HASlotSnapshot,
     retention: HARetentionSnapshot,
     durability: ?HADurabilityDecision = null,
+    lease_watchdog: ?HALeaseWatchdogProof = null,
 };
 
 pub const HAPrimaryStatusResponse = struct {

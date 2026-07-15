@@ -262,7 +262,14 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	}
 	holder := haKubernetesLeaseFenceCandidate(ha, cluster.Status.HAStatus)
 	if holder == "" {
-		return nil
+		identity := haReplicationIdentity(ha)
+		if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) == "" {
+			return nil
+		}
+		// A fail-closed runtime must prove its normal write authority before
+		// serving. Keep the healthy primary as holder until the atomic transfer
+		// to a promotion candidate increments LeaseTransitions.
+		holder = strings.TrimSpace(identity.CurrentPrimaryID)
 	}
 	scope, ok := haFencingLeaseReconcileScope(cluster, holder)
 	if !ok {

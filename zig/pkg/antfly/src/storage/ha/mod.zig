@@ -36,6 +36,7 @@ pub const commit_gate = @import("commit_gate.zig");
 pub const read_gate = @import("read_gate.zig");
 pub const write_gate = @import("write_gate.zig");
 pub const public_gate_state = @import("public_gate_state.zig");
+pub const kubernetes_lease_watchdog = @import("kubernetes_lease_watchdog.zig");
 pub const owner_job_gate = @import("owner_job_gate.zig");
 pub const admin = @import("admin.zig");
 pub const admin_exec = @import("admin_exec.zig");
@@ -78,6 +79,7 @@ test {
     _ = read_gate;
     _ = write_gate;
     _ = public_gate_state;
+    _ = kubernetes_lease_watchdog;
     _ = owner_job_gate;
     _ = admin;
     _ = admin_exec;
