@@ -1248,6 +1248,22 @@ fn testFenceReceipt() admin_api.HAFenceReceipt {
     };
 }
 
+fn testFenceResponse() admin_api.HAFenceResponse {
+    return .{
+        .schema_version = 1,
+        .action = .{
+            .action_id = "fence_acquire:standby-a",
+            .action_kind = "fence_acquire",
+            .target = "standby-a",
+            .state = "applied",
+            // The endpoint actor is the former primary; the promoted standby
+            // remains the action target.
+            .node_id = "primary-a",
+        },
+        .receipt = testFenceReceipt(),
+    };
+}
+
 fn seedFiles() [2]backup_manifest.FileEntry {
     return .{
         .{ .path = "manifest", .kind = .manifest, .size_bytes = 8, .crc32 = backup_manifest.crc32("manifest") },
@@ -1991,6 +2007,51 @@ test "storage.ha http client accepts empty fence receipt reason" {
     defer response.deinit(alloc);
 
     try std.testing.expectEqualStrings("", response.parsed.value.receipt.reason);
+}
+
+test "storage.ha http client validates live upgraded fence boundary and topology binding" {
+    const request = admin_api.FenceAcquireRequest{
+        .identity = testAdminIdentity(),
+        .old_primary_id = "primary-a",
+        .promoted_node_id = "standby-a",
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 1,
+        .observed_lsn = 1,
+        .force = false,
+        .reason = "operator-observation",
+    };
+
+    // A former primary freezes its live durable tail under the append mutex.
+    // The returned boundary can therefore be stronger than the stale
+    // control-plane observation carried by the request.
+    var upgraded = testFenceResponse();
+    upgraded.receipt.required_lsn = 4;
+    upgraded.receipt.observed_lsn = 4;
+    try validateFenceResponse(upgraded, request);
+
+    var downgraded = testFenceResponse();
+    downgraded.receipt.required_lsn = 1;
+    downgraded.receipt.observed_lsn = 0;
+    downgraded.receipt.forced = true;
+    try std.testing.expectError(error.AdminFenceResponseMismatch, validateFenceResponse(downgraded, request));
+
+    var cross_cluster = upgraded;
+    cross_cluster.receipt.identity.cluster_id += 1;
+    try std.testing.expectError(error.AdminFenceResponseMismatch, validateFenceResponse(cross_cluster, request));
+
+    var wrong_parent = upgraded;
+    wrong_parent.receipt.parent_epoch += 1;
+    try std.testing.expectError(error.AdminFenceResponseMismatch, validateFenceResponse(wrong_parent, request));
+
+    var unrequested_force = upgraded;
+    unrequested_force.receipt.forced = true;
+    try std.testing.expectError(error.AdminFenceResponseMismatch, validateFenceResponse(unrequested_force, request));
+
+    var unsafe_unforced = upgraded;
+    unsafe_unforced.receipt.required_lsn = 4;
+    unsafe_unforced.receipt.observed_lsn = 3;
+    try std.testing.expectError(error.AdminFenceResponseMismatch, validateFenceResponse(unsafe_unforced, request));
 }
 
 test "storage.ha http client accepts already applied idempotent admin receipts" {
