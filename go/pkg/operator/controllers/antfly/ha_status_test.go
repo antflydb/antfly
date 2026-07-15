@@ -57,6 +57,45 @@ func TestUpdateHAStatusDisabledClearsStatusAndPublishesConditions(t *testing.T) 
 	}
 }
 
+func TestHASeedPlanPublishesSourcePVCNameOnEveryTopologyBoundAction(t *testing.T) {
+	standby := antflyv1.HAStandbySpec{
+		Name:     "standby-a",
+		SlotName: "standby-a",
+		SeedArtifact: &antflyv1.HASeedArtifactSpec{
+			Location: "s3://ha-seeds/cluster-a", Generation: "seed-standby-a-10", StagingRoot: "/target/staging",
+			TopologyID: "topology-a", TopologyGeneration: 7, NodeID: "standby-a", TargetPVCUID: "target-pvc-uid",
+			SourcePVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+			TargetPVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+		},
+	}
+	ha := &antflyv1.HighAvailabilitySpec{
+		Standbys: []antflyv1.HAStandbySpec{standby},
+		Runtime: &antflyv1.HARuntimeSpec{StartupGate: &antflyv1.HAStartupGateSpec{
+			RequiredReceipt: &antflyv1.HARequiredSeedActivationReceipt{
+				TopologyID: "topology-a", TopologyGeneration: 7, NodeID: "standby-a", SlotName: "standby-a",
+				Generation: "seed-standby-a-10", TargetPVCName: "standby-data", TargetPVCUID: "target-pvc-uid",
+			},
+		}},
+	}
+
+	planned := haPlannedActionStatuses(
+		haSeedCompletionActions(standby, "standby-a", 10, "test", haActionReseedFormerPrimary),
+		ha,
+		&antflyv1.HAStatus{},
+	)
+	if len(planned) != 8 {
+		t.Fatalf("expected complete eight-action portable seed chain, got %d", len(planned))
+	}
+	for _, action := range planned {
+		if action.SourcePVCName != "primary-data" {
+			t.Errorf("%s omitted planned source PVC name: %#v", action.Kind, action)
+		}
+		if action.SourcePVCUID != "" {
+			t.Errorf("%s fabricated source PVC UID before live observation: %q", action.Kind, action.SourcePVCUID)
+		}
+	}
+}
+
 func TestHAReplicationIdentityAllowsWholeInstanceScope(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
 		Identity: &antflyv1.HAReplicationIdentitySpec{

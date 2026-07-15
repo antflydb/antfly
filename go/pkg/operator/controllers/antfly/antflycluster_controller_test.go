@@ -4689,6 +4689,108 @@ func TestHAPortableArtifactJobActionFreezesBothPVCsAndRejectsStaleTopology(t *te
 	g.Expect(err).To(MatchError(ContainSubstring("target PVC UID is stale")))
 }
 
+func TestReconcileHAAdminJobsFreezesLiveSourcePVCAuthorityAcrossSeedChain(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := testHASourcePVCAuthorityCluster()
+	source := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "primary-data", Namespace: cluster.Namespace, UID: types.UID("source-pvc-uid"),
+	}}
+	target := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "standby-data", Namespace: cluster.Namespace, UID: types.UID("target-pvc-uid"),
+	}}
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster.DeepCopy(), source, target).Build(),
+		Scheme: s,
+	}
+
+	err := reconciler.reconcileHAAdminJobs(context.Background(), cluster)
+	g.Expect(stderrors.Is(err, errHAPlanNeedsPersistence)).To(BeTrue(),
+		"live source identity must cross a status persistence barrier before any direct request or Job can start")
+	for _, action := range cluster.Status.HAStatus.PlannedActions {
+		g.Expect(action.SourcePVCName).To(Equal("primary-data"), action.Kind)
+		g.Expect(action.SourcePVCUID).To(Equal("source-pvc-uid"), action.Kind)
+	}
+}
+
+func TestReconcileHAAdminJobsRejectsReplacedSourcePVCAcrossSeedChain(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := testHASourcePVCAuthorityCluster()
+	for i := range cluster.Status.HAStatus.PlannedActions {
+		cluster.Status.HAStatus.PlannedActions[i].SourcePVCName = "primary-data"
+		cluster.Status.HAStatus.PlannedActions[i].SourcePVCUID = "source-pvc-uid-before-replacement"
+	}
+	source := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "primary-data", Namespace: cluster.Namespace, UID: types.UID("source-pvc-uid-after-replacement"),
+	}}
+	target := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "standby-data", Namespace: cluster.Namespace, UID: types.UID("target-pvc-uid"),
+	}}
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster.DeepCopy(), source, target).Build(),
+		Scheme: s,
+	}
+
+	err := reconciler.reconcileHAAdminJobs(context.Background(), cluster)
+	g.Expect(err).To(MatchError(ContainSubstring("source PVC identity is stale")))
+	for _, action := range cluster.Status.HAStatus.PlannedActions {
+		g.Expect(action.SourcePVCUID).To(Equal("source-pvc-uid-before-replacement"),
+			"a replacement PVC must never be silently rebound into %s", action.Kind)
+	}
+}
+
+func testHASourcePVCAuthorityCluster() *antflyv1.AntflyCluster {
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: "default", UID: types.UID("cluster-uid")},
+		Spec: antflyv1.AntflyClusterSpec{HighAvailability: &antflyv1.HighAvailabilitySpec{
+			Mode:  antflyv1.HAModeHotStandby,
+			Admin: &antflyv1.HAAdminSpec{ExecutePlannedActions: true},
+			Standbys: []antflyv1.HAStandbySpec{{Name: "standby-a", SlotName: "standby-a", SeedArtifact: &antflyv1.HASeedArtifactSpec{
+				Location: "s3://ha-seeds/cluster-a", Generation: "seed-standby-a-10", StagingRoot: "/target/staging",
+				TopologyID: "topology-a", TopologyGeneration: 7, NodeID: "standby-a", TargetPVCUID: "target-pvc-uid",
+				SourcePVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+				TargetPVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+			}}},
+		}},
+	}
+	chain := []struct {
+		kind      haActionKind
+		dependsOn haActionKind
+	}{
+		{haActionCaptureSeedArtifact, haActionReseedFormerPrimary},
+		{haActionPublishSeedArtifact, haActionCaptureSeedArtifact},
+		{haActionGCSourceSeedGenerations, haActionPublishSeedArtifact},
+		{haActionRestoreSeedArtifact, haActionGCSourceSeedGenerations},
+		{haActionActivateSeedArtifact, haActionRestoreSeedArtifact},
+		{haActionActivateSeededSlot, haActionActivateSeedArtifact},
+		{haActionGCTargetSeedGenerations, haActionActivateSeededSlot},
+		{haActionPruneSeedArtifacts, haActionGCTargetSeedGenerations},
+	}
+	cluster.Status.HAStatus = &antflyv1.HAStatus{}
+	for _, item := range chain {
+		action := antflyv1.HAPlannedActionStatus{
+			Kind: string(item.kind), Phase: string(haActionPhaseSeed), Executor: string(haPlannedActionExecutor(item.kind)),
+			DependsOn: string(item.dependsOn), StandbyName: "standby-a", SlotName: "standby-a", TargetLSN: 10,
+			SeedArtifactLocation: "s3://ha-seeds/cluster-a", SeedArtifactGeneration: "seed-standby-a-10",
+			TopologyID: "topology-a", TopologyGeneration: 7, TopologyNodeID: "standby-a",
+			TargetPVCName: "standby-data", TargetPVCUID: "target-pvc-uid",
+			AdminURL: "http://primary-standalone.default.svc.cluster.local:8080",
+		}
+		action.OperationID = haPlannedActionOperationID(action)
+		cluster.Status.HAStatus.PlannedActions = append(cluster.Status.HAStatus.PlannedActions, action)
+	}
+	return cluster
+}
+
 func TestReconcileHAAdminJobPersistsExactSourcePVCIdentityAndRejectsReplacement(t *testing.T) {
 	g := NewWithT(t)
 	s := runtime.NewScheme()
