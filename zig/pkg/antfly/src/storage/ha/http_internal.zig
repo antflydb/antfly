@@ -339,6 +339,7 @@ fn commandErrorStatus(err: anyerror) u16 {
     return switch (err) {
         error.PrimaryUnavailable,
         error.SlotAlreadyExists,
+        error.SlotSeeding,
         error.SlotInactive,
         error.SlotRequiresReseed,
         error.WalNoLongerRetained,
