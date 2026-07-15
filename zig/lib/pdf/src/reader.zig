@@ -4088,6 +4088,10 @@ pub const Reader = struct {
 
                     const lo = try parseCodeBytesToU32(src_lo.string);
                     const hi = try parseCodeBytesToU32(src_hi.string);
+                    if (hi < lo) return error.InvalidToUnicodeMap;
+                    const range_len = @as(u64, hi) - @as(u64, lo) + 1;
+                    const max_to_unicode_entries: usize = 1_000_000;
+                    if (range_len > max_to_unicode_entries or entries.items.len > max_to_unicode_entries - @as(usize, @intCast(range_len))) return error.ToUnicodeMapTooLarge;
                     const code_len: u8 = @intCast(src_lo.string.len);
                     if (code_len > code_bytes_out.*) code_bytes_out.* = code_len;
 
