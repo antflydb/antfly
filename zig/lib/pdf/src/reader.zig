@@ -5516,7 +5516,7 @@ fn extractTextFromContentAlloc(
         defer syntax.Scanner.freeLexeme(alloc, &lex);
 
         if (lex == .eof) break;
-        if (lex == .keyword) {
+        if (lex == .keyword and !isContentObjectStartKeyword(lex.keyword)) {
             try applyTextOperator(alloc, &out, &state, fonts, forms, form_depth, lex.keyword, operands.items);
             for (operands.items) |*obj| obj.deinit(alloc);
             operands.clearRetainingCapacity();
@@ -9055,7 +9055,7 @@ test "reader uses WinAnsi font encoding for text extraction" {
 
 test "reader uses ToUnicode cmap for text extraction" {
     const alloc = std.testing.allocator;
-    const content = "BT\n/F1 12 Tf\n<0001> Tj\nET\n";
+    const content = "BT\n/F1 12 Tf\n[<0001>] TJ\nET\n";
     const cmap =
         "/CIDInit /ProcSet findresource begin\n" ++
         "12 dict begin\n" ++
