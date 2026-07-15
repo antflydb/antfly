@@ -160,6 +160,7 @@ func haMetricActionLabel(kind string) string {
 		string(haActionPromoteStandby),
 		string(haActionUpdatePrimaryRoute),
 		string(haActionFenceFormerPrimary),
+		string(haActionIsolateFormerPrimary),
 		string(haActionDemoteFormerPrimary),
 		string(haActionRewindFormerPrimary),
 		string(haActionReseedFormerPrimary):

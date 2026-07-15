@@ -3020,6 +3020,13 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 	if replicas == 0 {
 		replicas = 1
 	}
+	if haFormerPrimaryIsolationActive(cluster) {
+		// A completed Kubernetes physical fence remains an availability hold
+		// until Colony rewrites this runtime as a standby with an exact startup
+		// gate. Never let ordinary StatefulSet reconciliation resurrect the old
+		// writer after ownership has moved to another Lease holder.
+		replicas = 0
+	}
 	storageSize := chooseStandaloneStorageSize(cluster)
 	startupGate := haRuntimeStartupGate(cluster)
 	activatedSeedGate := startupGate != nil && startupGate.Policy == antflyv1.HAStartupGatePolicyRequireActivatedSeed && startupGate.RequiredReceipt != nil
@@ -4104,6 +4111,9 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 			}
 			return err
 		}
+		if err := r.reconcileHAFormerPrimaryIsolation(ctx, cluster); err != nil {
+			return err
+		}
 		r.updateHAStartupGateStatus(ctx, cluster)
 		r.updateHALastPromotionFromAdminJobs(ctx, cluster)
 		r.updateHAFormerPrimaryFromAdminJobs(ctx, cluster)
@@ -4205,6 +4215,9 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 			}
 			return errHAStatusCheckpointed
 		}
+		return err
+	}
+	if err := r.reconcileHAFormerPrimaryIsolation(ctx, cluster); err != nil {
 		return err
 	}
 	r.updateHAStartupGateStatus(ctx, cluster)
@@ -9408,6 +9421,9 @@ func haPlannedActionDependenciesSucceeded(actions []antflyv1.HAPlannedActionStat
 		dependency := actions[i]
 		if dependency.Kind != action.DependsOn {
 			continue
+		}
+		if dependency.Executor == string(haActionExecutorControllerAction) {
+			return dependency.AdminJobPhase == haAdminJobPhaseSucceeded
 		}
 		if dependency.AdminJobName != haAdminDirectAPIName && !haPlannedActionRequiresAdminTarget(dependency) {
 			return true

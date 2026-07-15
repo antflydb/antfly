@@ -46,6 +46,7 @@ const (
 	haActionAssessPromotion         haActionKind = "AssessPromotion"
 	haActionPromoteStandby          haActionKind = "PromoteStandby"
 	haActionUpdatePrimaryRoute      haActionKind = "UpdatePrimaryRoute"
+	haActionIsolateFormerPrimary    haActionKind = "IsolateFormerPrimary"
 	haActionFenceFormerPrimary      haActionKind = "FenceFormerPrimary"
 	haActionDemoteFormerPrimary     haActionKind = "DemoteFormerPrimary"
 	haActionRewindFormerPrimary     haActionKind = "RewindFormerPrimary"
@@ -449,6 +450,10 @@ func (r *AntflyClusterReconciler) observeHAFormerPrimaryFenceStatus(ctx context.
 	if ha == nil || promotion == nil || strings.TrimSpace(promotion.OldPrimaryID) == "" {
 		return
 	}
+	if haSucceededFormerPrimaryIsolation(cluster.Status.HAStatus, promotion) != nil {
+		haSetFormerPrimaryFenceObserved(cluster.Status.HAStatus, promotion, true)
+		return
+	}
 	adminURL := haFormerPrimaryAdminURL(ha, haPlannedAction{
 		StandbyName: promotion.OldPrimaryID,
 		RouteFrom:   promotion.OldPrimaryID,
@@ -817,9 +822,10 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		fence := status.Fencing
 		promotionBoundary := haAutomaticFailoverPromotionBoundary(status, fence.Holder, fence.Generation)
 		formerPrimaryID := haAutomaticFailoverFormerPrimaryID(ha)
+		formerPrimaryFenceAction := haActionIsolateFormerPrimary
 		plan.Actions = append(plan.Actions,
 			haPlannedAction{
-				Kind:            haActionFenceFormerPrimary,
+				Kind:            formerPrimaryFenceAction,
 				StandbyName:     formerPrimaryID,
 				TargetLSN:       promotionBoundary,
 				RouteFrom:       formerPrimaryID,
@@ -828,11 +834,11 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				FenceHolder:     fence.Holder,
 				FenceGeneration: fence.Generation,
 				FenceReason:     fence.Reason,
-				Reason:          "FenceFormerPrimaryForPromotion",
+				Reason:          "IsolateUnreachableFormerPrimaryForPromotion",
 			},
 			haPlannedAction{
 				Kind:            haActionAcquireFence,
-				DependsOn:       haActionFenceFormerPrimary,
+				DependsOn:       formerPrimaryFenceAction,
 				StandbyName:     plan.PromotionStandbyName,
 				TargetLSN:       promotionBoundary,
 				FenceAuthority:  fence.Authority,
@@ -897,11 +903,13 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		plan.Actions = append(plan.Actions, action)
 	}
 	plan.FormerPrimary = haEvaluateFormerPrimary(status)
+	formerPrimaryFenceDependency := haActionFenceFormerPrimary
 	if action := haFormerPrimaryFencePlannedAction(status); action.Kind != "" {
+		formerPrimaryFenceDependency = action.Kind
 		plan.Actions = append(plan.Actions, action)
 	}
 	if action := haFormerPrimaryPlannedAction(plan.FormerPrimary, status); action.Kind != "" {
-		action.DependsOn = haActionFenceFormerPrimary
+		action.DependsOn = formerPrimaryFenceDependency
 		plan.Actions = append(plan.Actions, action)
 		if action.Kind == haActionReseedFormerPrimary {
 			if standby, ok := haStandbySpecByName(ha, action.StandbyName); ok {
@@ -942,6 +950,21 @@ func haFormerPrimaryFencePlannedAction(status *antflyv1.HAStatus) haPlannedActio
 	if promotion == nil {
 		return haPlannedAction{}
 	}
+	if isolated := haSucceededFormerPrimaryIsolation(status, promotion); isolated != nil {
+		return haPlannedAction{
+			Kind:            haActionIsolateFormerPrimary,
+			StandbyName:     promotion.OldPrimaryID,
+			TargetLSN:       isolated.TargetLSN,
+			ObservedLSN:     isolated.ObservedLSN,
+			RouteFrom:       promotion.OldPrimaryID,
+			RouteTo:         promotion.PromotedStandbyID,
+			FenceAuthority:  promotion.FenceAuthority,
+			FenceHolder:     promotion.PromotedStandbyID,
+			FenceGeneration: promotion.FenceGeneration,
+			FenceReason:     promotion.FenceReason,
+			Reason:          "FormerPrimaryPhysicallyIsolated",
+		}
+	}
 	return haPlannedAction{
 		Kind:            haActionFenceFormerPrimary,
 		StandbyName:     promotion.OldPrimaryID,
@@ -954,6 +977,29 @@ func haFormerPrimaryFencePlannedAction(status *antflyv1.HAStatus) haPlannedActio
 		FenceReason:     promotion.FenceReason,
 		Reason:          "FenceFormerPrimaryForPromotion",
 	}
+}
+
+func haSucceededFormerPrimaryIsolation(status *antflyv1.HAStatus, promotion *antflyv1.HAPromotionStatus) *antflyv1.HAPlannedActionStatus {
+	if status == nil || promotion == nil || promotion.FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
+		promotion.FenceGeneration == 0 || strings.TrimSpace(promotion.OldPrimaryID) == "" ||
+		strings.TrimSpace(promotion.PromotedStandbyID) == "" || haPromotionRequiredLSN(promotion) == 0 {
+		return nil
+	}
+	for i := range status.PlannedActions {
+		action := &status.PlannedActions[i]
+		if haActionKind(action.Kind) != haActionIsolateFormerPrimary ||
+			action.AdminJobPhase != haAdminJobPhaseSucceeded ||
+			action.AdminJobName != haKubernetesPhysicalFenceName ||
+			strings.TrimSpace(action.StandbyName) != strings.TrimSpace(promotion.OldPrimaryID) ||
+			strings.TrimSpace(action.RouteTo) != strings.TrimSpace(promotion.PromotedStandbyID) ||
+			action.FenceAuthority != promotion.FenceAuthority ||
+			action.FenceGeneration != promotion.FenceGeneration ||
+			action.TargetLSN == 0 || action.TargetLSN != haPromotionRequiredLSN(promotion) {
+			continue
+		}
+		return action
+	}
+	return nil
 }
 
 func haSeedBeginTargetLSN(primaryLSN uint64) uint64 {
@@ -1744,6 +1790,8 @@ func haCLIActionKind(raw string) (haActionKind, bool) {
 		return haActionAcquireFence, true
 	case "fence_former_primary":
 		return haActionFenceFormerPrimary, true
+	case "isolate_former_primary":
+		return haActionIsolateFormerPrimary, true
 	case "assess_promotion", "promotion_assess":
 		return haActionAssessPromotion, true
 	case "promote_standby":
@@ -1812,7 +1860,7 @@ func haCLIFencingAuthority(raw string) antflyv1.HAFencingAuthority {
 
 func haPlannedActionPhase(kind haActionKind) haActionPhase {
 	switch kind {
-	case haActionAcquireFence, haActionFenceFormerPrimary:
+	case haActionAcquireFence, haActionFenceFormerPrimary, haActionIsolateFormerPrimary:
 		return haActionPhaseFence
 	case haActionAssessPromotion, haActionPromoteStandby:
 		return haActionPhasePromote
@@ -1828,7 +1876,7 @@ func haPlannedActionPhase(kind haActionKind) haActionPhase {
 }
 
 func haPlannedActionExecutor(kind haActionKind) haActionExecutor {
-	if kind == haActionUpdatePrimaryRoute {
+	if kind == haActionUpdatePrimaryRoute || kind == haActionIsolateFormerPrimary {
 		return haActionExecutorControllerAction
 	}
 	if haPlannedActionKindIsPortableArtifact(kind) {
@@ -2933,10 +2981,41 @@ func haCommittedAutomaticPromotionStandby(ha *antflyv1.HighAvailabilitySpec, sta
 	if !fencing.Ready && fencing.Reason != "LeaseExpired" {
 		return ""
 	}
-	if haCommittedFormerPrimaryFenceAction(ha, status, fencing.Holder, fencing.Generation) != nil {
+	if haCommittedFormerPrimaryFenceAction(ha, status, fencing.Holder, fencing.Generation) != nil ||
+		haCommittedFormerPrimaryIsolationAction(ha, status, fencing.Holder, fencing.Generation) != nil {
 		return fencing.Holder
 	}
 	return ""
+}
+
+func haCommittedFormerPrimaryIsolationAction(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus, holder string, generation uint64) *antflyv1.HAPlannedActionStatus {
+	if ha == nil || ha.AutomaticFailover == nil || status == nil || haPromotionReceipt(status) != nil ||
+		generation == 0 || !desiredStandbyNamed(ha, holder) {
+		return nil
+	}
+	identity := haReplicationIdentity(ha)
+	if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) == "" {
+		return nil
+	}
+	for i := range status.PlannedActions {
+		action := &status.PlannedActions[i]
+		if haActionKind(action.Kind) != haActionIsolateFormerPrimary ||
+			strings.TrimSpace(action.StandbyName) != strings.TrimSpace(identity.CurrentPrimaryID) ||
+			strings.TrimSpace(action.RouteTo) != strings.TrimSpace(holder) ||
+			strings.TrimSpace(action.FenceHolder) != strings.TrimSpace(holder) ||
+			action.FenceGeneration != generation ||
+			action.FenceAuthority != ha.AutomaticFailover.FencingAuthority ||
+			action.TargetLSN == 0 {
+			continue
+		}
+		switch action.AdminJobPhase {
+		case haAdminJobPhaseRunning, haAdminJobPhaseSucceeded:
+			return action
+		default:
+			continue
+		}
+	}
+	return nil
 }
 
 func haCommittedFormerPrimaryFenceAction(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus, holder string, generation uint64) *antflyv1.HAPlannedActionStatus {
@@ -2978,13 +3057,17 @@ func haAutomaticFailoverPromotionBoundary(status *antflyv1.HAStatus, holder stri
 	}
 	var committedLowerBound uint64
 	for _, action := range status.PlannedActions {
-		if haActionKind(action.Kind) != haActionFenceFormerPrimary ||
+		kind := haActionKind(action.Kind)
+		if (kind != haActionFenceFormerPrimary && kind != haActionIsolateFormerPrimary) ||
 			strings.TrimSpace(action.RouteTo) != strings.TrimSpace(holder) ||
 			action.FenceGeneration != generation {
 			continue
 		}
 		if action.TargetLSN != 0 {
 			committedLowerBound = action.TargetLSN
+		}
+		if kind == haActionIsolateFormerPrimary && action.AdminJobPhase == haAdminJobPhaseSucceeded {
+			return action.TargetLSN
 		}
 		if action.AdminJobPhase != haAdminJobPhaseSucceeded || action.AdminResult == nil {
 			continue
