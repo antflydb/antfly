@@ -27,9 +27,27 @@ pub const MetadataStateMachine = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .prepare_snapshot = prepareSnapshot,
+                .build_snapshot = buildSnapshot,
                 .apply_ready = applyReady,
             },
         };
+    }
+
+    fn prepareSnapshot(
+        ptr: *anyopaque,
+        group_id: raft_engine.core.types.GroupId,
+        applied_index: raft_engine.core.types.Index,
+    ) !?raft_engine.runtime.storage_iface.SnapshotSource {
+        const self: *MetadataStateMachine = @ptrCast(@alignCast(ptr));
+        const builder = self.snapshot_builder orelse return null;
+        return try builder.prepareSnapshot(group_id, applied_index);
+    }
+
+    fn buildSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: raft_engine.core.types.GroupId) !?[]u8 {
+        const self: *MetadataStateMachine = @ptrCast(@alignCast(ptr));
+        const builder = self.snapshot_builder orelse return null;
+        return try builder.buildSnapshot(alloc, group_id);
     }
 
     fn applyReady(
@@ -40,6 +58,13 @@ pub const MetadataStateMachine = struct {
         read_states: []const raft_engine.core.ReadState,
     ) !void {
         const self: *MetadataStateMachine = @ptrCast(@alignCast(ptr));
+        if (snapshot) |value| {
+            if (self.snapshot_builder) |snapshot_builder| {
+                if (!try snapshot_builder.installSnapshot(self.alloc, group_id, value.metadata.index, value.data)) {
+                    return error.SnapshotInstallUnsupported;
+                }
+            }
+        }
         if (committed_entries.len > 0) {
             if (self.snapshot_builder) |snapshot_builder| {
                 const payload = try mod.encodeCommittedEntries(self.alloc, committed_entries);

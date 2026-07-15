@@ -41,6 +41,11 @@ pub const SnapshotBuilder = struct {
 
     pub const VTable = struct {
         build_snapshot: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) anyerror![]u8,
+        prepare_snapshot: ?*const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            applied_index: u64,
+        ) anyerror!?raft_engine.runtime.storage_iface.SnapshotSource = null,
         install_snapshot: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -53,6 +58,15 @@ pub const SnapshotBuilder = struct {
 
     pub fn buildSnapshot(self: SnapshotBuilder, alloc: std.mem.Allocator, group_id: u64) ![]u8 {
         return try self.vtable.build_snapshot(self.ptr, alloc, group_id);
+    }
+
+    pub fn prepareSnapshot(
+        self: SnapshotBuilder,
+        group_id: u64,
+        applied_index: u64,
+    ) !?raft_engine.runtime.storage_iface.SnapshotSource {
+        const prepare = self.vtable.prepare_snapshot orelse return null;
+        return try prepare(self.ptr, group_id, applied_index);
     }
 
     pub fn applyBatch(self: SnapshotBuilder, batch: ApplyBatch) !void {

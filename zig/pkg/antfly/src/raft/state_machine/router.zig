@@ -26,10 +26,24 @@ pub const RoutedStateMachine = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .prepare_snapshot = prepareSnapshot,
                 .build_snapshot = buildSnapshot,
                 .apply_ready = applyReady,
             },
         };
+    }
+
+    fn prepareSnapshot(
+        ptr: *anyopaque,
+        group_id: raft_engine.core.types.GroupId,
+        applied_index: raft_engine.core.types.Index,
+    ) !?raft_engine.runtime.storage_iface.SnapshotSource {
+        const self: *RoutedStateMachine = @ptrCast(@alignCast(ptr));
+        const target = if (self.metadata_group_id != null and group_id == self.metadata_group_id.?)
+            self.metadata_state_machine
+        else
+            self.data_state_machine;
+        return try target.prepareSnapshot(group_id, applied_index);
     }
 
     fn buildSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: raft_engine.core.types.GroupId) !?[]u8 {

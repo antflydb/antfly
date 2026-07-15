@@ -145,6 +145,13 @@ pub const HostMetrics = struct {
     pending_apply_bytes: usize = 0,
     transport_queue_denials: usize = 0,
     apply_queue_denials: usize = 0,
+    snapshot_compaction_requests: usize = 0,
+    snapshot_compaction_completions: usize = 0,
+    snapshot_compaction_failures: usize = 0,
+    snapshot_compaction_busy_skips: usize = 0,
+    snapshot_compaction_stale_drops: usize = 0,
+    snapshot_compaction_bytes: usize = 0,
+    snapshot_compaction_build_ns: u64 = 0,
 };
 
 const PendingApplyTask = struct {
@@ -163,14 +170,158 @@ const PendingApplyTask = struct {
     }
 };
 
+const SnapshotBuildRequest = struct {
+    group_id: core.types.GroupId,
+    incarnation: u64,
+    source: storage_iface.SnapshotSource,
+    metadata: core.types.SnapshotMetadata,
+
+    fn deinit(self: *@This()) void {
+        self.source.deinit();
+        self.metadata.deinit(std.heap.page_allocator);
+        self.* = undefined;
+    }
+};
+
+const SnapshotBuildResult = union(enum) {
+    success: struct {
+        group_id: core.types.GroupId,
+        incarnation: u64,
+        snapshot: core.types.Snapshot,
+        build_ns: u64,
+    },
+    failure: struct {
+        group_id: core.types.GroupId,
+        incarnation: u64,
+        applied_index: core.types.Index,
+        cause: anyerror,
+    },
+
+    fn deinit(self: *@This()) void {
+        switch (self.*) {
+            .success => |*result| result.snapshot.deinit(std.heap.page_allocator),
+            .failure => {},
+        }
+        self.* = undefined;
+    }
+};
+
+const SnapshotBuildWorker = struct {
+    io_impl: std.Io.Threaded,
+    mutex: std.Io.Mutex = .init,
+    ready: std.Io.Condition = .init,
+    thread: ?std.Thread = null,
+    stopping: bool = false,
+    running: bool = false,
+    pending: ?SnapshotBuildRequest = null,
+    result: ?SnapshotBuildResult = null,
+
+    fn start(self: *@This()) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn deinit(self: *@This()) void {
+        const io = self.io_impl.io();
+        self.mutex.lockUncancelable(io);
+        self.stopping = true;
+        self.ready.broadcast(io);
+        self.mutex.unlock(io);
+        if (self.thread) |thread| thread.join();
+        if (self.pending) |*request| request.deinit();
+        if (self.result) |*result| result.deinit();
+        self.io_impl.deinit();
+        self.* = undefined;
+    }
+
+    fn canSubmit(self: *@This()) bool {
+        const io = self.io_impl.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return !self.stopping and !self.running and self.pending == null and self.result == null;
+    }
+
+    fn submit(self: *@This(), request: SnapshotBuildRequest) bool {
+        const io = self.io_impl.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.stopping or self.running or self.pending != null or self.result != null) return false;
+        self.pending = request;
+        self.ready.signal(io);
+        return true;
+    }
+
+    fn takeResult(self: *@This()) ?SnapshotBuildResult {
+        const io = self.io_impl.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const result = self.result;
+        self.result = null;
+        return result;
+    }
+
+    fn run(self: *@This()) void {
+        const io = self.io_impl.io();
+        while (true) {
+            self.mutex.lockUncancelable(io);
+            while (!self.stopping and self.pending == null) self.ready.waitUncancelable(io, &self.mutex);
+            if (self.stopping) {
+                self.mutex.unlock(io);
+                return;
+            }
+            var request = self.pending.?;
+            self.pending = null;
+            self.running = true;
+            self.mutex.unlock(io);
+
+            const started_ns = clock.monotonicNs();
+            const applied_index = request.metadata.index;
+            const data = request.source.materialize(std.heap.page_allocator);
+            request.source.deinit();
+            request.source = undefined;
+            const result: SnapshotBuildResult = if (data) |snapshot_data|
+                .{ .success = .{
+                    .group_id = request.group_id,
+                    .incarnation = request.incarnation,
+                    .snapshot = .{ .metadata = request.metadata, .data = snapshot_data },
+                    .build_ns = clock.elapsedSinceNs(started_ns),
+                } }
+            else |err| blk: {
+                request.metadata.deinit(std.heap.page_allocator);
+                break :blk .{ .failure = .{
+                    .group_id = request.group_id,
+                    .incarnation = request.incarnation,
+                    .applied_index = applied_index,
+                    .cause = err,
+                } };
+            };
+
+            self.mutex.lockUncancelable(io);
+            self.running = false;
+            std.debug.assert(self.result == null);
+            self.result = result;
+            self.mutex.unlock(io);
+        }
+    }
+};
+
+const SnapshotCandidate = struct {
+    applied_index: core.types.Index,
+    incarnation: u64,
+};
+
 pub const MultiRaft = struct {
     alloc: std.mem.Allocator,
     cfg: RuntimeConfig,
     hooks: RuntimeHooks,
     scheduler: scheduler_mod.Scheduler,
     groups: std.AutoHashMapUnmanaged(core.types.GroupId, group_mod.Group) = .empty,
+    group_incarnations: std.AutoHashMapUnmanaged(core.types.GroupId, u64) = .empty,
+    next_group_incarnation: u64 = 1,
     pending_outbox: TransportOutbox = .{},
     pending_apply: std.ArrayListUnmanaged(PendingApplyTask) = .empty,
+    snapshot_candidates: std.AutoHashMapUnmanaged(core.types.GroupId, SnapshotCandidate) = .empty,
+    snapshot_worker: ?*SnapshotBuildWorker = null,
+    snapshot_publish: ?SnapshotBuildResult = null,
     metrics: HostMetrics = .{},
 
     pub fn init(alloc: std.mem.Allocator, cfg: RuntimeConfig, hooks: RuntimeHooks) MultiRaft {
@@ -186,12 +337,19 @@ pub const MultiRaft = struct {
     }
 
     pub fn deinit(self: *MultiRaft) void {
+        if (self.snapshot_worker) |worker| {
+            worker.deinit();
+            self.alloc.destroy(worker);
+        }
+        if (self.snapshot_publish) |*result| result.deinit();
         var it = self.groups.valueIterator();
         while (it.next()) |grp| grp.deinit();
         self.groups.deinit(self.alloc);
+        self.group_incarnations.deinit(self.alloc);
         self.pending_outbox.deinit(self.alloc);
         for (self.pending_apply.items) |*task| task.deinit(self.alloc);
         self.pending_apply.deinit(self.alloc);
+        self.snapshot_candidates.deinit(self.alloc);
         self.scheduler.deinit();
         self.* = undefined;
     }
@@ -201,10 +359,23 @@ pub const MultiRaft = struct {
         if (self.groups.contains(cfg.group_id)) return error.GroupAlreadyExists;
 
         var grp = try group_mod.Group.init(self.alloc, cfg);
-        errdefer grp.deinit();
+        var grp_owned = true;
+        errdefer if (grp_owned) grp.deinit();
+
+        const incarnation = self.next_group_incarnation;
+        self.next_group_incarnation +%= 1;
+        if (self.next_group_incarnation == 0) self.next_group_incarnation = 1;
+        try self.group_incarnations.put(self.alloc, cfg.group_id, incarnation);
+        errdefer _ = self.group_incarnations.remove(cfg.group_id);
 
         try self.groups.put(self.alloc, cfg.group_id, grp);
+        grp_owned = false;
+        errdefer if (self.groups.fetchRemove(cfg.group_id)) |removed| {
+            var failed_group = removed.value;
+            failed_group.deinit();
+        };
         try self.scheduler.registerGroup(cfg.group_id);
+        errdefer _ = self.scheduler.unregisterGroup(cfg.group_id);
         if (self.hooks.transport) |transport| {
             try transport.serveGroup(cfg.group_id, self.transportReceiver());
             self.metrics.transport_group_serves += 1;
@@ -274,6 +445,8 @@ pub const MultiRaft = struct {
 
     pub fn removeGroup(self: *MultiRaft, group_id: core.types.GroupId) bool {
         const removed = self.groups.fetchRemove(group_id) orelse return false;
+        _ = self.group_incarnations.remove(group_id);
+        _ = self.snapshot_candidates.remove(group_id);
         var grp = removed.value;
         grp.deinit();
         _ = self.scheduler.unregisterGroup(group_id);
@@ -788,6 +961,8 @@ pub const MultiRaft = struct {
     }
 
     fn flushPendingApply(self: *MultiRaft) !void {
+        try self.publishCompletedSnapshotCompaction();
+        try self.dispatchNextSnapshotCompaction();
         if (self.pending_apply.items.len == 0) return;
 
         const drain_count = @min(self.cfg.max_apply_tasks_per_round, self.pending_apply.items.len);
@@ -810,16 +985,17 @@ pub const MultiRaft = struct {
                 try state_machine.applyReady(task.group_id, task.snapshot, task.entries, task.read_states);
             }
         }
-        try self.compactAppliedLogs(self.pending_apply.items[0..drain_count]);
+        try self.scheduleAppliedLogCompaction(self.pending_apply.items[0..drain_count]);
 
         self.consumePendingApplyPrefix(drain_count);
+        try self.publishCompletedSnapshotCompaction();
+        try self.dispatchNextSnapshotCompaction();
     }
 
-    fn compactAppliedLogs(self: *MultiRaft, tasks: []const PendingApplyTask) !void {
+    fn scheduleAppliedLogCompaction(self: *MultiRaft, tasks: []const PendingApplyTask) !void {
         if (self.cfg.applied_log_retained_entries == 0) return;
-        const state_machine = self.hooks.state_machine orelse return;
-        const group_storage = self.hooks.group_storage orelse return;
         for (tasks, 0..) |task, task_index| {
+            if (task.snapshot != null) _ = self.snapshot_candidates.remove(task.group_id);
             if (task.entries.len == 0) continue;
             var has_later_group_task = false;
             for (tasks[task_index + 1 ..]) |later| {
@@ -830,31 +1006,150 @@ pub const MultiRaft = struct {
             }
             if (has_later_group_task) continue;
             const last_applied = task.entries[task.entries.len - 1].index;
-            if (last_applied <= self.cfg.applied_log_retained_entries) continue;
+            const incarnation = self.group_incarnations.get(task.group_id) orelse continue;
+            const candidate = try self.snapshot_candidates.getOrPut(self.alloc, task.group_id);
+            if (!candidate.found_existing or candidate.value_ptr.incarnation != incarnation or last_applied > candidate.value_ptr.applied_index) {
+                candidate.value_ptr.* = .{ .applied_index = last_applied, .incarnation = incarnation };
+            }
+        }
+        try self.dispatchNextSnapshotCompaction();
+    }
+
+    fn dispatchNextSnapshotCompaction(self: *MultiRaft) !void {
+        if (self.cfg.applied_log_retained_entries == 0 or self.snapshot_candidates.count() == 0) return;
+        const state_machine = self.hooks.state_machine orelse return;
+        if (state_machine.vtable.prepare_snapshot == null) {
+            self.snapshot_candidates.clearRetainingCapacity();
+            return;
+        }
+        if (self.hooks.group_storage == null) return;
+        const worker = try self.ensureSnapshotWorker();
+        if (!worker.canSubmit()) {
+            self.metrics.snapshot_compaction_busy_skips += 1;
+            return;
+        }
+
+        while (self.snapshot_candidates.count() > 0) {
+            var candidates = self.snapshot_candidates.iterator();
+            const candidate = candidates.next().?;
+            const group_id = candidate.key_ptr.*;
+            const last_applied = candidate.value_ptr.applied_index;
+            const incarnation = candidate.value_ptr.incarnation;
+            if (self.group_incarnations.get(group_id) != incarnation) {
+                _ = self.snapshot_candidates.remove(group_id);
+                continue;
+            }
+            const grp = self.groups.getPtr(group_id) orelse {
+                _ = self.snapshot_candidates.remove(group_id);
+                continue;
+            };
+            if (last_applied <= self.cfg.applied_log_retained_entries) {
+                _ = self.snapshot_candidates.remove(group_id);
+                continue;
+            }
             const compact_index = last_applied - self.cfg.applied_log_retained_entries;
-            const grp = self.groups.getPtr(task.group_id) orelse continue;
-            if (self.cfg.applied_log_compaction_single_node_only and grp.status().conf_state.voters.len != 1) continue;
+            if (self.cfg.applied_log_compaction_single_node_only and grp.status().conf_state.voters.len != 1) {
+                _ = self.snapshot_candidates.remove(group_id);
+                continue;
+            }
             const first_index = grp.raw_node.raft.log.firstIndex();
-            if (compact_index < first_index) continue;
+            if (compact_index < first_index) {
+                _ = self.snapshot_candidates.remove(group_id);
+                continue;
+            }
             const snapshot_index = first_index - 1;
             if (self.cfg.applied_log_compaction_min_interval_entries > 0 and
                 compact_index - snapshot_index < self.cfg.applied_log_compaction_min_interval_entries)
             {
+                _ = self.snapshot_candidates.remove(group_id);
                 continue;
             }
-            const snapshot_data = (try state_machine.buildSnapshot(self.alloc, task.group_id)) orelse continue;
-            defer self.alloc.free(snapshot_data);
-            const status = grp.status();
-            const snapshot = core.types.Snapshot{
-                .metadata = .{
-                    .index = last_applied,
-                    .term = try grp.termAt(last_applied),
-                    .conf_state = status.conf_state,
-                },
-                .data = snapshot_data,
+            const source = (try state_machine.prepareSnapshot(group_id, last_applied)) orelse {
+                _ = self.snapshot_candidates.remove(group_id);
+                continue;
             };
-            try group_storage.compactSnapshot(task.group_id, snapshot);
-            try grp.compactAppliedLogTo(last_applied);
+            var source_owned = true;
+            defer if (source_owned) source.deinit();
+            const status = grp.status();
+            var metadata = core.types.SnapshotMetadata{
+                .index = last_applied,
+                .term = try grp.termAt(last_applied),
+                .conf_state = try status.conf_state.clone(std.heap.page_allocator),
+            };
+            var metadata_owned = true;
+            defer if (metadata_owned) metadata.deinit(std.heap.page_allocator);
+            if (!worker.submit(.{
+                .group_id = group_id,
+                .incarnation = incarnation,
+                .source = source,
+                .metadata = metadata,
+            })) {
+                self.metrics.snapshot_compaction_busy_skips += 1;
+                return;
+            }
+            source_owned = false;
+            metadata_owned = false;
+            _ = self.snapshot_candidates.remove(group_id);
+            self.metrics.snapshot_compaction_requests += 1;
+            return;
+        }
+    }
+
+    fn ensureSnapshotWorker(self: *MultiRaft) !*SnapshotBuildWorker {
+        if (self.snapshot_worker) |worker| return worker;
+        const worker = try self.alloc.create(SnapshotBuildWorker);
+        errdefer self.alloc.destroy(worker);
+        worker.* = .{ .io_impl = std.Io.Threaded.init(self.alloc, .{}) };
+        errdefer worker.io_impl.deinit();
+        try worker.start();
+        self.snapshot_worker = worker;
+        return worker;
+    }
+
+    fn publishCompletedSnapshotCompaction(self: *MultiRaft) !void {
+        if (self.snapshot_publish == null) {
+            const worker = self.snapshot_worker orelse return;
+            self.snapshot_publish = worker.takeResult();
+        }
+        const result = if (self.snapshot_publish) |*value| value else return;
+        switch (result.*) {
+            .failure => |failure| {
+                self.metrics.snapshot_compaction_failures += 1;
+                std.log.warn("raft snapshot compaction build failed group_id={d} applied_index={d} error={s}", .{
+                    failure.group_id,
+                    failure.applied_index,
+                    @errorName(failure.cause),
+                });
+                self.snapshot_publish = null;
+            },
+            .success => |*completed| {
+                if (self.group_incarnations.get(completed.group_id) != completed.incarnation) {
+                    self.metrics.snapshot_compaction_stale_drops += 1;
+                    result.deinit();
+                    self.snapshot_publish = null;
+                    return;
+                }
+                const grp = self.groups.getPtr(completed.group_id) orelse {
+                    result.deinit();
+                    self.snapshot_publish = null;
+                    return;
+                };
+                const current_snapshot_index = grp.raw_node.raft.log.firstIndex() - 1;
+                if (completed.snapshot.metadata.index < current_snapshot_index) {
+                    self.metrics.snapshot_compaction_stale_drops += 1;
+                    result.deinit();
+                    self.snapshot_publish = null;
+                    return;
+                }
+                const group_storage = self.hooks.group_storage orelse return;
+                try group_storage.compactSnapshot(completed.group_id, completed.snapshot);
+                try grp.compactAppliedLogTo(completed.snapshot.metadata.index);
+                self.metrics.snapshot_compaction_completions += 1;
+                self.metrics.snapshot_compaction_bytes += completed.snapshot.data.len;
+                self.metrics.snapshot_compaction_build_ns += completed.build_ns;
+                result.deinit();
+                self.snapshot_publish = null;
+            },
         }
     }
 

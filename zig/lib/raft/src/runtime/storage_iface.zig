@@ -127,6 +127,29 @@ pub const DiskBatcher = struct {
     }
 };
 
+/// A point-in-time state-machine view prepared on the Raft host thread and
+/// materialized by the snapshot worker. Implementations must capture the view
+/// synchronously in `prepare_snapshot`; `materialize` and `deinit` run on the
+/// same background thread. The state-machine owner must outlive every source it
+/// returns. MultiRaft enforces that by joining its snapshot worker on shutdown.
+pub const SnapshotSource = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        materialize: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8,
+        deinit: *const fn (ptr: *anyopaque) void,
+    };
+
+    pub fn materialize(self: SnapshotSource, alloc: std.mem.Allocator) ![]u8 {
+        return try self.vtable.materialize(self.ptr, alloc);
+    }
+
+    pub fn deinit(self: SnapshotSource) void {
+        self.vtable.deinit(self.ptr);
+    }
+};
+
 // StateMachine owns apply-side effects for one hosted group.
 // Implementations must consume the slices synchronously and must not retain them.
 pub const StateMachine = struct {
@@ -134,6 +157,11 @@ pub const StateMachine = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        prepare_snapshot: ?*const fn (
+            ptr: *anyopaque,
+            group_id: core.types.GroupId,
+            applied_index: core.types.Index,
+        ) anyerror!?SnapshotSource = null,
         build_snapshot: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -147,6 +175,15 @@ pub const StateMachine = struct {
             read_states: []const core.ReadState,
         ) anyerror!void,
     };
+
+    pub fn prepareSnapshot(
+        self: StateMachine,
+        group_id: core.types.GroupId,
+        applied_index: core.types.Index,
+    ) !?SnapshotSource {
+        const prepare = self.vtable.prepare_snapshot orelse return null;
+        return try prepare(self.ptr, group_id, applied_index);
+    }
 
     pub fn buildSnapshot(self: StateMachine, alloc: std.mem.Allocator, group_id: core.types.GroupId) !?[]u8 {
         const build = self.vtable.build_snapshot orelse return null;

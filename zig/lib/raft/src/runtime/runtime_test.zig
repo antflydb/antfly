@@ -132,15 +132,60 @@ const ApplyRecorder = struct {
     applied_read_states: usize = 0,
     last_applied_index: core.types.Index = 0,
     last_read_index: core.types.Index = 0,
+    snapshot_materializations: std.atomic.Value(usize) = .init(0),
+    block_snapshot_materialization: bool = false,
+    snapshot_materialization_started: std.atomic.Value(bool) = .init(false),
+    release_snapshot_materialization: std.atomic.Value(bool) = .init(false),
+
+    const PreparedSnapshot = struct {
+        recorder: *ApplyRecorder,
+        applied_index: core.types.Index,
+
+        fn source(self: *@This()) runtime.storage_iface.SnapshotSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .materialize = materialize,
+                    .deinit = deinit,
+                },
+            };
+        }
+
+        fn materialize(ptr: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.recorder.snapshot_materializations.fetchAdd(1, .monotonic);
+            if (self.recorder.block_snapshot_materialization) {
+                self.recorder.snapshot_materialization_started.store(true, .release);
+                while (!self.recorder.release_snapshot_materialization.load(.acquire)) {
+                    std.Thread.yield() catch {};
+                }
+            }
+            return try std.fmt.allocPrint(alloc, "applied-state-{d}", .{self.applied_index});
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.heap.page_allocator.destroy(self);
+        }
+    };
 
     fn iface(self: *ApplyRecorder) runtime.storage_iface.StateMachine {
         return .{
             .ptr = self,
             .vtable = &.{
+                .prepare_snapshot = prepareSnapshot,
                 .build_snapshot = buildSnapshot,
                 .apply_ready = applyReady,
             },
         };
+    }
+
+    fn prepareSnapshot(ptr: *anyopaque, _: core.types.GroupId, applied_index: core.types.Index) !?runtime.storage_iface.SnapshotSource {
+        const self: *ApplyRecorder = @ptrCast(@alignCast(ptr));
+        if (applied_index != self.last_applied_index) return error.AppliedSnapshotIndexMismatch;
+        const prepared = try std.heap.page_allocator.create(PreparedSnapshot);
+        prepared.* = .{ .recorder = self, .applied_index = applied_index };
+        return prepared.source();
     }
 
     fn buildSnapshot(_: *anyopaque, alloc: std.mem.Allocator, _: core.types.GroupId) !?[]u8 {
@@ -682,10 +727,67 @@ test "multi raft compacts active applied log after retained entry window" {
         try std.testing.expectEqual(@as(usize, 1), try drainGroup(&host, 63));
     }
 
+    var wait_iterations: usize = 0;
+    while (host.metricsSnapshot().snapshot_compaction_completions == 0 and wait_iterations < 10_000) : (wait_iterations += 1) {
+        _ = try host.drainReady(0);
+        std.Thread.yield() catch {};
+    }
+
     const grp = host.group(63) orelse return error.UnknownGroup;
     try std.testing.expectEqual(@as(core.types.Index, 9), apply_recorder.last_applied_index);
-    try std.testing.expectEqual(@as(core.types.Index, 8), grp.raw_node.raft.log.firstIndex());
+    try std.testing.expect(host.metricsSnapshot().snapshot_compaction_completions > 0);
+    try std.testing.expect(apply_recorder.snapshot_materializations.load(.monotonic) > 0);
+    try std.testing.expect(grp.raw_node.raft.log.firstIndex() > 1);
     try std.testing.expectEqual(@as(core.types.Index, 9), grp.raw_node.raft.log.lastIndex());
+}
+
+test "multi raft drops a completed snapshot from a retired group incarnation" {
+    var old_store = core.MemoryStorage.init(std.testing.allocator);
+    defer old_store.deinit();
+    var replacement_store = core.MemoryStorage.init(std.testing.allocator);
+    defer replacement_store.deinit();
+
+    var storage_recorder = StorageRecorder{ .alloc = std.testing.allocator };
+    defer storage_recorder.deinit();
+    try storage_recorder.registerStore(64, &old_store);
+    var apply_recorder = ApplyRecorder{
+        .alloc = std.testing.allocator,
+        .block_snapshot_materialization = true,
+    };
+    defer apply_recorder.release_snapshot_materialization.store(true, .release);
+
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{
+        .applied_log_retained_entries = 1,
+        .applied_log_compaction_min_interval_entries = 1,
+    }, .{
+        .group_storage = storage_recorder.iface(),
+        .state_machine = apply_recorder.iface(),
+    });
+    defer host.deinit();
+
+    try addSingleNodeGroup(&host, 64, &old_store, false);
+    try host.group(64).?.campaign();
+    try std.testing.expectEqual(@as(usize, 1), try drainGroup(&host, 64));
+    try host.propose(64, "old-generation");
+    try std.testing.expectEqual(@as(usize, 1), try drainGroup(&host, 64));
+
+    var wait_iterations: usize = 0;
+    while (!apply_recorder.snapshot_materialization_started.load(.acquire) and wait_iterations < 10_000) : (wait_iterations += 1) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(apply_recorder.snapshot_materialization_started.load(.acquire));
+    try std.testing.expect(host.removeGroup(64));
+    try storage_recorder.registerStore(64, &replacement_store);
+    try addSingleNodeGroup(&host, 64, &replacement_store, false);
+
+    apply_recorder.release_snapshot_materialization.store(true, .release);
+    wait_iterations = 0;
+    while (host.metricsSnapshot().snapshot_compaction_stale_drops == 0 and wait_iterations < 10_000) : (wait_iterations += 1) {
+        _ = try host.drainReady(0);
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().snapshot_compaction_stale_drops);
+    try std.testing.expectEqual(@as(usize, 0), storage_recorder.persisted_snapshots);
 }
 
 test "multi raft quiescing skips host round and drain fairness" {

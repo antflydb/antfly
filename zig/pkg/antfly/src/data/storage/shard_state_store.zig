@@ -106,12 +106,28 @@ pub fn validateSplitTerminalIdentity(terminal: AppliedSplitTerminal, transition_
 }
 
 pub fn currentRange(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64) !AppliedDataRange {
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    return try currentRangeTxn(&txn, alloc, group_id);
+}
+
+fn currentRangeTxn(txn: *docstore.DocStore.Txn, alloc: std.mem.Allocator, group_id: u64) !AppliedDataRange {
     const key = try groupRangeKeyAlloc(alloc, group_id);
     defer alloc.free(key);
-    return try range_state.loadRangeAtKey(alloc, store, key);
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return .{ .start = "", .end = "" },
+        else => return err,
+    };
+    return try range_state.decodeRangeAlloc(alloc, raw);
 }
 
 pub fn groupState(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64) ![]AppliedDataKV {
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    return try groupStateTxn(&txn, alloc, group_id);
+}
+
+fn groupStateTxn(txn: *docstore.DocStore.Txn, alloc: std.mem.Allocator, group_id: u64) ![]AppliedDataKV {
     const logical_prefix = try groupDocumentPrefixAlloc(alloc, group_id);
     defer alloc.free(logical_prefix);
     const lower = try internal_keys.documentRangeLowerAlloc(alloc, logical_prefix);
@@ -119,7 +135,7 @@ pub fn groupState(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id:
     const upper = (try internal_keys.documentRangeUpperAlloc(alloc, logical_prefix)) orelse return &.{};
     defer alloc.free(upper);
 
-    return try collectGroupDocumentsInPhysicalRange(store, alloc, group_id, lower, upper);
+    return try collectGroupDocumentsInPhysicalRangeTxn(txn, alloc, group_id, lower, upper);
 }
 
 pub fn replaceGroupSnapshot(
@@ -399,9 +415,15 @@ pub fn applyDeltas(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id
 }
 
 pub fn buildSnapshot(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64) ![]u8 {
-    const byte_range = try currentRange(store, alloc, group_id);
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    return try buildSnapshotTxn(&txn, alloc, group_id);
+}
+
+pub fn buildSnapshotTxn(txn: *docstore.DocStore.Txn, alloc: std.mem.Allocator, group_id: u64) ![]u8 {
+    const byte_range = try currentRangeTxn(txn, alloc, group_id);
     defer range_state.freeRange(alloc, byte_range);
-    const entries = try groupState(store, alloc, group_id);
+    const entries = try groupStateTxn(txn, alloc, group_id);
     defer {
         for (entries) |entry| {
             alloc.free(entry.key);
@@ -409,7 +431,7 @@ pub fn buildSnapshot(store: *docstore.DocStore, alloc: std.mem.Allocator, group_
         }
         alloc.free(entries);
     }
-    const controls = try groupControlState(store, alloc, group_id);
+    const controls = try groupControlStateTxn(txn, alloc, group_id);
     defer freeGroupStateEntries(alloc, controls);
     return try encodeGroupStateSnapshot(alloc, byte_range, entries, controls);
 }
@@ -700,6 +722,12 @@ fn readSnapshotU32(encoded: []const u8, pos: *usize) !u32 {
 }
 
 fn groupControlState(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64) ![]AppliedDataKV {
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    return try groupControlStateTxn(&txn, alloc, group_id);
+}
+
+fn groupControlStateTxn(txn: *docstore.DocStore.Txn, alloc: std.mem.Allocator, group_id: u64) ![]AppliedDataKV {
     var out = std.ArrayListUnmanaged(AppliedDataKV).empty;
     errdefer {
         for (out.items) |entry| {
@@ -721,17 +749,20 @@ fn groupControlState(store: *docstore.DocStore, alloc: std.mem.Allocator, group_
     point_keys[initialized] = try groupSplitTerminalKeyAlloc(alloc, group_id);
     initialized += 1;
     for (point_keys) |key| {
-        const value = store.get(alloc, key) catch |err| switch (err) {
+        const borrowed = txn.get(key) catch |err| switch (err) {
             error.NotFound => continue,
             else => return err,
         };
+        const owned_key = try alloc.dupe(u8, key);
+        errdefer alloc.free(owned_key);
+        const value = try alloc.dupe(u8, borrowed);
         errdefer alloc.free(value);
-        try out.append(alloc, .{ .key = try alloc.dupe(u8, key), .value = value });
+        try out.append(alloc, .{ .key = owned_key, .value = value });
     }
 
     const delta_prefix = try groupSplitDeltaPrefixAlloc(alloc, group_id);
     defer alloc.free(delta_prefix);
-    const deltas = try store.scanPrefix(alloc, delta_prefix);
+    const deltas = try docstore.DocStore.scanPrefixTxn(alloc, txn, delta_prefix);
     defer alloc.free(deltas);
     for (deltas) |delta| {
         errdefer {
@@ -764,7 +795,19 @@ fn collectGroupDocumentsInPhysicalRange(
     lower: []const u8,
     upper: []const u8,
 ) ![]AppliedDataKV {
-    const kvs = try store.scanRange(alloc, lower, upper);
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    return try collectGroupDocumentsInPhysicalRangeTxn(&txn, alloc, group_id, lower, upper);
+}
+
+fn collectGroupDocumentsInPhysicalRangeTxn(
+    txn: *docstore.DocStore.Txn,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lower: []const u8,
+    upper: []const u8,
+) ![]AppliedDataKV {
+    const kvs = try docstore.DocStore.scanRangeTxn(alloc, txn, lower, upper);
     var processed: usize = 0;
     defer {
         for (kvs[processed..]) |kv| {

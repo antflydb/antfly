@@ -8137,6 +8137,10 @@ pub const DB = struct {
         }
         for (existing_documents) |entry| {
             const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, entry.key)) orelse continue;
+            if (seen.contains(logical_key)) {
+                alloc.free(logical_key);
+                continue;
+            }
             errdefer alloc.free(logical_key);
             try deletes.append(alloc, logical_key);
         }
@@ -8223,6 +8227,10 @@ pub const DB = struct {
         }
         for (existing_documents) |entry| {
             const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, entry.key)) orelse continue;
+            if (seen.contains(logical_key)) {
+                alloc.free(logical_key);
+                continue;
+            }
             errdefer alloc.free(logical_key);
             try deletes.append(alloc, logical_key);
         }
@@ -61952,6 +61960,72 @@ test "db split cutover fences enrichment to the owning range" {
     for (parent_result.hits) |hit| {
         try std.testing.expect(!std.mem.eql(u8, hit.id, "doc:y"));
     }
+}
+
+test "db raft snapshot replacement preserves overlapping incoming documents" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:keep", .value = "{\"version\":1}" },
+        .{ .key = "doc:stale", .value = "{\"stale\":true}" },
+    } });
+
+    try db.replaceRaftDocumentSnapshot(alloc, .{ .start = "", .end = "" }, &.{
+        .{ .key = "doc:keep", .value = "{\"version\":2}" },
+        .{ .key = "doc:new", .value = "{\"new\":true}" },
+    });
+
+    const retained = (try db.get(alloc, "doc:keep")).?;
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("{\"version\":2}", retained);
+    const added = (try db.get(alloc, "doc:new")).?;
+    defer alloc.free(added);
+    try std.testing.expectEqualStrings("{\"new\":true}", added);
+    try std.testing.expect((try db.get(alloc, "doc:stale")) == null);
+}
+
+test "db split bootstrap replacement preserves overlapping incoming documents" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:keep", .value = "{\"version\":1}" },
+        .{ .key = "doc:stale", .value = "{\"stale\":true}" },
+    } });
+
+    try std.testing.expect(try db.replaceSplitBootstrap(
+        alloc,
+        .{ .start = "", .end = "" },
+        &.{
+            .{ .key = "doc:keep", .value = "{\"version\":2}" },
+            .{ .key = "doc:new", .value = "{\"new\":true}" },
+        },
+        17,
+        .{
+            .transition_id = 11,
+            .attempt_epoch = 1,
+            .source_group_id = 101,
+            .destination_group_id = 102,
+            .bootstrap_complete = true,
+        },
+    ));
+
+    const retained = (try db.get(alloc, "doc:keep")).?;
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("{\"version\":2}", retained);
+    const added = (try db.get(alloc, "doc:new")).?;
+    defer alloc.free(added);
+    try std.testing.expectEqualStrings("{\"new\":true}", added);
+    try std.testing.expect((try db.get(alloc, "doc:stale")) == null);
 }
 
 test "db split cutover fences enrichment to the owning range with durable lsm primary backend" {

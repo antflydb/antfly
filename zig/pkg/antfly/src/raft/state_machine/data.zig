@@ -27,10 +27,21 @@ pub const DataStateMachine = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .prepare_snapshot = prepareSnapshot,
                 .build_snapshot = buildSnapshot,
                 .apply_ready = applyReady,
             },
         };
+    }
+
+    fn prepareSnapshot(
+        ptr: *anyopaque,
+        group_id: raft_engine.core.types.GroupId,
+        applied_index: raft_engine.core.types.Index,
+    ) !?raft_engine.runtime.storage_iface.SnapshotSource {
+        const self: *DataStateMachine = @ptrCast(@alignCast(ptr));
+        const builder = self.snapshot_builder orelse return null;
+        return try builder.prepareSnapshot(group_id, applied_index);
     }
 
     fn buildSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: raft_engine.core.types.GroupId) !?[]u8 {

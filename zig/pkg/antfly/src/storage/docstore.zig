@@ -1487,6 +1487,11 @@ pub const DocStore = struct {
         var txn = try self.beginReadTxn();
         defer txn.abort();
 
+        return try scanPrefixTxn(alloc, &txn, prefix);
+    }
+
+    /// Scan a prefix from an existing point-in-time read transaction.
+    pub fn scanPrefixTxn(alloc: Allocator, txn: *Txn, prefix: []const u8) ![]OwnedKVPair {
         var cur = try txn.openCursor();
         defer cur.close();
 
@@ -1567,6 +1572,11 @@ pub const DocStore = struct {
         var txn = try self.beginReadTxn();
         defer txn.abort();
 
+        return try scanRangeTxn(alloc, &txn, lower, upper);
+    }
+
+    /// Scan a range from an existing point-in-time read transaction.
+    pub fn scanRangeTxn(alloc: Allocator, txn: *Txn, lower: []const u8, upper: []const u8) ![]OwnedKVPair {
         var cur = try txn.openCursor();
         defer cur.close();
         cur.setUpperBound(if (upper.len > 0) upper else null);

@@ -3443,6 +3443,7 @@ pub fn build(b: *std.Build) void {
         "db split coordinator remains closed after failed reopen",
         "db split successor bootstrap atomically replaces stale destination generation",
         "data raft apply store applies delete operations into group state",
+        "data raft apply store prepared snapshot retains its MVCC view across later writes",
         "data raft apply store orders independent groups through separate shards",
         "data raft apply store admits one writable owner per root",
         "data raft apply store skips persisted split commands in overlapping replay",

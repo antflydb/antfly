@@ -60,6 +60,15 @@ const public_api_max_connection_threads: u32 = 64;
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
 
+fn dataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
+    var cfg: raft_engine.runtime.RuntimeConfig = .{};
+    // Every replica can now build a complete point-in-time data snapshot. Keep
+    // replicated logs bounded independently instead of restricting compaction
+    // to single-node groups.
+    cfg.applied_log_compaction_single_node_only = false;
+    return cfg;
+}
+
 fn decodeSplitDeltaDocumentKeyAlloc(alloc: std.mem.Allocator, internal_key: []const u8) ![]u8 {
     const logical_key = (try antfly.internal_keys.decodePrimaryDocumentKeyAlloc(alloc, internal_key)) orelse
         return error.InvalidAppliedDataDocumentKey;
@@ -7694,6 +7703,7 @@ pub const DataServer = struct {
                     .http = .{
                         .host = .{
                             .local_node_id = registration.node_id,
+                            .runtime = dataRaftRuntimeConfig(),
                             .replica_root_dir = cfg.replica_root_dir,
                             .replica_catalog_path = cfg.replica_catalog_path,
                             .replica_state_backend = cfg.data_raft_state_backend,
@@ -10495,6 +10505,7 @@ test "data runtime module compiles" {
     _ = DataServerConfig;
     _ = DataServer;
     _ = GroupLeadershipSource;
+    try std.testing.expect(!dataRaftRuntimeConfig().applied_log_compaction_single_node_only);
 }
 
 test "data raft bootstrap campaign retries leaderless voter elections" {

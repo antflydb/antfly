@@ -377,6 +377,96 @@ test "metadata raft apply store replicates restore job records" {
     try std.testing.expect((try store.getRestoreJobValue(std.testing.allocator, group_id, logical_key)) == null);
 }
 
+test "metadata raft apply store snapshot replaces one complete projection and preserves other groups" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-snapshot-source", .{tmp.sub_path});
+    defer std.testing.allocator.free(source_root);
+    const target_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-snapshot-target", .{tmp.sub_path});
+    defer std.testing.allocator.free(target_root);
+    const group_id = group_ids.main_metadata_group_id;
+    const other_group_id = group_id + 1;
+    const retained_key = "\x00\x00__api_restore_jobs__:0000000000000001";
+    const stale_key = "\x00\x00__api_restore_jobs__:0000000000000002";
+    const other_group_key = "\x00\x00__api_restore_jobs__:0000000000000003";
+
+    const retained_command = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_restore_job = .{ .key = retained_key, .value = "retained" },
+    });
+    defer std.testing.allocator.free(retained_command);
+    const split_command = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_split_transition = .{
+            .transition_id = 71,
+            .attempt_epoch = 1,
+            .source_group_id = 101,
+            .destination_group_id = 102,
+            .phase = .prepare,
+            .split_key = "m",
+        },
+    });
+    defer std.testing.allocator.free(split_command);
+    const source_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = retained_command },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = split_command },
+    });
+    defer std.testing.allocator.free(source_entries);
+
+    var source = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
+    defer source.deinit();
+    try source.snapshotBuilder().applyBatch(.{
+        .group_id = group_id,
+        .commit_index = 2,
+        .entries_bytes = source_entries,
+    });
+    var prepared = (try source.snapshotBuilder().prepareSnapshot(group_id, 2)) orelse return error.MissingMetadataSnapshotSource;
+    defer prepared.deinit();
+    const snapshot = try prepared.materialize(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    const rebuilt_snapshot = try source.snapshotBuilder().buildSnapshot(std.testing.allocator, group_id);
+    defer std.testing.allocator.free(rebuilt_snapshot);
+    try std.testing.expectEqualSlices(u8, rebuilt_snapshot, snapshot);
+
+    var target = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = target_root });
+    defer target.deinit();
+    const stale_command = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_restore_job = .{ .key = stale_key, .value = "stale" },
+    });
+    defer std.testing.allocator.free(stale_command);
+    const stale_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = stale_command },
+    });
+    defer std.testing.allocator.free(stale_entries);
+    try target.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 1, .entries_bytes = stale_entries });
+
+    const other_group_command = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_restore_job = .{ .key = other_group_key, .value = "other-group" },
+    });
+    defer std.testing.allocator.free(other_group_command);
+    const other_group_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = other_group_command },
+    });
+    defer std.testing.allocator.free(other_group_entries);
+    try target.snapshotBuilder().applyBatch(.{ .group_id = other_group_id, .commit_index = 1, .entries_bytes = other_group_entries });
+
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(std.testing.allocator, group_id, 2, snapshot));
+    const retained = (try target.getRestoreJobValue(std.testing.allocator, group_id, retained_key)).?;
+    defer std.testing.allocator.free(retained);
+    try std.testing.expectEqualStrings("retained", retained);
+    try std.testing.expect((try target.getRestoreJobValue(std.testing.allocator, group_id, stale_key)) == null);
+    const other = (try target.getRestoreJobValue(std.testing.allocator, other_group_id, other_group_key)).?;
+    defer std.testing.allocator.free(other);
+    try std.testing.expectEqualStrings("other-group", other);
+    const splits = try target.listSplitTransitions(std.testing.allocator, group_id);
+    defer target.freeSplitTransitions(std.testing.allocator, splits);
+    try std.testing.expectEqual(@as(usize, 1), splits.len);
+    try std.testing.expectEqual(@as(u64, 71), splits[0].transition_id);
+    const batch = (try target.latestBatch(group_id)).?;
+    try std.testing.expectEqual(@as(u64, 2), batch.commit_index);
+    const installed_snapshot = try target.snapshotBuilder().buildSnapshot(std.testing.allocator, group_id);
+    defer std.testing.allocator.free(installed_snapshot);
+    try std.testing.expectEqualSlices(u8, snapshot, installed_snapshot);
+}
+
 pub const RaftApplyStoreConfig = struct {
     root_dir: []const u8,
     map_size: usize = 16 * 1024 * 1024,
@@ -526,6 +616,8 @@ pub const RaftApplyStore = struct {
             .ptr = self,
             .vtable = &.{
                 .build_snapshot = buildSnapshot,
+                .prepare_snapshot = prepareSnapshot,
+                .install_snapshot = installSnapshotFromRaft,
                 .apply_batch = applyBatch,
             },
         };
@@ -1142,10 +1234,195 @@ pub const RaftApplyStore = struct {
         alloc.free(rows);
     }
 
+    const metadata_snapshot_magic = "AFMS";
+    const metadata_snapshot_version: u8 = 1;
+
+    const PreparedSnapshot = struct {
+        owner: *RaftApplyStore,
+        txn: docstore.DocStore.Txn,
+        group_id: u64,
+
+        fn source(self: *@This()) raft_engine.runtime.storage_iface.SnapshotSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .materialize = materialize,
+                    .deinit = PreparedSnapshot.deinit,
+                },
+            };
+        }
+
+        fn materialize(ptr: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.owner.buildMetadataSnapshotTxn(alloc, &self.txn, self.group_id);
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.txn.abort();
+            std.heap.page_allocator.destroy(self);
+        }
+    };
+
     fn buildSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) ![]u8 {
         const self: *RaftApplyStore = @ptrCast(@alignCast(ptr));
-        const batch = try self.ensureLoaded(group_id) orelse return error.MissingAppliedBatch;
-        return try alloc.dupe(u8, batch.entries_bytes);
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        return try self.buildMetadataSnapshotTxn(alloc, &txn, group_id);
+    }
+
+    fn prepareSnapshot(ptr: *anyopaque, group_id: u64, applied_index: u64) !?raft_engine.runtime.storage_iface.SnapshotSource {
+        const self: *RaftApplyStore = @ptrCast(@alignCast(ptr));
+        var txn = try self.store.beginReadTxn();
+        errdefer txn.abort();
+        var key_buf: [128]u8 = undefined;
+        const key = try keyForGroup(&key_buf, group_id);
+        const value = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        if (value.len < @sizeOf(u64)) return error.InvalidMetadataApplyBatch;
+        if (std.mem.readInt(u64, value[0..8], .little) != applied_index) return error.AppliedSnapshotIndexMismatch;
+
+        const prepared = try std.heap.page_allocator.create(PreparedSnapshot);
+        prepared.* = .{
+            .owner = self,
+            .txn = txn,
+            .group_id = group_id,
+        };
+        return prepared.source();
+    }
+
+    fn installSnapshotFromRaft(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        commit_index: u64,
+        encoded: []const u8,
+    ) !void {
+        const self: *RaftApplyStore = @ptrCast(@alignCast(ptr));
+        const rows = try decodeMetadataSnapshotAlloc(alloc, encoded);
+        defer freeMetadataSnapshotRows(alloc, rows);
+        try validateMetadataSnapshotRows(alloc, group_id, rows);
+
+        const existing = blk: {
+            var read_txn = try self.store.beginReadTxn();
+            defer read_txn.abort();
+            break :blk try self.collectMetadataSnapshotRowsTxn(alloc, &read_txn, group_id);
+        };
+        defer freeMetadataSnapshotRows(alloc, existing);
+
+        const empty_entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{});
+        defer alloc.free(empty_entries);
+        const watermark = try alloc.alloc(u8, @sizeOf(u64) + empty_entries.len);
+        defer alloc.free(watermark);
+        std.mem.writeInt(u64, watermark[0..8], commit_index, .little);
+        @memcpy(watermark[8..], empty_entries);
+        var watermark_key_buf: [128]u8 = undefined;
+        const watermark_key = try keyForGroup(&watermark_key_buf, group_id);
+
+        const writes = try alloc.alloc(docstore.KVPair, rows.len + 1);
+        defer alloc.free(writes);
+        for (rows, 0..) |row, i| writes[i] = .{ .key = row.key, .value = row.value };
+        writes[rows.len] = .{ .key = watermark_key, .value = watermark };
+        const deletes = try alloc.alloc([]const u8, existing.len);
+        defer alloc.free(deletes);
+        for (existing, 0..) |row, i| deletes[i] = row.key;
+        try self.store.putBatch(writes, deletes);
+
+        const owned_entries = try self.alloc.dupe(u8, empty_entries);
+        errdefer self.alloc.free(owned_entries);
+        if (self.batches.getPtr(group_id)) |batch| {
+            self.alloc.free(batch.entries_bytes);
+            batch.* = .{ .commit_index = commit_index, .entries_bytes = owned_entries };
+        } else {
+            try self.batches.put(self.alloc, group_id, .{ .commit_index = commit_index, .entries_bytes = owned_entries });
+        }
+        self.invalidateProjectedPlacementGroup(group_id);
+        self.notifyMetadataSnapshotInstalled(group_id);
+        for (existing) |row| self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = row.key });
+        for (rows) |row| self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = row.key });
+    }
+
+    fn buildMetadataSnapshotTxn(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+    ) ![]u8 {
+        const rows = try self.collectMetadataSnapshotRowsTxn(alloc, txn, group_id);
+        defer freeMetadataSnapshotRows(alloc, rows);
+        return try encodeMetadataSnapshot(alloc, rows);
+    }
+
+    fn collectMetadataSnapshotRowsTxn(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+    ) ![]docstore.OwnedKVPair {
+        _ = self;
+        var rows = std.ArrayListUnmanaged(docstore.OwnedKVPair).empty;
+        errdefer {
+            for (rows.items) |row| {
+                alloc.free(row.key);
+                alloc.free(row.value);
+            }
+            rows.deinit(alloc);
+        }
+        var buf: [256]u8 = undefined;
+        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try splitTransitionPrefixForGroup(&buf, group_id));
+        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try mergeTransitionPrefixForGroup(&buf, group_id));
+        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try placementPrefixForGroup(&buf, group_id));
+        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try nodePrefixForGroup(&buf, group_id));
+        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try storePrefixForGroup(&buf, group_id));
+        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try tablePrefixForGroup(&buf, group_id));
+        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try schemaProgressPrefixForGroup(&buf, group_id));
+        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try restoreProgressPrefixForGroup(&buf, group_id));
+        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try replicationSourceStatusPrefixForGroup(&buf, group_id));
+        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try extensionPackagePrefixForGroup(&buf, group_id));
+        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try installedExtensionPrefixForGroup(&buf, group_id));
+        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try extensionMemberPrefixForGroup(&buf, group_id));
+        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try extensionDependencyPrefixForGroup(&buf, group_id));
+        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try shuffleJoinLeasePrefixForGroup(&buf, group_id));
+        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try restoreJobPrefixForGroup(&buf, group_id));
+        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try rangePrefixForGroup(&buf, group_id));
+        try appendMetadataPointRowTxn(alloc, txn, &rows, try reconcileLeaseKeyForGroup(&buf, group_id));
+        try appendMetadataPointRowTxn(alloc, txn, &rows, try reallocationRequestKeyForGroup(&buf, group_id));
+        std.sort.pdq(docstore.OwnedKVPair, rows.items, {}, metadataSnapshotRowLessThan);
+        return try rows.toOwnedSlice(alloc);
+    }
+
+    fn invalidateProjectedPlacementGroup(self: *RaftApplyStore, group_id: u64) void {
+        var i = self.projected_placement_intents.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.projected_placement_intents.items[i].metadata_group_id != group_id) continue;
+            const removed = self.projected_placement_intents.swapRemove(i);
+            freePlacementIntent(self.alloc, removed.intent);
+        }
+        _ = self.loaded_placement_groups.remove(group_id);
+    }
+
+    fn notifyMetadataSnapshotInstalled(self: *RaftApplyStore, group_id: u64) void {
+        const kinds = [_]ProjectionSignalKind{
+            .table,
+            .range,
+            .store,
+            .placement_intent,
+            .reconcile_lease,
+            .shuffle_join_lease,
+            .split_transition,
+            .merge_transition,
+            .schema_progress,
+            .restore_progress,
+            .restore_job,
+            .replication_source_status,
+        };
+        for (kinds) |kind| self.notifyProjectionListeners(.{
+            .kind = kind,
+            .metadata_group_id = group_id,
+        });
     }
 
     fn applyBatch(ptr: *anyopaque, batch: raft_state_machine.ApplyBatch) !void {
@@ -4272,6 +4549,147 @@ fn readReallocationRequestRecord(
     return .{
         .requested_at_ms = try readInt(encoded, pos, u64),
     };
+}
+
+fn appendMetadataPrefixRowsTxn(
+    alloc: std.mem.Allocator,
+    txn: *docstore.DocStore.Txn,
+    out: *std.ArrayListUnmanaged(docstore.OwnedKVPair),
+    prefix: []const u8,
+) !void {
+    const rows = try docstore.DocStore.scanPrefixTxn(alloc, txn, prefix);
+    var transferred = false;
+    defer {
+        if (!transferred) freeMetadataSnapshotRows(alloc, rows) else alloc.free(rows);
+    }
+    try out.appendSlice(alloc, rows);
+    transferred = true;
+}
+
+fn appendMetadataPointRowTxn(
+    alloc: std.mem.Allocator,
+    txn: *docstore.DocStore.Txn,
+    out: *std.ArrayListUnmanaged(docstore.OwnedKVPair),
+    key: []const u8,
+) !void {
+    const borrowed = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return,
+        else => return err,
+    };
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const owned_value = try alloc.dupe(u8, borrowed);
+    errdefer alloc.free(owned_value);
+    try out.append(alloc, .{ .key = owned_key, .value = owned_value });
+}
+
+fn metadataSnapshotRowLessThan(_: void, lhs: docstore.OwnedKVPair, rhs: docstore.OwnedKVPair) bool {
+    return std.mem.order(u8, lhs.key, rhs.key) == .lt;
+}
+
+fn encodeMetadataSnapshot(alloc: std.mem.Allocator, rows: []const docstore.OwnedKVPair) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, RaftApplyStore.metadata_snapshot_magic);
+    try out.append(alloc, RaftApplyStore.metadata_snapshot_version);
+    try appendInt(alloc, &out, u32, std.math.cast(u32, rows.len) orelse return error.MetadataSnapshotTooLarge);
+    for (rows) |row| {
+        try appendInt(alloc, &out, u32, std.math.cast(u32, row.key.len) orelse return error.MetadataSnapshotTooLarge);
+        try out.appendSlice(alloc, row.key);
+        try appendInt(alloc, &out, u32, std.math.cast(u32, row.value.len) orelse return error.MetadataSnapshotTooLarge);
+        try out.appendSlice(alloc, row.value);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn decodeMetadataSnapshotAlloc(alloc: std.mem.Allocator, encoded: []const u8) ![]docstore.OwnedKVPair {
+    if (encoded.len < RaftApplyStore.metadata_snapshot_magic.len + 1 + @sizeOf(u32) or
+        !std.mem.eql(u8, encoded[0..RaftApplyStore.metadata_snapshot_magic.len], RaftApplyStore.metadata_snapshot_magic) or
+        encoded[RaftApplyStore.metadata_snapshot_magic.len] != RaftApplyStore.metadata_snapshot_version)
+    {
+        return error.InvalidMetadataSnapshot;
+    }
+    var pos: usize = RaftApplyStore.metadata_snapshot_magic.len + 1;
+    const count = readInt(encoded, &pos, u32) catch return error.InvalidMetadataSnapshot;
+    if (count > (encoded.len - pos) / 8) return error.InvalidMetadataSnapshot;
+    const rows = try alloc.alloc(docstore.OwnedKVPair, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (rows[0..initialized]) |row| {
+            alloc.free(row.key);
+            alloc.free(row.value);
+        }
+        alloc.free(rows);
+    }
+    while (initialized < rows.len) : (initialized += 1) {
+        const key_len = readInt(encoded, &pos, u32) catch return error.InvalidMetadataSnapshot;
+        if (key_len > encoded.len - pos) return error.InvalidMetadataSnapshot;
+        const key = try alloc.dupe(u8, encoded[pos .. pos + key_len]);
+        pos += key_len;
+        errdefer alloc.free(key);
+        const value_len = readInt(encoded, &pos, u32) catch return error.InvalidMetadataSnapshot;
+        if (value_len > encoded.len - pos) return error.InvalidMetadataSnapshot;
+        const value = try alloc.dupe(u8, encoded[pos .. pos + value_len]);
+        pos += value_len;
+        rows[initialized] = .{ .key = key, .value = value };
+    }
+    if (pos != encoded.len) return error.InvalidMetadataSnapshot;
+    return rows;
+}
+
+fn freeMetadataSnapshotRows(alloc: std.mem.Allocator, rows: []const docstore.OwnedKVPair) void {
+    for (rows) |row| {
+        alloc.free(row.key);
+        alloc.free(row.value);
+    }
+    alloc.free(rows);
+}
+
+fn validateMetadataSnapshotRows(
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    rows: []const docstore.OwnedKVPair,
+) !void {
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    try seen.ensureTotalCapacity(alloc, @intCast(rows.len));
+    for (rows) |row| {
+        if (!metadataSnapshotKeyBelongsToGroup(group_id, row.key)) return error.InvalidMetadataSnapshot;
+        const result = try seen.getOrPut(alloc, row.key);
+        if (result.found_existing) return error.InvalidMetadataSnapshot;
+    }
+}
+
+fn metadataSnapshotKeyBelongsToGroup(group_id: u64, key: []const u8) bool {
+    var buf: [256]u8 = undefined;
+    const split_prefix = splitTransitionPrefixForGroup(&buf, group_id) catch return false;
+    if (std.mem.startsWith(u8, key, split_prefix)) return true;
+    const merge_prefix = mergeTransitionPrefixForGroup(&buf, group_id) catch return false;
+    if (std.mem.startsWith(u8, key, merge_prefix)) return true;
+    const prefix_fns = .{
+        placementPrefixForGroup,
+        nodePrefixForGroup,
+        storePrefixForGroup,
+        tablePrefixForGroup,
+        schemaProgressPrefixForGroup,
+        restoreProgressPrefixForGroup,
+        replicationSourceStatusPrefixForGroup,
+        extensionPackagePrefixForGroup,
+        installedExtensionPrefixForGroup,
+        extensionMemberPrefixForGroup,
+        extensionDependencyPrefixForGroup,
+        shuffleJoinLeasePrefixForGroup,
+        restoreJobPrefixForGroup,
+        rangePrefixForGroup,
+    };
+    inline for (prefix_fns) |prefix_fn| {
+        const prefix = prefix_fn(&buf, group_id) catch return false;
+        if (std.mem.startsWith(u8, key, prefix)) return true;
+    }
+    const reconcile_key = reconcileLeaseKeyForGroup(&buf, group_id) catch return false;
+    if (std.mem.eql(u8, key, reconcile_key)) return true;
+    const reallocation_key = reallocationRequestKeyForGroup(&buf, group_id) catch return false;
+    return std.mem.eql(u8, key, reallocation_key);
 }
 
 fn appendInt(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), comptime T: type, value: T) !void {

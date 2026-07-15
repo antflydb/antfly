@@ -119,6 +119,7 @@ pub const RaftApplyStore = struct {
             .ptr = self,
             .vtable = &.{
                 .build_snapshot = buildSnapshot,
+                .prepare_snapshot = prepareSnapshot,
                 .install_snapshot = installSnapshotFromRaft,
                 .apply_batch = applyBatch,
             },
@@ -299,6 +300,55 @@ pub const RaftApplyStore = struct {
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
         return try shard_state_store.buildSnapshot(&self.store, alloc, group_id);
+    }
+
+    const PreparedSnapshot = struct {
+        owner: *RaftApplyStore,
+        txn: docstore.DocStore.Txn,
+        group_id: u64,
+
+        fn source(self: *@This()) raft_engine.runtime.storage_iface.SnapshotSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .materialize = materialize,
+                    .deinit = PreparedSnapshot.deinit,
+                },
+            };
+        }
+
+        fn materialize(ptr: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try shard_state_store.buildSnapshotTxn(&self.txn, alloc, self.group_id);
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.txn.abort();
+            std.heap.page_allocator.destroy(self);
+        }
+    };
+
+    fn prepareSnapshot(ptr: *anyopaque, group_id: u64, applied_index: u64) !?raft_engine.runtime.storage_iface.SnapshotSource {
+        const self: *RaftApplyStore = @ptrCast(@alignCast(ptr));
+        var txn = try self.store.beginReadTxn();
+        errdefer txn.abort();
+        var key_buf: [128]u8 = undefined;
+        const key = try keyForGroup(&key_buf, group_id);
+        const value = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        if (value.len < @sizeOf(u64)) return error.InvalidDataApplyBatch;
+        if (std.mem.readInt(u64, value[0..8], .little) != applied_index) return error.AppliedSnapshotIndexMismatch;
+
+        const prepared = try std.heap.page_allocator.create(PreparedSnapshot);
+        prepared.* = .{
+            .owner = self,
+            .txn = txn,
+            .group_id = group_id,
+        };
+        return prepared.source();
     }
 
     fn installSnapshotFromRaft(
@@ -924,6 +974,57 @@ test "data raft apply store applies delete operations into group state" {
     try std.testing.expectEqual(@as(usize, 1), group_state.len);
     try std.testing.expectEqualStrings("z", group_state[0].key);
     try std.testing.expectEqualStrings("9", group_state[0].value);
+}
+
+test "data raft apply store prepared snapshot retains its MVCC view across later writes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-prepared-snapshot", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    const first = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{.{
+        .term = 1,
+        .index = 1,
+        .entry_type = .normal,
+        .data = @constCast("put:k=old"),
+    }});
+    defer std.testing.allocator.free(first);
+    try store.snapshotBuilder().applyBatch(.{ .group_id = 78, .commit_index = 1, .entries_bytes = first });
+    const source = (try store.snapshotBuilder().prepareSnapshot(78, 1)) orelse return error.MissingDataSnapshotSource;
+
+    const second = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:k=new") },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:z=later") },
+    });
+    defer std.testing.allocator.free(second);
+    try store.snapshotBuilder().applyBatch(.{ .group_id = 78, .commit_index = 3, .entries_bytes = second });
+
+    const Worker = struct {
+        source: raft_engine.runtime.storage_iface.SnapshotSource,
+        snapshot: ?[]u8 = null,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            defer self.source.deinit();
+            self.snapshot = self.source.materialize(std.heap.page_allocator) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var worker = Worker{ .source = source };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    thread.join();
+    if (worker.failure) |err| return err;
+    const encoded = worker.snapshot orelse return error.MissingDataSnapshot;
+    defer std.heap.page_allocator.free(encoded);
+    var snapshot = try shard_state_store.decodeGroupStateSnapshotAlloc(std.testing.allocator, encoded);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.entries.len);
+    try std.testing.expectEqualStrings("k", snapshot.entries[0].key);
+    try std.testing.expectEqualStrings("old", snapshot.entries[0].value);
 }
 
 test "data raft apply store orders independent groups through separate shards" {
