@@ -800,6 +800,7 @@ const dense_catch_up_startup_max_chunk_bytes_default: u64 = 512 * 1024;
 const graph_repair_rebuild_batch_size: usize = 2048;
 var test_graph_repair_stream_flushes: std.atomic.Value(u64) = .init(0);
 var test_dense_repair_rebuild_batch_size: ?usize = null;
+var test_index_repair_catch_up_max_records_per_window: ?usize = null;
 const dense_posting_idle_default_max_postings_per_index: usize = 64;
 const dense_posting_idle_default_max_layout_changes_per_index: usize = 8;
 const dense_posting_idle_default_max_boundary_reassignments_per_index: usize = 64;
@@ -9906,16 +9907,18 @@ pub const DB = struct {
         var observed_ns_per_sequence: u64 = 0;
         var catch_up_start_sequence = build_floor_sequence;
         var catch_up_start_ns = monotonicTimeNs();
-        var converged_sequence = try self.catchUpShadowReplacementUntil(
+        const initial_catch_up_target = self.core.nextDerivedSequence();
+        const initial_catch_up = try self.catchUpShadowReplacementUntil(
             alloc,
             &shadow_manager,
             shadow_checkpoint_path,
             index_ref,
-            self.core.nextDerivedSequence(),
+            initial_catch_up_target,
             options,
             null,
             0,
         );
+        var converged_sequence = initial_catch_up.applied_sequence;
         if (options.capacity_check) |check| {
             try check.current(try directoryUsageBytes(alloc, shadow_base));
         }
@@ -9925,6 +9928,18 @@ pub const DB = struct {
             converged_sequence,
             elapsedSince(catch_up_start_ns),
         );
+        if (initial_catch_up.yielded) {
+            if (durable_repair_id) |repair_id| try self.updateIndexRepairIntent(alloc, repair_id, .{
+                .phase = .catching_up,
+                .candidate_applied_sequence = converged_sequence,
+                .target_sequence = initial_catch_up_target,
+                .failure_streak = 0,
+                .next_retry_at_ms = 0,
+                .replace_last_error = true,
+            });
+            candidate_reopenable = durable_repair_id != null;
+            return .{ .reprocessed = reprocessed_this_pass, .yielded = true };
+        }
         try index_generation_manifest.writeReady(
             alloc,
             shadow_index_path,
@@ -9969,7 +9984,7 @@ pub const DB = struct {
             });
             catch_up_start_sequence = converged_sequence;
             catch_up_start_ns = monotonicTimeNs();
-            converged_sequence = try self.catchUpShadowReplacementUntil(
+            const convergence_catch_up = try self.catchUpShadowReplacementUntil(
                 alloc,
                 &shadow_manager,
                 shadow_checkpoint_path,
@@ -9979,6 +9994,7 @@ pub const DB = struct {
                 null,
                 0,
             );
+            converged_sequence = convergence_catch_up.applied_sequence;
             if (options.capacity_check) |check| {
                 try check.current(try directoryUsageBytes(alloc, shadow_base));
             }
@@ -9988,6 +10004,18 @@ pub const DB = struct {
                 converged_sequence,
                 elapsedSince(catch_up_start_ns),
             );
+            if (convergence_catch_up.yielded) {
+                if (durable_repair_id) |repair_id| try self.updateIndexRepairIntent(alloc, repair_id, .{
+                    .phase = .catching_up,
+                    .candidate_applied_sequence = converged_sequence,
+                    .target_sequence = convergence_target,
+                    .failure_streak = 0,
+                    .next_retry_at_ms = 0,
+                    .replace_last_error = true,
+                });
+                candidate_reopenable = durable_repair_id != null;
+                return .{ .reprocessed = reprocessed_this_pass, .yielded = true };
+            }
             try index_generation_manifest.writeReady(
                 alloc,
                 shadow_index_path,
@@ -10068,7 +10096,7 @@ pub const DB = struct {
             activation_deadline_ns,
             max_activation_pause_ns,
         ) orelse return error.ShadowIndexCatchUpIncomplete;
-        const reached_target = self.catchUpShadowReplacementUntil(
+        const activation_catch_up = self.catchUpShadowReplacementUntil(
             alloc,
             &shadow_manager,
             shadow_checkpoint_path,
@@ -10081,6 +10109,8 @@ pub const DB = struct {
             error.CatchUpDeadlineExceeded => return error.ShadowIndexCatchUpIncomplete,
             else => return err,
         };
+        std.debug.assert(!activation_catch_up.yielded);
+        const reached_target = activation_catch_up.applied_sequence;
         if (reached_target < final_target) return error.ShadowIndexCatchUpIncomplete;
         // The artifact counter is maintained in the same fenced primary write
         // stream and is O(1) to read. Checking it only after final replay makes
@@ -10233,6 +10263,11 @@ pub const DB = struct {
         };
     }
 
+    const ShadowCatchUpResult = struct {
+        applied_sequence: u64,
+        yielded: bool = false,
+    };
+
     fn catchUpShadowReplacementUntil(
         self: *DB,
         alloc: Allocator,
@@ -10243,8 +10278,12 @@ pub const DB = struct {
         options: types.ArtifactRepairRunOptions,
         deadline_ns: ?u64,
         observed_ns_per_sequence: u64,
-    ) !u64 {
-        if (target_sequence == 0) return 0;
+    ) !ShadowCatchUpResult {
+        if (target_sequence == 0) return .{ .applied_sequence = 0 };
+        // Cooperative yielding is only valid before activation fencing. Final
+        // replay has its own hard deadline and must either reach that target or
+        // abort activation while the write/search barriers remain held.
+        const cooperative = deadline_ns == null and options.yield_check != null;
         var batch_ctx = self.batchContext();
         batch_ctx.index_manager = shadow_manager;
         batch_ctx.applied_sequence_checkpoint_path = shadow_checkpoint_path;
@@ -10267,7 +10306,10 @@ pub const DB = struct {
                 .dense_bulk_session_scope = .external,
             };
             const remaining_sequences = target_sequence -| applied;
-            var max_records_per_window = derived_worker.catch_up_max_records_per_window_default;
+            var max_records_per_window = if (comptime builtin.is_test)
+                test_index_repair_catch_up_max_records_per_window orelse derived_worker.catch_up_max_records_per_window_default
+            else
+                derived_worker.catch_up_max_records_per_window_default;
             var max_items_per_window: usize = 0;
             if (deadline_ns) |deadline| {
                 const now = monotonicTimeNs();
@@ -10297,6 +10339,12 @@ pub const DB = struct {
                     .target_sequence = target_sequence,
                     .max_records_per_window = max_records_per_window,
                     .max_items_per_window = max_items_per_window,
+                    // One independently durable window lets the owner inspect
+                    // its cooperative deadline without adding a clock read to
+                    // every replay record or changing the ordinary catch-up
+                    // path. The outer loop immediately reopens from the saved
+                    // applied sequence while budget remains.
+                    .max_windows_per_call = if (cooperative) 1 else 0,
                     .deadline_ns = deadline_ns,
                 },
             );
@@ -10308,9 +10356,12 @@ pub const DB = struct {
                 }
                 break :blk applied;
             };
-            if (advanced <= applied) return applied;
+            if (advanced <= applied) return .{ .applied_sequence = applied };
             try self.saveShadowReplacementAppliedSequence(alloc, shadow_manager, shadow_checkpoint_path, index_ref, advanced);
             applied = advanced;
+            if (cooperative and applied < target_sequence and options.yield_check.?.requested()) {
+                return .{ .applied_sequence = applied, .yielded = true };
+            }
             if (deadline_ns) |deadline| {
                 if (applied < target_sequence and monotonicTimeNs() >= deadline) {
                     return error.ShadowIndexCatchUpIncomplete;
@@ -10318,7 +10369,7 @@ pub const DB = struct {
             }
         }
         try checkArtifactRepairCancelled(options);
-        return applied;
+        return .{ .applied_sequence = applied };
     }
 
     fn observeRepairCatchUpCost(previous_ns_per_sequence: u64, from_sequence: u64, to_sequence: u64, elapsed_ns: u64) u64 {
@@ -57358,6 +57409,8 @@ test "db dense repair durably yields and resumes a reopenable building candidate
     defer cleanupTempDir(path);
     test_dense_repair_rebuild_batch_size = 1;
     defer test_dense_repair_rebuild_batch_size = null;
+    test_index_repair_catch_up_max_records_per_window = 1;
+    defer test_index_repair_catch_up_max_records_per_window = null;
 
     const cfg: types.IndexConfig = .{
         .name = "dense_idx",
@@ -57437,9 +57490,13 @@ test "db dense repair durably yields and resumes a reopenable building candidate
         // candidate from zero.
         try db.batch(.{
             .writes = &.{.{ .key = "doc:0", .value = "{\"title\":\"zero\",\"_embeddings\":{\"dense_idx\":[1,0,1]}}" }},
-            .deletes = &.{"doc:d"},
             .sync_level = .write,
         });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"bravo-updated\",\"_embeddings\":{\"dense_idx\":[0,1,1]}}" }},
+            .sync_level = .write,
+        });
+        try db.batch(.{ .deletes = &.{"doc:d"}, .sync_level = .write });
     }
     defer alloc.free(candidate_path);
 
@@ -57455,16 +57512,43 @@ test "db dense repair durably yields and resumes a reopenable building candidate
         candidate.close();
     }
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{
+    var documents_reprocessed: u64 = 1;
+    var observed_catch_up_yield = false;
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reopened.close();
+        for (0..16) |_| {
+            const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, options);
+            documents_reprocessed += step.documents_reprocessed;
+            try std.testing.expect(!step.repaired);
+            try std.testing.expect(step.busy);
+            try std.testing.expect(!step.terminal);
+            var state = try reopened.loadIndexRepairEntryById(alloc, repair_id);
+            defer state.deinit(alloc);
+            if (state.intent.phase == .catching_up) {
+                try std.testing.expect(state.intent.candidate_applied_sequence > state.intent.build_floor_sequence);
+                observed_catch_up_yield = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(observed_catch_up_yield);
+
+    // Reopen from the durable replay checkpoint, proving a yielded catch-up
+    // turn is independently restartable just like a yielded source scan.
+    var final_reopened = try DB.open(alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer reopened.close();
+    defer final_reopened.close();
     var repaired = false;
-    var documents_reprocessed: u64 = 1;
     for (0..16) |_| {
-        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, options);
+        const step = try final_reopened.advanceIndexRepairIntent(alloc, repair_id, options);
         documents_reprocessed += step.documents_reprocessed;
         if (step.repaired) {
             repaired = true;
@@ -57478,9 +57562,9 @@ test "db dense repair durably yields and resumes a reopenable building candidate
     // deleted); doc:0 arrived through replay and is intentionally not counted
     // as snapshot-reprocessed work.
     try std.testing.expectEqual(@as(u64, 3), documents_reprocessed);
-    try std.testing.expect(!try reopened.hasPendingIndexRepairIntents(alloc));
+    try std.testing.expect(!try final_reopened.hasPendingIndexRepairIntents(alloc));
 
-    var result = try reopened.search(alloc, .{
+    var result = try final_reopened.search(alloc, .{
         .index_name = cfg.name,
         .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 4 } },
         .limit = 4,

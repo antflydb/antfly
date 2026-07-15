@@ -43,12 +43,13 @@ Implemented in the current tree:
   advance. Allocation failure is logged, counted, scheduler-backed off, and
   leaves the cursor on the same route instead of silently degrading exact debt
   notification into a full fallback rotation
-- large dense candidate scans are cooperatively time-sliced by the
-  `BackendRuntime` owner. Every slice uses streaming publication, durably closes
-  the candidate, and checkpoints the source-store cursor plus cumulative
-  progress before releasing the one-per-node repair slot. Restart or ownership
-  transfer reopens that candidate and resumes strictly after the durable cursor;
-  a crash before cursor publication safely replays the last idempotent slice
+- large dense candidate scans and pre-activation replay catch-up are
+  cooperatively time-sliced by the `BackendRuntime` owner. Scan slices use
+  streaming publication and checkpoint the source-store cursor; catch-up
+  checkpoints the applied sequence after each bounded replay window. Both leave
+  the candidate reopenable before releasing the one-per-node repair slot.
+  Restart or ownership transfer resumes from the durable cursor/checkpoint; a
+  crash before publication safely repeats the last idempotent unit
 - retry backoff uses a separate durable consecutive-failure streak; successful
   slices reset it, so a large repair's lifetime attempt count cannot turn its
   first later transient failure into the maximum ten-minute delay
@@ -1220,9 +1221,12 @@ time-sliced at reopenable publication boundaries: the source cursor is advanced
 only after the candidate slice is durable, and the linked group cursor then
 rotates the node slot. The production default is a 15-second scheduler budget;
 the scan observes it only after a resource-sized batch, avoiding per-document
-clock calls. Other index families retain their existing bounded/cancellable
-builders and require the same largest-incident SLO proof before higher
-concurrency is enabled.
+clock calls. Pre-activation replay observes the same budget after each durable
+replay window. Final replay while activation fences are held does not yield; it
+remains bounded by the activation deadline and aborts the swap if it cannot
+converge. Other index families retain their existing bounded/cancellable builders
+and require the same largest-incident SLO proof before higher concurrency is
+enabled.
 
 The scheduler publishes queue depth, oldest-intent age, bounded-scan work,
 attempt outcomes, disk-admission waits, and current/peak resource-manager disk
@@ -1263,7 +1267,8 @@ ordering makes queue notification and cursor advancement one logical outcome
 without putting the fallback cursor itself on the durability path. The periodic
 discovery anchor is rewound on that failure, so the same cursor becomes eligible
 as soon as scheduler backoff expires rather than waiting another discovery
-interval.
+interval. The same rewind applies when fallback candidate allocation or
+failure-backoff enqueue cannot allocate.
 
 Lost-wakeup reconciliation uses a compact node-local routing index rebuilt only
 when the metadata epoch changes. Steady-state passes neither clone nor free the
@@ -1719,6 +1724,7 @@ Use at least:
 - multiple dense indexes and multiple active groups per node
 - forced termination during an active session
 - repeated cooperative yield/reopen cycles during a candidate snapshot build
+- repeated cooperative yield/reopen cycles during pre-activation replay catch-up
 
 Record the baseline and candidate commit IDs, build mode, backend and durability
 configuration, dataset/version and random seeds, CPU model/count, memory, disk,

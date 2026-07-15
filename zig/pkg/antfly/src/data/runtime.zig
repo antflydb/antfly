@@ -6962,6 +6962,13 @@ pub const DataServer = struct {
         self.provisioned_index_repair_dirty.store(true, .release);
     }
 
+    fn retainProvisionedIndexRepairFallbackForRetry(self: *DataServer, now_ms: u64) void {
+        self.provisioned_index_repair_last_fallback_at_ms.store(
+            indexRepairFallbackRetryAnchor(now_ms, self.provisioned_index_repair_discovery_interval_ms),
+            .monotonic,
+        );
+    }
+
     fn clearProvisionedIndexRepairSchedulerFailure(self: *DataServer) void {
         self.provisioned_index_repair_scheduler_failure_count.store(0, .release);
         self.provisioned_index_repair_scheduler_not_before_ms.store(0, .release);
@@ -7623,6 +7630,7 @@ pub const DataServer = struct {
                 }) catch |err| {
                     _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
                     self.recordProvisionedIndexRepairSchedulerFailure(now_ms);
+                    self.retainProvisionedIndexRepairFallbackForRetry(now_ms);
                     std.log.warn("provisioned index repair fallback allocation failed err={s}", .{@errorName(err)});
                     return;
                 };
@@ -7681,6 +7689,7 @@ pub const DataServer = struct {
                 found_pending = true;
                 const retry_at_ms = self.deferProvisionedIndexRepairAfterFailureForTable(table_name, group_id) catch |queue_err| {
                     self.recordProvisionedIndexRepairSchedulerFailure(now_ms);
+                    if (!candidate.queued) self.retainProvisionedIndexRepairFallbackForRetry(now_ms);
                     std.log.warn(
                         "provisioned index repair failure backoff could not be queued group={} table={s} err={s}",
                         .{ group_id, table_name, @errorName(queue_err) },
@@ -7702,10 +7711,7 @@ pub const DataServer = struct {
                     _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
                     self.recordProvisionedIndexRepairSchedulerFailure(now_ms);
                     if (!candidate.queued) {
-                        self.provisioned_index_repair_last_fallback_at_ms.store(
-                            indexRepairFallbackRetryAnchor(now_ms, self.provisioned_index_repair_discovery_interval_ms),
-                            .monotonic,
-                        );
+                        self.retainProvisionedIndexRepairFallbackForRetry(now_ms);
                     }
                     std.log.warn(
                         "provisioned index repair pending group could not be requeued group={} table={s} err={s}",
