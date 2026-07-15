@@ -303,6 +303,18 @@ pub const TextRun = struct {
     }
 };
 
+pub const PageTextAnalysis = struct {
+    text: []u8,
+    runs: []TextRun,
+
+    pub fn deinit(self: *PageTextAnalysis, alloc: Allocator) void {
+        alloc.free(self.text);
+        for (self.runs) |*run| run.deinit(alloc);
+        if (self.runs.len > 0) alloc.free(self.runs);
+        self.* = undefined;
+    }
+};
+
 pub const ImageRun = struct {
     rgba: []u8,
     width: u32,
@@ -1248,9 +1260,44 @@ pub const Reader = struct {
             for (fonts) |*font| font.deinit(self.alloc);
             self.alloc.free(fonts);
         }
+        const forms = try self.collectPageFormsAlloc(&page);
+        defer {
+            for (forms) |*form| form.deinit(self.alloc);
+            self.alloc.free(forms);
+        }
 
         const contents = page.get("Contents") orelse return try self.alloc.dupe(u8, "");
-        return try self.extractContentsTextAlloc(contents, fonts);
+        return try self.extractContentsTextAlloc(contents, fonts, forms);
+    }
+
+    /// Extracts canonical page text and positioned text runs while sharing the
+    /// page object, resource collection, content stream resolution, and stream
+    /// decoding work between both representations.
+    pub fn extractPageTextAnalysisAlloc(self: *const Reader, page_num: usize) !PageTextAnalysis {
+        var page = try self.readPageObject(page_num);
+        defer page.deinit(self.alloc);
+
+        const fonts = try self.collectPageFontsAlloc(&page);
+        defer {
+            for (fonts) |*font| font.deinit(self.alloc);
+            self.alloc.free(fonts);
+        }
+        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        defer {
+            for (gstates) |*gstate| gstate.deinit(self.alloc);
+            self.alloc.free(gstates);
+        }
+        const forms = try self.collectPageFormsAlloc(&page);
+        defer {
+            for (forms) |*form| form.deinit(self.alloc);
+            self.alloc.free(forms);
+        }
+
+        const contents = page.get("Contents") orelse return .{
+            .text = try self.alloc.dupe(u8, ""),
+            .runs = try self.alloc.alloc(TextRun, 0),
+        };
+        return try self.extractContentsTextAnalysisAlloc(contents, fonts, gstates, forms);
     }
 
     pub fn extractPageTextRunsAlloc(self: *const Reader, page_num: usize) ![]TextRun {
@@ -1910,7 +1957,7 @@ pub const Reader = struct {
         }
     }
 
-    fn extractContentsTextAlloc(self: *const Reader, contents: *const syntax.Object, fonts: []const PageFont) ![]u8 {
+    fn extractContentsTextAlloc(self: *const Reader, contents: *const syntax.Object, fonts: []const PageFont, forms: []const PageForm) ![]u8 {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
 
@@ -1920,7 +1967,7 @@ pub const Reader = struct {
             self.alloc.free(streams);
         }
         for (streams) |*stream| {
-            const chunk = try self.extractSingleContentTextAlloc(stream, fonts);
+            const chunk = try self.extractSingleContentTextAlloc(stream, fonts, forms);
             defer self.alloc.free(chunk);
             try out.appendSlice(self.alloc, chunk);
         }
@@ -1928,10 +1975,45 @@ pub const Reader = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn extractSingleContentTextAlloc(self: *const Reader, obj: *const syntax.Object, fonts: []const PageFont) ![]u8 {
+    fn extractContentsTextAnalysisAlloc(
+        self: *const Reader,
+        contents: *const syntax.Object,
+        fonts: []const PageFont,
+        gstates: []const PageExtGState,
+        forms: []const PageForm,
+    ) !PageTextAnalysis {
+        var text = std.ArrayList(u8).empty;
+        errdefer text.deinit(self.alloc);
+        var runs = std.ArrayList(TextRun).empty;
+        errdefer {
+            for (runs.items) |*run| run.deinit(self.alloc);
+            runs.deinit(self.alloc);
+        }
+
+        const streams = try self.collectContentStreamsAlloc(contents);
+        defer {
+            for (streams) |*stream| stream.deinit(self.alloc);
+            self.alloc.free(streams);
+        }
+        for (streams) |*stream| {
+            const decoded = try self.readDecodedStreamData(stream);
+            defer self.alloc.free(decoded);
+            const chunk = try extractTextFromContentAlloc(self.alloc, decoded, fonts, forms, 0);
+            defer self.alloc.free(chunk);
+            try text.appendSlice(self.alloc, chunk);
+            try extractTextRunsFromContentAppend(self.alloc, &runs, decoded, fonts, gstates, forms);
+        }
+
+        const owned_text = try text.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(owned_text);
+        const owned_runs = try runs.toOwnedSlice(self.alloc);
+        return .{ .text = owned_text, .runs = owned_runs };
+    }
+
+    fn extractSingleContentTextAlloc(self: *const Reader, obj: *const syntax.Object, fonts: []const PageFont, forms: []const PageForm) ![]u8 {
         const decoded = try self.readDecodedStreamData(obj);
         defer self.alloc.free(decoded);
-        return try extractTextFromContentAlloc(self.alloc, decoded, fonts);
+        return try extractTextFromContentAlloc(self.alloc, decoded, fonts, forms, 0);
     }
 
     fn extractSingleContentTextRunsAppend(self: *const Reader, out: *std.ArrayList(TextRun), obj: *const syntax.Object, fonts: []const PageFont, gstates: []const PageExtGState, forms: []const PageForm) !void {
@@ -5333,7 +5415,14 @@ fn parseHexToUtf8Alloc(alloc: Allocator, hex: []const u8) ![]u8 {
     return try alloc.dupe(u8, buf[0..n]);
 }
 
-fn extractTextFromContentAlloc(alloc: Allocator, bytes: []const u8, fonts: []const PageFont) ![]u8 {
+fn extractTextFromContentAlloc(
+    alloc: Allocator,
+    bytes: []const u8,
+    fonts: []const PageFont,
+    forms: []const PageForm,
+    form_depth: usize,
+) anyerror![]u8 {
+    if (form_depth > 128) return error.InvalidContents;
     var scanner = syntax.Scanner.init(alloc, bytes);
     defer scanner.deinit();
 
@@ -5356,7 +5445,7 @@ fn extractTextFromContentAlloc(alloc: Allocator, bytes: []const u8, fonts: []con
 
         if (lex == .eof) break;
         if (lex == .keyword) {
-            try applyTextOperator(alloc, &out, &state, fonts, lex.keyword, operands.items);
+            try applyTextOperator(alloc, &out, &state, fonts, forms, form_depth, lex.keyword, operands.items);
             for (operands.items) |*obj| obj.deinit(alloc);
             operands.clearRetainingCapacity();
             continue;
@@ -5440,6 +5529,8 @@ fn applyTextOperator(
     out: *std.ArrayList(u8),
     state: *TextExtractionState,
     fonts: []const PageFont,
+    forms: []const PageForm,
+    form_depth: usize,
     op: []const u8,
     operands: []const syntax.Object,
 ) !void {
@@ -5480,6 +5571,17 @@ fn applyTextOperator(
         return;
     }
     if (std.mem.eql(u8, op, "T*") or std.mem.eql(u8, op, "ET")) {
+        try appendNewline(alloc, out);
+        return;
+    }
+    if (std.mem.eql(u8, op, "Do")) {
+        if (operands.len == 0 or operands[operands.len - 1] != .name) return;
+        const form = findPageForm(forms, operands[operands.len - 1].name) orelse return;
+        const nested = try extractTextFromContentAlloc(alloc, form.content, form.fonts, form.forms, form_depth + 1);
+        defer alloc.free(nested);
+        if (nested.len == 0) return;
+        try appendNewline(alloc, out);
+        try out.appendSlice(alloc, nested);
         try appendNewline(alloc, out);
     }
 }
@@ -12408,6 +12510,10 @@ test "reader extracts text and shapes through form xobject" {
     var reader = try Reader.init(alloc, out.items);
     defer reader.deinit();
 
+    const page_text = try reader.extractPageTextAlloc(1);
+    defer alloc.free(page_text);
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(alloc);
     const text_runs = try reader.extractPageTextRunsAlloc(1);
     defer {
         for (text_runs) |*run| run.deinit(alloc);
@@ -12419,6 +12525,10 @@ test "reader extracts text and shapes through form xobject" {
         alloc.free(shape_runs);
     }
 
+    try std.testing.expect(std.mem.indexOf(u8, page_text, "Hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, analysis.text, "Hi") != null);
+    try std.testing.expectEqual(@as(usize, 1), analysis.runs.len);
+    try std.testing.expectEqualStrings("Hi", analysis.runs[0].text);
     try std.testing.expectEqual(@as(usize, 1), text_runs.len);
     try std.testing.expectEqualStrings("Hi", text_runs[0].text);
     try std.testing.expectEqual(@as(usize, 1), shape_runs.len);

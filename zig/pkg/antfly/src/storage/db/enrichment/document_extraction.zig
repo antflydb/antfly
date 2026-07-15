@@ -33,6 +33,10 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
                     return error.PdfExtractionUnavailable;
                 }
 
+                pub fn extractPageTextAnalysisAlloc(_: *Reader, _: usize) !PageTextAnalysis {
+                    return error.PdfExtractionUnavailable;
+                }
+
                 pub fn extractPageTextRunsAlloc(_: *const Reader, _: usize) ![]TextRun {
                     return error.PdfExtractionUnavailable;
                 }
@@ -60,6 +64,13 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
                 descent: f64 = 0,
 
                 pub fn deinit(_: *TextRun, _: Allocator) void {}
+            };
+
+            pub const PageTextAnalysis = struct {
+                text: []u8,
+                runs: []TextRun,
+
+                pub fn deinit(_: *PageTextAnalysis, _: Allocator) void {}
             };
         };
 
@@ -431,15 +442,16 @@ fn fontCorruptionScore(text_raw: []const u8) f64 {
     const text = std.mem.trim(u8, text_raw, &std.ascii.whitespace);
     if (text.len < 10) return 0;
     var letters: usize = 0;
-    var upper: usize = 0;
-    var lower: usize = 0;
     var vowels: usize = 0;
     var consonant_runs: usize = 0;
     var consonant_run: usize = 0;
     for (text) |ch| {
-        if (!std.ascii.isAlphabetic(ch)) continue;
+        if (!std.ascii.isAlphabetic(ch)) {
+            if (consonant_run >= 4) consonant_runs += 1;
+            consonant_run = 0;
+            continue;
+        }
         letters += 1;
-        if (std.ascii.isUpper(ch)) upper += 1 else lower += 1;
         if (std.mem.indexOfScalar(u8, "aeiouAEIOU", ch) != null) {
             vowels += 1;
             if (consonant_run >= 4) consonant_runs += 1;
@@ -448,30 +460,38 @@ fn fontCorruptionScore(text_raw: []const u8) f64 {
     }
     if (consonant_run >= 4) consonant_runs += 1;
     if (letters == 0) return 0;
-    var score: f64 = 0;
-    if (upper > 0 and lower > 0) {
-        const upper_ratio = @as(f64, @floatFromInt(upper)) / @as(f64, @floatFromInt(letters));
-        if (upper_ratio > 0.3 and upper_ratio < 0.7) score += 0.3;
-    }
-    var word_count: usize = 0;
+
+    // Only natural-language-looking alphabetic words participate in the font
+    // corruption signal. Financial tables legitimately contain dense runs of
+    // tickers, currency, identifiers, and mixed capitalization; treating those
+    // as prose caused otherwise usable pages to OCR in their entirety.
+    var eligible_word_count: usize = 0;
     var no_vowel_long_words: usize = 0;
     var words = std.mem.tokenizeAny(u8, text, &std.ascii.whitespace);
     while (words.next()) |word_raw| {
-        word_count += 1;
         const word = std.mem.trim(u8, word_raw, ".,!?;:\"'()[]{}$%");
         if (word.len <= 4) continue;
+        var alphabetic = true;
         var has_vowel = false;
-        for (word) |ch| if (std.mem.indexOfScalar(u8, "aeiouAEIOU", ch) != null) {
-            has_vowel = true;
-            break;
-        };
+        for (word) |ch| {
+            if (!std.ascii.isAlphabetic(ch)) {
+                alphabetic = false;
+                break;
+            }
+            if (std.mem.indexOfScalar(u8, "aeiouAEIOU", ch) != null) has_vowel = true;
+        }
+        if (!alphabetic) continue;
+        eligible_word_count += 1;
         if (!has_vowel) no_vowel_long_words += 1;
     }
-    const consonant_ratio = @as(f64, @floatFromInt(consonant_runs)) / @as(f64, @floatFromInt(word_count + 1));
-    if (consonant_runs > 0 and consonant_ratio > 0.3) score += 0.3;
+    if (eligible_word_count < 4) return 0;
+
+    var score: f64 = 0;
+    const consonant_ratio = @as(f64, @floatFromInt(consonant_runs)) / @as(f64, @floatFromInt(eligible_word_count));
+    if (consonant_runs > 0 and consonant_ratio > 0.3) score += 0.4;
     const vowel_ratio = @as(f64, @floatFromInt(vowels)) / @as(f64, @floatFromInt(letters));
-    if (vowel_ratio < 0.15) score += 0.3;
-    if (word_count > 0 and @as(f64, @floatFromInt(no_vowel_long_words)) / @as(f64, @floatFromInt(word_count)) > 0.5) score += 0.2;
+    if (vowel_ratio < 0.15) score += 0.4;
+    if (@as(f64, @floatFromInt(no_vowel_long_words)) / @as(f64, @floatFromInt(eligible_word_count)) > 0.5) score += 0.3;
     return @min(1.0, score);
 }
 
@@ -1199,9 +1219,14 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
         const force_ocr = ocr_mode == .always;
         // `.always` forces the OCR attempt, but the merger still needs the
         // embedded candidate in order to retain whichever text is better.
-        const text = try parsed.extractPageTextAlloc(page_num);
+        const analysis = try parsed.extractPageTextAnalysisAlloc(page_num);
+        defer {
+            for (analysis.runs) |*run| run.deinit(alloc);
+            if (analysis.runs.len > 0) alloc.free(analysis.runs);
+        }
+        const text = analysis.text;
         errdefer alloc.free(text);
-        const text_regions: []TextRegion = try extractPdfTextRegionsAlloc(alloc, &parsed, page_num, text);
+        const text_regions: []TextRegion = try extractPdfTextRegionsFromRunsAlloc(alloc, analysis.runs, text);
         errdefer if (text_regions.len > 0) alloc.free(text_regions);
         const page_box = parsed.extractPageBox(page_num) catch null;
         const page_rotation = parsed.extractPageRotation(page_num) catch null;
@@ -1265,9 +1290,14 @@ fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []cons
         const force_ocr = ocr_mode == .always;
         // Keep embedded text even in forced mode so OCR is not a blind
         // replacement for usable born-digital content.
-        var text = try parsed.extractPageTextAlloc(page_num);
+        const analysis = try parsed.extractPageTextAnalysisAlloc(page_num);
+        defer {
+            for (analysis.runs) |*run| run.deinit(alloc);
+            if (analysis.runs.len > 0) alloc.free(analysis.runs);
+        }
+        var text = analysis.text;
         errdefer alloc.free(text);
-        var text_regions: []TextRegion = try extractPdfTextRegionsAlloc(alloc, &parsed, page_num, text);
+        var text_regions: []TextRegion = try extractPdfTextRegionsFromRunsAlloc(alloc, analysis.runs, text);
         errdefer if (text_regions.len > 0) alloc.free(text_regions);
         const page_text_len = text.len;
         const page_box = parsed.extractPageBox(page_num) catch null;
@@ -1319,18 +1349,12 @@ fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []cons
     try sink.on_end(sink.ptr);
 }
 
-fn extractPdfTextRegionsAlloc(
+fn extractPdfTextRegionsFromRunsAlloc(
     alloc: Allocator,
-    parsed: *const pdf.reader.Reader,
-    page_num: usize,
+    runs: []const pdf.reader.TextRun,
     page_text: []const u8,
 ) ![]TextRegion {
     if (page_text.len == 0) return &.{};
-    const runs = try parsed.extractPageTextRunsAlloc(page_num);
-    defer {
-        for (runs) |*run| run.deinit(alloc);
-        if (runs.len > 0) alloc.free(runs);
-    }
 
     var regions = std.ArrayListUnmanaged(TextRegion).empty;
     defer regions.deinit(alloc);
@@ -3282,6 +3306,21 @@ test "OCR quality fallback covers born digital scanned garbled and encoding fail
 
     const replacement = assessOcrQuality("Readable source text that is long enough but contains replacement markers \u{fffd} \u{fffd} \u{fffd} \u{fffd} \u{fffd} \u{fffd}.", config);
     try std.testing.expect(replacement.replacement_corrupted);
+
+    const financial_table = assessOcrQuality(
+        "JPMORGAN CHASE & CO. CONSOLIDATED FINANCIAL HIGHLIGHTS\n" ++
+            "NET REVENUE $33,119 $30,161 10% TOTAL ASSETS $3,689,336 $3,386,071",
+        config,
+    );
+    try std.testing.expect(!financial_table.font_corrupted);
+    try std.testing.expect(!financial_table.needsFallback());
+
+    const font_garbled = assessOcrQuality(
+        "Qzxvbnm Plkghjkl Mnbvcxz Trwqplkj Bcdfghjk\n" ++
+            "Zxcvbnml Qwrtplkj Hgfdsqwr Mnbvcxzl Plkjhgfd",
+        config,
+    );
+    try std.testing.expect(font_garbled.font_corrupted);
 
     try std.testing.expectEqual(@as(u8, 4), (OcrQuality{
         .too_short = true,
