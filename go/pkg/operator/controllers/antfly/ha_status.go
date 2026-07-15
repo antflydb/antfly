@@ -160,6 +160,8 @@ type haPlannedAction struct {
 	TopologyID                       string
 	TopologyGeneration               int64
 	TopologyNodeID                   string
+	SourcePVCName                    string
+	SourcePVCUID                     string
 	TargetPVCName                    string
 	TargetPVCUID                     string
 	TargetLocalNodeID                uint64
@@ -1053,6 +1055,7 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 		}
 		haBindSeedCaptureResult(&action, status)
 		haBindSeedArtifactProtections(&action, status)
+		haBindSeedSourcePVCName(&action, ha)
 		haBindSeedTopology(&action, ha)
 		haBindFormerPrimaryTopology(&action, ha)
 		adminMethod, adminPath := haAdminOperation(action)
@@ -1085,6 +1088,8 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 			TopologyID:                       action.TopologyID,
 			TopologyGeneration:               action.TopologyGeneration,
 			TopologyNodeID:                   action.TopologyNodeID,
+			SourcePVCName:                    action.SourcePVCName,
+			SourcePVCUID:                     action.SourcePVCUID,
 			TargetPVCName:                    action.TargetPVCName,
 			TargetPVCUID:                     action.TargetPVCUID,
 			TargetLocalNodeID:                action.TargetLocalNodeID,
@@ -1133,6 +1138,17 @@ func haBindFormerPrimaryTopology(action *haPlannedAction, ha *antflyv1.HighAvail
 	action.TopologyNodeID = nodeID
 	action.TargetPVCName = strings.TrimSpace(artifact.TargetPVC.ClaimName)
 	action.TargetPVCUID = targetPVCUID
+}
+
+func haBindSeedSourcePVCName(action *haPlannedAction, ha *antflyv1.HighAvailabilitySpec) {
+	if action == nil || ha == nil || !haPlannedActionKindUsesSeedSourceAuthority(action.Kind) {
+		return
+	}
+	standby, ok := haStandbySpecByName(ha, strings.TrimSpace(action.StandbyName))
+	if !ok || standby.SeedArtifact == nil || standby.SeedArtifact.SourcePVC == nil {
+		return
+	}
+	action.SourcePVCName = strings.TrimSpace(standby.SeedArtifact.SourcePVC.ClaimName)
 }
 
 func haBindSeedTopology(action *haPlannedAction, ha *antflyv1.HighAvailabilitySpec) {
@@ -1301,6 +1317,14 @@ func haPreservePlannedActionExecution(action antflyv1.HAPlannedActionStatus, sta
 		if !haSamePlannedActionIdentity(action, previous) {
 			continue
 		}
+		if haPlannedActionKindUsesSeedSourceAuthority(haActionKind(action.Kind)) &&
+			strings.TrimSpace(action.SourcePVCName) != "" && action.SourcePVCName == previous.SourcePVCName &&
+			strings.TrimSpace(action.SourcePVCUID) == "" {
+			// The live Kubernetes UID is frozen at the execution boundary rather
+			// than accepted from spec. Preserve that exact incarnation across pure
+			// replans only while the declarative source claim name is unchanged.
+			action.SourcePVCUID = previous.SourcePVCUID
+		}
 		if haActionKind(previous.Kind) == haActionDemoteFormerPrimary &&
 			previous.AdminJobPhase == haAdminJobPhaseSucceeded &&
 			!haFormerPrimaryDemotePreserveAllowed(status, previous) {
@@ -1370,9 +1394,12 @@ func haPlannedActionExecutionStarted(action antflyv1.HAPlannedActionStatus) bool
 }
 
 // haPlannedActionOperationID intentionally excludes mutable observations
-// (TargetLSN, ObservedLSN, RetainedFromLSN, FenceReason, Reason, and argv hints).
-// Those values remain frozen in the persisted action payload after execution
-// begins, but they do not create an unbounded stream of new retry identities.
+// (TargetLSN, ObservedLSN, RetainedFromLSN, FenceReason, Reason, argv hints, and
+// the live-observed source PVC identity). Those values remain frozen in the
+// persisted action payload after execution begins, but they do not create an
+// unbounded stream of new retry identities. The source PVC UID is preserved
+// only while its declarative claim name remains unchanged and is revalidated at
+// the execution boundary.
 func haPlannedActionOperationID(action antflyv1.HAPlannedActionStatus) string {
 	if strings.TrimSpace(action.SeedArtifactCaptureRoot) == "" && strings.TrimSpace(action.TopologyID) == "" &&
 		action.TopologyGeneration == 0 && strings.TrimSpace(action.TopologyNodeID) == "" &&
@@ -1568,6 +1595,8 @@ func haSamePlannedActionOperation(a antflyv1.HAPlannedActionStatus, b antflyv1.H
 		a.TopologyID == b.TopologyID &&
 		a.TopologyGeneration == b.TopologyGeneration &&
 		a.TopologyNodeID == b.TopologyNodeID &&
+		a.SourcePVCName == b.SourcePVCName &&
+		a.SourcePVCUID == b.SourcePVCUID &&
 		a.TargetPVCName == b.TargetPVCName &&
 		a.TargetPVCUID == b.TargetPVCUID &&
 		a.TargetLocalNodeID == b.TargetLocalNodeID &&
@@ -1815,6 +1844,12 @@ func haPlannedActionKindIsPortableArtifact(kind haActionKind) bool {
 		kind == haActionActivateSeedArtifact ||
 		kind == haActionGCTargetSeedGenerations ||
 		kind == haActionPruneSeedArtifacts
+}
+
+func haPlannedActionKindUsesSeedSourceAuthority(kind haActionKind) bool {
+	return kind == haActionCaptureSeedArtifact ||
+		haPlannedActionKindIsPortableArtifact(kind) ||
+		kind == haActionActivateSeededSlot
 }
 
 func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIdentitySpec, status *antflyv1.HAStatus) []string {

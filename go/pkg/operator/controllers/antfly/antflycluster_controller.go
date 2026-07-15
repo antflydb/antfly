@@ -4260,6 +4260,13 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 	for i := range cluster.Status.HAStatus.PlannedActions {
 		haBindPlannedActionToFrozenPrimaryBoundary(cluster.Status.HAStatus, &cluster.Status.HAStatus.PlannedActions[i])
 	}
+	sourceAuthorityChanged, err := r.bindHASeedSourcePVCAuthority(ctx, cluster)
+	if err != nil {
+		return err
+	}
+	if sourceAuthorityChanged {
+		return errHAPlanNeedsPersistence
+	}
 	if err := r.requirePersistedHADirectActionPlan(ctx, cluster); err != nil {
 		return err
 	}
@@ -4377,6 +4384,63 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 		}
 	}
 	return nil
+}
+
+func (r *AntflyClusterReconciler) bindHASeedSourcePVCAuthority(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
+	if r == nil || r.Client == nil || cluster == nil || cluster.Status.HAStatus == nil {
+		return false, nil
+	}
+	resolvedUIDs := make(map[string]string)
+	changed := false
+	for i := range cluster.Status.HAStatus.PlannedActions {
+		action := &cluster.Status.HAStatus.PlannedActions[i]
+		if !haPlannedActionKindUsesSeedSourceAuthority(haActionKind(action.Kind)) ||
+			strings.TrimSpace(action.TopologyID) == "" {
+			continue
+		}
+		artifact := haSeedArtifactForAction(cluster, *action)
+		if artifact == nil || artifact.SourcePVC == nil || artifact.TargetPVC == nil {
+			return false, fmt.Errorf("HA %s requires distinct configured source and target PVCs", action.Kind)
+		}
+		sourceName := strings.TrimSpace(artifact.SourcePVC.ClaimName)
+		if sourceName == "" || sourceName == strings.TrimSpace(artifact.TargetPVC.ClaimName) {
+			return false, fmt.Errorf("HA %s requires one distinct configured source PVC", action.Kind)
+		}
+		if action.TopologyGeneration <= 0 || strings.TrimSpace(action.TopologyNodeID) == "" ||
+			strings.TrimSpace(action.TargetPVCName) == "" || strings.TrimSpace(action.TargetPVCUID) == "" ||
+			action.TopologyID != strings.TrimSpace(artifact.TopologyID) ||
+			action.TopologyGeneration != artifact.TopologyGeneration ||
+			action.TopologyNodeID != strings.TrimSpace(artifact.NodeID) ||
+			action.TargetPVCName != strings.TrimSpace(artifact.TargetPVC.ClaimName) ||
+			action.TargetPVCUID != strings.TrimSpace(artifact.TargetPVCUID) {
+			return false, fmt.Errorf("HA %s source PVC authority belongs to a stale topology or target incarnation", action.Kind)
+		}
+		if existing := strings.TrimSpace(action.SourcePVCName); existing != "" && existing != sourceName {
+			return false, fmt.Errorf("HA %s source PVC identity is stale: planned name %s, live name %s", action.Kind, existing, sourceName)
+		}
+		uid, ok := resolvedUIDs[sourceName]
+		if !ok {
+			pvc := &corev1.PersistentVolumeClaim{}
+			key := types.NamespacedName{Name: sourceName, Namespace: cluster.Namespace}
+			if err := r.Get(ctx, key, pvc); err != nil {
+				return false, fmt.Errorf("read source PVC %s for HA seed authority: %w", sourceName, err)
+			}
+			uid = strings.TrimSpace(string(pvc.UID))
+			if uid == "" {
+				return false, fmt.Errorf("HA source PVC %s has no durable UID", sourceName)
+			}
+			resolvedUIDs[sourceName] = uid
+		}
+		if existing := strings.TrimSpace(action.SourcePVCUID); existing != "" && existing != uid {
+			return false, fmt.Errorf("HA %s source PVC identity is stale: planned UID %s, live UID %s", action.Kind, existing, uid)
+		}
+		if action.SourcePVCName != sourceName || action.SourcePVCUID != uid {
+			action.SourcePVCName = sourceName
+			action.SourcePVCUID = uid
+			changed = true
+		}
+	}
+	return changed, nil
 }
 
 func (r *AntflyClusterReconciler) requirePersistedHADirectActionPlan(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
