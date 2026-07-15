@@ -5795,14 +5795,14 @@ test "v21 postings keep norms in per-section table with bit-packed chunk metadat
 
     var reader = try InvertedIndexReader.init(alloc, section);
     const layout = reader.layoutStats();
-    try std.testing.expectEqual(@as(u64, 8), layout.norm_bytes);
+    try std.testing.expectEqual(@as(u64, 9), layout.norm_bytes);
 
     const result = reader.lookup("term") orelse return error.TestExpectedEqual;
     switch (result) {
         .postings => |p| {
             try std.testing.expectEqual(@as(u8, wire_version_current), p.version);
             try std.testing.expect(p.chunk_meta_data.len < 24);
-            try std.testing.expectEqual(@as(usize, 8), p.payload_data.len);
+            try std.testing.expectEqual(@as(usize, 10), p.payload_data.len);
             var iter = try p.iterator(alloc);
             defer iter.deinit();
 

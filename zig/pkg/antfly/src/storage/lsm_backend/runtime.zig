@@ -3194,7 +3194,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 self.mutable = .{};
                 self.bulk_appends.deinit(self.allocator);
                 self.bulk_appends = .{};
-                self.invalidateCursorSnapshot();
+                self.invalidateCursorSnapshotLocked();
                 releaseHeldValues(&self.held_values, self.allocator);
                 self.backend.finishBatchMode(self.batch_options);
                 releaseWriteReader(BackendType, self.backend, .write_txn);
@@ -3234,7 +3234,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             try self.backend.finalizeExitedBatchMode(self.batch_options);
             release_on_error = false;
             self.closed = true;
-            self.invalidateCursorSnapshot();
+            self.invalidateCursorSnapshotLocked();
             releaseHeldValues(&self.held_values, self.allocator);
             var finalize_err: ?anyerror = null;
             finalizeWriteReader(BackendType, self.backend, .write_txn) catch |err| {
@@ -3604,6 +3604,12 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         fn invalidateCursorSnapshot(self: *@This()) void {
+            const locked = lockBackend(BackendType, self.backend);
+            defer unlockBackend(BackendType, self.backend, locked);
+            self.invalidateCursorSnapshotLocked();
+        }
+
+        fn invalidateCursorSnapshotLocked(self: *@This()) void {
             if (self.cursor_overlay) |*state| {
                 state.deinit(self.allocator);
                 self.cursor_overlay = null;
@@ -3613,8 +3619,6 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 self.cursor_base_mutable = null;
             }
             if (self.cursor_immutable_memtables.len > 0) {
-                const locked = lockBackend(BackendType, self.backend);
-                defer unlockBackend(BackendType, self.backend, locked);
                 releaseImmutableMemtablePins(BackendType, self.backend, self.cursor_immutable_memtables[1..]);
                 self.allocator.free(self.cursor_immutable_memtables);
                 self.cursor_immutable_memtables = &.{};
@@ -5808,7 +5812,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 self.mutable = .{};
                 self.bulk_appends.deinit(self.allocator);
                 self.bulk_appends = .{};
-                self.invalidateCursorSnapshot();
+                self.invalidateCursorSnapshotLocked();
                 releaseHeldValues(&self.held_values, self.allocator);
                 self.backend.finishBatchMode(self.batch_options);
                 releaseWriteReader(BackendType, self.backend, .write_txn);
@@ -5848,7 +5852,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             try self.backend.finalizeExitedBatchMode(self.batch_options);
             release_on_error = false;
             self.closed = true;
-            self.invalidateCursorSnapshot();
+            self.invalidateCursorSnapshotLocked();
             releaseHeldValues(&self.held_values, self.allocator);
             var finalize_err: ?anyerror = null;
             finalizeWriteReader(BackendType, self.backend, .write_txn) catch |err| {
@@ -6101,6 +6105,12 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         }
 
         fn invalidateCursorSnapshot(self: *@This()) void {
+            const locked = lockBackend(BackendType, self.backend);
+            defer unlockBackend(BackendType, self.backend, locked);
+            self.invalidateCursorSnapshotLocked();
+        }
+
+        fn invalidateCursorSnapshotLocked(self: *@This()) void {
             if (self.cursor_overlay) |*state| {
                 state.deinit(self.allocator);
                 self.cursor_overlay = null;
@@ -6110,8 +6120,6 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 self.cursor_base_mutable = null;
             }
             if (self.cursor_immutable_memtables.len > 0) {
-                const locked = lockBackend(BackendType, self.backend);
-                defer unlockBackend(BackendType, self.backend, locked);
                 releaseImmutableMemtablePins(BackendType, self.backend, self.cursor_immutable_memtables[1..]);
                 self.allocator.free(self.cursor_immutable_memtables);
                 self.cursor_immutable_memtables = &.{};
