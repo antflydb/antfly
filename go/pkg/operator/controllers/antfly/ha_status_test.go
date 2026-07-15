@@ -1227,6 +1227,8 @@ func TestPlanHAPlansPortablePublishRestoreAndVerifiedBootstrap(t *testing.T) {
 func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *testing.T) {
 	initial := uint64(5)
 	cluster := haCluster()
+	cluster.Spec.Mode = antflyv1.ClusterModeStandalone
+	cluster.Spec.Standalone = &antflyv1.StandaloneSpec{Replicas: 1, NodeID: 7}
 	cluster.Status.HAStatus = &antflyv1.HAStatus{PrimaryLSN: 9}
 	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
 	cluster.Spec.HighAvailability.Identity = &antflyv1.HAReplicationIdentitySpec{
@@ -1284,6 +1286,7 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 		t.Fatalf("TARGET_ACTIVATION_MISSING: activation must be a generation-bound target-PVC job, got %#v", actions[4])
 	}
 	digest := strings.Repeat("a", 64)
+	captureDigest := strings.Repeat("d", 64)
 	cluster.Status.HAStatus.PlannedActions[0].AdminJobName = haAdminDirectAPIName
 	cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseSucceeded
 	cluster.Status.HAStatus.PlannedActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
@@ -1300,6 +1303,7 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 		EndRecordLSN:           11,
 		SeedArtifactGeneration: "base-standby-a-10",
 		ManifestSHA256:         digest,
+		CaptureReceiptSHA256:   captureDigest,
 		SeedClusterID:          100,
 		SeedTimelineID:         4,
 		SeedEpoch:              6,
@@ -1326,6 +1330,8 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 			"--slot", "standby-a",
 			"--manifest", "/antflydb/ha/seed-captures/generations/base-standby-a-10/manifest.afha",
 			"--content-root", "/antflydb/ha/seed-captures/generations/base-standby-a-10/content",
+			"--capture-receipt", "/antflydb/ha/seed-captures/generations/base-standby-a-10/COMPLETE.json",
+			"--capture-receipt-sha256", captureDigest,
 			"--topology-id", "topology-a",
 			"--topology-generation", "7",
 			"--node-id", "standby-a",
@@ -1333,6 +1339,18 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 			"--target-pvc-uid", "pvc-uid-1",
 		}) {
 		t.Fatalf("CAPTURE_OUTPUT_NOT_PUBLISHED: publish must consume exact runtime capture paths, got %#v", publish)
+	}
+	restore := cluster.Status.HAStatus.PlannedActions[3]
+	if !strings.Contains(strings.Join(restore.AdminCommand, " "), "--capture-receipt-sha256 "+captureDigest) ||
+		!strings.Contains(strings.Join(restore.AdminCommand, " "), "--topology-id topology-a") {
+		t.Fatalf("CAPTURE_AUTHORITY_NOT_RESTORED: restore must bind the exact capture and topology authority, got %#v", restore)
+	}
+	activate := cluster.Status.HAStatus.PlannedActions[4]
+	if !strings.Contains(strings.Join(activate.AdminCommand, " "), "--capture-receipt-sha256 "+captureDigest) ||
+		!strings.Contains(strings.Join(activate.AdminCommand, " "), "--topology-id topology-a") ||
+		!strings.Contains(strings.Join(activate.AdminCommand, " "), "--target-local-node-id 7") ||
+		!strings.Contains(strings.Join(activate.AdminCommand, " "), "--target-replica-id 1") {
+		t.Fatalf("MATERIALIZED_ACTIVATION_IDENTITY_MISSING: activation must bind exact capture, topology, and runtime identity, got %#v", activate)
 	}
 	sourceGC := cluster.Status.HAStatus.PlannedActions[2]
 	if sourceGC.SeedArtifactCaptureRoot != "/antflydb/ha/seed-captures" ||
