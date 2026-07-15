@@ -25768,6 +25768,93 @@ test "provisioned table write source status visibility does not invalidate read 
     try std.testing.expectEqual(@as(u64, 42), read_cache.table_epochs.get("docs").?);
 }
 
+test "standby HA replay reconciles managed indexes without opening the public write gate" {
+    const alloc = std.testing.allocator;
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"search_idx\":{\"type\":\"full_text\",\"config\":{}}}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/standby-ha-replay-index-reconcile", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+
+    var gate_state = ha_public_gate_state_mod.State{};
+    gate_state.configureStandby(.{
+        .received_lsn = 0,
+        .applied_lsn = 0,
+        .safe_read_lsn = 0,
+    });
+    _ = try source.withHAWriteGate(.{ .shared = .{ .state = &gate_state } });
+
+    const ha_effects = @import("../storage/ha/effects.zig");
+    const payload = try ha_effects.encodeBatchMutationRequestAlloc(alloc, .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+    });
+    defer alloc.free(payload);
+    try source.applyHAReplicationRecordGroupLocal(alloc, 7001, "docs", .{
+        .kind = .batch_mutation,
+        .payload_codec = .json,
+        .cluster_id = 700,
+        .shard_id = 7001,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 1,
+        .previous_lsn = 0,
+        .payload = payload,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    const indexes = try write_cache.entries.items[0].db.listIndexes(alloc);
+    defer db_mod.types.freeIndexConfigs(alloc, indexes);
+    try std.testing.expectEqual(@as(usize, 1), indexes.len);
+    try std.testing.expectEqualStrings("search_idx", indexes[0].name);
+    var lookup = (try write_cache.entries.items[0].db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedDocument;
+    defer lookup.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, lookup.json, "alpha") != null);
+
+    try std.testing.expectError(error.HAReadOnlyStandby, source.source().batchGroupLocal(alloc, 7001, "docs", .{
+        .writes = &.{.{ .key = "doc:forbidden", .value = "{\"body\":\"must not commit\"}" }},
+    }));
+}
+
 test "provisioned replicated sync marks local runtime status dirty" {
     const alloc = std.testing.allocator;
 
