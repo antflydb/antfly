@@ -834,8 +834,9 @@ type HARuntimeFencingLeaseSpec struct {
 	Name string `json:"name"`
 
 	// TopologyID is stable across primary handoff and distinct from a local
-	// standby AntflyCluster UID. Colony uses the anchor primary CR UID and
-	// propagates it unchanged to every topology member.
+	// standby AntflyCluster UID. Colony uses the durable Cloud instance ID,
+	// which exists before the first CR is created, and propagates it unchanged
+	// to every topology member.
 	// +kubebuilder:validation:MinLength=1
 	TopologyID string `json:"topologyID"`
 
