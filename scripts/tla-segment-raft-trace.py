@@ -65,11 +65,13 @@ def segment_trace(lines):
     current = []
     init_nodes = set()  # nodes with InitState in current segment
 
-    for line in lines:
+    for line_number, line in enumerate(lines, 1):
         try:
             obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"{line_number}: invalid JSON trace event: {exc.msg}"
+            ) from exc
         if obj.get("tag") != "trace":
             continue
 
@@ -136,7 +138,11 @@ def main():
     with open(trace_file) as f:
         lines = [l.strip() for l in f if l.strip()]
 
-    segments = segment_trace(lines)
+    try:
+        segments = segment_trace(lines)
+    except ValueError as exc:
+        print(f"{trace_file}:{exc}", file=sys.stderr)
+        sys.exit(1)
     for i, seg in enumerate(segments):
         # Skip segments with no non-bootstrap events (empty runs)
         has_activity = any(
