@@ -3435,6 +3435,7 @@ pub fn build(b: *std.Build) void {
         "db split sync coordinator allocates destination identity namespace",
         "db split status rejects stale destination identity namespace",
         "db split status borrows the live raft apply store without a second writer",
+        "db split coordinator rejects mismatched active transition destination",
         "data raft apply store applies delete operations into group state",
         "data raft apply store orders independent groups through separate shards",
         "data raft apply store admits one writable owner per root",

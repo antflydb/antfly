@@ -39,6 +39,11 @@ pub const Gcs = objectstore.Gcs;
 /// Thin wrapper for host-provided object storage callbacks.
 /// Hosts can provide an object-oriented blob implementation without exposing
 /// the underlying transport details to serverless or future external segment paths.
+/// Conditional writes must be atomic and report failed `if_none_match` or
+/// `if_match_etag` conditions as `error.PreconditionFailed`. Successful writes
+/// must become readable promptly; immutable manifest publication tolerates a
+/// short bounded visibility delay after a lost conditional-create race and then
+/// fails closed rather than assuming the winner's content.
 pub const HostObjectStorage = struct {
     allocator: Allocator,
     ptr: *anyopaque,

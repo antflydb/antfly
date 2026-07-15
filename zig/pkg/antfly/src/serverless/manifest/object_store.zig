@@ -18,10 +18,16 @@ const manifest_types = @import("types.zig");
 const manifest_codec = @import("codec.zig");
 const manifest_store = @import("store.zig");
 const object_store_support = @import("../object_store_support.zig");
+const platform_clock = @import("../../platform/clock.zig");
+
+const winner_visibility_attempts: usize = 5;
+const winner_visibility_initial_backoff_ms: u64 = 1;
+const winner_visibility_max_backoff_ms: u64 = 8;
 
 pub const ObjectStore = struct {
     alloc: std.mem.Allocator,
     opened: object_store_support.OpenedObjectStore,
+    clock: platform_clock.Clock,
 
     pub fn initRemoteUri(alloc: std.mem.Allocator, uri: []const u8) !ObjectStore {
         return try initRemoteUriWithS3Options(alloc, uri, null);
@@ -35,6 +41,7 @@ pub const ObjectStore = struct {
         return .{
             .alloc = alloc,
             .opened = try object_store_support.OpenedObjectStore.initRemoteUriWithS3Options(alloc, uri, "serverless-manifests", s3_options),
+            .clock = platform_clock.Clock.real(),
         };
     }
 
@@ -42,6 +49,7 @@ pub const ObjectStore = struct {
         return .{
             .alloc = alloc,
             .opened = try object_store_support.OpenedObjectStore.initFileUri(alloc, uri, "serverless-manifests"),
+            .clock = platform_clock.Clock.real(),
         };
     }
 
@@ -49,6 +57,7 @@ pub const ObjectStore = struct {
         return .{
             .alloc = alloc,
             .opened = try object_store_support.OpenedObjectStore.initGcsUri(alloc, bucket, prefix),
+            .clock = platform_clock.Clock.real(),
         };
     }
 
@@ -56,6 +65,7 @@ pub const ObjectStore = struct {
         return .{
             .alloc = alloc,
             .opened = try object_store_support.OpenedObjectStore.initS3Uri(alloc, bucket, prefix),
+            .clock = platform_clock.Clock.real(),
         };
     }
 
@@ -63,6 +73,7 @@ pub const ObjectStore = struct {
         return .{
             .alloc = alloc,
             .opened = try object_store_support.OpenedObjectStore.initWithClient(alloc, client, bucket, prefix),
+            .clock = platform_clock.Clock.real(),
         };
     }
 
@@ -100,7 +111,7 @@ pub const ObjectStore = struct {
                 // publishers may both observe a missing key before one wins
                 // the conditional create. Treat the loser as idempotent only
                 // when the winner published exactly the same manifest.
-                const existing = (try self.tryGetEncoded(self.alloc, key)) orelse
+                const existing = (try self.getWinnerAfterPrecondition(self.alloc, key)) orelse
                     return error.PreconditionFailed;
                 defer self.alloc.free(existing);
                 if (!std.mem.eql(u8, existing, encoded)) return error.ManifestVersionAlreadyExists;
@@ -243,6 +254,20 @@ pub const ObjectStore = struct {
         return try alloc.dupe(u8, result.body);
     }
 
+    fn getWinnerAfterPrecondition(self: *ObjectStore, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
+        // Native backends are read-after-write consistent. Keep host adapter
+        // tolerance bounded so publication cannot block indefinitely or accept
+        // an unverified winner after a conditional-create race.
+        var backoff_ms = winner_visibility_initial_backoff_ms;
+        for (0..winner_visibility_attempts) |attempt| {
+            if (try self.tryGetEncoded(alloc, key)) |existing| return existing;
+            if (attempt + 1 == winner_visibility_attempts) return null;
+            self.clock.sleepMs(backoff_ms);
+            backoff_ms = @min(backoff_ms * 2, winner_visibility_max_backoff_ms);
+        }
+        unreachable;
+    }
+
     const vtable: manifest_store.ManifestStore.VTable = .{
         .deinit = erasedDeinit,
         .put = erasedPut,
@@ -321,6 +346,7 @@ const ConditionalCreateRaceClient = struct {
     backing: *object_storage.MemoryObjectStorage,
     winner_body: []const u8,
     injected: bool = false,
+    hidden_reads_after_publish: usize = 0,
 
     fn client(self: *@This()) object_storage.ObjectStorage {
         return .{
@@ -377,6 +403,10 @@ const ConditionalCreateRaceClient = struct {
         opts: object_storage.GetOptions,
     ) !object_storage.GetResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.injected and self.hidden_reads_after_publish > 0) {
+            self.hidden_reads_after_publish -= 1;
+            return error.FileNotFound;
+        }
         var client_impl = self.backingClient(alloc);
         return try client_impl.getObject(bucket, key, opts);
     }
@@ -473,13 +503,20 @@ test "objectstore-backed manifest store resolves conditional create races by con
     {
         var backing = object_storage.MemoryObjectStorage.init(std.testing.allocator);
         defer backing.deinit();
-        var race = ConditionalCreateRaceClient{ .backing = &backing, .winner_body = encoded };
+        var race = ConditionalCreateRaceClient{
+            .backing = &backing,
+            .winner_body = encoded,
+            .hidden_reads_after_publish = 2,
+        };
         var impl = try ObjectStore.initWithClient(std.testing.allocator, race.client(), "manifests", "");
+        var clock = platform_clock.ManualClock{};
+        impl.clock = clock.clock();
         var store = impl.manifestStore();
         defer store.deinit();
 
         try store.put(manifest);
         try std.testing.expect(race.injected);
+        try std.testing.expectEqual(@as(usize, 0), race.hidden_reads_after_publish);
     }
 
     var conflicting = manifest;
@@ -489,13 +526,39 @@ test "objectstore-backed manifest store resolves conditional create races by con
     {
         var backing = object_storage.MemoryObjectStorage.init(std.testing.allocator);
         defer backing.deinit();
-        var race = ConditionalCreateRaceClient{ .backing = &backing, .winner_body = conflicting_encoded };
+        var race = ConditionalCreateRaceClient{
+            .backing = &backing,
+            .winner_body = conflicting_encoded,
+            .hidden_reads_after_publish = 1,
+        };
         var impl = try ObjectStore.initWithClient(std.testing.allocator, race.client(), "manifests", "");
+        var clock = platform_clock.ManualClock{};
+        impl.clock = clock.clock();
         var store = impl.manifestStore();
         defer store.deinit();
 
         try std.testing.expectError(error.ManifestVersionAlreadyExists, store.put(manifest));
         try std.testing.expect(race.injected);
+        try std.testing.expectEqual(@as(usize, 0), race.hidden_reads_after_publish);
+    }
+
+    {
+        var backing = object_storage.MemoryObjectStorage.init(std.testing.allocator);
+        defer backing.deinit();
+        var race = ConditionalCreateRaceClient{
+            .backing = &backing,
+            .winner_body = encoded,
+            .hidden_reads_after_publish = winner_visibility_attempts,
+        };
+        var impl = try ObjectStore.initWithClient(std.testing.allocator, race.client(), "manifests", "");
+        var clock = platform_clock.ManualClock{};
+        impl.clock = clock.clock();
+        var store = impl.manifestStore();
+        defer store.deinit();
+
+        try std.testing.expectError(error.PreconditionFailed, store.put(manifest));
+        try std.testing.expect(race.injected);
+        try std.testing.expectEqual(@as(usize, 0), race.hidden_reads_after_publish);
     }
 }
 

@@ -58,8 +58,9 @@ pub const SplitCoordinatorRuntime = struct {
         };
     }
 
-    fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data.SplitTransitionStatus {
+    fn observeStatus(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) !data.SplitTransitionStatus {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
+        try self.coordinator.validateTransitionCoordinates(source_group_id, destination_group_id);
         const status = try self.coordinator.status();
         return .{
             .phase = status.phase,
@@ -74,33 +75,39 @@ pub const SplitCoordinatorRuntime = struct {
         };
     }
 
-    fn prepareSource(ptr: *anyopaque, _: u64, _: u64, split_key: []const u8, source_range_end: ?[]const u8) !bool {
+    fn prepareSource(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64, split_key: []const u8, source_range_end: ?[]const u8) !bool {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
+        try self.coordinator.validateTransitionCoordinates(source_group_id, destination_group_id);
         return try self.coordinator.prepareSourceSplit(split_key, source_range_end);
     }
 
-    fn startSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+    fn startSource(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) !bool {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
+        try self.coordinator.validateTransitionCoordinates(source_group_id, destination_group_id);
         return try self.coordinator.startSourceSplit();
     }
 
-    fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64) !bool {
+    fn bootstrapDestination(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) !bool {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
+        try self.coordinator.validateTransitionCoordinates(source_group_id, destination_group_id);
         return try self.coordinator.ensureBootstrapped();
     }
 
-    fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64) !usize {
+    fn catchUpDestination(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) !usize {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
+        try self.coordinator.validateTransitionCoordinates(source_group_id, destination_group_id);
         return try self.coordinator.catchUp();
     }
 
-    fn finalizeSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+    fn finalizeSource(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) !bool {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
+        try self.coordinator.validateTransitionCoordinates(source_group_id, destination_group_id);
         return try self.coordinator.finalizeSource();
     }
 
-    fn rollbackSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+    fn rollbackSource(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) !bool {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
+        try self.coordinator.validateTransitionCoordinates(source_group_id, destination_group_id);
         return try self.coordinator.rollbackSource();
     }
 };
@@ -1444,7 +1451,12 @@ test "real split coordinator runtime observes prepared source state" {
     });
     defer split.deinit();
 
-    const runtime = TransitionRuntime{ .split = split.runtime() };
+    const split_runtime = split.runtime();
+    try std.testing.expectError(error.ConflictingSplitTransition, split_runtime.observeStatus(1701, 1703));
+    try std.testing.expectError(error.ConflictingSplitTransition, split_runtime.prepareSource(1701, 1703, "doc:m", "doc:z"));
+    try std.testing.expectError(error.ConflictingSplitTransition, split_runtime.startSource(1703, 1702));
+
+    const runtime = TransitionRuntime{ .split = split_runtime };
     const observation = try runtime.observeSplit(.{
         .transition_id = 1,
         .source_group_id = 1701,
