@@ -52,6 +52,7 @@ pub const http_client = @import("http_client.zig");
 
 test {
     _ = @import("lifecycle_receipt_inventory_test.zig");
+    _ = @import("seed_prefix_cleanup_test.zig");
     _ = replication_record;
     _ = replication_log;
     _ = slot_store;
