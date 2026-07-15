@@ -5232,7 +5232,11 @@ func TestReconcileHAFencingLeaseCreatesReadyLeaseForCaughtUpStandby(t *testing.T
 	cluster.Status.HAStatus = caughtUpHAStatus()
 	cluster.Status.HAStatus.PrimaryAdminReachable = false
 	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin timeout"
-	reconciler := testHAReconciler(t, cluster)
+	now := time.Now()
+	cluster.Status.HAStatus.Standbys[0].WatchdogProof = candidateLeaseProof(now, "standby-a", "primary-a", 1)
+	primaryLease := haFenceLease(cluster, now.Add(-time.Second), haFencingLeaseDefaultDurationSeconds, 1, "primary-a")
+	reconciler := testHAReconciler(t, cluster, primaryLease, candidateLeasePod(now, "standby-a-pod-uid"))
+	reconciler.Now = func() time.Time { return now }
 
 	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
 		t.Fatalf("reconcile fencing lease: %v", err)
@@ -5248,8 +5252,8 @@ func TestReconcileHAFencingLeaseCreatesReadyLeaseForCaughtUpStandby(t *testing.T
 	if lease.Spec.LeaseDurationSeconds == nil || *lease.Spec.LeaseDurationSeconds != haFencingLeaseDefaultDurationSeconds {
 		t.Fatalf("expected default lease duration, got %#v", lease.Spec.LeaseDurationSeconds)
 	}
-	if lease.Spec.LeaseTransitions == nil || *lease.Spec.LeaseTransitions != 1 {
-		t.Fatalf("expected first lease transition, got %#v", lease.Spec.LeaseTransitions)
+	if lease.Spec.LeaseTransitions == nil || *lease.Spec.LeaseTransitions != 2 {
+		t.Fatalf("expected compare-and-swap handoff transition 2, got %#v", lease.Spec.LeaseTransitions)
 	}
 	if lease.Spec.AcquireTime == nil || lease.Spec.RenewTime == nil {
 		t.Fatalf("expected acquire and renew timestamps, got %#v", lease.Spec)
@@ -5310,6 +5314,7 @@ func TestReconcileHAFencingLeaseRenewsExpiredCommittedTransfer(t *testing.T) {
 	}}
 	durationSeconds := int32(30)
 	lease := haFenceLease(cluster, time.Now().Add(-2*time.Minute), durationSeconds, 2, "standby-a")
+	authorizeHandoffRenewalForTest(lease, cluster, "primary-a", 2)
 	reconciler := testHAReconciler(t, cluster, lease)
 
 	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
@@ -5346,7 +5351,11 @@ func TestReconcileHAFencingLeaseAllowsRemoteWriteCandidate(t *testing.T) {
 	cluster.Status.HAStatus.Standbys[0].SafeReadLSN = 11
 	cluster.Status.HAStatus.Standbys[0].ApplyLagLSN = 1
 	cluster.Status.HAStatus.Standbys[0].CanServeSafeReads = false
-	reconciler := testHAReconciler(t, cluster)
+	now := time.Now()
+	cluster.Status.HAStatus.Standbys[0].WatchdogProof = candidateLeaseProof(now, "standby-a", "primary-a", 1)
+	primaryLease := haFenceLease(cluster, now.Add(-time.Second), haFencingLeaseDefaultDurationSeconds, 1, "primary-a")
+	reconciler := testHAReconciler(t, cluster, primaryLease, candidateLeasePod(now, "standby-a-pod-uid"))
+	reconciler.Now = func() time.Time { return now }
 
 	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
 		t.Fatalf("reconcile fencing lease: %v", err)
@@ -5371,6 +5380,9 @@ func TestReconcileHAFencingLeaseAllowsRemoteWriteCandidate(t *testing.T) {
 
 func TestReconcileHAFencingLeaseRetargetsUnsafeHolder(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.UID = types.UID("cluster-standby-a-uid")
+	cluster.Spec.HighAvailability.Runtime.NodeID = "standby-a"
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
 	cluster.Spec.HighAvailability.Standbys = append(cluster.Spec.HighAvailability.Standbys, antflyv1.HAStandbySpec{
 		Name:          "standby-b",
 		AdminURL:      "http://standby-b-ha.default.svc:8081",
@@ -5401,8 +5413,11 @@ func TestReconcileHAFencingLeaseRetargetsUnsafeHolder(t *testing.T) {
 		}},
 	}
 	durationSeconds := int32(15)
-	lease := haFenceLease(cluster, time.Now().Add(-time.Second), durationSeconds, 2, "standby-a")
-	reconciler := testHAReconciler(t, cluster, lease)
+	now := time.Now()
+	cluster.Status.HAStatus.Standbys[1].WatchdogProof = candidateLeaseProof(now, "standby-b", "standby-a", 2)
+	lease := haFenceLease(cluster, now.Add(-time.Second), durationSeconds, 2, "standby-a")
+	reconciler := testHAReconciler(t, cluster, lease, candidateLeasePod(now, "standby-b-pod-uid"))
+	reconciler.Now = func() time.Time { return now }
 
 	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
 		t.Fatalf("reconcile fencing lease: %v", err)
@@ -5736,6 +5751,7 @@ func TestReconcileHAFencingLeaseKeepsCommittedLowerBoundWhileOldPrimaryTailMoves
 		AdminError:      "connection refused",
 	}}
 	lease := haFenceLease(cluster, time.Now().Add(-time.Second), 30, 3, "standby-a")
+	authorizeHandoffRenewalForTest(lease, cluster, "primary-a", 3)
 	cluster.Status.HAStatus.PrimaryLSN = 13
 	reconciler := testHAReconciler(t, cluster, lease)
 
@@ -5858,6 +5874,7 @@ func haCluster() *antflyv1.AntflyCluster {
 			Name:       "antfly",
 			Namespace:  "default",
 			Generation: 7,
+			UID:        types.UID("cluster-primary-a-uid"),
 		},
 		Spec: antflyv1.AntflyClusterSpec{
 			HighAvailability: &antflyv1.HighAvailabilitySpec{
@@ -5980,6 +5997,13 @@ func haFenceLease(cluster *antflyv1.AntflyCluster, renewTime time.Time, duration
 			LeaseTransitions:     &transitions,
 		},
 	}
+}
+
+func authorizeHandoffRenewalForTest(lease *coordinationv1.Lease, cluster *antflyv1.AntflyCluster, formerHolder string, transition int32) {
+	lease.Annotations[haFencingLeaseAnnotationTransferCommitted] = "true"
+	lease.Annotations[haFencingLeaseAnnotationFormerHolder] = formerHolder
+	lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] = string(cluster.UID)
+	lease.Annotations[haFencingLeaseAnnotationCommittedTransition] = strconv.FormatInt(int64(transition), 10)
 }
 
 type haTestResourceVersionReader struct {

@@ -16,10 +16,12 @@ import (
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
 	adminsdk "github.com/antflydb/antfly/go/pkg/sdk/admin"
 	coordinationv1 "k8s.io/api/coordination/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type haActionKind string
@@ -106,16 +108,18 @@ const haFencingLeaseDefaultDurationSeconds int32 = 30
 const haSeededSlotActivationReceiptPath = "/var/run/antfly-ha/seeded-slot-activation/seeded-slot-activation.json"
 
 const (
-	haFencingLeaseAnnotationClusterID         = "antfly.io/ha-fence-cluster-id"
-	haFencingLeaseAnnotationShardID           = "antfly.io/ha-fence-shard-id"
-	haFencingLeaseAnnotationTableID           = "antfly.io/ha-fence-table-id"
-	haFencingLeaseAnnotationTimelineID        = "antfly.io/ha-fence-timeline-id"
-	haFencingLeaseAnnotationEpoch             = "antfly.io/ha-fence-epoch"
-	haFencingLeaseAnnotationCurrentPrimaryID  = "antfly.io/ha-fence-current-primary-id"
-	haFencingLeaseAnnotationPrimaryLSN        = "antfly.io/ha-fence-primary-lsn"
-	haFencingLeaseAnnotationTopologyID        = "antfly.io/ha-fence-topology-id"
-	haFencingLeaseAnnotationTransferCommitted = "antfly.io/ha-fence-transfer-committed"
-	haFencingLeaseAnnotationFormerHolder      = "antfly.io/ha-fence-former-holder"
+	haFencingLeaseAnnotationClusterID           = "antfly.io/ha-fence-cluster-id"
+	haFencingLeaseAnnotationShardID             = "antfly.io/ha-fence-shard-id"
+	haFencingLeaseAnnotationTableID             = "antfly.io/ha-fence-table-id"
+	haFencingLeaseAnnotationTimelineID          = "antfly.io/ha-fence-timeline-id"
+	haFencingLeaseAnnotationEpoch               = "antfly.io/ha-fence-epoch"
+	haFencingLeaseAnnotationCurrentPrimaryID    = "antfly.io/ha-fence-current-primary-id"
+	haFencingLeaseAnnotationPrimaryLSN          = "antfly.io/ha-fence-primary-lsn"
+	haFencingLeaseAnnotationTopologyID          = "antfly.io/ha-fence-topology-id"
+	haFencingLeaseAnnotationTransferCommitted   = "antfly.io/ha-fence-transfer-committed"
+	haFencingLeaseAnnotationFormerHolder        = "antfly.io/ha-fence-former-holder"
+	haFencingLeaseAnnotationTransferOriginUID   = "antfly.io/ha-fence-transfer-origin-uid"
+	haFencingLeaseAnnotationCommittedTransition = "antfly.io/ha-fence-committed-transition"
 )
 
 func haFencingLeaseRenewalRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
@@ -273,6 +277,10 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	if cluster.Status.HAStatus == nil {
 		return nil
 	}
+	localNodeID := strings.TrimSpace(ha.Runtime.NodeID)
+	if localNodeID == "" {
+		return nil
+	}
 	holder := haKubernetesLeaseFenceCandidate(ha, cluster.Status.HAStatus)
 	if holder == "" {
 		if !cluster.Status.HAStatus.PrimaryAdminReachable &&
@@ -298,11 +306,18 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 
 	now := metav1.NowMicro()
 	lease := &coordinationv1.Lease{}
-	err := r.Get(ctx, types.NamespacedName{
+	err := r.haBoundaryReader().Get(ctx, types.NamespacedName{
 		Name:      haFencingLeaseName(cluster),
 		Namespace: cluster.Namespace,
 	}, lease)
 	if apierrors.IsNotFound(err) {
+		// A missing shared Lease can only be initialized by the runtime that is
+		// itself the configured current writer. Creating it directly for a
+		// candidate would skip the compare-and-swap handoff from the old holder.
+		identity := haReplicationIdentity(ha)
+		if identity == nil || holder != localNodeID || holder != strings.TrimSpace(identity.CurrentPrimaryID) {
+			return nil
+		}
 		transitions := int32(1)
 		durationSeconds := haFencingLeaseDefaultDurationSeconds
 		annotations := scope.annotations()
@@ -343,6 +358,10 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	if lease.Spec.LeaseTransitions != nil {
 		transitions = *lease.Spec.LeaseTransitions
 	}
+	if currentHolder == "" || transitions <= 0 ||
+		lease.Annotations[haFencingLeaseAnnotationTopologyID] != haFencingLeaseTopologyID(cluster) {
+		return nil
+	}
 	preserveTransferredScope := false
 	if lease.Annotations[haFencingLeaseAnnotationTransferCommitted] == "true" && currentHolder != "" &&
 		haKubernetesLeaseFenceCandidate(ha, cluster.Status.HAStatus) == "" && holder != currentHolder {
@@ -353,6 +372,16 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	}
 	holderChanged := currentHolder != holder
 	if holderChanged {
+		// Only the exact current holder controller may commit the next holder.
+		// The candidate must independently prove that its live runtime process
+		// pre-watched this exact Lease generation without write authority.
+		if localNodeID != currentHolder || cluster.UID == "" {
+			return nil
+		}
+		ready, err := r.haCandidateRuntimeWatchdogReady(ctx, cluster, holder, currentHolder, uint64(transitions))
+		if err != nil || !ready {
+			return err
+		}
 		transitions++
 		lease.Spec.LeaseTransitions = &transitions
 		lease.Spec.AcquireTime = &now
@@ -361,11 +390,30 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		}
 		lease.Annotations[haFencingLeaseAnnotationTransferCommitted] = "true"
 		lease.Annotations[haFencingLeaseAnnotationFormerHolder] = currentHolder
+		lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] = string(cluster.UID)
+		lease.Annotations[haFencingLeaseAnnotationCommittedTransition] = strconv.FormatInt(int64(transitions), 10)
 	} else if transitions == 0 {
 		transitions = 1
 		lease.Spec.LeaseTransitions = &transitions
 		if lease.Spec.AcquireTime == nil {
 			lease.Spec.AcquireTime = &now
+		}
+	} else {
+		ownerRenewal := localNodeID == currentHolder
+		handoffRenewal := lease.Annotations[haFencingLeaseAnnotationTransferCommitted] == "true" &&
+			lease.Annotations[haFencingLeaseAnnotationFormerHolder] == localNodeID &&
+			lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] == string(cluster.UID) &&
+			lease.Annotations[haFencingLeaseAnnotationCommittedTransition] == strconv.FormatInt(int64(transitions), 10)
+		if !ownerRenewal && !handoffRenewal {
+			return nil
+		}
+		if ownerRenewal {
+			// Taking over renewal closes the former controller's narrow handoff
+			// bridge. From this point only the new holder can renew or transfer.
+			delete(lease.Annotations, haFencingLeaseAnnotationTransferCommitted)
+			delete(lease.Annotations, haFencingLeaseAnnotationFormerHolder)
+			delete(lease.Annotations, haFencingLeaseAnnotationTransferOriginUID)
+			delete(lease.Annotations, haFencingLeaseAnnotationCommittedTransition)
 		}
 	}
 	durationSeconds := haFencingLeaseDefaultDurationSeconds
@@ -395,6 +443,68 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	}
 	haRecordRenewedFencingLeaseStatus(cluster, holder, transitions)
 	return nil
+}
+
+func (r *AntflyClusterReconciler) haCandidateRuntimeWatchdogReady(
+	ctx context.Context,
+	cluster *antflyv1.AntflyCluster,
+	candidate string,
+	observedHolder string,
+	transition uint64,
+) (bool, error) {
+	if cluster == nil || cluster.Status.HAStatus == nil || cluster.Spec.HighAvailability == nil ||
+		cluster.Spec.HighAvailability.Runtime == nil || cluster.Spec.HighAvailability.Runtime.FencingLease == nil {
+		return false, nil
+	}
+	var proof *antflyv1.HAWatchdogProofStatus
+	for i := range cluster.Status.HAStatus.Standbys {
+		standby := &cluster.Status.HAStatus.Standbys[i]
+		if standby.Name == candidate || standby.SlotName == candidate {
+			proof = standby.WatchdogProof
+			break
+		}
+	}
+	if proof == nil {
+		return false, nil
+	}
+	lease := cluster.Spec.HighAvailability.Runtime.FencingLease
+	expectedMaxFenceLatencyMS := int32(10_000)
+	if lease.WatchdogGraceSeconds > 0 {
+		expectedMaxFenceLatencyMS = lease.WatchdogGraceSeconds * 1000
+	}
+	now := r.haNow()
+	if proof.ObservedAt.IsZero() || now.Before(proof.ObservedAt.Time) ||
+		now.Sub(proof.ObservedAt.Time) >= time.Duration(proof.MaxFenceLatencyMS)*time.Millisecond ||
+		proof.CapabilityVersion != 1 || !proof.Active || proof.AuthorityGranted || proof.AuthorityRemainingMS != 0 ||
+		proof.MaxFenceLatencyMS != expectedMaxFenceLatencyMS ||
+		proof.LocalNodeID != candidate || proof.ObservedHolderNodeID != observedHolder ||
+		proof.LeaseName != strings.TrimSpace(lease.Name) || proof.LeaseNamespace != cluster.Namespace ||
+		proof.TopologyID != strings.TrimSpace(lease.TopologyID) ||
+		proof.ObservedLeaseTransitions <= 0 || uint64(proof.ObservedLeaseTransitions) != transition ||
+		proof.PodUID == "" || !haWatchdogProcessBootIDValid(proof.ProcessBootID) {
+		return false, nil
+	}
+
+	pods := &corev1.PodList{}
+	if err := r.haBoundaryReader().List(ctx, pods, client.InNamespace(cluster.Namespace)); err != nil {
+		return false, err
+	}
+	matches := 0
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if string(pod.UID) != proof.PodUID || pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		for j := range pod.Status.ContainerStatuses {
+			container := &pod.Status.ContainerStatuses[j]
+			if container.Name == "antfly" && container.State.Running != nil &&
+				!proof.ObservedAt.Before(&container.State.Running.StartedAt) {
+				matches++
+				break
+			}
+		}
+	}
+	return matches == 1, nil
 }
 
 func haRecordRenewedFencingLeaseStatus(cluster *antflyv1.AntflyCluster, holder string, generation int32) {

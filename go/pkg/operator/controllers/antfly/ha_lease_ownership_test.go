@@ -1,0 +1,139 @@
+package controllers
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+func TestReconcileHAFencingLeaseRejectsStaleControllersAcrossSuccessiveTransfers(t *testing.T) {
+	now := time.Unix(1_750_000_000, 0)
+	clusterA := haClusterWithAutomaticKubernetesLeaseFailover()
+	clusterA.UID = types.UID("cluster-a-uid")
+	clusterA.Status.HAStatus = caughtUpHAStatus()
+	clusterA.Status.HAStatus.PrimaryAdminReachable = false
+	clusterA.Status.HAStatus.PrimaryAdminLastError = "primary admin timeout"
+	clusterA.Status.HAStatus.Standbys[0].WatchdogProof = candidateLeaseProof(now, "standby-a", "primary-a", 1)
+	lease := haFenceLease(clusterA, now.Add(-time.Second), 30, 1, "primary-a")
+	podA := candidateLeasePod(now, "standby-a-pod-uid")
+	podC := candidateLeasePod(now, "standby-c-pod-uid")
+	reconciler := testHAReconciler(t, lease, podA, podC)
+	reconciler.Now = func() time.Time { return now }
+
+	if err := reconciler.reconcileHAFencingLease(context.Background(), clusterA); err != nil {
+		t.Fatalf("A -> B transfer: %v", err)
+	}
+	assertLeaseHolderAndTransition(t, reconciler, "standby-a", 2)
+
+	// A may keep B alive only through the exact committed handoff bridge.
+	now = now.Add(time.Second)
+	if err := reconciler.reconcileHAFencingLease(context.Background(), clusterA); err != nil {
+		t.Fatalf("A handoff renewal for B: %v", err)
+	}
+	assertLeaseHolderAndTransition(t, reconciler, "standby-a", 2)
+
+	clusterB := clusterA.DeepCopy()
+	clusterB.UID = types.UID("cluster-b-uid")
+	clusterB.Spec.HighAvailability.Runtime.NodeID = "standby-a"
+	clusterB.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+	clusterB.Status.HAStatus = &antflyv1.HAStatus{PrimaryAdminReachable: true, PrimaryLSN: 12}
+	now = now.Add(time.Second)
+	if err := reconciler.reconcileHAFencingLease(context.Background(), clusterB); err != nil {
+		t.Fatalf("B takes over renewal: %v", err)
+	}
+	observed := getOwnershipTestLease(t, reconciler)
+	if observed.Annotations[haFencingLeaseAnnotationTransferOriginUID] != "" {
+		t.Fatalf("B takeover did not close A handoff bridge: %#v", observed.Annotations)
+	}
+
+	clusterB.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{{
+		Name: "standby-c", AdminURL: "http://standby-c-ha.default.svc:8081", RouteSelector: haTestRouteSelector("standby-c"),
+	}}
+	clusterB.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryLSN: 12, PrimaryAdminReachable: false, PrimaryAdminLastError: "primary admin timeout", PrimaryAdminFailureThresholdMet: true,
+		Standbys: []antflyv1.HAStandbyStatus{{
+			Name: "standby-c", SlotName: "standby-c", Active: true, ReceivedLSN: 12, AppliedLSN: 12, SafeReadLSN: 12,
+			CanServeSafeReads: true, Status: "healthy", WatchdogProof: candidateLeaseProof(now, "standby-c", "standby-a", 2),
+		}},
+	}
+	now = now.Add(time.Second)
+	clusterB.Status.HAStatus.Standbys[0].WatchdogProof.ObservedAt = metav1.NewTime(now)
+	if err := reconciler.reconcileHAFencingLease(context.Background(), clusterB); err != nil {
+		t.Fatalf("B -> C transfer: %v", err)
+	}
+	assertLeaseHolderAndTransition(t, reconciler, "standby-c", 3)
+
+	// A still wants B and must not roll C back to its stale candidate.
+	now = now.Add(time.Second)
+	if err := reconciler.reconcileHAFencingLease(context.Background(), clusterA); err != nil {
+		t.Fatalf("stale A reconcile: %v", err)
+	}
+	assertLeaseHolderAndTransition(t, reconciler, "standby-c", 3)
+
+	clusterC := clusterB.DeepCopy()
+	clusterC.UID = types.UID("cluster-c-uid")
+	clusterC.Spec.HighAvailability.Runtime.NodeID = "standby-c"
+	clusterC.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-c"
+	clusterC.Status.HAStatus = &antflyv1.HAStatus{PrimaryAdminReachable: true, PrimaryLSN: 12}
+	if err := reconciler.reconcileHAFencingLease(context.Background(), clusterC); err != nil {
+		t.Fatalf("C takes over renewal: %v", err)
+	}
+
+	// Once C acknowledges ownership, stale B loses even its handoff-renewal right.
+	before := getOwnershipTestLease(t, reconciler).Spec.RenewTime.DeepCopy()
+	now = now.Add(time.Second)
+	if err := reconciler.reconcileHAFencingLease(context.Background(), clusterB); err != nil {
+		t.Fatalf("stale B reconcile: %v", err)
+	}
+	after := getOwnershipTestLease(t, reconciler)
+	assertLeaseHolderAndTransition(t, reconciler, "standby-c", 3)
+	if !after.Spec.RenewTime.Equal(before) {
+		t.Fatalf("stale B renewed C after C takeover: before=%s after=%s", before, after.Spec.RenewTime)
+	}
+}
+
+func candidateLeaseProof(now time.Time, nodeID, observedHolder string, transition int32) *antflyv1.HAWatchdogProofStatus {
+	return &antflyv1.HAWatchdogProofStatus{
+		CapabilityVersion: 1, Active: true, AuthorityGranted: false, AuthorityRemainingMS: 0,
+		LeaseName: "topology-ha-fence", LeaseNamespace: "default", TopologyID: "topology-anchor-uid",
+		LocalNodeID: nodeID, ObservedHolderNodeID: observedHolder, PodUID: nodeID + "-pod-uid",
+		ProcessBootID: strings.Repeat("a", 64), ObservedLeaseTransitions: transition, MaxFenceLatencyMS: 10_000,
+		ObservedAt: metav1.NewTime(now),
+	}
+}
+
+func candidateLeasePod(now time.Time, uid string) *corev1.Pod {
+	started := metav1.NewTime(now.Add(-time.Minute))
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: string(uid), Namespace: "default", UID: types.UID(uid)},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: []corev1.ContainerStatus{{
+			Name: "antfly", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: started}},
+		}}},
+	}
+}
+
+func getOwnershipTestLease(t *testing.T, reconciler *AntflyClusterReconciler) *coordinationv1.Lease {
+	t.Helper()
+	lease := &coordinationv1.Lease{}
+	if err := reconciler.Get(context.Background(), client.ObjectKey{Name: "topology-ha-fence", Namespace: "default"}, lease); err != nil {
+		t.Fatal(err)
+	}
+	return lease
+}
+
+func assertLeaseHolderAndTransition(t *testing.T, reconciler *AntflyClusterReconciler, holder string, transition int32) {
+	t.Helper()
+	lease := getOwnershipTestLease(t, reconciler)
+	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != holder ||
+		lease.Spec.LeaseTransitions == nil || *lease.Spec.LeaseTransitions != transition {
+		t.Fatalf("lease = holder %#v transition %#v, want %q/%d", lease.Spec.HolderIdentity, lease.Spec.LeaseTransitions, holder, transition)
+	}
+}
