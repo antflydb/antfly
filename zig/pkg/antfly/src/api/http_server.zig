@@ -54,6 +54,7 @@ const tables_api = @import("tables.zig");
 const table_reads = @import("table_reads.zig");
 const table_router = @import("table_router.zig");
 const table_writes = @import("table_writes.zig");
+const ha_mutation_inventory = @import("../storage/ha/mutation_inventory.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const public_search_request = @import("public_search_request.zig");
@@ -298,6 +299,15 @@ pub const ApiHttpServerConfig = struct {
     session_store_path: ?[]const u8 = null,
     ha_admin_executor: ?http_common.RequestExecutor = null,
     ha_internal_executor: ?http_common.RequestExecutor = null,
+    /// When continuous standalone HA is active, only mutations classified as
+    /// synchronously replicated may reach their handler. Non-replicated
+    /// security, catalog, restore, and workflow state fails closed before any
+    /// local side effect.
+    ha_failover_safe_mutations_only: bool = false,
+    /// True only when the owning runtime has configured fail-closed
+    /// synchronous RemoteApply. The route classifier alone cannot establish
+    /// the active durability policy.
+    ha_remote_apply_mutations_enabled: bool = false,
     join_job_store_path: ?[]const u8 = null,
     join_job_lease_ttl_ms: ?u64 = null,
     join_job_retention_ms: ?u64 = null,
@@ -1653,6 +1663,10 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn runSessionMaintenanceOnce(self: *ApiHttpServer) !void {
+        // Durable transaction, repair, and reprocess job checkpoints are
+        // primary-local. Their mutating routes are rejected in continuous HA,
+        // and their cleanup/resume loop must remain frozen for the same reason.
+        if (!self.mutationBackgroundExecutionPermitted()) return;
         try self.maybeCleanupExpiredSessions();
         try self.maybeRenewOwnedSessionLeases();
         self.join_job_store.cleanupExpiredJoinJobs();
@@ -1663,6 +1677,10 @@ pub const ApiHttpServer = struct {
                 std.log.warn("failed to reap table repair background jobs err={s}", .{@errorName(err)});
             };
         }
+    }
+
+    fn mutationBackgroundExecutionPermitted(self: *const ApiHttpServer) bool {
+        return !self.cfg.ha_failover_safe_mutations_only;
     }
 
     const SessionMaintenanceWork = struct {
@@ -2427,6 +2445,20 @@ pub const ApiHttpServer = struct {
                     if (!permissionsAllow(identity.permissions, required.resource_type, required.resource, required.permission_type)) {
                         return try textResponse(self.alloc, 403, "forbidden");
                     }
+                }
+            }
+        }
+
+        if (self.cfg.ha_failover_safe_mutations_only) {
+            if (ha_mutation_inventory.classify(req.method, uri_parts.path)) |mutation| {
+                if (mutation.disposition == .reject or
+                    (mutation.disposition == .remote_apply and !self.cfg.ha_remote_apply_mutations_enabled))
+                {
+                    return try jsonResponseWithStatus(self.alloc, 503, .{
+                        .@"error" = "mutation is not continuously replicated while HA is active",
+                        .code = "ha_mutation_not_replicated",
+                        .surface = @tagName(mutation.surface),
+                    });
                 }
             }
         }
@@ -8232,6 +8264,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn restoreExecutionPermitted(self: *ApiHttpServer) bool {
+        if (self.cfg.ha_failover_safe_mutations_only) return false;
         if (self.restore_dispatch_paused.load(.acquire)) return false;
         const guard = self.cfg.restore_execution_guard orelse return true;
         const term = self.restore_leadership_term.load(.acquire);
@@ -9226,6 +9259,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn resumeRestoreJobsOnce(self: *ApiHttpServer) !void {
+        if (self.cfg.ha_failover_safe_mutations_only) return;
         if (self.restore_jobs_resumed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
         self.schedulePendingRestoreJobs() catch |err| {
             self.restore_jobs_resumed.store(false, .release);
@@ -16522,6 +16556,233 @@ test "api http server requires auth on public routes when enabled" {
     var readyz = try server.handle(.{ .method = .GET, .uri = routes.Routes.readyz });
     defer readyz.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), readyz.status);
+}
+
+test "continuous HA rejects non-replicated public mutations before handlers" {
+    const Rejection = struct {
+        @"error": []const u8,
+        code: []const u8,
+        surface: []const u8,
+    };
+    const FakeSource = struct {
+        created: bool = false,
+        table_record: metadata_table_manager.TableRecord = .{
+            .table_id = 1,
+            .name = "docs",
+            .description = "docs table",
+            .schema_json = "{\"kind\":\"demo\"}",
+            .indexes_json = "{\"full_text_index_v0\":{}}",
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+        },
+        range_record: metadata_table_manager.RangeRecord = .{
+            .group_id = 10,
+            .table_id = 1,
+            .start_key = "",
+            .end_key = null,
+        },
+        empty_tables: [0]metadata_table_manager.TableRecord = .{},
+        empty_ranges: [0]metadata_table_manager.RangeRecord = .{},
+        empty_stores: [0]metadata_table_manager.StoreRecord = .{},
+        empty_placements: [0]raft_reconciler.PlacementIntent = .{},
+        empty_splits: [0]metadata_transition_state.SplitTransitionRecord = .{},
+        empty_merges: [0]metadata_transition_state.MergeTransitionRecord = .{},
+
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{
+                .status = status,
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .create_table = createTable,
+                .wait_table_lifecycle = waitTableLifecycle,
+            } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
+            return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table_record))[0..1];
+        }
+
+        fn rangeSlice(self: *@This()) []metadata_table_manager.RangeRecord {
+            return @as([*]metadata_table_manager.RangeRecord, @ptrCast(&self.range_record))[0..1];
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 77, .metrics = .{} },
+                .tables = if (self.created) self.tableSlice() else self.empty_tables[0..],
+                .ranges = if (self.created) self.rangeSlice() else self.empty_ranges[0..],
+                .stores = self.empty_stores[0..],
+                .placement_intents = self.empty_placements[0..],
+                .split_transitions = self.empty_splits[0..],
+                .merge_transitions = self.empty_merges[0..],
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: tables_api.CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.created = true;
+        }
+
+        fn waitTableLifecycle(ptr: *anyopaque, _: []const u8, expected: TableVisibility) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(expected == .present, self.created);
+        }
+    };
+
+    var auth = try initTestAuthManager(std.testing.allocator);
+    try bindTestAuthManager(std.testing.allocator, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var source = FakeSource{};
+    var config = ApiHttpServerConfig{ .user_manager = &auth.manager };
+    // This test is intentionally source-compatible with the pre-guard
+    // revision. There, the field is absent and the same behavioral fixture
+    // fails with HAAcknowledgedMutationLostAfterPromotion instead of compile
+    // noise. On the fixed revision it activates the HA guard.
+    if (comptime @hasField(ApiHttpServerConfig, "ha_failover_safe_mutations_only")) {
+        @field(config, "ha_failover_safe_mutations_only") = true;
+    }
+    var server = ApiHttpServer.init(std.testing.allocator, config, source.iface(), null, null);
+
+    const cases = [_]struct {
+        method: http_common.Method,
+        uri: []const u8,
+        body: []const u8,
+        surface: []const u8,
+    }{
+        .{ .method = .POST, .uri = "/auth/v1/users/alice", .body = "{\"password\":\"secret\"}", .surface = "auth_user" },
+        .{ .method = .PUT, .uri = "/secrets/inference.api-key", .body = "{}", .surface = "secret" },
+        .{ .method = .POST, .uri = "/tables/docs", .body = "{\"num_shards\":1,\"description\":\"docs table\"}", .surface = "table_catalog" },
+        .{ .method = .POST, .uri = "/tables/docs/batch", .body = "{}", .surface = "document_batch" },
+        .{ .method = .POST, .uri = "/tables/docs/merge", .body = "{}", .surface = "document_merge" },
+        .{ .method = .PUT, .uri = "/tables/docs/schema", .body = "{}", .surface = "table_schema" },
+        .{ .method = .POST, .uri = "/tables/docs/indexes/title", .body = "{}", .surface = "table_index" },
+        .{ .method = .POST, .uri = "/backup", .body = "{}", .surface = "backup" },
+        .{ .method = .POST, .uri = "/tables/docs/backup", .body = "{}", .surface = "backup" },
+        .{ .method = .POST, .uri = "/restore", .body = "{}", .surface = "cluster_restore" },
+        .{ .method = .POST, .uri = "/transactions/begin", .body = "{}", .surface = "transaction_session" },
+        .{ .method = .POST, .uri = "/tables/docs/repair/run", .body = "{}", .surface = "artifact_repair" },
+    };
+    var auth_status: u16 = 0;
+    var catalog_status: u16 = 0;
+    var rejected: usize = 0;
+    for (cases) |case| {
+        var response = try server.handle(.{ .method = case.method, .uri = case.uri, .body = case.body });
+        defer response.deinit(std.testing.allocator);
+        if (std.mem.eql(u8, case.surface, "auth_user")) auth_status = response.status;
+        if (std.mem.eql(u8, case.surface, "table_catalog")) catalog_status = response.status;
+        if (response.status != 503) continue;
+        rejected += 1;
+        var parsed = try std.json.parseFromSlice(Rejection, std.testing.allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("mutation is not continuously replicated while HA is active", parsed.value.@"error");
+        try std.testing.expectEqualStrings("ha_mutation_not_replicated", parsed.value.code);
+        try std.testing.expectEqualStrings(case.surface, parsed.value.surface);
+    }
+
+    // Before the guard, both requests were acknowledged against primary-local
+    // state even though a promoted standby had neither mutation. Make that red
+    // leg an invariant failure with a stable behavioral error.
+    if (auth_status == 201 and catalog_status == 200) {
+        try std.testing.expect(source.created);
+        const primary_users = try auth.manager.listUsers();
+        defer freeOwnedStrings(std.testing.allocator, primary_users);
+        try std.testing.expectEqual(@as(usize, 1), primary_users.len);
+
+        var promoted_auth = try initTestAuthManager(std.testing.allocator);
+        try bindTestAuthManager(std.testing.allocator, &promoted_auth);
+        defer promoted_auth.manager.deinit();
+        defer promoted_auth.policy_store.deinit();
+        defer promoted_auth.store.deinit();
+        const promoted_users = try promoted_auth.manager.listUsers();
+        defer freeOwnedStrings(std.testing.allocator, promoted_users);
+        try std.testing.expectEqual(@as(usize, 0), promoted_users.len);
+        const promoted_source = FakeSource{};
+        try std.testing.expect(!promoted_source.created);
+        return error.HAAcknowledgedMutationLostAfterPromotion;
+    }
+
+    try std.testing.expectEqual(cases.len, rejected);
+    try std.testing.expect(!source.created);
+    const users = try auth.manager.listUsers();
+    defer freeOwnedStrings(std.testing.allocator, users);
+    try std.testing.expectEqual(@as(usize, 0), users.len);
+
+    // Read availability is unchanged by the mutation policy.
+    var health = try server.handle(.{ .method = .GET, .uri = routes.Routes.healthz });
+    defer health.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), health.status);
+}
+
+test "continuous HA freezes pre-existing restore workers and resumption" {
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{
+        .ha_failover_safe_mutations_only = true,
+    }, source.iface(), null, null);
+
+    try std.testing.expect(!server.restoreExecutionPermitted());
+    try std.testing.expect(!server.mutationBackgroundExecutionPermitted());
+    try std.testing.expectError(error.NotLeader, server.ensureRestoreActive(null));
+    try server.resumeRestoreJobsOnce();
+    try std.testing.expect(!server.restore_jobs_resumed.load(.acquire));
+    try server.pollRestoreJobsOnce();
+    try std.testing.expect(!server.restore_jobs_resumed.load(.acquire));
+}
+
+test "continuous HA allows a configured RemoteApply batch write" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ha-remote-apply-batch", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .start_index_workers = false });
+    defer db.close();
+    var table_source = table_writes.BoundTableWriteSource.init("docs", &db);
+
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{
+        .ha_failover_safe_mutations_only = true,
+        .ha_remote_apply_mutations_enabled = true,
+    }, source.iface(), null, table_source.source());
+    const body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"doc:ha\":{\"title\":\"remote-apply\"}}}");
+    defer alloc.free(body);
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/batch",
+        .content_type = "application/json",
+        .body = body,
+    });
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), response.status);
+    var found = (try db.lookup(alloc, "doc:ha", .{})) orelse return error.TestExpectedEqual;
+    defer found.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, found.json, "remote-apply") != null);
 }
 
 test "api http server dispatches HA admin and internal executors" {

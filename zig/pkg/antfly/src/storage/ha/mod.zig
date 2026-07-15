@@ -27,6 +27,7 @@ pub const seed_capture = @import("seed_capture.zig");
 pub const lifecycle_receipt_ledger = @import("lifecycle_receipt_ledger.zig");
 pub const local_generation_gc = @import("local_generation_gc.zig");
 pub const mutation_barrier = @import("mutation_barrier.zig");
+pub const mutation_inventory = @import("mutation_inventory.zig");
 pub const bootstrap = @import("bootstrap.zig");
 pub const status = @import("status.zig");
 pub const replication_api = @import("replication_api.zig");
@@ -70,6 +71,7 @@ test {
     _ = lifecycle_receipt_ledger;
     _ = local_generation_gc;
     _ = mutation_barrier;
+    _ = mutation_inventory;
     _ = bootstrap;
     _ = status;
     _ = replication_api;

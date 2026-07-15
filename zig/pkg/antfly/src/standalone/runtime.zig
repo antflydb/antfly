@@ -1516,6 +1516,10 @@ pub fn runFromIterator(
     const data_dir = try resolveLocalBaseDir(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer alloc.free(data_dir);
     if (storage_engine == .local) try antfly.common.data_format.ensureCompatible(alloc, data_dir);
+    // Validate and freeze the HA role before any startup helper can mutate a
+    // primary-local sidecar that is not part of the continuous HA WAL.
+    try validateHARole(cli);
+    const ha_role_requested = haContinuousMutationGuardRequested(cli);
 
     const resolved = try resolvePaths(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer resolved.deinit(alloc);
@@ -1598,10 +1602,21 @@ pub fn runFromIterator(
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
         errdefer if (user_manager) |*manager| manager.deinit();
-        // This seeds only the local auth store and must remain auth-gated.
-        // Raft-backed metadata writes during metadata bootstrap can block
-        // clustered startup before raft listeners are running.
-        try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
+        if (ha_role_requested) {
+            // Auth is carried by the portable seed, not the continuous HA WAL.
+            // Creating a local default admin on either HA role after seeding
+            // would acknowledge credentials that disappear on promotion.
+            var seeded_admin = user_manager.?.getUser("admin") catch |err| switch (err) {
+                error.UserNotFound => return error.HAAuthSeedMissing,
+                else => return err,
+            };
+            seeded_admin.deinit(alloc);
+        } else {
+            // This seeds only the local auth store and must remain auth-gated.
+            // Raft-backed metadata writes during metadata bootstrap can block
+            // clustered startup before raft listeners are running.
+            try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
+        }
     }
     defer if (user_manager) |*manager| manager.deinit();
     defer if (auth_runtime) |*runtime| runtime.deinit();
@@ -1648,15 +1663,17 @@ pub fn runFromIterator(
         )
     else
         null;
-    const synced_extension_packages = local_metadata.syncExtensionPackageStore(setup_io.io(), resolved.extension_package_store_dir) catch |err| {
-        std.log.err("standalone startup failed step=sync_extension_packages err={}", .{err});
-        return err;
-    };
+    const synced_extension_packages = if (ha_role_requested)
+        0
+    else
+        local_metadata.syncExtensionPackageStore(setup_io.io(), resolved.extension_package_store_dir) catch |err| {
+            std.log.err("standalone startup failed step=sync_extension_packages err={}", .{err});
+            return err;
+        };
     if (synced_extension_packages > 0) {
         std.log.info("standalone synced extension package store path={s} packages={d}", .{ resolved.extension_package_store_dir, synced_extension_packages });
     }
 
-    try validateHARole(cli);
     try validateHAPathsUnderRoot(cli, data_dir);
     const ha_startup_expectation = try haStartupExpectationFromCli(cli);
     const ha_startup_checkpoint_lsn = if (ha_startup_expectation) |expectation|
@@ -1719,6 +1736,8 @@ pub fn runFromIterator(
             .role = "data",
         },
         .api_server_cfg = .{
+            .ha_failover_safe_mutations_only = ha_role_requested,
+            .ha_remote_apply_mutations_enabled = haRemoteApplyMutationsEnabled(ha_sync_policy.policy),
             .auth_enabled = auth_enabled,
             .ard_base_url = cli.ard_base_url,
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
@@ -1890,10 +1909,12 @@ pub fn runFromIterator(
             error.LsmRootWriterAlreadyOpen, error.WriterLocked => std.log.warn("standalone data round skipped err={}", .{err}),
             else => return err,
         };
-        LocalStandaloneMetadata.runRound(&local_metadata) catch |err| switch (err) {
-            error.LsmRootWriterAlreadyOpen, error.WriterLocked => std.log.warn("standalone metadata round skipped err={}", .{err}),
-            else => return err,
-        };
+        if (!ha_role_requested) {
+            LocalStandaloneMetadata.runRound(&local_metadata) catch |err| switch (err) {
+                error.LsmRootWriterAlreadyOpen, error.WriterLocked => std.log.warn("standalone metadata round skipped err={}", .{err}),
+                else => return err,
+            };
+        }
         const err = std.posix.errno(std.posix.system.nanosleep(&req, &req));
         switch (err) {
             .SUCCESS => {},
@@ -3584,6 +3605,16 @@ fn haStandbyRequested(cli: CliConfig) bool {
         cli.ha_standby_slot != null;
 }
 
+fn haContinuousMutationGuardRequested(cli: CliConfig) bool {
+    return haPrimaryRequested(cli) or haStandbyRequested(cli);
+}
+
+fn haRemoteApplyMutationsEnabled(policy: antfly.ha.primary.SyncPolicy) bool {
+    return policy.mode == .remote_apply and
+        policy.failure_policy == .block and
+        policy.standby_names.len > 0;
+}
+
 fn haIdentityRequested(cli: CliConfig) bool {
     return cli.ha_cluster_id != null or
         cli.ha_shard_id != null or
@@ -4338,6 +4369,23 @@ test "standalone runtime leaves auth disabled unless config or cli enables it" {
     try std.testing.expect(!resolveAuthEnabled(.{}, null));
     try std.testing.expect(resolveAuthEnabled(.{ .auth_enabled = true }, null));
     try std.testing.expect(!resolveAuthEnabled(.{ .auth_enabled = false }, null));
+}
+
+test "standalone HA roles freeze startup-local mutation producers" {
+    try std.testing.expect(!haContinuousMutationGuardRequested(.{}));
+    try std.testing.expect(haContinuousMutationGuardRequested(.{ .ha_primary_log = "/ha/primary.wal" }));
+    try std.testing.expect(haContinuousMutationGuardRequested(.{ .ha_standby_log = "/ha/standby.wal" }));
+    try std.testing.expect(!haRemoteApplyMutationsEnabled(.{}));
+    try std.testing.expect(!haRemoteApplyMutationsEnabled(.{
+        .mode = .remote_write,
+        .failure_policy = .block,
+        .standby_names = &.{"standby-a"},
+    }));
+    try std.testing.expect(haRemoteApplyMutationsEnabled(.{
+        .mode = .remote_apply,
+        .failure_policy = .block,
+        .standby_names = &.{"standby-a"},
+    }));
 }
 
 test "standalone bridge shared adapter preserves protocol headers and absent body" {

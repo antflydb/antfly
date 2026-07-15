@@ -17,6 +17,7 @@ const db_mod = @import("../storage/db/mod.zig");
 const raft_mod = @import("../raft/mod.zig");
 const table_reads = @import("table_reads.zig");
 const table_writes = @import("table_writes.zig");
+const query_api = @import("query.zig");
 const public_limits = @import("public_limits.zig");
 
 pub const OwnedLinearMergeRequest = struct {
@@ -398,4 +399,57 @@ test "linear merge scan line key uses reserved document identity" {
     try std.testing.expectEqualStrings("doc:a", key);
 
     try std.testing.expectError(error.InvalidLinearMergeRequest, parseScanLineKey(std.testing.allocator, "{\"key\":\"doc:legacy\"}"));
+}
+
+test "storage.ha linear merge delegates every mutation to the HA-mirrored batch source" {
+    const FakeReads = struct {
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query } };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return .{ .ndjson = try alloc.dupe(u8, "") };
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return null;
+        }
+    };
+    const RecordingWrites = struct {
+        calls: usize = 0,
+        writes: usize = 0,
+        deletes: usize = 0,
+        sync_level: ?db_mod.types.SyncLevel = null,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{ .batch = batch } };
+        }
+
+        fn batch(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, req: db_mod.types.BatchRequest) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.writes += req.writes.len;
+            self.deletes += req.deletes.len;
+            self.sync_level = req.sync_level;
+            return {};
+        }
+    };
+
+    var request = try parseRequest(std.testing.allocator,
+        \\{"records":{"doc:a":{"title":"alpha"}},"sync_level":"full_text"}
+    );
+    defer request.deinit(std.testing.allocator);
+    var reads = FakeReads{};
+    var writes = RecordingWrites{};
+    const response = try executeResponse(std.testing.allocator, reads.source(), writes.source(), "docs", request);
+
+    try std.testing.expectEqual(@as(usize, 1), writes.calls);
+    try std.testing.expectEqual(@as(usize, 1), writes.writes);
+    try std.testing.expectEqual(@as(usize, 0), writes.deletes);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, writes.sync_level.?);
+    try std.testing.expectEqual(@as(usize, 1), response.upserted);
 }

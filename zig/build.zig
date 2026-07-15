@@ -4024,6 +4024,9 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "api http server requires auth on public routes when enabled",
+            "continuous HA rejects non-replicated public mutations before handlers",
+            "continuous HA freezes pre-existing restore workers and resumption",
+            "continuous HA allows a configured RemoteApply batch write",
             "api http server returns retryable not leader for local public metadata mutation",
             "api http server returns retryable not leader when metadata proposal is dropped",
             "api http server returns retryable not leader through public table adapter mutation",
@@ -5106,6 +5109,7 @@ pub fn build(b: *std.Build) void {
             "standalone HA standby replication flags require upstream and slot",
             "standalone HA string classifier distinguishes missing padded and valid values",
             "standalone HA runtime rejects ambiguous role flags",
+            "standalone HA roles freeze startup-local mutation producers",
             "antfly config uses cli override before common config",
             "standalone public api caps keep alive request reuse",
             "standalone public api body limit matches common http listener",
