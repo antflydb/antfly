@@ -4495,9 +4495,10 @@ test "parse cli accepts HA standby runtime flags" {
     try std.testing.expectEqual(@as(u64, 3), cfg.ha_timeline_id.?);
     try std.testing.expectEqual(@as(u64, 4), cfg.ha_epoch.?);
 
-    const replication_cfg = (try haStandbyReplicationConfigFromCli(cfg)) orelse return error.TestExpectedEqual;
+    const replication_cfg = (try haStandbyReplicationConfigFromCli(cfg, "runtime-secret-token")) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("http://primary.antfly.svc:8080", replication_cfg.upstream_base_uri);
     try std.testing.expectEqualStrings("standby-a", replication_cfg.slot_name);
+    try std.testing.expectEqualStrings("runtime-secret-token", replication_cfg.bearer_token orelse return error.TestExpectedEqual);
     const startup = (try haStartupExpectationFromCli(cfg)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("/tmp/active", startup.target_root);
     try std.testing.expectEqualStrings("topology-a", startup.binding.topology_id);
