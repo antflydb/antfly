@@ -230,7 +230,7 @@ const RuntimeLeaseWatchdog = struct {
             .data_generation = data_generation,
         };
         var entropy: [32]u8 = undefined;
-        std.crypto.random.bytes(&entropy);
+        try io.randomSecure(&entropy);
         const process_boot_id = std.fmt.bytesToHex(entropy, .lower);
         var executor = antfly.common.http.StdHttpExecutor.init(alloc, .{
             .max_response_bytes = 256 * 1024,
@@ -293,8 +293,11 @@ const RuntimeLeaseWatchdog = struct {
         const deadline = self.proof_authority_deadline_ns.load(.acquire);
         const capability_deadline = self.proof_capability_deadline_ns.load(.acquire);
         const now = authority_time.authorityNs();
-        const authority_remaining_ms = if (deadline > now)
-            (deadline - now) / std.time.ns_per_ms
+        const authority_remaining_ms: i64 = if (deadline > now)
+            @intCast(@min(
+                (deadline - now) / std.time.ns_per_ms,
+                self.watchdog.cfg.grace_ns / std.time.ns_per_ms,
+            ))
         else
             0;
         return .{
@@ -1786,7 +1789,7 @@ pub fn runFromIterator(
     var ha_lease_watchdog = try RuntimeLeaseWatchdog.initFromEnv(
         alloc,
         setup_io.io(),
-        &init.environ_map,
+        init.environ_map,
         cli,
         ha_pod_uid,
     );
