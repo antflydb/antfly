@@ -3855,9 +3855,11 @@ func TestReconcileHAFormerPrimaryIsolationStopsOldWriterBeforeCandidateFence(t *
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cluster.Name + "-standalone-0",
-			Namespace: cluster.Namespace,
-			Labels:    serviceSelectorLabels(cluster.Name, "standalone"),
+			Name:              cluster.Name + "-standalone-0",
+			Namespace:         cluster.Namespace,
+			Labels:            serviceSelectorLabels(cluster.Name, "standalone"),
+			DeletionTimestamp: ptr.To(metav1.NewTime(now)),
+			Finalizers:        []string{"test.antfly.io/keep-terminating"},
 		},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
@@ -3887,7 +3889,7 @@ func TestReconcileHAFormerPrimaryIsolationStopsOldWriterBeforeCandidateFence(t *
 		t.Fatalf("old writer was not held at zero before fencing: sts=%#v action=%#v", observedSTS.Spec.Replicas, cluster.Status.HAStatus.PlannedActions[0])
 	}
 	if haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, 1) {
-		t.Fatal("candidate fence dependency passed while the old runtime pod still existed")
+		t.Fatal("candidate fence dependency passed while the terminating old runtime pod could still be running")
 	}
 
 	observedSTS.ResourceVersion = ""

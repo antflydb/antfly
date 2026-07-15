@@ -98,7 +98,10 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 		}
 		for j := range pods.Items {
 			pod := &pods.Items[j]
-			if pod.DeletionTimestamp == nil && pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
+			// A deletion timestamp is only intent; kubelet may still be running
+			// the container throughout its grace period. Require the API snapshot
+			// to show either no Pod object or a terminal process state.
+			if pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
 				return nil
 			}
 		}
