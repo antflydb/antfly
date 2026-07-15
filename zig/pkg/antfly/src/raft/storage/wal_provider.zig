@@ -93,6 +93,7 @@ pub const WalReplicaProvider = struct {
                 .vtable = &.{
                     .persist_ready = persistReady,
                     .compact_snapshot = compactSnapshot,
+                    .compact_snapshot_artifact = compactSnapshotArtifact,
                 },
             },
         };
@@ -156,6 +157,17 @@ pub const WalReplicaProvider = struct {
         const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
         const state = self.states.get(group_id) orelse return error.UnknownGroup;
         try state.groupStorage().compactSnapshot(group_id, snapshot);
+    }
+
+    fn compactSnapshotArtifact(
+        ptr: *anyopaque,
+        group_id: u64,
+        metadata: raft_engine.core.types.SnapshotMetadata,
+        artifact: raft_engine.runtime.storage_iface.SnapshotArtifact,
+    ) !void {
+        const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
+        const state = self.states.get(group_id) orelse return error.UnknownGroup;
+        try state.groupStorage().compactSnapshotArtifact(self.alloc, group_id, metadata, artifact);
     }
 
     fn setAppliedIndex(

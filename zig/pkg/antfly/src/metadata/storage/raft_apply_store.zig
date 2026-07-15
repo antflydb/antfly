@@ -420,8 +420,12 @@ test "metadata raft apply store snapshot replaces one complete projection and pr
     });
     var prepared = (try source.snapshotBuilder().prepareSnapshot(group_id, 2)) orelse return error.MissingMetadataSnapshotSource;
     defer prepared.deinit();
-    const snapshot = try prepared.materialize(std.testing.allocator);
-    defer std.testing.allocator.free(snapshot);
+    var materialized = try prepared.materialize(std.testing.allocator);
+    defer materialized.deinit(std.testing.allocator);
+    const snapshot = switch (materialized) {
+        .bytes => |bytes| bytes,
+        .artifact => return error.UnexpectedMetadataSnapshotArtifact,
+    };
     const rebuilt_snapshot = try source.snapshotBuilder().buildSnapshot(std.testing.allocator, group_id);
     defer std.testing.allocator.free(rebuilt_snapshot);
     try std.testing.expectEqualSlices(u8, rebuilt_snapshot, snapshot);
@@ -1237,24 +1241,56 @@ pub const RaftApplyStore = struct {
     const metadata_snapshot_magic = "AFMS";
     const metadata_snapshot_version: u8 = 1;
 
+    const MetadataSnapshotKeyFn = *const fn ([]u8, u64) anyerror![]const u8;
+    const metadata_snapshot_prefixes = [_]MetadataSnapshotKeyFn{
+        splitTransitionPrefixForGroup,
+        mergeTransitionPrefixForGroup,
+        placementPrefixForGroup,
+        nodePrefixForGroup,
+        storePrefixForGroup,
+        tablePrefixForGroup,
+        schemaProgressPrefixForGroup,
+        restoreProgressPrefixForGroup,
+        replicationSourceStatusPrefixForGroup,
+        extensionPackagePrefixForGroup,
+        installedExtensionPrefixForGroup,
+        extensionMemberPrefixForGroup,
+        extensionDependencyPrefixForGroup,
+        shuffleJoinLeasePrefixForGroup,
+        restoreJobPrefixForGroup,
+        rangePrefixForGroup,
+    };
+    const metadata_snapshot_point_keys = [_]MetadataSnapshotKeyFn{
+        reconcileLeaseKeyForGroup,
+        reallocationRequestKeyForGroup,
+    };
+
     const PreparedSnapshot = struct {
         owner: *RaftApplyStore,
         txn: docstore.DocStore.Txn,
         group_id: u64,
+        cancelled: std.atomic.Value(bool) = .init(false),
 
         fn source(self: *@This()) raft_engine.runtime.storage_iface.SnapshotSource {
             return .{
                 .ptr = self,
                 .vtable = &.{
                     .materialize = materialize,
+                    .cancel = cancel,
                     .deinit = PreparedSnapshot.deinit,
                 },
             };
         }
 
-        fn materialize(ptr: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+        fn materialize(ptr: *anyopaque, alloc: std.mem.Allocator) !raft_engine.runtime.storage_iface.SnapshotMaterialization {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try self.owner.buildMetadataSnapshotTxn(alloc, &self.txn, self.group_id);
+            if (self.cancelled.load(.acquire)) return error.SnapshotBuildCancelled;
+            return .{ .bytes = try self.owner.buildMetadataSnapshotTxn(alloc, &self.txn, self.group_id, &self.cancelled) };
+        }
+
+        fn cancel(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.cancelled.store(true, .release);
         }
 
         fn deinit(ptr: *anyopaque) void {
@@ -1268,7 +1304,7 @@ pub const RaftApplyStore = struct {
         const self: *RaftApplyStore = @ptrCast(@alignCast(ptr));
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
-        return try self.buildMetadataSnapshotTxn(alloc, &txn, group_id);
+        return try self.buildMetadataSnapshotTxn(alloc, &txn, group_id, null);
     }
 
     fn prepareSnapshot(ptr: *anyopaque, group_id: u64, applied_index: u64) !?raft_engine.runtime.storage_iface.SnapshotSource {
@@ -1308,7 +1344,7 @@ pub const RaftApplyStore = struct {
         const existing = blk: {
             var read_txn = try self.store.beginReadTxn();
             defer read_txn.abort();
-            break :blk try self.collectMetadataSnapshotRowsTxn(alloc, &read_txn, group_id);
+            break :blk try self.collectMetadataSnapshotRowsTxn(alloc, &read_txn, group_id, null);
         };
         defer freeMetadataSnapshotRows(alloc, existing);
 
@@ -1349,8 +1385,9 @@ pub const RaftApplyStore = struct {
         alloc: std.mem.Allocator,
         txn: *docstore.DocStore.Txn,
         group_id: u64,
+        cancelled: ?*const std.atomic.Value(bool),
     ) ![]u8 {
-        const rows = try self.collectMetadataSnapshotRowsTxn(alloc, txn, group_id);
+        const rows = try self.collectMetadataSnapshotRowsTxn(alloc, txn, group_id, cancelled);
         defer freeMetadataSnapshotRows(alloc, rows);
         return try encodeMetadataSnapshot(alloc, rows);
     }
@@ -1360,6 +1397,7 @@ pub const RaftApplyStore = struct {
         alloc: std.mem.Allocator,
         txn: *docstore.DocStore.Txn,
         group_id: u64,
+        cancelled: ?*const std.atomic.Value(bool),
     ) ![]docstore.OwnedKVPair {
         _ = self;
         var rows = std.ArrayListUnmanaged(docstore.OwnedKVPair).empty;
@@ -1371,24 +1409,14 @@ pub const RaftApplyStore = struct {
             rows.deinit(alloc);
         }
         var buf: [256]u8 = undefined;
-        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try splitTransitionPrefixForGroup(&buf, group_id));
-        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try mergeTransitionPrefixForGroup(&buf, group_id));
-        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try placementPrefixForGroup(&buf, group_id));
-        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try nodePrefixForGroup(&buf, group_id));
-        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try storePrefixForGroup(&buf, group_id));
-        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try tablePrefixForGroup(&buf, group_id));
-        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try schemaProgressPrefixForGroup(&buf, group_id));
-        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try restoreProgressPrefixForGroup(&buf, group_id));
-        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try replicationSourceStatusPrefixForGroup(&buf, group_id));
-        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try extensionPackagePrefixForGroup(&buf, group_id));
-        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try installedExtensionPrefixForGroup(&buf, group_id));
-        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try extensionMemberPrefixForGroup(&buf, group_id));
-        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try extensionDependencyPrefixForGroup(&buf, group_id));
-        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try shuffleJoinLeasePrefixForGroup(&buf, group_id));
-        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try restoreJobPrefixForGroup(&buf, group_id));
-        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try rangePrefixForGroup(&buf, group_id));
-        try appendMetadataPointRowTxn(alloc, txn, &rows, try reconcileLeaseKeyForGroup(&buf, group_id));
-        try appendMetadataPointRowTxn(alloc, txn, &rows, try reallocationRequestKeyForGroup(&buf, group_id));
+        for (metadata_snapshot_prefixes) |prefix_fn| {
+            if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+            try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try prefix_fn(&buf, group_id));
+        }
+        for (metadata_snapshot_point_keys) |key_fn| {
+            if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+            try appendMetadataPointRowTxn(alloc, txn, &rows, try key_fn(&buf, group_id));
+        }
         std.sort.pdq(docstore.OwnedKVPair, rows.items, {}, metadataSnapshotRowLessThan);
         return try rows.toOwnedSlice(alloc);
     }
@@ -4662,34 +4690,32 @@ fn validateMetadataSnapshotRows(
 
 fn metadataSnapshotKeyBelongsToGroup(group_id: u64, key: []const u8) bool {
     var buf: [256]u8 = undefined;
-    const split_prefix = splitTransitionPrefixForGroup(&buf, group_id) catch return false;
-    if (std.mem.startsWith(u8, key, split_prefix)) return true;
-    const merge_prefix = mergeTransitionPrefixForGroup(&buf, group_id) catch return false;
-    if (std.mem.startsWith(u8, key, merge_prefix)) return true;
-    const prefix_fns = .{
-        placementPrefixForGroup,
-        nodePrefixForGroup,
-        storePrefixForGroup,
-        tablePrefixForGroup,
-        schemaProgressPrefixForGroup,
-        restoreProgressPrefixForGroup,
-        replicationSourceStatusPrefixForGroup,
-        extensionPackagePrefixForGroup,
-        installedExtensionPrefixForGroup,
-        extensionMemberPrefixForGroup,
-        extensionDependencyPrefixForGroup,
-        shuffleJoinLeasePrefixForGroup,
-        restoreJobPrefixForGroup,
-        rangePrefixForGroup,
-    };
-    inline for (prefix_fns) |prefix_fn| {
+    for (RaftApplyStore.metadata_snapshot_prefixes) |prefix_fn| {
         const prefix = prefix_fn(&buf, group_id) catch return false;
         if (std.mem.startsWith(u8, key, prefix)) return true;
     }
-    const reconcile_key = reconcileLeaseKeyForGroup(&buf, group_id) catch return false;
-    if (std.mem.eql(u8, key, reconcile_key)) return true;
-    const reallocation_key = reallocationRequestKeyForGroup(&buf, group_id) catch return false;
-    return std.mem.eql(u8, key, reallocation_key);
+    for (RaftApplyStore.metadata_snapshot_point_keys) |key_fn| {
+        const point_key = key_fn(&buf, group_id) catch return false;
+        if (std.mem.eql(u8, key, point_key)) return true;
+    }
+    return false;
+}
+
+test "metadata raft apply store snapshot key registry covers every durable projection class" {
+    try std.testing.expectEqual(@as(usize, 16), RaftApplyStore.metadata_snapshot_prefixes.len);
+    try std.testing.expectEqual(@as(usize, 2), RaftApplyStore.metadata_snapshot_point_keys.len);
+
+    var buf: [256]u8 = undefined;
+    for (RaftApplyStore.metadata_snapshot_prefixes) |prefix_fn| {
+        const prefix = try prefix_fn(&buf, 41);
+        try std.testing.expect(metadataSnapshotKeyBelongsToGroup(41, prefix));
+        try std.testing.expect(!metadataSnapshotKeyBelongsToGroup(42, prefix));
+    }
+    for (RaftApplyStore.metadata_snapshot_point_keys) |key_fn| {
+        const key = try key_fn(&buf, 41);
+        try std.testing.expect(metadataSnapshotKeyBelongsToGroup(41, key));
+        try std.testing.expect(!metadataSnapshotKeyBelongsToGroup(42, key));
+    }
 }
 
 fn appendInt(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), comptime T: type, value: T) !void {

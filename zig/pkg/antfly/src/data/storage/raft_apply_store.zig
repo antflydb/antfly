@@ -24,6 +24,7 @@ const raft_state_machine = @import("../../raft/state_machine/mod.zig");
 const shard_state_store = @import("shard_state_store.zig");
 const data_raft_batch = @import("../raft_batch.zig");
 const batch_shard_count: usize = 64;
+var snapshot_spool_nonce = std.atomic.Value(u64).init(1);
 
 pub const AppliedDataBatch = struct {
     commit_index: u64,
@@ -76,7 +77,6 @@ pub const RaftApplyStore = struct {
         errdefer alloc.free(root_dir);
 
         if (!cfg.read_only) try fs_paths.createDirPathPortable(io_impl.io(), root_dir);
-
         const path = try std.fmt.allocPrint(alloc, "{s}/data-apply-store", .{root_dir});
         errdefer alloc.free(path);
         if (!cfg.read_only) try fs_paths.createDirPathPortable(io_impl.io(), path);
@@ -90,6 +90,13 @@ pub const RaftApplyStore = struct {
             .flush_threshold = 1,
         });
         errdefer backend.close();
+
+        if (!cfg.read_only) {
+            const spool_dir = try std.fmt.allocPrint(alloc, "{s}/snapshot-spool", .{root_dir});
+            defer alloc.free(spool_dir);
+            try std.Io.Dir.cwd().deleteTree(io_impl.io(), spool_dir);
+            try fs_paths.createDirPathPortable(io_impl.io(), spool_dir);
+        }
 
         var runtime_store = try backend.backend.runtimeStore(alloc, .{ .name = "data-apply" });
         errdefer runtime_store.deinit();
@@ -306,20 +313,56 @@ pub const RaftApplyStore = struct {
         owner: *RaftApplyStore,
         txn: docstore.DocStore.Txn,
         group_id: u64,
+        cancelled: std.atomic.Value(bool) = .init(false),
 
         fn source(self: *@This()) raft_engine.runtime.storage_iface.SnapshotSource {
             return .{
                 .ptr = self,
                 .vtable = &.{
                     .materialize = materialize,
+                    .cancel = cancel,
                     .deinit = PreparedSnapshot.deinit,
                 },
             };
         }
 
-        fn materialize(ptr: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+        fn materialize(ptr: *anyopaque, alloc: std.mem.Allocator) !raft_engine.runtime.storage_iface.SnapshotMaterialization {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try shard_state_store.buildSnapshotTxn(&self.txn, alloc, self.group_id);
+            if (self.cancelled.load(.acquire)) return error.SnapshotBuildCancelled;
+            const io = self.owner.io_impl.io();
+            const spool_dir = try std.fmt.allocPrint(alloc, "{s}/snapshot-spool", .{self.owner.root_dir});
+            defer alloc.free(spool_dir);
+            try fs_paths.createDirPathPortable(io, spool_dir);
+            const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}-{d}.snap", .{
+                spool_dir,
+                self.group_id,
+                snapshot_spool_nonce.fetchAdd(1, .monotonic),
+            });
+            defer alloc.free(path);
+            errdefer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+            var size: u64 = 0;
+            {
+                var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+                defer file.close(io);
+                var buffer: [64 * 1024]u8 = undefined;
+                var writer = file.writer(io, &buffer);
+                try shard_state_store.writeSnapshotTxn(&self.txn, alloc, self.group_id, &writer.interface, &self.cancelled);
+                try writer.end();
+                try file.sync(io);
+                size = (try file.stat(io)).size;
+            }
+            return .{ .artifact = try raft_storage_mod.file_snapshot_artifact.FileSnapshotArtifact.create(
+                alloc,
+                io,
+                path,
+                size,
+            ) };
+        }
+
+        fn cancel(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.cancelled.store(true, .release);
         }
 
         fn deinit(ptr: *anyopaque) void {
@@ -1003,7 +1046,7 @@ test "data raft apply store prepared snapshot retains its MVCC view across later
 
     const Worker = struct {
         source: raft_engine.runtime.storage_iface.SnapshotSource,
-        snapshot: ?[]u8 = null,
+        snapshot: ?raft_engine.runtime.storage_iface.SnapshotMaterialization = null,
         failure: ?anyerror = null,
 
         fn run(self: *@This()) void {
@@ -1018,8 +1061,17 @@ test "data raft apply store prepared snapshot retains its MVCC view across later
     const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
     thread.join();
     if (worker.failure) |err| return err;
-    const encoded = worker.snapshot orelse return error.MissingDataSnapshot;
-    defer std.heap.page_allocator.free(encoded);
+    var materialized = worker.snapshot orelse return error.MissingDataSnapshot;
+    defer materialized.deinit(std.heap.page_allocator);
+    const artifact_bytes = switch (materialized) {
+        .bytes => null,
+        .artifact => |artifact| try artifact.readAll(std.heap.page_allocator),
+    };
+    defer if (artifact_bytes) |bytes| std.heap.page_allocator.free(bytes);
+    const encoded = switch (materialized) {
+        .bytes => |bytes| bytes,
+        .artifact => artifact_bytes.?,
+    };
     var snapshot = try shard_state_store.decodeGroupStateSnapshotAlloc(std.testing.allocator, encoded);
     defer snapshot.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), snapshot.entries.len);

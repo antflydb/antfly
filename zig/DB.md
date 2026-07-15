@@ -1254,6 +1254,28 @@ and control state. Publishing the snapshot's applied Raft index remains a
 separate state-machine step; partially installed split lifecycle state must
 never become visible.
 
+Snapshot compaction is asynchronous, fair, bounded-memory maintenance:
+
+- each group has at most one coalesced candidate, and FIFO admission prevents a
+  continuously written group from starving colder groups;
+- build and publish failures retain the latest incarnation-fenced candidate and
+  retry with capped exponential backoff without blocking Raft apply or transport;
+- shutdown cooperatively cancels the active point-in-time source before joining
+  its worker, while source cancellation and destruction remain thread-safe;
+- data snapshots stream from the MVCC cursor into a temporary artifact with a
+  fixed-size buffer instead of first materializing all documents in memory;
+- durable replica state publishes payloads by `(index, term)` before advancing
+  checkpoint metadata, retains the preceding payload until that checkpoint is
+  durable, and loads payload bytes only when snapshot transfer requests them;
+- WAL/checkpoint state retains snapshot metadata but does not retain or encode a
+  second full copy of the document image.
+
+The data and metadata point-in-time views share the same worker contract, but
+metadata remains an in-memory payload because its bounded control-plane state is
+small. One declarative metadata key registry drives both snapshot collection and
+group-ownership validation so adding a durable projection cannot update one
+allowlist while silently omitting the other.
+
 Transition observation reads only this already-open replicated control state.
 It does not open the live table DB, initialize indexes, or compete with the
 generation-owned writer. Destination bootstrap and catch-up apply through the

@@ -16,9 +16,21 @@ const std = @import("std");
 const fs_paths = @import("../../common/fs_paths.zig");
 const raft_engine = @import("raft_engine");
 const storage_mod = @import("mod.zig");
+const snapshot_payload_store = @import("snapshot_payload_store.zig");
 
 const magic: u32 = 0x41524654; // ARFT
 const version: u32 = 2;
+var state_publish_nonce = std.atomic.Value(u64).init(1);
+
+const SnapshotIdentity = struct { index: u64, term: u64 };
+
+fn snapshotIdentity(metadata: raft_engine.core.types.SnapshotMetadata) SnapshotIdentity {
+    return .{ .index = metadata.index, .term = metadata.term };
+}
+
+fn metadataOnlySnapshot(snapshot: raft_engine.core.types.Snapshot) raft_engine.core.types.Snapshot {
+    return .{ .metadata = snapshot.metadata, .data = &.{} };
+}
 
 pub const PersistentReplicaState = struct {
     alloc: std.mem.Allocator,
@@ -43,7 +55,9 @@ pub const PersistentReplicaState = struct {
             .store = raft_engine.core.MemoryStorage.init(alloc),
         };
         errdefer self.deinit();
+        try fs_paths.createDirPathPortable(self.io_impl.io(), self.layout.snapshot_dir);
         try self.load();
+        self.cleanupOrphanSnapshotPayloads();
         return self;
     }
 
@@ -56,7 +70,17 @@ pub const PersistentReplicaState = struct {
     }
 
     pub fn storage(self: *PersistentReplicaState) raft_engine.core.Storage {
-        return self.store.storage();
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .initial_state = storageInitialState,
+                .entries = storageEntries,
+                .term = storageTerm,
+                .first_index = storageFirstIndex,
+                .last_index = storageLastIndex,
+                .snapshot = storageSnapshot,
+            },
+        };
     }
 
     pub fn groupStorage(self: *PersistentReplicaState) raft_engine.runtime.storage_iface.GroupStorage {
@@ -65,6 +89,7 @@ pub const PersistentReplicaState = struct {
             .vtable = &.{
                 .persist_ready = persistReady,
                 .compact_snapshot = compactSnapshot,
+                .compact_snapshot_artifact = compactSnapshotArtifact,
             },
         };
     }
@@ -86,21 +111,121 @@ pub const PersistentReplicaState = struct {
     fn persistReady(ptr: *anyopaque, group_id: u64, ready: raft_engine.core.Ready) !void {
         _ = group_id;
         const self: *PersistentReplicaState = @ptrCast(@alignCast(ptr));
+        var previous_snapshot: ?SnapshotIdentity = null;
         if (ready.snapshot) |snapshot| {
-            try self.store.applySnapshot(snapshot);
+            previous_snapshot = snapshotIdentity(self.store.snapshot_state.metadata);
+            try self.publishSnapshotPayload(snapshot);
+            try self.store.applySnapshot(metadataOnlySnapshot(snapshot));
             if (snapshot.metadata.index > self.applied_index) self.applied_index = snapshot.metadata.index;
         }
         if (ready.hard_state) |hard_state| self.store.setHardState(hard_state);
         if (ready.conf_state) |conf_state| try self.store.setConfState(conf_state);
         if (ready.entries.len > 0) try self.store.append(ready.entries);
         try self.persist();
+        if (previous_snapshot) |previous| self.deleteSupersededSnapshotPayload(previous, snapshotIdentity(ready.snapshot.?.metadata));
     }
 
     fn compactSnapshot(ptr: *anyopaque, group_id: u64, snapshot: raft_engine.core.types.Snapshot) !void {
         _ = group_id;
         const self: *PersistentReplicaState = @ptrCast(@alignCast(ptr));
-        try self.store.compactToSnapshot(snapshot);
+        const previous = snapshotIdentity(self.store.snapshot_state.metadata);
+        try self.publishSnapshotPayload(snapshot);
+        try self.store.compactToSnapshot(metadataOnlySnapshot(snapshot));
         try self.persist();
+        self.deleteSupersededSnapshotPayload(previous, snapshotIdentity(snapshot.metadata));
+    }
+
+    fn compactSnapshotArtifact(
+        ptr: *anyopaque,
+        group_id: u64,
+        metadata: raft_engine.core.types.SnapshotMetadata,
+        artifact: raft_engine.runtime.storage_iface.SnapshotArtifact,
+    ) !void {
+        _ = group_id;
+        const self: *PersistentReplicaState = @ptrCast(@alignCast(ptr));
+        const previous = snapshotIdentity(self.store.snapshot_state.metadata);
+        try snapshot_payload_store.writeArtifactAtomically(
+            self.alloc,
+            self.io_impl.io(),
+            self.layout.snapshot_dir,
+            metadata.index,
+            metadata.term,
+            artifact,
+        );
+        try self.store.compactToSnapshot(.{ .metadata = metadata, .data = &.{} });
+        try self.persist();
+        self.deleteSupersededSnapshotPayload(previous, snapshotIdentity(metadata));
+    }
+
+    fn publishSnapshotPayload(self: *PersistentReplicaState, snapshot: raft_engine.core.types.Snapshot) !void {
+        try snapshot_payload_store.writeAtomically(
+            self.alloc,
+            self.io_impl.io(),
+            self.layout.snapshot_dir,
+            snapshot.metadata.index,
+            snapshot.metadata.term,
+            snapshot.data,
+        );
+    }
+
+    fn deleteSupersededSnapshotPayload(self: *PersistentReplicaState, previous: SnapshotIdentity, current: SnapshotIdentity) void {
+        if (previous.index == 0 or (previous.index == current.index and previous.term == current.term)) return;
+        snapshot_payload_store.delete(self.alloc, self.io_impl.io(), self.layout.snapshot_dir, previous.index, previous.term);
+    }
+
+    fn cleanupOrphanSnapshotPayloads(self: *PersistentReplicaState) void {
+        const current = snapshotIdentity(self.store.snapshot_state.metadata);
+        snapshot_payload_store.cleanupOrphans(
+            self.alloc,
+            self.io_impl.io(),
+            self.layout.snapshot_dir,
+            current.index,
+            current.term,
+        ) catch |err| std.log.warn("raft snapshot payload startup cleanup failed path={s} error={s}", .{
+            self.layout.snapshot_dir,
+            @errorName(err),
+        });
+    }
+
+    fn storageInitialState(ptr: *anyopaque, alloc: std.mem.Allocator) !raft_engine.core.Storage.InitialState {
+        const self: *PersistentReplicaState = @ptrCast(@alignCast(ptr));
+        return try self.store.storage().initialState(alloc);
+    }
+
+    fn storageEntries(ptr: *anyopaque, alloc: std.mem.Allocator, low: u64, high: u64, max_bytes: usize) ![]raft_engine.core.Entry {
+        const self: *PersistentReplicaState = @ptrCast(@alignCast(ptr));
+        return try self.store.storage().entries(alloc, low, high, max_bytes);
+    }
+
+    fn storageTerm(ptr: *anyopaque, index: u64) !u64 {
+        const self: *PersistentReplicaState = @ptrCast(@alignCast(ptr));
+        return try self.store.storage().term(index);
+    }
+
+    fn storageFirstIndex(ptr: *anyopaque) !u64 {
+        const self: *PersistentReplicaState = @ptrCast(@alignCast(ptr));
+        return try self.store.storage().firstIndex();
+    }
+
+    fn storageLastIndex(ptr: *anyopaque) !u64 {
+        const self: *PersistentReplicaState = @ptrCast(@alignCast(ptr));
+        return try self.store.storage().lastIndex();
+    }
+
+    fn storageSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !raft_engine.core.types.Snapshot {
+        const self: *PersistentReplicaState = @ptrCast(@alignCast(ptr));
+        var snapshot = try self.store.storage().snapshot(alloc);
+        errdefer snapshot.deinit(alloc);
+        if (snapshot.data.len == 0 and snapshot.metadata.index != 0) {
+            snapshot.data = try snapshot_payload_store.readAlloc(
+                alloc,
+                self.io_impl.io(),
+                self.layout.snapshot_dir,
+                snapshot.metadata.index,
+                snapshot.metadata.term,
+            );
+        }
+        return snapshot;
     }
 
     fn load(self: *PersistentReplicaState) !void {
@@ -179,10 +304,23 @@ pub const PersistentReplicaState = struct {
         const path = try self.statePath();
         defer self.alloc.free(path);
         try fs_paths.createDirPathPortable(self.io(), self.layout.log_dir);
-        try std.Io.Dir.cwd().writeFile(self.io(), .{
-            .sub_path = path,
-            .data = buffer.items,
+        const tmp_path = try std.fmt.allocPrint(self.alloc, "{s}.tmp-{d}", .{
+            path,
+            state_publish_nonce.fetchAdd(1, .monotonic),
         });
+        defer self.alloc.free(tmp_path);
+        errdefer std.Io.Dir.cwd().deleteFile(self.io(), tmp_path) catch {};
+        {
+            var file = try fs_paths.createFilePortable(self.io(), tmp_path, .{ .truncate = true });
+            defer file.close(self.io());
+            var writer_buffer: [64 * 1024]u8 = undefined;
+            var writer = file.writer(self.io(), &writer_buffer);
+            try writer.interface.writeAll(buffer.items);
+            try writer.end();
+            try file.sync(self.io());
+        }
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, self.io());
+        try fs_paths.syncDirPortable(self.io(), self.layout.log_dir);
     }
 
     fn statePath(self: *const PersistentReplicaState) ![]u8 {
@@ -500,6 +638,7 @@ test "persistent replica state persists snapshots across reopen" {
     {
         var reopened = try PersistentReplicaState.init(std.testing.allocator, layout);
         defer reopened.deinit();
+        try std.testing.expectEqual(@as(usize, 0), reopened.store.snapshot_state.data.len);
         const snapshot = try reopened.storage().snapshot(std.testing.allocator);
         defer {
             var owned = snapshot;

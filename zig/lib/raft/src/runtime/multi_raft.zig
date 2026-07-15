@@ -150,6 +150,8 @@ pub const HostMetrics = struct {
     snapshot_compaction_failures: usize = 0,
     snapshot_compaction_busy_skips: usize = 0,
     snapshot_compaction_stale_drops: usize = 0,
+    snapshot_compaction_retries: usize = 0,
+    snapshot_compaction_candidates: usize = 0,
     snapshot_compaction_bytes: usize = 0,
     snapshot_compaction_build_ns: u64 = 0,
 };
@@ -187,7 +189,8 @@ const SnapshotBuildResult = union(enum) {
     success: struct {
         group_id: core.types.GroupId,
         incarnation: u64,
-        snapshot: core.types.Snapshot,
+        metadata: core.types.SnapshotMetadata,
+        payload: storage_iface.SnapshotMaterialization,
         build_ns: u64,
     },
     failure: struct {
@@ -199,7 +202,10 @@ const SnapshotBuildResult = union(enum) {
 
     fn deinit(self: *@This()) void {
         switch (self.*) {
-            .success => |*result| result.snapshot.deinit(std.heap.page_allocator),
+            .success => |*result| {
+                result.metadata.deinit(std.heap.page_allocator);
+                result.payload.deinit(std.heap.page_allocator);
+            },
             .failure => {},
         }
         self.* = undefined;
@@ -214,6 +220,7 @@ const SnapshotBuildWorker = struct {
     stopping: bool = false,
     running: bool = false,
     pending: ?SnapshotBuildRequest = null,
+    running_source: ?storage_iface.SnapshotSource = null,
     result: ?SnapshotBuildResult = null,
 
     fn start(self: *@This()) !void {
@@ -224,6 +231,7 @@ const SnapshotBuildWorker = struct {
         const io = self.io_impl.io();
         self.mutex.lockUncancelable(io);
         self.stopping = true;
+        if (self.running_source) |source| source.cancel();
         self.ready.broadcast(io);
         self.mutex.unlock(io);
         if (self.thread) |thread| thread.join();
@@ -271,18 +279,24 @@ const SnapshotBuildWorker = struct {
             var request = self.pending.?;
             self.pending = null;
             self.running = true;
+            self.running_source = request.source;
             self.mutex.unlock(io);
 
             const started_ns = clock.monotonicNs();
             const applied_index = request.metadata.index;
-            const data = request.source.materialize(std.heap.page_allocator);
+            const payload = request.source.materialize(std.heap.page_allocator);
+
+            self.mutex.lockUncancelable(io);
+            self.running_source = null;
+            self.mutex.unlock(io);
             request.source.deinit();
             request.source = undefined;
-            const result: SnapshotBuildResult = if (data) |snapshot_data|
+            const result: SnapshotBuildResult = if (payload) |snapshot_payload|
                 .{ .success = .{
                     .group_id = request.group_id,
                     .incarnation = request.incarnation,
-                    .snapshot = .{ .metadata = request.metadata, .data = snapshot_data },
+                    .metadata = request.metadata,
+                    .payload = snapshot_payload,
                     .build_ns = clock.elapsedSinceNs(started_ns),
                 } }
             else |err| blk: {
@@ -307,7 +321,19 @@ const SnapshotBuildWorker = struct {
 const SnapshotCandidate = struct {
     applied_index: core.types.Index,
     incarnation: u64,
+    enqueue_sequence: u64,
+    retry_attempt: u8 = 0,
+    retry_after_ns: u64 = 0,
 };
+
+const snapshot_retry_base_ns: u64 = 10 * std.time.ns_per_ms;
+const snapshot_retry_max_ns: u64 = 5 * std.time.ns_per_s;
+const snapshot_publish_inline_retry_limit: u8 = 5;
+
+fn snapshotRetryDelayNs(attempt: u8) u64 {
+    const shift: u6 = @intCast(@min(attempt -| 1, 9));
+    return @min(snapshot_retry_base_ns << shift, snapshot_retry_max_ns);
+}
 
 pub const MultiRaft = struct {
     alloc: std.mem.Allocator,
@@ -320,8 +346,11 @@ pub const MultiRaft = struct {
     pending_outbox: TransportOutbox = .{},
     pending_apply: std.ArrayListUnmanaged(PendingApplyTask) = .empty,
     snapshot_candidates: std.AutoHashMapUnmanaged(core.types.GroupId, SnapshotCandidate) = .empty,
+    next_snapshot_candidate_sequence: u64 = 1,
     snapshot_worker: ?*SnapshotBuildWorker = null,
     snapshot_publish: ?SnapshotBuildResult = null,
+    snapshot_publish_retry_attempt: u8 = 0,
+    snapshot_publish_retry_after_ns: u64 = 0,
     metrics: HostMetrics = .{},
 
     pub fn init(alloc: std.mem.Allocator, cfg: RuntimeConfig, hooks: RuntimeHooks) MultiRaft {
@@ -447,6 +476,7 @@ pub const MultiRaft = struct {
         const removed = self.groups.fetchRemove(group_id) orelse return false;
         _ = self.group_incarnations.remove(group_id);
         _ = self.snapshot_candidates.remove(group_id);
+        self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
         var grp = removed.value;
         grp.deinit();
         _ = self.scheduler.unregisterGroup(group_id);
@@ -1007,16 +1037,47 @@ pub const MultiRaft = struct {
             if (has_later_group_task) continue;
             const last_applied = task.entries[task.entries.len - 1].index;
             const incarnation = self.group_incarnations.get(task.group_id) orelse continue;
-            const candidate = try self.snapshot_candidates.getOrPut(self.alloc, task.group_id);
-            if (!candidate.found_existing or candidate.value_ptr.incarnation != incarnation or last_applied > candidate.value_ptr.applied_index) {
-                candidate.value_ptr.* = .{ .applied_index = last_applied, .incarnation = incarnation };
-            }
+            try self.queueSnapshotCandidate(task.group_id, last_applied, incarnation, false);
         }
+        self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
         try self.dispatchNextSnapshotCompaction();
+    }
+
+    fn queueSnapshotCandidate(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        applied_index: core.types.Index,
+        incarnation: u64,
+        retry: bool,
+    ) !void {
+        const candidate = try self.snapshot_candidates.getOrPut(self.alloc, group_id);
+        if (!candidate.found_existing or candidate.value_ptr.incarnation != incarnation) {
+            candidate.value_ptr.* = .{
+                .applied_index = applied_index,
+                .incarnation = incarnation,
+                .enqueue_sequence = self.takeSnapshotCandidateSequence(),
+            };
+        } else if (applied_index > candidate.value_ptr.applied_index) {
+            candidate.value_ptr.applied_index = applied_index;
+        }
+        if (retry) {
+            candidate.value_ptr.retry_attempt +|= 1;
+            candidate.value_ptr.retry_after_ns = clock.monotonicNs() + snapshotRetryDelayNs(candidate.value_ptr.retry_attempt);
+            self.metrics.snapshot_compaction_retries += 1;
+        }
+    }
+
+    fn takeSnapshotCandidateSequence(self: *MultiRaft) u64 {
+        const sequence = self.next_snapshot_candidate_sequence;
+        self.next_snapshot_candidate_sequence +%= 1;
+        if (self.next_snapshot_candidate_sequence == 0) self.next_snapshot_candidate_sequence = 1;
+        return sequence;
     }
 
     fn dispatchNextSnapshotCompaction(self: *MultiRaft) !void {
         if (self.cfg.applied_log_retained_entries == 0 or self.snapshot_candidates.count() == 0) return;
+        defer self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
+        if (self.snapshot_publish != null) return;
         const state_machine = self.hooks.state_machine orelse return;
         if (state_machine.vtable.prepare_snapshot == null) {
             self.snapshot_candidates.clearRetainingCapacity();
@@ -1030,11 +1091,20 @@ pub const MultiRaft = struct {
         }
 
         while (self.snapshot_candidates.count() > 0) {
+            const now_ns = clock.monotonicNs();
+            var selected_group_id: ?core.types.GroupId = null;
+            var selected: SnapshotCandidate = undefined;
             var candidates = self.snapshot_candidates.iterator();
-            const candidate = candidates.next().?;
-            const group_id = candidate.key_ptr.*;
-            const last_applied = candidate.value_ptr.applied_index;
-            const incarnation = candidate.value_ptr.incarnation;
+            while (candidates.next()) |candidate| {
+                if (candidate.value_ptr.retry_after_ns > now_ns) continue;
+                if (selected_group_id == null or candidate.value_ptr.enqueue_sequence < selected.enqueue_sequence) {
+                    selected_group_id = candidate.key_ptr.*;
+                    selected = candidate.value_ptr.*;
+                }
+            }
+            const group_id = selected_group_id orelse return;
+            const last_applied = selected.applied_index;
+            const incarnation = selected.incarnation;
             if (self.group_incarnations.get(group_id) != incarnation) {
                 _ = self.snapshot_candidates.remove(group_id);
                 continue;
@@ -1112,6 +1182,7 @@ pub const MultiRaft = struct {
             self.snapshot_publish = worker.takeResult();
         }
         const result = if (self.snapshot_publish) |*value| value else return;
+        if (self.snapshot_publish_retry_after_ns > clock.monotonicNs()) return;
         switch (result.*) {
             .failure => |failure| {
                 self.metrics.snapshot_compaction_failures += 1;
@@ -1120,37 +1191,80 @@ pub const MultiRaft = struct {
                     failure.applied_index,
                     @errorName(failure.cause),
                 });
+                if (self.group_incarnations.get(failure.group_id) == failure.incarnation) {
+                    try self.queueSnapshotCandidate(failure.group_id, failure.applied_index, failure.incarnation, true);
+                }
                 self.snapshot_publish = null;
+                self.snapshot_publish_retry_attempt = 0;
+                self.snapshot_publish_retry_after_ns = 0;
+                self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
             },
             .success => |*completed| {
                 if (self.group_incarnations.get(completed.group_id) != completed.incarnation) {
                     self.metrics.snapshot_compaction_stale_drops += 1;
-                    result.deinit();
-                    self.snapshot_publish = null;
+                    self.clearSnapshotPublish(result);
                     return;
                 }
                 const grp = self.groups.getPtr(completed.group_id) orelse {
-                    result.deinit();
-                    self.snapshot_publish = null;
+                    self.clearSnapshotPublish(result);
                     return;
                 };
                 const current_snapshot_index = grp.raw_node.raft.log.firstIndex() - 1;
-                if (completed.snapshot.metadata.index < current_snapshot_index) {
+                if (completed.metadata.index < current_snapshot_index) {
                     self.metrics.snapshot_compaction_stale_drops += 1;
-                    result.deinit();
-                    self.snapshot_publish = null;
+                    self.clearSnapshotPublish(result);
                     return;
                 }
                 const group_storage = self.hooks.group_storage orelse return;
-                try group_storage.compactSnapshot(completed.group_id, completed.snapshot);
-                try grp.compactAppliedLogTo(completed.snapshot.metadata.index);
+                const publish_result = switch (completed.payload) {
+                    .bytes => |bytes| group_storage.compactSnapshot(completed.group_id, .{
+                        .metadata = completed.metadata,
+                        .data = bytes,
+                    }),
+                    .artifact => |artifact| group_storage.compactSnapshotArtifact(
+                        std.heap.page_allocator,
+                        completed.group_id,
+                        completed.metadata,
+                        artifact,
+                    ),
+                };
+                publish_result catch |err| {
+                    self.metrics.snapshot_compaction_failures += 1;
+                    self.snapshot_publish_retry_attempt +|= 1;
+                    self.snapshot_publish_retry_after_ns = clock.monotonicNs() + snapshotRetryDelayNs(self.snapshot_publish_retry_attempt);
+                    self.metrics.snapshot_compaction_retries += 1;
+                    std.log.warn("raft snapshot compaction publish deferred group_id={d} applied_index={d} attempt={d} error={s}", .{
+                        completed.group_id,
+                        completed.metadata.index,
+                        self.snapshot_publish_retry_attempt,
+                        @errorName(err),
+                    });
+                    if (self.snapshot_publish_retry_attempt >= snapshot_publish_inline_retry_limit) {
+                        try self.queueSnapshotCandidate(
+                            completed.group_id,
+                            completed.metadata.index,
+                            completed.incarnation,
+                            true,
+                        );
+                        self.clearSnapshotPublish(result);
+                        self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
+                    }
+                    return;
+                };
+                try grp.compactAppliedLogTo(completed.metadata.index);
                 self.metrics.snapshot_compaction_completions += 1;
-                self.metrics.snapshot_compaction_bytes += completed.snapshot.data.len;
+                self.metrics.snapshot_compaction_bytes += @intCast(completed.payload.len());
                 self.metrics.snapshot_compaction_build_ns += completed.build_ns;
-                result.deinit();
-                self.snapshot_publish = null;
+                self.clearSnapshotPublish(result);
             },
         }
+    }
+
+    fn clearSnapshotPublish(self: *MultiRaft, result: *SnapshotBuildResult) void {
+        result.deinit();
+        self.snapshot_publish = null;
+        self.snapshot_publish_retry_attempt = 0;
+        self.snapshot_publish_retry_after_ns = 0;
     }
 
     fn refreshMetricsTopology(self: *MultiRaft) void {

@@ -18,6 +18,7 @@ const raft_engine = @import("raft_engine");
 const platform_time = @import("../../platform/time.zig");
 const wal_mod = @import("../../storage/wal.zig");
 const storage_mod = @import("mod.zig");
+const snapshot_payload_store = @import("snapshot_payload_store.zig");
 const storage_iface = raft_engine.runtime.storage_iface;
 
 const magic: u32 = 0x41524654; // ARFT
@@ -73,6 +74,16 @@ const DeltaRecordKind = enum(u8) {
     conf_state = 2,
 };
 
+const SnapshotIdentity = struct { index: u64, term: u64 };
+
+fn snapshotIdentity(metadata: raft_engine.core.types.SnapshotMetadata) SnapshotIdentity {
+    return .{ .index = metadata.index, .term = metadata.term };
+}
+
+fn metadataOnlySnapshot(snapshot: raft_engine.core.types.Snapshot) raft_engine.core.types.Snapshot {
+    return .{ .metadata = snapshot.metadata, .data = &.{} };
+}
+
 pub const WalReplicaState = struct {
     alloc: std.mem.Allocator,
     cfg: WalReplicaStateConfig,
@@ -99,6 +110,7 @@ pub const WalReplicaState = struct {
         errdefer io_impl.deinit();
 
         try fs_paths.createDirPathPortable(io_impl.io(), layout.log_dir);
+        try fs_paths.createDirPathPortable(io_impl.io(), layout.snapshot_dir);
         const wal_dir = try std.fmt.allocPrint(alloc, "{s}/state-wal", .{layout.log_dir});
         errdefer alloc.free(wal_dir);
         try fs_paths.createDirPathPortable(io_impl.io(), wal_dir);
@@ -124,6 +136,7 @@ pub const WalReplicaState = struct {
         };
         errdefer self.deinit();
         try self.load();
+        self.cleanupOrphanSnapshotPayloads();
         return self;
     }
 
@@ -139,7 +152,17 @@ pub const WalReplicaState = struct {
     }
 
     pub fn storage(self: *WalReplicaState) raft_engine.core.Storage {
-        return self.store.storage();
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .initial_state = storageInitialState,
+                .entries = storageEntries,
+                .term = storageTerm,
+                .first_index = storageFirstIndex,
+                .last_index = storageLastIndex,
+                .snapshot = storageSnapshot,
+            },
+        };
     }
 
     pub fn groupStorage(self: *WalReplicaState) raft_engine.runtime.storage_iface.GroupStorage {
@@ -148,6 +171,7 @@ pub const WalReplicaState = struct {
             .vtable = &.{
                 .persist_ready = persistReady,
                 .compact_snapshot = compactSnapshot,
+                .compact_snapshot_artifact = compactSnapshotArtifact,
                 .persist_ready_diagnostics = persistReadyWithDiagnostics,
             },
         };
@@ -226,13 +250,46 @@ pub const WalReplicaState = struct {
         _ = group_id;
         const self: *WalReplicaState = @ptrCast(@alignCast(ptr));
         const started_ns = nowNs();
-        try self.store.compactToSnapshot(snapshot);
+        const previous = snapshotIdentity(self.store.snapshot_state.metadata);
+        try self.publishSnapshotPayload(snapshot);
+        try self.store.compactToSnapshot(metadataOnlySnapshot(snapshot));
         self.last_compacted_index = snapshot.metadata.index;
         self.stats.storage_compactions += 1;
         const elapsed = elapsedSince(started_ns);
         self.stats.storage_compaction_ns += elapsed;
         self.stats.max_storage_compaction_ns = @max(self.stats.max_storage_compaction_ns, elapsed);
         try self.persistCheckpoint();
+        self.deleteSupersededSnapshotPayload(previous, snapshotIdentity(snapshot.metadata));
+        self.delta_records_since_checkpoint = 0;
+        self.delta_bytes_since_checkpoint = 0;
+    }
+
+    fn compactSnapshotArtifact(
+        ptr: *anyopaque,
+        group_id: u64,
+        metadata: raft_engine.core.types.SnapshotMetadata,
+        artifact: storage_iface.SnapshotArtifact,
+    ) !void {
+        _ = group_id;
+        const self: *WalReplicaState = @ptrCast(@alignCast(ptr));
+        const previous = snapshotIdentity(self.store.snapshot_state.metadata);
+        const started_ns = nowNs();
+        try snapshot_payload_store.writeArtifactAtomically(
+            self.alloc,
+            self.io_impl.io(),
+            self.layout.snapshot_dir,
+            metadata.index,
+            metadata.term,
+            artifact,
+        );
+        try self.store.compactToSnapshot(.{ .metadata = metadata, .data = &.{} });
+        self.last_compacted_index = metadata.index;
+        self.stats.storage_compactions += 1;
+        const elapsed = elapsedSince(started_ns);
+        self.stats.storage_compaction_ns += elapsed;
+        self.stats.max_storage_compaction_ns = @max(self.stats.max_storage_compaction_ns, elapsed);
+        try self.persistCheckpoint();
+        self.deleteSupersededSnapshotPayload(previous, snapshotIdentity(metadata));
         self.delta_records_since_checkpoint = 0;
         self.delta_bytes_since_checkpoint = 0;
     }
@@ -245,10 +302,13 @@ pub const WalReplicaState = struct {
     ) !void {
         _ = group_id;
         self.stats.persist_ready_calls += 1;
+        var previous_snapshot: ?SnapshotIdentity = null;
 
         const storage_apply_started_ns = if (diagnostics != null) nowNs() else 0;
         if (ready.snapshot) |snapshot| {
-            try self.store.applySnapshot(snapshot);
+            previous_snapshot = snapshotIdentity(self.store.snapshot_state.metadata);
+            try self.publishSnapshotPayload(snapshot);
+            try self.store.applySnapshot(metadataOnlySnapshot(snapshot));
             if (snapshot.metadata.index > self.applied_index) self.applied_index = snapshot.metadata.index;
         }
         if (ready.hard_state) |hard_state| self.store.setHardState(hard_state);
@@ -261,6 +321,9 @@ pub const WalReplicaState = struct {
         if (diagnostics) |diag| diag.storage_apply_elapsed_ns += elapsedSince(storage_apply_started_ns);
 
         try self.persistReadyDelta(ready, diagnostics);
+        if (previous_snapshot) |previous| {
+            self.deleteSupersededSnapshotPayload(previous, snapshotIdentity(ready.snapshot.?.metadata));
+        }
     }
 
     fn load(self: *WalReplicaState) !void {
@@ -283,6 +346,81 @@ pub const WalReplicaState = struct {
         try self.loadAppliedWatermark();
         self.durable_applied_index = self.applied_index;
         try self.refreshLastCompactedIndex();
+    }
+
+    fn publishSnapshotPayload(self: *WalReplicaState, snapshot: raft_engine.core.types.Snapshot) !void {
+        try snapshot_payload_store.writeAtomically(
+            self.alloc,
+            self.io_impl.io(),
+            self.layout.snapshot_dir,
+            snapshot.metadata.index,
+            snapshot.metadata.term,
+            snapshot.data,
+        );
+    }
+
+    fn deleteSupersededSnapshotPayload(
+        self: *WalReplicaState,
+        previous: SnapshotIdentity,
+        current: SnapshotIdentity,
+    ) void {
+        if (previous.index == 0 or (previous.index == current.index and previous.term == current.term)) return;
+        snapshot_payload_store.delete(self.alloc, self.io_impl.io(), self.layout.snapshot_dir, previous.index, previous.term);
+    }
+
+    fn cleanupOrphanSnapshotPayloads(self: *WalReplicaState) void {
+        const current = snapshotIdentity(self.store.snapshot_state.metadata);
+        snapshot_payload_store.cleanupOrphans(
+            self.alloc,
+            self.io_impl.io(),
+            self.layout.snapshot_dir,
+            current.index,
+            current.term,
+        ) catch |err| std.log.warn("raft snapshot payload startup cleanup failed path={s} error={s}", .{
+            self.layout.snapshot_dir,
+            @errorName(err),
+        });
+    }
+
+    fn storageInitialState(ptr: *anyopaque, alloc: std.mem.Allocator) !raft_engine.core.Storage.InitialState {
+        const self: *WalReplicaState = @ptrCast(@alignCast(ptr));
+        return try self.store.storage().initialState(alloc);
+    }
+
+    fn storageEntries(ptr: *anyopaque, alloc: std.mem.Allocator, low: u64, high: u64, max_bytes: usize) ![]raft_engine.core.Entry {
+        const self: *WalReplicaState = @ptrCast(@alignCast(ptr));
+        return try self.store.storage().entries(alloc, low, high, max_bytes);
+    }
+
+    fn storageTerm(ptr: *anyopaque, index: u64) !u64 {
+        const self: *WalReplicaState = @ptrCast(@alignCast(ptr));
+        return try self.store.storage().term(index);
+    }
+
+    fn storageFirstIndex(ptr: *anyopaque) !u64 {
+        const self: *WalReplicaState = @ptrCast(@alignCast(ptr));
+        return try self.store.storage().firstIndex();
+    }
+
+    fn storageLastIndex(ptr: *anyopaque) !u64 {
+        const self: *WalReplicaState = @ptrCast(@alignCast(ptr));
+        return try self.store.storage().lastIndex();
+    }
+
+    fn storageSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !raft_engine.core.types.Snapshot {
+        const self: *WalReplicaState = @ptrCast(@alignCast(ptr));
+        var snapshot = try self.store.storage().snapshot(alloc);
+        errdefer snapshot.deinit(alloc);
+        if (snapshot.data.len == 0 and snapshot.metadata.index != 0) {
+            snapshot.data = try snapshot_payload_store.readAlloc(
+                alloc,
+                self.io_impl.io(),
+                self.layout.snapshot_dir,
+                snapshot.metadata.index,
+                snapshot.metadata.term,
+            );
+        }
+        return snapshot;
     }
 
     fn persist(self: *WalReplicaState, reason: PersistReason) !void {
@@ -553,7 +691,7 @@ pub const WalReplicaState = struct {
         }
 
         try appendBool(self.alloc, &buffer, ready.snapshot != null);
-        if (ready.snapshot) |snapshot| try encodeSnapshot(self.alloc, &buffer, snapshot);
+        if (ready.snapshot) |snapshot| try encodeSnapshot(self.alloc, &buffer, metadataOnlySnapshot(snapshot));
 
         try appendInt(u32, self.alloc, &buffer, @intCast(ready.entries.len));
         for (ready.entries) |entry| try encodeEntry(self.alloc, &buffer, entry);
@@ -735,6 +873,7 @@ pub const WalReplicaState = struct {
             try file.sync(io);
         }
         try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+        try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".");
     }
 
     fn decodeConfState(alloc: std.mem.Allocator, bytes: []const u8, cursor: *usize) !raft_engine.core.ConfState {
@@ -1301,6 +1440,7 @@ test "wal replica state persists semantic compaction snapshot and preserves suff
         try std.testing.expectEqual(@as(u64, 0), stats.replay_debt_records);
         try std.testing.expectEqual(@as(u64, 7), try state.storage().firstIndex());
         try std.testing.expectEqual(@as(u64, 8), try state.storage().lastIndex());
+        try std.testing.expectEqual(@as(usize, 0), state.store.snapshot_state.data.len);
         var snapshot = try state.storage().snapshot(std.testing.allocator);
         defer snapshot.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings("state-machine-6", snapshot.data);
@@ -1313,6 +1453,7 @@ test "wal replica state persists semantic compaction snapshot and preserves suff
         try std.testing.expectEqual(@as(u64, 8), reopened.appliedIndex());
         try std.testing.expectEqual(@as(u64, 7), try reopened.storage().firstIndex());
         try std.testing.expectEqual(@as(u64, 8), try reopened.storage().lastIndex());
+        try std.testing.expectEqual(@as(usize, 0), reopened.store.snapshot_state.data.len);
         var snapshot = try reopened.storage().snapshot(std.testing.allocator);
         defer snapshot.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings("state-machine-6", snapshot.data);

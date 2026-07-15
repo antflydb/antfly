@@ -421,19 +421,108 @@ pub fn buildSnapshot(store: *docstore.DocStore, alloc: std.mem.Allocator, group_
 }
 
 pub fn buildSnapshotTxn(txn: *docstore.DocStore.Txn, alloc: std.mem.Allocator, group_id: u64) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writeSnapshotTxn(txn, alloc, group_id, &out.writer, null);
+    return try out.toOwnedSlice();
+}
+
+pub fn writeSnapshotTxn(
+    txn: *docstore.DocStore.Txn,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    writer: *std.Io.Writer,
+    cancelled: ?*const std.atomic.Value(bool),
+) !void {
     const byte_range = try currentRangeTxn(txn, alloc, group_id);
     defer range_state.freeRange(alloc, byte_range);
-    const entries = try groupStateTxn(txn, alloc, group_id);
-    defer {
-        for (entries) |entry| {
-            alloc.free(entry.key);
-            alloc.free(entry.value);
-        }
-        alloc.free(entries);
-    }
     const controls = try groupControlStateTxn(txn, alloc, group_id);
     defer freeGroupStateEntries(alloc, controls);
-    return try encodeGroupStateSnapshot(alloc, byte_range, entries, controls);
+
+    try writer.writeAll(group_snapshot_magic);
+    try writer.writeByte(group_snapshot_version);
+    try writeSnapshotBytes(writer, byte_range.start);
+    try writeSnapshotBytes(writer, byte_range.end);
+    const document_count = try countGroupDocumentsTxn(txn, alloc, group_id, cancelled);
+    try writeSnapshotU32(writer, try snapshotLength(document_count));
+    try writeGroupDocumentsTxn(txn, alloc, group_id, writer, cancelled);
+    try writeSnapshotEntries(writer, controls);
+}
+
+fn countGroupDocumentsTxn(
+    txn: *docstore.DocStore.Txn,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    cancelled: ?*const std.atomic.Value(bool),
+) !usize {
+    const logical_prefix = try groupDocumentPrefixAlloc(alloc, group_id);
+    defer alloc.free(logical_prefix);
+    const lower = try internal_keys.documentRangeLowerAlloc(alloc, logical_prefix);
+    defer alloc.free(lower);
+    const upper = (try internal_keys.documentRangeUpperAlloc(alloc, logical_prefix)) orelse return 0;
+    defer alloc.free(upper);
+
+    var cur = try txn.openCursor();
+    defer cur.close();
+    cur.setUpperBound(upper);
+    var count: usize = 0;
+    var entry = try cur.seekAtOrAfter(lower);
+    while (entry) |kv| : (entry = try cur.next()) {
+        if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+        if (std.mem.order(u8, kv.key, upper) != .lt) break;
+        const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse continue;
+        defer alloc.free(logical_key);
+        if (std.mem.startsWith(u8, logical_key, logical_prefix)) count += 1;
+    }
+    return count;
+}
+
+fn writeGroupDocumentsTxn(
+    txn: *docstore.DocStore.Txn,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    writer: *std.Io.Writer,
+    cancelled: ?*const std.atomic.Value(bool),
+) !void {
+    const logical_prefix = try groupDocumentPrefixAlloc(alloc, group_id);
+    defer alloc.free(logical_prefix);
+    const lower = try internal_keys.documentRangeLowerAlloc(alloc, logical_prefix);
+    defer alloc.free(lower);
+    const upper = (try internal_keys.documentRangeUpperAlloc(alloc, logical_prefix)) orelse return;
+    defer alloc.free(upper);
+
+    var cur = try txn.openCursor();
+    defer cur.close();
+    cur.setUpperBound(upper);
+    var entry = try cur.seekAtOrAfter(lower);
+    while (entry) |kv| : (entry = try cur.next()) {
+        if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+        if (std.mem.order(u8, kv.key, upper) != .lt) break;
+        const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse continue;
+        defer alloc.free(logical_key);
+        if (!std.mem.startsWith(u8, logical_key, logical_prefix)) continue;
+        try writeSnapshotBytes(writer, logical_key[logical_prefix.len..]);
+        try writeSnapshotBytes(writer, kv.value);
+    }
+}
+
+fn writeSnapshotEntries(writer: *std.Io.Writer, entries: []const AppliedDataKV) !void {
+    try writeSnapshotU32(writer, try snapshotLength(entries.len));
+    for (entries) |entry| {
+        try writeSnapshotBytes(writer, entry.key);
+        try writeSnapshotBytes(writer, entry.value);
+    }
+}
+
+fn writeSnapshotBytes(writer: *std.Io.Writer, bytes: []const u8) !void {
+    try writeSnapshotU32(writer, try snapshotLength(bytes.len));
+    try writer.writeAll(bytes);
+}
+
+fn writeSnapshotU32(writer: *std.Io.Writer, value: u32) !void {
+    var encoded: [4]u8 = undefined;
+    std.mem.writeInt(u32, &encoded, value, .little);
+    try writer.writeAll(&encoded);
 }
 
 pub const GroupStateSnapshot = struct {

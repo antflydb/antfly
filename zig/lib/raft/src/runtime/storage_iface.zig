@@ -15,6 +15,57 @@
 const std = @import("std");
 const core = @import("../core/mod.zig");
 
+/// An immutable, bounded-memory snapshot payload. Implementations own the
+/// backing resource and must support concurrent cancellation-safe reads until
+/// `deinit` is called.
+pub const SnapshotArtifact = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        len: *const fn (ptr: *anyopaque) u64,
+        write_to: *const fn (ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void,
+        read_all: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8,
+        deinit: *const fn (ptr: *anyopaque) void,
+    };
+
+    pub fn len(self: SnapshotArtifact) u64 {
+        return self.vtable.len(self.ptr);
+    }
+
+    pub fn writeTo(self: SnapshotArtifact, writer: *std.Io.Writer) !void {
+        return try self.vtable.write_to(self.ptr, writer);
+    }
+
+    pub fn readAll(self: SnapshotArtifact, alloc: std.mem.Allocator) ![]u8 {
+        return try self.vtable.read_all(self.ptr, alloc);
+    }
+
+    pub fn deinit(self: SnapshotArtifact) void {
+        self.vtable.deinit(self.ptr);
+    }
+};
+
+pub const SnapshotMaterialization = union(enum) {
+    bytes: []u8,
+    artifact: SnapshotArtifact,
+
+    pub fn len(self: SnapshotMaterialization) u64 {
+        return switch (self) {
+            .bytes => |bytes| bytes.len,
+            .artifact => |artifact| artifact.len(),
+        };
+    }
+
+    pub fn deinit(self: *SnapshotMaterialization, alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .bytes => |bytes| if (bytes.len > 0) alloc.free(bytes),
+            .artifact => |artifact| artifact.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
 pub const ReadyPersistenceDiagnostics = struct {
     skipped_no_durable_state: bool = false,
     used_batch: bool = false,
@@ -42,6 +93,12 @@ pub const GroupStorage = struct {
     pub const VTable = struct {
         persist_ready: *const fn (ptr: *anyopaque, group_id: core.types.GroupId, ready: core.Ready) anyerror!void,
         compact_snapshot: *const fn (ptr: *anyopaque, group_id: core.types.GroupId, snapshot: core.types.Snapshot) anyerror!void,
+        compact_snapshot_artifact: ?*const fn (
+            ptr: *anyopaque,
+            group_id: core.types.GroupId,
+            metadata: core.types.SnapshotMetadata,
+            artifact: SnapshotArtifact,
+        ) anyerror!void = null,
         persist_ready_diagnostics: ?*const fn (
             ptr: *anyopaque,
             group_id: core.types.GroupId,
@@ -56,6 +113,21 @@ pub const GroupStorage = struct {
 
     pub fn compactSnapshot(self: GroupStorage, group_id: core.types.GroupId, snapshot: core.types.Snapshot) !void {
         return try self.vtable.compact_snapshot(self.ptr, group_id, snapshot);
+    }
+
+    pub fn compactSnapshotArtifact(
+        self: GroupStorage,
+        alloc: std.mem.Allocator,
+        group_id: core.types.GroupId,
+        metadata: core.types.SnapshotMetadata,
+        artifact: SnapshotArtifact,
+    ) !void {
+        if (self.vtable.compact_snapshot_artifact) |compact| {
+            return try compact(self.ptr, group_id, metadata, artifact);
+        }
+        const data = try artifact.readAll(alloc);
+        defer alloc.free(data);
+        return try self.compactSnapshot(group_id, .{ .metadata = metadata, .data = data });
     }
 
     pub fn persistReadyWithDiagnostics(
@@ -129,20 +201,28 @@ pub const DiskBatcher = struct {
 
 /// A point-in-time state-machine view prepared on the Raft host thread and
 /// materialized by the snapshot worker. Implementations must capture the view
-/// synchronously in `prepare_snapshot`; `materialize` and `deinit` run on the
-/// same background thread. The state-machine owner must outlive every source it
-/// returns. MultiRaft enforces that by joining its snapshot worker on shutdown.
+/// synchronously in `prepare_snapshot`. `cancel` may race with `materialize`
+/// and must return promptly without calling back into MultiRaft;
+/// and `deinit` may run on either the worker or shutdown thread, so both must be
+/// thread-safe. The state-machine owner must outlive every source it returns;
+/// MultiRaft enforces that by joining its snapshot worker on shutdown.
 pub const SnapshotSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        materialize: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8,
+        materialize: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror!SnapshotMaterialization,
+        cancel: ?*const fn (ptr: *anyopaque) void = null,
         deinit: *const fn (ptr: *anyopaque) void,
     };
 
-    pub fn materialize(self: SnapshotSource, alloc: std.mem.Allocator) ![]u8 {
+    pub fn materialize(self: SnapshotSource, alloc: std.mem.Allocator) !SnapshotMaterialization {
         return try self.vtable.materialize(self.ptr, alloc);
+    }
+
+    pub fn cancel(self: SnapshotSource) void {
+        const cancel_fn = self.vtable.cancel orelse return;
+        cancel_fn(self.ptr);
     }
 
     pub fn deinit(self: SnapshotSource) void {
