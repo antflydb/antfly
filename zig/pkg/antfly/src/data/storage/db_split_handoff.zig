@@ -569,7 +569,7 @@ pub const SyncCoordinator = struct {
             try self.applySourceControlEntryVia(self.source, restore);
         }
 
-        const op = try std.fmt.allocPrint(self.alloc, "split_prepare:{s}", .{split_key});
+        const op = try std.fmt.allocPrint(self.alloc, "split_prepare:{d}:{s}", .{ self.dest_group_id, split_key });
         defer self.alloc.free(op);
         try self.applySourceControlEntryVia(self.source, op);
         return true;
@@ -1152,7 +1152,7 @@ test "db split destination applies handoff and filtered split deltas" {
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
         .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:90:doc:m") },
         .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:90:doc:m") },
         .{ .term = 1, .index = 6, .entry_type = .normal, .data = @constCast("put:doc:u={\"v\":\"right-1\"}") },
     });
@@ -1209,7 +1209,7 @@ test "db split destination persists handoff state across reopen" {
     const setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-        .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("split_prepare:91:doc:m") },
         .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_start:91:doc:m") },
     });
     defer std.testing.allocator.free(setup);
@@ -1272,7 +1272,7 @@ test "db split sync coordinator resumes catch-up across source and destination r
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:92:doc:m") },
             .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:92:doc:m") },
         });
         defer std.testing.allocator.free(setup);
@@ -1384,7 +1384,7 @@ test "db split sync coordinator allocates destination identity namespace" {
         const setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+            .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("split_prepare:7022:doc:m") },
             .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_start:7022:doc:m") },
         });
         defer std.testing.allocator.free(setup);
@@ -1552,7 +1552,7 @@ test "db split sync coordinator tracks explicit split transition phases" {
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
         .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:132:doc:m") },
     });
     defer std.testing.allocator.free(prepare);
     try source.snapshotBuilder().applyBatch(.{
@@ -1644,7 +1644,7 @@ test "db split sync coordinator can start source split from prepare" {
 
     const prepare = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
-        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("split_prepare:134:doc:m") },
     });
     defer std.testing.allocator.free(prepare);
     try source.snapshotBuilder().applyBatch(.{
@@ -1685,7 +1685,7 @@ test "db split sync coordinator can prepare source split again after rollback" {
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:136:doc:m") },
         });
         defer std.testing.allocator.free(setup);
         try source.snapshotBuilder().applyBatch(.{

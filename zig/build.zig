@@ -3145,6 +3145,32 @@ pub fn build(b: *std.Build) void {
     const cmd_test_step = b.step("cmd-test", "Run Antfly command and client CLI tests");
     cmd_test_step.dependOn(&run_cmd_tests.step);
 
+    const lite_cmd_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lite_cmd_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lite_cmd_test_mod.addImport("antfly-zig", lib_mod);
+    lite_cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
+    lite_cmd_test_mod.addImport("httpx", httpx_mod);
+    lite_cmd_test_mod.addImport("antfly_vellum", vellum_mod);
+    lite_cmd_test_mod.addImport("raft_engine", raft_engine_mod);
+    lite_cmd_test_mod.addImport("structlog", structlog_mod);
+    lite_cmd_test_mod.addImport("antfly_platform", platform_mod);
+    lite_cmd_test_mod.addImport("handlebars", handlebars_mod);
+    lite_cmd_test_mod.addOptions("build_options", build_options);
+    const lite_cmd_tests = b.addTest(.{
+        .root_module = lite_cmd_test_mod,
+        .filters = &.{ "cmd.lite", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.mod" },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lite_cmd_tests = b.addRunArtifact(lite_cmd_tests);
+    const lite_cmd_test_step = b.step("lite-cmd-test", "Run command tests owned by Antfly Lite profiles");
+    lite_cmd_test_step.dependOn(&run_lite_cmd_tests.step);
+
     const lib_recall_default_filters = [_][]const u8{
         "HBC recall",
     };
@@ -3335,7 +3361,10 @@ pub fn build(b: *std.Build) void {
     antfly_imports.configure(b, serverless_manifest_test_mod, true, true);
     const serverless_manifest_tests = b.addTest(.{
         .root_module = serverless_manifest_test_mod,
-        .filters = &.{"objectstore-backed manifest store supports publish and list"},
+        .filters = &.{
+            "objectstore-backed manifest store supports publish and list",
+            "objectstore-backed manifest store resolves conditional create races by content",
+        },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     const run_serverless_manifest_tests = b.addRunArtifact(serverless_manifest_tests);
@@ -3408,10 +3437,12 @@ pub fn build(b: *std.Build) void {
         "db split status borrows the live raft apply store without a second writer",
         "data raft apply store applies delete operations into group state",
         "data raft apply store orders independent groups through separate shards",
+        "data raft apply store admits one writable owner per root",
         "data raft apply store skips persisted split commands in overlapping replay",
-        "data raft apply store reconciles exact split state ahead of its durable watermark",
+        "data raft apply store recovers exact split replay after injected projection corruption",
         "data raft apply store seeds pre-raft snapshots once at reserved index zero",
         "group state range scan is allocation-failure safe",
+        "shard state store persists split lifecycle and ownership",
         "db merge coordinator opt-in applies configured receiver identity namespace",
         "db merge coordinator reapplies target namespace for persisted reassignment opt-in",
         "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",
@@ -7355,7 +7386,7 @@ pub fn build(b: *std.Build) void {
     const run_lite_core_main_tests = b.addRunArtifact(lite_core_main_tests);
     const lite_core_test_step = b.step("lite-core-test", "Run Antfly Lite core wrapper tests");
     lite_core_test_step.dependOn(&run_lite_core_main_tests.step);
-    lite_core_test_step.dependOn(&run_cmd_tests.step);
+    lite_core_test_step.dependOn(&run_lite_cmd_tests.step);
     lite_core_test_step.dependOn(&run_lite_native_tests.step);
     lite_core_test_step.dependOn(&run_lite_capi_smoke.step);
     lite_core_test_step.dependOn(&run_lite_go_tests.step);
@@ -7385,7 +7416,7 @@ pub fn build(b: *std.Build) void {
     lite_full_step.dependOn(&install_lite_capi_lib.step);
     lite_full_step.dependOn(&install_lite_capi_header.step);
     lite_full_step.dependOn(&run_antfly_main_tests.step);
-    lite_full_step.dependOn(&run_cmd_tests.step);
+    lite_full_step.dependOn(&run_lite_cmd_tests.step);
     lite_full_step.dependOn(&run_lite_native_tests.step);
     lite_full_step.dependOn(&run_lite_capi_smoke.step);
     lite_full_step.dependOn(&run_lite_go_tests.step);
@@ -7429,7 +7460,7 @@ pub fn build(b: *std.Build) void {
     lite_dev_step.dependOn(&install_lite_capi_header.step);
     lite_dev_step.dependOn(&run_antfly_main_tests.step);
     lite_dev_step.dependOn(&run_lite_core_main_tests.step);
-    lite_dev_step.dependOn(&run_cmd_tests.step);
+    lite_dev_step.dependOn(&run_lite_cmd_tests.step);
     lite_dev_step.dependOn(&run_lite_native_tests.step);
     lite_dev_step.dependOn(&run_lite_capi_smoke.step);
     lite_dev_step.dependOn(&run_lite_go_tests.step);

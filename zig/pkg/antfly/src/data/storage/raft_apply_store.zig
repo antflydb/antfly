@@ -48,6 +48,8 @@ pub const RaftApplyStoreConfig = struct {
     root_dir: []const u8,
     map_size: usize = 64 * 1024 * 1024,
     no_sync: bool = false,
+    /// Writable stores inherit the LSM backend's process and native-path
+    /// exclusive writer lease. Read-only inspection may coexist with the owner.
     read_only: bool = false,
 };
 
@@ -300,7 +302,7 @@ pub const RaftApplyStore = struct {
                     self.alloc.free(range.start);
                     self.alloc.free(range.end);
                 },
-                .prepare_split => |split_key| self.alloc.free(split_key),
+                .prepare_split => |prepare| self.alloc.free(prepare.split_key),
                 .start_split => |start| self.alloc.free(start.split_key),
                 .acknowledge_split, .finalize_split, .rollback_split => {},
             };
@@ -444,7 +446,7 @@ pub const RaftApplyStore = struct {
                     alloc.free(range.start);
                     alloc.free(range.end);
                 },
-                .prepare_split => |split_key| alloc.free(split_key),
+                .prepare_split => |prepare| alloc.free(prepare.split_key),
                 .start_split => |start| alloc.free(start.split_key),
                 .acknowledge_split, .finalize_split, .rollback_split => {},
             };
@@ -531,7 +533,14 @@ pub const RaftApplyStore = struct {
             return error.InvalidAppliedDataRange;
         }
         if (std.mem.startsWith(u8, data, "split_prepare:")) {
-            return .{ .prepare_split = try alloc.dupe(u8, data["split_prepare:".len..]) };
+            const payload = data["split_prepare:".len..];
+            if (std.mem.indexOfScalar(u8, payload, ':')) |sep| {
+                return .{ .prepare_split = .{
+                    .new_shard_id = try std.fmt.parseInt(u64, payload[0..sep], 10),
+                    .split_key = try alloc.dupe(u8, payload[sep + 1 ..]),
+                } };
+            }
+            return error.InvalidAppliedDataRange;
         }
         if (std.mem.startsWith(u8, data, "split_start:")) {
             const payload = data["split_start:".len..];
@@ -596,7 +605,10 @@ pub const RaftApplyStore = struct {
             .prepare => {
                 const split_key = try alloc.dupe(u8, transition.split_key);
                 errdefer alloc.free(split_key);
-                try operations.append(alloc, .{ .prepare_split = split_key });
+                try operations.append(alloc, .{ .prepare_split = .{
+                    .new_shard_id = transition.destination_group_id,
+                    .split_key = split_key,
+                } });
             },
             .start => {
                 const split_key = try alloc.dupe(u8, transition.split_key);
@@ -674,6 +686,21 @@ test "data raft apply store persists batches across reopen" {
         try std.testing.expectEqualStrings("b", group_state[1].key);
         try std.testing.expectEqualStrings("", group_state[1].value);
     }
+}
+
+test "data raft apply store admits one writable owner per root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-single-writer", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var owner = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer owner.deinit();
+    try std.testing.expectError(
+        error.LsmRootWriterAlreadyOpen,
+        RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root }),
+    );
 }
 
 test "data raft apply store separates normal and admin entries" {
@@ -964,7 +991,7 @@ test "data raft apply store captures split handoff and replays destination delta
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b=left-0") },
         .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t=right-0") },
-        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:90:doc:m") },
         .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:90:doc:m") },
         .{ .term = 1, .index = 6, .entry_type = .normal, .data = @constCast("put:doc:u=right-1") },
     });
@@ -1027,7 +1054,7 @@ test "data raft apply store parses colon-delimited range keys correctly" {
     const encoded = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:m={\"v\":1}") },
-        .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("split_prepare:doc:n") },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("split_prepare:192:doc:n") },
     });
     defer std.testing.allocator.free(encoded);
 
@@ -1140,7 +1167,7 @@ test "data raft apply store skips persisted split commands in overlapping replay
     try std.testing.expectEqualStrings("doc:m", split_state.split_key);
 }
 
-test "data raft apply store reconciles exact split state ahead of its durable watermark" {
+test "data raft apply store recovers exact split replay after injected projection corruption" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1180,8 +1207,9 @@ test "data raft apply store reconciles exact split state ahead of its durable wa
             .entries_bytes = applied,
         });
 
-        // Model the observed durable state: the lifecycle effect is visible
-        // while this projection's watermark still points at the prior entry.
+        // Fault-inject a marker regression that the atomic putBatch path cannot
+        // produce. Split operations remain exactly idempotent as a final line
+        // of defense if storage is externally corrupted or restored unevenly.
         const lagging = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{range_entry});
         defer std.testing.allocator.free(lagging);
         var key_buf: [128]u8 = undefined;

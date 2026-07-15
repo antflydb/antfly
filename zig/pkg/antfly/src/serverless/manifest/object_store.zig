@@ -317,6 +317,107 @@ fn parseVersionFromManifestKey(key: []const u8) !u64 {
     return try std.fmt.parseInt(u64, file_name[0 .. file_name.len - 4], 10);
 }
 
+const ConditionalCreateRaceClient = struct {
+    backing: *object_storage.MemoryObjectStorage,
+    winner_body: []const u8,
+    injected: bool = false,
+
+    fn client(self: *@This()) object_storage.ObjectStorage {
+        return .{
+            .allocator = std.testing.allocator,
+            .ptr = self,
+            .vtable = &vtable,
+        };
+    }
+
+    fn backingClient(self: *@This(), alloc: std.mem.Allocator) object_storage.ObjectStorage {
+        var client_impl = self.backing.client();
+        client_impl.allocator = alloc;
+        return client_impl;
+    }
+
+    fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
+
+    fn bucketExists(ptr: *anyopaque, bucket: []const u8) !bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var client_impl = self.backingClient(std.testing.allocator);
+        return try client_impl.bucketExists(bucket);
+    }
+
+    fn makeBucket(ptr: *anyopaque, bucket: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var client_impl = self.backingClient(std.testing.allocator);
+        try client_impl.makeBucket(bucket);
+    }
+
+    fn putObject(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        bucket: []const u8,
+        key: []const u8,
+        body: []const u8,
+        opts: object_storage.PutOptions,
+    ) !object_storage.PutResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var client_impl = self.backingClient(alloc);
+        if (opts.if_none_match and !self.injected) {
+            self.injected = true;
+            var winner = try client_impl.putObject(bucket, key, self.winner_body, opts);
+            winner.deinit(alloc);
+            return error.PreconditionFailed;
+        }
+        return try client_impl.putObject(bucket, key, body, opts);
+    }
+
+    fn getObject(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        bucket: []const u8,
+        key: []const u8,
+        opts: object_storage.GetOptions,
+    ) !object_storage.GetResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var client_impl = self.backingClient(alloc);
+        return try client_impl.getObject(bucket, key, opts);
+    }
+
+    fn getObjectAttributes(ptr: *anyopaque, alloc: std.mem.Allocator, bucket: []const u8, key: []const u8) !object_storage.ObjectAttributes {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var client_impl = self.backingClient(alloc);
+        return try client_impl.getObjectAttributes(bucket, key);
+    }
+
+    fn statObject(ptr: *anyopaque, alloc: std.mem.Allocator, bucket: []const u8, key: []const u8) !object_storage.ObjectMetadata {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var client_impl = self.backingClient(alloc);
+        return try client_impl.statObject(bucket, key);
+    }
+
+    fn deleteObject(ptr: *anyopaque, bucket: []const u8, key: []const u8, opts: object_storage.DeleteOptions) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var client_impl = self.backingClient(std.testing.allocator);
+        try client_impl.deleteObject(bucket, key, opts);
+    }
+
+    fn listObjects(ptr: *anyopaque, alloc: std.mem.Allocator, bucket: []const u8, opts: object_storage.ListOptions) !object_storage.ListResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var client_impl = self.backingClient(alloc);
+        return try client_impl.listObjects(bucket, opts);
+    }
+
+    const vtable: object_storage.ObjectStorage.VTable = .{
+        .deinit = deinit,
+        .bucket_exists = bucketExists,
+        .make_bucket = makeBucket,
+        .put_object = putObject,
+        .get_object = getObject,
+        .get_object_attributes = getObjectAttributes,
+        .stat_object = statObject,
+        .delete_object = deleteObject,
+        .list_objects = listObjects,
+    };
+};
+
 test "objectstore-backed manifest store supports publish and list" {
     var path_buf: [256]u8 = undefined;
     const path = tmpPath(&path_buf, "manifests");
@@ -353,6 +454,49 @@ test "objectstore-backed manifest store supports publish and list" {
     const versions = try impl.listVersionsAllocWithPageSize(std.testing.allocator, "docs", 2);
     defer std.testing.allocator.free(versions);
     try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, versions);
+}
+
+test "objectstore-backed manifest store resolves conditional create races by content" {
+    var manifest = manifest_types.Manifest{
+        .namespace = try std.testing.allocator.dupe(u8, "docs"),
+        .version = 1,
+        .built_at_ns = 10,
+        .wal_start_lsn = 1,
+        .wal_end_lsn = 1,
+        .stats = .{},
+        .artifacts = try std.testing.allocator.alloc(manifest_types.ArtifactRef, 0),
+    };
+    defer manifest.deinit(std.testing.allocator);
+
+    const encoded = try manifest_codec.encodeAlloc(std.testing.allocator, manifest);
+    defer std.testing.allocator.free(encoded);
+    {
+        var backing = object_storage.MemoryObjectStorage.init(std.testing.allocator);
+        defer backing.deinit();
+        var race = ConditionalCreateRaceClient{ .backing = &backing, .winner_body = encoded };
+        var impl = try ObjectStore.initWithClient(std.testing.allocator, race.client(), "manifests", "");
+        var store = impl.manifestStore();
+        defer store.deinit();
+
+        try store.put(manifest);
+        try std.testing.expect(race.injected);
+    }
+
+    var conflicting = manifest;
+    conflicting.built_at_ns = 11;
+    const conflicting_encoded = try manifest_codec.encodeAlloc(std.testing.allocator, conflicting);
+    defer std.testing.allocator.free(conflicting_encoded);
+    {
+        var backing = object_storage.MemoryObjectStorage.init(std.testing.allocator);
+        defer backing.deinit();
+        var race = ConditionalCreateRaceClient{ .backing = &backing, .winner_body = conflicting_encoded };
+        var impl = try ObjectStore.initWithClient(std.testing.allocator, race.client(), "manifests", "");
+        var store = impl.manifestStore();
+        defer store.deinit();
+
+        try std.testing.expectError(error.ManifestVersionAlreadyExists, store.put(manifest));
+        try std.testing.expect(race.injected);
+    }
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

@@ -4543,7 +4543,8 @@ pub const DataServer = struct {
             split_key;
         switch (kind) {
             .prepare => if (source_state) |state| {
-                if (std.mem.eql(u8, state.split_key, effective_split_key)) return;
+                if (std.mem.eql(u8, state.split_key, effective_split_key) and
+                    state.new_shard_id == destination_group_id) return;
                 return error.ConflictingSplitTransition;
             },
             .start => if (source_state) |state| {

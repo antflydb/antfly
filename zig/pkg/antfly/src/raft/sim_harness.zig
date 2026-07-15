@@ -4882,7 +4882,7 @@ test "http host simulation drives queued split transitions through the service l
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:102:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -5283,7 +5283,7 @@ test "cluster simulation drives queued split transitions through service-owned m
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:402:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -5389,7 +5389,7 @@ test "cluster simulation resumes queued split transitions after node restart wit
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:1702:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -5553,7 +5553,7 @@ test "cluster simulation removes queued split transition mid-flight across node 
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:1902:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -5729,7 +5729,7 @@ test "cluster simulation rolls back queued split transition mid-flight across no
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:1912:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -5938,7 +5938,7 @@ test "cluster simulation survives repeated same-id split overwrites across resta
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:1922:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -7493,7 +7493,7 @@ test "cluster simulation isolates concurrent split removal and merge retry acros
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:1982:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -7786,7 +7786,7 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-1\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-1\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:1992:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -8076,7 +8076,7 @@ test "cluster simulation drives multiple concurrent real transition ids through 
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-a\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-a\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:2002:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -8093,7 +8093,7 @@ test "cluster simulation drives multiple concurrent real transition ids through 
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:c={\"v\":\"left-b\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:u={\"v\":\"right-b\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:p") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:2004:doc:p") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -8391,7 +8391,7 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-a2\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-a2\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:2012:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -8408,7 +8408,7 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:c={\"v\":\"left-b2\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:u={\"v\":\"right-b2\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:p") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:2014:doc:p") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{

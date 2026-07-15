@@ -51,14 +51,16 @@ pub const DataOperation = union(enum) {
         start: []u8,
         end: []u8,
     },
-    prepare_split: []u8,
-    start_split: struct {
-        new_shard_id: u64,
-        split_key: []u8,
-    },
+    prepare_split: SplitTransition,
+    start_split: SplitTransition,
     acknowledge_split: SplitAcknowledgement,
     finalize_split,
     rollback_split,
+};
+
+pub const SplitTransition = struct {
+    new_shard_id: u64,
+    split_key: []u8,
 };
 
 pub const SplitAcknowledgement = struct {
@@ -540,13 +542,16 @@ pub fn appendOperationEffects(
             errdefer alloc.free(range_value);
             try writes.append(alloc, .{ .key = range_key, .value = range_value });
         },
-        .prepare_split => |split_key| {
+        .prepare_split => |prepare| {
             if (split_state) |state| {
                 const already_prepared = switch (state.phase) {
-                    .prepare, .splitting, .finalizing => std.mem.eql(u8, state.split_key, split_key),
+                    .prepare, .splitting, .finalizing => state.new_shard_id == prepare.new_shard_id and
+                        std.mem.eql(u8, state.split_key, prepare.split_key),
                     .none, .rolling_back => false,
                 };
                 if (already_prepared) continue;
+                if (state.phase == .prepare or state.phase == .splitting or state.phase == .finalizing)
+                    return error.ConflictingSplitTransition;
             }
             const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
                 .phase = state.phase,
@@ -555,21 +560,21 @@ pub fn appendOperationEffects(
                 .started_at = 0,
                 .original_range_end = state.original_range_end,
             } else null;
-            try shard_mod.validatePrepareSplit(byte_range, shard_split_state, split_key);
+            try shard_mod.validatePrepareSplit(byte_range, shard_split_state, prepare.split_key);
 
             if (split_state) |state| {
                 freeSplitState(alloc, state);
                 split_state = null;
             }
 
-            const owned_split_key = try alloc.dupe(u8, split_key);
+            const owned_split_key = try alloc.dupe(u8, prepare.split_key);
             errdefer alloc.free(owned_split_key);
             const owned_original_end = try alloc.dupe(u8, byte_range.end);
             errdefer alloc.free(owned_original_end);
             split_state = .{
                 .phase = .prepare,
                 .split_key = owned_split_key,
-                .new_shard_id = 0,
+                .new_shard_id = prepare.new_shard_id,
                 .original_range_end = owned_original_end,
             };
             const split_state_key = try groupSplitStateKeyAlloc(alloc, group_id);
@@ -596,6 +601,8 @@ pub fn appendOperationEffects(
                     .none, .prepare, .rolling_back => false,
                 };
                 if (already_started) continue;
+                if (state.phase == .splitting or state.phase == .finalizing)
+                    return error.ConflictingSplitTransition;
             }
             const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
                 .phase = state.phase,
@@ -605,9 +612,10 @@ pub fn appendOperationEffects(
                 .original_range_end = state.original_range_end,
             } else null;
             try shard_mod.validateStartSplit(shard_split_state, start.split_key);
+            if (split_state.?.new_shard_id != start.new_shard_id)
+                return error.ConflictingSplitTransition;
 
             split_state.?.phase = .splitting;
-            split_state.?.new_shard_id = start.new_shard_id;
 
             const original_start = try alloc.dupe(u8, byte_range.start);
             errdefer alloc.free(original_start);
@@ -1146,7 +1154,7 @@ test "shard state store persists split lifecycle and ownership" {
     deletes.clearRetainingCapacity();
 
     const prepare_ops = [_]DataOperation{
-        .{ .prepare_split = @constCast("doc:m") },
+        .{ .prepare_split = .{ .new_shard_id = 42, .split_key = @constCast("doc:m") } },
     };
     try appendOperationEffects(&store, std.testing.allocator, 23, &prepare_ops, &writes, &deletes);
     try putOwnedBatch(&store, std.testing.allocator, writes.items, deletes.items);
@@ -1158,7 +1166,26 @@ test "shard state store persists split lifecycle and ownership" {
     const prepared = (try currentSplitState(&store, std.testing.allocator, 23)).?;
     defer freeSplitState(std.testing.allocator, prepared);
     try std.testing.expectEqual(SplitPhase.prepare, prepared.phase);
+    try std.testing.expectEqual(@as(u64, 42), prepared.new_shard_id);
     try std.testing.expectEqualStrings("doc:m", prepared.split_key);
+
+    try appendOperationEffects(&store, std.testing.allocator, 23, &prepare_ops, &writes, &deletes);
+    try std.testing.expectEqual(@as(usize, 0), writes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), deletes.items.len);
+    const conflicting_prepare = [_]DataOperation{
+        .{ .prepare_split = .{ .new_shard_id = 43, .split_key = @constCast("doc:m") } },
+    };
+    try std.testing.expectError(
+        error.ConflictingSplitTransition,
+        appendOperationEffects(&store, std.testing.allocator, 23, &conflicting_prepare, &writes, &deletes),
+    );
+    const conflicting_start = [_]DataOperation{
+        .{ .start_split = .{ .new_shard_id = 43, .split_key = @constCast("doc:m") } },
+    };
+    try std.testing.expectError(
+        error.ConflictingSplitTransition,
+        appendOperationEffects(&store, std.testing.allocator, 23, &conflicting_start, &writes, &deletes),
+    );
 
     const start_ops = [_]DataOperation{
         .{ .start_split = .{ .new_shard_id = 42, .split_key = @constCast("doc:m") } },
@@ -1169,6 +1196,14 @@ test "shard state store persists split lifecycle and ownership" {
     writes = .empty;
     for (deletes.items) |key| std.testing.allocator.free(key);
     deletes.clearRetainingCapacity();
+
+    try appendOperationEffects(&store, std.testing.allocator, 23, &start_ops, &writes, &deletes);
+    try std.testing.expectEqual(@as(usize, 0), writes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), deletes.items.len);
+    try std.testing.expectError(
+        error.ConflictingSplitTransition,
+        appendOperationEffects(&store, std.testing.allocator, 23, &conflicting_start, &writes, &deletes),
+    );
 
     const narrowed_range = try currentRange(&store, std.testing.allocator, 23);
     defer range_state.freeRange(std.testing.allocator, narrowed_range);
@@ -1230,7 +1265,7 @@ test "shard state store finalize split reclaims right-hand document range" {
     deletes.clearRetainingCapacity();
 
     const split_ops = [_]DataOperation{
-        .{ .prepare_split = @constCast("doc:m") },
+        .{ .prepare_split = .{ .new_shard_id = 77, .split_key = @constCast("doc:m") } },
         .{ .start_split = .{ .new_shard_id = 77, .split_key = @constCast("doc:m") } },
         .finalize_split,
     };
@@ -1279,7 +1314,7 @@ test "shard state store records and replays split deltas" {
 
     const setup_ops = [_]DataOperation{
         .{ .set_range = .{ .start = @constCast("doc:a"), .end = @constCast("doc:z") } },
-        .{ .prepare_split = @constCast("doc:m") },
+        .{ .prepare_split = .{ .new_shard_id = 88, .split_key = @constCast("doc:m") } },
         .{ .start_split = .{ .new_shard_id = 88, .split_key = @constCast("doc:m") } },
     };
     try appendOperationEffects(&src, std.testing.allocator, 41, &setup_ops, &writes, &deletes);
@@ -1354,7 +1389,7 @@ test "shard state store captures right-hand split handoff and filters delta catc
         .{ .set_range = .{ .start = @constCast("doc:a"), .end = @constCast("doc:z") } },
         .{ .put = .{ .key = @constCast("doc:b"), .value = @constCast("left-0") } },
         .{ .put = .{ .key = @constCast("doc:t"), .value = @constCast("right-0") } },
-        .{ .prepare_split = @constCast("doc:m") },
+        .{ .prepare_split = .{ .new_shard_id = 89, .split_key = @constCast("doc:m") } },
         .{ .start_split = .{ .new_shard_id = 89, .split_key = @constCast("doc:m") } },
         .{ .put = .{ .key = @constCast("doc:u"), .value = @constCast("right-1") } },
     };
