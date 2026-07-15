@@ -26,6 +26,7 @@ const state_machine = @import("state_machine/mod.zig");
 const storage = @import("storage/mod.zig");
 const backup_restore = @import("storage/backup_restore.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
+const resource_manager = @import("../storage/resource_manager.zig");
 
 pub const ManagedHostConfig = struct {
     host: host_mod.HostConfig,
@@ -418,6 +419,16 @@ pub const ManagedHttpHost = struct {
 
     pub fn replacePlacementIntents(self: *ManagedHttpHost, intents: []const reconciler.PlacementIntent) !void {
         try self.view.replaceReplicaIntents(intents);
+    }
+
+    pub fn attachDataApplyStoreResourceManager(self: *ManagedHttpHost, manager: *resource_manager.ResourceManager) !void {
+        const store = self.owned_data_store orelse return;
+        try store.attachResourceManager(manager);
+    }
+
+    pub fn retainDataApplyGroups(self: *ManagedHttpHost, group_ids: []const u64) !void {
+        const store = self.owned_data_store orelse return;
+        try store.retainActiveGroups(group_ids);
     }
 
     pub fn applyBatch(self: *ManagedHttpHost, updates: []const metadata_view.MetadataUpdate) !void {

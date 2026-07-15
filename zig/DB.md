@@ -80,6 +80,12 @@ data-Raft projections are physically partitioned by group, while a root-level
 coordinator retains the single process writer authority. This makes snapshot
 replacement proportional to the incoming group snapshot and avoids rewriting,
 describing, or retaining keys for unrelated groups.
+The durable apply-store projection uses a per-group generation-preparation
+marker rather than holding its hash-stripe mutex while importing the snapshot.
+Operations for the target group wait; unrelated groups continue to apply and
+serve even when their IDs collide in the same lock stripe. Only reader drain,
+cached-owner retirement, atomic exchange, and allocation-free watermark
+publication execute under the stripe lock.
 Shared cache-generation bookkeeping is reserved before staging and advanced
 without allocation immediately after the namespace exchange, so no fallible
 bookkeeping step can leave the new root visible under the old cache identity.
@@ -95,10 +101,14 @@ epochs.
 The install's catalog inputs form one explicit contract: table identity, table
 name, schema, index catalog, range topology, and document-identity namespace are
 captured after group admission. The snapshot's encoded range must match that
-catalog range. The exact contract is recaptured after serving
-leases drain and immediately before namespace publication. A split, merge,
-schema, index, or identity change therefore fails the install closed with no
-live-root mutation; unrelated metadata changes do not force a retry.
+catalog range. Staging owns only this compact contract, not the complete admin
+snapshot, so its memory cost is independent of cluster catalog size. After
+serving leases drain, the catalog source refreshes and pins its locally visible
+projection through namespace publication. The compact contract must match the
+pinned projection exactly. A locally observed split, merge, schema, index, or
+identity change therefore fails the install closed with no live-root mutation;
+unrelated metadata changes do not force a retry, and a concurrent local catalog
+refresh cannot invalidate borrowed publication data.
 
 `DB.restoreSnapshotToDeferredRuntimeRepair()` accepts a `StagedGeneration`
 capability and rejects a path that is not the capability's staging root. Raw
@@ -344,6 +354,23 @@ reference, so topology pruning cannot remove generation bookkeeping during a
 fallible staging operation. Exchanged old apply roots are submitted to the
 shared backend runtime cleanup lane rather than reclaimed on the Raft apply
 critical path.
+
+The Raft apply store's per-group DB owners are a bounded LRU cache, not a second
+unbounded storage registry. Owners and their LSM mutable state are charged to
+the provisioned node's shared `ResourceManager` under `lsm.in_memory_state`.
+Normal pressure retains the configured per-stripe bound, soft pressure shrinks
+it, and hard pressure retains only the most recently needed unpinned owner.
+Snapshot staging uses the same manager, so temporary generations cannot bypass
+the node memory policy. Eviction closes only the runtime owner; durable group
+files and apply watermarks remain available for transparent reopen.
+
+Placement reconciliation explicitly retires owners and cached summaries for
+groups no longer assigned locally. Retirement is non-blocking: an owner pinned
+by snapshot materialization or generation publication is marked retired, new
+operations fail closed, and the last reader or publisher performs final close.
+Reassignment clears the retirement marker before the group is admitted again.
+This keeps topology reconciliation independent of slow snapshot consumers while
+making stale apply-store ownership bounded over the lifetime of the node.
 
 Split and merge control paths follow the same rule. Transition coordinators
 borrow the raft host's apply store and retain the managed destination or

@@ -13,12 +13,15 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const raft_engine = @import("raft_engine");
+const platform = @import("antfly_platform");
 const fs_paths = @import("../../common/fs_paths.zig");
 const background_runtime = @import("../../storage/background_runtime.zig");
 const docstore = @import("../../storage/docstore.zig");
 const generation_lifecycle = @import("../../storage/db/generation_lifecycle.zig");
 const lsm_backend = @import("../../storage/lsm_backend.zig");
+const resource_manager_mod = @import("../../storage/resource_manager.zig");
 const raft_storage_mod = @import("../../raft/storage/mod.zig");
 const wal_replica_state_mod = @import("../../raft/storage/wal_replica_state.zig");
 const shard_mod = @import("../../storage/shard.zig");
@@ -26,7 +29,11 @@ const raft_state_machine = @import("../../raft/state_machine/mod.zig");
 const shard_state_store = @import("shard_state_store.zig");
 const data_raft_batch = @import("../raft_batch.zig");
 const batch_shard_count: usize = 64;
+const default_cached_group_stores_per_shard: usize = 4;
+const group_store_owner_accounting_bytes: u64 = 64 * 1024;
 var snapshot_spool_nonce = std.atomic.Value(u64).init(1);
+var test_block_snapshot_staging = std.atomic.Value(bool).init(false);
+var test_snapshot_staging_started = std.atomic.Value(bool).init(false);
 
 pub const AppliedDataBatch = struct {
     commit_index: u64,
@@ -54,6 +61,8 @@ pub const RaftApplyStoreConfig = struct {
     /// exclusive writer lease. Read-only inspection may coexist with the owner.
     read_only: bool = false,
     backend_runtime: ?*background_runtime.BackendRuntime = null,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    max_cached_group_stores_per_shard: usize = default_cached_group_stores_per_shard,
 };
 
 pub const RaftApplyStore = struct {
@@ -65,6 +74,9 @@ pub const RaftApplyStore = struct {
     no_sync: bool,
     read_only: bool,
     backend_runtime: ?*background_runtime.BackendRuntime,
+    resource_manager: ?*resource_manager_mod.ResourceManager,
+    max_cached_group_stores_per_shard: usize,
+    group_store_access_clock: std.atomic.Value(u64) = .init(1),
     // The root backend is an ownership sentinel: its native writer lease keeps
     // one process-wide data apply owner while physical state lives per group.
     backend: lsm_backend.BackendHandle,
@@ -74,10 +86,13 @@ pub const RaftApplyStore = struct {
     const OwnedBatch = AppliedDataBatch;
     const BatchShard = struct {
         mutex: std.Io.Mutex = .init,
-        snapshot_readers_drained: std.Io.Condition = .init,
+        state_changed: std.Io.Condition = .init,
         batches: std.AutoHashMapUnmanaged(u64, OwnedBatch) = .empty,
         stores: std.AutoHashMapUnmanaged(u64, *GroupStore) = .empty,
         snapshot_readers: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+        generation_preparations: std.AutoHashMapUnmanaged(u64, void) = .empty,
+        active_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
+        placement_filter_enabled: bool = false,
     };
 
     const GroupStore = struct {
@@ -85,8 +100,22 @@ pub const RaftApplyStore = struct {
         path: []u8,
         backend: lsm_backend.BackendHandle,
         store: docstore.DocStore,
+        owner_reservation: ?resource_manager_mod.Reservation = null,
+        last_access: u64,
 
-        fn open(alloc: std.mem.Allocator, path: []const u8, no_sync: bool, read_only: bool) !*GroupStore {
+        fn open(
+            alloc: std.mem.Allocator,
+            path: []const u8,
+            no_sync: bool,
+            read_only: bool,
+            resource_manager: ?*resource_manager_mod.ResourceManager,
+            last_access: u64,
+        ) !*GroupStore {
+            var owner_reservation = if (resource_manager) |manager|
+                try manager.reserve(.lsm_in_memory_state, group_store_owner_accounting_bytes)
+            else
+                null;
+            errdefer if (owner_reservation) |*reservation| reservation.release();
             const owned = try alloc.create(GroupStore);
             errdefer alloc.destroy(owned);
             const owned_path = try alloc.dupe(u8, path);
@@ -98,6 +127,7 @@ pub const RaftApplyStore = struct {
                     .create_if_missing = !read_only,
                 },
                 .flush_threshold = 1,
+                .resource_manager = resource_manager,
             });
             errdefer backend.close();
             var runtime_store = try backend.backend.runtimeStore(alloc, .{ .name = "data-apply-group" });
@@ -107,7 +137,10 @@ pub const RaftApplyStore = struct {
                 .path = owned_path,
                 .backend = backend,
                 .store = try docstore.DocStore.openRuntime(alloc, runtime_store),
+                .owner_reservation = owner_reservation,
+                .last_access = last_access,
             };
+            owner_reservation = null;
             return owned;
         }
 
@@ -115,6 +148,7 @@ pub const RaftApplyStore = struct {
             const alloc = self.alloc;
             self.store.close();
             self.backend.close();
+            if (self.owner_reservation) |*reservation| reservation.release();
             alloc.free(self.path);
             alloc.destroy(self);
         }
@@ -161,8 +195,92 @@ pub const RaftApplyStore = struct {
             .no_sync = cfg.no_sync,
             .read_only = cfg.read_only,
             .backend_runtime = cfg.backend_runtime,
+            .resource_manager = cfg.resource_manager,
+            .max_cached_group_stores_per_shard = @max(@as(usize, 1), cfg.max_cached_group_stores_per_shard),
             .backend = backend,
         };
+    }
+
+    /// Attaches the node-wide resource policy before the Raft host starts
+    /// serving. Existing group owners would have been opened without complete
+    /// accounting, so changing managers after admission is intentionally
+    /// rejected.
+    pub fn attachResourceManager(self: *RaftApplyStore, manager: *resource_manager_mod.ResourceManager) !void {
+        const io = self.io_impl.io();
+        for (&self.batch_shards) |*shard| {
+            shard.mutex.lockUncancelable(io);
+            if (shard.stores.count() != 0) {
+                shard.mutex.unlock(io);
+                return error.ApplyStoreAlreadyServing;
+            }
+            shard.mutex.unlock(io);
+        }
+        self.resource_manager = manager;
+    }
+
+    /// Retires in-memory owners for groups no longer assigned to this host.
+    /// Durable group generations remain on disk for later reassignment or
+    /// operator-directed cleanup. Pinned owners are marked retired and closed
+    /// by the last snapshot reader or generation publisher, keeping placement
+    /// reconciliation non-blocking.
+    pub fn retainActiveGroups(self: *RaftApplyStore, group_ids: []const u64) !void {
+        var next_active = [_]std.AutoHashMapUnmanaged(u64, void){.empty} ** batch_shard_count;
+        defer for (&next_active) |*groups| groups.deinit(self.alloc);
+        for (group_ids) |group_id| {
+            const shard_index: usize = @intCast(group_id % batch_shard_count);
+            try next_active[shard_index].put(self.alloc, group_id, {});
+        }
+
+        const io = self.io_impl.io();
+        for (&self.batch_shards, 0..) |*shard, shard_index| {
+            shard.mutex.lockUncancelable(io);
+            const previous_active = shard.active_groups;
+            shard.active_groups = next_active[shard_index];
+            next_active[shard_index] = previous_active;
+            shard.placement_filter_enabled = true;
+            shard.mutex.unlock(io);
+        }
+
+        for (&self.batch_shards) |*shard| {
+            shard.mutex.lockUncancelable(io);
+            defer shard.mutex.unlock(io);
+
+            var stale = std.ArrayListUnmanaged(u64).empty;
+            defer stale.deinit(self.alloc);
+            stale.ensureTotalCapacity(
+                self.alloc,
+                shard.stores.count() + shard.batches.count() +
+                    shard.snapshot_readers.count() + shard.generation_preparations.count(),
+            ) catch continue;
+            var stores = shard.stores.keyIterator();
+            while (stores.next()) |group_id| {
+                if (!shard.active_groups.contains(group_id.*)) stale.appendAssumeCapacity(group_id.*);
+            }
+            var batches = shard.batches.keyIterator();
+            while (batches.next()) |group_id| {
+                if (!shard.active_groups.contains(group_id.*)) stale.appendAssumeCapacity(group_id.*);
+            }
+            var readers = shard.snapshot_readers.keyIterator();
+            while (readers.next()) |group_id| {
+                if (!shard.active_groups.contains(group_id.*)) stale.appendAssumeCapacity(group_id.*);
+            }
+            var preparations = shard.generation_preparations.keyIterator();
+            while (preparations.next()) |group_id| {
+                if (!shard.active_groups.contains(group_id.*)) stale.appendAssumeCapacity(group_id.*);
+            }
+            for (stale.items) |group_id| self.closeRetiredGroupIfDrainedLocked(shard, group_id);
+        }
+    }
+
+    fn cachedGroupStoreCount(self: *RaftApplyStore) usize {
+        const io = self.io_impl.io();
+        var count: usize = 0;
+        for (&self.batch_shards) |*shard| {
+            shard.mutex.lockUncancelable(io);
+            count += shard.stores.count();
+            shard.mutex.unlock(io);
+        }
+        return count;
     }
 
     pub fn deinit(self: *RaftApplyStore) void {
@@ -170,13 +288,16 @@ pub const RaftApplyStore = struct {
         const io = self.io_impl.io();
         for (&self.batch_shards) |*shard| {
             shard.mutex.lockUncancelable(io);
-            while (shard.snapshot_readers.count() != 0) {
-                shard.snapshot_readers_drained.waitUncancelable(io, &shard.mutex);
+            shard.state_changed.broadcast(io);
+            while (shard.snapshot_readers.count() != 0 or shard.generation_preparations.count() != 0) {
+                shard.state_changed.waitUncancelable(io, &shard.mutex);
             }
             var stores = shard.stores.valueIterator();
             while (stores.next()) |store| store.*.close();
             shard.stores.deinit(self.alloc);
             shard.snapshot_readers.deinit(self.alloc);
+            shard.generation_preparations.deinit(self.alloc);
+            shard.active_groups.deinit(self.alloc);
             shard.batches.deinit(self.alloc);
             shard.mutex.unlock(io);
         }
@@ -197,17 +318,90 @@ pub const RaftApplyStore = struct {
         return true;
     }
 
+    fn nextGroupStoreAccess(self: *RaftApplyStore) u64 {
+        return self.group_store_access_clock.fetchAdd(1, .monotonic);
+    }
+
+    fn groupStorePinnedLocked(shard: *BatchShard, group_id: u64) bool {
+        return (shard.snapshot_readers.get(group_id) orelse 0) != 0 or
+            shard.generation_preparations.contains(group_id);
+    }
+
+    fn closeRetiredGroupIfDrainedLocked(self: *RaftApplyStore, shard: *BatchShard, group_id: u64) void {
+        _ = self;
+        if (!shard.placement_filter_enabled or shard.active_groups.contains(group_id) or groupStorePinnedLocked(shard, group_id)) return;
+        if (shard.stores.fetchRemove(group_id)) |removed| removed.value.close();
+        _ = shard.batches.remove(group_id);
+    }
+
+    fn evictOldestGroupStoreLocked(self: *RaftApplyStore, shard: *BatchShard, exclude_group_id: ?u64) bool {
+        _ = self;
+        var oldest_group_id: ?u64 = null;
+        var oldest_access: u64 = std.math.maxInt(u64);
+        var it = shard.stores.iterator();
+        while (it.next()) |entry| {
+            const group_id = entry.key_ptr.*;
+            if (exclude_group_id != null and exclude_group_id.? == group_id) continue;
+            if (groupStorePinnedLocked(shard, group_id)) continue;
+            if (entry.value_ptr.*.last_access >= oldest_access) continue;
+            oldest_group_id = group_id;
+            oldest_access = entry.value_ptr.*.last_access;
+        }
+        const group_id = oldest_group_id orelse return false;
+        const removed = shard.stores.fetchRemove(group_id) orelse unreachable;
+        removed.value.close();
+        return true;
+    }
+
+    fn trimGroupStoresForPressureLocked(self: *RaftApplyStore, shard: *BatchShard, exclude_group_id: ?u64) void {
+        const pressure = if (self.resource_manager) |manager|
+            manager.sliceStats(.lsm_in_memory_state).pressure
+        else
+            resource_manager_mod.Pressure.normal;
+        const target = switch (pressure) {
+            .normal => self.max_cached_group_stores_per_shard,
+            .soft => @max(@as(usize, 1), self.max_cached_group_stores_per_shard / 2),
+            .hard => 1,
+        };
+        while (shard.stores.count() > target) {
+            if (!self.evictOldestGroupStoreLocked(shard, exclude_group_id)) break;
+        }
+    }
+
     fn groupStoreLocked(self: *RaftApplyStore, shard: *BatchShard, group_id: u64, create: bool) !?*GroupStore {
-        if (shard.stores.get(group_id)) |store| return store;
+        if (shard.stores.get(group_id)) |store| {
+            store.last_access = self.nextGroupStoreAccess();
+            self.trimGroupStoresForPressureLocked(shard, group_id);
+            return store;
+        }
         const path = try self.groupPathAlloc(group_id);
         defer self.alloc.free(path);
         if (!create and !self.pathExists(path)) return null;
         if (self.read_only and !self.pathExists(path)) return null;
         try shard.stores.ensureUnusedCapacity(self.alloc, 1);
-        const store = try GroupStore.open(self.alloc, path, self.no_sync, self.read_only);
-        errdefer store.close();
-        shard.stores.putAssumeCapacity(group_id, store);
-        return store;
+        while (true) {
+            while (shard.stores.count() >= self.max_cached_group_stores_per_shard) {
+                if (!self.evictOldestGroupStoreLocked(shard, null)) return error.ApplyStoreOwnerCachePinned;
+            }
+            const store = GroupStore.open(
+                self.alloc,
+                path,
+                self.no_sync,
+                self.read_only,
+                self.resource_manager,
+                self.nextGroupStoreAccess(),
+            ) catch |err| switch (err) {
+                error.ResourceBudgetExceeded => {
+                    if (self.evictOldestGroupStoreLocked(shard, null)) continue;
+                    return err;
+                },
+                else => return err,
+            };
+            errdefer store.close();
+            shard.stores.putAssumeCapacity(group_id, store);
+            self.trimGroupStoresForPressureLocked(shard, group_id);
+            return store;
+        }
     }
 
     fn writableGroupStoreLocked(self: *RaftApplyStore, shard: *BatchShard, group_id: u64) !*GroupStore {
@@ -229,15 +423,51 @@ pub const RaftApplyStore = struct {
         readers.* -= 1;
         if (readers.* == 0) {
             _ = shard.snapshot_readers.remove(group_id);
-            shard.snapshot_readers_drained.broadcast(io);
+            self.closeRetiredGroupIfDrainedLocked(shard, group_id);
+            shard.state_changed.broadcast(io);
         }
     }
 
     fn waitForSnapshotReadersLocked(self: *RaftApplyStore, shard: *BatchShard, group_id: u64) void {
         const io = self.io_impl.io();
         while ((shard.snapshot_readers.get(group_id) orelse 0) != 0) {
-            shard.snapshot_readers_drained.waitUncancelable(io, &shard.mutex);
+            shard.state_changed.waitUncancelable(io, &shard.mutex);
         }
+    }
+
+    fn waitForGenerationPreparationLocked(self: *RaftApplyStore, shard: *BatchShard, group_id: u64) !void {
+        const io = self.io_impl.io();
+        while (shard.generation_preparations.contains(group_id)) {
+            if (self.shutting_down.load(.acquire)) return error.ApplyStoreShuttingDown;
+            shard.state_changed.waitUncancelable(io, &shard.mutex);
+        }
+        if (self.shutting_down.load(.acquire)) return error.ApplyStoreShuttingDown;
+        if (shard.placement_filter_enabled and !shard.active_groups.contains(group_id)) return error.ApplyStoreGroupRetired;
+    }
+
+    fn beginGenerationPreparation(self: *RaftApplyStore, group_id: u64) !void {
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
+        try shard.generation_preparations.ensureUnusedCapacity(self.alloc, 1);
+        if (shard.batches.getPtr(group_id) == null) try shard.batches.ensureUnusedCapacity(self.alloc, 1);
+        shard.generation_preparations.putAssumeCapacity(group_id, {});
+    }
+
+    fn finishGenerationPreparationLocked(self: *RaftApplyStore, shard: *BatchShard, group_id: u64) void {
+        std.debug.assert(shard.generation_preparations.remove(group_id));
+        self.closeRetiredGroupIfDrainedLocked(shard, group_id);
+        shard.state_changed.broadcast(self.io_impl.io());
+    }
+
+    fn cancelGenerationPreparation(self: *RaftApplyStore, group_id: u64) void {
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        self.finishGenerationPreparationLocked(shard, group_id);
     }
 
     pub fn snapshotBuilder(self: *RaftApplyStore) raft_state_machine.SnapshotBuilder {
@@ -257,6 +487,7 @@ pub const RaftApplyStore = struct {
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
         const batch = (try self.ensureLoaded(shard, group_id)) orelse return null;
         return batch.*;
     }
@@ -266,6 +497,7 @@ pub const RaftApplyStore = struct {
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
         const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return try alloc.alloc(AppliedNormalEntry, 0);
         var prefix_buf: [128]u8 = undefined;
         const prefix = try normalEntryPrefixForGroup(&prefix_buf, group_id);
@@ -297,6 +529,7 @@ pub const RaftApplyStore = struct {
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
         const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return try alloc.alloc(AppliedDataKV, 0);
         return try shard_state_store.groupState(&group_store.store, alloc, group_id);
     }
@@ -308,12 +541,7 @@ pub const RaftApplyStore = struct {
         commit_index: u64,
         encoded: []const u8,
     ) !void {
-        const io = self.io_impl.io();
-        const shard = self.batchShard(group_id);
-        shard.mutex.lockUncancelable(io);
-        defer shard.mutex.unlock(io);
-
-        if (shard.batches.getPtr(group_id) == null) try shard.batches.ensureUnusedCapacity(self.alloc, 1);
+        const snapshot = try shard_state_store.GroupStateSnapshotStream.init(encoded);
         const empty_batch = try raft_state_machine.encodeCommittedEntries(alloc, &.{});
         defer alloc.free(empty_batch);
         var key_buf: [128]u8 = undefined;
@@ -322,7 +550,50 @@ pub const RaftApplyStore = struct {
         defer alloc.free(value);
         std.mem.writeInt(u64, value[0..8], commit_index, .little);
         @memcpy(value[8..], empty_batch);
-        const publication_outcome = try self.installSnapshotStreamLocked(shard, alloc, group_id, encoded, .{ .key = key, .value = value });
+
+        try self.beginGenerationPreparation(group_id);
+        var preparation_active = true;
+        defer if (preparation_active) self.cancelGenerationPreparation(group_id);
+        if (builtin.is_test and test_block_snapshot_staging.load(.acquire)) {
+            test_snapshot_staging_started.store(true, .release);
+            while (test_block_snapshot_staging.load(.acquire)) platform.time.yieldBriefly();
+        }
+
+        const path = try self.groupPathAlloc(group_id);
+        defer self.alloc.free(path);
+        var preparation = try generation_lifecycle.beginProcessPreparationWithRuntime(path, self.backend_runtime);
+        defer preparation.deinit();
+        var staged = try preparation.beginStaging();
+        defer staged.deinit();
+        {
+            const candidate = try GroupStore.open(
+                self.alloc,
+                staged.path(),
+                self.no_sync,
+                false,
+                self.resource_manager,
+                self.nextGroupStoreAccess(),
+            );
+            defer candidate.close();
+            try shard_state_store.installSnapshotStreamIntoEmptyStore(
+                &candidate.store,
+                alloc,
+                group_id,
+                snapshot,
+                &.{.{ .key = key, .value = value }},
+            );
+        }
+        try staged.seal();
+
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        self.waitForSnapshotReadersLocked(shard, group_id);
+        if (shard.stores.fetchRemove(group_id)) |removed| removed.value.close();
+        var transition = try preparation.promote();
+        defer transition.deinit();
+        const publication_outcome = try staged.publish();
 
         const summary = AppliedDataBatch{
             .commit_index = commit_index,
@@ -337,43 +608,9 @@ pub const RaftApplyStore = struct {
         } else {
             shard.batches.putAssumeCapacity(group_id, summary);
         }
+        self.finishGenerationPreparationLocked(shard, group_id);
+        preparation_active = false;
         if (publication_outcome == .durability_uncertain) return error.GenerationDurabilityUncertain;
-    }
-
-    fn installSnapshotStreamLocked(
-        self: *RaftApplyStore,
-        shard: *BatchShard,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        encoded: []const u8,
-        metadata_write: docstore.KVPair,
-    ) !generation_lifecycle.PublicationOutcome {
-        const snapshot = try shard_state_store.GroupStateSnapshotStream.init(encoded);
-        const path = try self.groupPathAlloc(group_id);
-        defer self.alloc.free(path);
-
-        var preparation = try generation_lifecycle.beginProcessPreparationWithRuntime(path, self.backend_runtime);
-        defer preparation.deinit();
-        var staged = try preparation.beginStaging();
-        defer staged.deinit();
-        {
-            const candidate = try GroupStore.open(self.alloc, staged.path(), self.no_sync, false);
-            defer candidate.close();
-            try shard_state_store.installSnapshotStreamIntoEmptyStore(
-                &candidate.store,
-                alloc,
-                group_id,
-                snapshot,
-                &.{metadata_write},
-            );
-        }
-        try staged.seal();
-
-        self.waitForSnapshotReadersLocked(shard, group_id);
-        if (shard.stores.fetchRemove(group_id)) |removed| removed.value.close();
-        var transition = try preparation.promote();
-        defer transition.deinit();
-        return try staged.publish();
     }
 
     /// Seeds a group that predates the data-Raft apply projection. Index zero is
@@ -400,6 +637,7 @@ pub const RaftApplyStore = struct {
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
         if ((try self.ensureLoaded(shard, group_id)) != null) return false;
         try shard.batches.ensureUnusedCapacity(self.alloc, 1);
         const group_store = try self.writableGroupStoreLocked(shard, group_id);
@@ -430,6 +668,7 @@ pub const RaftApplyStore = struct {
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
         const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return .{ .start = "", .end = "" };
         return try shard_state_store.currentRange(&group_store.store, alloc, group_id);
     }
@@ -439,6 +678,7 @@ pub const RaftApplyStore = struct {
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
         const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return null;
         return try shard_state_store.currentSplitState(&group_store.store, alloc, group_id);
     }
@@ -448,6 +688,7 @@ pub const RaftApplyStore = struct {
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
         const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return 0;
         return try shard_state_store.currentSplitDeltaSequence(&group_store.store, alloc, group_id);
     }
@@ -457,6 +698,7 @@ pub const RaftApplyStore = struct {
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
         const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return null;
         return try shard_state_store.currentSplitAcknowledgement(&group_store.store, alloc, group_id);
     }
@@ -466,6 +708,7 @@ pub const RaftApplyStore = struct {
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
         const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return null;
         return try shard_state_store.currentSplitTerminal(&group_store.store, alloc, group_id);
     }
@@ -475,6 +718,7 @@ pub const RaftApplyStore = struct {
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
         const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return error.AppliedDataRangeNotFound;
         return try shard_state_store.captureSplitHandoff(&group_store.store, alloc, group_id);
     }
@@ -484,6 +728,7 @@ pub const RaftApplyStore = struct {
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
         const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return try alloc.alloc(shard_state_store.SplitDelta, 0);
         return try shard_state_store.listDeltasAfter(&group_store.store, alloc, group_id, after_seq);
     }
@@ -493,6 +738,7 @@ pub const RaftApplyStore = struct {
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
         const group_store = try self.writableGroupStoreLocked(shard, group_id);
         try shard_state_store.applyHandoff(&group_store.store, alloc, group_id, handoff);
     }
@@ -502,6 +748,7 @@ pub const RaftApplyStore = struct {
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
         const group_store = try self.writableGroupStoreLocked(shard, group_id);
         try shard_state_store.applyDeltas(&group_store.store, alloc, group_id, deltas);
     }
@@ -512,6 +759,7 @@ pub const RaftApplyStore = struct {
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
         const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return error.AppliedDataRangeNotFound;
         return try shard_state_store.buildSnapshot(&group_store.store, alloc, group_id);
     }
@@ -586,7 +834,7 @@ pub const RaftApplyStore = struct {
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
-        if (self.shutting_down.load(.acquire)) return error.ApplyStoreShuttingDown;
+        try self.waitForGenerationPreparationLocked(shard, group_id);
         const group_store = (try self.groupStoreLocked(shard, group_id, false)) orelse return null;
         var txn = try group_store.store.beginReadTxn();
         errdefer txn.abort();
@@ -636,6 +884,7 @@ pub const RaftApplyStore = struct {
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
         try self.writeBatchLocked(shard, group_id, commit_index, entries_bytes);
     }
 
@@ -1959,6 +2208,143 @@ test "data raft apply store installs snapshot watermark atomically" {
         try std.testing.expectEqual(@as(u64, 51), advanced.commit_index);
         try std.testing.expectEqual(@as(u64, 51), advanced.last_entry_index);
     }
+}
+
+test "data raft snapshot staging blocks only the target group" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshot-concurrency-source", .{tmp.sub_path});
+    defer std.testing.allocator.free(source_root);
+    const target_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshot-concurrency-target", .{tmp.sub_path});
+    defer std.testing.allocator.free(target_root);
+
+    var source = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
+    defer source.deinit();
+    try std.testing.expect(try source.seedGroupSnapshotIfAbsent(
+        std.testing.allocator,
+        1,
+        .{ .start = "doc:a", .end = "doc:z" },
+        &.{.{ .key = "doc:a", .value = "snapshot" }},
+    ));
+    const snapshot = try source.snapshotBuilder().buildSnapshot(std.testing.allocator, 1);
+    defer std.testing.allocator.free(snapshot);
+
+    var target = try RaftApplyStore.init(std.heap.smp_allocator, .{ .root_dir = target_root });
+    defer target.deinit();
+    try std.testing.expect(try target.seedGroupSnapshotIfAbsent(
+        std.heap.smp_allocator,
+        1 + batch_shard_count,
+        .{ .start = "other:a", .end = "other:z" },
+        &.{.{ .key = "other:a", .value = "available" }},
+    ));
+
+    const InstallContext = struct {
+        store: *RaftApplyStore,
+        snapshot: []const u8,
+        failure: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            ctx.store.installSnapshot(std.heap.smp_allocator, 1, 10, ctx.snapshot) catch |err| {
+                ctx.failure = err;
+            };
+        }
+    };
+    const ReadContext = struct {
+        store: *RaftApplyStore,
+        completed: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            const batch = ctx.store.latestBatch(1 + batch_shard_count) catch |err| {
+                ctx.failure = err;
+                ctx.completed.store(true, .release);
+                return;
+            };
+            if (batch == null) ctx.failure = error.MissingDataBatch;
+            ctx.completed.store(true, .release);
+        }
+    };
+
+    test_snapshot_staging_started.store(false, .release);
+    test_block_snapshot_staging.store(true, .release);
+    defer test_block_snapshot_staging.store(false, .release);
+    var install_ctx = InstallContext{ .store = &target, .snapshot = snapshot };
+    var install_thread = try std.Thread.spawn(.{}, InstallContext.run, .{&install_ctx});
+    var install_joined = false;
+    defer if (!install_joined) {
+        test_block_snapshot_staging.store(false, .release);
+        install_thread.join();
+    };
+
+    var attempts: usize = 0;
+    while (!test_snapshot_staging_started.load(.acquire) and attempts < 100_000) : (attempts += 1) platform.time.yieldBriefly();
+    try std.testing.expect(test_snapshot_staging_started.load(.acquire));
+
+    var read_ctx = ReadContext{ .store = &target };
+    var read_thread = try std.Thread.spawn(.{}, ReadContext.run, .{&read_ctx});
+    var read_joined = false;
+    defer if (!read_joined) read_thread.join();
+    attempts = 0;
+    while (!read_ctx.completed.load(.acquire) and attempts < 100_000) : (attempts += 1) platform.time.yieldBriefly();
+    const colliding_group_completed_during_staging = read_ctx.completed.load(.acquire);
+
+    test_block_snapshot_staging.store(false, .release);
+    read_thread.join();
+    read_joined = true;
+    install_thread.join();
+    install_joined = true;
+    if (read_ctx.failure) |err| return err;
+    if (install_ctx.failure) |err| return err;
+    try std.testing.expect(colliding_group_completed_during_staging);
+}
+
+test "data raft apply store bounds and retires resource-managed group owners" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/bounded-group-owners", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    var store = try RaftApplyStore.init(std.testing.allocator, .{
+        .root_dir = root,
+        .resource_manager = &manager,
+        .max_cached_group_stores_per_shard = 1,
+    });
+    defer store.deinit();
+
+    try std.testing.expect(try store.seedGroupSnapshotIfAbsent(
+        std.testing.allocator,
+        1,
+        .{ .start = "a", .end = "m" },
+        &.{.{ .key = "a", .value = "one" }},
+    ));
+    try std.testing.expect(manager.sliceStats(.lsm_in_memory_state).used_bytes >= group_store_owner_accounting_bytes);
+    try std.testing.expect(try store.seedGroupSnapshotIfAbsent(
+        std.testing.allocator,
+        1 + batch_shard_count,
+        .{ .start = "m", .end = "z" },
+        &.{.{ .key = "m", .value = "two" }},
+    ));
+    try std.testing.expectEqual(@as(usize, 1), store.cachedGroupStoreCount());
+
+    const restored = try store.groupState(std.testing.allocator, 1);
+    defer shard_state_store.freeGroupStateEntries(std.testing.allocator, restored);
+    try std.testing.expectEqual(@as(usize, 1), restored.len);
+    try std.testing.expectEqualStrings("one", restored[0].value);
+    try std.testing.expectEqual(@as(usize, 1), store.cachedGroupStoreCount());
+
+    const prepared = (try store.snapshotBuilder().prepareSnapshot(1, 0)) orelse return error.MissingDataSnapshotSource;
+    try store.retainActiveGroups(&.{});
+    try std.testing.expectEqual(@as(usize, 1), store.cachedGroupStoreCount());
+    try std.testing.expectError(error.ApplyStoreGroupRetired, store.latestBatch(1));
+    prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 0), store.cachedGroupStoreCount());
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_in_memory_state).used_bytes);
+
+    try store.retainActiveGroups(&.{1});
+    const reassigned = (try store.latestBatch(1)) orelse return error.MissingDataBatch;
+    try std.testing.expectEqual(@as(u64, 0), reassigned.commit_index);
+    try std.testing.expectEqual(@as(usize, 1), store.cachedGroupStoreCount());
 }
 
 test "data apply store replay is idempotent when applied watermark lags WAL state" {

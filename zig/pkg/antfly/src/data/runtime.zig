@@ -2695,6 +2695,9 @@ pub const DataServer = struct {
             self.provisioned_storage.attachBackendRuntime(runtime, &self.read_source, &self.write_source);
         }
         self.provisioned_storage.attachSources(&self.read_source, &self.write_source);
+        if (self.data_raft) |raft| {
+            try raft.attachDataApplyStoreResourceManager(&self.provisioned_storage.resource_manager);
+        }
         _ = self.read_source.withHAReadGate(self.haReadGate());
         const ha_write_gate = self.haWriteGate();
         const ha_primary_mirror = self.haPrimaryMirror();
@@ -5883,8 +5886,16 @@ pub const DataServer = struct {
             }
         }
 
+        const active_group_ids = try self.alloc.alloc(u64, local_intents.items.len);
+        defer self.alloc.free(active_group_ids);
+        for (local_intents.items, active_group_ids) |intent, *group_id| group_id.* = intent.record.group_id;
+
         lockAtomic(&self.data_raft_mutex);
         defer self.data_raft_mutex.unlock();
+        // Publish admission before reconciliation can instantiate a newly
+        // assigned group. Removed groups fail closed immediately; pinned
+        // owners drain through deferred apply-store retirement.
+        try raft.retainDataApplyGroups(active_group_ids);
         try factory.replacePeerSets(local_intents.items);
         try raft.host.replacePlacementIntents(local_intents.items);
         _ = try raft.host.reconcileOnce();
@@ -8002,6 +8013,7 @@ const RemoteMetadataSource = struct {
             .vtable = &.{
                 .admin_snapshot = remoteAdminSnapshot,
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
+                .begin_publication = remoteBeginCatalogPublication,
             },
         };
     }
@@ -8137,6 +8149,63 @@ const RemoteMetadataSource = struct {
     fn remoteFreeAdminSnapshot(ptr: *anyopaque, snapshot: *antfly.metadata_api.AdminSnapshot) void {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         freeAdminSnapshotOwned(self.alloc, snapshot);
+    }
+
+    fn remoteBeginCatalogPublication(ptr: *anyopaque) !antfly.public_api.table_catalog.CatalogSource.PublicationGuard {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        var last_err: anyerror = error.CatalogChangedDuringPublicationCheck;
+        for (0..2) |_| {
+            for (0..self.base_uris.len) |attempt| {
+                const index = self.metadataApiIndexForAttempt(attempt);
+                var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer arena.deinit();
+                const scratch = arena.allocator();
+                var executor = antfly.raft.transport.std_http_executor.StdHttpExecutor.init(scratch, .{});
+                defer executor.deinit();
+                var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, executor.executor());
+                var parsed = metadata_client.fetchSnapshot(self.base_uris[index]) catch |err| {
+                    last_err = err;
+                    continue;
+                };
+                defer parsed.deinit();
+                const head = metadata_client.fetchHead(self.base_uris[index]) catch |err| {
+                    last_err = err;
+                    continue;
+                };
+                if (parsed.value.status.metadata_group_id != head.metadata_group_id or
+                    parsed.value.status.metadata_epoch != head.metadata_epoch)
+                {
+                    last_err = error.CatalogChangedDuringPublicationCheck;
+                    continue;
+                }
+
+                var fresh = try cloneAdminSnapshotOwned(self.alloc, parsed.value);
+                errdefer freeAdminSnapshotOwned(self.alloc, &fresh);
+                self.noteMetadataApiSuccess(index);
+                const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+                lockAtomic(&self.cache_mutex);
+                if (self.cached_snapshot) |*cached| {
+                    freeAdminSnapshotOwned(self.alloc, cached);
+                    cached.* = fresh;
+                } else {
+                    self.cached_snapshot = fresh;
+                }
+                self.cached_head = head;
+                self.cached_head_at_ms = now_ms;
+                self.cached_snapshot_at_ms = now_ms;
+                return .{
+                    .ptr = self,
+                    .snapshot = &self.cached_snapshot.?,
+                    .release_fn = remoteEndCatalogPublication,
+                };
+            }
+        }
+        return last_err;
+    }
+
+    fn remoteEndCatalogPublication(ptr: *anyopaque) void {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        self.cache_mutex.unlock();
     }
 
     fn remoteCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !void {

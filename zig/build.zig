@@ -3452,6 +3452,8 @@ pub fn build(b: *std.Build) void {
         "data raft apply store persists split destination acknowledgements",
         "data raft apply store seeds pre-raft snapshots once at reserved index zero",
         "data raft apply store installs snapshot watermark atomically",
+        "data raft snapshot staging blocks only the target group",
+        "data raft apply store bounds and retires resource-managed group owners",
         "split bootstrap marker distinguishes reservation from completion",
         "group state range scan is allocation-failure safe",
         "shard state store persists split lifecycle and ownership",

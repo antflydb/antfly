@@ -10465,18 +10465,23 @@ pub const ProvisionedTableWriteSource = struct {
         // same contract is checked again before publication so a concurrent
         // split or schema/index change cannot publish a generation built for a
         // stale table topology.
-        var catalog_snapshot = try self.catalog.adminSnapshot();
-        defer self.catalog.freeAdminSnapshot(&catalog_snapshot);
-        const range = metadata_mod.findAdminRange(&catalog_snapshot, group_id) orelse return error.CatalogChanged;
-        if (range.table_id != table_id) return error.CatalogChanged;
-        const table = metadata_mod.findAdminTable(&catalog_snapshot, table_id) orelse return error.CatalogChanged;
-        if (!std.mem.eql(u8, table.name, table_name)) return error.CatalogChanged;
-        if (!std.mem.eql(u8, state.byte_range.start, range.start_key) or
-            !std.mem.eql(u8, state.byte_range.end, range.end_key orelse ""))
+        var catalog_contract = try captureRaftSnapshotCatalogContract(
+            alloc,
+            self.catalog,
+            group_id,
+            table_id,
+            table_name,
+        );
+        defer catalog_contract.deinit(alloc);
+        if (!std.mem.eql(u8, state.byte_range.start, catalog_contract.range.start_key) or
+            !std.mem.eql(u8, state.byte_range.end, catalog_contract.range.end_key orelse ""))
         {
             return error.SnapshotRangeMismatch;
         }
-        const identity_namespace = tableIdentityNamespaceForRange(table.*, range.*);
+        const identity_namespace = tableIdentityNamespaceForRangeId(
+            catalog_contract.table_id,
+            catalog_contract.range,
+        );
 
         const generation_source = self.groupVisibleRootGenerationSource();
         var generation_reservation = if (generation_source) |root_generation_source|
@@ -10491,7 +10496,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer staged.deinit();
 
         var parsed_schema: ?tables_api.ParsedTableSchema = null;
-        if (table.schema_json.len > 0) parsed_schema = try tables_api.parseValidatedTableSchema(alloc, table.schema_json);
+        if (catalog_contract.schema_json.len > 0) parsed_schema = try tables_api.parseValidatedTableSchema(alloc, catalog_contract.schema_json);
         defer if (parsed_schema) |*schema| schema.deinit(alloc);
 
         {
@@ -10499,11 +10504,11 @@ pub const ProvisionedTableWriteSource = struct {
                 alloc,
                 &staged,
                 group_id,
-                table.indexes_json,
+                catalog_contract.indexes_json,
                 identity_namespace,
             );
             defer staged_db.close();
-            try applyLocalTableSchemaJson(alloc, &staged_db, table.schema_json);
+            try applyLocalTableSchemaJson(alloc, &staged_db, catalog_contract.schema_json);
 
             const max_chunk_entries = 512;
             const max_chunk_payload_bytes = 4 * 1024 * 1024;
@@ -10544,13 +10549,9 @@ pub const ProvisionedTableWriteSource = struct {
 
         // Draining an old read generation can take time. Fence the catalog only
         // after that drain so the final check is adjacent to namespace publish.
-        var publication_snapshot = try self.catalog.adminSnapshot();
-        defer self.catalog.freeAdminSnapshot(&publication_snapshot);
-        const publication_range = metadata_mod.findAdminRange(&publication_snapshot, group_id) orelse return error.CatalogChanged;
-        const publication_table = metadata_mod.findAdminTable(&publication_snapshot, table_id) orelse return error.CatalogChanged;
-        if (!raftSnapshotCatalogContractEqual(table.*, range.*, publication_table.*, publication_range.*)) {
-            return error.CatalogChanged;
-        }
+        var catalog_publication = try self.catalog.beginPublication();
+        defer catalog_publication.deinit();
+        if (!catalog_contract.matches(catalog_publication.snapshot, group_id)) return error.CatalogChanged;
 
         self.invalidateSharedPathCaches(path);
         var shard_transition = try preparation.promote();
@@ -10559,6 +10560,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (generation_reservation) |*reservation| reservation.advance();
         self.invalidateSharedPathCaches(path);
         transition.finishMutation();
+        catalog_publication.deinit();
         self.notifyLocalChange(table_name, .structural);
         self.notifyLocalChange(table_name, .data);
         if (publication_outcome == .durability_uncertain) return error.GenerationDurabilityUncertain;
@@ -17001,24 +17003,77 @@ fn tableIdentityNamespaceForRange(
     table: metadata_table_manager.TableRecord,
     range: metadata_table_manager.RangeRecord,
 ) doc_identity.Namespace {
+    return tableIdentityNamespaceForRangeId(table.table_id, range);
+}
+
+fn tableIdentityNamespaceForRangeId(
+    table_id: u64,
+    range: metadata_table_manager.RangeRecord,
+) doc_identity.Namespace {
     return .{
-        .table_id = table.table_id,
+        .table_id = table_id,
         .shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
         .range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
     };
 }
 
-fn raftSnapshotCatalogContractEqual(
-    expected_table: metadata_table_manager.TableRecord,
-    expected_range: metadata_table_manager.RangeRecord,
-    actual_table: metadata_table_manager.TableRecord,
-    actual_range: metadata_table_manager.RangeRecord,
-) bool {
-    return expected_table.table_id == actual_table.table_id and
-        std.mem.eql(u8, expected_table.name, actual_table.name) and
-        std.mem.eql(u8, expected_table.schema_json, actual_table.schema_json) and
-        std.mem.eql(u8, expected_table.indexes_json, actual_table.indexes_json) and
-        metadata_table_manager.rangeRecordsEqual(expected_range, actual_range);
+const RaftSnapshotCatalogContract = struct {
+    table_id: u64,
+    table_name: []u8,
+    schema_json: []u8,
+    indexes_json: []u8,
+    range: metadata_table_manager.RangeRecord,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        alloc.free(self.schema_json);
+        alloc.free(self.indexes_json);
+        metadata_table_manager.freeRange(alloc, self.range);
+        self.* = undefined;
+    }
+
+    fn matches(
+        self: *const @This(),
+        snapshot: *const metadata_api.AdminSnapshot,
+        group_id: u64,
+    ) bool {
+        const range = metadata_mod.findAdminRange(snapshot, group_id) orelse return false;
+        if (range.table_id != self.table_id or !metadata_table_manager.rangeRecordsEqual(self.range, range.*)) return false;
+        const table = metadata_mod.findAdminTable(snapshot, self.table_id) orelse return false;
+        return std.mem.eql(u8, self.table_name, table.name) and
+            std.mem.eql(u8, self.schema_json, table.schema_json) and
+            std.mem.eql(u8, self.indexes_json, table.indexes_json);
+    }
+};
+
+fn captureRaftSnapshotCatalogContract(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    group_id: u64,
+    expected_table_id: u64,
+    expected_table_name: []const u8,
+) !RaftSnapshotCatalogContract {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const range = metadata_mod.findAdminRange(&snapshot, group_id) orelse return error.CatalogChanged;
+    if (range.table_id != expected_table_id) return error.CatalogChanged;
+    const table = metadata_mod.findAdminTable(&snapshot, expected_table_id) orelse return error.CatalogChanged;
+    if (!std.mem.eql(u8, table.name, expected_table_name)) return error.CatalogChanged;
+
+    const table_name = try alloc.dupe(u8, table.name);
+    errdefer alloc.free(table_name);
+    const schema_json = try alloc.dupe(u8, table.schema_json);
+    errdefer alloc.free(schema_json);
+    const indexes_json = try alloc.dupe(u8, table.indexes_json);
+    errdefer alloc.free(indexes_json);
+    const owned_range = try metadata_table_manager.cloneRange(alloc, range.*);
+    return .{
+        .table_id = expected_table_id,
+        .table_name = table_name,
+        .schema_json = schema_json,
+        .indexes_json = indexes_json,
+        .range = owned_range,
+    };
 }
 
 fn findTableRecord(tables: []const metadata_table_manager.TableRecord, table_id: u64) ?metadata_table_manager.TableRecord {
@@ -31273,6 +31328,8 @@ fn testingVisibleRootGenerationForGroup(ptr: *anyopaque, _: u64) u64 {
 const RaftSnapshotInstallTestCatalog = struct {
     calls: usize = 0,
     change_on_call: ?usize = null,
+    publication_mutex: std.atomic.Mutex = .unlocked,
+    publication_snapshot: metadata_api.AdminSnapshot = undefined,
 
     fn iface(self: *@This()) table_catalog.CatalogSource {
         return .{
@@ -31280,6 +31337,7 @@ const RaftSnapshotInstallTestCatalog = struct {
             .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .begin_publication = beginPublication,
             },
         };
     }
@@ -31287,6 +31345,27 @@ const RaftSnapshotInstallTestCatalog = struct {
     fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.calls += 1;
+        return self.snapshotForCurrentCall();
+    }
+
+    fn beginPublication(ptr: *anyopaque) !table_catalog.CatalogSource.PublicationGuard {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.publication_mutex);
+        self.calls += 1;
+        self.publication_snapshot = self.snapshotForCurrentCall();
+        return .{
+            .ptr = self,
+            .snapshot = &self.publication_snapshot,
+            .release_fn = endPublication,
+        };
+    }
+
+    fn endPublication(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.publication_mutex.unlock();
+    }
+
+    fn snapshotForCurrentCall(self: *@This()) metadata_api.AdminSnapshot {
         const changed = if (self.change_on_call) |call| self.calls >= call else false;
         const ranges = if (changed)
             @constCast((&[_]metadata_table_manager.RangeRecord{.{

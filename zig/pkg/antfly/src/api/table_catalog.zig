@@ -29,9 +29,26 @@ pub const CatalogSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
+    /// Pins the catalog source's locally visible projection while a prepared
+    /// storage generation is validated and published. The snapshot is borrowed
+    /// and remains valid until the guard is released.
+    pub const PublicationGuard = struct {
+        ptr: *anyopaque,
+        snapshot: *const metadata_api.AdminSnapshot,
+        release_fn: *const fn (ptr: *anyopaque) void,
+        active: bool = true,
+
+        pub fn deinit(self: *PublicationGuard) void {
+            if (!self.active) return;
+            self.release_fn(self.ptr);
+            self.active = false;
+        }
+    };
+
     pub const VTable = struct {
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
+        begin_publication: ?*const fn (ptr: *anyopaque) anyerror!PublicationGuard = null,
     };
 
     pub fn adminSnapshot(self: CatalogSource) !metadata_api.AdminSnapshot {
@@ -40,6 +57,11 @@ pub const CatalogSource = struct {
 
     pub fn freeAdminSnapshot(self: CatalogSource, snapshot: *metadata_api.AdminSnapshot) void {
         self.vtable.free_admin_snapshot(self.ptr, snapshot);
+    }
+
+    pub fn beginPublication(self: CatalogSource) !PublicationGuard {
+        const begin = self.vtable.begin_publication orelse return error.CatalogPublicationFenceUnavailable;
+        return try begin(self.ptr);
     }
 
     pub fn fromMetadataService(svc: *metadata_service.MetadataService) CatalogSource {

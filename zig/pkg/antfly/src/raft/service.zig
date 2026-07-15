@@ -27,6 +27,7 @@ const raft_state_machine = @import("state_machine/mod.zig");
 const shard_ops = @import("shard_ops.zig");
 const transition_runtime = @import("transition_runtime.zig");
 const transition_service = @import("transition_service.zig");
+const resource_manager = @import("../storage/resource_manager.zig");
 
 pub const ManagedServiceConfig = struct {
     max_inbound_messages: usize = host_mod.default_max_inbound_messages_per_round,
@@ -494,6 +495,14 @@ pub const ManagedHttpHostService = struct {
 
     pub fn baseUri(self: *ManagedHttpHostService, alloc: std.mem.Allocator) ![]u8 {
         return try self.host.baseUri(alloc);
+    }
+
+    pub fn attachDataApplyStoreResourceManager(self: *ManagedHttpHostService, manager: *resource_manager.ResourceManager) !void {
+        try self.host.attachDataApplyStoreResourceManager(manager);
+    }
+
+    pub fn retainDataApplyGroups(self: *ManagedHttpHostService, group_ids: []const u64) !void {
+        try self.host.retainDataApplyGroups(group_ids);
     }
 
     pub fn replaceTransitionOps(self: *ManagedHttpHostService, ops: shard_ops.ShardOperationAdapter) !void {
