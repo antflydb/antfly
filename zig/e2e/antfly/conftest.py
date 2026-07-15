@@ -939,8 +939,12 @@ class PdfOcrE2EServer:
         self.base_url = f"http://{host}:{port}"
         self.reader_api_url = f"{self.base_url}{INFERENCE_PUBLIC_API_ROOT}"
         self.pdf_url = f"{self.base_url}/fixtures/two-page.pdf"
+        self.form_pdf_url = f"{self.base_url}/fixtures/form-xobject-text.pdf"
         self._pdf = (
             REPO_ROOT / "lib/pdf/testdata/two_page_text_fixture.pdf"
+        ).read_bytes()
+        self._form_pdf = (
+            REPO_ROOT / "lib/pdf/testdata/form_xobject_text_fixture.pdf"
         ).read_bytes()
         self._lock = threading.Lock()
         self._png_page_by_hash: dict[str, int] = {}
@@ -951,14 +955,18 @@ class PdfOcrE2EServer:
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
-                if self.path != "/fixtures/two-page.pdf":
+                if self.path == "/fixtures/two-page.pdf":
+                    pdf = outer._pdf
+                elif self.path == "/fixtures/form-xobject-text.pdf":
+                    pdf = outer._form_pdf
+                else:
                     self.send_error(404)
                     return
                 self.send_response(200)
                 self.send_header("Content-Type", "application/pdf")
-                self.send_header("Content-Length", str(len(outer._pdf)))
+                self.send_header("Content-Length", str(len(pdf)))
                 self.end_headers()
-                self.wfile.write(outer._pdf)
+                self.wfile.write(pdf)
 
             def do_POST(self) -> None:  # noqa: N802
                 if self.path != f"{INFERENCE_PUBLIC_API_ROOT}/read":

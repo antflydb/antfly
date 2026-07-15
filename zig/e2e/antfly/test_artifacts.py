@@ -494,6 +494,153 @@ def test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e(
     assert len(png_hashes) == 3
 
 
+def test_pdf_auto_ocr_only_renders_pages_without_usable_embedded_text_e2e(
+    stateful_api, pdf_ocr_e2e_server
+):
+    """Auto OCR keeps Form-XObject text and renders only the scanned page."""
+
+    table_name = f"document_pdf_auto_ocr_{time.time_ns()}"
+    index_config = _document_units_index_config()
+    extraction_config = index_config["artifact"]["producer_json"]["config"]
+    extraction_config["ocr"] = {
+        "enabled": True,
+        "mode": "auto",
+        "render_dpi": 150,
+        "max_rendered_pixels": 4_000_000,
+        "config": {
+            "provider": "antfly",
+            "model": "antflydb/Florence-2-base",
+            "api_url": pdf_ocr_e2e_server.reader_api_url,
+        },
+    }
+    asset_enrichment = dict(index_config["artifact"])
+    asset_enrichment["producer_json"] = json.dumps(asset_enrichment["producer_json"])
+    created = stateful_api.create_table(table_name, num_shards=1)
+    assert created.get("name") == table_name or created.get("table_name") == table_name
+    assert (
+        stateful_api.put(
+            f"{_table_artifact_path(table_name, DOCUMENT_UNITS_ARTIFACT)}/enrichment",
+            asset_enrichment,
+        )
+        == {}
+    )
+    assert (
+        wait_until(
+            lambda: _table_has_artifact_enrichment(
+                stateful_api, table_name, DOCUMENT_UNITS_ARTIFACT, "asset"
+            ),
+            timeout_s=30.0,
+            interval_s=0.25,
+        )
+        is not None
+    )
+    assert (
+        stateful_api.put(
+            f"{_table_artifact_path(table_name, 'document_chunks_v1')}/enrichment",
+            {
+                "kind": "chunk",
+                "source_artifact_name": DOCUMENT_UNITS_ARTIFACT,
+                "field": "text",
+                "chunk_size": 256,
+                "chunk_overlap": 0,
+                "full_text_index": True,
+            },
+        )
+        == {}
+    )
+
+    zig_root = Path(__file__).resolve().parents[2]
+    scanned_table_pdf = (
+        zig_root / "lib/pdf/testdata/scanned_table_fixture.pdf"
+    ).read_bytes()
+    inline_scanned_table = "data:application/pdf;base64," + base64.b64encode(
+        scanned_table_pdf
+    ).decode("ascii")
+    docs = {
+        "form-text-url": {
+            "filename": "form-xobject-text.pdf",
+            "mime_type": "application/pdf",
+            "version": "1",
+            "url": pdf_ocr_e2e_server.form_pdf_url,
+        },
+        "scanned-table-inline": {
+            "filename": "scanned-table.pdf",
+            "mime_type": "application/pdf",
+            "version": "1",
+            "url": inline_scanned_table,
+        },
+    }
+    batch = stateful_api.batch_write(
+        table_name,
+        inserts=docs,
+        sync_level="full_index",
+    )
+    assert batch["inserted"] == len(docs)
+
+    manifests: dict[str, dict] = {}
+    for doc_key in docs:
+        manifest = wait_until(
+            lambda doc_key=doc_key: (
+                current
+                if (
+                    (current := _manifest_ready(stateful_api, table_name, doc_key))
+                    is not None
+                    and current.get("chunk_count", 0) >= 1
+                )
+                else None
+            ),
+            timeout_s=90.0,
+            interval_s=0.5,
+        )
+        assert manifest is not None, {
+            "document": doc_key,
+            "manifest": _manifest_ready(stateful_api, table_name, doc_key),
+            "reader": pdf_ocr_e2e_server.stats(),
+        }
+        manifests[doc_key] = manifest
+
+    embedded = manifests["form-text-url"]
+    assert embedded["source_url"] == pdf_ocr_e2e_server.form_pdf_url
+    assert embedded["unit_count"] == 1
+    assert embedded["ocr_attempted_count"] == 0
+    assert embedded["ocr_selected_count"] == 0
+    assert embedded["ocr_failed_count"] == 0
+
+    scanned = manifests["scanned-table-inline"]
+    assert scanned["unit_count"] == 1
+    assert scanned["ocr_attempted_count"] == 1
+    assert scanned["ocr_selected_count"] == 1
+    assert scanned["ocr_failed_count"] == 0
+
+    for term, expected_id in (
+        ("CONSOLIDATED FINANCIAL HIGHLIGHTS", "form-text-url"),
+        ("OfficeQA scanned table", "scanned-table-inline"),
+    ):
+        result = wait_until(
+            lambda term=term, expected_id=expected_id: (
+                response
+                if expected_id
+                in _query_hit_ids(
+                    response := stateful_api.query_table(
+                        table_name,
+                        {
+                            "full_text_search": {"field": "text", "match": term},
+                            "limit": 10,
+                        },
+                    )
+                )
+                else None
+            ),
+            timeout_s=60.0,
+            interval_s=0.5,
+        )
+        assert result is not None, {"term": term, "manifests": manifests}
+
+    reader_stats = pdf_ocr_e2e_server.stats()
+    assert reader_stats["png_requests"] == 1, reader_stats
+    assert reader_stats["jpeg_requests"] == 0, reader_stats
+
+
 def test_artifact_backed_embedding_table_provisions_atomically(
     stateful_api, openai_embedder
 ):
