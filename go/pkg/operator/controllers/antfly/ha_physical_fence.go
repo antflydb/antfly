@@ -401,7 +401,8 @@ func haPhysicalIsolationReceiptScope(receipt *antflyv1.HAPhysicalIsolationReceip
 }
 
 func validateCurrentPhysicalIsolationLease(lease *coordinationv1.Lease, action *antflyv1.HAPlannedActionStatus, scope haFencingLeaseScope) error {
-	if lease == nil || action == nil || haLeaseFenceGeneration(lease) != action.FenceGeneration {
+	if lease == nil || action == nil || lease.Spec.LeaseTransitions == nil || *lease.Spec.LeaseTransitions <= 0 ||
+		uint64(*lease.Spec.LeaseTransitions) != action.FenceGeneration {
 		return fmt.Errorf("isolate former primary: fencing Lease generation does not match planned generation %d", action.FenceGeneration)
 	}
 	if lease.Spec.HolderIdentity == nil || strings.TrimSpace(*lease.Spec.HolderIdentity) != strings.TrimSpace(action.RouteTo) {

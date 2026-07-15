@@ -4046,6 +4046,12 @@ func TestPhysicalIsolationReceiptRejectsForgedPartialAndStaleEvidence(t *testing
 	if err := validateCurrentPhysicalIsolationObjects(cluster, &action, exact, lease, scope); err == nil {
 		t.Fatal("changed Lease holder-transfer time was accepted as an ordinary renewal")
 	}
+	lease.Spec.AcquireTime = &metav1.MicroTime{Time: now}
+	lease.Spec.LeaseTransitions = nil
+	lease.Generation = int64(action.FenceGeneration)
+	if err := validateCurrentPhysicalIsolationObjects(cluster, &action, exact, lease, scope); err == nil {
+		t.Fatal("metadata.generation substituted for the missing Lease transition fencing token")
+	}
 }
 
 func TestPhysicalIsolationReceiptRejectsLiveOldRuntimeWithoutWatchdogCapability(t *testing.T) {
