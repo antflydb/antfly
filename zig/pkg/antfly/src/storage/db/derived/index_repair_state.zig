@@ -20,11 +20,12 @@ const types = @import("../types.zig");
 
 const file_name = "index_repair.checkpoint";
 const magic = "AFIDXRP1";
-const format_version: u32 = 5;
+const format_version: u32 = 6;
 const max_file_bytes: usize = 16 * 1024 * 1024;
 const max_entries: usize = 65_536;
 const max_index_name_bytes: usize = 4 * 1024;
 const max_candidate_path_bytes: usize = 16 * 1024;
+const max_build_resume_key_bytes: usize = 64 * 1024;
 const max_error_bytes: usize = 16 * 1024;
 
 pub const Trigger = enum(u8) {
@@ -93,6 +94,11 @@ pub const IndexRepairIntent = struct {
     previous_active_relative_path: ?[]u8 = null,
     detected_sequence: u64,
     build_floor_sequence: u64 = 0,
+    /// Last source-store key durably incorporated into a reopenable building
+    /// candidate. Resume scans begin strictly after this key. The cumulative
+    /// count is diagnostic/accounting state and is not used for correctness.
+    build_resume_key: ?[]u8 = null,
+    build_reprocessed: u64 = 0,
     candidate_applied_sequence: u64 = 0,
     /// Reconstructible node plan, not a durable reservation. The estimate is
     /// candidate bytes; planned bytes additionally include replay/WAL growth
@@ -102,6 +108,10 @@ pub const IndexRepairIntent = struct {
     target_sequence: u64,
     phase: Phase = .detected,
     attempt_count: u32 = 0,
+    /// Consecutive failed/deferred attempts used for retry backoff. Successful
+    /// cooperative progress resets this without destroying the lifetime
+    /// attempt counter exposed for diagnostics.
+    failure_streak: u32 = 0,
     next_retry_at_ms: u64 = 0,
     started_at_ms: u64,
     updated_at_ms: u64,
@@ -112,6 +122,7 @@ pub const IndexRepairIntent = struct {
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.index_name);
         if (self.candidate_relative_path) |value| alloc.free(value);
+        if (self.build_resume_key) |value| alloc.free(value);
         if (self.previous_active_relative_path) |value| alloc.free(value);
         if (self.last_error) |value| alloc.free(value);
         self.* = undefined;
@@ -124,12 +135,15 @@ pub const IndexRepairIntent = struct {
         errdefer if (candidate) |value| alloc.free(value);
         const previous_active = if (self.previous_active_relative_path) |value| try alloc.dupe(u8, value) else null;
         errdefer if (previous_active) |value| alloc.free(value);
+        const build_resume_key = if (self.build_resume_key) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (build_resume_key) |value| alloc.free(value);
         const last_error = if (self.last_error) |value| try alloc.dupe(u8, value) else null;
         errdefer if (last_error) |value| alloc.free(value);
         var out = self;
         out.index_name = index_name;
         out.candidate_relative_path = candidate;
         out.previous_active_relative_path = previous_active;
+        out.build_resume_key = build_resume_key;
         out.last_error = last_error;
         return out;
     }
@@ -494,6 +508,13 @@ fn validateEntry(entry: Entry) !void {
         try validateCandidateRelativePath(intent.index_name, path);
     }
     if (intent.last_error) |value| if (value.len > max_error_bytes) return error.InvalidIndexRepairState;
+    if (intent.build_resume_key) |value| {
+        if (value.len == 0 or value.len > max_build_resume_key_bytes or
+            intent.candidate_relative_path == null)
+        {
+            return error.InvalidIndexRepairState;
+        }
+    }
     if ((intent.operator_job_id == 0) != (intent.operator_job_created_at_ms == 0)) return error.InvalidIndexRepairState;
     if (intent.planned_disk_bytes != 0 and intent.planned_disk_bytes < intent.estimated_candidate_bytes) return error.InvalidIndexRepairState;
     if (entry.pin) |pin| {
@@ -587,6 +608,8 @@ fn encode(alloc: Allocator, state: *const State) ![]u8 {
         try appendOptionalString(alloc, &out, intent.previous_active_relative_path, max_candidate_path_bytes);
         try appendInt(alloc, &out, u64, intent.detected_sequence);
         try appendInt(alloc, &out, u64, intent.build_floor_sequence);
+        try appendOptionalString(alloc, &out, intent.build_resume_key, max_build_resume_key_bytes);
+        try appendInt(alloc, &out, u64, intent.build_reprocessed);
         try appendInt(alloc, &out, u64, intent.candidate_applied_sequence);
         try appendInt(alloc, &out, u64, intent.estimated_candidate_bytes);
         // Format versions 2 and 3 called this value "reserved". Its on-disk
@@ -596,6 +619,7 @@ fn encode(alloc: Allocator, state: *const State) ![]u8 {
         try appendInt(alloc, &out, u64, intent.target_sequence);
         try appendInt(alloc, &out, u8, @intFromEnum(intent.phase));
         try appendInt(alloc, &out, u32, intent.attempt_count);
+        try appendInt(alloc, &out, u32, intent.failure_streak);
         try appendInt(alloc, &out, u64, intent.next_retry_at_ms);
         try appendInt(alloc, &out, u64, intent.started_at_ms);
         try appendInt(alloc, &out, u64, intent.updated_at_ms);
@@ -667,6 +691,10 @@ fn decode(alloc: Allocator, raw: []const u8) !State {
         }
         intent.detected_sequence = try readInt(raw[0..payload_end], &pos, u64);
         intent.build_floor_sequence = try readInt(raw[0..payload_end], &pos, u64);
+        if (decoded_format_version >= 6) {
+            intent.build_resume_key = try readOptionalString(alloc, raw[0..payload_end], &pos, max_build_resume_key_bytes);
+            intent.build_reprocessed = try readInt(raw[0..payload_end], &pos, u64);
+        }
         intent.candidate_applied_sequence = try readInt(raw[0..payload_end], &pos, u64);
         if (decoded_format_version >= 2) {
             intent.estimated_candidate_bytes = try readInt(raw[0..payload_end], &pos, u64);
@@ -675,6 +703,9 @@ fn decode(alloc: Allocator, raw: []const u8) !State {
         intent.target_sequence = try readInt(raw[0..payload_end], &pos, u64);
         intent.phase = try readEnum(Phase, raw[0..payload_end], &pos);
         intent.attempt_count = try readInt(raw[0..payload_end], &pos, u32);
+        if (decoded_format_version >= 6) {
+            intent.failure_streak = try readInt(raw[0..payload_end], &pos, u32);
+        }
         intent.next_retry_at_ms = try readInt(raw[0..payload_end], &pos, u64);
         intent.started_at_ms = try readInt(raw[0..payload_end], &pos, u64);
         intent.updated_at_ms = try readInt(raw[0..payload_end], &pos, u64);
@@ -808,6 +839,10 @@ test "index repair state persists intent and provisional replay pin atomically" 
     }, preflight);
     var entry = try testEntry(alloc, identity, .building);
     defer entry.deinit(alloc);
+    entry.intent.build_floor_sequence = 11;
+    entry.intent.build_resume_key = try alloc.dupe(u8, "artifact-key:42");
+    entry.intent.build_reprocessed = 42;
+    entry.intent.failure_streak = 3;
     entry.intent.previous_pointer_captured = true;
     entry.intent.previous_active_relative_path = try alloc.dupe(
         u8,
@@ -828,6 +863,9 @@ test "index repair state persists intent and provisional replay pin atomically" 
     try std.testing.expectEqual(@as(usize, 1), reopened.entries.items.len);
     try std.testing.expectEqual(@as(?u64, 0), reopened.minimumRetainAfterSequence());
     try std.testing.expectEqual(Phase.building, reopened.entries.items[0].intent.phase);
+    try std.testing.expectEqualStrings("artifact-key:42", reopened.entries.items[0].intent.build_resume_key.?);
+    try std.testing.expectEqual(@as(u64, 42), reopened.entries.items[0].intent.build_reprocessed);
+    try std.testing.expectEqual(@as(u32, 3), reopened.entries.items[0].intent.failure_streak);
     try std.testing.expect(reopened.entries.items[0].intent.previous_pointer_captured);
     try std.testing.expectEqualStrings(
         ".repair-shadow-77/indexes/dense_idx",

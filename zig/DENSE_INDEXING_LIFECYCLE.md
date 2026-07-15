@@ -39,6 +39,19 @@ Implemented in the current tree:
   independent adaptive 16-to-256-group cursor window rather than a periodic
   full-node sweep, with a measured full-rotation estimate and SLO violation
   metric when the configured group count exceeds the qualified envelope
+- pending repair outcomes are re-enqueued before a lost-wakeup cursor may
+  advance. Allocation failure is logged, counted, scheduler-backed off, and
+  leaves the cursor on the same route instead of silently degrading exact debt
+  notification into a full fallback rotation
+- large dense candidate scans are cooperatively time-sliced by the
+  `BackendRuntime` owner. Every slice uses streaming publication, durably closes
+  the candidate, and checkpoints the source-store cursor plus cumulative
+  progress before releasing the one-per-node repair slot. Restart or ownership
+  transfer reopens that candidate and resumes strictly after the durable cursor;
+  a crash before cursor publication safely replays the last idempotent slice
+- retry backoff uses a separate durable consecutive-failure streak; successful
+  slices reset it, so a large repair's lifetime attempt count cannot turn its
+  first later transient failure into the maximum ten-minute delay
 - repair execution is owned by a dedicated `BackendRuntime` maintenance owner;
   shutdown cooperatively cancels at durable boundaries and drains that owner,
   leaving the candidate resumable instead of waiting for a full rebuild
@@ -1202,11 +1215,14 @@ Start with these scheduler limits:
   preserves resumable durable repair state without recording an attempt failure
 
 The concurrency limit may become configurable after qualification, but
-unbounded per-group concurrency is never allowed. A future resumable scanner
-may time-slice large builds; the first implementation may run one admitted
-build to completion on the dedicated executor only if capacity tests show that
-the largest supported repair meets queue-age and startup SLOs. Otherwise,
-resumable checkpoints and cooperative yielding are required before GA.
+unbounded per-group concurrency is never allowed. Dense reconstruction is
+time-sliced at reopenable publication boundaries: the source cursor is advanced
+only after the candidate slice is durable, and the linked group cursor then
+rotates the node slot. The production default is a 15-second scheduler budget;
+the scan observes it only after a resource-sized batch, avoiding per-document
+clock calls. Other index families retain their existing bounded/cancellable
+builders and require the same largest-incident SLO proof before higher
+concurrency is enabled.
 
 The scheduler publishes queue depth, oldest-intent age, bounded-scan work,
 attempt outcomes, disk-admission waits, and current/peak resource-manager disk
@@ -1239,6 +1255,15 @@ failure state, and an explicit durable wake clears stale per-group scheduler
 backoff. Consequently an unhealthy group or metadata fallback cannot turn the
 five-second executor poll into a hot retry loop or delay unrelated runnable
 groups.
+
+A successful DB pass that still reports durable debt must first restore the
+exact group queue entry. If that allocation fails, the executor records global
+scheduler backoff and returns before publishing fallback cursor progress. This
+ordering makes queue notification and cursor advancement one logical outcome
+without putting the fallback cursor itself on the durability path. The periodic
+discovery anchor is rewound on that failure, so the same cursor becomes eligible
+as soon as scheduler backoff expires rather than waiting another discovery
+interval.
 
 Lost-wakeup reconciliation uses a compact node-local routing index rebuilt only
 when the metadata epoch changes. Steady-state passes neither clone nor free the
@@ -1693,6 +1718,7 @@ Use at least:
 - bursty writes below and above the replay coalescing threshold
 - multiple dense indexes and multiple active groups per node
 - forced termination during an active session
+- repeated cooperative yield/reopen cycles during a candidate snapshot build
 
 Record the baseline and candidate commit IDs, build mode, backend and durability
 configuration, dataset/version and random seeds, CPU model/count, memory, disk,
@@ -1718,6 +1744,9 @@ Acceptance:
   independent-batch design is selected instead
 - peak memory, WAL growth, and L0 debt remain inside configured node budgets
 - unpaced ingest cannot create a permanently unloadable dense index
+- dense repair slicing stays within the accepted throughput threshold and a
+  large candidate cannot monopolize the node repair slot beyond one slice plus
+  one resource-sized batch
 
 ### Phase 4: Durable automatic repair core
 
@@ -1841,9 +1870,11 @@ General availability requires the deterministic crash matrix to pass on every
 supported durable backend mode, no unresolved correctness-severity failures,
 reproducible performance results within the accepted thresholds, and evidence
 that the largest supported incident stays within memory, disk, replay,
-snapshot, activation-pause, queue-age, and projected-recovery SLOs. If a
-nonpreemptive repair cannot meet those bounds, resumable scan checkpoints are a
-GA requirement rather than deferred follow-up work.
+snapshot, activation-pause, queue-age, slice-overhead, and projected-recovery
+SLOs. Dense reconstruction already has durable resumable scan checkpoints;
+incident qualification must verify their fairness and throughput. Any remaining
+nonpreemptive index-family builder that cannot meet those bounds requires the
+same checkpointed-yield treatment before GA.
 
 ## Non-Goals
 

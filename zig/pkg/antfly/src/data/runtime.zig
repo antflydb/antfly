@@ -55,6 +55,10 @@ const provisioned_index_repair_fallback_rotation_target_ms: u64 = 30 * std.time.
 const provisioned_index_repair_queued_groups_per_scan: usize = 32;
 const provisioned_index_repair_retry_min_ms: u64 = 30 * std.time.ms_per_s;
 const provisioned_index_repair_retry_max_ms: u64 = 10 * std.time.ms_per_min;
+/// Bound one non-activation reconstruction turn so the BackendRuntime owner can
+/// rotate fairly across broken groups. Dense scan code observes this only at a
+/// durable streaming-session boundary, keeping the hot batch path branch-free.
+const provisioned_index_repair_build_slice_ns: u64 = 15 * std.time.ns_per_s;
 
 /// Durable repair intents use realtime deadlines so they survive restart.
 /// The in-memory scheduler uses monotonic time so wall-clock adjustments cannot
@@ -108,6 +112,14 @@ fn indexRepairFallbackDue(
 ) bool {
     if (fallback_not_before_ms != 0 and now_ms < fallback_not_before_ms) return false;
     return now_ms -| last_fallback_at_ms >= discovery_interval_ms;
+}
+
+fn indexRepairFallbackRetryAnchor(now_ms: u64, discovery_interval_ms: u64) u64 {
+    // The global scheduler backoff determines the retry time. Rewind the
+    // periodic-discovery anchor so that, once that backoff expires, the same
+    // unconsumed cursor is immediately eligible instead of waiting for an
+    // additional discovery interval.
+    return now_ms -| discovery_interval_ms;
 }
 
 fn indexRepairFallbackFailureBlocksPass(exact_candidate_count: usize) bool {
@@ -183,6 +195,8 @@ test "index repair fallback backoff never blocks an exact durable wake" {
     try std.testing.expect(indexRepairFallbackDue(0, 1_000, 10_000, 10_000));
     try std.testing.expect(indexRepairFallbackFailureBlocksPass(0));
     try std.testing.expect(!indexRepairFallbackFailureBlocksPass(1));
+    const retry_anchor = indexRepairFallbackRetryAnchor(100_000, 30_000);
+    try std.testing.expect(indexRepairFallbackDue(retry_anchor, 30_000, 0, 100_001));
 }
 
 test "index repair lost-wakeup fallback stays bounded at large group counts" {
@@ -772,6 +786,7 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_fallback_rotation_estimate_ms", "gauge", "Estimated full rotation time for bounded lost-wakeup discovery", self.data_server.provisioned_index_repair_fallback_rotation_estimate_ms.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_fallback_rotation_slo_exceeded", "gauge", "Whether the local group count exceeds the bounded lost-wakeup rotation envelope", self.data_server.provisioned_index_repair_fallback_rotation_slo_exceeded.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_disk_waits_total", "counter", "Repair passes deferred by disk admission", self.data_server.provisioned_index_repair_disk_waits.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_cooperative_deferrals_total", "counter", "Repair passes that durably yielded or deferred under owner-side contention", self.data_server.provisioned_index_repair_cooperative_deferrals.load(.monotonic));
         const activation = self.data_server.provisioned_storage.resource_manager.indexRepairActivationStats();
         try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_activation_attempts_total", "counter", "Index generation activations measured by the node resource manager", activation.attempts);
         try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_activation_overruns_total", "counter", "Index generation activations whose fenced interval exceeded its budget", activation.overruns);
@@ -2399,6 +2414,15 @@ const IndexRepairCancellationFence = struct {
     }
 };
 
+const IndexRepairYieldFence = struct {
+    deadline_ns: u64,
+
+    fn requested(ptr: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return platform_time.monotonicNs() >= self.deadline_ns;
+    }
+};
+
 pub const GroupMembership = struct {
     local_voter: bool = false,
     voter_count: u16 = 0,
@@ -2748,6 +2772,7 @@ pub const DataServer = struct {
     provisioned_index_repair_fallback_rotation_estimate_ms: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_fallback_rotation_slo_exceeded: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_disk_waits: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_cooperative_deferrals: std.atomic.Value(u64) = .init(0),
     // Round-robin position for the bounded lost-wakeup fallback scan.
     provisioned_index_repair_scan_cursor: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_queue_mutex: std.atomic.Mutex = .unlocked,
@@ -6833,6 +6858,28 @@ pub const DataServer = struct {
             platform_clock.Clock.real().nowRealtimeMs(),
             now_ms,
         );
+
+        // The overwhelmingly common path is retaining an exact durable wake
+        // that is already in the linked queue. Keep that path allocation-free:
+        // apart from being cheaper for every cooperative slice, it cannot lose
+        // exact scheduling merely because the allocator is under pressure.
+        lockAtomic(&self.provisioned_index_repair_queue_mutex);
+        if (self.provisioned_index_repair_group_ages.getPtr(group_id)) |entry| {
+            if (entry.table_name != null or table_name == null) {
+                entry.transient_failure_count = 0;
+                entry.next_retry_at_ms = next_retry_at_ms;
+                self.refreshProvisionedIndexRepairQueueMetricsLocked(now_ms);
+                self.provisioned_index_repair_dirty.store(true, .release);
+                self.provisioned_index_repair_queue_mutex.unlock();
+                return;
+            }
+        }
+        self.provisioned_index_repair_queue_mutex.unlock();
+
+        // Allocate before getOrPut so an allocation failure cannot leave a new
+        // hash-map slot with an uninitialized queue entry. Another enqueuer may
+        // win the race while the lock is released; the second lookup below
+        // safely reuses or enriches that entry.
         var owned_table_name = if (table_name) |name| try self.alloc.dupe(u8, name) else null;
         defer if (owned_table_name) |name| self.alloc.free(name);
         lockAtomic(&self.provisioned_index_repair_queue_mutex);
@@ -7587,7 +7634,6 @@ pub const DataServer = struct {
                 break;
             }
             const group_id = candidate.group_id;
-            if (!candidate.queued) fallback_advance_count = @max(fallback_advance_count, candidate.cursor_distance + 1);
             const table_name = candidate.table_name;
 
             var ownership_fence = IndexRepairOwnershipFence{
@@ -7601,6 +7647,9 @@ pub const DataServer = struct {
                 .server = self,
                 .group_id = group_id,
             };
+            var yield_fence = IndexRepairYieldFence{
+                .deadline_ns = started_ns +| provisioned_index_repair_build_slice_ns,
+            };
             ownership_fence.owner_epoch = ownership_fence.currentOwnerEpoch();
             groups_inspected +|= 1;
             const result = self.liveRuntimeWriteSource().catchUpTableGroupBestEffortWithMetadata(self.alloc, group_id, table_name, .{
@@ -7609,6 +7658,10 @@ pub const DataServer = struct {
                     .cancel_check = .{
                         .ptr = &cancellation_fence,
                         .is_requested = IndexRepairCancellationFence.requested,
+                    },
+                    .yield_check = .{
+                        .ptr = &yield_fence,
+                        .is_requested = IndexRepairYieldFence.requested,
                     },
                     // The DB measures the selected index generation. Group disk
                     // bytes above are only a fair-scheduling proxy.
@@ -7645,9 +7698,34 @@ pub const DataServer = struct {
                 _ = self.provisioned_index_repair_disk_waits.fetchAdd(1, .monotonic);
             }
             if (result.index_repair_pending) {
-                self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, result.index_repair_retry_at_ms) catch {};
+                self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, result.index_repair_retry_at_ms) catch |err| {
+                    _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
+                    self.recordProvisionedIndexRepairSchedulerFailure(now_ms);
+                    if (!candidate.queued) {
+                        self.provisioned_index_repair_last_fallback_at_ms.store(
+                            indexRepairFallbackRetryAnchor(now_ms, self.provisioned_index_repair_discovery_interval_ms),
+                            .monotonic,
+                        );
+                    }
+                    std.log.warn(
+                        "provisioned index repair pending group could not be requeued group={} table={s} err={s}",
+                        .{ group_id, table_name, @errorName(err) },
+                    );
+                    // In particular, do not publish fallback cursor progress.
+                    // The durable intent remains authoritative and this same
+                    // route must be reconsidered after scheduler backoff.
+                    return;
+                };
             } else {
                 self.removeProvisionedIndexRepair(group_id);
+            }
+            // A fallback route is consumed only after its durable outcome was
+            // completed or its exact group was successfully retained in the
+            // O(1) queue. Advancing earlier can turn allocation pressure into a
+            // full lost-wakeup rotation.
+            if (!candidate.queued) fallback_advance_count = @max(fallback_advance_count, candidate.cursor_distance + 1);
+            if (result.busy) {
+                _ = self.provisioned_index_repair_cooperative_deferrals.fetchAdd(1, .monotonic);
             }
             if (result.index_repair_attempted) {
                 attempted = true;
@@ -16542,6 +16620,43 @@ test "data runtime repair failures preserve durable backoff and increase retry d
     try server.enqueueProvisionedIndexRepairForTable("docs", 7001);
     try std.testing.expectEqual(@as(u64, 0), entry.next_retry_at_ms);
     try std.testing.expectEqual(@as(u32, 0), entry.transient_failure_count);
+    server.removeProvisionedIndexRepair(7001);
+}
+
+test "data runtime exact repair requeue is allocation-free and failed new enqueue is atomic" {
+    const alloc = std.testing.allocator;
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = undefined,
+        .read_source = undefined,
+        .write_source = undefined,
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.provisioned_index_repair_group_ages.deinit(alloc);
+
+    try server.enqueueProvisionedIndexRepairForTable("docs", 7001);
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    failing.fail_index = failing.alloc_index;
+    server.alloc = failing.allocator();
+
+    // Retaining an existing exact wake must not allocate, even when its durable
+    // retry deadline changes after a cooperative repair slice.
+    try server.enqueueProvisionedIndexRepairWithRetryForTable("docs", 7001, 1234);
+    try std.testing.expect(server.provisioned_index_repair_group_ages.contains(7001));
+
+    // A fallback-discovered group does require queue storage. Failure must be
+    // explicit and must not leave an uninitialized entry that could later be
+    // mistaken for retained exact debt.
+    try std.testing.expectError(
+        error.OutOfMemory,
+        server.enqueueProvisionedIndexRepairWithRetryForTable("docs", 7002, 0),
+    );
+    try std.testing.expect(!server.provisioned_index_repair_group_ages.contains(7002));
+
+    server.alloc = alloc;
     server.removeProvisionedIndexRepair(7001);
 }
 

@@ -2023,6 +2023,19 @@ pub const RepairCancelCheck = struct {
     }
 };
 
+/// Cooperative scheduler preemption checked only at durable reconstruction
+/// boundaries. Unlike cancellation, yielding is a successful partial pass: the
+/// candidate remains reopenable and its scan cursor is persisted before the
+/// BackendRuntime owner releases the node repair slot.
+pub const RepairYieldCheck = struct {
+    ptr: *anyopaque,
+    is_requested: *const fn (ptr: *anyopaque) bool,
+
+    pub fn requested(self: @This()) bool {
+        return self.is_requested(self.ptr);
+    }
+};
+
 pub const RepairActivationCheck = struct {
     ptr: *anyopaque,
     is_current_owner: *const fn (ptr: *anyopaque) anyerror!bool,
@@ -2065,6 +2078,10 @@ pub const RepairCapacityCheck = struct {
 
 pub const ArtifactRepairRunOptions = struct {
     cancel_check: ?RepairCancelCheck = null,
+    /// Internal BackendRuntime scheduling policy. This is deliberately not an
+    /// API/index setting and is observed only after a bounded candidate batch
+    /// can be made durable and restart-reopenable.
+    yield_check: ?RepairYieldCheck = null,
     /// Revalidated immediately before a replacement pointer is activated.
     /// Long-running reconstruction may outlive leadership or placement.
     activation_check: ?RepairActivationCheck = null,
