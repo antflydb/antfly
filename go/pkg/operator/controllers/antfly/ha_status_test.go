@@ -3864,7 +3864,11 @@ func TestReconcileHAFormerPrimaryIsolationStopsOldWriterBeforeCandidateFence(t *
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
 	lease := haFenceLease(cluster, now, haFencingLeaseDefaultDurationSeconds, 1, "standby-a")
-	reconciler := testHAReconciler(t, cluster, sts, pod, lease)
+	// The cached client deliberately omits the still-running Pod. The uncached
+	// boundary reader sees it and must prevent a false isolation receipt.
+	reconciler := testHAReconciler(t, cluster, sts, lease)
+	boundary := testHAReconciler(t, sts.DeepCopy(), pod, lease.DeepCopy())
+	reconciler.BoundaryReader = boundary.Client
 	reconciler.Now = func() time.Time { return now }
 
 	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); !errors.Is(err, errHAStatusCheckpointed) {

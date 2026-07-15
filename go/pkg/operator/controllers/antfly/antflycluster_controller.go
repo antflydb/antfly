@@ -55,6 +55,9 @@ import (
 // AntflyClusterReconciler reconciles an AntflyCluster object
 type AntflyClusterReconciler struct {
 	client.Client
+	// BoundaryReader bypasses the controller cache for fencing decisions whose
+	// correctness depends on a current Lease/workload/Pod snapshot.
+	BoundaryReader        client.Reader
 	Scheme                *runtime.Scheme
 	AutoScaler            *AutoScaler
 	KubeClient            kubernetes.Interface

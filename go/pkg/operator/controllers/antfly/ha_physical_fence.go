@@ -35,7 +35,8 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 			return err
 		}
 		lease := &coordinationv1.Lease{}
-		if err := r.Get(ctx, types.NamespacedName{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease); err != nil {
+		reader := r.haBoundaryReader()
+		if err := reader.Get(ctx, types.NamespacedName{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease); err != nil {
 			return fmt.Errorf("isolate former primary: read fencing Lease: %w", err)
 		}
 		if generation := haLeaseFenceGeneration(lease); generation != action.FenceGeneration {
@@ -55,7 +56,7 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 
 		statefulSet := &appsv1.StatefulSet{}
 		key := types.NamespacedName{Name: cluster.Name + "-standalone", Namespace: cluster.Namespace}
-		if err := r.Get(ctx, key, statefulSet); err != nil {
+		if err := reader.Get(ctx, key, statefulSet); err != nil {
 			return fmt.Errorf("isolate former primary: read StatefulSet: %w", err)
 		}
 		owner := metav1.GetControllerOf(statefulSet)
@@ -93,7 +94,7 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 		}
 
 		var pods corev1.PodList
-		if err := r.List(ctx, &pods, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, "standalone"))); err != nil {
+		if err := reader.List(ctx, &pods, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, "standalone"))); err != nil {
 			return fmt.Errorf("isolate former primary: list runtime pods: %w", err)
 		}
 		for j := range pods.Items {
@@ -105,7 +106,8 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 				return nil
 			}
 		}
-		if statefulSet.Status.Replicas != 0 || statefulSet.Status.CurrentReplicas != 0 || statefulSet.Status.ReadyReplicas != 0 {
+		if (statefulSet.Generation > 0 && statefulSet.Status.ObservedGeneration < statefulSet.Generation) ||
+			statefulSet.Status.Replicas != 0 || statefulSet.Status.CurrentReplicas != 0 || statefulSet.Status.ReadyReplicas != 0 {
 			return nil
 		}
 		if action.LastAttemptAt == nil {
@@ -136,6 +138,13 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 		return nil
 	}
 	return nil
+}
+
+func (r *AntflyClusterReconciler) haBoundaryReader() client.Reader {
+	if r != nil && r.BoundaryReader != nil {
+		return r.BoundaryReader
+	}
+	return r.Client
 }
 
 func validateHAFormerPrimaryIsolationAction(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus) error {

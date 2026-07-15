@@ -115,6 +115,7 @@ func main() {
 
 	if err = (&controllers.AntflyClusterReconciler{
 		Client:                mgr.GetClient(),
+		BoundaryReader:        mgr.GetAPIReader(),
 		Scheme:                mgr.GetScheme(),
 		AutoScaler:            autoScaler,
 		KubeClient:            k8sClient,
