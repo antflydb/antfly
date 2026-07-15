@@ -18751,6 +18751,36 @@ test "data server pulls and applies HA standby replication through internal HTTP
         fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
     };
 
+    const AuthenticatedExecutor = struct {
+        upstream: antfly.common.http.RequestExecutor,
+        accepted: usize = 0,
+        rejected: usize = 0,
+
+        fn executor(self: *@This()) antfly.common.http.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(
+            ptr: *anyopaque,
+            response_alloc: std.mem.Allocator,
+            request: antfly.common.http.HttpRequest,
+        ) !antfly.common.http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.authorization == null or
+                !std.mem.eql(u8, request.authorization.?, "Bearer runtime-secret-token"))
+            {
+                self.rejected += 1;
+                return .{
+                    .status = 401,
+                    .content_type = try response_alloc.dupe(u8, "text/plain"),
+                    .body = try response_alloc.dupe(u8, "unauthorized"),
+                };
+            }
+            self.accepted += 1;
+            return try self.upstream.execute(response_alloc, request);
+        }
+    };
+
     const nonce = platform_time.monotonicNs();
     const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-root-{d}", .{nonce});
     defer alloc.free(replica_root_raw);
@@ -18805,6 +18835,7 @@ test "data server pulls and applies HA standby replication through internal HTTP
     defer standby.close();
 
     var primary_internal = antfly.ha.http_internal.Server.init(alloc, &primary);
+    var authenticated_executor = AuthenticatedExecutor{ .upstream = primary_internal.executor() };
     var server = DataServer.initFromLocalMetadataSources(alloc, .{
         .replica_root_dir = replica_root,
         .ha = .{
@@ -18812,12 +18843,13 @@ test "data server pulls and applies HA standby replication through internal HTTP
                 .standby = &standby,
                 .standby_node_id = "standby-a",
             },
+            .admin_bearer_token = "runtime-secret-token",
             .standby_replication = .{
                 .upstream_base_uri = "http://primary.internal.test",
                 .slot_name = "standby-a",
                 .options = .{ .max_records = 1 },
                 .catch_up_until_end_of_wal = true,
-                .executor = primary_internal.executor(),
+                .executor = authenticated_executor.executor(),
             },
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
@@ -18828,6 +18860,8 @@ test "data server pulls and applies HA standby replication through internal HTTP
     const progress = standby.currentProgress();
     try std.testing.expectEqual(@as(u64, 1), progress.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), progress.applied_lsn);
+    try std.testing.expect(authenticated_executor.accepted >= 3);
+    try std.testing.expectEqual(@as(usize, 0), authenticated_executor.rejected);
     try std.testing.expect(server.ha_standby_replication_last_attempt_ns.load(.acquire) > 0);
     try std.testing.expect(server.ha_standby_replication_last_success_ns.load(.acquire) > 0);
 
