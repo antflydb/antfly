@@ -10835,7 +10835,7 @@ test "data runtime live writer source follows raft apply ownership" {
 
         fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
             return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .status = .{ .metadata_group_id = 1, .metadata_epoch = 7, .metrics = .{} },
                 .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
                 .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
                 .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
@@ -17053,9 +17053,12 @@ test "data server wires configured HA executors into API server" {
                 }})[0..]),
                 .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
                     .group_id = 1,
+                    .range_id = 1,
                     .table_id = 20,
                     .start_key = "",
                     .end_key = null,
+                    .doc_identity_shard_id = 10,
+                    .doc_identity_range_id = 1,
                 }})[0..]),
                 .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
@@ -17281,27 +17284,26 @@ test "data server wires configured HA executors into API server" {
     defer alloc.free(captured_topology_path);
     const captured_topology_json = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), captured_topology_path, alloc, .limited(1024 * 1024));
     defer alloc.free(captured_topology_json);
-    const TestTopologyReplica = struct {
-        group_id: u64,
-        table_id: u64,
-        table_name: []const u8,
-        snapshot_path: []const u8,
-        logical_sha256: []const u8,
-    };
-    const TestTopology = struct {
-        format_version: u16,
-        generation: []const u8,
-        replicas: []const TestTopologyReplica,
-    };
-    var captured_topology = try std.json.parseFromSlice(TestTopology, alloc, captured_topology_json, .{ .ignore_unknown_fields = false });
+    var captured_topology = try std.json.parseFromSlice(
+        antfly.ha.seed_materialization.Topology,
+        alloc,
+        captured_topology_json,
+        .{ .ignore_unknown_fields = false },
+    );
     defer captured_topology.deinit();
-    try std.testing.expectEqual(@as(u16, 1), captured_topology.value.format_version);
+    try std.testing.expectEqual(antfly.ha.seed_materialization.topology_format_version, captured_topology.value.format_version);
     try std.testing.expectEqualStrings("seed-standby-capture-3", captured_topology.value.generation);
+    try std.testing.expectEqual(@as(u64, 7), captured_topology.value.catalog.epoch);
+    try std.testing.expectEqual(@as(usize, 1), captured_topology.value.catalog.tables.len);
+    try std.testing.expectEqual(@as(usize, 1), captured_topology.value.catalog.ranges.len);
     try std.testing.expectEqual(@as(usize, 1), captured_topology.value.replicas.len);
     const captured_replica = captured_topology.value.replicas[0];
     try std.testing.expectEqual(@as(u64, 1), captured_replica.group_id);
     try std.testing.expectEqual(@as(u64, 20), captured_replica.table_id);
     try std.testing.expectEqualStrings("docs", captured_replica.table_name);
+    try std.testing.expectEqual(@as(u64, 20), captured_replica.identity_table_id);
+    try std.testing.expectEqual(@as(u64, 10), captured_replica.identity_shard_id);
+    try std.testing.expectEqual(@as(u64, 1), captured_replica.identity_range_id);
 
     const captured_snapshot_root = try std.fs.path.join(alloc, &.{
         seed_capture_root,
@@ -17395,6 +17397,24 @@ test "data server wires configured HA executors into API server" {
     const default_captured_slot = primary.slot("standby-default-provider") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(antfly.ha.slot_store.SlotLifecycle.seeding, default_captured_slot.lifecycle);
     try std.testing.expect(!default_captured_slot.reseed_required);
+
+    // Auth state has no portable snapshot/restore contract yet. A production
+    // seed must reject capture before backup_start instead of silently
+    // materializing a standby with a different authorization database.
+    server.api_server_cfg.auth_enabled = true;
+    if (DataServer.captureHASeedCallback(
+        &server,
+        alloc,
+        "standby-auth-enabled",
+        "seed-standby-auth-enabled-5",
+        capture_binding,
+    )) |unexpected_value| {
+        var unexpected = unexpected_value;
+        unexpected.deinit(alloc);
+        return error.TestExpectedError;
+    } else |err| try std.testing.expectEqual(error.HASeedCaptureAuthUnsupported, err);
+    try std.testing.expect(primary.slot("standby-auth-enabled") == null);
+    server.api_server_cfg.auth_enabled = false;
 
     // Contract: maintenance, bulk/structural activity, or an unsupported
     // snapshot provider must fail closed before backup_start burns a slot.
