@@ -722,6 +722,21 @@ def _assert_admin_requires_bearer(node: HAStandaloneNode, path: str) -> None:
     assert wrong.status_code == 401
 
 
+def _assert_internal_replication_requires_bearer(node: HAStandaloneNode) -> None:
+    url = f"{node.url}/internal/v1/ha/replication/identify"
+    missing = requests.get(url, timeout=10)
+    assert missing.status_code == 401
+    wrong = requests.get(
+        url,
+        headers={"Authorization": "Bearer wrong-token"},
+        timeout=10,
+    )
+    assert wrong.status_code == 401
+    authorized = requests.get(url, headers=node.admin_headers(), timeout=10)
+    assert authorized.status_code == 200
+    assert authorized.json()["identity"]["cluster_id"] == node.cluster_id
+
+
 def _sync_policy(mode: str, *, failure_policy: str = "block", standby_name: str = "standby-a") -> dict[str, Any]:
     return {
         "mode": mode,
@@ -750,6 +765,7 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     ha_cluster.configure_table_identity(shard_id=shard_id, table_id=table_id)
     ha_cluster.primary.start()
     _assert_admin_requires_bearer(ha_cluster.primary, "/primary/status")
+    _assert_internal_replication_requires_bearer(ha_cluster.primary)
 
     seed = ha_cluster.seed_standby_catalog_from_primary()
     assert seed["backup_lsn"] >= 1
@@ -776,6 +792,7 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     assert seeding_slot["active"] is False
     blocked_stream = requests.post(
         f"{ha_cluster.primary.url}/internal/v1/ha/replication/start",
+        headers=ha_cluster.primary.admin_headers(),
         json={
             "slot_name": "standby-a",
             "from_lsn": seed["backup_lsn"] + 1,

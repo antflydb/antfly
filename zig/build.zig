@@ -4020,7 +4020,7 @@ pub fn build(b: *std.Build) void {
             "api http server returns retryable not leader through public table adapter mutation",
             "api http server returns retryable not leader through public cluster adapter mutation",
             "api http server dispatches HA admin and internal executors",
-            "api http server protects HA admin routes while exempting HA internal routes",
+            "api http server requires exact HA bearer token for internal replication routes",
             "api http server forbids non-admin secret access when auth is enabled",
             "api http server query builder requires table read permission when auth is enabled",
             "api http server restricts runtime schema debug to admins when auth is enabled",

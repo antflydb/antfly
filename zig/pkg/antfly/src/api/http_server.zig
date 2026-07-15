@@ -2554,6 +2554,16 @@ pub const ApiHttpServer = struct {
             return try ha_exec.execute(self.alloc, req);
         }
         if (isHaInternalPath(uri_parts.path)) {
+            const expected = self.cfg.admin_bearer_token orelse
+                return try textResponse(self.alloc, 403, "HA internal API disabled without authentication");
+            if (expected.len == 0)
+                return try textResponse(self.alloc, 403, "HA internal API disabled without authentication");
+            const authorization = req.authorization orelse return try unauthorizedResponse(self.alloc);
+            if (!std.mem.startsWith(u8, authorization, "Bearer ") or
+                !constantTimeEql(expected, authorization["Bearer ".len..]))
+            {
+                return try unauthorizedResponse(self.alloc);
+            }
             const ha_exec = self.cfg.ha_internal_executor orelse return null;
             return try ha_exec.execute(self.alloc, req);
         }
@@ -16565,6 +16575,7 @@ test "api http server dispatches HA admin and internal executors" {
     var admin_exec = RecordingExecutor{ .alloc = alloc, .body = "{\"handler\":\"ha-admin\"}" };
     var internal_exec = RecordingExecutor{ .alloc = alloc, .body = "{\"handler\":\"ha-internal\"}" };
     var server = ApiHttpServer.init(alloc, .{
+        .admin_bearer_token = "ha-internal-secret",
         .ha_admin_executor = admin_exec.executor(),
         .ha_internal_executor = internal_exec.executor(),
     }, source.iface(), null, null);
@@ -16583,6 +16594,7 @@ test "api http server dispatches HA admin and internal executors" {
     var internal_resp = try server.handle(.{
         .method = .POST,
         .uri = internal_api_routes.ha_replication_status,
+        .authorization = "Bearer ha-internal-secret",
         .body = "{\"slot_name\":\"standby-a\"}",
     });
     defer internal_resp.deinit(alloc);
@@ -16599,7 +16611,7 @@ test "api http server dispatches HA admin and internal executors" {
     try std.testing.expectEqual(@as(usize, 2), admin_exec.calls);
 }
 
-test "api http server protects HA admin routes while exempting HA internal routes" {
+test "api http server requires exact HA bearer token for internal replication routes" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
         fn iface(self: *@This()) StatusSource {
@@ -16661,6 +16673,7 @@ test "api http server protects HA admin routes while exempting HA internal route
     var server = ApiHttpServer.init(alloc, .{
         .auth_enabled = true,
         .user_manager = &auth.manager,
+        .admin_bearer_token = "ha-internal-secret",
         .ha_admin_executor = admin_exec.executor(),
         .ha_internal_executor = internal_exec.executor(),
     }, source.iface(), null, null);
@@ -16692,12 +16705,60 @@ test "api http server protects HA admin routes while exempting HA internal route
     try std.testing.expectEqual(@as(u16, 200), authorized.status);
     try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
 
+    const internal_routes = [_][]const u8{
+        internal_api_routes.ha_replication_identify,
+        internal_api_routes.ha_replication_slots,
+        internal_api_routes.ha_replication_start,
+        internal_api_routes.ha_replication_status,
+    };
+    for (internal_routes) |path| {
+        var internal_missing = try server.handle(.{ .method = .GET, .uri = path });
+        defer internal_missing.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 401), internal_missing.status);
+        try std.testing.expectEqual(@as(usize, 0), internal_exec.calls);
+
+        var internal_wrong = try server.handle(.{
+            .method = .GET,
+            .uri = path,
+            .authorization = "Bearer wrong-token",
+        });
+        defer internal_wrong.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 401), internal_wrong.status);
+        try std.testing.expectEqual(@as(usize, 0), internal_exec.calls);
+    }
+
     var internal = try server.handle(.{
         .method = .GET,
         .uri = internal_api_routes.ha_replication_identify,
+        .authorization = "Bearer ha-internal-secret",
     });
     defer internal.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), internal.status);
+    try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
+
+    var disabled_server = ApiHttpServer.init(alloc, .{
+        .ha_internal_executor = internal_exec.executor(),
+    }, source.iface(), null, null);
+    var disabled = try disabled_server.handle(.{
+        .method = .GET,
+        .uri = internal_api_routes.ha_replication_identify,
+        .authorization = "Bearer ha-internal-secret",
+    });
+    defer disabled.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), disabled.status);
+    try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
+
+    var empty_token_server = ApiHttpServer.init(alloc, .{
+        .admin_bearer_token = "",
+        .ha_internal_executor = internal_exec.executor(),
+    }, source.iface(), null, null);
+    var empty_token = try empty_token_server.handle(.{
+        .method = .GET,
+        .uri = internal_api_routes.ha_replication_identify,
+        .authorization = "Bearer ",
+    });
+    defer empty_token.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), empty_token.status);
     try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
 }
 
