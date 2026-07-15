@@ -503,7 +503,13 @@ fn hasCmykComponentIds(info: Info) bool {
 
 fn colorEncodingForStructure(structure: Structure) ?ColorEncoding {
     return switch (structure.info.component_count) {
-        3 => if (structure.info.components[0].id == 1 and structure.info.components[1].id == 2 and structure.info.components[2].id == 3)
+        3 => if (structure.adobe_transform) |transform|
+            switch (transform) {
+                0 => .rgb,
+                1 => .ycbcr,
+                else => null,
+            }
+        else if (structure.info.components[0].id == 1 and structure.info.components[1].id == 2 and structure.info.components[2].id == 3)
             .ycbcr
         else if (structure.info.components[0].id == 'R' and structure.info.components[1].id == 'G' and structure.info.components[2].id == 'B')
             .rgb
@@ -8009,4 +8015,25 @@ test "grayscale baseline fixture first block decodes from scan entropy" {
 
     try std.testing.expect(block.coefficients[0] != 0);
     try std.testing.expectEqual(block.coefficients[0], block.dc_predictor);
+}
+
+test "adobe transform classifies zero-based three-component color ids" {
+    const alloc = std.testing.allocator;
+    const manifest = try test_support.loadManifest(alloc, std.testing.io);
+    defer test_support.freeManifest(alloc, manifest);
+    const fixture = test_support.findFixture(manifest, "jpeg/baseline/white-2x1.jpg") orelse return error.MissingImageFixture;
+    const fixture_bytes = try test_support.readFixtureAlloc(alloc, std.testing.io, fixture.path);
+    defer alloc.free(fixture_bytes);
+
+    var structure = try parseStructure(fixture_bytes);
+    structure.info.components[0].id = 0;
+    structure.info.components[1].id = 1;
+    structure.info.components[2].id = 2;
+    structure.adobe_transform = 1;
+    try std.testing.expectEqual(ColorEncoding.ycbcr, colorEncodingForStructure(structure).?);
+    try std.testing.expect(canPureZigDecodeColorBaseline(structure));
+
+    structure.adobe_transform = 0;
+    try std.testing.expectEqual(ColorEncoding.rgb, colorEncodingForStructure(structure).?);
+    try std.testing.expect(canPureZigDecodeColorBaseline(structure));
 }
