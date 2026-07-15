@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -377,6 +378,36 @@ class HACluster:
             "manifest_path": manifest_path,
         }
 
+    def activate_seeded_slot(
+        self,
+        seed: dict[str, Any],
+        bootstrapped: dict[str, Any],
+    ) -> dict[str, Any]:
+        generation = f"seed-{self.standby.node_id}-{seed['backup_lsn']}"
+        seed_receipt_sha256 = _canonical_json_sha256(bootstrapped)
+        capture_receipt_sha256 = _canonical_json_sha256(seed["finished"])
+        manifest_sha256 = hashlib.sha256(seed["manifest_path"].read_bytes()).hexdigest()
+        aggregate_sha256 = hashlib.sha256(
+            b"antfly-ha-seed-activation-v1\0"
+            + bytes.fromhex(seed_receipt_sha256)
+            + bytes.fromhex(capture_receipt_sha256)
+            + bytes.fromhex(manifest_sha256)
+        ).hexdigest()
+        return self.primary.admin_post(
+            "/base-backups/activate",
+            {
+                "slot_name": self.standby.node_id,
+                "generation": generation,
+                "manifest_id": seed["manifest_id"],
+                "timeline_id": self.primary.timeline_id,
+                "checkpoint_lsn": seed["backup_lsn"],
+                "seed_receipt_sha256": seed_receipt_sha256,
+                "capture_receipt_sha256": capture_receipt_sha256,
+                "manifest_sha256": manifest_sha256,
+                "aggregate_sha256": aggregate_sha256,
+            },
+        )
+
     def close(self) -> None:
         self.standby.close()
         self.primary.close()
@@ -533,6 +564,11 @@ def _identity(cluster: HACluster) -> dict[str, int]:
         "timeline_id": cluster.primary.timeline_id,
         "epoch": cluster.primary.epoch,
     }
+
+
+def _canonical_json_sha256(value: dict[str, Any]) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _encode_ha_backup_manifest(
@@ -696,6 +732,46 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
         target=seed["manifest_id"],
         state="applied",
         node_id="standby-a",
+    )
+
+    seeding_slot = _slot_by_name(ha_cluster.primary.admin_get("/primary/status"), "standby-a")
+    assert seeding_slot["active"] is False
+    blocked_stream = requests.post(
+        f"{ha_cluster.primary.url}/internal/v1/ha/replication/start",
+        json={
+            "slot_name": "standby-a",
+            "from_lsn": seed["backup_lsn"] + 1,
+            "max_records": 1,
+            "max_encoded_bytes": 1024 * 1024,
+        },
+        timeout=10,
+    )
+    assert blocked_stream.status_code == 409
+    assert blocked_stream.text == "SlotSeeding"
+
+    activated = ha_cluster.activate_seeded_slot(seed, bootstrapped)
+    generation = f"seed-standby-a-{seed['backup_lsn']}"
+    _assert_action_receipt(
+        activated,
+        action_id=f"seeded_slot_activate:{generation}",
+        action_kind="seeded_slot_activate",
+        target=generation,
+        state="applied",
+        node_id="primary-a",
+    )
+    assert activated["slot_name"] == "standby-a"
+    assert int(activated["checkpoint_lsn"]) == seed["backup_lsn"]
+    activated_slot = _slot_by_name(ha_cluster.primary.admin_get("/primary/status"), "standby-a")
+    assert activated_slot["active"] is True
+
+    activated_retry = ha_cluster.activate_seeded_slot(seed, bootstrapped)
+    _assert_action_receipt(
+        activated_retry,
+        action_id=f"seeded_slot_activate:{generation}",
+        action_kind="seeded_slot_activate",
+        target=generation,
+        state="already_applied",
+        node_id="primary-a",
     )
 
     ha_cluster.standby.restart()
