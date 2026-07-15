@@ -736,14 +736,27 @@ fn isReal(s: []const u8) bool {
     if (slice.len > 0 and (slice[0] == '+' or slice[0] == '-')) slice = slice[1..];
     if (slice.len == 0) return false;
     var dots: usize = 0;
+    var digits: usize = 0;
     for (slice) |c| {
         if (c == '.') {
             dots += 1;
             continue;
         }
         if (!std.ascii.isDigit(c)) return false;
+        digits += 1;
     }
-    return dots == 1;
+    return dots == 1 and digits > 0;
+}
+
+test "scanner treats a bare decimal point as a keyword" {
+    const alloc = std.testing.allocator;
+    var scanner = Scanner.init(alloc, ".");
+    defer scanner.deinit();
+
+    var token = try scanner.readToken();
+    defer token.deinit(alloc);
+    try std.testing.expect(token == .keyword);
+    try std.testing.expectEqualStrings(".", token.keyword);
 }
 
 test "scanner returns unterminated literal string prefix" {

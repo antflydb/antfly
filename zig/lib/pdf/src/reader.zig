@@ -4995,16 +4995,31 @@ fn applyPredictorAlloc(alloc: Allocator, decoded: []const u8, param: ?*const syn
     const predictor_obj = param.?.get("Predictor") orelse return try alloc.dupe(u8, decoded);
     const predictor = predictor_obj.asInteger() orelse return try alloc.dupe(u8, decoded);
     if (predictor <= 1) return try alloc.dupe(u8, decoded);
-    if (predictor < 10 or predictor > 15) return error.UnsupportedPredictor;
 
     const columns_i = if (param.?.get("Columns")) |obj| obj.asInteger() orelse 1 else 1;
     const colors_i = if (param.?.get("Colors")) |obj| obj.asInteger() orelse 1 else 1;
     const bits_i = if (param.?.get("BitsPerComponent")) |obj| obj.asInteger() orelse 8 else 8;
     if (columns_i <= 0 or colors_i <= 0 or bits_i <= 0) return error.UnsupportedPredictor;
-    if (@mod(bits_i, 8) != 0) return error.UnsupportedPredictor;
 
     const bytes_per_pixel: usize = @intCast(@divTrunc(colors_i * bits_i + 7, 8));
     const row_len: usize = @intCast(@divTrunc(columns_i * colors_i * bits_i + 7, 8));
+
+    if (predictor == 2) {
+        // TIFF Predictor 2 stores each sample as its difference from the
+        // corresponding sample in the preceding pixel. PDF image streams in
+        // the wild commonly use this with 8-bit RGB and grayscale data.
+        if (bits_i != 8 or row_len == 0 or decoded.len % row_len != 0) return error.UnsupportedPredictor;
+        const out = try alloc.dupe(u8, decoded);
+        var row_start: usize = 0;
+        while (row_start < out.len) : (row_start += row_len) {
+            const row = out[row_start .. row_start + row_len];
+            for (row[bytes_per_pixel..], bytes_per_pixel..) |*byte, index| {
+                byte.* +%= row[index - bytes_per_pixel];
+            }
+        }
+        return out;
+    }
+    if (predictor < 10 or predictor > 15) return error.UnsupportedPredictor;
     if ((row_len + 1) == 0 or decoded.len % (row_len + 1) != 0) return error.MalformedPredictorData;
 
     var out = std.ArrayList(u8).empty;
@@ -9158,6 +9173,57 @@ test "reader applies png up predictor after flate decode" {
     const decoded = try reader.readDecodedStreamData(&stream);
     defer alloc.free(decoded);
     try std.testing.expectEqualStrings("hello", decoded);
+}
+
+test "reader applies TIFF horizontal predictor after flate decode" {
+    const alloc = std.testing.allocator;
+    // Two RGB pixels: (10, 20, 30), (15, 27, 39). Predictor 2 stores the
+    // second pixel as the per-channel delta (5, 7, 9).
+    const raw_predicted = &.{ 10, 20, 30, 5, 7, 9 };
+    var comp = std.ArrayList(u8).empty;
+    defer comp.deinit(alloc);
+    {
+        var hist: [std.compress.flate.max_window_len]u8 = undefined;
+        var out_buf: [256]u8 = undefined;
+        var out: std.Io.Writer = .fixed(&out_buf);
+        var zw = try std.compress.flate.Compress.init(&out, hist[0..], .zlib, .default);
+        try zw.writer.writeAll(raw_predicted);
+        try zw.finish();
+        try comp.appendSlice(alloc, out.buffered());
+    }
+
+    var prefix = std.ArrayList(u8).empty;
+    defer prefix.deinit(alloc);
+    try prefix.appendSlice(alloc, "%PDF-1.7\n");
+    const obj_offset = prefix.items.len;
+    const obj_head = try std.fmt.allocPrint(
+        alloc,
+        "1 0 obj\n<< /Length {d} /Filter /FlateDecode /DecodeParms << /Predictor 2 /Columns 2 /Colors 3 /BitsPerComponent 8 >> >>\nstream\n",
+        .{comp.items.len},
+    );
+    defer alloc.free(obj_head);
+    try prefix.appendSlice(alloc, obj_head);
+    try prefix.appendSlice(alloc, comp.items);
+    try prefix.appendSlice(alloc, "\nendstream\nendobj\n");
+    const xref_offset = prefix.items.len;
+    try prefix.appendSlice(alloc, "xref\n" ++
+        "0 2\n" ++
+        "0000000000 65535 f \n");
+    const line = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{obj_offset});
+    defer alloc.free(line);
+    try prefix.appendSlice(alloc, line);
+    try prefix.appendSlice(alloc, "trailer\n<< /Size 2 /Root 1 0 R >>\n");
+    const sample = try std.fmt.allocPrint(alloc, "{s}startxref\n{d}\n%%EOF\n", .{ prefix.items, xref_offset });
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+
+    var stream = try reader.readIndirectObject(.{ .id = 1, .gen = 0 });
+    defer stream.deinit(alloc);
+    const decoded = try reader.readDecodedStreamData(&stream);
+    defer alloc.free(decoded);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 20, 30, 15, 27, 39 }, decoded);
 }
 
 test "reader can decode lzw stream object" {
