@@ -855,6 +855,9 @@ test "index repair state persists intent and provisional replay pin atomically" 
     entry.intent.build_resume_key = try alloc.dupe(u8, "artifact-key:42");
     entry.intent.build_reprocessed = 42;
     entry.intent.failure_streak = 3;
+    entry.intent.trigger = .projection_generation_invalid;
+    entry.intent.operator_job_id = 77;
+    entry.intent.operator_job_created_at_ms = 1234;
     entry.intent.previous_pointer_captured = true;
     entry.intent.previous_active_relative_path = try alloc.dupe(
         u8,
@@ -878,6 +881,9 @@ test "index repair state persists intent and provisional replay pin atomically" 
     try std.testing.expectEqualStrings("artifact-key:42", reopened.entries.items[0].intent.build_resume_key.?);
     try std.testing.expectEqual(@as(u64, 42), reopened.entries.items[0].intent.build_reprocessed);
     try std.testing.expectEqual(@as(u32, 3), reopened.entries.items[0].intent.failure_streak);
+    try std.testing.expectEqual(Trigger.projection_generation_invalid, reopened.entries.items[0].intent.trigger);
+    try std.testing.expectEqual(@as(u64, 77), reopened.entries.items[0].intent.operator_job_id);
+    try std.testing.expectEqual(@as(u64, 1234), reopened.entries.items[0].intent.operator_job_created_at_ms);
     try std.testing.expect(reopened.entries.items[0].intent.previous_pointer_captured);
     try std.testing.expectEqualStrings(
         ".repair-shadow-77/indexes/dense_idx",

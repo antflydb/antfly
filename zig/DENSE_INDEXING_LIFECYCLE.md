@@ -76,10 +76,11 @@ Implemented in the current tree:
   a separately committed status snapshot is never substituted as a correctness
   target. Ordinary counter/index differences are ignored while derived replay
   is behind its source target. After replay convergence, a deficit may be filled
-  in place and a surplus schedules a shadow-generation rebuild while leaving the
-  published generation queryable but degraded. Configuration mismatch,
-  `repair_required`, and backend structural-validation failures schedule the same
-  efficient shadow rebuild but fail the affected index closed immediately.
+  in place. A surplus, missing authoritative counter, configuration mismatch,
+  `repair_required`, or allowlisted backend structural-validation failure
+  schedules a shadow-generation rebuild and fails the affected index closed.
+  Only an explicit operator rebuild of a proven healthy generation continues
+  serving during construction.
   Shadow activation rejects either deficit or surplus. Cardinality detects missing/additional
   entries but is not a cryptographic proof of key-set identity. Key-set
   correctness derives from constructing an empty shadow exclusively from the
@@ -1360,7 +1361,8 @@ This preserves the policy distinction:
 - `IncompleteBulkPublish` with valid source artifacts becomes scheduled repair
   debt
 - a transient open race is retried without reconstruction
-- unknown, corrupt, unsupported, or unreconstructible state remains fail-closed
+- unknown, non-allowlisted corruption, unsupported, or unreconstructible state
+  remains fail-closed for operator intervention
 
 ### Exclusion, fencing, and backoff
 
@@ -1430,11 +1432,10 @@ While rebuilding:
 - primary document reads and ordinary writes remain available, subject to the
   explicit hard-pressure contract below
 - unrelated indexes remain searchable
-- a structurally unsafe affected index returns a stable `index_rebuilding`
-  error mapped to the existing `IndexUnavailable` class. Operator-requested
-  rebuilds and coverage-only repairs keep a safe serving generation queryable
-  until the short activation/validation fence; coverage repairs remain visibly
-  degraded rather than being reported healthy
+- an affected index with missing or false correctness proof returns a stable
+  `index_rebuilding` error mapped to the existing `IndexUnavailable` class.
+  Only an operator-requested rebuild of a proven healthy generation remains
+  queryable until the short activation/validation fence
 - runnable or retryable startup status reports `artifact_rebuild`, not terminal
   degradation; a paused or terminal intent is reported distinctly
 - process and node readiness remain healthy unless primary storage itself is
@@ -1478,7 +1479,9 @@ Operator actions follow these rules:
 - an explicit repair request attaches to the existing intent instead of
   creating a competing rebuild. The newest `(created_at, job_id)` is attached
   atomically even when the existing intent was created by automatic coverage
-  repair, and intent completion records that job before deletion
+  repair, and intent completion records that job before deletion. A forced
+  request first performs the bounded current-generation classification, so it
+  cannot relabel missing coverage proof as a healthy operator rebuild
 - `cancel_current_attempt` stops candidate work at a safe boundary, preserves
   the quarantined root and replay pin, releases admitted resources, records
   retryable debt, and permits the automatic executor to try again later
@@ -1511,6 +1514,8 @@ Operator actions follow these rules:
   secondary index, validates each key against the authoritative primary job
   record, deletes orphan markers, reconstructs the unfinished-cancellation FIFO
   in creation order, and leaves retained terminal history lazily loaded.
+  Primary records are size-bounded and validated for job ID, phase, target,
+  status, limit, and bounded strings before they enter scheduler memory.
   Malformed marker keys or primary records fail attach visibly instead of
   silently dropping work
 - a transient cancellation pass failure preserves `cancel_requested`, cursor,
@@ -1550,8 +1555,10 @@ The minimum deterministic test matrix is:
    publication, replay-pin removal, and intent deletion. Each restart must
    deterministically finish the remaining transition without losing the new
    active root.
-7. Inject `UnsupportedVersion` and structural corruption; both must remain
-   terminally degraded and must not delete the root automatically.
+7. Inject `UnsupportedVersion`; it must remain terminally degraded and must not
+   delete the root automatically. Inject allowlisted `Corrupted`, `NotFound`,
+   and `FileNotFound` backend validation failures; they must fail closed and
+   reconstruct through a separate generation without mutating the poisoned root.
 8. Remove or corrupt required source artifacts; preflight must become terminal
    without creating or activating a candidate.
 9. Verify only the active local owner repairs a group, then transfer leadership
@@ -1858,7 +1865,8 @@ Acceptance:
 
 Acceptance:
 
-- the previous complete generation remains searchable until activation
+- a previous generation remains searchable until activation only when it is
+  still proven complete (for example, an explicit operator rebuild)
 - restart deterministically chooses the active complete generation
 - incomplete candidates never become active
 - retired generations are garbage-collected safely

@@ -820,11 +820,13 @@ pub const Store = struct {
     }
 
     fn storeEncodedLocked(self: *Store, job_id: u64, encoded: []const u8, next_job_id: ?u64) !void {
+        if (encoded.len > max_job_record_bytes) return error.InvalidRepairJobState;
         const owned = try self.alloc.dupe(u8, encoded);
         errdefer self.alloc.free(owned);
         var parsed = try std.json.parseFromSlice(JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         if (parsed.value.job_id != job_id) return error.InvalidRepairJobState;
+        try validateJobState(parsed.value);
         // Reserve the process-local cache slot before committing the durable
         // state. Once the store write succeeds, publishing the matching cache
         // value cannot fail and leave scheduler metadata out of sync.
@@ -891,10 +893,12 @@ pub const Store = struct {
                 else => return err,
             };
             defer self.alloc.free(primary);
+            if (primary.len > max_job_record_bytes) return error.InvalidRepairJobState;
             var parsed = std.json.parseFromSlice(JobState, self.alloc, primary, .{ .ignore_unknown_fields = true }) catch
                 return error.InvalidRepairJobState;
             defer parsed.deinit();
             if (parsed.value.job_id != marker_job_id) return error.InvalidRepairJobState;
+            try validateJobState(parsed.value);
             const now_ms = nowMillis();
             const was_running = std.mem.eql(u8, parsed.value.phase, phaseString(.running));
             const durable_cancel = requiresDurableCancel(parsed.value);
@@ -1029,6 +1033,41 @@ pub fn phaseString(phase: JobPhase) []const u8 {
     };
 }
 
+fn jobPhaseFromString(phase: []const u8) ?JobPhase {
+    inline for (std.meta.tags(JobPhase)) |candidate| {
+        if (std.mem.eql(u8, phase, phaseString(candidate))) return candidate;
+    }
+    return null;
+}
+
+fn validateJobState(state: JobState) !void {
+    if (state.job_id == 0 or state.table_name.len == 0 or
+        state.table_name.len > max_job_string_bytes or state.target.len > max_job_string_bytes or
+        state.repair_status.len > max_job_string_bytes or state.phase.len > max_job_string_bytes or
+        state.limit == 0)
+    {
+        return error.InvalidRepairJobState;
+    }
+    const phase = jobPhaseFromString(state.phase) orelse return error.InvalidRepairJobState;
+    if (std.meta.stringToEnum(db_mod.types.RepairTarget, state.target) == null) {
+        return error.InvalidRepairJobState;
+    }
+    if (!std.mem.eql(
+        u8,
+        state.repair_status,
+        repairStatusForPhase(phase, state.result.has_more, state.result.debt_remaining),
+    )) return error.InvalidRepairJobState;
+    if (state.index) |value| {
+        if (value.len == 0 or value.len > max_job_string_bytes) return error.InvalidRepairJobState;
+    }
+    if (state.cursor) |value| {
+        if (value.len > max_job_string_bytes) return error.InvalidRepairJobState;
+    }
+    if (state.last_error) |value| {
+        if (value.len > max_job_string_bytes) return error.InvalidRepairJobState;
+    }
+}
+
 pub fn isTerminalPhase(phase: []const u8) bool {
     return std.mem.eql(u8, phase, phaseString(.succeeded)) or
         std.mem.eql(u8, phase, phaseString(.failed)) or
@@ -1114,6 +1153,8 @@ const job_key_prefix = "__api_table_repair_jobs__:";
 const next_job_id_key = "__api_table_repair_jobs_meta__:next_job_id";
 const active_job_key_prefix = "__api_table_repair_jobs_active__:";
 const active_job_marker_value = "1";
+const max_job_record_bytes: usize = 1024 * 1024;
+const max_job_string_bytes: usize = 64 * 1024;
 const durable_cleanup_interval_ms: u64 = 60_000;
 const durable_cleanup_scan_limit: usize = 128;
 
@@ -1428,6 +1469,44 @@ test "named index repair cancellation restarts its durable traversal after job s
         defer alloc.free(terminal);
         try std.testing.expectEqual(@as(usize, 2), store.jobs.count());
     }
+}
+
+test "table repair job recovery rejects corrupt authoritative primary state" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repair-job-corrupt-primary", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    {
+        const opened = try alloc.create(OpenedStore);
+        errdefer alloc.destroy(opened);
+        opened.* = try OpenedStore.open(alloc, path);
+        var store = Store.init(alloc, .{});
+        defer store.deinit();
+        try store.attachOpenedStore(opened);
+        const started = try store.startJob(alloc, "docs", .{ .target = "artifact" });
+        defer alloc.free(started);
+        var parsed = try std.json.parseFromSlice(JobState, alloc, started, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const primary_key = try jobKey(alloc, parsed.value.job_id);
+        defer alloc.free(primary_key);
+        try opened.docstore.put(primary_key, "{\"job_id\":1,\"phase\":\"unknown\"}");
+    }
+
+    const opened = try alloc.create(OpenedStore);
+    opened.* = try OpenedStore.open(alloc, path);
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+    try std.testing.expectError(error.InvalidRepairJobState, store.attachOpenedStore(opened));
+    try std.testing.expectEqual(@as(usize, 0), store.jobs.count());
+    opened.deinit();
+    alloc.destroy(opened);
+}
+
+test "active repair job keys reject malformed secondary entries" {
+    try std.testing.expectError(error.InvalidRepairJobState, activeJobIdFromKey(active_job_key_prefix));
+    try std.testing.expectError(error.InvalidRepairJobState, activeJobIdFromKey(active_job_key_prefix ++ "short"));
 }
 
 test "table repair job store persists monotonic next id across stale durable writes" {
