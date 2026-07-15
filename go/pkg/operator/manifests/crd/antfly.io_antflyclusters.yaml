@@ -2490,6 +2490,19 @@ spec:
                                         items:
                                           type: string
                                         type: array
+                                      kind:
+                                        enum:
+                                        - generator
+                                        - embedder
+                                        - reranker
+                                        - chunker
+                                        - classifier
+                                        - recognizer
+                                        - rewriter
+                                        - reader
+                                        - transcriber
+                                        - extractor
+                                        type: string
                                       name:
                                         minLength: 1
                                         type: string
@@ -2511,6 +2524,7 @@ spec:
                                           type: string
                                         type: array
                                     required:
+                                    - kind
                                     - name
                                     type: object
                                   type: array

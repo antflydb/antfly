@@ -33,10 +33,25 @@ const (
 // ModelPriority defines the priority of a model for loading/eviction
 type ModelPriority string
 
+// ModelKind identifies the inference API used to warm a model.
+// +kubebuilder:validation:Enum=generator;embedder;reranker;chunker;classifier;recognizer;rewriter;reader;transcriber;extractor
+type ModelKind string
+
 const (
 	ModelPriorityHigh   ModelPriority = "high"
 	ModelPriorityMedium ModelPriority = "medium"
 	ModelPriorityLow    ModelPriority = "low"
+
+	ModelKindGenerator   ModelKind = "generator"
+	ModelKindEmbedder    ModelKind = "embedder"
+	ModelKindReranker    ModelKind = "reranker"
+	ModelKindChunker     ModelKind = "chunker"
+	ModelKindClassifier  ModelKind = "classifier"
+	ModelKindRecognizer  ModelKind = "recognizer"
+	ModelKindRewriter    ModelKind = "rewriter"
+	ModelKindReader      ModelKind = "reader"
+	ModelKindTranscriber ModelKind = "transcriber"
+	ModelKindExtractor   ModelKind = "extractor"
 )
 
 // LoadingStrategy defines how models are loaded
@@ -159,6 +174,9 @@ type ModelSpec struct {
 	// (e.g., "BAAI/bge-small-en-v1.5:i8" or "hf:antflydb/clipclap:gguf:Q4_K").
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
+
+	// Kind identifies how the model is loaded and warmed by the inference runtime.
+	Kind ModelKind `json:"kind"`
 
 	// Tasks declares the model tasks to write into the pulled model manifest.
 	// For example: ["embed"].

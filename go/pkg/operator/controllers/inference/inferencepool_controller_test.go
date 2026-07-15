@@ -50,6 +50,7 @@ var _ = Describe("InferencePool Controller", func() {
 						Preload: []antflyaiv1alpha1.ModelSpec{
 							{
 								Name:         "bge-small-en-v1.5",
+								Kind:         antflyaiv1alpha1.ModelKindEmbedder,
 								Tasks:        []string{"embed"},
 								Capabilities: []string{"text"},
 								Priority:     antflyaiv1alpha1.ModelPriorityHigh,
@@ -117,7 +118,7 @@ var _ = Describe("InferencePool Controller", func() {
 			Expect(createdSts.Spec.Template.Spec.Containers).To(HaveLen(1))
 			Expect(createdSts.Spec.Template.Spec.Containers[0].Name).To(Equal("inference"))
 			Expect(createdSts.Spec.Template.Spec.Containers[0].Command).To(Equal([]string{"/antfly"}))
-			Expect(createdSts.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"inference", "run", "--host", "0.0.0.0", "--port", "8080", "--models-dir", "/models"}))
+			Expect(createdSts.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"inference", "run", "--host", "0.0.0.0", "--port", "8080", "--config", "/config/config.json"}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers).To(HaveLen(1))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Command).To(Equal([]string{"/antfly"}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Args).To(Equal([]string{
@@ -161,7 +162,7 @@ var _ = Describe("InferencePool Controller", func() {
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
 					Models: antflyaiv1alpha1.ModelConfig{
 						Preload: []antflyaiv1alpha1.ModelSpec{
-							{Name: "test-model"},
+							{Name: "test-model", Kind: antflyaiv1alpha1.ModelKindGenerator},
 						},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
@@ -218,7 +219,7 @@ var _ = Describe("InferencePool Controller", func() {
 				Spec: antflyaiv1alpha1.InferencePoolSpec{
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
 					Models: antflyaiv1alpha1.ModelConfig{
-						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "test-model"}},
+						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "test-model", Kind: antflyaiv1alpha1.ModelKindGenerator}},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
 					Replicas: antflyaiv1alpha1.ReplicaConfig{
@@ -273,7 +274,7 @@ var _ = Describe("InferencePool Controller", func() {
 				Spec: antflyaiv1alpha1.InferencePoolSpec{
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
 					Models: antflyaiv1alpha1.ModelConfig{
-						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "test-model"}},
+						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "test-model", Kind: antflyaiv1alpha1.ModelKindGenerator}},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
 					Replicas: antflyaiv1alpha1.ReplicaConfig{
@@ -332,6 +333,7 @@ var _ = Describe("InferencePool Controller", func() {
 						Preload: []antflyaiv1alpha1.ModelSpec{
 							{
 								Name: "bge-small-en-v1.5:quantized",
+								Kind: antflyaiv1alpha1.ModelKindEmbedder,
 							},
 						},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
@@ -375,7 +377,7 @@ var _ = Describe("InferencePool Controller", func() {
 					Image:        "my-registry/antfly:omni-v1.0.0",
 					Models: antflyaiv1alpha1.ModelConfig{
 						Preload: []antflyaiv1alpha1.ModelSpec{
-							{Name: "test-model"},
+							{Name: "test-model", Kind: antflyaiv1alpha1.ModelKindGenerator},
 						},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
@@ -417,9 +419,9 @@ var _ = Describe("InferencePool Controller", func() {
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
 					Models: antflyaiv1alpha1.ModelConfig{
 						Preload: []antflyaiv1alpha1.ModelSpec{
-							{Name: "model-a:i8"},
-							{Name: "model-b"},
-							{Name: "model-c:i8"},
+							{Name: "model-a:i8", Kind: antflyaiv1alpha1.ModelKindGenerator},
+							{Name: "model-b", Kind: antflyaiv1alpha1.ModelKindGenerator},
+							{Name: "model-c:i8", Kind: antflyaiv1alpha1.ModelKindGenerator},
 						},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},

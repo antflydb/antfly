@@ -208,6 +208,7 @@ pub const NodeConfig = struct {
     max_loaded_models: usize = 10,
     max_concurrent_requests: usize = 32,
     pool_size: usize = 1,
+    backend_priority: ?[]const backends_mod.BackendType = null,
     generation_budget_overrides: BudgetOverrides = .{},
     prompt_cache: PromptCacheConfig = .{},
     prompt_cache_resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver = null,
@@ -684,12 +685,15 @@ pub const Node = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: NodeConfig) !Node {
         if (config.pool_size == 0) return error.InvalidPoolSize;
-        try backends_mod.validateRequiredBackend();
+        if (config.backend_priority) |priority| try backends_mod.validateBackendPriority(priority);
         var node: Node = .{
             .config = config,
             .allocator = allocator,
-            .session_manager = backends_mod.SessionManager.init(allocator),
-            .model_manager = model_manager_mod.ModelManager.init(allocator, backends_mod.SessionManager.init(allocator)),
+            .session_manager = backends_mod.SessionManager.initWithBackendPriority(allocator, config.backend_priority),
+            .model_manager = model_manager_mod.ModelManager.init(
+                allocator,
+                backends_mod.SessionManager.initWithBackendPriority(allocator, config.backend_priority),
+            ),
             .registry = registry_mod.ModelRegistry.init(allocator, config.models_dir),
             .tabular_registry = tabular_mod.registry.Registry.init(allocator),
             .embed_cache = cache_mod.ResultCache([]const f32).init(allocator, 120_000),

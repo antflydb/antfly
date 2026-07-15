@@ -95,6 +95,31 @@ pub fn parseOptionalBackendType(value: ?[]const u8) !?inference.backends.Backend
     return parseBackendType(raw) orelse error.InvalidArguments;
 }
 
+pub const ResolvedBackendPriority = struct {
+    items: ?[]const inference.backends.BackendType = null,
+
+    pub fn deinit(self: *ResolvedBackendPriority, alloc: std.mem.Allocator) void {
+        if (self.items) |items| alloc.free(items);
+        self.* = undefined;
+    }
+};
+
+pub fn resolveBackendPriority(
+    alloc: std.mem.Allocator,
+    configured: ?[]const []const u8,
+) !ResolvedBackendPriority {
+    const values = configured orelse return .{};
+    if (values.len == 0) return error.InvalidConfig;
+    const out = try alloc.alloc(inference.backends.BackendType, values.len);
+    errdefer alloc.free(out);
+    for (values, 0..) |value, i| {
+        if (std.mem.indexOfScalar(u8, value, ':') != null or std.mem.eql(u8, value, "auto"))
+            return error.InvalidConfig;
+        out[i] = parseBackendType(value) orelse return error.InvalidConfig;
+    }
+    return .{ .items = out };
+}
+
 fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
     inline for (std.meta.fields(inference.server.WarmModelKind)) |field| {
         if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
@@ -208,7 +233,7 @@ fn parseInferenceFileConfig(alloc: std.mem.Allocator, raw: []const u8) !common_c
         .object => |object| object,
         else => return error.InvalidConfig,
     };
-    inline for (.{ "backend_priority", "model_strategies", "embedder_models_dir", "chunker_models_dir", "reranker_models_dir" }) |key| {
+    inline for (.{ "model_strategies", "embedder_models_dir", "chunker_models_dir", "reranker_models_dir" }) |key| {
         if (source.contains(key)) return error.InvalidConfig;
     }
 
@@ -300,6 +325,11 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         if (!ml_dir_set) ml_dir = loaded_config.?.inference.ml_dir orelse ml_dir;
         try appendConfiguredPreloads(alloc, &preload_models, loaded_config.?.inference.preload);
     }
+    var backend_priority = try resolveBackendPriority(
+        alloc,
+        if (loaded_config) |*config| config.inference.backend_priority else null,
+    );
+    defer backend_priority.deinit(alloc);
 
     std.debug.print("antfly inference\n", .{});
     std.debug.print("ai models: {s}\n", .{models_dir});
@@ -310,6 +340,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         .ml_dir = ml_dir,
         .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
         .preload = preload_models.items,
+        .backend_priority = backend_priority.items,
     };
     if (loaded_config) |*config| {
         if (config.inference.content_security) |security| node_config.content_security = security;
@@ -691,6 +722,7 @@ test "inference run parses operator config" {
         \\  "max_loaded_models": 3,
         \\  "max_concurrent_requests": 4,
         \\  "pool_size": 2,
+        \\  "backend_priority": ["metal", "native"],
         \\  "prompt_cache": {"enabled":true,"mode":"simple","max_bytes_mb":256,"min_tokens":32,"ttl_ms":60000},
         \\  "preload": [{"kind":"embedder","name":"antflydb/clipclap","backend":"metal"}]
         \\}
@@ -702,6 +734,13 @@ test "inference run parses operator config" {
     try std.testing.expectEqual(@as(usize, 3), config.inference.max_loaded_models);
     try std.testing.expectEqual(@as(usize, 4), config.inference.max_concurrent_requests);
     try std.testing.expectEqual(@as(usize, 2), config.inference.pool_size);
+    var backend_priority = try resolveBackendPriority(std.testing.allocator, config.inference.backend_priority);
+    defer backend_priority.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(
+        inference.backends.BackendType,
+        &.{ .metal, .native },
+        backend_priority.items.?,
+    );
     try std.testing.expect(config.inference.prompt_cache.enabled);
     try std.testing.expectEqual(common_config.Config.InferenceConfig.PromptCacheMode.simple, config.inference.prompt_cache.mode);
     try std.testing.expectEqual(@as(usize, 256), config.inference.prompt_cache.max_bytes_mb);
@@ -730,10 +769,24 @@ test "inference run rejects unsupported preload selectors" {
 }
 
 test "inference run rejects unsupported config fields" {
-    inline for (.{ "backend_priority", "model_strategies", "embedder_models_dir", "chunker_models_dir", "reranker_models_dir" }) |key| {
+    inline for (.{ "model_strategies", "embedder_models_dir", "chunker_models_dir", "reranker_models_dir" }) |key| {
         const raw = try std.fmt.allocPrint(std.testing.allocator, "{{\"{s}\":{{}}}}", .{key});
         defer std.testing.allocator.free(raw);
         try std.testing.expectError(error.InvalidConfig, parseInferenceFileConfig(std.testing.allocator, raw));
+    }
+}
+
+test "inference run rejects invalid backend priorities" {
+    inline for (.{
+        &.{},
+        &.{"auto"},
+        &.{"onnx:cuda"},
+        &.{"unknown"},
+    }) |priority| {
+        try std.testing.expectError(
+            error.InvalidConfig,
+            resolveBackendPriority(std.testing.allocator, priority),
+        );
     }
 }
 

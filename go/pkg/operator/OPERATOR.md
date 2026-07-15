@@ -85,7 +85,9 @@ Model references in InferencePool specs are canonical tags in
 models:
   preload:
     - name: BAAI/bge-small-en-v1.5:i8
+      kind: embedder
     - name: hf:antflydb/clipclap:gguf:Q4_K
+      kind: embedder
       tasks: ["embed"]
       capabilities: ["text", "image", "audio"]
 ```

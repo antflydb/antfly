@@ -29,7 +29,7 @@ func validPool() *InferencePool {
 		ObjectMeta: metav1.ObjectMeta{Name: "test-pool", Namespace: "default"},
 		Spec: InferencePoolSpec{
 			Models: ModelConfig{
-				Preload: []ModelSpec{{Name: "bge-small-en-v1.5"}},
+				Preload: []ModelSpec{{Name: "bge-small-en-v1.5", Kind: ModelKindEmbedder}},
 			},
 			Replicas: ReplicaConfig{Min: 1, Max: 3},
 		},

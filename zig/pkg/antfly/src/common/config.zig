@@ -204,6 +204,7 @@ pub const Config = struct {
         content_security: ?ContentSecurityConfig = null,
         s3_credentials: ?S3CredentialsConfig = null,
         preload: []WarmModelConfig = &.{},
+        backend_priority: ?[]const []u8 = null,
         prompt_cache: PromptCacheConfig = .{},
         query_embedding_cache: QueryEmbeddingCacheConfig = .{},
         keep_alive_ms: u64 = 300_000,
@@ -220,6 +221,7 @@ pub const Config = struct {
             if (self.s3_credentials) |*credentials| credentials.deinit(alloc);
             for (self.preload) |*model| model.deinit(alloc);
             if (self.preload.len > 0) alloc.free(self.preload);
+            if (self.backend_priority) |values| freeOwnedStringSlice(alloc, values);
             self.* = undefined;
         }
     };
@@ -650,6 +652,7 @@ pub const Config = struct {
                 .content_security = if (inference.content_security) |security| try contentSecurityFromOpenApi(alloc, security) else null,
                 .s3_credentials = try parseRawInferenceS3Credentials(alloc, raw_root, inference.s3_credentials),
                 .preload = try parseInferencePreloadModels(alloc, raw_root.get("inference")),
+                .backend_priority = if (inference.backend_priority) |values| try dupOwnedStringSlice(alloc, values) else null,
                 .prompt_cache = prompt_cache,
                 .query_embedding_cache = query_embedding_cache,
                 .keep_alive_ms = inference_keep_alive_ms,

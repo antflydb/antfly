@@ -1283,6 +1283,11 @@ pub fn runFromIterator(
     // server for compatibility with external clients.
     var resolved_warm_models = try resolveInferenceWarmModels(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer resolved_warm_models.deinit(alloc);
+    var resolved_backend_priority = try antfly.inference_runtime.resolveBackendPriority(
+        alloc,
+        if (loaded_config) |*cfg| cfg.inference.backend_priority else null,
+    );
+    defer resolved_backend_priority.deinit(alloc);
     var antfly_node_cfg = inference.server.NodeConfig{
         .models_dir = resolveInferenceModelsDir(cli, if (loaded_config) |*cfg| cfg else null) orelse
             antfly.inference_runtime.defaultModelsDirForDataDir(alloc, data_dir),
@@ -1290,6 +1295,7 @@ pub fn runFromIterator(
             antfly.inference_runtime.defaultMlDirForDataDir(alloc, data_dir),
         .generation_budget_overrides = resolveInferenceBudgetOverrides(cli),
         .preload = resolved_warm_models.items,
+        .backend_priority = resolved_backend_priority.items,
     };
     if (loaded_config) |*cfg| {
         if (cfg.effectiveAntflyContentSecurity()) |security| antfly_node_cfg.content_security = security.*;

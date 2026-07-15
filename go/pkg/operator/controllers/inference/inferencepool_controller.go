@@ -296,9 +296,15 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 	}
 
 	// Build preload model list
-	preload := make([]string, 0, len(pool.Spec.Models.Preload))
+	preload := make([]map[string]any, 0, len(pool.Spec.Models.Preload))
 	for _, m := range pool.Spec.Models.Preload {
-		preload = append(preload, m.Name)
+		if m.Kind == "" {
+			return "", fmt.Errorf("preload model %q is missing kind", m.Name)
+		}
+		preload = append(preload, map[string]any{
+			"kind": m.Kind,
+			"name": m.Name,
+		})
 	}
 
 	// Set auto-generated config (don't override if user specified)
@@ -306,30 +312,8 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 		config["preload"] = preload
 	}
 
-	// Build per-model loading strategies map
-	// Only include models that have an explicit strategy override
-	// Key format is the canonical model ref from spec.models.preload[].name.
-	if _, exists := config["model_strategies"]; !exists {
-		modelStrategies := make(map[string]string)
-		for _, m := range pool.Spec.Models.Preload {
-			if m.Strategy != "" {
-				modelStrategies[m.Name] = string(m.Strategy)
-			}
-		}
-		if len(modelStrategies) > 0 {
-			config["model_strategies"] = modelStrategies
-		}
-	}
-
-	// Set model directories based on models-dir default
-	if _, exists := config["embedder_models_dir"]; !exists {
-		config["embedder_models_dir"] = "/models/embedders"
-	}
-	if _, exists := config["chunker_models_dir"]; !exists {
-		config["chunker_models_dir"] = "/models/chunkers"
-	}
-	if _, exists := config["reranker_models_dir"]; !exists {
-		config["reranker_models_dir"] = "/models/rerankers"
+	if _, exists := config["models_dir"]; !exists {
+		config["models_dir"] = "/models"
 	}
 
 	// Set loading strategy config
@@ -369,17 +353,13 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 		}
 	}
 
-	// Set backend_priority based on accelerator type.
-	// For CPU-only pools, the default from the container env var is sufficient.
-	// This must be a JSON array (not a comma-separated string) so that
-	// viper.GetStringSlice parses it correctly.
+	// A single configured backend is strict: the runtime fails startup when the
+	// accelerator backend is unavailable instead of silently running on CPU.
 	if _, exists := config["backend_priority"]; !exists && pool.Spec.Hardware.Accelerator != "" {
 		if strings.Contains(pool.Spec.Hardware.Accelerator, "tpu") {
-			// TPU: prefer XLA backend
-			config["backend_priority"] = []string{"xla", "onnx", "go"}
+			config["backend_priority"] = []string{"xla"}
 		} else {
-			// GPU (nvidia, etc.): prefer ONNX backend (CUDA support)
-			config["backend_priority"] = []string{"onnx", "xla", "go"}
+			config["backend_priority"] = []string{"cuda"}
 		}
 	}
 
@@ -454,7 +434,7 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 							Name:    "inference",
 							Image:   image,
 							Command: []string{"/antfly"},
-							Args:    []string{"inference", "run", "--host", "0.0.0.0", "--port", strconv.Itoa(InferenceAPIPort), "--models-dir", "/models"},
+							Args:    []string{"inference", "run", "--host", "0.0.0.0", "--port", strconv.Itoa(InferenceAPIPort), "--config", "/config/config.json"},
 							Ports: []corev1.ContainerPort{
 								{Name: "http", ContainerPort: InferenceAPIPort, Protocol: corev1.ProtocolTCP},
 							},
