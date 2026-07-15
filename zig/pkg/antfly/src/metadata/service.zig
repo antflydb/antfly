@@ -1087,6 +1087,8 @@ pub const MetadataService = struct {
     placement_epoch: std.atomic.Value(u64) = .init(1),
     reconcile_lease_epoch: std.atomic.Value(u64) = .init(1),
     transition_epoch: std.atomic.Value(u64) = .init(1),
+    metadata_incarnation_candidate: ?metadata_mod.MetadataClusterIncarnation = null,
+    metadata_incarnation_proposal_pending: bool = false,
     local_placement_epoch: ?u64,
     last_local_placement_refresh_at_ms: u64,
     local_transition_epoch: ?u64,
@@ -1487,6 +1489,7 @@ pub const MetadataService = struct {
         try self.ensureLifecycleListenerRegistered();
         defer self.lifecycle_signal.notify(null);
         try self.raft.runRound();
+        if (!try self.ensureMetadataIncarnation()) return;
         if (!self.observe_local_replica_root) return;
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForRound();
         if ((self.store_status_ticks >= 40 or backfill_markers.len > 0) and shouldRefreshLocalStoreStatus(self, backfill_markers)) {
@@ -1516,6 +1519,7 @@ pub const MetadataService = struct {
         try self.ensureLifecycleListenerRegistered();
         defer self.lifecycle_signal.notify(null);
         try self.raft.runRound();
+        if (!try self.ensureMetadataIncarnation()) return;
         if (!self.observe_local_replica_root) return;
 
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForLifecycleRound();
@@ -1623,6 +1627,7 @@ pub const MetadataService = struct {
     pub fn head(self: *MetadataService) metadata_api.MetadataHead {
         return .{
             .metadata_group_id = self.metadata_group_id,
+            .metadata_incarnation = self.metadataIncarnation() catch null,
             .metadata_epoch = projectedProvisioningFingerprint(self.alloc, self) catch self.lifecycle_signal.currentEpoch(),
         };
     }
@@ -1651,6 +1656,34 @@ pub const MetadataService = struct {
 
     pub fn projectedStore(self: *MetadataService) ?*metadata_storage.RaftApplyStore {
         return self.raft.host.owned_metadata_store;
+    }
+
+    pub fn metadataIncarnation(self: *MetadataService) !?metadata_mod.MetadataClusterIncarnation {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.getMetadataIncarnation(self.metadata_group_id);
+    }
+
+    fn ensureMetadataIncarnation(self: *MetadataService) !bool {
+        if (try self.metadataIncarnation() != null) {
+            self.metadata_incarnation_proposal_pending = false;
+            return true;
+        }
+        if (!self.raft.host.host.isLocalLeader(self.metadata_group_id)) {
+            self.metadata_incarnation_proposal_pending = false;
+            return false;
+        }
+        if (self.metadata_incarnation_proposal_pending) return false;
+        if (self.metadata_incarnation_candidate == null) {
+            self.metadata_incarnation_candidate = try metadata_mod.incarnation.generate(std.Options.debug_io);
+        }
+        self.proposeTransitionCommand(.{
+            .initialize_metadata_incarnation = self.metadata_incarnation_candidate.?,
+        }) catch |err| switch (err) {
+            error.NotLeader => return false,
+            else => return err,
+        };
+        self.metadata_incarnation_proposal_pending = true;
+        return false;
     }
 
     pub fn getProjectedReconcileLease(self: *MetadataService) !?metadata_reconcile_lease.ReconcileLeaseRecord {
@@ -2288,6 +2321,8 @@ pub const MetadataHttpService = struct {
     placement_epoch: std.atomic.Value(u64) = .init(1),
     reconcile_lease_epoch: std.atomic.Value(u64) = .init(1),
     transition_epoch: std.atomic.Value(u64) = .init(1),
+    metadata_incarnation_candidate: ?metadata_mod.MetadataClusterIncarnation = null,
+    metadata_incarnation_proposal_pending: bool = false,
     local_placement_epoch: ?u64,
     last_local_placement_refresh_at_ms: u64,
     local_transition_epoch: ?u64,
@@ -2768,6 +2803,10 @@ pub const MetadataHttpService = struct {
             }
             raft_diagnostics_snapshot = self.raftDiagnosticsSnapshotLocked();
         }
+        if (!try self.ensureMetadataIncarnation()) {
+            self.probe_ready.store(false, .release);
+            return;
+        }
         self.refreshProbeReady();
         run_round_trace.recordSince("raft_round", phase_start_ns);
         if (raft_diagnostics_snapshot.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
@@ -2873,6 +2912,11 @@ pub const MetadataHttpService = struct {
                 try self.raft.runRaftRoundOnly();
             }
         }
+        if (!try self.ensureMetadataIncarnation()) {
+            self.probe_ready.store(false, .release);
+            return;
+        }
+        self.refreshProbeReady();
         if (!self.observe_local_replica_root) return;
 
         var local_transition_inputs = try captureLocalTransitionInputs(self);
@@ -2979,6 +3023,7 @@ pub const MetadataHttpService = struct {
     pub fn head(self: *MetadataHttpService) metadata_api.MetadataHead {
         return .{
             .metadata_group_id = self.metadata_group_id,
+            .metadata_incarnation = self.metadataIncarnation() catch null,
             .metadata_epoch = projectedProvisioningFingerprint(self.alloc, self) catch self.lifecycle_signal.currentEpoch(),
         };
     }
@@ -3318,6 +3363,39 @@ pub const MetadataHttpService = struct {
 
     pub fn projectedStore(self: *MetadataHttpService) ?*metadata_storage.RaftApplyStore {
         return self.raft.host.owned_metadata_store;
+    }
+
+    pub fn metadataIncarnation(self: *MetadataHttpService) !?metadata_mod.MetadataClusterIncarnation {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.getMetadataIncarnation(self.metadata_group_id);
+    }
+
+    fn ensureMetadataIncarnation(self: *MetadataHttpService) !bool {
+        if (try self.metadataIncarnation() != null) {
+            self.metadata_incarnation_proposal_pending = false;
+            return true;
+        }
+        self.lockRuntime();
+        const is_local_leader = self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id);
+        self.unlockRuntime();
+        if (!is_local_leader) {
+            self.metadata_incarnation_proposal_pending = false;
+            return false;
+        }
+        if (self.metadata_incarnation_proposal_pending) return false;
+        if (self.metadata_incarnation_candidate == null) {
+            self.metadata_incarnation_candidate = try metadata_mod.incarnation.generate(std.Options.debug_io);
+        }
+        self.proposeTransitionCommand(.{
+            .initialize_metadata_incarnation = self.metadata_incarnation_candidate.?,
+        }) catch |err| switch (err) {
+            error.NotLeader => return false,
+            else => return err,
+        };
+        self.metadata_incarnation_proposal_pending = true;
+        return false;
     }
 
     /// Returns the current Raft term only while this node is the metadata
@@ -5720,8 +5798,18 @@ fn countHealthyStoresReportingGroup(
 }
 
 fn runServiceRounds(svc: *MetadataService, count: usize) !void {
+    try runServiceRoundsUntilMetadataReady(svc);
     var rounds: usize = 0;
     while (rounds < count) : (rounds += 1) try svc.runRound();
+}
+
+fn runServiceRoundsUntilMetadataReady(svc: *MetadataService) !void {
+    var rounds: usize = 0;
+    while (rounds < 32) : (rounds += 1) {
+        if (try svc.metadataIncarnation() != null) return;
+        try svc.runRound();
+    }
+    return error.MetadataIncarnationUnavailable;
 }
 
 fn logServiceWaitTimeout(svc: *MetadataService, label: []const u8, group_id: u64, desired: raft_host.HostedReplicaStatus, rounds: usize) !void {
@@ -5901,6 +5989,10 @@ pub fn snapshotStatusWithOptions(
         service.statusProjectedReconcileLease(now_ms) catch null
     else if (@hasDecl(SourceDeclType, "getProjectedReconcileLease"))
         service.getProjectedReconcileLease() catch null
+    else
+        null;
+    const metadata_incarnation = if (@hasDecl(SourceDeclType, "metadataIncarnation"))
+        try service.metadataIncarnation()
     else
         null;
     const projected_tables = try service.listProjectedTables(alloc);
@@ -6139,6 +6231,7 @@ pub fn snapshotStatusWithOptions(
 
     return .{
         .metadata_group_id = metadata_group_id,
+        .metadata_incarnation = metadata_incarnation,
         .metadata_raft_local_node_id = metadata_raft.local_node_id,
         .metadata_raft_role = metadata_raft.role,
         .metadata_raft_leader_id = metadata_raft.leader_id,
@@ -6460,8 +6553,8 @@ test "metadata service status reflects reconcile lease ownership" {
     try std.testing.expectEqual(@as(u64, 0), before_leadership.reconcile_lease_owner_node_id);
 
     try svc.campaignMetadataGroup();
-    try svc.runRound();
-    try svc.runRound();
+    try runServiceRoundsUntilMetadataReady(&svc);
+    try runServiceRounds(&svc, 2);
 
     const held_status = try svc.status();
     try std.testing.expect(held_status.reconcile_lease_enabled);
@@ -6676,7 +6769,7 @@ test "metadata service can apply reconciliation plan proposals" {
         .bootstrap_mode = .empty,
     });
     try svc.campaignMetadataGroup();
-    try svc.runRound();
+    try runServiceRoundsUntilMetadataReady(&svc);
 
     var manager = metadata_table_manager.TableManager.init(std.testing.allocator);
     defer manager.deinit();
@@ -6817,7 +6910,8 @@ test "metadata control loop can drive the real metadata service" {
     });
 
     const summary = try svc.reconcileOnceEnsuringLease(&loop);
-    try std.testing.expectEqual(@as(usize, 1), summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), summary.split_admissions);
+    try std.testing.expectEqual(@as(usize, 0), summary.split_upserts);
 
     try runServiceRounds(&svc, 8);
 
@@ -7095,7 +7189,8 @@ test "table workflow can drive real metadata service topology and split setup" {
         .destination_group_id = 8802,
         .split_key = "doc:m",
     });
-    try std.testing.expectEqual(@as(usize, 1), split_summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), split_summary.split_admissions);
+    try std.testing.expectEqual(@as(usize, 0), split_summary.split_upserts);
 
     rounds = 0;
     while (rounds < 8) : (rounds += 1) try svc.runRound();
@@ -8580,7 +8675,7 @@ test "metadata service lifecycle round backs off empty backfill probes after ini
         .bootstrap_mode = .empty,
     });
     try svc.campaignMetadataGroup();
-    try svc.runRound();
+    try runServiceRoundsUntilMetadataReady(&svc);
 
     try std.testing.expectEqual(@as(usize, 0), svc.store_status_backfill_marker_cache.markers.len);
     const first_scanned_at_ms = svc.store_status_backfill_marker_cache.scanned_at_ms;

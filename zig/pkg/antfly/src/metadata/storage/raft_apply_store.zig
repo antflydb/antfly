@@ -19,6 +19,7 @@ const group_ids = @import("../../common/group_ids.zig");
 const docstore = @import("../../storage/docstore.zig");
 const lsm_backend = @import("../../storage/lsm_backend.zig");
 const metadata = @import("../mod.zig");
+const metadata_incarnation = @import("../incarnation.zig");
 const extension_domain = @import("../../extensions/mod.zig");
 const metadata_table_manager = @import("../table_manager.zig");
 const raft_catalog = @import("../../raft/catalog.zig");
@@ -55,6 +56,7 @@ pub const ExtensionLifecycleDelta = struct {
 };
 
 pub const TransitionCommand = union(enum) {
+    initialize_metadata_incarnation: metadata_incarnation.MetadataClusterIncarnation,
     upsert_node: metadata.NodeRecord,
     register_node: metadata.NodeRecord,
     remove_node: struct {
@@ -377,6 +379,44 @@ test "metadata raft apply store replicates restore job records" {
     try std.testing.expect((try store.getRestoreJobValue(std.testing.allocator, group_id, logical_key)) == null);
 }
 
+test "metadata raft apply store initializes one durable snapshotted cluster incarnation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-incarnation-source", .{tmp.sub_path});
+    defer std.testing.allocator.free(source_root);
+    const target_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-incarnation-target", .{tmp.sub_path});
+    defer std.testing.allocator.free(target_root);
+    const group_id = group_ids.main_metadata_group_id;
+    const first: metadata_incarnation.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const competing: metadata_incarnation.MetadataClusterIncarnation = "22222222222222222222222222222222".*;
+
+    const initialize = try encodeTransitionCommand(std.testing.allocator, .{ .initialize_metadata_incarnation = first });
+    defer std.testing.allocator.free(initialize);
+    const compete = try encodeTransitionCommand(std.testing.allocator, .{ .initialize_metadata_incarnation = competing });
+    defer std.testing.allocator.free(compete);
+    const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = initialize },
+        .{ .term = 2, .index = 2, .entry_type = .normal, .data = compete },
+    });
+    defer std.testing.allocator.free(entries);
+
+    var source = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
+    try source.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 2, .entries_bytes = entries });
+    try std.testing.expectEqual(first, (try source.getMetadataIncarnation(group_id)).?);
+    const snapshot = try source.snapshotBuilder().buildSnapshot(std.testing.allocator, group_id);
+    defer std.testing.allocator.free(snapshot);
+    source.deinit();
+
+    var reopened = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
+    defer reopened.deinit();
+    try std.testing.expectEqual(first, (try reopened.getMetadataIncarnation(group_id)).?);
+
+    var target = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = target_root });
+    defer target.deinit();
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(std.testing.allocator, group_id, 2, snapshot));
+    try std.testing.expectEqual(first, (try target.getMetadataIncarnation(group_id)).?);
+}
+
 test "metadata raft apply store snapshot replaces one complete projection and preserves other groups" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -649,6 +689,26 @@ pub const RaftApplyStore = struct {
 
     pub fn addCommittedKeyListener(self: *RaftApplyStore, listener: CommittedKeyListener) !void {
         try self.committed_key_listeners.append(self.alloc, listener);
+    }
+
+    pub fn getMetadataIncarnation(
+        self: *RaftApplyStore,
+        group_id: u64,
+    ) !?metadata_incarnation.MetadataClusterIncarnation {
+        var key_buf: [160]u8 = undefined;
+        const key = try metadataIncarnationKeyForGroup(&key_buf, group_id);
+        const encoded = self.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer self.alloc.free(encoded);
+        if (encoded.len != @sizeOf(metadata_incarnation.MetadataClusterIncarnation)) {
+            return error.InvalidMetadataIncarnation;
+        }
+        var incarnation: metadata_incarnation.MetadataClusterIncarnation = undefined;
+        @memcpy(&incarnation, encoded);
+        if (!metadata_incarnation.isValid(incarnation)) return error.InvalidMetadataIncarnation;
+        return incarnation;
     }
 
     pub fn listSplitTransitions(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.SplitTransitionRecord {
@@ -1243,6 +1303,7 @@ pub const RaftApplyStore = struct {
 
     const MetadataSnapshotKeyFn = *const fn ([]u8, u64) anyerror![]const u8;
     const MetadataSnapshotProjection = enum {
+        metadata_incarnation,
         split_transition,
         merge_transition,
         placement,
@@ -1271,6 +1332,7 @@ pub const RaftApplyStore = struct {
         key: MetadataSnapshotKey,
     };
     const metadata_snapshot_projections = [_]MetadataSnapshotProjectionDescriptor{
+        .{ .projection = .metadata_incarnation, .key = .{ .point = metadataIncarnationKeyForGroup } },
         .{ .projection = .split_transition, .key = .{ .prefix = splitTransitionPrefixForGroup } },
         .{ .projection = .merge_transition, .key = .{ .prefix = mergeTransitionPrefixForGroup } },
         .{ .projection = .placement, .key = .{ .prefix = placementPrefixForGroup } },
@@ -1300,6 +1362,7 @@ pub const RaftApplyStore = struct {
     /// without classifying its durable output is therefore a compile error.
     fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) u32 {
         return switch (tag) {
+            .initialize_metadata_incarnation => metadataSnapshotProjectionBit(.metadata_incarnation),
             .upsert_node, .register_node, .remove_node => metadataSnapshotProjectionBit(.node),
             .request_node_shutdown, .cancel_node_shutdown, .finalize_node_shutdown => metadataSnapshotProjectionBit(.node) | metadataSnapshotProjectionBit(.store),
             .upsert_store, .register_store, .remove_store => metadataSnapshotProjectionBit(.store),
@@ -1593,6 +1656,27 @@ pub const RaftApplyStore = struct {
     fn applyTransitionCommandTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, command: TransitionCommand) !void {
         try validateTransitionCommandDataGroupIds(command);
         switch (command) {
+            .initialize_metadata_incarnation => |incarnation| {
+                if (!metadata_incarnation.isValid(incarnation)) return error.InvalidMetadataIncarnation;
+                var key_buf: [160]u8 = undefined;
+                const key = try metadataIncarnationKeyForGroup(&key_buf, group_id);
+                const existing = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => {
+                        try txn.put(key, &incarnation);
+                        return;
+                    },
+                    else => return err,
+                };
+                if (existing.len != @sizeOf(metadata_incarnation.MetadataClusterIncarnation)) {
+                    return error.InvalidMetadataIncarnation;
+                }
+                var committed: metadata_incarnation.MetadataClusterIncarnation = undefined;
+                @memcpy(&committed, existing);
+                if (!metadata_incarnation.isValid(committed)) return error.InvalidMetadataIncarnation;
+                // Initialization is first-writer-wins. A proposal accepted by a
+                // superseded leader may race a later term, but it must never
+                // replace the cluster identity selected by the committed log.
+            },
             .upsert_node => |record| {
                 var key_buf: [160]u8 = undefined;
                 const key = try nodeKeyForGroup(&key_buf, group_id, record.node_id);
@@ -2544,6 +2628,7 @@ const runtime_status_record_version: u16 = 7;
 const group_status_record_version: u16 = 1;
 
 const TransitionTag = enum(u8) {
+    initialize_metadata_incarnation = 45,
     upsert_node = 1,
     remove_node = 2,
     upsert_store = 3,
@@ -2596,6 +2681,10 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
 
     try out.appendSlice(alloc, transition_magic);
     switch (command) {
+        .initialize_metadata_incarnation => |incarnation| {
+            try out.append(alloc, @intFromEnum(TransitionTag.initialize_metadata_incarnation));
+            try out.appendSlice(alloc, &incarnation);
+        },
         .upsert_node => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_node));
             try appendNodeRecord(alloc, &out, record);
@@ -2796,6 +2885,14 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
     pos += 1;
 
     return switch (tag) {
+        .initialize_metadata_incarnation => blk: {
+            if (pos + @sizeOf(metadata_incarnation.MetadataClusterIncarnation) != encoded.len) {
+                return error.InvalidMetadataTransitionEncoding;
+            }
+            var incarnation: metadata_incarnation.MetadataClusterIncarnation = undefined;
+            @memcpy(&incarnation, encoded[pos..][0..incarnation.len]);
+            break :blk .{ .initialize_metadata_incarnation = incarnation };
+        },
         .upsert_node => .{
             .upsert_node = try readNodeRecord(alloc, encoded, &pos),
         },
@@ -4896,6 +4993,10 @@ pub fn mergeTransitionPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
 
 pub fn reconcileLeaseKeyForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_reconcile_lease:{d}", .{group_id});
+}
+
+pub fn metadataIncarnationKeyForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_incarnation:{d}", .{group_id});
 }
 
 pub fn reallocationRequestKeyForGroup(buf: []u8, group_id: u64) ![]const u8 {

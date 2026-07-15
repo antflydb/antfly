@@ -3396,6 +3396,7 @@ pub fn build(b: *std.Build) void {
         "data runtime startup catch-up clears no-debt busy writer groups",
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
+        "remote metadata source pins one cluster incarnation across cache invalidation",
         "data runtime treats metadata leadership churn as retryable bootstrap failure",
         "data runtime metadata bootstrap retry delay is bounded and jittered",
         "idle cached runtime status stays fresh only for the published root generation",
@@ -4689,6 +4690,7 @@ pub fn build(b: *std.Build) void {
             "prepared generation reconciliation rolls back an exchanged candidate",
             "prepared first generation reconciliation removes an unvalidated candidate",
             "committed generation reconciliation preserves the validated candidate",
+            "generation publication marker parsing preserves allocator exhaustion",
         },
     });
     const run_api_table_writes_production_regression_tests = b.addRunArtifact(api_table_writes_production_regression_tests);
@@ -4844,6 +4846,7 @@ pub fn build(b: *std.Build) void {
             "metadata module compiles",
             "metadata transition driver ",
             "metadata storage module compiles",
+            "metadata cluster incarnation has one canonical JSON representation",
             "table workflow can build desired topology through the control loop seam",
             "table workflow doc identity guards reject active transition intents",
             "table workflow can remove a table topology from desired state",

@@ -99,7 +99,8 @@ and restore transitions wait for every group preparation and retain table-wide
 epochs.
 
 The install's catalog inputs form one explicit contract: metadata Raft group
-identity, table identity, table name, schema, index catalog, range topology,
+identity, the metadata cluster's durable 128-bit incarnation, table identity,
+table name, schema, index catalog, range topology,
 and document-identity namespace are captured after group admission. The
 snapshot's encoded range must match that catalog range. Staging owns only this
 compact contract, not the complete admin snapshot, so its memory cost is
@@ -116,6 +117,16 @@ exchange and advances the visible generation. Metadata changes committed before
 the barrier therefore reject stale publication, while changes committed after
 it are correctly ordered after publication. Unrelated metadata changes do not
 force a retry.
+
+The fixed metadata Raft group id is not a cluster identity. Metadata initializes
+its incarnation exactly once through the replicated state machine; the singleton
+projection is included in Raft snapshots and therefore survives restart,
+leadership transfer, and replica replacement. Data nodes pin the first valid
+incarnation they observe. Every configured metadata endpoint, head/snapshot
+pair, and mutating control-plane request must prove the same incarnation before
+it can affect provisioning or generation publication. Missing, zero, or
+mismatched identities fail closed, preventing a mixed endpoint configuration
+from validating a candidate against an unrelated cluster with the same group id.
 
 `DB.restoreSnapshotToDeferredRuntimeRepair()` accepts a `StagedGeneration`
 capability and rejects a path that is not the capability's staging root. Raw

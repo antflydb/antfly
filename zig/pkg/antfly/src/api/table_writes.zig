@@ -17033,6 +17033,7 @@ fn tableIdentityNamespaceForRangeId(
 
 const RaftSnapshotCatalogContract = struct {
     metadata_group_id: u64,
+    metadata_incarnation: metadata_api.MetadataClusterIncarnation,
     table_id: u64,
     table_name: []u8,
     schema_json: []u8,
@@ -17050,6 +17051,7 @@ const RaftSnapshotCatalogContract = struct {
     fn publicationContract(self: *const @This()) metadata_api.CatalogPublicationContract {
         return .{
             .metadata_group_id = self.metadata_group_id,
+            .metadata_incarnation = self.metadata_incarnation,
             .table_id = self.table_id,
             .table_name = self.table_name,
             .schema_json = self.schema_json,
@@ -17072,6 +17074,7 @@ fn captureRaftSnapshotCatalogContract(
     if (range.table_id != expected_table_id) return error.CatalogChanged;
     const table = metadata_mod.findAdminTable(&snapshot, expected_table_id) orelse return error.CatalogChanged;
     if (!std.mem.eql(u8, table.name, expected_table_name)) return error.CatalogChanged;
+    const metadata_incarnation = snapshot.status.metadata_incarnation orelse return error.MetadataIncarnationUnavailable;
 
     const table_name = try alloc.dupe(u8, table.name);
     errdefer alloc.free(table_name);
@@ -17082,6 +17085,7 @@ fn captureRaftSnapshotCatalogContract(
     const owned_range = try metadata_table_manager.cloneRange(alloc, range.*);
     return .{
         .metadata_group_id = snapshot.status.metadata_group_id,
+        .metadata_incarnation = metadata_incarnation,
         .table_id = expected_table_id,
         .table_name = table_name,
         .schema_json = schema_json,
@@ -21843,7 +21847,11 @@ const ProvisionedWriteCoalesceTestCatalog = struct {
 
     fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
         return .{
-            .status = .{ .metadata_group_id = 1, .metrics = .{} },
+            .status = .{
+                .metadata_group_id = 1,
+                .metadata_incarnation = "31313131313131313131313131313131".*,
+                .metrics = .{},
+            },
             .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                 .table_id = 7,
                 .name = "docs",
@@ -31340,6 +31348,8 @@ fn testingVisibleRootGenerationForGroup(ptr: *anyopaque, _: u64) u64 {
 }
 
 const RaftSnapshotInstallTestCatalog = struct {
+    const metadata_incarnation: metadata_api.MetadataClusterIncarnation = "31313131313131313131313131313131".*;
+
     calls: usize = 0,
     change_on_call: ?usize = null,
 
@@ -31386,7 +31396,11 @@ const RaftSnapshotInstallTestCatalog = struct {
                 .end_key = null,
             }})[0..]);
         return .{
-            .status = .{ .metadata_group_id = 1, .metrics = .{} },
+            .status = .{
+                .metadata_group_id = 1,
+                .metadata_incarnation = metadata_incarnation,
+                .metrics = .{},
+            },
             .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                 .table_id = 7,
                 .name = "docs",

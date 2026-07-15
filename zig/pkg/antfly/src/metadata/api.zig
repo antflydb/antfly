@@ -21,9 +21,13 @@ const raft_host = @import("../raft/host.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const raft_service = @import("../raft/service.zig");
 const transition_state = @import("transition_state.zig");
+const metadata_incarnation = @import("incarnation.zig");
+
+pub const MetadataClusterIncarnation = metadata_incarnation.MetadataClusterIncarnation;
 
 pub const MetadataStatus = struct {
     metadata_group_id: u64,
+    metadata_incarnation: ?MetadataClusterIncarnation = null,
     metadata_epoch: u64 = 0,
     metadata_raft_local_node_id: u64 = 0,
     metadata_raft_role: []const u8 = "absent",
@@ -123,6 +127,7 @@ pub const MetadataStatus = struct {
 
 pub const MetadataHead = struct {
     metadata_group_id: u64,
+    metadata_incarnation: ?MetadataClusterIncarnation = null,
     metadata_epoch: u64 = 0,
 };
 
@@ -163,6 +168,7 @@ pub const AdminSnapshot = struct {
 /// allocation cost is independent of the cluster-wide catalog size.
 pub const CatalogPublicationContract = struct {
     metadata_group_id: u64,
+    metadata_incarnation: MetadataClusterIncarnation,
     table_id: u64,
     table_name: []const u8,
     schema_json: []const u8,
@@ -171,6 +177,8 @@ pub const CatalogPublicationContract = struct {
 
     pub fn matches(self: @This(), snapshot: *const AdminSnapshot) bool {
         if (snapshot.status.metadata_group_id != self.metadata_group_id) return false;
+        const incarnation = snapshot.status.metadata_incarnation orelse return false;
+        if (!std.mem.eql(u8, &incarnation, &self.metadata_incarnation)) return false;
         var table_match = false;
         for (snapshot.tables) |table| {
             if (table.table_id != self.table_id) continue;

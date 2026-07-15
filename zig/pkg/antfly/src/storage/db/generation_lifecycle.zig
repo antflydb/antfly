@@ -977,8 +977,14 @@ fn readPublicationMarker(alloc: Allocator, io: std.Io, root: []const u8) !?Owned
         else => return err,
     };
     defer alloc.free(encoded);
-    var parsed = std.json.parseFromSlice(PublicationMarker, alloc, encoded, .{ .allocate = .alloc_always }) catch
-        return error.InvalidGenerationPublicationMarker;
+    return try parsePublicationMarker(alloc, encoded);
+}
+
+fn parsePublicationMarker(alloc: Allocator, encoded: []const u8) !OwnedPublicationMarker {
+    var parsed = std.json.parseFromSlice(PublicationMarker, alloc, encoded, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidGenerationPublicationMarker,
+    };
     defer parsed.deinit();
     if (parsed.value.version != 2 or parsed.value.retained_name.len == 0 or
         std.mem.indexOfAny(u8, parsed.value.retained_name, "/\\") != null)
@@ -990,6 +996,15 @@ fn readPublicationMarker(alloc: Allocator, io: std.Io, root: []const u8) !?Owned
         .retained_name = try alloc.dupe(u8, parsed.value.retained_name),
         .had_live_generation = parsed.value.had_live_generation,
     };
+}
+
+test "generation publication marker parsing preserves allocator exhaustion" {
+    const encoded =
+        \\{"version":2,"phase":"prepared","retained_name":"table.retained","had_live_generation":true}
+    ;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, parsePublicationMarker(failing.allocator(), encoded));
+    try std.testing.expectError(error.InvalidGenerationPublicationMarker, parsePublicationMarker(std.testing.allocator, "{"));
 }
 
 fn clearPublicationMarker(alloc: Allocator, io: std.Io, root: []const u8) bool {

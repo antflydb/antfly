@@ -7869,6 +7869,7 @@ const RemoteMetadataSource = struct {
     preferred_base_uri_index: usize = 0,
     cache_mutex: std.atomic.Mutex = .unlocked,
     cached_head: ?antfly.metadata_api.MetadataHead = null,
+    metadata_incarnation: ?antfly.metadata_api.MetadataClusterIncarnation = null,
     cached_head_at_ms: u64 = 0,
     cached_snapshot: ?antfly.metadata_api.AdminSnapshot = null,
     cached_snapshot_at_ms: u64 = 0,
@@ -7912,6 +7913,21 @@ const RemoteMetadataSource = struct {
         lockAtomic(&self.cache_mutex);
         self.preferred_base_uri_index = index;
         self.cache_mutex.unlock();
+    }
+
+    fn acceptMetadataIncarnation(
+        self: *RemoteMetadataSource,
+        candidate: ?antfly.metadata_api.MetadataClusterIncarnation,
+    ) !void {
+        const incarnation = candidate orelse return error.MetadataIncarnationUnavailable;
+        if (!antfly.metadata.incarnation.isValid(incarnation)) return error.InvalidMetadataIncarnation;
+        lockAtomic(&self.cache_mutex);
+        defer self.cache_mutex.unlock();
+        if (self.metadata_incarnation) |expected| {
+            if (!std.mem.eql(u8, &expected, &incarnation)) return error.MetadataIncarnationMismatch;
+            return;
+        }
+        self.metadata_incarnation = incarnation;
     }
 
     fn fetchHead(self: *RemoteMetadataSource) !antfly.metadata_api.MetadataHead {
@@ -7976,6 +7992,7 @@ const RemoteMetadataSource = struct {
         if (self.cached_head) |cached_head| {
             if (self.cached_snapshot) |snapshot| {
                 if (cached_head.metadata_group_id == head.metadata_group_id and
+                    std.meta.eql(cached_head.metadata_incarnation, head.metadata_incarnation) and
                     cached_head.metadata_epoch == head.metadata_epoch and
                     now_ms -| self.cached_snapshot_at_ms <= metadata_snapshot_cache_ttl_ms)
                 {
@@ -7986,7 +8003,7 @@ const RemoteMetadataSource = struct {
         }
         self.cache_mutex.unlock();
 
-        var fresh = try self.fetchSnapshotRemote();
+        var fresh = try self.fetchSnapshotRemote(head);
         errdefer freeAdminSnapshotOwned(self.alloc, &fresh);
 
         lockAtomic(&self.cache_mutex);
@@ -7994,6 +8011,7 @@ const RemoteMetadataSource = struct {
         if (self.cached_head) |cached_head| {
             if (self.cached_snapshot) |snapshot| {
                 if (cached_head.metadata_group_id == head.metadata_group_id and
+                    std.meta.eql(cached_head.metadata_incarnation, head.metadata_incarnation) and
                     cached_head.metadata_epoch == head.metadata_epoch and
                     now_ms -| self.cached_snapshot_at_ms <= metadata_snapshot_cache_ttl_ms)
                 {
@@ -8065,6 +8083,14 @@ const RemoteMetadataSource = struct {
             var executor = antfly.raft.transport.std_http_executor.StdHttpExecutor.init(scratch, .{});
             defer executor.deinit();
             var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, executor.executor());
+            const head = metadata_client.fetchHead(self.base_uris[index]) catch |err| {
+                last_err = err;
+                continue;
+            };
+            self.acceptMetadataIncarnation(head.metadata_incarnation) catch |err| {
+                last_err = err;
+                continue;
+            };
             const result = callFn(self, &metadata_client, self.base_uris[index], ctx) catch |err| {
                 last_err = err;
                 continue;
@@ -8090,6 +8116,10 @@ const RemoteMetadataSource = struct {
                 last_err = err;
                 continue;
             };
+            self.acceptMetadataIncarnation(head.metadata_incarnation) catch |err| {
+                last_err = err;
+                continue;
+            };
             self.noteMetadataApiSuccess(index);
             return head;
         }
@@ -8111,13 +8141,20 @@ const RemoteMetadataSource = struct {
                 last_err = err;
                 continue;
             };
+            self.acceptMetadataIncarnation(status.metadata_incarnation) catch |err| {
+                last_err = err;
+                continue;
+            };
             self.noteMetadataApiSuccess(index);
             return status;
         }
         return last_err;
     }
 
-    fn fetchSnapshotRemote(self: *RemoteMetadataSource) !antfly.metadata_api.AdminSnapshot {
+    fn fetchSnapshotRemote(
+        self: *RemoteMetadataSource,
+        expected_head: antfly.metadata_api.MetadataHead,
+    ) !antfly.metadata_api.AdminSnapshot {
         var last_err: anyerror = error.MissingMetadataApi;
         for (0..self.base_uris.len) |attempt| {
             const index = self.metadataApiIndexForAttempt(attempt);
@@ -8132,6 +8169,18 @@ const RemoteMetadataSource = struct {
                 continue;
             };
             defer parsed.deinit();
+            self.acceptMetadataIncarnation(parsed.value.status.metadata_incarnation) catch |err| {
+                last_err = err;
+                continue;
+            };
+            const snapshot_incarnation = parsed.value.status.metadata_incarnation orelse unreachable;
+            const head_incarnation = expected_head.metadata_incarnation orelse return error.MetadataIncarnationUnavailable;
+            if (parsed.value.status.metadata_group_id != expected_head.metadata_group_id or
+                !std.mem.eql(u8, &snapshot_incarnation, &head_incarnation))
+            {
+                last_err = error.MetadataSnapshotHeadMismatch;
+                continue;
+            }
             self.noteMetadataApiSuccess(index);
             return try cloneAdminSnapshotOwned(self.alloc, parsed.value);
         }
@@ -19048,4 +19097,21 @@ test "data runtime background maintenance is due for dense posting cadence witho
     try std.testing.expect(server.backgroundMaintenanceDue(100));
     try std.testing.expect(server.backgroundMaintenanceDue(101));
     try std.testing.expect(!server.backgroundMaintenanceDue(99));
+}
+
+test "remote metadata source pins one cluster incarnation across cache invalidation" {
+    const first: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const foreign: antfly.metadata_api.MetadataClusterIncarnation = "22222222222222222222222222222222".*;
+    var source = try RemoteMetadataSource.init(std.testing.allocator, &.{"http://metadata.invalid"});
+    defer source.deinit();
+
+    try source.acceptMetadataIncarnation(first);
+    source.invalidateCache();
+    try source.acceptMetadataIncarnation(first);
+    try std.testing.expectError(error.MetadataIncarnationMismatch, source.acceptMetadataIncarnation(foreign));
+    try std.testing.expectError(error.MetadataIncarnationUnavailable, source.acceptMetadataIncarnation(null));
+    try std.testing.expectError(
+        error.InvalidMetadataIncarnation,
+        source.acceptMetadataIncarnation(antfly.metadata.incarnation.zero),
+    );
 }

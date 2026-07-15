@@ -142,6 +142,7 @@ pub const AdminSource = struct {
         const current_status = try self.status();
         return .{
             .metadata_group_id = current_status.metadata_group_id,
+            .metadata_incarnation = current_status.metadata_incarnation,
             .metadata_epoch = current_status.metadata_epoch,
         };
     }
@@ -2947,6 +2948,8 @@ fn freeStoreStatusReport(alloc: std.mem.Allocator, report: metadata_table_manage
 
 test "metadata http server serves status and filtered admin routes" {
     const FakeSource = struct {
+        const incarnation: metadata_api.MetadataClusterIncarnation = "77777777777777777777777777777777".*;
+
         fn iface(_: *@This()) AdminSource {
             return .{
                 .ptr = undefined,
@@ -2961,12 +2964,13 @@ test "metadata http server serves status and filtered admin routes" {
         }
 
         fn head(_: *anyopaque) !metadata_api.MetadataHead {
-            return .{ .metadata_group_id = 77, .metadata_epoch = 5 };
+            return .{ .metadata_group_id = 77, .metadata_incarnation = incarnation, .metadata_epoch = 5 };
         }
 
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{
                 .metadata_group_id = 77,
+                .metadata_incarnation = incarnation,
                 .metadata_epoch = 5,
                 .metrics = .{},
                 .projected_tables = 1,
@@ -2985,7 +2989,7 @@ test "metadata http server serves status and filtered admin routes" {
 
         fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
             return .{
-                .status = .{ .metadata_group_id = 77, .metadata_epoch = 5, .metrics = .{} },
+                .status = .{ .metadata_group_id = 77, .metadata_incarnation = incarnation, .metadata_epoch = 5, .metrics = .{} },
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{
                     .{ .table_id = 1, .name = "docs", .placement_role = "data" },
                 })[0..]),
@@ -3105,6 +3109,7 @@ test "metadata http server serves status and filtered admin routes" {
 
     const publication_body = try std.json.Stringify.valueAlloc(std.testing.allocator, metadata_api.CatalogPublicationContract{
         .metadata_group_id = 77,
+        .metadata_incarnation = FakeSource.incarnation,
         .table_id = 1,
         .table_name = "docs",
         .schema_json = "",
@@ -3121,6 +3126,7 @@ test "metadata http server serves status and filtered admin routes" {
     try std.testing.expectEqual(@as(u16, 204), publication_resp.status);
     const foreign_group_publication_body = try std.json.Stringify.valueAlloc(std.testing.allocator, metadata_api.CatalogPublicationContract{
         .metadata_group_id = 78,
+        .metadata_incarnation = FakeSource.incarnation,
         .table_id = 1,
         .table_name = "docs",
         .schema_json = "",
@@ -3135,8 +3141,26 @@ test "metadata http server serves status and filtered admin routes" {
     });
     defer foreign_group_publication_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 409), foreign_group_publication_resp.status);
+    const foreign_incarnation_publication_body = try std.json.Stringify.valueAlloc(std.testing.allocator, metadata_api.CatalogPublicationContract{
+        .metadata_group_id = 77,
+        .metadata_incarnation = "78787878787878787878787878787878".*,
+        .table_id = 1,
+        .table_name = "docs",
+        .schema_json = "",
+        .indexes_json = "{}",
+        .range = .{ .group_id = 10, .table_id = 1, .start_key = "doc:a", .end_key = "doc:m" },
+    }, .{});
+    defer std.testing.allocator.free(foreign_incarnation_publication_body);
+    var foreign_incarnation_publication_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.internal_catalog_publication_check,
+        .body = foreign_incarnation_publication_body,
+    });
+    defer foreign_incarnation_publication_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), foreign_incarnation_publication_resp.status);
     const stale_publication_body = try std.json.Stringify.valueAlloc(std.testing.allocator, metadata_api.CatalogPublicationContract{
         .metadata_group_id = 77,
+        .metadata_incarnation = FakeSource.incarnation,
         .table_id = 1,
         .table_name = "docs",
         .schema_json = "",
