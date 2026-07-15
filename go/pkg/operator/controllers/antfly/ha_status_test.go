@@ -2314,7 +2314,7 @@ func TestHAFormerPrimaryFencePrecedesRejoinAndTargetsOldPrimary(t *testing.T) {
 	promotion.ObservedLSN = 12
 	promotion.SwitchLSN = 13
 	status := &antflyv1.HAStatus{LastPromotion: promotion}
-	fence := haFormerPrimaryFencePlannedAction(status)
+	fence := haFormerPrimaryFencePlannedAction(nil, status)
 	rejoin := haFormerPrimaryPlannedAction(haFormerPrimaryEvaluation{
 		Present:          true,
 		NodeID:           "primary-a",
@@ -3770,6 +3770,8 @@ func TestPlanHAContinuesCommittedFenceTransactionWhenPrimaryAdminRecovers(t *tes
 		AdminJobPhase:   haAdminJobPhaseRunning,
 		AdminError:      "connection refused",
 	}}
+	_, isolationFixture := validPhysicalIsolationReceiptFixture(time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC))
+	cluster.Status.HAStatus.PlannedActions[0].PhysicalIsolationReceipt = isolationFixture.PhysicalIsolationReceipt.DeepCopy()
 
 	plan := planHA(cluster)
 	if !plan.AutomaticPromotionAllowed || plan.PromotionStandbyName != "standby-a" {
@@ -3841,8 +3843,10 @@ func TestReconcileHAFormerPrimaryIsolationStopsOldWriterBeforeCandidateFence(t *
 	one := int32(1)
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cluster.Name + "-standalone",
-			Namespace: cluster.Namespace,
+			Name:            cluster.Name + "-standalone",
+			Namespace:       cluster.Namespace,
+			UID:             types.UID("former-primary-sts-uid"),
+			ResourceVersion: "1",
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: antflyv1.GroupVersion.String(),
 				Kind:       "AntflyCluster",
@@ -3852,12 +3856,14 @@ func TestReconcileHAFormerPrimaryIsolationStopsOldWriterBeforeCandidateFence(t *
 			}},
 		},
 		Spec:   appsv1.StatefulSetSpec{Replicas: &one},
-		Status: appsv1.StatefulSetStatus{Replicas: 1, CurrentReplicas: 1, ReadyReplicas: 1},
+		Status: appsv1.StatefulSetStatus{ObservedGeneration: 1, Replicas: 1, CurrentReplicas: 1, ReadyReplicas: 1},
 	}
+	sts.Generation = 1
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              cluster.Name + "-standalone-0",
 			Namespace:         cluster.Namespace,
+			UID:               types.UID("former-primary-pod-uid"),
 			Labels:            serviceSelectorLabels(cluster.Name, "standalone"),
 			DeletionTimestamp: ptr.To(metav1.NewTime(now)),
 			Finalizers:        []string{"test.antfly.io/keep-terminating"},
@@ -3869,7 +3875,7 @@ func TestReconcileHAFormerPrimaryIsolationStopsOldWriterBeforeCandidateFence(t *
 	// boundary reader sees it and must prevent a false isolation receipt.
 	reconciler := testHAReconciler(t, cluster, sts, lease)
 	boundary := testHAReconciler(t, sts.DeepCopy(), pod, lease.DeepCopy())
-	reconciler.BoundaryReader = boundary.Client
+	reconciler.BoundaryReader = haTestResourceVersionReader{Reader: boundary.Client, listResourceVersion: "pods-initial-rv"}
 	reconciler.Now = func() time.Time { return now }
 
 	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); !errors.Is(err, errHAStatusCheckpointed) {
@@ -3897,10 +3903,12 @@ func TestReconcileHAFormerPrimaryIsolationStopsOldWriterBeforeCandidateFence(t *
 		t.Fatal("candidate fence dependency passed while the terminating old runtime pod could still be running")
 	}
 
-	observedSTS.ResourceVersion = ""
-	observedSTS.Status = appsv1.StatefulSetStatus{}
+	observedSTS.ResourceVersion = "2"
+	observedSTS.Generation = 2
+	observedSTS.Status = appsv1.StatefulSetStatus{ObservedGeneration: 2}
 	reconciler = testHAReconciler(t, cluster, observedSTS, lease.DeepCopy())
-	reconciler.Now = func() time.Time { return now }
+	reconciler.BoundaryReader = haTestResourceVersionReader{Reader: reconciler.Client, listResourceVersion: "pods-absence-rv"}
+	reconciler.Now = func() time.Time { return now.Add(11 * time.Second) }
 	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); !errors.Is(err, errHAStatusCheckpointed) {
 		t.Fatalf("expected pod-absence checkpoint before boundary freeze, got %v", err)
 	}
@@ -3914,9 +3922,140 @@ func TestReconcileHAFormerPrimaryIsolationStopsOldWriterBeforeCandidateFence(t *
 	if action.AdminJobPhase != haAdminJobPhaseSucceeded || action.AdminJobName != haKubernetesPhysicalFenceName || action.TargetLSN != 12 {
 		t.Fatalf("physical isolation did not checkpoint the exact promotion boundary: %#v", action)
 	}
-	if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, 1) {
+	if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, 1, cluster) {
 		t.Fatal("candidate fence remained blocked after StatefulSet zero and exact old-pod absence")
 	}
+}
+
+func TestPhysicalIsolationReceiptRejectsForgedPartialAndStaleEvidence(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	cluster, action := validPhysicalIsolationReceiptFixture(now)
+	dependent := antflyv1.HAPlannedActionStatus{
+		Kind: string(haActionAcquireFence), DependsOn: string(haActionIsolateFormerPrimary),
+	}
+	if !haPhysicalIsolationSucceededWithEvidence(cluster, action) ||
+		!haPlannedActionDependenciesSucceeded([]antflyv1.HAPlannedActionStatus{action, dependent}, 1, cluster) {
+		t.Fatal("valid exact physical-isolation receipt did not release its dependency")
+	}
+
+	mutations := map[string]func(*antflyv1.HAPlannedActionStatus){
+		"missing receipt":         func(a *antflyv1.HAPlannedActionStatus) { a.PhysicalIsolationReceipt = nil },
+		"forged cluster UID":      func(a *antflyv1.HAPlannedActionStatus) { a.PhysicalIsolationReceipt.ClusterUID = "forged" },
+		"missing StatefulSet UID": func(a *antflyv1.HAPlannedActionStatus) { a.PhysicalIsolationReceipt.StatefulSetUID = "" },
+		"stale observed generation": func(a *antflyv1.HAPlannedActionStatus) {
+			a.PhysicalIsolationReceipt.IsolatedStatefulSetObservedGeneration = 1
+		},
+		"cached omission without PodList RV": func(a *antflyv1.HAPlannedActionStatus) {
+			a.PhysicalIsolationReceipt.AbsencePodListResourceVersion = ""
+		},
+		"completed before watchdog grace": func(a *antflyv1.HAPlannedActionStatus) {
+			early := metav1.NewTime(now.Add(time.Second))
+			a.CompletedAt = &early
+			a.PhysicalIsolationReceipt.CompletedAt = early.DeepCopy()
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			forged := *action.DeepCopy()
+			mutate(&forged)
+			if haPhysicalIsolationSucceededWithEvidence(cluster, forged) {
+				t.Fatal("forged or partial Succeeded action was accepted")
+			}
+			if haPlannedActionDependenciesSucceeded([]antflyv1.HAPlannedActionStatus{forged, dependent}, 1, cluster) {
+				t.Fatal("forged or partial Succeeded action released a dependent action")
+			}
+			desired := forged
+			desired.AdminJobName = ""
+			desired.AdminJobPhase = ""
+			desired.PhysicalIsolationReceipt = nil
+			preserved := haPreservePlannedActionExecution(desired, &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{forged}}, cluster)
+			if preserved.AdminJobPhase == haAdminJobPhaseSucceeded {
+				t.Fatal("forged or partial receipt survived committed-action preservation")
+			}
+		})
+	}
+	scope, ok := haPhysicalIsolationReceiptScope(action.PhysicalIsolationReceipt)
+	if !ok {
+		t.Fatal("valid fixture lost Lease scope")
+	}
+	replacement := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+		Name: "antfly-standalone", UID: types.UID("replacement-sts-uid"), ResourceVersion: "3",
+	}}
+	lease := haFenceLease(cluster, now, haFencingLeaseDefaultDurationSeconds, 1, "standby-a")
+	lease.UID = types.UID("lease-uid")
+	if err := validateCurrentPhysicalIsolationObjects(cluster, &action, replacement, lease, scope); err == nil {
+		t.Fatal("replacement StatefulSet UID was accepted against the frozen receipt")
+	}
+}
+
+func TestPhysicalIsolationReceiptRejectsLiveOldRuntimeWithoutWatchdogCapability(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	_, action := validPhysicalIsolationReceiptFixture(now)
+	action.AdminJobPhase = haAdminJobPhaseRunning
+	action.CompletedAt = nil
+	action.PhysicalIsolationReceipt.CompletedAt = nil
+	action.PhysicalIsolationReceipt.ObservedAt = nil
+	action.PhysicalIsolationReceipt.AbsenceProven = false
+	action.PhysicalIsolationReceipt.AbsencePodListResourceVersion = ""
+	action.PhysicalIsolationReceipt.WatchdogProof = nil
+	live := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "antfly-standalone-0", UID: types.UID("old-pod-uid"),
+	}, Status: corev1.PodStatus{Phase: corev1.PodRunning}}
+	if haPhysicalIsolationWatchdogFallbackProven(action, &corev1.PodList{Items: []corev1.Pod{*live}}) {
+		t.Fatal("old runtime without a runtime-originated watchdog capability proof enabled fallback")
+	}
+	if haPhysicalIsolationSucceededStructurallyWithEvidence(action) {
+		t.Fatal("live old runtime without watchdog proof produced a success receipt")
+	}
+
+	started := metav1.NewTime(now.Add(-10 * time.Second))
+	runtimeObserved := metav1.NewTime(now.Add(-time.Second))
+	live.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "antfly", ContainerID: "containerd://old-process", RestartCount: 2,
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: started}},
+	}}
+	action.FenceGeneration = 2
+	action.PhysicalIsolationReceipt.LeaseGeneration = 2
+	action.PhysicalIsolationReceipt.WatchdogProof = &antflyv1.HAPhysicalIsolationWatchdogProofStatus{
+		CapabilityVersion: 1, Active: true, LeaseName: "antfly-ha-fence", LeaseNamespace: "default",
+		TopologyID: "stable-topology", HolderNodeID: "primary-a", PodName: "antfly-standalone-0", PodUID: "old-pod-uid",
+		ContainerName: "antfly", ContainerID: "containerd://old-process", ContainerRestartCount: 2,
+		ContainerStartedAt: started, ProcessBootID: "process-boot-id", ObservedLeaseTransitions: 1, RuntimeObservedAt: runtimeObserved,
+	}
+	if !haPhysicalIsolationWatchdogFallbackProven(action, &corev1.PodList{Items: []corev1.Pod{*live}}) {
+		t.Fatal("exact runtime-originated watchdog proof did not bind to the live old process")
+	}
+	restarted := live.DeepCopy()
+	restarted.Status.ContainerStatuses[0].ContainerID = "containerd://replacement-process"
+	if haPhysicalIsolationWatchdogFallbackProven(action, &corev1.PodList{Items: []corev1.Pod{*restarted}}) {
+		t.Fatal("stale watchdog proof survived an old-Pod process replacement")
+	}
+}
+
+func validPhysicalIsolationReceiptFixture(now time.Time) (*antflyv1.AntflyCluster, antflyv1.HAPlannedActionStatus) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.UID = types.UID("cluster-uid")
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	observed := metav1.NewTime(now.Add(11 * time.Second))
+	action := antflyv1.HAPlannedActionStatus{
+		Kind: string(haActionIsolateFormerPrimary), Executor: string(haActionExecutorControllerAction),
+		StandbyName: "primary-a", TargetLSN: 12, ObservedLSN: 12, RouteFrom: "primary-a", RouteTo: "standby-a",
+		FenceAuthority: antflyv1.HAFencingAuthorityKubernetesLease, FenceHolder: "standby-a", FenceGeneration: 1,
+		AdminJobName: haKubernetesPhysicalFenceName, AdminJobPhase: haAdminJobPhaseSucceeded, CompletedAt: observed.DeepCopy(),
+	}
+	action.PhysicalIsolationReceipt = &antflyv1.HAPhysicalIsolationReceiptStatus{
+		ClusterUID: "cluster-uid", StatefulSetName: "antfly-standalone", StatefulSetUID: "sts-uid",
+		InitialStatefulSetGeneration: 1, InitialStatefulSetResourceVersion: "1",
+		InitialOldPods:                []antflyv1.HAPhysicalIsolationPodIdentity{{Name: "antfly-standalone-0", UID: "old-pod-uid"}},
+		InitialPodListResourceVersion: "pods-initial", LeaseName: "antfly-ha-fence", LeaseUID: "lease-uid",
+		LeaseResourceVersion: "1", LeaseHolder: "standby-a", LeaseGeneration: 1,
+		LeaseScope:        antflyv1.HAPhysicalIsolationLeaseScope{ClusterID: 100, TimelineID: 4, Epoch: 6, CurrentPrimaryID: "primary-a", PrimaryLSN: 12},
+		LeaseTransferTime: metav1.NewTime(now), WatchdogGraceSeconds: 10,
+		IsolatedStatefulSetGeneration: 2, IsolatedStatefulSetObservedGeneration: 2,
+		IsolatedStatefulSetResourceVersion: "2", ObservedLeaseResourceVersion: "2", AbsenceProven: true,
+		AbsencePodListResourceVersion: "pods-absence", FrozenBoundaryLSN: 12, ObservedAt: observed.DeepCopy(), CompletedAt: observed.DeepCopy(),
+	}
+	return cluster, action
 }
 
 func TestUpdateHAStatusBlocksAutomaticPromotionWithoutStandbyAdminURL(t *testing.T) {
@@ -5692,23 +5831,44 @@ func haPlannedActionByKind(actions []antflyv1.HAPlannedActionStatus, kind haActi
 
 func haFenceLease(cluster *antflyv1.AntflyCluster, renewTime time.Time, durationSeconds int32, transitions int32, holder string) *coordinationv1.Lease {
 	renew := metav1.NewMicroTime(renewTime)
+	acquire := metav1.NewMicroTime(renewTime)
 	annotations := map[string]string{}
 	if scope, ok := haCurrentFencingLeaseScope(cluster); ok {
 		annotations = scope.annotations()
 	}
 	return &coordinationv1.Lease{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        haFencingLeaseName(cluster),
-			Namespace:   cluster.Namespace,
-			Annotations: annotations,
+			Name:            haFencingLeaseName(cluster),
+			Namespace:       cluster.Namespace,
+			UID:             types.UID("ha-fence-lease-uid"),
+			ResourceVersion: "1",
+			Annotations:     annotations,
 		},
 		Spec: coordinationv1.LeaseSpec{
 			HolderIdentity:       &holder,
 			LeaseDurationSeconds: &durationSeconds,
+			AcquireTime:          &acquire,
 			RenewTime:            &renew,
 			LeaseTransitions:     &transitions,
 		},
 	}
+}
+
+type haTestResourceVersionReader struct {
+	client.Reader
+	listResourceVersion string
+}
+
+func (r haTestResourceVersionReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if err := r.Reader.List(ctx, list, opts...); err != nil {
+		return err
+	}
+	accessor, err := meta.ListAccessor(list)
+	if err != nil {
+		return err
+	}
+	accessor.SetResourceVersion(r.listResourceVersion)
+	return nil
 }
 
 func testHAReconciler(t *testing.T, objects ...client.Object) *AntflyClusterReconciler {

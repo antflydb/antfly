@@ -1821,6 +1821,13 @@ type HAStatus struct {
 	// +optional
 	PrimaryAdminFailureThresholdMet bool `json:"primaryAdminFailureThresholdMet,omitempty"`
 
+	// PrimaryWatchdogProof is the last runtime-originated, authenticated proof
+	// that the exact primary process had the Kubernetes Lease watchdog active.
+	// The operator retains it across an admin outage only for binding to the
+	// same live Pod/container incarnation at a later isolation boundary.
+	// +optional
+	PrimaryWatchdogProof *HAWatchdogProofStatus `json:"primaryWatchdogProof,omitempty"`
+
 	// DesiredStandbyCount is the count requested by spec.highAvailability.
 	// +optional
 	DesiredStandbyCount int32 `json:"desiredStandbyCount,omitempty"`
@@ -1885,6 +1892,31 @@ type HAStatus struct {
 	// never appears in spec and cannot be self-asserted by a caller.
 	// +optional
 	StartupGate *HAStartupGateStatus `json:"startupGate,omitempty"`
+}
+
+// HAWatchdogProofStatus records an authenticated primary runtime observation.
+// It is not itself a fencing receipt: physical isolation additionally binds it
+// to the uncached Kubernetes Pod and container incarnation.
+type HAWatchdogProofStatus struct {
+	CapabilityVersion int32 `json:"capabilityVersion"`
+
+	Active bool `json:"active"`
+
+	LeaseName string `json:"leaseName"`
+
+	LeaseNamespace string `json:"leaseNamespace"`
+
+	TopologyID string `json:"topologyID"`
+
+	HolderNodeID string `json:"holderNodeID"`
+
+	PodUID string `json:"podUID"`
+
+	ProcessBootID string `json:"processBootID"`
+
+	ObservedLeaseTransitions int32 `json:"observedLeaseTransitions"`
+
+	ObservedAt metav1.Time `json:"observedAt"`
 }
 
 // HAStartupGateStatus reports whether the exact activated target is eligible.
@@ -2019,6 +2051,147 @@ type HAFencingStatus struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// HAPhysicalIsolationPodIdentity binds a physical-isolation intent to one
+// exact former-primary Pod incarnation. Pod names alone are reusable and are
+// therefore never sufficient evidence at this safety boundary.
+type HAPhysicalIsolationPodIdentity struct {
+	Name string `json:"name"`
+
+	UID string `json:"uid"`
+}
+
+// HAPhysicalIsolationLeaseScope records the complete topology scope frozen in
+// the Kubernetes fencing Lease at holder transfer.
+type HAPhysicalIsolationLeaseScope struct {
+	ClusterID uint64 `json:"clusterID"`
+
+	ShardID uint64 `json:"shardID,omitempty"`
+
+	TableID uint64 `json:"tableID,omitempty"`
+
+	TimelineID uint64 `json:"timelineID"`
+
+	Epoch uint64 `json:"epoch"`
+
+	CurrentPrimaryID string `json:"currentPrimaryID"`
+
+	PrimaryLSN uint64 `json:"primaryLSN"`
+}
+
+// HAPhysicalIsolationReceiptStatus is the typed, immutable proof that an
+// automatic failover crossed the Kubernetes physical-isolation boundary. The
+// intent half is checkpointed before the old StatefulSet is scaled. The final
+// half is populated only from uncached API-server observations after that
+// mutation. AbsenceProven is the preferred proof; a node-partition fallback is
+// permitted only after the runtime Lease watchdog grace has elapsed.
+type HAPhysicalIsolationReceiptStatus struct {
+	ClusterUID string `json:"clusterUID"`
+
+	StatefulSetName string `json:"statefulSetName"`
+
+	StatefulSetUID string `json:"statefulSetUID"`
+
+	InitialStatefulSetGeneration int64 `json:"initialStatefulSetGeneration"`
+
+	InitialStatefulSetResourceVersion string `json:"initialStatefulSetResourceVersion"`
+
+	// +optional
+	// +kubebuilder:validation:MaxItems=256
+	InitialOldPods []HAPhysicalIsolationPodIdentity `json:"initialOldPods,omitempty"`
+
+	InitialPodListResourceVersion string `json:"initialPodListResourceVersion"`
+
+	LeaseName string `json:"leaseName"`
+
+	LeaseUID string `json:"leaseUID"`
+
+	LeaseResourceVersion string `json:"leaseResourceVersion"`
+
+	LeaseHolder string `json:"leaseHolder"`
+
+	LeaseGeneration uint64 `json:"leaseGeneration"`
+
+	LeaseScope HAPhysicalIsolationLeaseScope `json:"leaseScope"`
+
+	LeaseTransferTime metav1.Time `json:"leaseTransferTime"`
+
+	// WatchdogGraceSeconds is the frozen runtime self-fencing grace. It is an
+	// extension point for alternative watchdog policies, not a controller-local
+	// sleep knob, and must be positive for every completed receipt.
+	WatchdogGraceSeconds int32 `json:"watchdogGraceSeconds"`
+
+	// WatchdogProof is optional while Pod absence remains possible, but is
+	// mandatory for the live-Pod fallback after WatchdogGraceSeconds.
+	// +optional
+	WatchdogProof *HAPhysicalIsolationWatchdogProofStatus `json:"watchdogProof,omitempty"`
+
+	// Final observations below are absent until the controller has re-read the
+	// exact objects through its uncached APIReader after scaling to zero.
+	// +optional
+	IsolatedStatefulSetGeneration int64 `json:"isolatedStatefulSetGeneration,omitempty"`
+
+	// +optional
+	IsolatedStatefulSetObservedGeneration int64 `json:"isolatedStatefulSetObservedGeneration,omitempty"`
+
+	// +optional
+	IsolatedStatefulSetResourceVersion string `json:"isolatedStatefulSetResourceVersion,omitempty"`
+
+	// +optional
+	ObservedLeaseResourceVersion string `json:"observedLeaseResourceVersion,omitempty"`
+
+	// AbsenceProven distinguishes the preferred uncached PodList proof from the
+	// watchdog fallback used when a partitioned kubelet leaves a Running Pod
+	// object behind indefinitely.
+	// +optional
+	AbsenceProven bool `json:"absenceProven,omitempty"`
+
+	// +optional
+	AbsencePodListResourceVersion string `json:"absencePodListResourceVersion,omitempty"`
+
+	// +optional
+	FrozenBoundaryLSN uint64 `json:"frozenBoundaryLSN,omitempty"`
+
+	// +optional
+	ObservedAt *metav1.Time `json:"observedAt,omitempty"`
+
+	// +optional
+	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+}
+
+// HAPhysicalIsolationWatchdogProofStatus binds the runtime-originated proof to
+// the exact old Pod and container process observed through the uncached API.
+type HAPhysicalIsolationWatchdogProofStatus struct {
+	CapabilityVersion int32 `json:"capabilityVersion"`
+
+	Active bool `json:"active"`
+
+	LeaseName string `json:"leaseName"`
+
+	LeaseNamespace string `json:"leaseNamespace"`
+
+	TopologyID string `json:"topologyID"`
+
+	HolderNodeID string `json:"holderNodeID"`
+
+	PodName string `json:"podName"`
+
+	PodUID string `json:"podUID"`
+
+	ContainerName string `json:"containerName"`
+
+	ContainerID string `json:"containerID"`
+
+	ContainerRestartCount int32 `json:"containerRestartCount"`
+
+	ContainerStartedAt metav1.Time `json:"containerStartedAt"`
+
+	ProcessBootID string `json:"processBootID"`
+
+	ObservedLeaseTransitions int32 `json:"observedLeaseTransitions"`
+
+	RuntimeObservedAt metav1.Time `json:"runtimeObservedAt"`
+}
+
 // HAPlannedActionStatus reports one planned HA operator action.
 type HAPlannedActionStatus struct {
 	Kind string `json:"kind,omitempty"`
@@ -2149,6 +2322,11 @@ type HAPlannedActionStatus struct {
 	// portable publish, restore, or prune Job.
 	// +optional
 	SeedArtifactReceipt *HASeedArtifactReceiptStatus `json:"seedArtifactReceipt,omitempty"`
+
+	// PhysicalIsolationReceipt is the typed Kubernetes object-incarnation and
+	// timing proof required for a successful IsolateFormerPrimary action.
+	// +optional
+	PhysicalIsolationReceipt *HAPhysicalIsolationReceiptStatus `json:"physicalIsolationReceipt,omitempty"`
 
 	// AdminJobName records direct-admin-api for typed execution or the Kubernetes Job created for CLI-backed execution.
 	// +optional

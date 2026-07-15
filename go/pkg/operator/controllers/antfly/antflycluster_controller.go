@@ -4343,7 +4343,7 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			}
 			continue
 		}
-		if !haPlannedActionDependenciesSucceededForStatus(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i) {
+		if !haPlannedActionDependenciesSucceededForStatus(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i, cluster) {
 			if action.AdminJobName == "" && action.AdminJobPhase == "" {
 				action.AdminJobPhase = haAdminJobPhaseWaitingDependency
 			}
@@ -7453,7 +7453,7 @@ func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(ctx context
 			action.StandbyName == "" {
 			continue
 		}
-		if !haPlannedActionDependenciesSucceededForStatus(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i) {
+		if !haPlannedActionDependenciesSucceededForStatus(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i, cluster) {
 			continue
 		}
 		if action.AdminResult == nil {
@@ -7706,7 +7706,7 @@ func (r *AntflyClusterReconciler) updateHAFormerPrimaryFromAdminJobs(ctx context
 			action.AdminJobName == "" {
 			continue
 		}
-		if !haPlannedActionDependenciesSucceededForStatus(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i) {
+		if !haPlannedActionDependenciesSucceededForStatus(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i, cluster) {
 			continue
 		}
 		if action.AdminResult == nil {
@@ -9338,7 +9338,7 @@ func (r *AntflyClusterReconciler) reconcileHAPrimaryRoute(ctx context.Context, c
 		if action.Kind != string(haActionUpdatePrimaryRoute) {
 			continue
 		}
-		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
+		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i, cluster) {
 			return nil
 		}
 		if !haPrimaryRouteActionHasPromotionEvidence(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i) {
@@ -9416,7 +9416,7 @@ func haPriorAdminActionsSucceeded(actions []antflyv1.HAPlannedActionStatus) bool
 	return true
 }
 
-func haPlannedActionDependenciesSucceeded(actions []antflyv1.HAPlannedActionStatus, index int) bool {
+func haPlannedActionDependenciesSucceeded(actions []antflyv1.HAPlannedActionStatus, index int, clusters ...*antflyv1.AntflyCluster) bool {
 	if index < 0 || index >= len(actions) {
 		return false
 	}
@@ -9430,6 +9430,12 @@ func haPlannedActionDependenciesSucceeded(actions []antflyv1.HAPlannedActionStat
 			continue
 		}
 		if dependency.Executor == string(haActionExecutorControllerAction) {
+			if haActionKind(dependency.Kind) == haActionIsolateFormerPrimary {
+				if len(clusters) > 0 && clusters[0] != nil {
+					return haPhysicalIsolationSucceededWithEvidence(clusters[0], dependency)
+				}
+				return haPhysicalIsolationSucceededStructurallyWithEvidence(dependency)
+			}
 			return dependency.AdminJobPhase == haAdminJobPhaseSucceeded
 		}
 		if dependency.AdminJobName != haAdminDirectAPIName && !haPlannedActionRequiresAdminTarget(dependency) {
@@ -9440,8 +9446,8 @@ func haPlannedActionDependenciesSucceeded(actions []antflyv1.HAPlannedActionStat
 	return false
 }
 
-func haPlannedActionDependenciesSucceededForStatus(status *antflyv1.HAStatus, actions []antflyv1.HAPlannedActionStatus, index int) bool {
-	if !haPlannedActionDependenciesSucceeded(actions, index) {
+func haPlannedActionDependenciesSucceededForStatus(status *antflyv1.HAStatus, actions []antflyv1.HAPlannedActionStatus, index int, clusters ...*antflyv1.AntflyCluster) bool {
+	if !haPlannedActionDependenciesSucceeded(actions, index, clusters...) {
 		return false
 	}
 	action := actions[index]
@@ -10152,7 +10158,7 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 			action.StandbyName == "" {
 			continue
 		}
-		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
+		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i, cluster) {
 			continue
 		}
 		if !haPromotionStatusMatches(cluster.Status.HAStatus.LastPromotion, identity, action) {

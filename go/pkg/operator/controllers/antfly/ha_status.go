@@ -457,7 +457,7 @@ func (r *AntflyClusterReconciler) observeHAFormerPrimaryFenceStatus(ctx context.
 	if ha == nil || promotion == nil || strings.TrimSpace(promotion.OldPrimaryID) == "" {
 		return
 	}
-	if haSucceededFormerPrimaryIsolation(cluster.Status.HAStatus, promotion) != nil {
+	if haSucceededFormerPrimaryIsolation(cluster, cluster.Status.HAStatus, promotion) != nil {
 		haSetFormerPrimaryFenceObserved(cluster.Status.HAStatus, promotion, true)
 		return
 	}
@@ -911,7 +911,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 	}
 	plan.FormerPrimary = haEvaluateFormerPrimary(status)
 	formerPrimaryFenceDependency := haActionFenceFormerPrimary
-	if action := haFormerPrimaryFencePlannedAction(status); action.Kind != "" {
+	if action := haFormerPrimaryFencePlannedAction(cluster, status); action.Kind != "" {
 		formerPrimaryFenceDependency = action.Kind
 		plan.Actions = append(plan.Actions, action)
 	}
@@ -952,12 +952,12 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 	return plan
 }
 
-func haFormerPrimaryFencePlannedAction(status *antflyv1.HAStatus) haPlannedAction {
+func haFormerPrimaryFencePlannedAction(cluster *antflyv1.AntflyCluster, status *antflyv1.HAStatus) haPlannedAction {
 	promotion := haPromotionReceipt(status)
 	if promotion == nil {
 		return haPlannedAction{}
 	}
-	if isolated := haSucceededFormerPrimaryIsolation(status, promotion); isolated != nil {
+	if isolated := haSucceededFormerPrimaryIsolation(cluster, status, promotion); isolated != nil {
 		return haPlannedAction{
 			Kind:            haActionIsolateFormerPrimary,
 			StandbyName:     promotion.OldPrimaryID,
@@ -986,7 +986,7 @@ func haFormerPrimaryFencePlannedAction(status *antflyv1.HAStatus) haPlannedActio
 	}
 }
 
-func haSucceededFormerPrimaryIsolation(status *antflyv1.HAStatus, promotion *antflyv1.HAPromotionStatus) *antflyv1.HAPlannedActionStatus {
+func haSucceededFormerPrimaryIsolation(cluster *antflyv1.AntflyCluster, status *antflyv1.HAStatus, promotion *antflyv1.HAPromotionStatus) *antflyv1.HAPlannedActionStatus {
 	if status == nil || promotion == nil || promotion.FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
 		promotion.FenceGeneration == 0 || strings.TrimSpace(promotion.OldPrimaryID) == "" ||
 		strings.TrimSpace(promotion.PromotedStandbyID) == "" || haPromotionRequiredLSN(promotion) == 0 {
@@ -995,8 +995,7 @@ func haSucceededFormerPrimaryIsolation(status *antflyv1.HAStatus, promotion *ant
 	for i := range status.PlannedActions {
 		action := &status.PlannedActions[i]
 		if haActionKind(action.Kind) != haActionIsolateFormerPrimary ||
-			action.AdminJobPhase != haAdminJobPhaseSucceeded ||
-			action.AdminJobName != haKubernetesPhysicalFenceName ||
+			!haPhysicalIsolationSucceededWithEvidence(cluster, *action) ||
 			strings.TrimSpace(action.StandbyName) != strings.TrimSpace(promotion.OldPrimaryID) ||
 			strings.TrimSpace(action.RouteTo) != strings.TrimSpace(promotion.PromotedStandbyID) ||
 			action.FenceAuthority != promotion.FenceAuthority ||
@@ -1053,7 +1052,7 @@ func applyHAPlanStatus(cluster *antflyv1.AntflyCluster, plan haPlan) {
 		plan.Actions[i].TargetLocalNodeID = uint64(cluster.Spec.Standalone.NodeID)
 		plan.Actions[i].TargetReplicaID = 1
 	}
-	cluster.Status.HAStatus.PlannedActions = haPlannedActionStatuses(plan.Actions, ha, cluster.Status.HAStatus)
+	cluster.Status.HAStatus.PlannedActions = haPlannedActionStatuses(plan.Actions, ha, cluster.Status.HAStatus, cluster)
 	cluster.Status.HAStatus.PrimaryRoute = haPrimaryRouteStatus(plan.PrimaryRoute)
 	cluster.Status.HAStatus.Sync = haSyncStatus(plan.SyncPolicy)
 	cluster.Status.HAStatus.FormerPrimary = haFormerPrimaryStatus(plan.FormerPrimary)
@@ -1073,7 +1072,7 @@ func haSyncStatus(evaluation haSyncEvaluation) antflyv1.HASyncStatus {
 	}
 }
 
-func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) []antflyv1.HAPlannedActionStatus {
+func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus, clusters ...*antflyv1.AntflyCluster) []antflyv1.HAPlannedActionStatus {
 	completedRewind := haCompletedFormerPrimaryRewind(status)
 	for _, action := range actions {
 		if action.Kind == haActionRewindFormerPrimary {
@@ -1158,7 +1157,7 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 			statusAction.RetryGeneration = ha.Admin.RetryGeneration
 		}
 		statusAction.OperationID = haPlannedActionOperationID(statusAction)
-		statusAction = haPreservePlannedActionExecution(statusAction, status)
+		statusAction = haPreservePlannedActionExecution(statusAction, status, clusters...)
 		out = append(out, statusAction)
 	}
 	return out
@@ -1362,7 +1361,7 @@ func haCompletedFormerPrimaryRewind(status *antflyv1.HAStatus) *antflyv1.HAPlann
 	return nil
 }
 
-func haPreservePlannedActionExecution(action antflyv1.HAPlannedActionStatus, status *antflyv1.HAStatus) antflyv1.HAPlannedActionStatus {
+func haPreservePlannedActionExecution(action antflyv1.HAPlannedActionStatus, status *antflyv1.HAStatus, clusters ...*antflyv1.AntflyCluster) antflyv1.HAPlannedActionStatus {
 	if status == nil {
 		return action
 	}
@@ -1382,6 +1381,15 @@ func haPreservePlannedActionExecution(action antflyv1.HAPlannedActionStatus, sta
 			previous.AdminJobPhase == haAdminJobPhaseSucceeded &&
 			!haFormerPrimaryDemotePreserveAllowed(status, previous) {
 			return action
+		}
+		if haActionKind(previous.Kind) == haActionIsolateFormerPrimary && previous.AdminJobPhase == haAdminJobPhaseSucceeded {
+			valid := haPhysicalIsolationSucceededStructurallyWithEvidence(previous)
+			if len(clusters) > 0 && clusters[0] != nil {
+				valid = haPhysicalIsolationSucceededWithEvidence(clusters[0], previous)
+			}
+			if !valid {
+				return action
+			}
 		}
 		if haActionRequiresAdminResult(haActionKind(previous.Kind)) &&
 			previous.AdminJobPhase == haAdminJobPhaseSucceeded &&
@@ -1428,6 +1436,9 @@ func haPreservePlannedActionExecution(action antflyv1.HAPlannedActionStatus, sta
 		}
 		if previous.SeedArtifactReceipt != nil {
 			action.SeedArtifactReceipt = previous.SeedArtifactReceipt.DeepCopy()
+		}
+		if previous.PhysicalIsolationReceipt != nil {
+			action.PhysicalIsolationReceipt = previous.PhysicalIsolationReceipt.DeepCopy()
 		}
 		return action
 	}
@@ -3016,7 +3027,15 @@ func haCommittedFormerPrimaryIsolationAction(ha *antflyv1.HighAvailabilitySpec, 
 			continue
 		}
 		switch action.AdminJobPhase {
-		case haAdminJobPhaseRunning, haAdminJobPhaseSucceeded:
+		case haAdminJobPhaseRunning:
+			if !haPhysicalIsolationIntentStructurallyMatches(*action) {
+				continue
+			}
+			return action
+		case haAdminJobPhaseSucceeded:
+			if !haPhysicalIsolationSucceededStructurallyWithEvidence(*action) {
+				continue
+			}
 			return action
 		default:
 			continue
