@@ -46,6 +46,19 @@ pub fn hashSource(source: []const u8) u64 {
     return std.hash.XxHash64.hash(0, source);
 }
 
+pub fn hashEmbeddingSource(source: []const u8, semantic_producer: []const u8) u64 {
+    if (semantic_producer.len == 0) return hashSource(source);
+    var hasher = std.hash.XxHash64.init(0);
+    var length: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &length, @intCast(source.len), .little);
+    hasher.update(&length);
+    hasher.update(source);
+    std.mem.writeInt(u64, &length, @intCast(semantic_producer.len), .little);
+    hasher.update(&length);
+    hasher.update(semantic_producer);
+    return hasher.final();
+}
+
 pub fn encodeDenseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, vector: []const f32) ![]u8 {
     const payload_len = @sizeOf(u32) + vector.len * @sizeOf(u32);
     const total_len = header_len + payload_len;
@@ -392,6 +405,19 @@ test "artifact codec encodes dense embedding with version and source hash" {
     } else {
         try std.testing.expect(native_endian != .little);
     }
+}
+
+test "embedding source hash binds semantic producer identity" {
+    try std.testing.expectEqual(hashSource("same text"), hashEmbeddingSource("same text", ""));
+    try std.testing.expectEqual(
+        hashEmbeddingSource("same text", "{\"model\":\"embed-v1\"}"),
+        hashEmbeddingSource("same text", "{\"model\":\"embed-v1\"}"),
+    );
+    try std.testing.expect(
+        hashEmbeddingSource("same text", "{\"model\":\"embed-v1\"}") !=
+            hashEmbeddingSource("same text", "{\"model\":\"embed-v2\"}"),
+    );
+    try std.testing.expect(hashEmbeddingSource("ab", "c") != hashEmbeddingSource("a", "bc"));
 }
 
 test "artifact codec falls back to scratch for unaligned dense embedding view" {

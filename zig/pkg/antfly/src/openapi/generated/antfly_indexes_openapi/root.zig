@@ -31,6 +31,7 @@ pub const GraphQueryParams = types.GraphQueryParams;
 pub const GraphQueryResult = types.GraphQueryResult;
 pub const GraphQueryType = types.GraphQueryType;
 pub const GraphResultNode = types.GraphResultNode;
+pub const GraphSourceArtifactStatus = types.GraphSourceArtifactStatus;
 pub const IndexConfig = types.IndexConfig;
 pub const IndexExecutionConfig = types.IndexExecutionConfig;
 pub const IndexStats = types.IndexStats;

@@ -24,8 +24,6 @@ from .algebraic_index_stats_planner_last_decision import AlgebraicIndexStatsPlan
 from .algebraic_index_stats_promotion import AlgebraicIndexStatsPromotion
 from .algebraic_index_stats_resolution import AlgebraicIndexStatsResolution
 from .algebraic_index_stats_resolver_replay import AlgebraicIndexStatsResolverReplay
-from .algebraic_index_stats_source_artifact import AlgebraicIndexStatsSourceArtifact
-from .algebraic_index_stats_source_artifacts_item import AlgebraicIndexStatsSourceArtifactsItem
 from .analyses import Analyses
 from .analyses_result import AnalysesResult
 from .answer_agent_result import AnswerAgentResult
@@ -267,8 +265,6 @@ from .graph_index_stats_index_type import GraphIndexStatsIndexType
 from .graph_index_stats_promotion import GraphIndexStatsPromotion
 from .graph_index_stats_resolution import GraphIndexStatsResolution
 from .graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
-from .graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
-from .graph_index_stats_source_artifacts_item import GraphIndexStatsSourceArtifactsItem
 from .graph_node_selector import GraphNodeSelector
 from .graph_query import GraphQuery
 from .graph_query_params import GraphQueryParams
@@ -278,6 +274,8 @@ from .graph_query_type import GraphQueryType
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
+from .graph_source_artifact_status import GraphSourceArtifactStatus
+from .graph_source_artifact_status_format import GraphSourceArtifactStatusFormat
 from .ground_truth import GroundTruth
 from .image_url import ImageURL
 from .image_url_content_part import ImageURLContentPart
@@ -696,8 +694,6 @@ __all__ = (
     "AlgebraicIndexStatsPromotion",
     "AlgebraicIndexStatsResolution",
     "AlgebraicIndexStatsResolverReplay",
-    "AlgebraicIndexStatsSourceArtifact",
-    "AlgebraicIndexStatsSourceArtifactsItem",
     "Analyses",
     "AnalysesResult",
     "AnswerAgentResult",
@@ -937,8 +933,6 @@ __all__ = (
     "GraphIndexStatsPromotion",
     "GraphIndexStatsResolution",
     "GraphIndexStatsResolverReplay",
-    "GraphIndexStatsSourceArtifact",
-    "GraphIndexStatsSourceArtifactsItem",
     "GraphNodeSelector",
     "GraphQuery",
     "GraphQueryParams",
@@ -948,6 +942,8 @@ __all__ = (
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
+    "GraphSourceArtifactStatus",
+    "GraphSourceArtifactStatusFormat",
     "GroundTruth",
     "ImageURL",
     "ImageURLContentPart",

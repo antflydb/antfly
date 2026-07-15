@@ -4022,6 +4022,7 @@ pub const IndexManager = struct {
                     });
                 }
                 if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name, embedding_name)) {
+                    const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
                     try requests.append(alloc, .{
                         .kind = .dense_embedding,
                         .index_name = try alloc.dupe(u8, entry.config.name),
@@ -4035,6 +4036,7 @@ pub const IndexManager = struct {
                         .chunk_overlap = chunk_cfg.chunk_overlap,
                         .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                         .full_text_index = chunk_cfg.full_text_index,
+                        .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
                         .execution_json = if (chunk_cfg.embedding_execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.embedding_execution_json) else "",
                     });
                 }
@@ -4080,6 +4082,7 @@ pub const IndexManager = struct {
                                 .chunk_overlap = chunk_cfg.chunk_overlap,
                                 .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                                 .full_text_index = chunk_cfg.full_text_index,
+                                .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
                                 .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
                             });
                         }
@@ -4094,6 +4097,7 @@ pub const IndexManager = struct {
                                 .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
                                 .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
                                 .expected_dims = entry.dims,
+                                .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
                                 .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
                             });
                         }
@@ -4128,11 +4132,13 @@ pub const IndexManager = struct {
                         .execution_json = if (chunk_cfg.chunking_execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunking_execution_json) else "",
                     });
                 }
+                const embedding_name = if (chunk_cfg.embedding_name) |name| name else entry.config.name;
+                const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
                 try requests.append(alloc, .{
                     .kind = .sparse_embedding,
                     .index_name = try alloc.dupe(u8, entry.config.name),
                     .artifact_name = try alloc.dupe(u8, chunk_cfg.artifact_name),
-                    .embedding_name = if (chunk_cfg.embedding_name) |embedding_name| try alloc.dupe(u8, embedding_name) else try alloc.dupe(u8, entry.config.name),
+                    .embedding_name = try alloc.dupe(u8, embedding_name),
                     .doc_key = try alloc.dupe(u8, doc_key),
                     .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
                     .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
@@ -4140,6 +4146,7 @@ pub const IndexManager = struct {
                     .chunk_overlap = chunk_cfg.chunk_overlap,
                     .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                     .full_text_index = chunk_cfg.full_text_index,
+                    .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
                     .execution_json = if (chunk_cfg.embedding_execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.embedding_execution_json) else "",
                 });
             } else {
@@ -4183,6 +4190,7 @@ pub const IndexManager = struct {
                                 .chunk_overlap = chunk_cfg.chunk_overlap,
                                 .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                                 .full_text_index = chunk_cfg.full_text_index,
+                                .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
                                 .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
                             });
                         }
@@ -4195,6 +4203,7 @@ pub const IndexManager = struct {
                             .doc_key = try alloc.dupe(u8, doc_key),
                             .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
                             .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
+                            .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
                             .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
                         });
                     }
@@ -7604,12 +7613,19 @@ pub const IndexManager = struct {
                 var multi_source_chunk_backing: ?bool = null;
                 var multi_source_vector_space: ?[]const u8 = null;
                 var multi_source_has_implicit_vector_space = false;
+                var multi_source_implicit_producer: ?[]const u8 = null;
                 for (dense_cfg.embedding_names) |embedding_name| {
                     const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
                     if (embedding_cfg.expected_dims > 0 and embedding_cfg.expected_dims != dense_cfg.dims) return error.InvalidIndexConfig;
                     if (dense_cfg.embedding_names.len > 1) {
                         if (embedding_cfg.vector_space.len == 0) {
                             multi_source_has_implicit_vector_space = true;
+                            if (embedding_cfg.producer_json.len == 0) return error.InvalidIndexConfig;
+                            if (multi_source_implicit_producer) |expected| {
+                                if (!std.mem.eql(u8, expected, embedding_cfg.producer_json)) return error.InvalidIndexConfig;
+                            } else {
+                                multi_source_implicit_producer = embedding_cfg.producer_json;
+                            }
                         } else {
                             if (multi_source_vector_space) |expected| {
                                 if (!std.mem.eql(u8, expected, embedding_cfg.vector_space)) return error.InvalidIndexConfig;
@@ -7761,12 +7777,19 @@ pub const IndexManager = struct {
                 var multi_source_chunk_backing: ?bool = null;
                 var multi_source_vector_space: ?[]const u8 = null;
                 var multi_source_has_implicit_vector_space = false;
+                var multi_source_implicit_producer: ?[]const u8 = null;
                 for (sparse_cfg.embedding_names) |embedding_name| {
                     const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
                     if (embedding_cfg.expected_dims != 0) return error.InvalidIndexConfig;
                     if (sparse_cfg.embedding_names.len > 1) {
                         if (embedding_cfg.vector_space.len == 0) {
                             multi_source_has_implicit_vector_space = true;
+                            if (embedding_cfg.producer_json.len == 0) return error.InvalidIndexConfig;
+                            if (multi_source_implicit_producer) |expected| {
+                                if (!std.mem.eql(u8, expected, embedding_cfg.producer_json)) return error.InvalidIndexConfig;
+                            } else {
+                                multi_source_implicit_producer = embedding_cfg.producer_json;
+                            }
                         } else {
                             if (multi_source_vector_space) |expected| {
                                 if (!std.mem.eql(u8, expected, embedding_cfg.vector_space)) return error.InvalidIndexConfig;
@@ -8095,6 +8118,8 @@ pub const IndexManager = struct {
             .dense_vector => {
                 const dense_cfg = try parseDenseConfig(self.alloc, cfg.config_json);
                 defer dense_cfg.deinit(self.alloc);
+                const semantic_producer = try parseEmbeddingSemanticProducerAlloc(self.alloc, cfg.config_json);
+                defer if (semantic_producer) |value| self.alloc.free(value);
                 if (try parseDenseGeneratorConfig(self.alloc, cfg.config_json)) |generator| {
                     defer generator.deinit(self.alloc);
                     const chunk_cfg = resolveChunkGenerator(self, generator);
@@ -8118,6 +8143,7 @@ pub const IndexManager = struct {
                         .source_template = if (chunk_cfg.source_template.len > 0) chunk_cfg.source_template else "",
                         .source_artifact_name = if (generatorHasChunking(chunk_cfg)) chunk_cfg.artifact_name else "",
                         .expected_dims = dense_cfg.dims,
+                        .producer_json = semantic_producer orelse "",
                         .chunk_size = chunk_cfg.chunk_size,
                         .chunk_overlap = chunk_cfg.chunk_overlap,
                         .execution_json = if (chunk_cfg.embedding_execution_json.len > 0) chunk_cfg.embedding_execution_json else "",
@@ -8125,6 +8151,8 @@ pub const IndexManager = struct {
                 }
             },
             .sparse_vector => {
+                const semantic_producer = try parseEmbeddingSemanticProducerAlloc(self.alloc, cfg.config_json);
+                defer if (semantic_producer) |value| self.alloc.free(value);
                 if (try parseSparseGeneratorConfig(self.alloc, cfg.config_json)) |generator| {
                     defer generator.deinit(self.alloc);
                     const chunk_cfg = resolveChunkGenerator(self, generator);
@@ -8141,6 +8169,17 @@ pub const IndexManager = struct {
                             .full_text_index = chunk_cfg.full_text_index,
                         })) or changed;
                     }
+                    changed = (try self.ensureEmbeddingEnrichment(.{
+                        .name = if (chunk_cfg.embedding_name) |embedding_name| embedding_name else cfg.name,
+                        .kind = .embedding,
+                        .source_field = chunk_cfg.source_field,
+                        .source_template = if (chunk_cfg.source_template.len > 0) chunk_cfg.source_template else "",
+                        .source_artifact_name = if (generatorHasChunking(chunk_cfg)) chunk_cfg.artifact_name else "",
+                        .producer_json = semantic_producer orelse "",
+                        .chunk_size = chunk_cfg.chunk_size,
+                        .chunk_overlap = chunk_cfg.chunk_overlap,
+                        .execution_json = if (chunk_cfg.embedding_execution_json.len > 0) chunk_cfg.embedding_execution_json else "",
+                    })) or changed;
                 }
             },
             .graph => {
@@ -8202,6 +8241,7 @@ pub const IndexManager = struct {
                 !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 existing.expected_dims != cfg.expected_dims or
                 !std.mem.eql(u8, existing.vector_space, cfg.vector_space) or
+                !std.mem.eql(u8, existing.producer_json, cfg.producer_json) or
                 !std.mem.eql(u8, existing.execution_json, cfg.execution_json))
             {
                 return error.ConflictingEnrichmentConfig;
@@ -14106,6 +14146,16 @@ fn cloneOwnedStrings(alloc: Allocator, values: []const []const u8) ![][]u8 {
     return cloned;
 }
 
+fn parseEmbeddingSemanticProducerAlloc(alloc: Allocator, raw: []const u8) !?[]u8 {
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidIndexConfig;
+
+    const value = parsed.value.object.get("semantic_producer") orelse return null;
+    if (value != .string or value.string.len == 0) return error.InvalidIndexConfig;
+    return try alloc.dupe(u8, value.string);
+}
+
 fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
@@ -17370,6 +17420,7 @@ test "shorthand chunk and embedding enrichment compatibility includes source_tem
         .source_template = "{{title}} {{body}}",
         .source_artifact_name = "body_chunks",
         .expected_dims = 384,
+        .producer_json = "{\"model\":\"embed-v1\"}",
     }));
     try std.testing.expect(!try manager.ensureEmbeddingEnrichment(.{
         .name = "body_embedding",
@@ -17378,6 +17429,7 @@ test "shorthand chunk and embedding enrichment compatibility includes source_tem
         .source_template = "{{title}} {{body}}",
         .source_artifact_name = "body_chunks",
         .expected_dims = 384,
+        .producer_json = "{\"model\":\"embed-v1\"}",
     }));
     try std.testing.expectError(error.ConflictingEnrichmentConfig, manager.ensureEmbeddingEnrichment(.{
         .name = "body_embedding",
@@ -17386,6 +17438,16 @@ test "shorthand chunk and embedding enrichment compatibility includes source_tem
         .source_template = "{{body}}",
         .source_artifact_name = "body_chunks",
         .expected_dims = 384,
+        .producer_json = "{\"model\":\"embed-v1\"}",
+    }));
+    try std.testing.expectError(error.ConflictingEnrichmentConfig, manager.ensureEmbeddingEnrichment(.{
+        .name = "body_embedding",
+        .kind = .embedding,
+        .source_field = "body",
+        .source_template = "{{title}} {{body}}",
+        .source_artifact_name = "body_chunks",
+        .expected_dims = 384,
+        .producer_json = "{\"model\":\"embed-v2\"}",
     }));
 }
 
@@ -17417,6 +17479,56 @@ test "generated enrichment request identity includes source_template" {
 
     try std.testing.expect(hasGeneratedDenseEmbeddingRequest(requests[0..], "doc:1", "body", "{{title}} {{body}}", "body_chunks", "body_embedding"));
     try std.testing.expect(!hasGeneratedDenseEmbeddingRequest(requests[0..], "doc:1", "body", "{{body}}", "body_chunks", "body_embedding"));
+}
+
+test "generated embedding requests carry semantic producer identity" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+
+    const dense_producer = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"dense-v1\"}";
+    const sparse_producer = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"sparse-v1\"}";
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "dense_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"dense\",\"dims\":3,\"metric\":\"cosine\",\"semantic_producer\":\"{\\\"version\\\":1,\\\"provider\\\":\\\"antfly\\\",\\\"model\\\":\\\"dense-v1\\\"}\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"artifact_name\":\"dense_chunks\",\"chunk_size\":64}}",
+        },
+        .{
+            .name = "sparse_v1",
+            .kind = .sparse_vector,
+            .config_json = "{\"field\":\"sparse\",\"semantic_producer\":\"{\\\"version\\\":1,\\\"provider\\\":\\\"antfly\\\",\\\"model\\\":\\\"sparse-v1\\\"}\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"artifact_name\":\"sparse_chunks\",\"chunk_size\":64}}",
+        },
+    });
+
+    const requests = try manager.planGeneratedEnrichments(alloc, "doc:1", "{\"body\":\"hello\"}", &.{}, &.{});
+    defer enrichment_types.deinitGeneratedRequests(alloc, requests);
+
+    var saw_dense = false;
+    var saw_sparse = false;
+    for (requests) |request| switch (request.kind) {
+        .dense_embedding => {
+            try std.testing.expectEqualStrings(dense_producer, request.producer_json);
+            saw_dense = true;
+        },
+        .sparse_embedding => {
+            try std.testing.expectEqualStrings(sparse_producer, request.producer_json);
+            saw_sparse = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_dense);
+    try std.testing.expect(saw_sparse);
 }
 
 test "parseTextConfig prefers source artifact name and accepts legacy chunk name" {
@@ -17824,12 +17936,14 @@ test "dense index unions multiple embedding artifact sources without overwriting
         .kind = .embedding,
         .field = "title",
         .expected_dims = 3,
+        .producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"test\",\"dimensions\":3}",
     });
     try manager.addEnrichment(&store, .{
         .name = "body_dense_v1",
         .kind = .embedding,
         .field = "body",
         .expected_dims = 3,
+        .producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"test\",\"dimensions\":3}",
     });
     try manager.addAllNoBackfill(&store, &.{.{
         .name = "document_vectors",

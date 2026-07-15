@@ -16,8 +16,7 @@ if TYPE_CHECKING:
     from ..models.graph_index_stats_promotion import GraphIndexStatsPromotion
     from ..models.graph_index_stats_resolution import GraphIndexStatsResolution
     from ..models.graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
-    from ..models.graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
-    from ..models.graph_index_stats_source_artifacts_item import GraphIndexStatsSourceArtifactsItem
+    from ..models.graph_source_artifact_status import GraphSourceArtifactStatus
 
 
 T = TypeVar("T", bound="GraphIndexStats")
@@ -51,9 +50,10 @@ class GraphIndexStats:
         catch_up_phase (str | Unset):
         catch_up_applied_sequence (int | Unset):
         catch_up_target_sequence (int | Unset):
-        source_artifact (GraphIndexStatsSourceArtifact | Unset): Graph source artifact materialization status.
-        source_artifacts (list[GraphIndexStatsSourceArtifactsItem] | Unset): Materialization status for every configured
-            graph source artifact.
+        source_artifact (GraphSourceArtifactStatus | Unset): Materialization status for one configured graph artifact
+            source.
+        source_artifacts (list[GraphSourceArtifactStatus] | Unset): Materialization status for every configured graph
+            source artifact.
         resolver_replay (GraphIndexStatsResolverReplay | Unset): Resolver replay diagnostics for graph materialization.
         async_indexing (GraphIndexStatsAsyncIndexing | Unset):
         projection_checkpoint_status (str | Unset): Durable projection checkpoint status: clean, rebuilding, degraded,
@@ -107,8 +107,8 @@ class GraphIndexStats:
     catch_up_phase: str | Unset = UNSET
     catch_up_applied_sequence: int | Unset = UNSET
     catch_up_target_sequence: int | Unset = UNSET
-    source_artifact: GraphIndexStatsSourceArtifact | Unset = UNSET
-    source_artifacts: list[GraphIndexStatsSourceArtifactsItem] | Unset = UNSET
+    source_artifact: GraphSourceArtifactStatus | Unset = UNSET
+    source_artifacts: list[GraphSourceArtifactStatus] | Unset = UNSET
     resolver_replay: GraphIndexStatsResolverReplay | Unset = UNSET
     async_indexing: GraphIndexStatsAsyncIndexing | Unset = UNSET
     projection_checkpoint_status: str | Unset = UNSET
@@ -357,8 +357,7 @@ class GraphIndexStats:
         from ..models.graph_index_stats_promotion import GraphIndexStatsPromotion
         from ..models.graph_index_stats_resolution import GraphIndexStatsResolution
         from ..models.graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
-        from ..models.graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
-        from ..models.graph_index_stats_source_artifacts_item import GraphIndexStatsSourceArtifactsItem
+        from ..models.graph_source_artifact_status import GraphSourceArtifactStatus
 
         d = dict(src_dict)
         index_type = GraphIndexStatsIndexType(d.pop("index_type"))
@@ -413,18 +412,18 @@ class GraphIndexStats:
         catch_up_target_sequence = d.pop("catch_up_target_sequence", UNSET)
 
         _source_artifact = d.pop("source_artifact", UNSET)
-        source_artifact: GraphIndexStatsSourceArtifact | Unset
+        source_artifact: GraphSourceArtifactStatus | Unset
         if isinstance(_source_artifact, Unset):
             source_artifact = UNSET
         else:
-            source_artifact = GraphIndexStatsSourceArtifact.from_dict(_source_artifact)
+            source_artifact = GraphSourceArtifactStatus.from_dict(_source_artifact)
 
         _source_artifacts = d.pop("source_artifacts", UNSET)
-        source_artifacts: list[GraphIndexStatsSourceArtifactsItem] | Unset = UNSET
+        source_artifacts: list[GraphSourceArtifactStatus] | Unset = UNSET
         if _source_artifacts is not UNSET:
             source_artifacts = []
             for source_artifacts_item_data in _source_artifacts:
-                source_artifacts_item = GraphIndexStatsSourceArtifactsItem.from_dict(source_artifacts_item_data)
+                source_artifacts_item = GraphSourceArtifactStatus.from_dict(source_artifacts_item_data)
 
                 source_artifacts.append(source_artifacts_item)
 

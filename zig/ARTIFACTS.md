@@ -450,18 +450,29 @@ artifact stream.
 
 All sources in one index must have the same dense dimension and must inhabit a
 compatible vector space. `vector_space` is optional. When every source omits
-it, Antfly compares the effective semantic embedder configuration (including
-provider, model, dense/sparse mode, dimensions, multimodal mode, input type,
-and truncation) and rejects incompatible producers. Operational settings such
-as credentials, endpoints, and rate limits do not change vector-space
-identity. To combine intentionally compatible but distinct producers, every
-source must declare the same non-empty `vector_space`. Explicit and implicit
-modes cannot be mixed, and dimensions are validated even when an explicit
-identifier matches. The identifier is an application-stable compatibility
-assertion, not a display label. Each source must resolve to a matching `kind:
-embedding` enrichment. Producer input remains defined only on that enrichment
-(`source_artifact_name`, `field`, or `template`); it is not repeated on the
-index.
+it, Antfly compares the durable canonical semantic producer identity stored on
+every embedding enrichment (provider, model, endpoint, region, dense/sparse
+mode, multimodal mode, input type, and truncation) and rejects
+unknown or incompatible producers. Endpoint is semantic because an
+OpenAI-compatible endpoint can serve an unrelated model under the same model
+name. Credentials, pacing, retries, and batch limits are execution settings and
+are excluded. This identity is persisted with the enrichment rather than
+reconstructed from the currently loaded index configs, so stale or externally
+written artifact streams cannot silently pass validation.
+
+Managed embedding artifact freshness hashes bind the rendered source content
+to that same canonical producer identity. Changing the provider, model,
+endpoint, region, modality, input type, or truncation therefore forces
+regeneration even when the source text and artifact name are unchanged.
+
+To combine intentionally compatible but distinct or externally produced
+embeddings, every source must declare the same non-empty `vector_space`.
+Explicit and implicit modes cannot be mixed, and dimensions are validated even
+when an explicit identifier matches. The identifier is an application-stable
+compatibility assertion, not a display label. Each source must resolve to a
+matching `kind: embedding` enrichment. Producer input remains defined only on
+that enrichment (`source_artifact_name`, `field`, or `template`); it is not
+repeated on the index.
 
 For vector indexes, `sources` is mutually exclusive with direct managed
 `field`/`template`/`chunker` configuration and `external: true`; it is supported
@@ -555,6 +566,16 @@ the other manifests, so deleting or changing the winning source immediately
 restores the next source's payload without rescanning per edge. State variants
 within one source use a stable state-key order as the final tie-breaker. This
 policy is independent of ingestion/update order.
+
+Within a write batch, Antfly coalesces repeated mutations to each artifact key
+(last mutation wins), groups affected artifacts by document and index, scans
+the persisted source-state prefix once per group, and materializes only the
+final winning edge payloads. This bounds reconciliation work to the affected
+group instead of multiplying a full manifest scan by the number of source
+mutations. Graph source state is versioned and self-contained: every manifest
+entry stores its edge payload. Older key-only manifests are rejected and the
+index must be rebuilt; falling back to the currently visible edge could restore
+the wrong source's payload.
 
 ```json
 {

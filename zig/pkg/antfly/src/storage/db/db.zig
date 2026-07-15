@@ -17143,7 +17143,9 @@ fn appendUniqueOwnedKey(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), k
     for (list.items) |existing| {
         if (std.mem.eql(u8, existing, key)) return;
     }
-    try list.append(alloc, try alloc.dupe(u8, key));
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    try list.append(alloc, owned_key);
 }
 
 fn containsName(names: []const []const u8, name: []const u8) bool {
@@ -20161,7 +20163,7 @@ fn loadGraphAssetStateKeysAlloc(alloc: Allocator, store: *docstore_mod.DocStore,
         else => return err,
     };
     defer alloc.free(raw);
-    const entries = graph_asset_state.decodeAlloc(alloc, raw) catch return null;
+    const entries = try graph_asset_state.decodeAlloc(alloc, raw);
     defer graph_asset_state.freeEntries(alloc, entries);
     const keys = if (entries.len > 0) try alloc.alloc([]const u8, entries.len) else return &.{};
     var initialized: usize = 0;
@@ -20187,7 +20189,7 @@ fn pendingStoreWriteValue(writes: []const docstore_mod.KVPair, key: []const u8) 
 
 const GraphEdgeWinner = struct {
     owner_state_key: []u8,
-    payload: ?[]u8,
+    payload: []u8,
     source_priority: usize,
 };
 
@@ -20199,7 +20201,7 @@ const GraphEdgeWinners = struct {
         while (it.next()) |entry| {
             alloc.free(@constCast(entry.key_ptr.*));
             alloc.free(entry.value_ptr.owner_state_key);
-            if (entry.value_ptr.payload) |payload| alloc.free(payload);
+            alloc.free(entry.value_ptr.payload);
         }
         self.map.deinit(alloc);
         self.* = undefined;
@@ -20221,9 +20223,9 @@ fn addGraphStateManifest(
                 (source_priority == winner.source_priority and std.mem.order(u8, state_key, winner.owner_state_key) != .lt)) continue;
             const owner = try alloc.dupe(u8, state_key);
             errdefer alloc.free(owner);
-            const payload = if (entry.value) |value| try alloc.dupe(u8, value) else null;
+            const payload = try alloc.dupe(u8, entry.value);
             alloc.free(winner.owner_state_key);
-            if (winner.payload) |value| alloc.free(value);
+            alloc.free(winner.payload);
             winner.* = .{ .owner_state_key = owner, .payload = payload, .source_priority = source_priority };
             continue;
         }
@@ -20232,8 +20234,8 @@ fn addGraphStateManifest(
         errdefer alloc.free(owned_key);
         const owner = try alloc.dupe(u8, state_key);
         errdefer alloc.free(owner);
-        const payload = if (entry.value) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (payload) |value| alloc.free(value);
+        const payload = try alloc.dupe(u8, entry.value);
+        errdefer alloc.free(payload);
         try winners.map.put(alloc, owned_key, .{ .owner_state_key = owner, .payload = payload, .source_priority = source_priority });
     }
 }
@@ -20265,32 +20267,42 @@ fn loadGraphEdgeWinners(
     pending_writes: []const docstore_mod.KVPair,
     sources: []const index_manager_mod.GraphArtifactSource,
 ) !GraphEdgeWinners {
+    var overrides = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer overrides.deinit(alloc);
+    try overrides.append(alloc, .{ .key = current_state_key, .value = current_state_value });
+    try overrides.appendSlice(alloc, pending_writes);
+    return try loadGraphEdgeWinnersWithOverrides(alloc, store, doc_key, index_name, overrides.items, sources);
+}
+
+fn loadGraphEdgeWinnersWithOverrides(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    doc_key: []const u8,
+    index_name: []const u8,
+    state_overrides: []const docstore_mod.KVPair,
+    sources: []const index_manager_mod.GraphArtifactSource,
+) !GraphEdgeWinners {
     var winners = GraphEdgeWinners{};
     errdefer winners.deinit(alloc);
     const prefix = try internal_keys.graphAssetStateIndexPrefixAlloc(alloc, doc_key, index_name);
     defer alloc.free(prefix);
     const existing = try store.scanPrefix(alloc, prefix);
     defer docstore_mod.DocStore.freeResults(alloc, existing);
-    var saw_current = false;
+    var override_values = std.StringHashMapUnmanaged([]const u8).empty;
+    defer override_values.deinit(alloc);
+    for (state_overrides) |override| try override_values.put(alloc, override.key, override.value);
     for (existing) |entry| {
-        const raw = if (std.mem.eql(u8, entry.key, current_state_key)) blk: {
-            saw_current = true;
-            break :blk current_state_value;
-        } else pendingStoreWriteValue(pending_writes, entry.key) orelse entry.value;
+        var raw: []const u8 = entry.value;
+        if (override_values.get(entry.key)) |override| {
+            raw = override;
+            _ = override_values.remove(entry.key);
+        }
         try addGraphStateManifest(alloc, &winners, entry.key, try graphStateSourcePriorityAlloc(alloc, entry.key, prefix, sources), raw);
     }
-    if (!saw_current) try addGraphStateManifest(alloc, &winners, current_state_key, try graphStateSourcePriorityAlloc(alloc, current_state_key, prefix, sources), current_state_value);
-    for (pending_writes) |write| {
-        if (!std.mem.startsWith(u8, write.key, prefix)) continue;
-        if (std.mem.eql(u8, write.key, current_state_key)) continue;
-        var existed = false;
-        for (existing) |entry| {
-            if (std.mem.eql(u8, entry.key, write.key)) {
-                existed = true;
-                break;
-            }
-        }
-        if (!existed) try addGraphStateManifest(alloc, &winners, write.key, try graphStateSourcePriorityAlloc(alloc, write.key, prefix, sources), write.value);
+    var override_it = override_values.iterator();
+    while (override_it.next()) |override| {
+        if (!std.mem.startsWith(u8, override.key_ptr.*, prefix)) continue;
+        try addGraphStateManifest(alloc, &winners, override.key_ptr.*, try graphStateSourcePriorityAlloc(alloc, override.key_ptr.*, prefix, sources), override.value_ptr.*);
     }
     return winners;
 }
@@ -20906,7 +20918,7 @@ fn flushGeneratedDenseChunkBatch(
             embedding_name,
             request.source_field,
             source.key,
-            enrichment_artifact_codec.hashSource(source.text),
+            enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json),
             vector,
         );
         defer alloc.free(artifact_key);
@@ -20921,6 +20933,7 @@ fn flushGeneratedSparseChunkBatch(
     alloc: Allocator,
     sparse_embedder: embedder_mod.SparseEmbedder,
     embedding_name: []const u8,
+    semantic_producer: []const u8,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
     sources: []const ChunkEmbeddingSource,
@@ -20941,7 +20954,7 @@ fn flushGeneratedSparseChunkBatch(
             artifact_writes,
             source.key,
             embedding_name,
-            enrichment_artifact_codec.hashSource(source.text),
+            enrichment_artifact_codec.hashEmbeddingSource(source.text, semantic_producer),
             sparse.indices,
             sparse.values,
         );
@@ -20976,7 +20989,7 @@ fn flushGeneratedDenseChunkSourceBatch(
     defer source_indexes.deinit(alloc);
 
     for (sources.items, 0..) |source, i| {
-        const source_hash = enrichment_artifact_codec.hashSource(source.text);
+        const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
         const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
         defer alloc.free(artifact_key);
         if (skip_unchanged_artifacts) {
@@ -20999,6 +21012,7 @@ fn flushGeneratedSparseChunkSourceBatch(
     db: *DB,
     sparse_embedder: embedder_mod.SparseEmbedder,
     embedding_name: []const u8,
+    semantic_producer: []const u8,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
     sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
@@ -21014,7 +21028,7 @@ fn flushGeneratedSparseChunkSourceBatch(
     defer source_indexes.deinit(alloc);
 
     for (sources.items, 0..) |source, i| {
-        const source_hash = enrichment_artifact_codec.hashSource(source.text);
+        const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, semantic_producer);
         const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
         defer alloc.free(artifact_key);
         if (try storedOrPendingEmbeddingSourceHash(alloc, db, pending_lookup, artifact_key)) |existing_hash| {
@@ -21027,7 +21041,7 @@ fn flushGeneratedSparseChunkSourceBatch(
         try source_indexes.append(alloc, i);
     }
 
-    try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes);
+    try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, semantic_producer, artifact_writes, sparse_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes);
 }
 
 fn appendMaterializedChunkSourceToBatch(
@@ -21241,7 +21255,7 @@ fn computeDenseRequestImpl(
         const max_batch_bytes = generatedEmbedBatchBytes();
         var batch_source_bytes: usize = 0;
         for (sources, 0..) |source, i| {
-            const source_hash = enrichment_artifact_codec.hashSource(source.text);
+            const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
             const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
             defer alloc.free(artifact_key);
             if (skip_unchanged_artifacts) {
@@ -21317,7 +21331,7 @@ fn computeDenseRequestImpl(
         embedding_name,
         request.source_field,
         null,
-        enrichment_artifact_codec.hashSource(source_text.?),
+        enrichment_artifact_codec.hashEmbeddingSource(source_text.?, request.producer_json),
         vector,
     );
     defer alloc.free(artifact_key);
@@ -21355,11 +21369,11 @@ fn computeSparseMaterializedChunkRequest(
         try pending_chunk_keys.put(alloc, write.key, {});
         _ = try appendMaterializedChunkSourceToBatch(alloc, &sources, &batch_source_bytes, write.key, write.value, request.source_field);
         if (sources.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
-            try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
+            try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
             batch_source_bytes = 0;
         }
     }
-    try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
+    try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
     batch_source_bytes = 0;
 
     const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "chunk", artifact_name);
@@ -21371,7 +21385,7 @@ fn computeSparseMaterializedChunkRequest(
     defer alloc.free(lower);
     while (true) {
         const next_lower = try scanMaterializedChunkSourceStoreBatch(alloc, db, prefix, upper_bound, lower, request.source_field, &pending_chunk_keys, &sources, &batch_source_bytes, max_batch_items, max_batch_bytes);
-        try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
+        try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
         batch_source_bytes = 0;
         if (next_lower) |owned_next| {
             alloc.free(lower);
@@ -21423,7 +21437,7 @@ fn computeSparseRequestDerived(
         const max_batch_bytes = generatedEmbedBatchBytes();
         var batch_source_bytes: usize = 0;
         for (sources, 0..) |source, i| {
-            const source_hash = enrichment_artifact_codec.hashSource(source.text);
+            const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
             const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
             defer alloc.free(artifact_key);
             if (try storedOrPendingEmbeddingSourceHash(alloc, db, &pending_writes, artifact_key)) |existing_hash| {
@@ -21435,18 +21449,18 @@ fn computeSparseRequestDerived(
             if (chunk_texts.items.len > 0 and
                 (chunk_texts.items.len >= max_batch_items or batch_source_bytes + source.text.len > max_batch_bytes))
             {
-                try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
+                try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
                 batch_source_bytes = 0;
             }
             try chunk_texts.append(alloc, source.text);
             try source_indexes.append(alloc, i);
             batch_source_bytes += source.text.len;
             if (chunk_texts.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
-                try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
+                try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
                 batch_source_bytes = 0;
             }
         }
-        try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
+        try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
         return;
     }
 
@@ -21470,7 +21484,7 @@ fn computeSparseRequestDerived(
         artifact_writes,
         request.doc_key,
         embedding_name,
-        null,
+        enrichment_artifact_codec.hashEmbeddingSource(source_text.?, request.producer_json),
         sparse.indices,
         sparse.values,
     );
@@ -22111,6 +22125,25 @@ fn partitionRemoteSparseEmbeddings(
     embeddings.* = try local.toOwnedSlice(alloc);
 }
 
+const PrecomputedGraphArtifactMutation = struct {
+    key: []const u8,
+    value: ?[]const u8,
+};
+
+const PrecomputedGraphStateUpdate = struct {
+    state_key: []const u8,
+    state_value: []const u8,
+    previous_keys: []const []const u8,
+    graph_writes: []const docstore_mod.KVPair,
+};
+
+const PrecomputedGraphReconcileGroup = struct {
+    doc_key: []const u8,
+    index_name: []const u8,
+    sources: []const index_manager_mod.GraphArtifactSource,
+    updates: std.ArrayListUnmanaged(PrecomputedGraphStateUpdate) = .empty,
+};
+
 fn appendPrecomputedGraphSourceArtifacts(
     self: *DB,
     artifact_writes: []const types.BatchWrite,
@@ -22123,72 +22156,107 @@ fn appendPrecomputedGraphSourceArtifacts(
 ) !void {
     if (!self.core.hasGraphIndexes()) return;
 
+    var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena_state.deinit();
+    const scratch = arena_state.allocator();
+
+    // Coalesce before parsing. A batch is last-write-wins, and processing a
+    // source state more than once can otherwise leave an intermediate edge
+    // outside its final manifest.
+    var mutations = std.ArrayListUnmanaged(PrecomputedGraphArtifactMutation).empty;
+    var mutation_positions = std.StringHashMapUnmanaged(usize).empty;
+    for (artifact_writes) |write| {
+        if (mutation_positions.get(write.key)) |position| {
+            mutations.items[position].value = write.value;
+        } else {
+            const position = mutations.items.len;
+            try mutations.append(scratch, .{ .key = write.key, .value = write.value });
+            try mutation_positions.put(scratch, write.key, position);
+        }
+    }
+    for (artifact_delete_keys) |key| {
+        if (mutation_positions.get(key)) |position| {
+            mutations.items[position].value = null;
+        } else {
+            const position = mutations.items.len;
+            try mutations.append(scratch, .{ .key = key, .value = null });
+            try mutation_positions.put(scratch, key, position);
+        }
+    }
+
+    var groups = std.ArrayListUnmanaged(PrecomputedGraphReconcileGroup).empty;
+    var group_positions = std.StringHashMapUnmanaged(usize).empty;
+    for (mutations.items) |mutation| {
+        try preparePrecomputedGraphSourceArtifactMutation(
+            self,
+            scratch,
+            mutation,
+            &groups,
+            &group_positions,
+            store_writes,
+            delete_keys,
+            owned_delete_keys,
+        );
+    }
+
     var pending_graph_positions = StoreWritePositions.empty;
     defer pending_graph_positions.deinit(self.alloc);
-
-    for (artifact_writes) |artifact_write| {
-        try appendPrecomputedGraphSourceArtifactKey(self, artifact_write.key, artifact_write.value, owned_graph_artifact_writes, store_writes, &pending_graph_positions, delete_keys, owned_delete_keys, changed_artifact_keys);
-    }
-    for (artifact_delete_keys) |artifact_key| {
-        try appendPrecomputedGraphSourceArtifactKey(self, artifact_key, null, owned_graph_artifact_writes, store_writes, &pending_graph_positions, delete_keys, owned_delete_keys, changed_artifact_keys);
+    for (groups.items) |group| {
+        try reconcilePrecomputedGraphGroup(
+            self,
+            scratch,
+            group,
+            owned_graph_artifact_writes,
+            store_writes,
+            &pending_graph_positions,
+            delete_keys,
+            owned_delete_keys,
+            changed_artifact_keys,
+        );
     }
 }
 
-fn appendPrecomputedGraphSourceArtifactKey(
+fn preparePrecomputedGraphSourceArtifactMutation(
     self: *DB,
-    artifact_key: []const u8,
-    artifact_value: ?[]const u8,
-    owned_graph_artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    scratch: Allocator,
+    mutation: PrecomputedGraphArtifactMutation,
+    groups: *std.ArrayListUnmanaged(PrecomputedGraphReconcileGroup),
+    group_positions: *std.StringHashMapUnmanaged(usize),
     store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
-    pending_graph_positions: *StoreWritePositions,
     delete_keys: *std.ArrayListUnmanaged([]const u8),
     owned_delete_keys: *std.ArrayListUnmanaged([]u8),
-    changed_artifact_keys: *std.ArrayListUnmanaged([]u8),
 ) !void {
-    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(self.alloc, artifact_key)) orelse return;
-    defer artifact_ref.deinit(self.alloc);
+    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(scratch, mutation.key)) orelse return;
+    defer artifact_ref.deinit(scratch);
 
     for (self.core.graphIndexes()) |graph_entry| {
         const source = self.core.index_manager.graphArtifactSourceForArtifact(graph_entry.config.name, artifact_ref.name) orelse continue;
         if (!graphArtifactSourceConsumesRef(self.core.index_manager, source, artifact_ref)) continue;
 
         var graph_store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
-        defer graph_store_writes.deinit(self.alloc);
         var graph_write_positions = StoreWritePositions.empty;
-        defer graph_write_positions.deinit(self.alloc);
 
-        if (artifact_value) |value| {
-            const raw_doc = try batchDocumentValueForGraphSource(self.alloc, self.core.store, store_writes.items, artifact_ref.document_id);
-            defer if (raw_doc) |doc_value| self.alloc.free(doc_value);
-            const graph_writes = try graphWritesFromArtifactValueAlloc(self.alloc, graph_entry.config.name, artifact_ref.document_id, value, source, graphArtifactContentType(self.core.index_manager, source.artifact_name), raw_doc);
-            defer freeGraphWrites(self.alloc, graph_writes);
+        if (mutation.value) |value| {
+            const raw_doc = try batchDocumentValueForGraphSource(scratch, self.core.store, store_writes.items, artifact_ref.document_id);
+            defer if (raw_doc) |doc_value| scratch.free(doc_value);
+            const graph_writes = try graphWritesFromArtifactValueAlloc(scratch, graph_entry.config.name, artifact_ref.document_id, value, source, graphArtifactContentType(self.core.index_manager, source.artifact_name), raw_doc);
+            defer freeGraphWrites(scratch, graph_writes);
             for (graph_writes) |write| {
-                const key = try internal_keys.graphEdgeArtifactKeyAlloc(self.alloc, write.source, write.index_name, write.edge_type, write.target);
-                var key_owned = true;
-                errdefer if (key_owned) self.alloc.free(key);
+                const key = try internal_keys.graphEdgeArtifactKeyAlloc(scratch, write.source, write.index_name, write.edge_type, write.target);
                 removePendingDeleteKey(self.alloc, delete_keys, owned_delete_keys, key);
-                const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(self.alloc, null, write.weight, write.created_at, write.updated_at, write.metadata_json);
-                var payload_owned = true;
-                errdefer if (payload_owned) self.alloc.free(payload);
-                try owned_graph_artifact_writes.append(self.alloc, .{ .key = key, .value = payload });
-                key_owned = false;
-                payload_owned = false;
-                try upsertPendingStoreWrite(self.alloc, &graph_store_writes, &graph_write_positions, key, payload);
-                try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, key);
+                const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(scratch, null, write.weight, write.created_at, write.updated_at, write.metadata_json);
+                try upsertPendingStoreWrite(scratch, &graph_store_writes, &graph_write_positions, key, payload);
             }
         }
 
-        const state_name = try graphArtifactStateNameAlloc(self.alloc, artifact_ref);
-        defer self.alloc.free(state_name);
-        const state_key = try graphAssetStateKeyAlloc(self.alloc, artifact_ref.document_id, graph_entry.config.name, state_name);
-        defer self.alloc.free(state_key);
-        const previous_keys = try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, state_key);
-        defer if (previous_keys) |keys| freeOwnedConstKeySlice(self.alloc, keys);
+        const state_name = try graphArtifactStateNameAlloc(scratch, artifact_ref);
+        const state_key = try graphAssetStateKeyAlloc(scratch, artifact_ref.document_id, graph_entry.config.name, state_name);
+        const previous_keys = try loadGraphAssetStateKeysAlloc(scratch, self.core.store, state_key);
         if (previous_keys == null and self.core.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1 and graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
-            const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(self.alloc, self.core.store, self.core.index_manager, artifact_ref.document_id, graph_entry.config.name, source);
-            defer freeOwnedConstKeySlice(self.alloc, protected_keys);
-            const existing = try collectGraphArtifactsForDocIndex(self.alloc, self.core.store, artifact_ref.document_id, graph_entry.config.name);
-            defer docstore_mod.DocStore.freeResults(self.alloc, existing);
+            const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(scratch, self.core.store, self.core.index_manager, artifact_ref.document_id, graph_entry.config.name, source);
+            defer freeOwnedConstKeySlice(scratch, protected_keys);
+            const existing = try collectGraphArtifactsForDocIndex(scratch, self.core.store, artifact_ref.document_id, graph_entry.config.name);
+            defer docstore_mod.DocStore.freeResults(scratch, existing);
             for (existing) |entry| {
                 if (containsStoreWriteKey(graph_store_writes.items, entry.key)) continue;
                 if (containsOwnedKey(owned_delete_keys.items, entry.key)) continue;
@@ -22196,65 +22264,87 @@ fn appendPrecomputedGraphSourceArtifactKey(
                 const owned_key = try self.alloc.dupe(u8, entry.key);
                 try owned_delete_keys.append(self.alloc, owned_key);
                 try delete_keys.append(self.alloc, owned_key);
-                try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, entry.key);
             }
         }
 
-        const state_value = try encodeGraphAssetStateKeysAlloc(self.alloc, graph_store_writes.items);
+        const group_key = try internal_keys.graphAssetStateIndexPrefixAlloc(scratch, artifact_ref.document_id, graph_entry.config.name);
+        const group_position = if (group_positions.get(group_key)) |position| position else blk: {
+            const position = groups.items.len;
+            try groups.append(scratch, .{
+                .doc_key = try scratch.dupe(u8, artifact_ref.document_id),
+                .index_name = graph_entry.config.name,
+                .sources = self.core.index_manager.graphArtifactSources(graph_entry.config.name),
+            });
+            try group_positions.put(scratch, group_key, position);
+            break :blk position;
+        };
+        const state_value = try encodeGraphAssetStateKeysAlloc(scratch, graph_store_writes.items);
+        try groups.items[group_position].updates.append(scratch, .{
+            .state_key = state_key,
+            .state_value = state_value,
+            .previous_keys = previous_keys orelse &.{},
+            .graph_writes = try graph_store_writes.toOwnedSlice(scratch),
+        });
+    }
+}
+
+fn reconcilePrecomputedGraphGroup(
+    self: *DB,
+    scratch: Allocator,
+    group: PrecomputedGraphReconcileGroup,
+    owned_graph_artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    pending_graph_positions: *StoreWritePositions,
+    delete_keys: *std.ArrayListUnmanaged([]const u8),
+    owned_delete_keys: *std.ArrayListUnmanaged([]u8),
+    changed_artifact_keys: *std.ArrayListUnmanaged([]u8),
+) !void {
+    const overrides = try scratch.alloc(docstore_mod.KVPair, group.updates.items.len);
+    var affected = std.ArrayListUnmanaged([]const u8).empty;
+    var affected_set = std.StringHashMapUnmanaged(void).empty;
+    for (group.updates.items, 0..) |update, i| {
+        overrides[i] = .{ .key = update.state_key, .value = update.state_value };
+        for (update.previous_keys) |key| {
+            if (try affected_set.fetchPut(scratch, key, {}) == null) try affected.append(scratch, key);
+        }
+        for (update.graph_writes) |write| {
+            if (try affected_set.fetchPut(scratch, write.key, {}) == null) try affected.append(scratch, write.key);
+        }
+    }
+
+    var winners = try loadGraphEdgeWinnersWithOverrides(scratch, self.core.store, group.doc_key, group.index_name, overrides, group.sources);
+    defer winners.deinit(scratch);
+    for (affected.items) |edge_key| {
+        try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, edge_key);
+        if (winners.map.get(edge_key)) |winner| {
+            removePendingDeleteKey(self.alloc, delete_keys, owned_delete_keys, edge_key);
+            const owned_key = try self.alloc.dupe(u8, edge_key);
+            var owned_key_owned = true;
+            errdefer if (owned_key_owned) self.alloc.free(owned_key);
+            const payload = try self.alloc.dupe(u8, winner.payload);
+            var payload_owned = true;
+            errdefer if (payload_owned) self.alloc.free(payload);
+            try owned_graph_artifact_writes.append(self.alloc, .{ .key = owned_key, .value = payload });
+            owned_key_owned = false;
+            payload_owned = false;
+            try upsertPendingStoreWrite(self.alloc, store_writes, pending_graph_positions, owned_key, payload);
+        } else if (!containsOwnedKey(owned_delete_keys.items, edge_key)) {
+            const owned_key = try self.alloc.dupe(u8, edge_key);
+            try owned_delete_keys.append(self.alloc, owned_key);
+            try delete_keys.append(self.alloc, owned_key);
+        }
+    }
+    for (group.updates.items) |update| {
+        const state_key = try self.alloc.dupe(u8, update.state_key);
+        var state_key_owned = true;
+        errdefer if (state_key_owned) self.alloc.free(state_key);
+        const state_value = try self.alloc.dupe(u8, update.state_value);
         var state_value_owned = true;
         errdefer if (state_value_owned) self.alloc.free(state_value);
-
-        var winners = try loadGraphEdgeWinners(
-            self.alloc,
-            self.core.store,
-            artifact_ref.document_id,
-            graph_entry.config.name,
-            state_key,
-            state_value,
-            store_writes.items,
-            self.core.index_manager.graphArtifactSources(graph_entry.config.name),
-        );
-        defer winners.deinit(self.alloc);
-        var affected = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (affected.items) |key| self.alloc.free(key);
-            affected.deinit(self.alloc);
-        }
-        if (previous_keys) |keys| for (keys) |key| try appendUniqueOwnedKey(self.alloc, &affected, key);
-        for (graph_store_writes.items) |write| try appendUniqueOwnedKey(self.alloc, &affected, write.key);
-        for (affected.items) |edge_key| {
-            if (winners.map.get(edge_key)) |winner| {
-                removePendingDeleteKey(self.alloc, delete_keys, owned_delete_keys, edge_key);
-                const payload = if (winner.payload) |value|
-                    try self.alloc.dupe(u8, value)
-                else
-                    self.core.store.get(self.alloc, edge_key) catch |err| switch (err) {
-                        error.NotFound => continue,
-                        else => return err,
-                    };
-                const owned_key = try self.alloc.dupe(u8, edge_key);
-                var owned_key_owned = true;
-                errdefer if (owned_key_owned) self.alloc.free(owned_key);
-                var payload_owned = true;
-                errdefer if (payload_owned) self.alloc.free(payload);
-                try owned_graph_artifact_writes.append(self.alloc, .{ .key = owned_key, .value = payload });
-                owned_key_owned = false;
-                payload_owned = false;
-                try upsertPendingStoreWrite(self.alloc, store_writes, pending_graph_positions, owned_key, payload);
-            } else if (!containsOwnedKey(owned_delete_keys.items, edge_key)) {
-                const owned_key = try self.alloc.dupe(u8, edge_key);
-                try owned_delete_keys.append(self.alloc, owned_key);
-                try delete_keys.append(self.alloc, owned_key);
-                try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, edge_key);
-            }
-        }
-        const state_key_owned = try self.alloc.dupe(u8, state_key);
-        var state_key_owned_flag = true;
-        errdefer if (state_key_owned_flag) self.alloc.free(state_key_owned);
-        try owned_graph_artifact_writes.append(self.alloc, .{ .key = state_key_owned, .value = state_value });
+        try owned_graph_artifact_writes.append(self.alloc, .{ .key = state_key, .value = state_value });
+        state_key_owned = false;
         state_value_owned = false;
-        state_key_owned_flag = false;
-        try upsertPendingStoreWrite(self.alloc, store_writes, pending_graph_positions, state_key_owned, state_value);
+        try upsertPendingStoreWrite(self.alloc, store_writes, pending_graph_positions, state_key, state_value);
     }
 }
 
@@ -22429,6 +22519,19 @@ fn graphArtifactStateNameAlloc(alloc: Allocator, artifact_ref: types.ArtifactRef
         defer alloc.free(chunk_part);
         try list.append(alloc, '\x1f');
         try list.appendSlice(alloc, chunk_part);
+    }
+    if (artifact_ref.source) |source| {
+        const source_key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, .{
+            .document_id = artifact_ref.document_id,
+            .name = source.name,
+            .kind = source.kind,
+            .chunk_id = source.chunk_id,
+            .unit_id = source.unit_id,
+        });
+        defer alloc.free(source_key);
+        try list.append(alloc, '\x1f');
+        try list.appendSlice(alloc, "source:");
+        try list.appendSlice(alloc, source_key);
     }
     return try list.toOwnedSlice(alloc);
 }
@@ -27344,13 +27447,7 @@ fn materializeGraphSourceArtifactsForIndex(
         for (writes.items[0..graph_write_count]) |write| try appendUniqueOwnedKey(alloc, &affected, write.key);
         for (affected.items) |edge_key| {
             if (winners.map.get(edge_key)) |winner| {
-                const payload = if (winner.payload) |value|
-                    try alloc.dupe(u8, value)
-                else
-                    store.get(alloc, edge_key) catch |err| switch (err) {
-                        error.NotFound => continue,
-                        else => return err,
-                    };
+                const payload = try alloc.dupe(u8, winner.payload);
                 var payload_owned = true;
                 errdefer if (payload_owned) alloc.free(payload);
                 try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, edge_key, payload);
@@ -27483,13 +27580,7 @@ fn materializeMentionEdgesForResolutionKey(
     for (writes.items[0..graph_write_count]) |write| try appendUniqueOwnedKey(alloc, &affected, write.key);
     for (affected.items) |edge_key| {
         if (winners.map.get(edge_key)) |winner| {
-            const payload = if (winner.payload) |value|
-                try alloc.dupe(u8, value)
-            else
-                store.get(alloc, edge_key) catch |err| switch (err) {
-                    error.NotFound => continue,
-                    else => return err,
-                };
+            const payload = try alloc.dupe(u8, winner.payload);
             var payload_owned = true;
             errdefer if (payload_owned) alloc.free(payload);
             try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, edge_key, payload);
@@ -40698,6 +40789,26 @@ test "db precomputed graph source batch transfers shared edge ownership" {
 
     _ = try db.applyDocumentArtifactChildRangeBatch(.{
         .artifact_writes = &.{
+            .{ .key = artifact_a, .value = without_edges },
+            .{ .key = artifact_b, .value = edge_from_b },
+        },
+    });
+    {
+        const stored_edge = try db.core.store.get(alloc, edge_key);
+        defer alloc.free(stored_edge);
+        var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, stored_edge);
+        defer decoded.deinit(alloc);
+        try std.testing.expectEqual(@as(f64, 0.75), decoded.weight);
+        try std.testing.expect(std.mem.indexOf(u8, decoded.metadata_json, "\"owner\":\"b\"") != null);
+    }
+
+    // Duplicate source mutations in one child batch are coalesced before graph
+    // reconciliation. The final mutation for relations_a is empty, so the
+    // lower-priority relations_b payload must remain visible and no orphaned
+    // edge may survive outside the final state manifest.
+    _ = try db.applyDocumentArtifactChildRangeBatch(.{
+        .artifact_writes = &.{
+            .{ .key = artifact_a, .value = edge_from_a },
             .{ .key = artifact_a, .value = without_edges },
             .{ .key = artifact_b, .value = edge_from_b },
         },

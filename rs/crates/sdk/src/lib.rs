@@ -2,7 +2,6 @@
 
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 
 pub const MAX_ARTIFACT_SOURCES: usize = 64;
 
@@ -47,11 +46,18 @@ fn validate_artifact_names<'a>(
 
 pub fn artifact_index_sources<'a>(
     artifacts: impl IntoIterator<Item = &'a str>,
-) -> Result<Vec<Value>, IndexConfigError> {
+) -> Result<Vec<ArtifactIndexSourceSpec>, IndexConfigError> {
     Ok(validate_artifact_names(artifacts)?
         .into_iter()
-        .map(|artifact| json!({ "artifact": artifact }))
+        .map(|artifact| ArtifactIndexSourceSpec {
+            artifact: artifact.to_owned(),
+        })
         .collect())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactIndexSourceSpec {
+    pub artifact: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -94,21 +100,80 @@ fn default_embedding_source_field() -> String {
     "text".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactEmbeddingIndexOptions {
     pub sources: Vec<ArtifactEmbeddingSourceSpec>,
-    pub embedder: Value,
+    pub embedder: types::EmbedderConfig,
     pub dimension: Option<u32>,
     #[serde(default)]
     pub sparse: bool,
-    pub distance_metric: Option<String>,
+    pub distance_metric: Option<ArtifactEmbeddingDistanceMetric>,
     pub vector_space: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactEmbeddingDistanceMetric {
+    L2Squared,
+    InnerProduct,
+    Cosine,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactEmbeddingEnrichmentSpec {
+    pub name: String,
+    pub kind: ArtifactEmbeddingEnrichmentKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    #[serde(
+        rename = "source_artifact_name",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source_artifact: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_dims: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_space: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactEmbeddingEnrichmentKind {
+    Embedding,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactEmbeddingIndexConfigSpec {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: ArtifactEmbeddingIndexKind,
+    pub sources: Vec<ArtifactIndexSourceSpec>,
+    pub enrichments: Vec<ArtifactEmbeddingEnrichmentSpec>,
+    pub embedder: types::EmbedderConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dimension: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sparse: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance_metric: Option<ArtifactEmbeddingDistanceMetric>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactEmbeddingIndexKind {
+    Embeddings,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 pub fn artifact_embedding_index_config(
     name: &str,
     options: ArtifactEmbeddingIndexOptions,
-) -> Result<Value, IndexConfigError> {
+) -> Result<ArtifactEmbeddingIndexConfigSpec, IndexConfigError> {
     if name.is_empty() {
         return Err(IndexConfigError("index name is required".into()));
     }
@@ -133,20 +198,6 @@ pub fn artifact_embedding_index_config(
             "dimension must be positive when provided".into(),
         ));
     }
-    if !matches!(
-        options.distance_metric.as_deref(),
-        None | Some("l2_squared" | "inner_product" | "cosine")
-    ) {
-        return Err(IndexConfigError("distance_metric is invalid".into()));
-    }
-    if options
-        .embedder
-        .get("provider")
-        .and_then(Value::as_str)
-        .map_or(true, str::is_empty)
-    {
-        return Err(IndexConfigError("embedder.provider is required".into()));
-    }
     if options.vector_space.as_deref() == Some("") {
         return Err(IndexConfigError(
             "vector_space cannot be empty when provided".into(),
@@ -165,51 +216,32 @@ pub fn artifact_embedding_index_config(
                 "sources[{index}].source_artifact cannot be empty"
             )));
         }
-        let mut enrichment = serde_json::Map::new();
-        enrichment.insert("name".into(), json!(source.artifact));
-        enrichment.insert("kind".into(), json!("embedding"));
-        if !source.field.is_empty() {
-            enrichment.insert("field".into(), json!(source.field));
-        }
-        if let Some(template) = &source.template {
-            enrichment.insert("template".into(), json!(template));
-        }
-        if let Some(source_artifact) = &source.source_artifact {
-            enrichment.insert("source_artifact_name".into(), json!(source_artifact));
-        }
-        if let Some(dimension) = options.dimension {
-            enrichment.insert("expected_dims".into(), json!(dimension));
-        }
-        if let Some(vector_space) = &options.vector_space {
-            enrichment.insert("vector_space".into(), json!(vector_space));
-        }
-        enrichments.push(Value::Object(enrichment));
+        enrichments.push(ArtifactEmbeddingEnrichmentSpec {
+            name: source.artifact.clone(),
+            kind: ArtifactEmbeddingEnrichmentKind::Embedding,
+            field: (!source.field.is_empty()).then(|| source.field.clone()),
+            template: source.template.clone(),
+            source_artifact: source.source_artifact.clone(),
+            expected_dims: options.dimension,
+            vector_space: options.vector_space.clone(),
+        });
     }
 
-    let mut config = serde_json::Map::new();
-    config.insert("name".into(), json!(name));
-    config.insert("type".into(), json!("embeddings"));
-    config.insert(
-        "sources".into(),
-        Value::Array(artifact_index_sources(
+    Ok(ArtifactEmbeddingIndexConfigSpec {
+        name: name.to_owned(),
+        kind: ArtifactEmbeddingIndexKind::Embeddings,
+        sources: artifact_index_sources(
             options
                 .sources
                 .iter()
                 .map(|source| source.artifact.as_str()),
-        )?),
-    );
-    config.insert("enrichments".into(), Value::Array(enrichments));
-    config.insert("embedder".into(), options.embedder);
-    if options.sparse {
-        config.insert("sparse".into(), json!(true));
-    }
-    if let Some(dimension) = options.dimension {
-        config.insert("dimension".into(), json!(dimension));
-    }
-    if let Some(distance_metric) = options.distance_metric {
-        config.insert("distance_metric".into(), json!(distance_metric));
-    }
-    Ok(Value::Object(config))
+        )?,
+        enrichments,
+        embedder: options.embedder,
+        dimension: options.dimension,
+        sparse: options.sparse,
+        distance_metric: options.distance_metric,
+    })
 }
 
 pub fn normalize_base_url(base_url: &str) -> String {
@@ -244,8 +276,9 @@ include!(concat!(env!("OUT_DIR"), "/client.rs"));
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactEmbeddingIndexOptions, ArtifactEmbeddingSourceSpec,
-        artifact_embedding_index_config, artifact_index_sources, normalize_base_url,
+        ArtifactEmbeddingDistanceMetric, ArtifactEmbeddingIndexOptions,
+        ArtifactEmbeddingSourceSpec, artifact_embedding_index_config, artifact_index_sources,
+        normalize_base_url,
     };
     use serde_json::json;
 
@@ -292,14 +325,18 @@ mod tests {
                         template: None,
                     },
                 ],
-                embedder: json!({ "provider": "antfly", "model": "antflydb/clipclap" }),
+                embedder: serde_json::from_value(
+                    json!({ "provider": "antfly", "model": "antflydb/clipclap" }),
+                )
+                .unwrap(),
                 dimension: Some(384),
                 sparse: false,
-                distance_metric: Some("cosine".into()),
+                distance_metric: Some(ArtifactEmbeddingDistanceMetric::Cosine),
                 vector_space: None,
             },
         )
         .unwrap();
+        let config = serde_json::to_value(config).unwrap();
         assert_eq!(config["sources"].as_array().unwrap().len(), 2);
         assert!(config["enrichments"][0].get("vector_space").is_none());
         assert!(config.get("field").is_none());
@@ -320,7 +357,10 @@ mod tests {
                     field: "text".into(),
                     template: None,
                 }],
-                embedder: json!({ "provider": "antfly" }),
+                embedder: serde_json::from_value(
+                    json!({ "provider": "antfly", "model": "antflydb/clipclap" }),
+                )
+                .unwrap(),
                 dimension: Some(0),
                 sparse: false,
                 distance_metric: None,

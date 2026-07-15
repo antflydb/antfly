@@ -8,6 +8,7 @@ from .client_generated.models.embedding_type_3 import EmbeddingType3 as PackedSp
 from .exceptions import AntflyAuthError, AntflyConnectionError, AntflyException
 from .index_config import (
     ArtifactEmbeddingSource,
+    GraphArtifactSource,
     artifact_embedding_index_config,
     artifact_index_sources,
     graph_index_sources,
@@ -23,6 +24,7 @@ __all__ = [
     "SparseEmbedding",
     "PackedSparseEmbedding",
     "ArtifactEmbeddingSource",
+    "GraphArtifactSource",
     "artifact_embedding_index_config",
     "artifact_index_sources",
     "graph_index_sources",

@@ -205,6 +205,7 @@ pub const GraphQueryParams = types.GraphQueryParams;
 pub const GraphQueryResult = types.GraphQueryResult;
 pub const GraphQueryType = types.GraphQueryType;
 pub const GraphResultNode = types.GraphResultNode;
+pub const GraphSourceArtifactStatus = types.GraphSourceArtifactStatus;
 pub const GroundTruth = types.GroundTruth;
 pub const IPRangeQuery = types.IPRangeQuery;
 pub const ImageURL = types.ImageURL;

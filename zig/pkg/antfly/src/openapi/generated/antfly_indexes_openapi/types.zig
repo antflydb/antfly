@@ -122,9 +122,9 @@ pub const AlgebraicIndexStats = struct {
     missing_groups: ?i64 = null,
     unknown_remote_groups: ?i64 = null,
     /// Source artifact stream used to materialize graph edges.
-    source_artifact: ?std.json.Value = null,
+    source_artifact: ?GraphSourceArtifactStatus = null,
     /// All source artifact streams used to materialize graph edges, in configured order.
-    source_artifacts: ?[]const std.json.Value = null,
+    source_artifacts: ?[]const GraphSourceArtifactStatus = null,
     /// Graph resolver replay diagnostics.
     resolver_replay: ?std.json.Value = null,
     /// Artifact resolution replay diagnostics.
@@ -598,7 +598,7 @@ pub const EnrichmentConfig = struct {
     full_text_index: ?bool = null,
     /// Produced asset content type for asset enrichments.
     content_type: ?[]const u8 = null,
-    /// Serialized asset producer configuration.
+    /// Serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
     producer_json: ?[]const u8 = null,
     /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
     execution: ?ExecutionPolicy = null,
@@ -829,9 +829,9 @@ pub const GraphIndexStats = struct {
     catch_up_applied_sequence: ?i64 = null,
     catch_up_target_sequence: ?i64 = null,
     /// Graph source artifact materialization status.
-    source_artifact: ?std.json.Value = null,
+    source_artifact: ?GraphSourceArtifactStatus = null,
     /// Materialization status for every configured graph source artifact.
-    source_artifacts: ?[]const std.json.Value = null,
+    source_artifacts: ?[]const GraphSourceArtifactStatus = null,
     /// Resolver replay diagnostics for graph materialization.
     resolver_replay: ?std.json.Value = null,
     async_indexing: ?std.json.Value = null,
@@ -999,6 +999,18 @@ pub const GraphResultNode = struct {
     evidence: ?std.json.Value = null,
     /// Connected edges (when include_edges=true)
     edges: ?[]const Edge = null,
+};
+
+/// Materialization status for one configured graph artifact source.
+pub const GraphSourceArtifactStatus = struct {
+    /// Configured artifact source name.
+    name: []const u8,
+    /// Configured JSON path, or an empty string when the payload root is consumed.
+    path: []const u8,
+    /// Payload interpretation configured for this source.
+    format: []const u8,
+    /// Whether index-wide replay or catch-up can still change this source's visible graph materialization.
+    materialization_pending: bool,
 };
 
 /// Configuration for an index

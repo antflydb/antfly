@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 MAX_ARTIFACT_SOURCES = 64
 
@@ -30,15 +30,37 @@ def artifact_index_sources(*artifacts: str) -> list[dict[str, str]]:
     return [{"artifact": artifact} for artifact in artifacts]
 
 
-def graph_index_sources(*sources: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Validate graph sources while preserving source-specific path and format."""
+GraphArtifactFormat = Literal["extraction_relation", "extraction_graph"]
 
-    copied = [dict(source) for source in sources]
-    _validate_artifacts([source.get("artifact", "") for source in copied])
-    for index, source in enumerate(copied):
-        if source.get("format") not in (None, "extraction_relation", "extraction_graph"):
+
+@dataclass(frozen=True, slots=True)
+class GraphArtifactSource:
+    """One graph artifact stream and its source-specific payload interpretation."""
+
+    artifact: str
+    path: str | None = None
+    format: GraphArtifactFormat = "extraction_relation"
+    mention_edge_type: str | None = None
+
+
+def graph_index_sources(*sources: GraphArtifactSource) -> list[dict[str, Any]]:
+    """Build validated graph sources without accepting unknown source fields."""
+
+    _validate_artifacts([source.artifact for source in sources])
+    result: list[dict[str, Any]] = []
+    for index, source in enumerate(sources):
+        if source.format not in ("extraction_relation", "extraction_graph"):
             raise ValueError(f"sources[{index}].format is invalid")
-    return copied
+        item: dict[str, Any] = {
+            "artifact": source.artifact,
+            "format": source.format,
+        }
+        if source.path is not None:
+            item["path"] = source.path
+        if source.mention_edge_type is not None:
+            item["mention_edge_type"] = source.mention_edge_type
+        result.append(item)
+    return result
 
 
 @dataclass(frozen=True, slots=True)

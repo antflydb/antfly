@@ -15,8 +15,7 @@ if TYPE_CHECKING:
     from ..models.algebraic_index_stats_promotion import AlgebraicIndexStatsPromotion
     from ..models.algebraic_index_stats_resolution import AlgebraicIndexStatsResolution
     from ..models.algebraic_index_stats_resolver_replay import AlgebraicIndexStatsResolverReplay
-    from ..models.algebraic_index_stats_source_artifact import AlgebraicIndexStatsSourceArtifact
-    from ..models.algebraic_index_stats_source_artifacts_item import AlgebraicIndexStatsSourceArtifactsItem
+    from ..models.graph_source_artifact_status import GraphSourceArtifactStatus
 
 
 T = TypeVar("T", bound="AlgebraicIndexStats")
@@ -99,10 +98,10 @@ class AlgebraicIndexStats:
             stale_groups (int | Unset):
             missing_groups (int | Unset):
             unknown_remote_groups (int | Unset):
-            source_artifact (AlgebraicIndexStatsSourceArtifact | Unset): Source artifact stream used to materialize graph
-                edges.
-            source_artifacts (list[AlgebraicIndexStatsSourceArtifactsItem] | Unset): All source artifact streams used to
-                materialize graph edges, in configured order.
+            source_artifact (GraphSourceArtifactStatus | Unset): Materialization status for one configured graph artifact
+                source.
+            source_artifacts (list[GraphSourceArtifactStatus] | Unset): All source artifact streams used to materialize
+                graph edges, in configured order.
             resolver_replay (AlgebraicIndexStatsResolverReplay | Unset): Graph resolver replay diagnostics.
             resolution (AlgebraicIndexStatsResolution | Unset): Artifact resolution replay diagnostics.
             promotion (AlgebraicIndexStatsPromotion | Unset): Artifact promotion replay diagnostics.
@@ -171,8 +170,8 @@ class AlgebraicIndexStats:
     stale_groups: int | Unset = UNSET
     missing_groups: int | Unset = UNSET
     unknown_remote_groups: int | Unset = UNSET
-    source_artifact: AlgebraicIndexStatsSourceArtifact | Unset = UNSET
-    source_artifacts: list[AlgebraicIndexStatsSourceArtifactsItem] | Unset = UNSET
+    source_artifact: GraphSourceArtifactStatus | Unset = UNSET
+    source_artifacts: list[GraphSourceArtifactStatus] | Unset = UNSET
     resolver_replay: AlgebraicIndexStatsResolverReplay | Unset = UNSET
     resolution: AlgebraicIndexStatsResolution | Unset = UNSET
     promotion: AlgebraicIndexStatsPromotion | Unset = UNSET
@@ -482,8 +481,7 @@ class AlgebraicIndexStats:
         from ..models.algebraic_index_stats_promotion import AlgebraicIndexStatsPromotion
         from ..models.algebraic_index_stats_resolution import AlgebraicIndexStatsResolution
         from ..models.algebraic_index_stats_resolver_replay import AlgebraicIndexStatsResolverReplay
-        from ..models.algebraic_index_stats_source_artifact import AlgebraicIndexStatsSourceArtifact
-        from ..models.algebraic_index_stats_source_artifacts_item import AlgebraicIndexStatsSourceArtifactsItem
+        from ..models.graph_source_artifact_status import GraphSourceArtifactStatus
 
         d = dict(src_dict)
         index_type = AlgebraicIndexStatsIndexType(d.pop("index_type"))
@@ -623,18 +621,18 @@ class AlgebraicIndexStats:
         unknown_remote_groups = d.pop("unknown_remote_groups", UNSET)
 
         _source_artifact = d.pop("source_artifact", UNSET)
-        source_artifact: AlgebraicIndexStatsSourceArtifact | Unset
+        source_artifact: GraphSourceArtifactStatus | Unset
         if isinstance(_source_artifact, Unset):
             source_artifact = UNSET
         else:
-            source_artifact = AlgebraicIndexStatsSourceArtifact.from_dict(_source_artifact)
+            source_artifact = GraphSourceArtifactStatus.from_dict(_source_artifact)
 
         _source_artifacts = d.pop("source_artifacts", UNSET)
-        source_artifacts: list[AlgebraicIndexStatsSourceArtifactsItem] | Unset = UNSET
+        source_artifacts: list[GraphSourceArtifactStatus] | Unset = UNSET
         if _source_artifacts is not UNSET:
             source_artifacts = []
             for source_artifacts_item_data in _source_artifacts:
-                source_artifacts_item = AlgebraicIndexStatsSourceArtifactsItem.from_dict(source_artifacts_item_data)
+                source_artifacts_item = GraphSourceArtifactStatus.from_dict(source_artifacts_item_data)
 
                 source_artifacts.append(source_artifacts_item)
 

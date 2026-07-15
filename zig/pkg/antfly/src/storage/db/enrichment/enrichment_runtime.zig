@@ -3878,13 +3878,7 @@ fn materializeGraphAssetForRuntime(
         for (writes.items[0..graph_write_count]) |write| try appendUniqueDupeKey(runtime.alloc, &affected, write.key);
         for (affected.items) |edge_key| {
             if (winners.map.get(edge_key)) |winner| {
-                const payload = if (winner.payload) |winner_payload|
-                    try runtime.alloc.dupe(u8, winner_payload)
-                else
-                    storeGetAlloc(runtime, edge_key) catch |err| switch (err) {
-                        std.mem.Allocator.Error.OutOfMemory => return err,
-                        else => continue,
-                    };
+                const payload = try runtime.alloc.dupe(u8, winner.payload);
                 var payload_owned = true;
                 errdefer if (payload_owned) runtime.alloc.free(payload);
                 try runtimeUpsertOwnedKVWriteDupeKey(runtime.alloc, &writes, &write_positions, edge_key, payload);
@@ -3952,13 +3946,7 @@ fn materializeGraphAssetDeleteForRuntime(
         }
         if (previous_keys) |keys| for (keys) |edge_key| {
             if (winners.map.get(edge_key)) |winner| {
-                const payload = if (winner.payload) |value|
-                    try runtime.alloc.dupe(u8, value)
-                else
-                    storeGetAlloc(runtime, edge_key) catch |err| switch (err) {
-                        std.mem.Allocator.Error.OutOfMemory => return err,
-                        else => continue,
-                    };
+                const payload = try runtime.alloc.dupe(u8, winner.payload);
                 try writes.append(runtime.alloc, .{
                     .key = try runtime.alloc.dupe(u8, edge_key),
                     .value = payload,
@@ -4020,7 +4008,7 @@ fn runtimeUpsertOwnedKVWriteDupeKey(
 
 const RuntimeGraphEdgeWinner = struct {
     owner_state_key: []u8,
-    payload: ?[]u8,
+    payload: []u8,
     source_priority: usize,
 };
 
@@ -4032,7 +4020,7 @@ const RuntimeGraphEdgeWinners = struct {
         while (it.next()) |entry| {
             alloc.free(@constCast(entry.key_ptr.*));
             alloc.free(entry.value_ptr.owner_state_key);
-            if (entry.value_ptr.payload) |payload| alloc.free(payload);
+            alloc.free(entry.value_ptr.payload);
         }
         self.map.deinit(alloc);
         self.* = undefined;
@@ -4054,9 +4042,9 @@ fn runtimeAddGraphStateManifest(
                 (source_priority == winner.source_priority and std.mem.order(u8, state_key, winner.owner_state_key) != .lt)) continue;
             const owner = try alloc.dupe(u8, state_key);
             errdefer alloc.free(owner);
-            const payload = if (entry.value) |value| try alloc.dupe(u8, value) else null;
+            const payload = try alloc.dupe(u8, entry.value);
             alloc.free(winner.owner_state_key);
-            if (winner.payload) |value| alloc.free(value);
+            alloc.free(winner.payload);
             winner.* = .{ .owner_state_key = owner, .payload = payload, .source_priority = source_priority };
             continue;
         }
@@ -4065,8 +4053,8 @@ fn runtimeAddGraphStateManifest(
         errdefer alloc.free(owned_key);
         const owner = try alloc.dupe(u8, state_key);
         errdefer alloc.free(owner);
-        const payload = if (entry.value) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (payload) |value| alloc.free(value);
+        const payload = try alloc.dupe(u8, entry.value);
+        errdefer alloc.free(payload);
         try winners.map.put(alloc, owned_key, .{ .owner_state_key = owner, .payload = payload, .source_priority = source_priority });
     }
 }
@@ -4850,7 +4838,7 @@ fn processMaterializedChunkDenseRequest(
                 const text = (try chunkPayloadTextAlloc(ctx.runtime.alloc, value, ctx.request.source_field)) orelse return .@"continue";
                 var text_owned = true;
                 errdefer if (text_owned) ctx.runtime.alloc.free(text);
-                const source_hash = enrichment_artifact_codec.hashSource(text);
+                const source_hash = enrichment_artifact_codec.hashEmbeddingSource(text, ctx.request.producer_json);
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(ctx.runtime.alloc, key, ctx.embedding_artifact_name);
                 var embedding_key_owned = true;
                 errdefer if (embedding_key_owned) ctx.runtime.alloc.free(embedding_key);
@@ -5067,7 +5055,7 @@ fn processMaterializedChunkSparseRequest(
                 const text = (try chunkPayloadTextAlloc(ctx.runtime.alloc, value, ctx.request.source_field)) orelse return .@"continue";
                 var text_owned = true;
                 errdefer if (text_owned) ctx.runtime.alloc.free(text);
-                const source_hash = enrichment_artifact_codec.hashSource(text);
+                const source_hash = enrichment_artifact_codec.hashEmbeddingSource(text, ctx.request.producer_json);
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(ctx.runtime.alloc, key, ctx.embedding_artifact_name);
                 var embedding_key_owned = true;
                 errdefer if (embedding_key_owned) ctx.runtime.alloc.free(embedding_key);
@@ -5157,7 +5145,7 @@ fn collectPlainDenseBatchItem(
         return null;
     };
     errdefer runtime.alloc.free(@constCast(source_text));
-    const source_hash = enrichment_artifact_codec.hashSource(source_text);
+    const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source_text, request.producer_json);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     errdefer runtime.alloc.free(artifact_key);
@@ -5359,7 +5347,7 @@ fn processChunkedDenseWindow(
             }
 
             for (source_set.sources) |source| {
-                const source_hash = enrichment_artifact_codec.hashSource(source.text);
+                const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, embedding_artifact_name);
                 defer runtime.alloc.free(embedding_key);
                 if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
@@ -5867,7 +5855,7 @@ fn processDenseEmbedding(
         return;
     };
     defer runtime.alloc.free(source_text);
-    const source_hash = enrichment_artifact_codec.hashSource(source_text);
+    const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source_text, request.producer_json);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
@@ -5968,7 +5956,7 @@ fn processSparseEmbedding(
         return;
     };
     defer runtime.alloc.free(source_text);
-    const source_hash = enrichment_artifact_codec.hashSource(source_text);
+    const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source_text, request.producer_json);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
@@ -6019,7 +6007,7 @@ fn buildChunkDenseEmbeddingsFromSources(
         const chunk_key = try runtime.alloc.dupe(u8, source.key);
         var chunk_key_owned = true;
         errdefer if (chunk_key_owned) runtime.alloc.free(chunk_key);
-        const source_hash = enrichment_artifact_codec.hashSource(source.text);
+        const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
         const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, requestEmbeddingName(request));
         defer runtime.alloc.free(embedding_key);
         if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
@@ -6142,7 +6130,7 @@ fn buildChunkSparseEmbeddingsFromSources(
         const chunk_key = try runtime.alloc.dupe(u8, source.key);
         var chunk_key_owned = true;
         errdefer if (chunk_key_owned) runtime.alloc.free(chunk_key);
-        const source_hash = enrichment_artifact_codec.hashSource(source.text);
+        const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
         const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, requestEmbeddingName(request));
         defer runtime.alloc.free(embedding_key);
         if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
@@ -7545,7 +7533,7 @@ fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const 
         else => return null,
     };
     defer alloc.free(raw);
-    const entries = graph_asset_state.decodeAlloc(alloc, raw) catch return null;
+    const entries = try graph_asset_state.decodeAlloc(alloc, raw);
     defer graph_asset_state.freeEntries(alloc, entries);
     const keys = if (entries.len > 0) try alloc.alloc([]const u8, entries.len) else return &.{};
     var initialized: usize = 0;

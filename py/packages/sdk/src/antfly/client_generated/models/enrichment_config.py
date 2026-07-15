@@ -39,7 +39,8 @@ class EnrichmentConfig:
             full_text_index (bool | Unset): When true on a chunk or asset enrichment, route generated text into the table's
                 default full-text index. Default: False.
             content_type (str | Unset): Produced asset content type for asset enrichments.
-            producer_json (str | Unset): Serialized asset producer configuration.
+            producer_json (str | Unset): Serialized producer configuration. For managed embedding enrichments Antfly stores
+                a canonical semantic producer identity here; credentials and execution policy are excluded.
             execution (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
                 operation. These fields tune how work is batched and do not change generated artifact identity.
     """

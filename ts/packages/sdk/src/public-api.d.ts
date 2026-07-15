@@ -7504,7 +7504,7 @@ export interface components {
             full_text_index?: boolean;
             /** @description Produced asset content type for asset enrichments. */
             content_type?: string;
-            /** @description Serialized asset producer configuration. */
+            /** @description Serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded. */
             producer_json?: string;
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
@@ -9304,6 +9304,20 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @description Materialization status for one configured graph artifact source. */
+        GraphSourceArtifactStatus: {
+            /** @description Configured artifact source name. */
+            name: string;
+            /** @description Configured JSON path, or an empty string when the payload root is consumed. */
+            path: string;
+            /**
+             * @description Payload interpretation configured for this source.
+             * @enum {string}
+             */
+            format: "extraction_relation" | "extraction_graph";
+            /** @description Whether index-wide replay or catch-up can still change this source's visible graph materialization. */
+            materialization_pending: boolean;
+        };
         /** @description Statistics for graph index */
         GraphIndexStats: {
             /**
@@ -9369,13 +9383,9 @@ export interface components {
             /** Format: uint64 */
             catch_up_target_sequence?: number;
             /** @description Graph source artifact materialization status. */
-            source_artifact?: {
-                [key: string]: unknown;
-            };
+            source_artifact?: components["schemas"]["GraphSourceArtifactStatus"];
             /** @description Materialization status for every configured graph source artifact. */
-            source_artifacts?: {
-                [key: string]: unknown;
-            }[];
+            source_artifacts?: components["schemas"]["GraphSourceArtifactStatus"][];
             /** @description Resolver replay diagnostics for graph materialization. */
             resolver_replay?: {
                 [key: string]: unknown;
@@ -9609,13 +9619,9 @@ export interface components {
             /** Format: uint64 */
             unknown_remote_groups?: number;
             /** @description Source artifact stream used to materialize graph edges. */
-            source_artifact?: {
-                [key: string]: unknown;
-            };
+            source_artifact?: components["schemas"]["GraphSourceArtifactStatus"];
             /** @description All source artifact streams used to materialize graph edges, in configured order. */
-            source_artifacts?: {
-                [key: string]: unknown;
-            }[];
+            source_artifacts?: components["schemas"]["GraphSourceArtifactStatus"][];
             /** @description Graph resolver replay diagnostics. */
             resolver_replay?: {
                 [key: string]: unknown;

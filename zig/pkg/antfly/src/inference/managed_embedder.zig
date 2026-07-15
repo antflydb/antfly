@@ -473,15 +473,62 @@ fn managedEmbeddingEntriesEquivalentForLookup(
     rhs: *const ManagedEmbeddingEntry,
 ) bool {
     // Only properties that can change the mathematical embedding space
-    // participate here. Credentials, deployment endpoints, pacing, and other
-    // execution settings may differ without changing vector semantics.
+    // participate here. Credentials, pacing, and other execution settings may
+    // differ. The endpoint is semantic for OpenAI-compatible deployments:
+    // model names are not globally meaningful across arbitrary endpoints.
     return lhs.provider == rhs.provider and
         lhs.dimensions == rhs.dimensions and
         lhs.sparse == rhs.sparse and
         lhs.multimodal == rhs.multimodal and
         std.mem.eql(u8, lhs.model, rhs.model) and
+        std.mem.eql(u8, lhs.base_url, rhs.base_url) and
+        std.mem.eql(u8, lhs.region, rhs.region) and
         std.mem.eql(u8, lhs.input_type, rhs.input_type) and
         std.mem.eql(u8, lhs.truncate, rhs.truncate);
+}
+
+/// Returns the durable semantic identity of the producer configured for an
+/// embeddings index. This deliberately excludes credentials, pacing, batching,
+/// and retry settings. It is persisted on embedding enrichments so compatibility
+/// is checked against the producer that owns an artifact stream, rather than
+/// inferred only from the set of index configs currently loaded in memory.
+pub fn embeddingSemanticProducerJsonAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) ![]u8 {
+    var parsed_cfg = try parseEmbeddingsIndexConfigFromValue(alloc, value);
+    defer parsed_cfg.deinit();
+    const cfg = parsed_cfg.value;
+    const embedder_value = switch (value) {
+        .object => |object| object.get("embedder") orelse return error.InvalidCreateTableRequest,
+        else => return error.InvalidCreateTableRequest,
+    };
+    var embedder_cfg = try parseEmbedderConfigFromValue(alloc, embedder_value);
+    defer embedder_cfg.deinit(alloc);
+    const provider = try parseEmbedderProvider(embedder_cfg);
+    if (embedder_cfg.model.len == 0) return error.InvalidCreateTableRequest;
+    const sparse = cfg.sparse orelse false;
+    const SemanticProducer = struct {
+        version: u8 = 1,
+        provider: []const u8,
+        model: []const u8,
+        endpoint: []const u8,
+        region: []const u8,
+        sparse: bool,
+        multimodal: bool,
+        input_type: []const u8,
+        truncate: []const u8,
+    };
+    return try std.json.Stringify.valueAlloc(alloc, SemanticProducer{
+        .provider = @tagName(provider),
+        .model = embedder_cfg.model,
+        .endpoint = embedder_cfg.url,
+        .region = embedder_cfg.region,
+        .sparse = sparse,
+        .multimodal = embedder_cfg.multimodal,
+        .input_type = embedder_cfg.input_type,
+        .truncate = embedder_cfg.truncate,
+    }, .{});
 }
 
 const VectorSpaceMap = std.StringHashMapUnmanaged([]const u8);
@@ -1103,6 +1150,11 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
 
     const sparse = cfg.sparse orelse false;
     const external = cfg.external orelse false;
+    const semantic_producer_json = if (!external and root.get("embedder") != null)
+        try embeddingSemanticProducerJsonAlloc(alloc, value)
+    else
+        null;
+    defer if (semantic_producer_json) |raw| alloc.free(raw);
 
     if (root.get("summarizer") != null) return error.UnsupportedCreateTableRequest;
 
@@ -1222,6 +1274,10 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         }
         try out.appendSlice(alloc, ",\"embedder\":");
         try out.appendSlice(alloc, embedder_json);
+        if (semantic_producer_json) |producer| {
+            try out.appendSlice(alloc, ",\"semantic_producer\":");
+            try appendJsonString(alloc, &out, producer);
+        }
         try appendExecutionObjectIfPresent(alloc, &out, root);
         try out.append(alloc, '}');
         return try out.toOwnedSlice(alloc);
@@ -1299,6 +1355,10 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     if (embedder_json) |embedder| {
         try out.appendSlice(alloc, ",\"embedder\":");
         try out.appendSlice(alloc, embedder);
+    }
+    if (semantic_producer_json) |producer| {
+        try out.appendSlice(alloc, ",\"semantic_producer\":");
+        try appendJsonString(alloc, &out, producer);
     }
 
     try appendExecutionObjectIfPresent(alloc, &out, root);
@@ -2900,16 +2960,12 @@ test "managed embedder rejects conflicting embedding name aliases" {
 }
 
 pub fn testVectorSpaceCompatibility() !void {
-    {
-        var managed = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
-            \\{
-            \\  "primary":{"type":"embeddings","field":"embedding","embedding_name":"shared_dense_v1","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"https://first.example/v1","api_key":"credential-a","requests_per_minute":100}},
-            \\  "secondary":{"type":"embeddings","field":"embedding","embedding_name":"shared_dense_v1","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"https://second.example/v1","api_key":"credential-b","requests_per_minute":200}}
-            \\}
-        );
-        defer managed.deinit();
-        try std.testing.expect(managed.findEntry("shared_dense_v1") != null);
-    }
+    try std.testing.expectError(error.InvalidManagedEmbeddingIndex, ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+        \\{
+        \\  "primary":{"type":"embeddings","field":"embedding","embedding_name":"shared_dense_v1","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"https://first.example/v1","api_key":"credential-a","requests_per_minute":100}},
+        \\  "secondary":{"type":"embeddings","field":"embedding","embedding_name":"shared_dense_v1","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"https://second.example/v1","api_key":"credential-b","requests_per_minute":200}}
+        \\}
+    ));
 
     var local = TestLocalDenseProvider{ .dimensions = 3 };
     {
@@ -2946,6 +3002,35 @@ pub fn testVectorSpaceCompatibility() !void {
 
 test "managed embedder enforces automatic and explicit vector space compatibility" {
     try testVectorSpaceCompatibility();
+}
+
+pub fn testEmbeddingSemanticProducerIdentity() !void {
+    var first = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"embeddings","dimension":3,"embedder":{"provider":"openai","model":"embed-v1","url":"https://first.example/v1","api_key":"secret-a","requests_per_minute":10}}
+    , .{});
+    defer first.deinit();
+    var second = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"embeddings","dimension":3,"embedder":{"provider":"openai","model":"embed-v1","url":"https://second.example/v1","api_key":"secret-b","requests_per_minute":20}}
+    , .{});
+    defer second.deinit();
+    var inferred_dimensions = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"embeddings","embedder":{"provider":"openai","model":"embed-v1","url":"https://first.example/v1","api_key":"secret-c"}}
+    , .{});
+    defer inferred_dimensions.deinit();
+    const first_identity = try embeddingSemanticProducerJsonAlloc(std.testing.allocator, first.value);
+    defer std.testing.allocator.free(first_identity);
+    const second_identity = try embeddingSemanticProducerJsonAlloc(std.testing.allocator, second.value);
+    defer std.testing.allocator.free(second_identity);
+    const inferred_identity = try embeddingSemanticProducerJsonAlloc(std.testing.allocator, inferred_dimensions.value);
+    defer std.testing.allocator.free(inferred_identity);
+    try std.testing.expect(!std.mem.eql(u8, first_identity, second_identity));
+    try std.testing.expectEqualStrings(first_identity, inferred_identity);
+    try std.testing.expect(std.mem.indexOf(u8, first_identity, "secret-a") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first_identity, "requests_per_minute") == null);
+}
+
+test "embedding semantic producer identity includes endpoint and excludes credentials" {
+    try testEmbeddingSemanticProducerIdentity();
 }
 
 test "managed embedder rejects index name and embedding name collisions with different configs" {

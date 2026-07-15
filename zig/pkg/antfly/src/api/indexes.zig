@@ -390,6 +390,13 @@ fn collectArtifactEnrichmentsFromValue(
 ) !void {
     switch (value) {
         .object => |object| {
+            const embedding_producer_json = blk: {
+                const type_value = object.get("type") orelse break :blk null;
+                if (type_value != .string or !std.mem.eql(u8, type_value.string, "embeddings")) break :blk null;
+                if (object.get("embedder") == null) break :blk null;
+                break :blk try managed_embedder.embeddingSemanticProducerJsonAlloc(alloc, value);
+            };
+            defer if (embedding_producer_json) |raw| alloc.free(raw);
             if (object.get("enrichments")) |enrichments| {
                 if (enrichments == .array) {
                     for (enrichments.array.items) |item| {
@@ -401,6 +408,12 @@ fn collectArtifactEnrichmentsFromValue(
                         defer parsed.deinit();
                         var owned = try db_mod.types.EnrichmentConfig.clone(alloc, parsed.value);
                         errdefer owned.deinit(alloc);
+                        if (owned.kind == .embedding) {
+                            if (embedding_producer_json) |raw| {
+                                if (owned.producer_json.len > 0) alloc.free(owned.producer_json);
+                                owned.producer_json = try alloc.dupe(u8, raw);
+                            }
+                        }
                         try out.append(alloc, owned);
                     }
                 }
@@ -3269,6 +3282,22 @@ test "index metadata validates artifact enrichment graph" {
     );
 }
 
+pub fn testEmbeddingEnrichmentsPersistSemanticProducerIdentity() !void {
+    const configs = try collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator,
+        \\{"vectors":{"type":"embeddings","dimension":3,"embedder":{"provider":"openai","model":"embed-v1","url":"https://models.example/v1","api_key":"secret"},"sources":[{"artifact":"title_dense_v1"},{"artifact":"body_dense_v1"}],"enrichments":[{"name":"title_dense_v1","kind":"embedding","field":"title"},{"name":"body_dense_v1","kind":"embedding","field":"body"}]}}
+    );
+    defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, configs);
+    try std.testing.expectEqual(@as(usize, 2), configs.len);
+    try std.testing.expect(configs[0].producer_json.len > 0);
+    try std.testing.expectEqualStrings(configs[0].producer_json, configs[1].producer_json);
+    try std.testing.expect(std.mem.indexOf(u8, configs[0].producer_json, "embed-v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, configs[0].producer_json, "secret") == null);
+}
+
+test "embedding enrichments persist canonical semantic producer identity" {
+    try testEmbeddingEnrichmentsPersistSemanticProducerIdentity();
+}
+
 test "index metadata rejects artifact enrichment deletion with dependents" {
     const indexes_json = "{\"enrichments\":[{\"name\":\"units\",\"kind\":\"asset\",\"field\":\"url\"},{\"name\":\"chunks\",\"kind\":\"chunk\",\"field\":\"text\",\"source_artifact_name\":\"units\",\"chunk_size\":512}]}";
     const removed = (try removeEnrichmentFromTableIndexesJson(std.testing.allocator, indexes_json, "units")).?;
@@ -3466,7 +3495,7 @@ test "index encoders expose algebraic graph traversal health" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"algebraic_graph\":{\"traversal\":{\"attempted\":3,\"proven\":2,\"rejected\":1,\"fallback\":4,\"result_nodes\":9}}") != null);
 }
 
-test "index encoders expose graph artifact source materialization status" {
+pub fn testGraphArtifactSourceMaterializationStatus() !void {
     const alloc = std.testing.allocator;
     const indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1);
     defer alloc.free(indexes);
@@ -3513,6 +3542,10 @@ test "index encoders expose graph artifact source materialization status" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_artifacts\":[{\"name\":\"relations_v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "{\"name\":\"entity_graph_v1\",\"path\":\"$.graph\",\"format\":\"extraction_graph\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"shard_status\":{\"7\":{") != null);
+}
+
+test "index encoders expose graph artifact source materialization status" {
+    try testGraphArtifactSourceMaterializationStatus();
 }
 
 test "index encoders expose compact algebraic public status" {

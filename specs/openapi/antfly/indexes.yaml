@@ -138,6 +138,31 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: "Optional provenance edge type emitted for resolver mention decisions from this source."
+    GraphSourceArtifactStatus:
+      type: object
+      additionalProperties: false
+      description: "Materialization status for one configured graph artifact source."
+      required:
+        - name
+        - path
+        - format
+        - materialization_pending
+      properties:
+        name:
+          type: string
+          description: "Configured artifact source name."
+        path:
+          type: string
+          description: "Configured JSON path, or an empty string when the payload root is consumed."
+        format:
+          type: string
+          enum:
+            - extraction_relation
+            - extraction_graph
+          description: "Payload interpretation configured for this source."
+        materialization_pending:
+          type: boolean
+          description: "Whether index-wide replay or catch-up can still change this source's visible graph materialization."
     EnrichmentConfig:
       type: object
       description: "Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams."
@@ -198,7 +223,7 @@ components:
         producer_json:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Serialized asset producer configuration."
+          description: "Serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded."
         execution:
           $ref: "#/components/schemas/ExecutionPolicy"
           description: "Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity."
@@ -1146,15 +1171,13 @@ components:
           format: uint64
         source_artifact:
           x-go-type-skip-optional-pointer: true
-          type: object
-          additionalProperties: true
+          $ref: "#/components/schemas/GraphSourceArtifactStatus"
           description: "Source artifact stream used to materialize graph edges."
         source_artifacts:
           x-go-type-skip-optional-pointer: true
           type: array
           items:
-            type: object
-            additionalProperties: true
+            $ref: "#/components/schemas/GraphSourceArtifactStatus"
           description: "All source artifact streams used to materialize graph edges, in configured order."
         resolver_replay:
           x-go-type-skip-optional-pointer: true
@@ -1472,15 +1495,13 @@ components:
           format: uint64
         source_artifact:
           x-go-type-skip-optional-pointer: true
-          type: object
-          additionalProperties: true
+          $ref: "#/components/schemas/GraphSourceArtifactStatus"
           description: "Graph source artifact materialization status."
         source_artifacts:
           x-go-type-skip-optional-pointer: true
           type: array
           items:
-            type: object
-            additionalProperties: true
+            $ref: "#/components/schemas/GraphSourceArtifactStatus"
           description: "Materialization status for every configured graph source artifact."
         resolver_replay:
           x-go-type-skip-optional-pointer: true
