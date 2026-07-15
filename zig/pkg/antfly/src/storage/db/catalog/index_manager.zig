@@ -5595,6 +5595,13 @@ pub const IndexManager = struct {
         return false;
     }
 
+    pub fn denseIndexConsumesEmbedding(self: *IndexManager, index_name: []const u8, embedding_name: []const u8) bool {
+        const entry = self.denseIndex(index_name) orelse return false;
+        if (denseEntryConsumesEmbedding(entry, embedding_name)) return true;
+        return entry.embedding_name == null and entry.embedding_names.len == 0 and
+            std.mem.eql(u8, entry.config.name, embedding_name);
+    }
+
     fn denseEntryArtifactBacked(entry: *const DenseIndex) bool {
         return entry.external or entry.chunk_name != null or entry.embedding_name != null or entry.embedding_names.len > 0;
     }
@@ -5759,6 +5766,16 @@ pub const IndexManager = struct {
             if (std.mem.eql(u8, entry.config.name, name)) return entry.embedding_name;
         }
         return null;
+    }
+
+    pub fn sparseIndexConsumesEmbedding(self: *IndexManager, index_name: []const u8, embedding_name: []const u8) bool {
+        const entry = self.sparseIndex(index_name) orelse return false;
+        if (entry.embedding_name) |configured| {
+            if (std.mem.eql(u8, configured, embedding_name)) return true;
+        }
+        if (containsOwnedString(entry.embedding_names, embedding_name)) return true;
+        return entry.embedding_name == null and entry.embedding_names.len == 0 and
+            std.mem.eql(u8, entry.config.name, embedding_name);
     }
 
     pub fn sparseIndexesForEmbedding(self: *const IndexManager, alloc: Allocator, embedding_name: []const u8) ![][]u8 {
@@ -17776,6 +17793,9 @@ test "dense index unions multiple embedding artifact sources without overwriting
     try std.testing.expectEqual(@as(usize, 1), body_routes.len);
     try std.testing.expectEqualStrings("document_vectors", title_routes[0]);
     try std.testing.expectEqualStrings("document_vectors", body_routes[0]);
+    try std.testing.expect(manager.denseIndexConsumesEmbedding("document_vectors", "title_dense_v1"));
+    try std.testing.expect(manager.denseIndexConsumesEmbedding("document_vectors", "body_dense_v1"));
+    try std.testing.expect(!manager.denseIndexConsumesEmbedding("document_vectors", "other_dense_v1"));
 
     const doc_key = "doc:multi";
     const stored_key = try internal_keys.documentKeyAlloc(alloc, doc_key);

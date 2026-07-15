@@ -32,8 +32,9 @@ fn main() {
 }
 
 /// Progenitor 0.13 can still treat two success statuses as distinct response
-/// types even when their JSON schemas are identical. Keep one status in that
-/// case; the generated method retains the same response body type.
+/// types even when their JSON schemas are identical. Replace equivalent
+/// statuses with one typed `2XX` range so the generated method accepts every
+/// documented success status without creating multiple body types.
 fn collapse_equivalent_success_responses(spec: &mut serde_yaml::Value) {
     if let Some(paths) = spec.get_mut("paths").and_then(|p| p.as_mapping_mut()) {
         for (_path, methods) in paths.iter_mut() {
@@ -79,16 +80,20 @@ fn collapse_equivalent_success_responses(spec: &mut serde_yaml::Value) {
                     continue;
                 }
 
-                let keep = success_keys
+                const SUCCESS_RANGE: &str = "2XX";
+                let representative = success_keys
                     .iter()
                     .find(|key| key.as_str() == Some("200"))
+                    .and_then(|key| responses.get(key))
                     .cloned()
-                    .unwrap_or_else(|| success_keys[0].clone());
+                    .unwrap_or_else(|| responses[&success_keys[0]].clone());
                 for key in success_keys {
-                    if key != keep {
-                        responses.remove(&key);
-                    }
+                    responses.remove(&key);
                 }
+                responses.insert(
+                    serde_yaml::Value::String(SUCCESS_RANGE.into()),
+                    representative,
+                );
             }
         }
     }

@@ -3846,6 +3846,7 @@ fn materializeGraphAssetForRuntime(
             defer freeOwnedConstKeySlice(runtime.alloc, previous_keys);
             for (previous_keys) |previous_key| {
                 if (runtimeContainsKVKey(writes.items, previous_key)) continue;
+                if (try runtimeGraphEdgeReferencedByOtherState(runtime, request.doc_key, graph_entry.config.name, state_key, previous_key)) continue;
                 try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
                 try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
             }
@@ -3901,6 +3902,7 @@ fn materializeGraphAssetDeleteForRuntime(
         if (try loadGraphAssetStateKeysAlloc(runtime, state_key)) |previous_keys| {
             defer freeOwnedConstKeySlice(runtime.alloc, previous_keys);
             for (previous_keys) |previous_key| {
+                if (try runtimeGraphEdgeReferencedByOtherState(runtime, request.doc_key, graph_entry.config.name, state_key, previous_key)) continue;
                 try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
                 try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
             }
@@ -3930,6 +3932,36 @@ fn materializeGraphAssetDeleteForRuntime(
 fn runtimeContainsKVKey(items: []const KVPair, key: []const u8) bool {
     for (items) |item| {
         if (std.mem.eql(u8, item.key, key)) return true;
+    }
+    return false;
+}
+
+fn runtimeGraphAssetStateValueContainsKey(raw: []const u8, target_key: []const u8) !bool {
+    var pos: usize = 0;
+    const count = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
+    for (0..count) |_| {
+        const len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
+        if (len > raw.len - pos) return error.InvalidGraphAssetState;
+        if (std.mem.eql(u8, raw[pos..][0..len], target_key)) return true;
+        pos += len;
+    }
+    return false;
+}
+
+fn runtimeGraphEdgeReferencedByOtherState(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    index_name: []const u8,
+    current_state_key: []const u8,
+    edge_key: []const u8,
+) !bool {
+    const prefix = try internal_keys.graphAssetStateIndexPrefixAlloc(runtime.alloc, doc_key, index_name);
+    defer runtime.alloc.free(prefix);
+    const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
+    defer backend_scan.freeResults(runtime.alloc, existing);
+    for (existing) |entry| {
+        if (std.mem.eql(u8, entry.key, current_state_key)) continue;
+        if (try runtimeGraphAssetStateValueContainsKey(entry.value, edge_key)) return true;
     }
     return false;
 }
