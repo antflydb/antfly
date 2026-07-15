@@ -40,6 +40,14 @@ pub const Trigger = enum(u8) {
     /// as the authoritative source counter. A healthy serving generation stays
     /// available while a replacement is reconstructed and validated.
     artifact_coverage_mismatch = 4,
+    /// The authoritative artifact counter is absent. The serving generation may
+    /// remain available but is explicitly degraded while the counter is
+    /// bootstrapped and a replacement is validated.
+    artifact_counter_missing = 5,
+    /// Configuration/checkpoint state or backend validation proves that the
+    /// current generation is unsafe to serve. Repair remains fail-closed until
+    /// a replacement reaches cleanup.
+    projection_generation_invalid = 6,
 };
 
 pub const Phase = enum(u8) {
@@ -88,7 +96,7 @@ pub const IndexRepairIntent = struct {
     config_hash: u64,
     trigger: Trigger = .incomplete_bulk_publish,
     /// Stable API job identity for crash-idempotent forced generation rebuilds.
-    /// Both values are zero for automatic repairs and legacy intents.
+    /// Both values are zero until an operator job attaches to the intent.
     operator_job_id: u64 = 0,
     operator_job_created_at_ms: u64 = 0,
     candidate_relative_path: ?[]u8 = null,

@@ -846,11 +846,10 @@ pub const Store = struct {
                 write_count += 1;
             }
             if (!isTerminalPhase(parsed.value.phase)) {
-                // The active index duplicates the compact job record so restart
-                // performs one ordered prefix scan rather than N random reads or
-                // a scan over retained terminal history. Both records commit in
+                // The active index is only a compact lookup index. The primary
+                // job record remains authoritative and both records commit in
                 // the same DocStore batch.
-                writes[write_count] = .{ .key = active_key, .value = encoded };
+                writes[write_count] = .{ .key = active_key, .value = active_job_marker_value };
                 write_count += 1;
                 try opened.docstore.putBatch(writes[0..write_count], &.{});
             } else {
@@ -879,8 +878,23 @@ pub const Store = struct {
         const results = try opened.docstore.scanPrefix(self.alloc, active_job_key_prefix);
         defer docstore_mod.DocStore.freeResults(self.alloc, results);
         for (results) |kv| {
-            var parsed = std.json.parseFromSlice(JobState, self.alloc, kv.value, .{ .ignore_unknown_fields = true }) catch continue;
+            const marker_job_id = try activeJobIdFromKey(kv.key);
+            const primary_key = try jobKey(self.alloc, marker_job_id);
+            defer self.alloc.free(primary_key);
+            const primary = opened.docstore.get(self.alloc, primary_key) catch |err| switch (err) {
+                error.NotFound => {
+                    // A stale secondary marker cannot resurrect a job. Remove
+                    // it and continue from authoritative primary state.
+                    try opened.docstore.putBatch(&.{}, &.{kv.key});
+                    continue;
+                },
+                else => return err,
+            };
+            defer self.alloc.free(primary);
+            var parsed = std.json.parseFromSlice(JobState, self.alloc, primary, .{ .ignore_unknown_fields = true }) catch
+                return error.InvalidRepairJobState;
             defer parsed.deinit();
+            if (parsed.value.job_id != marker_job_id) return error.InvalidRepairJobState;
             const now_ms = nowMillis();
             const was_running = std.mem.eql(u8, parsed.value.phase, phaseString(.running));
             const durable_cancel = requiresDurableCancel(parsed.value);
@@ -922,7 +936,7 @@ pub const Store = struct {
                     .last_updated_at_millis = now_ms,
                     .expires_at_millis = now_ms + self.retentionMillis(),
                 });
-            } else try self.alloc.dupe(u8, kv.value);
+            } else try self.alloc.dupe(u8, primary);
             errdefer self.alloc.free(cached);
             if (was_running or durable_cancel) {
                 const key = try jobKey(self.alloc, parsed.value.job_id);
@@ -931,7 +945,7 @@ pub const Store = struct {
                 defer self.alloc.free(active_key);
                 try opened.docstore.putBatch(&.{
                     .{ .key = key, .value = cached },
-                    .{ .key = active_key, .value = cached },
+                    .{ .key = active_key, .value = active_job_marker_value },
                 }, &.{});
             } else if (isTerminalPhase(parsed.value.phase)) {
                 // Self-heal an impossible/stale marker without making startup
@@ -1061,6 +1075,15 @@ fn activeJobKey(alloc: std.mem.Allocator, job_id: u64) ![]u8 {
     return key;
 }
 
+fn activeJobIdFromKey(key: []const u8) !u64 {
+    if (!std.mem.startsWith(u8, key, active_job_key_prefix) or
+        key.len != active_job_key_prefix.len + @sizeOf(u64))
+    {
+        return error.InvalidRepairJobState;
+    }
+    return std.mem.readInt(u64, key[active_job_key_prefix.len..][0..8], .big);
+}
+
 fn encodeNextJobId(alloc: std.mem.Allocator, next_job_id: u64) ![]u8 {
     const out = try alloc.alloc(u8, @sizeOf(u64));
     std.mem.writeInt(u64, out[0..8], next_job_id, .big);
@@ -1090,6 +1113,7 @@ fn persistNextJobId(store: *docstore_mod.DocStore, alloc: std.mem.Allocator, nex
 const job_key_prefix = "__api_table_repair_jobs__:";
 const next_job_id_key = "__api_table_repair_jobs_meta__:next_job_id";
 const active_job_key_prefix = "__api_table_repair_jobs_active__:";
+const active_job_marker_value = "1";
 const durable_cleanup_interval_ms: u64 = 60_000;
 const durable_cleanup_scan_limit: usize = 128;
 
@@ -1352,6 +1376,17 @@ test "named index repair cancellation restarts its durable traversal after job s
         const cancelling = try store.requestCancel(alloc, parsed_running.value);
         defer alloc.free(cancelling);
 
+        // The active marker is a secondary lookup index, not job state. A
+        // damaged marker value and an orphan marker must be harmless on the
+        // next attach: primary records are authoritative and the orphan is
+        // removed in-place.
+        const damaged_marker = try activeJobKey(alloc, job_id);
+        defer alloc.free(damaged_marker);
+        try opened.docstore.put(damaged_marker, "not-json");
+        const orphan_marker = try activeJobKey(alloc, 9_999_999);
+        defer alloc.free(orphan_marker);
+        try opened.docstore.put(orphan_marker, active_job_marker_value);
+
         const terminal_started = try store.startJob(alloc, "docs", .{ .target = "artifact" });
         defer alloc.free(terminal_started);
         var parsed_terminal_started = try std.json.parseFromSlice(JobState, alloc, terminal_started, .{ .ignore_unknown_fields = true });
@@ -1369,8 +1404,9 @@ test "named index repair cancellation restarts its durable traversal after job s
         defer store.deinit();
         try store.attachOpenedStore(opened);
 
-        // Restart scans only the fixed-width active index. Retained terminal
-        // history remains lazy and does not consume startup I/O or cache space.
+        // Restart scans only the fixed-width active index and validates each
+        // marker against its primary record. Retained terminal history remains
+        // lazy and does not consume startup I/O or cache space.
         try std.testing.expectEqual(@as(usize, 1), store.jobs.count());
         const active = try opened.docstore.scanPrefix(alloc, active_job_key_prefix);
         defer docstore_mod.DocStore.freeResults(alloc, active);

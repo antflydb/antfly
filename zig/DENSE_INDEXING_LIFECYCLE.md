@@ -12,7 +12,7 @@ Implemented in the current tree:
   bulk-publication state
 - `IncompleteBulkPublish` is quarantined and repaired through a durable,
   restart-resumable shadow-generation state machine
-- a counterless legacy artifact projection bootstraps its authoritative target
+- an artifact projection with missing counter metadata bootstraps its authoritative target
   count from a stable snapshot plus a signed concurrent-write delta; only the
   two short marker/finalization boundaries hold the apply lock, and restart
   safely repeats the scan under the existing durable repair intent. A random
@@ -59,7 +59,7 @@ Implemented in the current tree:
 - dense repair snapshot batches are sized from vector dimensions and the
   currently available `ResourceManager` repair budget. Background planning
   stays within the soft budget and retains the hard budget as an authoritative
-  race/safety fence. The legacy counter-bootstrap scan is admitted from the
+  race/safety fence. The counter-bootstrap scan is admitted from the
   same repair slice before it publishes a marker or opens its stable snapshot
 - temporarily unknown leadership retains queued debt with retry semantics;
   only an authoritative non-local ownership decision removes local queue state
@@ -72,12 +72,15 @@ Implemented in the current tree:
   generation remains available
 - artifact-backed dense coverage uses the durable source counter as the
   authoritative cardinality invariant at snapshot, replay advancement, and final
-  fenced activation boundaries. A separately committed status snapshot is only
-  a bootstrap fallback when that counter is absent; it can never override a
-  present counter after a crash. A deficit may be filled in place. A surplus or
-  reset-class anomaly durably schedules a shadow-generation rebuild, leaving the
-  published generation queryable until fenced pointer swap; shadow activation
-  rejects either deficit or surplus. Cardinality detects missing/additional
+  fenced activation boundaries. An absent counter is explicit bootstrap debt;
+  a separately committed status snapshot is never substituted as a correctness
+  target. Ordinary counter/index differences are ignored while derived replay
+  is behind its source target. After replay convergence, a deficit may be filled
+  in place and a surplus schedules a shadow-generation rebuild while leaving the
+  published generation queryable but degraded. Configuration mismatch,
+  `repair_required`, and backend structural-validation failures schedule the same
+  efficient shadow rebuild but fail the affected index closed immediately.
+  Shadow activation rejects either deficit or surplus. Cardinality detects missing/additional
   entries but is not a cryptographic proof of key-set identity. Key-set
   correctness derives from constructing an empty shadow exclusively from the
   stable source snapshot plus fenced replay; adding a per-write cryptographic
@@ -617,13 +620,13 @@ None of these cases may produce `IncompleteBulkPublish`.
 Streaming replay prevents new ordinary-write incidents but does not remove the
 need to recover:
 
-- indexes created by older builds
+- previously interrupted or structurally invalid local generations
 - interrupted explicit bulk publications
 - interrupted in-place rebuilds
 
 Automatic restart repair is an independently landable track. It can ship before
 the streaming-session change to eliminate wipe/re-ingest as the operational
-recovery procedure, or after it as recovery for legacy and explicit-publication
+recovery procedure, or after it as recovery for exceptional and explicit-publication
 state. It must not be confused with the generation-publication project: the
 affected index remains unavailable while this repair runs.
 
@@ -722,7 +725,12 @@ pub const IndexRepairIntent = struct {
         incomplete_bulk_publish,
         operator_generation_rebuild,
         root_generation_rebuild,
+        artifact_coverage_mismatch,
+        artifact_counter_missing,
+        projection_generation_invalid,
     },
+    operator_job_id: u64 = 0,
+    operator_job_created_at_ms: u64 = 0,
     candidate_relative_path: ?[]const u8 = null,
     previous_pointer_captured: bool = false,
     // null after capture means the canonical root was previously active
@@ -744,6 +752,7 @@ pub const IndexRepairIntent = struct {
         terminal,
     },
     attempt_count: u32 = 0,
+    failure_streak: u32 = 0,
     next_retry_at_ms: u64 = 0,
     started_at_ms: u64,
     updated_at_ms: u64,
@@ -1421,16 +1430,19 @@ While rebuilding:
 - primary document reads and ordinary writes remain available, subject to the
   explicit hard-pressure contract below
 - unrelated indexes remain searchable
-- the affected index returns a stable `index_rebuilding` error mapped to the
-  existing `IndexUnavailable` class
+- a structurally unsafe affected index returns a stable `index_rebuilding`
+  error mapped to the existing `IndexUnavailable` class. Operator-requested
+  rebuilds and coverage-only repairs keep a safe serving generation queryable
+  until the short activation/validation fence; coverage repairs remain visibly
+  degraded rather than being reported healthy
 - runnable or retryable startup status reports `artifact_rebuild`, not terminal
   degradation; a paused or terminal intent is reported distinctly
 - process and node readiness remain healthy unless primary storage itself is
   unavailable. Table/index health still reports degradation, and deployments
   that require every configured index may opt into a strict readiness policy
 
-Only a completed clean checkpoint and cleared load failure return the index to
-service.
+Only a completed clean checkpoint and cleared load failure return a fail-closed
+index to service.
 
 ### Query and operator experience
 
@@ -1464,7 +1476,9 @@ keep up with foreground traffic.
 Operator actions follow these rules:
 
 - an explicit repair request attaches to the existing intent instead of
-  creating a competing rebuild
+  creating a competing rebuild. The newest `(created_at, job_id)` is attached
+  atomically even when the existing intent was created by automatic coverage
+  repair, and intent completion records that job before deletion
 - `cancel_current_attempt` stops candidate work at a safe boundary, preserves
   the quarantined root and replay pin, releases admitted resources, records
   retryable debt, and permits the automatic executor to try again later
@@ -1492,10 +1506,13 @@ Operator actions follow these rules:
   owner is signalled before the control waits for group-operation serialization,
   allowing an active rebuild to yield at its next durable boundary. Only after
   the traversal completes does the job become `cancelled`; resumption remains
-  an explicit operator action. Every nonterminal job is mirrored atomically into
-  a fixed-width, job-ID-ordered active-job index. Restart scans only that bounded
-  index, reconstructs the unfinished-cancellation FIFO in creation order, and
-  leaves retained terminal history lazily loaded
+  an explicit operator action. Every nonterminal job is indexed atomically by a
+  fixed-width, job-ID-ordered active marker. Restart scans only that bounded
+  secondary index, validates each key against the authoritative primary job
+  record, deletes orphan markers, reconstructs the unfinished-cancellation FIFO
+  in creation order, and leaves retained terminal history lazily loaded.
+  Malformed marker keys or primary records fail attach visibly instead of
+  silently dropping work
 - a transient cancellation pass failure preserves `cancel_requested`, cursor,
   and accumulated results, then enters durable exponential backoff. The FIFO
   inspects a bounded window from a process-local round-robin cursor, advancing
@@ -1513,7 +1530,7 @@ The minimum deterministic test matrix is:
 1. Create an external dense index, persist vectors, leave
    `__bulk_publish_state`, run managed startup catch-up, and verify the index is
    automatically searchable without an API repair request. Repeat with the
-   durable artifact target counter removed to exercise legacy snapshot-plus-
+   durable artifact target counter removed to exercise snapshot-plus-
    delta bootstrap.
 2. Stop after intent persistence and before candidate creation; restart must
    retain the quarantined root and resume.
@@ -1521,7 +1538,7 @@ The minimum deterministic test matrix is:
    checkpoint or discard only the candidate and rebuild it.
 4. Write documents after the snapshot floor while the shadow is building;
    replay truncation must remain pinned and the final index must include them.
-   For a counterless quarantined dense index, perform artifact insert,
+   For a missing-counter quarantined dense index, perform artifact insert,
    replacement, and deletion while the bootstrap snapshot is open; verify the
    signed delta, durable target count, and repaired search result.
    Repeat deletes through the normal document path and TTL cleanup, and route
@@ -1606,8 +1623,8 @@ existing index.
 
 Bulk publication defaults to an isolated candidate. In-place publication is
 allowed only for a brand-new root that has never been advertised, an explicitly
-offline index with no prior searchable generation, or a legacy compatibility
-path. A live active index is never placed into an in-place incomplete
+offline index with no prior searchable generation, or an explicitly isolated
+maintenance path. A live active index is never placed into an in-place incomplete
 publication window.
 
 The generation flow is:
@@ -1877,7 +1894,7 @@ Rollout order:
 1. tests and local benchmarks
 2. fault-injection deployment canary with forced process termination
 3. staged binary rollout with ordinary dense replay using streaming sessions
-4. removal of any unreachable legacy ordinary-replay bulk-session plumbing
+4. removal of any unreachable ordinary-replay bulk-session plumbing
    after qualification
 
 Automatic repair rolls out separately:
@@ -1927,7 +1944,7 @@ explicit import/rebuild
     -> atomic active-generation swap
     -> retired-generation cleanup
 
-legacy/interrupted in-place bulk publication
+interrupted in-place bulk publication
     -> quarantine
     -> allowlisted discovery + rebuildability preflight
     -> replica-bound durable repair intent + atomic pinned snapshot
