@@ -3373,7 +3373,6 @@ pub const DataServer = struct {
         artifacts: *std.ArrayListUnmanaged(HASeedSnapshotExtensionArtifact),
         probe: ?HASeedExtensionCaptureProbe,
     ) !void {
-        _ = probe;
         const store_root = self.api_server_cfg.extension_package_store_dir orelse {
             if (packages.len != 0) return error.HASeedExtensionCatalogMismatch;
             return;
@@ -3473,6 +3472,7 @@ pub const DataServer = struct {
         // A second full walk binds the published image to one filesystem
         // observation. It detects source additions, removals, type changes,
         // and mutations that race the per-file copy loop.
+        if (probe) |capture_probe| try capture_probe.afterCopy(alloc);
         var verify_walker = try store_dir.walk(alloc);
         defer verify_walker.deinit();
         var verified_files: usize = 0;
