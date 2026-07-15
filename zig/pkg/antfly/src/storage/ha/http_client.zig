@@ -799,10 +799,18 @@ fn validateFenceReceipt(receipt: admin_api.HAFenceReceipt) !void {
     if (!validation.isIdentifier(receipt.old_primary_id) or !validation.isIdentifier(receipt.promoted_node_id) or receipt.token.len == 0) {
         return error.AdminFenceResponseMismatch;
     }
+    if (std.mem.eql(u8, receipt.old_primary_id, receipt.promoted_node_id)) return error.AdminFenceResponseMismatch;
     if (receipt.parent_timeline_id <= 0 or receipt.parent_epoch <= 0 or receipt.new_timeline_id <= 0 or receipt.new_epoch <= 0) {
         return error.AdminFenceResponseMismatch;
     }
     if (receipt.required_lsn <= 0 or receipt.observed_lsn < 0 or receipt.generation <= 0) return error.AdminFenceResponseMismatch;
+    if (receipt.identity.timeline_id != receipt.new_timeline_id or receipt.identity.epoch != receipt.new_epoch) {
+        return error.AdminFenceResponseMismatch;
+    }
+    if (receipt.new_timeline_id <= receipt.parent_timeline_id or receipt.new_epoch <= receipt.parent_epoch) {
+        return error.AdminFenceResponseMismatch;
+    }
+    if (!receipt.forced and receipt.observed_lsn < receipt.required_lsn) return error.AdminFenceResponseMismatch;
 }
 
 fn validateFenceResponse(response: admin_api.HAFenceResponse, request: admin_api.FenceAcquireRequest) !void {
