@@ -1768,9 +1768,15 @@ spec:
                             properties:
                               aggregateSHA256:
                                 type: string
+                              captureReceiptSHA256:
+                                type: string
                               generation:
                                 type: string
                               manifestSHA256:
+                                type: string
+                              materializedAggregateSHA256:
+                                type: string
+                              materializedReceiptSHA256:
                                 type: string
                               nodeID:
                                 type: string
@@ -1778,10 +1784,16 @@ spec:
                                 type: string
                               slotName:
                                 type: string
+                              targetLocalNodeID:
+                                format: int64
+                                type: integer
                               targetPVCName:
                                 type: string
                               targetPVCUID:
                                 type: string
+                              targetReplicaID:
+                                format: int64
+                                type: integer
                               topologyGeneration:
                                 format: int64
                                 type: integer
@@ -4502,6 +4514,8 @@ spec:
                             backupLSN:
                               format: int64
                               type: integer
+                            captureReceiptSHA256:
+                              type: string
                             checkpointLSN:
                               format: int64
                               type: integer
@@ -4765,6 +4779,8 @@ spec:
                             backupLSN:
                               format: int64
                               type: integer
+                            captureReceiptSHA256:
+                              type: string
                             checkpointLSN:
                               format: int64
                               type: integer
@@ -4793,11 +4809,17 @@ spec:
                               type: string
                             manifestSHA256:
                               type: string
+                            materializedAggregateSHA256:
+                              type: string
+                            materializedReceiptSHA256:
+                              type: string
                             nodeID:
                               type: string
                             protectedCount:
                               format: int32
                               type: integer
+                            rawGenerationPath:
+                              type: string
                             resumedTombstoneCount:
                               format: int32
                               type: integer
@@ -4819,10 +4841,16 @@ spec:
                             tableID:
                               format: int64
                               type: integer
+                            targetLocalNodeID:
+                              format: int64
+                              type: integer
                             targetPVCName:
                               type: string
                             targetPVCUID:
                               type: string
+                            targetReplicaID:
+                              format: int64
+                              type: integer
                             timelineID:
                               format: int64
                               type: integer
@@ -4844,6 +4872,10 @@ spec:
                           type: integer
                         seedArtifactTargetRoot:
                           type: string
+                        seedCaptureReceiptPath:
+                          type: string
+                        seedCaptureReceiptSHA256:
+                          type: string
                         seedContentRoot:
                           type: string
                         seedManifestPath:
@@ -4859,10 +4891,16 @@ spec:
                         targetLSN:
                           format: int64
                           type: integer
+                        targetLocalNodeID:
+                          format: int64
+                          type: integer
                         targetPVCName:
                           type: string
                         targetPVCUID:
                           type: string
+                        targetReplicaID:
+                          format: int64
+                          type: integer
                         topologyGeneration:
                           format: int64
                           type: integer
@@ -5002,6 +5040,8 @@ spec:
                           backupLSN:
                             format: int64
                             type: integer
+                          captureReceiptSHA256:
+                            type: string
                           checkpointLSN:
                             format: int64
                             type: integer
@@ -5019,7 +5059,13 @@ spec:
                             type: string
                           manifestSHA256:
                             type: string
+                          materializedAggregateSHA256:
+                            type: string
+                          materializedReceiptSHA256:
+                            type: string
                           nodeID:
+                            type: string
+                          rawGenerationPath:
                             type: string
                           seedReceiptSHA256:
                             type: string
@@ -5031,10 +5077,16 @@ spec:
                           tableID:
                             format: int64
                             type: integer
+                          targetLocalNodeID:
+                            format: int64
+                            type: integer
                           targetPVCName:
                             type: string
                           targetPVCUID:
                             type: string
+                          targetReplicaID:
+                            format: int64
+                            type: integer
                           timelineID:
                             format: int64
                             type: integer
