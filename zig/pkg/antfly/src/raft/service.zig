@@ -505,6 +505,13 @@ pub const ManagedHttpHostService = struct {
         try self.host.retainDataApplyGroups(group_ids);
     }
 
+    pub fn beginDataApplyGroupTransition(
+        self: *ManagedHttpHostService,
+        group_ids: []const u64,
+    ) !?data.RaftApplyStore.ActiveGroupTransition {
+        return try self.host.beginDataApplyGroupTransition(group_ids);
+    }
+
     pub fn replaceTransitionOps(self: *ManagedHttpHostService, ops: shard_ops.ShardOperationAdapter) !void {
         if (self.transition_svc) |*transition_svc| transition_svc.deinit();
         self.transition_svc = null;

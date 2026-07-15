@@ -10547,20 +10547,34 @@ pub const ProvisionedTableWriteSource = struct {
         errdefer transition.abort();
         defer transition.deinit();
 
-        // Draining an old read generation can take time. Fence the catalog only
-        // after that drain so the final check is adjacent to namespace publish.
-        var catalog_publication = try self.catalog.beginPublication();
-        defer catalog_publication.deinit();
-        if (!catalog_contract.matches(catalog_publication.snapshot, group_id)) return error.CatalogChanged;
-
         self.invalidateSharedPathCaches(path);
         var shard_transition = try preparation.promote();
         defer shard_transition.deinit();
-        const publication_outcome = try staged.publish();
+        const publication_outcome = try staged.publishPrepared();
+        var publication_pending = true;
+        errdefer if (publication_pending) staged.rollbackPublication() catch |rollback_err| {
+            std.log.err("Raft snapshot catalog validation rollback failed group_id={} err={s}", .{ group_id, @errorName(rollback_err) });
+        };
+
+        // The candidate is physically installed but remains unservable under
+        // the local generation transition. ReadIndex forwarding makes this
+        // snapshot authoritative even when the contacted metadata node is a
+        // follower. A mismatch atomically restores the prior root.
+        const catalog_valid = self.catalog.validatePublication(catalog_contract.publicationContract()) catch |err| {
+            try staged.rollbackPublication();
+            publication_pending = false;
+            return err;
+        };
+        if (!catalog_valid) {
+            try staged.rollbackPublication();
+            publication_pending = false;
+            return error.CatalogChanged;
+        }
+        try staged.commitPublication();
+        publication_pending = false;
         if (generation_reservation) |*reservation| reservation.advance();
         self.invalidateSharedPathCaches(path);
         transition.finishMutation();
-        catalog_publication.deinit();
         self.notifyLocalChange(table_name, .structural);
         self.notifyLocalChange(table_name, .data);
         if (publication_outcome == .durability_uncertain) return error.GenerationDurabilityUncertain;
@@ -17032,17 +17046,14 @@ const RaftSnapshotCatalogContract = struct {
         self.* = undefined;
     }
 
-    fn matches(
-        self: *const @This(),
-        snapshot: *const metadata_api.AdminSnapshot,
-        group_id: u64,
-    ) bool {
-        const range = metadata_mod.findAdminRange(snapshot, group_id) orelse return false;
-        if (range.table_id != self.table_id or !metadata_table_manager.rangeRecordsEqual(self.range, range.*)) return false;
-        const table = metadata_mod.findAdminTable(snapshot, self.table_id) orelse return false;
-        return std.mem.eql(u8, self.table_name, table.name) and
-            std.mem.eql(u8, self.schema_json, table.schema_json) and
-            std.mem.eql(u8, self.indexes_json, table.indexes_json);
+    fn publicationContract(self: *const @This()) metadata_api.CatalogPublicationContract {
+        return .{
+            .table_id = self.table_id,
+            .table_name = self.table_name,
+            .schema_json = self.schema_json,
+            .indexes_json = self.indexes_json,
+            .range = self.range,
+        };
     }
 };
 
@@ -31328,8 +31339,6 @@ fn testingVisibleRootGenerationForGroup(ptr: *anyopaque, _: u64) u64 {
 const RaftSnapshotInstallTestCatalog = struct {
     calls: usize = 0,
     change_on_call: ?usize = null,
-    publication_mutex: std.atomic.Mutex = .unlocked,
-    publication_snapshot: metadata_api.AdminSnapshot = undefined,
 
     fn iface(self: *@This()) table_catalog.CatalogSource {
         return .{
@@ -31337,7 +31346,7 @@ const RaftSnapshotInstallTestCatalog = struct {
             .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
-                .begin_publication = beginPublication,
+                .validate_publication = validatePublication,
             },
         };
     }
@@ -31348,21 +31357,11 @@ const RaftSnapshotInstallTestCatalog = struct {
         return self.snapshotForCurrentCall();
     }
 
-    fn beginPublication(ptr: *anyopaque) !table_catalog.CatalogSource.PublicationGuard {
+    fn validatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        lockAtomic(&self.publication_mutex);
         self.calls += 1;
-        self.publication_snapshot = self.snapshotForCurrentCall();
-        return .{
-            .ptr = self,
-            .snapshot = &self.publication_snapshot,
-            .release_fn = endPublication,
-        };
-    }
-
-    fn endPublication(ptr: *anyopaque) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        self.publication_mutex.unlock();
+        var snapshot = self.snapshotForCurrentCall();
+        return contract.matches(&snapshot);
     }
 
     fn snapshotForCurrentCall(self: *@This()) metadata_api.AdminSnapshot {

@@ -81,6 +81,7 @@ pub const RaftApplyStore = struct {
     // one process-wide data apply owner while physical state lives per group.
     backend: lsm_backend.BackendHandle,
     shutting_down: std.atomic.Value(bool) = .init(false),
+    placement_transition_mutex: std.atomic.Mutex = .unlocked,
     batch_shards: [batch_shard_count]BatchShard = [_]BatchShard{.{}} ** batch_shard_count,
 
     const OwnedBatch = AppliedDataBatch;
@@ -218,57 +219,119 @@ pub const RaftApplyStore = struct {
         self.resource_manager = manager;
     }
 
-    /// Retires in-memory owners for groups no longer assigned to this host.
-    /// Durable group generations remain on disk for later reassignment or
-    /// operator-directed cleanup. Pinned owners are marked retired and closed
-    /// by the last snapshot reader or generation publisher, keeping placement
-    /// reconciliation non-blocking.
-    pub fn retainActiveGroups(self: *RaftApplyStore, group_ids: []const u64) !void {
-        var next_active = [_]std.AutoHashMapUnmanaged(u64, void){.empty} ** batch_shard_count;
-        defer for (&next_active) |*groups| groups.deinit(self.alloc);
+    pub const ActiveGroupTransition = struct {
+        store: *RaftApplyStore,
+        previous: [batch_shard_count]std.AutoHashMapUnmanaged(u64, void),
+        next_exact: [batch_shard_count]std.AutoHashMapUnmanaged(u64, void),
+        active: bool = true,
+
+        /// Commits exact placement only after the Raft host has reconciled.
+        pub fn commit(self: *@This()) void {
+            std.debug.assert(self.active);
+            const io = self.store.io_impl.io();
+            for (&self.store.batch_shards, 0..) |*shard, shard_index| {
+                shard.mutex.lockUncancelable(io);
+                const admitted_union = shard.active_groups;
+                shard.active_groups = self.next_exact[shard_index];
+                self.next_exact[shard_index] = admitted_union;
+                self.store.retireInactiveGroupsLocked(shard);
+                shard.mutex.unlock(io);
+            }
+            self.finish();
+        }
+
+        /// Reconciliation can have externally visible partial side effects.
+        /// Keep old and new groups admitted so neither side is invalidated;
+        /// the next successful metadata sync narrows admission exactly.
+        pub fn abort(self: *@This()) void {
+            if (!self.active) return;
+            self.finish();
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.abort();
+        }
+
+        fn finish(self: *@This()) void {
+            for (&self.previous) |*groups| groups.deinit(self.store.alloc);
+            for (&self.next_exact) |*groups| groups.deinit(self.store.alloc);
+            self.active = false;
+            self.store.placement_transition_mutex.unlock();
+        }
+    };
+
+    /// Prepares exact placement and publishes conservative old-or-new
+    /// admission before fallible host reconciliation starts. No existing
+    /// owner is retired until commit().
+    pub fn beginActiveGroupTransition(self: *RaftApplyStore, group_ids: []const u64) !ActiveGroupTransition {
+        platform.sync.lockYielding(&self.placement_transition_mutex);
+        errdefer self.placement_transition_mutex.unlock();
+
+        var next_exact = [_]std.AutoHashMapUnmanaged(u64, void){.empty} ** batch_shard_count;
+        errdefer for (&next_exact) |*groups| groups.deinit(self.alloc);
+        var admitted_union = [_]std.AutoHashMapUnmanaged(u64, void){.empty} ** batch_shard_count;
+        errdefer for (&admitted_union) |*groups| groups.deinit(self.alloc);
         for (group_ids) |group_id| {
             const shard_index: usize = @intCast(group_id % batch_shard_count);
-            try next_active[shard_index].put(self.alloc, group_id, {});
+            try next_exact[shard_index].put(self.alloc, group_id, {});
+            try admitted_union[shard_index].put(self.alloc, group_id, {});
         }
 
         const io = self.io_impl.io();
         for (&self.batch_shards, 0..) |*shard, shard_index| {
             shard.mutex.lockUncancelable(io);
-            const previous_active = shard.active_groups;
-            shard.active_groups = next_active[shard_index];
-            next_active[shard_index] = previous_active;
-            shard.placement_filter_enabled = true;
+            var previous = shard.active_groups.keyIterator();
+            while (previous.next()) |group_id| {
+                admitted_union[shard_index].put(self.alloc, group_id.*, {}) catch |err| {
+                    shard.mutex.unlock(io);
+                    return err;
+                };
+            }
             shard.mutex.unlock(io);
         }
 
-        for (&self.batch_shards) |*shard| {
+        var previous = [_]std.AutoHashMapUnmanaged(u64, void){.empty} ** batch_shard_count;
+        for (&self.batch_shards, 0..) |*shard, shard_index| {
             shard.mutex.lockUncancelable(io);
-            defer shard.mutex.unlock(io);
+            previous[shard_index] = shard.active_groups;
+            shard.active_groups = admitted_union[shard_index];
+            admitted_union[shard_index] = .empty;
+            shard.placement_filter_enabled = true;
+            shard.mutex.unlock(io);
+        }
+        return .{ .store = self, .previous = previous, .next_exact = next_exact };
+    }
 
-            var stale = std.ArrayListUnmanaged(u64).empty;
-            defer stale.deinit(self.alloc);
-            stale.ensureTotalCapacity(
-                self.alloc,
-                shard.stores.count() + shard.batches.count() +
-                    shard.snapshot_readers.count() + shard.generation_preparations.count(),
-            ) catch continue;
+    /// Convenience for initialization and tests without an external host
+    /// reconciliation phase.
+    pub fn retainActiveGroups(self: *RaftApplyStore, group_ids: []const u64) !void {
+        var transition = try self.beginActiveGroupTransition(group_ids);
+        transition.commit();
+    }
+
+    fn retireInactiveGroupsLocked(self: *RaftApplyStore, shard: *BatchShard) void {
+        // Remove one entry at a time after dropping each map iterator. This is
+        // allocation-free and topology changes are rare relative to applies.
+        while (true) {
+            var stale_group_id: ?u64 = null;
             var stores = shard.stores.keyIterator();
             while (stores.next()) |group_id| {
-                if (!shard.active_groups.contains(group_id.*)) stale.appendAssumeCapacity(group_id.*);
+                if (!shard.active_groups.contains(group_id.*) and !groupStorePinnedLocked(shard, group_id.*)) {
+                    stale_group_id = group_id.*;
+                    break;
+                }
             }
-            var batches = shard.batches.keyIterator();
-            while (batches.next()) |group_id| {
-                if (!shard.active_groups.contains(group_id.*)) stale.appendAssumeCapacity(group_id.*);
+            if (stale_group_id == null) {
+                var batches = shard.batches.keyIterator();
+                while (batches.next()) |group_id| {
+                    if (!shard.active_groups.contains(group_id.*) and !groupStorePinnedLocked(shard, group_id.*)) {
+                        stale_group_id = group_id.*;
+                        break;
+                    }
+                }
             }
-            var readers = shard.snapshot_readers.keyIterator();
-            while (readers.next()) |group_id| {
-                if (!shard.active_groups.contains(group_id.*)) stale.appendAssumeCapacity(group_id.*);
-            }
-            var preparations = shard.generation_preparations.keyIterator();
-            while (preparations.next()) |group_id| {
-                if (!shard.active_groups.contains(group_id.*)) stale.appendAssumeCapacity(group_id.*);
-            }
-            for (stale.items) |group_id| self.closeRetiredGroupIfDrainedLocked(shard, group_id);
+            const group_id = stale_group_id orelse break;
+            self.closeRetiredGroupIfDrainedLocked(shard, group_id);
         }
     }
 
@@ -2345,6 +2408,45 @@ test "data raft apply store bounds and retires resource-managed group owners" {
     const reassigned = (try store.latestBatch(1)) orelse return error.MissingDataBatch;
     try std.testing.expectEqual(@as(u64, 0), reassigned.commit_index);
     try std.testing.expectEqual(@as(usize, 1), store.cachedGroupStoreCount());
+}
+
+test "data raft apply placement transition retains union on abort and retires without allocation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/placement-transition", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var store = try RaftApplyStore.init(failing.allocator(), .{ .root_dir = root });
+    defer store.deinit();
+    try std.testing.expect(try store.seedGroupSnapshotIfAbsent(
+        std.testing.allocator,
+        1,
+        .{ .start = "a", .end = "z" },
+        &.{.{ .key = "a", .value = "one" }},
+    ));
+    try store.retainActiveGroups(&.{1});
+
+    var aborted = try store.beginActiveGroupTransition(&.{1 + batch_shard_count});
+    aborted.abort();
+    const shard = store.batchShard(1);
+    shard.mutex.lockUncancelable(store.io_impl.io());
+    try std.testing.expect(shard.active_groups.contains(1));
+    try std.testing.expect(shard.active_groups.contains(1 + batch_shard_count));
+    shard.mutex.unlock(store.io_impl.io());
+
+    var committed = try store.beginActiveGroupTransition(&.{1 + batch_shard_count});
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    committed.commit();
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+
+    shard.mutex.lockUncancelable(store.io_impl.io());
+    try std.testing.expect(!shard.active_groups.contains(1));
+    try std.testing.expect(shard.active_groups.contains(1 + batch_shard_count));
+    try std.testing.expect(!shard.stores.contains(1));
+    shard.mutex.unlock(store.io_impl.io());
 }
 
 test "data apply store replay is idempotent when applied watermark lags WAL state" {

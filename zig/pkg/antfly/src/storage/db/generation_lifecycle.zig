@@ -705,9 +705,13 @@ fn beginStagingGeneration(
 ) !StagedGeneration {
     const live_path = try alloc.dupe(u8, path);
     errdefer alloc.free(live_path);
+    const live_path_z = try alloc.dupeZ(u8, path);
+    errdefer alloc.free(live_path_z);
     const nonce = platform.time.monotonicNs();
     const staging_path = try std.fmt.allocPrint(alloc, "{s}.restore-stage-{x}-{x}", .{ path, transition_id, nonce });
     errdefer alloc.free(staging_path);
+    const staging_path_z = try alloc.dupeZ(u8, staging_path);
+    errdefer alloc.free(staging_path_z);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -722,7 +726,9 @@ fn beginStagingGeneration(
         .manager = manager,
         .transition_id = transition_id,
         .live_path = live_path,
+        .live_path_z = live_path_z,
         .staging_path = staging_path,
+        .staging_path_z = staging_path_z,
         .cleanup_scheduler = cleanup_scheduler,
     };
 }
@@ -732,8 +738,13 @@ pub const StagedGeneration = struct {
     manager: *Manager,
     transition_id: u64,
     live_path: []u8,
+    live_path_z: [:0]u8,
     staging_path: []u8,
+    staging_path_z: [:0]u8,
     published: bool = false,
+    publication_committed: bool = false,
+    had_live_generation: bool = false,
+    publication_outcome: ?PublicationOutcome = null,
     sealed: bool = false,
     preserve_retired: bool = false,
     cleanup_scheduler: ?CleanupScheduler = null,
@@ -769,10 +780,12 @@ pub const StagedGeneration = struct {
         self.sealed = true;
     }
 
-    /// Errors are returned only before the live namespace changes. Once the
-    /// generation is visible, durability failures are represented in the
-    /// outcome so callers must finish their committed transition.
-    pub fn publish(self: *StagedGeneration) !PublicationOutcome {
+    /// Atomically installs the candidate while retaining the prior namespace
+    /// for an explicit catalog validation. The exclusive transition keeps the
+    /// candidate unservable until commitPublication() advances caller-owned
+    /// admission. Every successful call must be followed by commitPublication
+    /// or rollbackPublication.
+    pub fn publishPrepared(self: *StagedGeneration) !PublicationOutcome {
         if (self.closed or self.published) return error.InvalidGenerationTransition;
         try self.manager.validateExclusive(self.transition_id, self.live_path);
 
@@ -787,7 +800,7 @@ pub const StagedGeneration = struct {
 
         const had_live_generation = pathExists(io, self.live_path);
         if (had_live_generation) {
-            if (!try exchangeDirectoriesAtomic(self.alloc, self.live_path, self.staging_path)) {
+            if (!exchangeDirectoriesAtomicSentinel(self.live_path_z, self.staging_path_z)) {
                 return error.AtomicGenerationExchangeUnavailable;
             }
             // The namespace mutation has completed. Record that before any operation
@@ -795,20 +808,8 @@ pub const StagedGeneration = struct {
             self.published = true;
             self.preserve_retired = true;
             const outcome = syncPublishedParent(io, parent);
-            if (outcome == .durable) {
-                _ = clearPublicationMarker(self.alloc, io, self.live_path);
-                scheduleRetiredGenerationCleanup(self.cleanup_scheduler, self.staging_path, parent) catch |err| {
-                    std.log.warn("retired generation cleanup scheduling deferred path={s} err={s}", .{ self.staging_path, @errorName(err) });
-                };
-            } else {
-                // The exchange is visible but not known durable. Keep the old root
-                // available for operator recovery instead of destroying both sides
-                // of the last durable namespace state.
-                self.preserve_retired = true;
-                // syncPublishedParent records the durability failure. This message
-                // describes the recovery action and must not duplicate the error.
-                std.log.warn("retaining previous generation after uncertain publication path={s}", .{self.staging_path});
-            }
+            self.had_live_generation = true;
+            self.publication_outcome = outcome;
             return outcome;
         }
 
@@ -816,7 +817,63 @@ pub const StagedGeneration = struct {
 
         self.published = true;
         const outcome = syncPublishedParent(io, parent);
-        if (outcome == .durable) _ = clearPublicationMarker(self.alloc, io, self.live_path);
+        self.publication_outcome = outcome;
+        return outcome;
+    }
+
+    /// Commits a prepared namespace exchange and retires the previous root.
+    /// Asynchronous cleanup scheduling failures remain reconciliation debt.
+    pub fn commitPublication(self: *StagedGeneration) !void {
+        if (self.closed or !self.published or self.publication_committed) return error.InvalidGenerationTransition;
+        try self.manager.validateExclusive(self.transition_id, self.live_path);
+
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        const parent = std.fs.path.dirname(self.live_path) orelse if (std.fs.path.isAbsolute(self.live_path)) "/" else ".";
+        if (self.publication_outcome.? == .durable) {
+            _ = clearPublicationMarker(self.alloc, io, self.live_path);
+            if (self.had_live_generation) {
+                scheduleRetiredGenerationCleanup(self.cleanup_scheduler, self.staging_path, parent) catch |err| {
+                    std.log.warn("retired generation cleanup scheduling deferred path={s} err={s}", .{ self.staging_path, @errorName(err) });
+                };
+            }
+        } else if (self.had_live_generation) {
+            std.log.warn("retaining previous generation after uncertain publication path={s}", .{self.staging_path});
+        }
+        self.publication_committed = true;
+    }
+
+    /// Restores the prior namespace after a post-exchange validation failure.
+    /// The exclusive generation transition prevents either namespace from
+    /// being admitted while this exchange is in flight.
+    pub fn rollbackPublication(self: *StagedGeneration) !void {
+        if (self.closed or !self.published or self.publication_committed) return error.InvalidGenerationTransition;
+        try self.manager.validateExclusive(self.transition_id, self.live_path);
+
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        const parent = std.fs.path.dirname(self.live_path) orelse if (std.fs.path.isAbsolute(self.live_path)) "/" else ".";
+        if (self.had_live_generation) {
+            if (!exchangeDirectoriesAtomicSentinel(self.live_path_z, self.staging_path_z)) {
+                return error.AtomicGenerationExchangeUnavailable;
+            }
+        } else {
+            try std.Io.Dir.rename(std.Io.Dir.cwd(), self.live_path, std.Io.Dir.cwd(), self.staging_path, io);
+        }
+        self.published = false;
+        self.preserve_retired = false;
+        self.had_live_generation = false;
+        self.publication_outcome = null;
+        if (syncPublishedParent(io, parent) == .durability_uncertain) return error.GenerationRollbackDurabilityUncertain;
+    }
+
+    /// Convenience API for callers whose publication has no external
+    /// validation step.
+    pub fn publish(self: *StagedGeneration) !PublicationOutcome {
+        const outcome = try self.publishPrepared();
+        try self.commitPublication();
         return outcome;
     }
 
@@ -824,13 +881,21 @@ pub const StagedGeneration = struct {
         if (self.closed) return;
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
+        if (self.published and !self.publication_committed) {
+            self.rollbackPublication() catch |err| {
+                std.log.err("prepared generation rollback failed path={s} err={s}", .{ self.live_path, @errorName(err) });
+                self.preserve_retired = true;
+            };
+        }
         if (self.published) {
             if (!self.preserve_retired) std.Io.Dir.cwd().deleteTree(io_impl.io(), self.staging_path) catch {};
         } else {
             std.Io.Dir.cwd().deleteTree(io_impl.io(), self.staging_path) catch {};
         }
         self.alloc.free(self.staging_path);
+        self.alloc.free(self.staging_path_z);
         self.alloc.free(self.live_path);
+        self.alloc.free(self.live_path_z);
         self.closed = true;
     }
 };
@@ -1172,6 +1237,14 @@ fn syncPublishedParent(io: std.Io, parent: []const u8) PublicationOutcome {
 }
 
 fn exchangeDirectoriesAtomic(alloc: Allocator, left: []const u8, right: []const u8) !bool {
+    const left_z = try alloc.dupeZ(u8, left);
+    defer alloc.free(left_z);
+    const right_z = try alloc.dupeZ(u8, right);
+    defer alloc.free(right_z);
+    return exchangeDirectoriesAtomicSentinel(left_z, right_z);
+}
+
+fn exchangeDirectoriesAtomicSentinel(left_z: [:0]const u8, right_z: [:0]const u8) bool {
     if (builtin.is_test and test_disable_atomic_exchange) return false;
     if (comptime builtin.os.tag == .macos and builtin.link_libc) {
         const Darwin = struct {
@@ -1183,19 +1256,11 @@ fn exchangeDirectoriesAtomic(alloc: Allocator, left: []const u8, right: []const 
                 flags: c_uint,
             ) c_int;
         };
-        const left_z = try alloc.dupeZ(u8, left);
-        defer alloc.free(left_z);
-        const right_z = try alloc.dupeZ(u8, right);
-        defer alloc.free(right_z);
         const rename_swap: c_uint = 0x0000_0002;
         return Darwin.renameatx_np(std.posix.AT.FDCWD, left_z.ptr, std.posix.AT.FDCWD, right_z.ptr, rename_swap) == 0;
     }
     if (comptime builtin.os.tag == .linux) {
         const linux = std.os.linux;
-        const left_z = try alloc.dupeZ(u8, left);
-        defer alloc.free(left_z);
-        const right_z = try alloc.dupeZ(u8, right);
-        defer alloc.free(right_z);
         return linux.errno(linux.renameat2(
             linux.AT.FDCWD,
             left_z.ptr,
@@ -1522,6 +1587,42 @@ test "staged generation seals while readers remain admitted before atomic public
     const after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(16));
     defer alloc.free(after);
     try std.testing.expectEqualStrings("new", after);
+}
+
+test "prepared generation publication rolls back before serving admission" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/rollback-live", .{tmp.sub_path});
+    defer alloc.free(live_path);
+    const live_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
+    defer alloc.free(live_value_path);
+    try fs_paths.createDirPathPortable(std.testing.io, live_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = live_value_path, .data = "old" });
+
+    var transition = try beginProcessExclusive(live_path);
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+    const staged_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{staged.path()});
+    defer alloc.free(staged_value_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = staged_value_path, .data = "candidate" });
+
+    try std.testing.expectEqual(PublicationOutcome.durable, try staged.publishPrepared());
+    const candidate = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(16));
+    defer alloc.free(candidate);
+    try std.testing.expectEqualStrings("candidate", candidate);
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try staged.rollbackPublication();
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    const restored = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(16));
+    defer alloc.free(restored);
+    try std.testing.expectEqualStrings("old", restored);
 }
 
 test "published generation reports post-commit sync failure without returning an error" {

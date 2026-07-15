@@ -431,6 +431,14 @@ pub const ManagedHttpHost = struct {
         try store.retainActiveGroups(group_ids);
     }
 
+    pub fn beginDataApplyGroupTransition(
+        self: *ManagedHttpHost,
+        group_ids: []const u64,
+    ) !?data_storage.RaftApplyStore.ActiveGroupTransition {
+        const store = self.owned_data_store orelse return null;
+        return try store.beginActiveGroupTransition(group_ids);
+    }
+
     pub fn applyBatch(self: *ManagedHttpHost, updates: []const metadata_view.MetadataUpdate) !void {
         for (updates) |update| try self.apply(update);
     }

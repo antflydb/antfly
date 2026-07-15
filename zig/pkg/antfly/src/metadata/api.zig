@@ -158,6 +158,34 @@ pub const AdminSnapshot = struct {
     merged_group_statuses: []metadata_reconciler.MergedGroupStatus = &.{},
 };
 
+/// Compact catalog values consumed while staging one data-Raft generation.
+/// Metadata replicas compare this after a linearizable read so the network and
+/// allocation cost is independent of the cluster-wide catalog size.
+pub const CatalogPublicationContract = struct {
+    table_id: u64,
+    table_name: []const u8,
+    schema_json: []const u8,
+    indexes_json: []const u8,
+    range: table_manager.RangeRecord,
+
+    pub fn matches(self: @This(), snapshot: *const AdminSnapshot) bool {
+        var table_match = false;
+        for (snapshot.tables) |table| {
+            if (table.table_id != self.table_id) continue;
+            table_match = std.mem.eql(u8, self.table_name, table.name) and
+                std.mem.eql(u8, self.schema_json, table.schema_json) and
+                std.mem.eql(u8, self.indexes_json, table.indexes_json);
+            break;
+        }
+        if (!table_match) return false;
+        for (snapshot.ranges) |range| {
+            if (range.group_id != self.range.group_id) continue;
+            return range.table_id == self.table_id and table_manager.rangeRecordsEqual(self.range, range);
+        }
+        return false;
+    }
+};
+
 pub fn captureSnapshot(alloc: std.mem.Allocator, source: anytype) !AdminSnapshot {
     const SourceType = @TypeOf(source);
     const SourceDeclType = switch (@typeInfo(SourceType)) {

@@ -103,12 +103,18 @@ name, schema, index catalog, range topology, and document-identity namespace are
 captured after group admission. The snapshot's encoded range must match that
 catalog range. Staging owns only this compact contract, not the complete admin
 snapshot, so its memory cost is independent of cluster catalog size. After
-serving leases drain, the catalog source refreshes and pins its locally visible
-projection through namespace publication. The compact contract must match the
-pinned projection exactly. A locally observed split, merge, schema, index, or
-identity change therefore fails the install closed with no live-root mutation;
-unrelated metadata changes do not force a retry, and a concurrent local catalog
-refresh cannot invalidate borrowed publication data.
+serving leases drain, the candidate is atomically exchanged into the filesystem
+but remains outside serving admission. The catalog source then performs a Raft
+linearizable read; followers forward ReadIndex to the metadata leader and wait
+until the returned committed index is applied locally. The compact contract
+is compared on the metadata replica, so the publication request and allocation
+cost remain independent of the cluster catalog size. It must match that
+authoritative projection exactly. A mismatch atomically
+restores the retained prior root before admission reopens; a match commits the
+exchange and advances the visible generation. Metadata changes committed before
+the barrier therefore reject stale publication, while changes committed after
+it are correctly ordered after publication. Unrelated metadata changes do not
+force a retry.
 
 `DB.restoreSnapshotToDeferredRuntimeRepair()` accepts a `StagedGeneration`
 capability and rejects a path that is not the capability's staging root. Raw
@@ -364,13 +370,16 @@ Snapshot staging uses the same manager, so temporary generations cannot bypass
 the node memory policy. Eviction closes only the runtime owner; durable group
 files and apply watermarks remain available for transparent reopen.
 
-Placement reconciliation explicitly retires owners and cached summaries for
-groups no longer assigned locally. Retirement is non-blocking: an owner pinned
-by snapshot materialization or generation publication is marked retired, new
-operations fail closed, and the last reader or publisher performs final close.
-Reassignment clears the retirement marker before the group is admitted again.
-This keeps topology reconciliation independent of slow snapshot consumers while
-making stale apply-store ownership bounded over the lifetime of the node.
+Placement reconciliation is a two-phase admission transition. Before fallible
+descriptor and host reconciliation, the apply store prepares exact new maps and
+admits the conservative union of old and new groups. Success commits exactly the
+new set; partial failure retains the union because the host may already have
+created or removed replicas, and the next metadata sync narrows it. Exact commit
+retires owners and cached summaries without heap allocation. An owner pinned by
+snapshot materialization or generation publication is marked retired, and the
+last reader or publisher performs final close. This keeps topology reconciliation
+independent of allocation pressure and slow snapshot consumers while making
+stale ownership bounded after the next successful sync.
 
 Split and merge control paths follow the same rule. Transition coordinators
 borrow the raft host's apply store and retain the managed destination or

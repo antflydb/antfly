@@ -105,6 +105,7 @@ pub const AdminSource = struct {
         head: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataHead = null,
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
+        validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
@@ -151,6 +152,11 @@ pub const AdminSource = struct {
 
     pub fn adminSnapshot(self: AdminSource) !metadata_api.AdminSnapshot {
         return try self.vtable.admin_snapshot(self.ptr);
+    }
+
+    pub fn validatePublication(self: AdminSource, contract: metadata_api.CatalogPublicationContract) !bool {
+        const validate = self.vtable.validate_publication orelse return error.UnsupportedOperation;
+        return try validate(self.ptr, contract);
     }
 
     pub fn freeAdminSnapshot(self: AdminSource, snapshot: *metadata_api.AdminSnapshot) void {
@@ -310,6 +316,7 @@ pub const AdminSource = struct {
                 .head = metadataServiceHead,
                 .status = metadataServiceStatus,
                 .admin_snapshot = metadataServiceAdminSnapshot,
+                .validate_publication = metadataServiceValidatePublication,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
                 .create_table = metadataServiceCreateTable,
                 .replace_table_definition = metadataServiceReplaceTableDefinition,
@@ -350,6 +357,7 @@ pub const AdminSource = struct {
                 .head = metadataHttpServiceHead,
                 .status = metadataHttpServiceStatus,
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
+                .validate_publication = metadataHttpServiceValidatePublication,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
                 .create_table = metadataHttpServiceCreateTable,
                 .replace_table_definition = metadataHttpServiceReplaceTableDefinition,
@@ -396,6 +404,14 @@ pub const AdminSource = struct {
     fn metadataServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         return try svc.adminSnapshot();
+    }
+
+    fn metadataServiceValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLinearizableRead();
+        var snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&snapshot);
+        return contract.matches(&snapshot);
     }
 
     fn metadataServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
@@ -726,6 +742,16 @@ pub const AdminSource = struct {
     fn metadataHttpServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         return try svc.adminSnapshot();
+    }
+
+    fn metadataHttpServiceValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        // Followers use Raft's built-in ReadIndex forwarding and wait until
+        // the returned committed index is applied locally.
+        try svc.ensureLinearizableRead();
+        var snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&snapshot);
+        return contract.matches(&snapshot);
     }
 
     fn metadataHttpServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
@@ -1121,6 +1147,19 @@ pub const MetadataHttpServer = struct {
                 }
             },
             .POST => {
+                if (std.mem.eql(u8, req.uri, routes.Routes.internal_catalog_publication_check)) {
+                    var parsed = std.json.parseFromSlice(metadata_api.CatalogPublicationContract, alloc, req.body, .{
+                        .allocate = .alloc_always,
+                        .ignore_unknown_fields = true,
+                    }) catch return try textResponse(alloc, 400, "invalid catalog publication contract");
+                    defer parsed.deinit();
+                    const valid = self.source.validatePublication(parsed.value) catch |err| switch (err) {
+                        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout => return try notLeaderResponse(alloc),
+                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
+                        else => return err,
+                    };
+                    return try textResponse(alloc, if (valid) 204 else 409, "");
+                }
                 if (std.mem.eql(u8, req.uri, routes.Routes.internal_reallocate)) {
                     self.source.triggerReallocate() catch |err| switch (err) {
                         error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
@@ -2915,6 +2954,7 @@ test "metadata http server serves status and filtered admin routes" {
                     .head = head,
                     .status = status,
                     .admin_snapshot = adminSnapshot,
+                    .validate_publication = validatePublication,
                     .free_admin_snapshot = freeAdminSnapshot,
                 },
             };
@@ -3017,6 +3057,11 @@ test "metadata http server serves status and filtered admin routes" {
         fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
             snapshot.* = undefined;
         }
+
+        fn validatePublication(_: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+            var snapshot = try adminSnapshot(undefined);
+            return contract.matches(&snapshot);
+        }
     };
 
     var source = FakeSource{};
@@ -3057,6 +3102,37 @@ test "metadata http server serves status and filtered admin routes" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot_resp.body, "\"backup_id\":\"snap1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_resp.body, "\"snapshot_path\":\"snap1/groups/10\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_resp.body, "\"replication_source_statuses\"") != null);
+
+    const publication_body = try std.json.Stringify.valueAlloc(std.testing.allocator, metadata_api.CatalogPublicationContract{
+        .table_id = 1,
+        .table_name = "docs",
+        .schema_json = "",
+        .indexes_json = "{}",
+        .range = .{ .group_id = 10, .table_id = 1, .start_key = "doc:a", .end_key = "doc:m" },
+    }, .{});
+    defer std.testing.allocator.free(publication_body);
+    var publication_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.internal_catalog_publication_check,
+        .body = publication_body,
+    });
+    defer publication_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 204), publication_resp.status);
+    const stale_publication_body = try std.json.Stringify.valueAlloc(std.testing.allocator, metadata_api.CatalogPublicationContract{
+        .table_id = 1,
+        .table_name = "docs",
+        .schema_json = "",
+        .indexes_json = "{}",
+        .range = .{ .group_id = 10, .table_id = 1, .start_key = "doc:b", .end_key = "doc:m" },
+    }, .{});
+    defer std.testing.allocator.free(stale_publication_body);
+    var stale_publication_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.internal_catalog_publication_check,
+        .body = stale_publication_body,
+    });
+    defer stale_publication_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), stale_publication_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_resp.body, "\"replication_source_action_hints\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_resp.body, "\"source_kind\":\"postgres\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_resp.body, "\"external_table\":\"users\"") != null);

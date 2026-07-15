@@ -378,6 +378,13 @@ pub const MetadataServer = struct {
         return try self.svc.adminSnapshot();
     }
 
+    pub fn validatePublication(self: *MetadataServer, contract: @import("api.zig").CatalogPublicationContract) !bool {
+        try self.svc.ensureLinearizableRead();
+        var snapshot = try self.svc.adminSnapshot();
+        defer self.svc.freeAdminSnapshot(&snapshot);
+        return contract.matches(&snapshot);
+    }
+
     pub fn freeAdminSnapshot(self: *MetadataServer, snapshot: *@import("api.zig").AdminSnapshot) void {
         self.svc.freeAdminSnapshot(snapshot);
     }
