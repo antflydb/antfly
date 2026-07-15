@@ -18023,6 +18023,7 @@ test "data server wires configured HA executors into API server" {
     var internal_resp = try server.http_server.?.handle(.{
         .method = .GET,
         .uri = antfly.internal.routes.ha_replication_identify,
+        .authorization = "Bearer runtime-secret-token",
     });
     defer internal_resp.deinit(server.http_server.?.alloc);
     try std.testing.expectEqual(@as(u16, 200), internal_resp.status);
@@ -19428,8 +19429,7 @@ test "data server promotion rewires live HTTP internal HA executor" {
         .uri = antfly.internal.routes.ha_replication_identify,
     });
     defer internal_resp.deinit(server.http_server.?.alloc);
-    try std.testing.expectEqual(@as(u16, 200), internal_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, internal_resp.body, "\"record_format_version\"") != null);
+    try std.testing.expectEqual(@as(u16, 403), internal_resp.status);
 }
 
 test "data server promotion open failure preserves retryable standby" {

@@ -287,7 +287,7 @@ const RuntimeLeaseWatchdog = struct {
     }
 
     fn proofSnapshot(ptr: *const anyopaque, alloc: std.mem.Allocator) !?antfly.admin.HALeaseWatchdogProof {
-        const self: *RuntimeLeaseWatchdog = @constCast(@ptrCast(@alignCast(ptr)));
+        const self: *RuntimeLeaseWatchdog = @ptrCast(@alignCast(@constCast(ptr)));
         platform_sync.lockYielding(&self.proof_mutex);
         defer self.proof_mutex.unlock();
         const deadline = self.proof_authority_deadline_ns.load(.acquire);
