@@ -4466,6 +4466,14 @@ test "parse cli accepts HA standby runtime flags" {
         "pvc-uid-1",
         "--ha-startup-capture-receipt-sha256",
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--ha-startup-materialized-receipt-sha256",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "--ha-startup-materialized-aggregate-sha256",
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "--ha-startup-target-local-node-id",
+        "7",
+        "--ha-startup-target-replica-id",
+        "1",
         "--ha-cluster-id",
         "100",
         "--ha-shard-id",
@@ -4497,6 +4505,10 @@ test "parse cli accepts HA standby runtime flags" {
     try std.testing.expectEqualStrings("standby-a-data", cfg.ha_startup_target_pvc_name.?);
     try std.testing.expectEqualStrings("pvc-uid-1", cfg.ha_startup_target_pvc_uid.?);
     try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", cfg.ha_startup_capture_receipt_sha256.?);
+    try std.testing.expectEqualStrings("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", cfg.ha_startup_materialized_receipt_sha256.?);
+    try std.testing.expectEqualStrings("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", cfg.ha_startup_materialized_aggregate_sha256.?);
+    try std.testing.expectEqual(@as(u64, 7), cfg.ha_startup_target_local_node_id.?);
+    try std.testing.expectEqual(@as(u64, 1), cfg.ha_startup_target_replica_id.?);
     try std.testing.expectEqual(@as(u64, 100), cfg.ha_cluster_id.?);
     try std.testing.expectEqual(@as(u64, 10), cfg.ha_shard_id.?);
     try std.testing.expectEqual(@as(u64, 20), cfg.ha_table_id.?);
@@ -4513,10 +4525,30 @@ test "parse cli accepts HA standby runtime flags" {
     try std.testing.expectEqual(@as(u64, 3), startup.binding.topology_generation);
     try std.testing.expectEqualStrings("generation-a", startup.expected.generation);
     try std.testing.expectEqualStrings(startup.capture_receipt_sha256.?, startup.expected.capture_receipt_sha256.?);
+    try std.testing.expectEqualStrings("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", startup.materialized_receipt_sha256.?);
+    try std.testing.expectEqualStrings("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", startup.materialized_aggregate_sha256.?);
+    try std.testing.expectEqual(@as(u64, 7), startup.target_local_node_id.?);
+    try std.testing.expectEqual(@as(u64, 1), startup.target_replica_id.?);
 
     var missing_capture_authority = cfg;
     missing_capture_authority.ha_startup_capture_receipt_sha256 = null;
     try std.testing.expectError(error.HAStartupCaptureReceiptSHA256Missing, haStartupExpectationFromCli(missing_capture_authority));
+
+    var missing_materialized_receipt = cfg;
+    missing_materialized_receipt.ha_startup_materialized_receipt_sha256 = null;
+    try std.testing.expectError(error.HAStartupMaterializedReceiptSHA256Missing, haStartupExpectationFromCli(missing_materialized_receipt));
+
+    var missing_materialized_aggregate = cfg;
+    missing_materialized_aggregate.ha_startup_materialized_aggregate_sha256 = null;
+    try std.testing.expectError(error.HAStartupMaterializedAggregateSHA256Missing, haStartupExpectationFromCli(missing_materialized_aggregate));
+
+    var missing_target_local_node = cfg;
+    missing_target_local_node.ha_startup_target_local_node_id = null;
+    try std.testing.expectError(error.HAStartupTargetLocalNodeIDMissing, haStartupExpectationFromCli(missing_target_local_node));
+
+    var missing_target_replica = cfg;
+    missing_target_replica.ha_startup_target_replica_id = null;
+    try std.testing.expectError(error.HAStartupTargetReplicaIDMissing, haStartupExpectationFromCli(missing_target_replica));
 }
 
 test "standalone HA standby replication flags require upstream and slot" {
