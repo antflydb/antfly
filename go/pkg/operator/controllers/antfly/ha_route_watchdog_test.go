@@ -192,6 +192,9 @@ func TestHAWatchdogAuthorityProofSubtractsDelayedResponseRTT(t *testing.T) {
 	if proof.AuthorityRemainingMS != 8_750 {
 		t.Fatalf("operator did not subtract RTT and margin: remaining=%d", proof.AuthorityRemainingMS)
 	}
+	if !proof.ObservedAt.Time.Equal(started) {
+		t.Fatalf("SAFETY: proof was anchored after the request and can be combined with a same-Pod replacement process: %s", proof.ObservedAt.Time)
+	}
 }
 
 func validRouteWatchdogProof(now time.Time) *antflyv1.HAWatchdogProofStatus {

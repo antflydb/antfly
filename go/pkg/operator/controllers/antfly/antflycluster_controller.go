@@ -9225,7 +9225,10 @@ func haWatchdogProofFromAdmin(raw *adminsdk.HALeaseWatchdogProof, cluster *antfl
 		ProcessBootID:            strings.TrimSpace(raw.ProcessBootId),
 		ObservedLeaseTransitions: int32(raw.ObservedLeaseTransitions),
 		MaxFenceLatencyMS:        int32(raw.MaxFenceLatencyMs),
-		ObservedAt:               metav1.NewTime(observedAt),
+		// Anchor process identity at request start. A response delayed across a
+		// same-Pod container restart must not be combined with the replacement
+		// container's Kubernetes identity by the later uncached Pod check.
+		ObservedAt: metav1.NewTime(requestStartedAt),
 	}, nil
 }
 
