@@ -1312,7 +1312,8 @@ fn canPureZigDecodeGrayscaleBaseline(structure: Structure) bool {
     if (structure.info.component_count != 1) return false;
 
     const component = structure.info.components[0];
-    return component.horizontal_sampling == 1 and component.vertical_sampling == 1;
+    if (component.horizontal_sampling == 0 or component.vertical_sampling == 0) return false;
+    return @as(usize, component.horizontal_sampling) * @as(usize, component.vertical_sampling) <= max_component_blocks;
 }
 
 fn canPureZigDecodeColorBaseline(structure: Structure) bool {
@@ -2520,6 +2521,8 @@ fn decodeRgbaPureZigGrayscaleBaseline(
 
     var reader = EntropyBitReader.init(entropy_bytes);
     var dc_predictor: i64 = 0;
+    // A one-component scan is non-interleaved, so each MCU contains one
+    // 8x8 block even when the frame carries non-unit sampling factors.
     const blocks_x = @divFloor(@as(usize, width) + 7, 8);
     const blocks_y = @divFloor(@as(usize, height) + 7, 8);
     const restart_interval = structure.restart_interval orelse 0;
@@ -4783,6 +4786,28 @@ test "decode rgba matches manifest-backed grayscale jpeg fixture" {
     const actual_hex = try test_support.sha256HexAlloc(alloc, decoded.rgba);
     defer alloc.free(actual_hex);
     try std.testing.expectEqualStrings(fixture.pixel_hashes[0], actual_hex);
+}
+
+test "decode grayscale jpeg ignores non-unit frame sampling for a non-interleaved scan" {
+    const alloc = std.testing.allocator;
+    const fixture_bytes = try test_support.readFixtureAlloc(alloc, std.testing.io, "jpeg/baseline/gray-3x2.jpg");
+    defer alloc.free(fixture_bytes);
+
+    const sof = std.mem.indexOf(u8, fixture_bytes, &.{ 0xff, 0xc0 }) orelse return error.MissingImageFixture;
+    const sampling_offset = sof + 11;
+    if (sampling_offset >= fixture_bytes.len) return error.MissingImageFixture;
+    try std.testing.expectEqual(@as(u8, 0x11), fixture_bytes[sampling_offset]);
+    fixture_bytes[sampling_offset] = 0x22;
+
+    const structure = try parseStructure(fixture_bytes);
+    try std.testing.expectEqual(@as(u8, 2), structure.info.components[0].horizontal_sampling);
+    try std.testing.expectEqual(@as(u8, 2), structure.info.components[0].vertical_sampling);
+    try std.testing.expect(canPureZigDecodeGrayscaleBaseline(structure));
+
+    const decoded = try decodeRgba(alloc, fixture_bytes);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqual(@as(u32, 3), decoded.width);
+    try std.testing.expectEqual(@as(u32, 2), decoded.height);
 }
 
 test "parse structure matches grayscale jpeg tables and scan" {

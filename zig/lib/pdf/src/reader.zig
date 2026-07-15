@@ -1162,6 +1162,12 @@ fn extractShapeRunsFromContentAppendWithState(
 
 const EncryptionContext = struct {
     file_key: [16]u8,
+    method: Method,
+
+    const Method = enum {
+        rc4,
+        aesv2,
+    };
 };
 
 const pdf_password_padding = [_]u8{
@@ -1213,7 +1219,13 @@ fn decryptAesV2Alloc(alloc: Allocator, encrypted: []const u8, key: [16]u8) ![]u8
     return result;
 }
 
-fn objectEncryptionKey(file_key: [16]u8, ptr: syntax.ObjRef) [16]u8 {
+fn decryptRc4Alloc(alloc: Allocator, encrypted: []const u8, key: [16]u8) ![]u8 {
+    const plaintext = try alloc.dupe(u8, encrypted);
+    rc4Crypt(&key, plaintext);
+    return plaintext;
+}
+
+fn objectEncryptionKey(file_key: [16]u8, ptr: syntax.ObjRef, method: EncryptionContext.Method) [16]u8 {
     var material: [25]u8 = undefined;
     @memcpy(material[0..16], &file_key);
     material[16] = @truncate(ptr.id);
@@ -1221,8 +1233,14 @@ fn objectEncryptionKey(file_key: [16]u8, ptr: syntax.ObjRef) [16]u8 {
     material[18] = @truncate(ptr.id >> 16);
     material[19] = @truncate(ptr.gen);
     material[20] = @truncate(ptr.gen >> 8);
-    @memcpy(material[21..25], "sAlT");
-    return std.crypto.hash.Md5.hashResult(&material);
+    const material_len: usize = switch (method) {
+        .rc4 => 21,
+        .aesv2 => blk: {
+            @memcpy(material[21..25], "sAlT");
+            break :blk 25;
+        },
+    };
+    return std.crypto.hash.Md5.hashResult(material[0..material_len]);
 }
 
 pub const Reader = struct {
@@ -1342,18 +1360,24 @@ pub const Reader = struct {
     }
 
     fn initializeEncryption(self: *Reader) !void {
-        // Support the common "encrypted" compatibility case used by public
-        // document corpora: Standard Security Handler revision 4, AESV2, and
-        // an empty user password. Password-protected documents and newer
-        // handlers remain explicitly unsupported rather than guessing.
+        // Support common empty-user-password compatibility encryption used by
+        // public document corpora: V2/R3 RC4 and V4/R4 AESV2, both with
+        // 128-bit file keys. Password-protected documents and newer handlers
+        // remain explicitly unsupported rather than guessing.
         const encrypt_value = self.trailerGet("Encrypt") orelse return;
         var encrypt = try self.resolveValue(encrypt_value);
         defer encrypt.deinit(self.alloc);
         if (encrypt != .dict) return error.UnsupportedPdfEncryption;
         if (!std.mem.eql(u8, (encrypt.get("Filter") orelse return error.UnsupportedPdfEncryption).asName() orelse return error.UnsupportedPdfEncryption, "Standard")) return error.UnsupportedPdfEncryption;
-        if ((encrypt.get("V") orelse return error.UnsupportedPdfEncryption).asInteger() != 4) return error.UnsupportedPdfEncryption;
-        if ((encrypt.get("R") orelse return error.UnsupportedPdfEncryption).asInteger() != 4) return error.UnsupportedPdfEncryption;
+        const version = (encrypt.get("V") orelse return error.UnsupportedPdfEncryption).asInteger() orelse return error.UnsupportedPdfEncryption;
+        const revision = (encrypt.get("R") orelse return error.UnsupportedPdfEncryption).asInteger() orelse return error.UnsupportedPdfEncryption;
         if ((encrypt.get("Length") orelse return error.UnsupportedPdfEncryption).asInteger() != 128) return error.UnsupportedPdfEncryption;
+        const method: EncryptionContext.Method = if (version == 2 and revision == 3)
+            .rc4
+        else if (version == 4 and revision == 4)
+            .aesv2
+        else
+            return error.UnsupportedPdfEncryption;
         const owner_key = switch ((encrypt.get("O") orelse return error.UnsupportedPdfEncryption).*) {
             .string => |value| value,
             else => return error.UnsupportedPdfEncryption,
@@ -1370,11 +1394,13 @@ pub const Reader = struct {
             .string => |value| value,
             else => return error.UnsupportedPdfEncryption,
         };
-        const crypt_filters = encrypt.get("CF") orelse return error.UnsupportedPdfEncryption;
-        const std_filter = crypt_filters.get("StdCF") orelse return error.UnsupportedPdfEncryption;
-        if (!std.mem.eql(u8, (std_filter.get("CFM") orelse return error.UnsupportedPdfEncryption).asName() orelse return error.UnsupportedPdfEncryption, "AESV2")) return error.UnsupportedPdfEncryption;
-        if (!std.mem.eql(u8, (encrypt.get("StmF") orelse return error.UnsupportedPdfEncryption).asName() orelse return error.UnsupportedPdfEncryption, "StdCF")) return error.UnsupportedPdfEncryption;
-        if (!std.mem.eql(u8, (encrypt.get("StrF") orelse return error.UnsupportedPdfEncryption).asName() orelse return error.UnsupportedPdfEncryption, "StdCF")) return error.UnsupportedPdfEncryption;
+        if (method == .aesv2) {
+            const crypt_filters = encrypt.get("CF") orelse return error.UnsupportedPdfEncryption;
+            const std_filter = crypt_filters.get("StdCF") orelse return error.UnsupportedPdfEncryption;
+            if (!std.mem.eql(u8, (std_filter.get("CFM") orelse return error.UnsupportedPdfEncryption).asName() orelse return error.UnsupportedPdfEncryption, "AESV2")) return error.UnsupportedPdfEncryption;
+            if (!std.mem.eql(u8, (encrypt.get("StmF") orelse return error.UnsupportedPdfEncryption).asName() orelse return error.UnsupportedPdfEncryption, "StdCF")) return error.UnsupportedPdfEncryption;
+            if (!std.mem.eql(u8, (encrypt.get("StrF") orelse return error.UnsupportedPdfEncryption).asName() orelse return error.UnsupportedPdfEncryption, "StdCF")) return error.UnsupportedPdfEncryption;
+        }
 
         var md5 = std.crypto.hash.Md5.init(.{});
         md5.update(&pdf_password_padding);
@@ -1383,8 +1409,10 @@ pub const Reader = struct {
         std.mem.writeInt(u32, &permissions, @bitCast(@as(i32, @intCast(permissions_i))), .little);
         md5.update(&permissions);
         md5.update(file_id);
-        if (encrypt.get("EncryptMetadata")) |metadata| {
-            if (metadata.* == .boolean and !metadata.boolean) md5.update(&.{ 0xff, 0xff, 0xff, 0xff });
+        if (revision >= 4) {
+            if (encrypt.get("EncryptMetadata")) |metadata| {
+                if (metadata.* == .boolean and !metadata.boolean) md5.update(&.{ 0xff, 0xff, 0xff, 0xff });
+            }
         }
         var digest: [16]u8 = undefined;
         md5.final(&digest);
@@ -1407,15 +1435,18 @@ pub const Reader = struct {
             rc4Crypt(&round_key, &user_check);
         }
         if (!std.mem.eql(u8, user_key[0..16], &user_check)) return error.UnsupportedPdfEncryption;
-        self.encryption = .{ .file_key = digest };
+        self.encryption = .{ .file_key = digest, .method = method };
     }
 
     fn decryptObject(self: *const Reader, obj: *syntax.Object, ptr: syntax.ObjRef) !void {
         const context = self.encryption orelse return;
-        const key = objectEncryptionKey(context.file_key, ptr);
+        const key = objectEncryptionKey(context.file_key, ptr, context.method);
         switch (obj.*) {
             .string => |encrypted| {
-                const decrypted = try decryptAesV2Alloc(self.alloc, encrypted, key);
+                const decrypted = switch (context.method) {
+                    .rc4 => try decryptRc4Alloc(self.alloc, encrypted, key),
+                    .aesv2 => try decryptAesV2Alloc(self.alloc, encrypted, key),
+                };
                 self.alloc.free(encrypted);
                 obj.* = .{ .string = decrypted };
             },
@@ -1426,7 +1457,10 @@ pub const Reader = struct {
                 if (!self.decrypted_streams.contains(stream.data_offset)) {
                     const end = std.math.add(usize, stream.data_offset, stream.data_length) catch return error.InvalidObjectOffset;
                     if (end > self.bytes.len) return error.InvalidObjectOffset;
-                    const decrypted = try decryptAesV2Alloc(self.alloc, self.bytes[stream.data_offset..end], key);
+                    const decrypted = switch (context.method) {
+                        .rc4 => try decryptRc4Alloc(self.alloc, self.bytes[stream.data_offset..end], key),
+                        .aesv2 => try decryptAesV2Alloc(self.alloc, self.bytes[stream.data_offset..end], key),
+                    };
                     errdefer self.alloc.free(decrypted);
                     try self.decrypted_streams.put(self.alloc, stream.data_offset, decrypted);
                 }
@@ -3196,7 +3230,15 @@ pub const Reader = struct {
         if (!image_mask and streamHasFilter(obj.get("Filter"), "DCTDecode")) {
             const raw = try self.readRawStreamData(obj);
             defer self.alloc.free(raw);
-            const jpeg_decoded = try image_lib.jpeg.decodeRgba(self.alloc, raw);
+            const encoded = try decodeStreamFiltersBeforeAlloc(
+                self.alloc,
+                raw,
+                obj.get("Filter"),
+                obj.get("DecodeParms"),
+                "DCTDecode",
+            );
+            defer self.alloc.free(encoded);
+            const jpeg_decoded = try image_lib.jpeg.decodeRgba(self.alloc, encoded);
             errdefer self.alloc.free(jpeg_decoded.rgba);
             if (jpeg_decoded.width != width or jpeg_decoded.height != height) return error.UnsupportedPdfRendering;
             try self.applyImageTransparencyAlloc(jpeg_decoded.rgba, width, height, obj);
@@ -4656,6 +4698,47 @@ fn decodeStreamFiltersAlloc(
                 current = next;
             }
             return current;
+        },
+        else => return error.UnsupportedStreamFilter,
+    }
+}
+
+fn decodeStreamFiltersBeforeAlloc(
+    alloc: Allocator,
+    raw: []const u8,
+    filter_obj: ?*const syntax.Object,
+    decode_parms_obj: ?*const syntax.Object,
+    stop_filter: []const u8,
+) ![]u8 {
+    const filter = filter_obj orelse return error.UnsupportedStreamFilter;
+    var current = try alloc.dupe(u8, raw);
+    errdefer alloc.free(current);
+
+    switch (filter.*) {
+        .name => |name| {
+            if (!std.mem.eql(u8, name, stop_filter)) return error.UnsupportedStreamFilter;
+            return current;
+        },
+        .array => |items| {
+            for (items, 0..) |item, i| {
+                const name = item.asName() orelse return error.UnsupportedStreamFilter;
+                if (std.mem.eql(u8, name, stop_filter)) {
+                    if (i + 1 != items.len) return error.UnsupportedStreamFilter;
+                    return current;
+                }
+                const param = if (decode_parms_obj) |parms|
+                    switch (parms.*) {
+                        .array => if (i < parms.array.len) &parms.array[i] else null,
+                        .null => null,
+                        else => parms,
+                    }
+                else
+                    null;
+                const next = try applyStreamFilterAlloc(alloc, current, name, param);
+                alloc.free(current);
+                current = next;
+            }
+            return error.UnsupportedStreamFilter;
         },
         else => return error.UnsupportedStreamFilter,
     }
@@ -9587,6 +9670,55 @@ test "AESV2 object data decrypts and removes PKCS7 padding" {
     const decrypted = try decryptAesV2Alloc(alloc, &encrypted, key);
     defer alloc.free(decrypted);
     try std.testing.expectEqualStrings("hello encrypted pdf", decrypted);
+}
+
+test "RC4 object data decrypts with the unsalted object key" {
+    const alloc = std.testing.allocator;
+    const file_key = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
+    const key = objectEncryptionKey(file_key, .{ .id = 42, .gen = 3 }, .rc4);
+    const encrypted = try alloc.dupe(u8, "hello legacy encrypted pdf");
+    defer alloc.free(encrypted);
+    rc4Crypt(&key, encrypted);
+
+    const decrypted = try decryptRc4Alloc(alloc, encrypted, key);
+    defer alloc.free(decrypted);
+    try std.testing.expectEqualStrings("hello legacy encrypted pdf", decrypted);
+
+    const aes_key = objectEncryptionKey(file_key, .{ .id = 42, .gen = 3 }, .aesv2);
+    try std.testing.expect(!std.mem.eql(u8, &key, &aes_key));
+}
+
+test "stream filter prefix decoding stops before DCT data" {
+    const alloc = std.testing.allocator;
+    const encoded = "compressed jpeg payload";
+    var compressed = std.ArrayList(u8).empty;
+    defer compressed.deinit(alloc);
+    {
+        var history: [std.compress.flate.max_window_len]u8 = undefined;
+        var output_buffer: [256]u8 = undefined;
+        var output: std.Io.Writer = .fixed(&output_buffer);
+        var compressor = try std.compress.flate.Compress.init(&output, history[0..], .zlib, .default);
+        try compressor.writer.writeAll(encoded);
+        try compressor.finish();
+        try compressed.appendSlice(alloc, output.buffered());
+    }
+
+    const filters = try alloc.alloc(syntax.Object, 2);
+    filters[0] = .null;
+    filters[1] = .null;
+    errdefer {
+        filters[0].deinit(alloc);
+        filters[1].deinit(alloc);
+        alloc.free(filters);
+    }
+    filters[0] = .{ .name = try alloc.dupe(u8, "FlateDecode") };
+    filters[1] = .{ .name = try alloc.dupe(u8, "DCTDecode") };
+    var filter_obj: syntax.Object = .{ .array = filters };
+    defer filter_obj.deinit(alloc);
+
+    const result = try decodeStreamFiltersBeforeAlloc(alloc, compressed.items, &filter_obj, null, "DCTDecode");
+    defer alloc.free(result);
+    try std.testing.expectEqualStrings(encoded, result);
 }
 
 test "xref parser ignores an out-of-range generation sentinel" {
