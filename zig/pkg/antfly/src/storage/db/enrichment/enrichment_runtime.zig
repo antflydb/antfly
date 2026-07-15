@@ -3020,15 +3020,26 @@ fn applyRuntimeGeneratedUnitText(
         unit.ocr_attempted = true;
         const embedded_quality = document_extraction_mod.assessOcrQuality(unit.text, quality_config);
         const output_quality = document_extraction_mod.assessOcrQuality(parsed.text, quality_config);
-        if (unit.ocr_embedded_quality) |value| alloc.free(value);
-        unit.ocr_embedded_quality = try document_extraction_mod.ocrQualityJsonAlloc(alloc, embedded_quality);
-        if (unit.ocr_output_quality) |value| alloc.free(value);
-        unit.ocr_output_quality = try document_extraction_mod.ocrQualityJsonAlloc(alloc, output_quality);
-        if (!document_extraction_mod.preferOcrText(embedded_quality, output_quality)) {
+        const prefer_ocr = document_extraction_mod.preferOcrText(embedded_quality, output_quality);
+        {
+            const owned_embedded_quality = try document_extraction_mod.ocrQualityJsonAlloc(alloc, embedded_quality);
+            errdefer alloc.free(owned_embedded_quality);
+            const owned_output_quality = try document_extraction_mod.ocrQualityJsonAlloc(alloc, output_quality);
+            errdefer alloc.free(owned_output_quality);
+            if (unit.ocr_embedded_quality) |value| alloc.free(value);
+            unit.ocr_embedded_quality = owned_embedded_quality;
+            if (unit.ocr_output_quality) |value| alloc.free(value);
+            unit.ocr_output_quality = owned_output_quality;
+        }
+        if (!prefer_ocr) {
+            const owned_extraction_status = try alloc.dupe(u8, "completed_embedded_preferred");
+            errdefer alloc.free(owned_extraction_status);
+            const owned_method = try alloc.dupe(u8, "pdf_text");
+            errdefer alloc.free(owned_method);
             if (unit.extraction_status) |value| alloc.free(value);
-            unit.extraction_status = try alloc.dupe(u8, "completed_embedded_preferred");
+            unit.extraction_status = owned_extraction_status;
             alloc.free(unit.method);
-            unit.method = try alloc.dupe(u8, "pdf_text");
+            unit.method = owned_method;
             unit.ocr_used = false;
             parsed.deinit(alloc);
             return;

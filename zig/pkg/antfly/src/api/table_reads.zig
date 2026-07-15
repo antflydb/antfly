@@ -13106,14 +13106,14 @@ fn remoteDocumentArtifactManifestAlloc(alloc: std.mem.Allocator, remote: RemoteD
 }
 
 fn parseRemoteDocumentArtifactManifest(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.DocumentArtifactManifest {
-    var parsed = try std.json.parseFromSlice(RemoteDocumentArtifactManifest, alloc, body, .{});
+    var parsed = try std.json.parseFromSlice(RemoteDocumentArtifactManifest, alloc, body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
 
     return try remoteDocumentArtifactManifestAlloc(alloc, parsed.value);
 }
 
 fn parseRemoteDocumentArtifactManifests(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.DocumentArtifactManifestList {
-    var parsed = try std.json.parseFromSlice(RemoteDocumentArtifactManifests, alloc, body, .{});
+    var parsed = try std.json.parseFromSlice(RemoteDocumentArtifactManifests, alloc, body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
 
     var artifacts = try alloc.alloc(db_mod.types.DocumentArtifactManifest, parsed.value.artifacts.len);

@@ -18227,7 +18227,7 @@ fn completeDocumentExtractionGeneratedText(
                 continue;
             };
             errdefer alloc.free(produced);
-            try applyGeneratedUnitText(alloc, unit, produced, "ocr_text", "completed", .ocr, config.ocr_quality);
+            try applyGeneratedUnitText(alloc, unit, produced, "ocr_text", "completed", .ocr, config.ocr_quality, config.ocr_prompt);
             continue;
         }
         if (config.transcription_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_transcription")) {
@@ -18241,7 +18241,7 @@ fn completeDocumentExtractionGeneratedText(
                 .content_type = "text/plain",
             });
             errdefer alloc.free(produced);
-            try applyGeneratedUnitText(alloc, unit, produced, "transcript_text", "completed", .transcript, config.ocr_quality);
+            try applyGeneratedUnitText(alloc, unit, produced, "transcript_text", "completed", .transcript, config.ocr_quality, "");
         }
     }
 }
@@ -18256,6 +18256,7 @@ fn applyGeneratedUnitText(
     status: []const u8,
     kind: GeneratedUnitTextKind,
     quality_config: document_extraction_mod.OcrQualityConfig,
+    ocr_prompt: []const u8,
 ) !void {
     if (produced.len == 0 and kind != .ocr) {
         alloc.free(produced);
@@ -18264,19 +18265,31 @@ fn applyGeneratedUnitText(
     defer alloc.free(produced);
     var parsed = try parseGeneratedUnitTextOutputAlloc(alloc, produced);
     errdefer parsed.deinit(alloc);
+    if (kind == .ocr and document_extraction_mod.isOcrPromptEcho(parsed.text, ocr_prompt)) return error.OcrPromptEcho;
     if (kind == .ocr and !std.mem.eql(u8, unit.unit_type, "image")) {
         unit.ocr_attempted = true;
         const embedded_quality = document_extraction_mod.assessOcrQuality(unit.text, quality_config);
         const output_quality = document_extraction_mod.assessOcrQuality(parsed.text, quality_config);
-        if (unit.ocr_embedded_quality) |value| alloc.free(value);
-        unit.ocr_embedded_quality = try document_extraction_mod.ocrQualityJsonAlloc(alloc, embedded_quality);
-        if (unit.ocr_output_quality) |value| alloc.free(value);
-        unit.ocr_output_quality = try document_extraction_mod.ocrQualityJsonAlloc(alloc, output_quality);
-        if (!document_extraction_mod.preferOcrText(embedded_quality, output_quality)) {
+        const prefer_ocr = document_extraction_mod.preferOcrText(embedded_quality, output_quality);
+        {
+            const owned_embedded_quality = try document_extraction_mod.ocrQualityJsonAlloc(alloc, embedded_quality);
+            errdefer alloc.free(owned_embedded_quality);
+            const owned_output_quality = try document_extraction_mod.ocrQualityJsonAlloc(alloc, output_quality);
+            errdefer alloc.free(owned_output_quality);
+            if (unit.ocr_embedded_quality) |value| alloc.free(value);
+            unit.ocr_embedded_quality = owned_embedded_quality;
+            if (unit.ocr_output_quality) |value| alloc.free(value);
+            unit.ocr_output_quality = owned_output_quality;
+        }
+        if (!prefer_ocr) {
+            const owned_extraction_status = try alloc.dupe(u8, "completed_embedded_preferred");
+            errdefer alloc.free(owned_extraction_status);
+            const owned_method = try alloc.dupe(u8, "pdf_text");
+            errdefer alloc.free(owned_method);
             if (unit.extraction_status) |value| alloc.free(value);
-            unit.extraction_status = try alloc.dupe(u8, "completed_embedded_preferred");
+            unit.extraction_status = owned_extraction_status;
             alloc.free(unit.method);
-            unit.method = try alloc.dupe(u8, "pdf_text");
+            unit.method = owned_method;
             unit.ocr_used = false;
             parsed.deinit(alloc);
             return;
