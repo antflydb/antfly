@@ -268,6 +268,15 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
         }
         backend.retired_mutable_snapshots.deinit(backend.allocator);
     }
+    if (@hasField(BackendType, "retired_mutable_snapshot_by_state")) {
+        backend.retired_mutable_snapshot_by_state.deinit(backend.allocator);
+    }
+    if (@hasField(BackendType, "mutable_snapshot_reader_refs")) {
+        backend.mutable_snapshot_reader_refs.deinit(backend.allocator);
+    }
+    if (@hasField(BackendType, "mutable_snapshot_reader_ref_by_state")) {
+        backend.mutable_snapshot_reader_ref_by_state.deinit(backend.allocator);
+    }
     for (backend.runs.items) |*run| {
         if (@hasDecl(BackendType, "releaseRunVersionRef")) backend.releaseRunVersionRef(run);
         if (@hasDecl(BackendType, "forgetRunSnapshotRef")) backend.forgetRunSnapshotRef(run);

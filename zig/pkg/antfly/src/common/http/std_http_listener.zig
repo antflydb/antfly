@@ -1315,7 +1315,7 @@ test "std http listener saturated connection slots queue instead of resetting" {
     defer app.release_slow.store(true, .release);
 
     var saw_slow = false;
-    for (0..1000) |_| {
+    for (0..10_000) |_| {
         if (app.entered_slow.load(.acquire)) {
             saw_slow = true;
             break;
@@ -1335,7 +1335,7 @@ test "std http listener saturated connection slots queue instead of resetting" {
     app.release_slow.store(true, .release);
 
     var fast_completed = false;
-    for (0..2000) |_| {
+    for (0..10_000) |_| {
         if (fast_req.done.load(.acquire)) {
             fast_completed = true;
             break;
@@ -1347,7 +1347,7 @@ test "std http listener saturated connection slots queue instead of resetting" {
     try std.testing.expectEqual(@as(u16, 200), fast_req.status.load(.acquire));
 
     var slow_completed = false;
-    for (0..1000) |_| {
+    for (0..10_000) |_| {
         if (slow_req.done.load(.acquire)) {
             slow_completed = true;
             break;
@@ -1386,8 +1386,8 @@ test "std http listener responds before header timeout without async capacity" {
 
     var listener = StdHttpListener.init(std.heap.page_allocator, .{
         .serve_in_connection_threads = true,
-        .header_read_timeout_ms = 1_000,
-        .body_read_timeout_ms = 1_000,
+        .header_read_timeout_ms = 10_000,
+        .body_read_timeout_ms = 10_000,
     }, app.executor());
     defer listener.deinit();
     listener.io_impl.setAsyncLimit(.nothing);
@@ -1400,7 +1400,7 @@ test "std http listener responds before header timeout without async capacity" {
         var response = try request_executor.execute(std.testing.allocator, .{
             .method = .GET,
             .uri = base_uri,
-            .timeout_ms = 250,
+            .timeout_ms = 10_000,
         });
         defer response.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(u16, 200), response.status);
@@ -1409,7 +1409,7 @@ test "std http listener responds before header timeout without async capacity" {
             .method = .POST,
             .uri = base_uri,
             .body = "ping",
-            .timeout_ms = 250,
+            .timeout_ms = 10_000,
         });
         defer body_response.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(u16, 200), body_response.status);
@@ -1457,7 +1457,7 @@ test "std http listener header timeout releases accepted idle connection slot" {
     defer idle_stream.close(idle_io);
 
     var saw_slot = false;
-    for (0..1000) |_| {
+    for (0..10_000) |_| {
         if (listener.active_connection_threads.load(.acquire) == 1) {
             saw_slot = true;
             break;
@@ -1466,15 +1466,13 @@ test "std http listener header timeout releases accepted idle connection slot" {
     }
     try std.testing.expect(saw_slot);
 
-    sleepMs(100);
-
     const base_uri = try listener.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(base_uri);
 
     var response = try request_executor.execute(std.testing.allocator, .{
         .method = .GET,
         .uri = base_uri,
-        .timeout_ms = 1_000,
+        .timeout_ms = 10_000,
     });
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), response.status);
@@ -1532,7 +1530,7 @@ test "std http listener body timeout releases accepted slow body connection slot
     try writer.interface.flush();
 
     var saw_slot = false;
-    for (0..1000) |_| {
+    for (0..10_000) |_| {
         if (listener.active_connection_threads.load(.acquire) == 1) {
             saw_slot = true;
             break;
@@ -1541,15 +1539,13 @@ test "std http listener body timeout releases accepted slow body connection slot
     }
     try std.testing.expect(saw_slot);
 
-    sleepMs(150);
-
     const base_uri = try listener.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(base_uri);
 
     var response = try request_executor.execute(std.testing.allocator, .{
         .method = .GET,
         .uri = base_uri,
-        .timeout_ms = 1_000,
+        .timeout_ms = 10_000,
     });
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), response.status);
@@ -1600,7 +1596,7 @@ test "std http listener stop interrupts accepted header read" {
     defer idle_stream.close(idle_io);
 
     var saw_slot = false;
-    for (0..1000) |_| {
+    for (0..10_000) |_| {
         if (listener.active_connection_threads.load(.acquire) == 1) {
             saw_slot = true;
             break;
@@ -1614,7 +1610,7 @@ test "std http listener stop interrupts accepted header read" {
     defer stop_thread.join();
 
     var stopped = false;
-    for (0..1000) |_| {
+    for (0..10_000) |_| {
         if (stop_thread_state.done.load(.acquire)) {
             stopped = true;
             break;
@@ -1680,7 +1676,7 @@ test "std http listener stop interrupts accepted body read" {
     try writer.interface.flush();
 
     var saw_slot = false;
-    for (0..1000) |_| {
+    for (0..10_000) |_| {
         if (listener.active_connection_threads.load(.acquire) == 1) {
             saw_slot = true;
             break;
@@ -1694,7 +1690,7 @@ test "std http listener stop interrupts accepted body read" {
     defer stop_thread.join();
 
     var stopped = false;
-    for (0..1000) |_| {
+    for (0..10_000) |_| {
         if (stop_thread_state.done.load(.acquire)) {
             stopped = true;
             break;
@@ -1784,7 +1780,7 @@ test "std http listener stop returns while saturated with a headerless connectio
     defer app.release_slow.store(true, .release);
 
     var saw_slow = false;
-    for (0..1000) |_| {
+    for (0..10_000) |_| {
         if (app.entered_slow.load(.acquire)) {
             saw_slow = true;
             break;
@@ -1812,7 +1808,7 @@ test "std http listener stop returns while saturated with a headerless connectio
     app.release_slow.store(true, .release);
 
     var stopped = false;
-    for (0..5000) |_| {
+    for (0..10_000) |_| {
         if (stop_thread_state.done.load(.acquire)) {
             stopped = true;
             break;

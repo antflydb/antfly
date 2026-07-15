@@ -122,6 +122,10 @@ pub const CatchUpOptions = struct {
     max_windows_per_call: usize = 0,
     estimated_dense_vector_bytes: u64 = 0,
     target_sequence: u64 = 0,
+    /// Optional absolute monotonic deadline. Collection stops before opening a
+    /// new apply window once this deadline is reached. Callers must still size
+    /// windows so an individual backend apply fits within their service SLO.
+    deadline_ns: ?u64 = null,
 };
 
 pub const catch_up_max_records_per_window_default: usize = 2048;
@@ -243,6 +247,9 @@ pub fn catchUpIndexFromMatchingCursor(
     var stats = CatchUpStats{};
     var completed_windows: usize = 0;
     while (true) {
+        if (options.deadline_ns) |deadline| {
+            if (monotonicTimeNs() >= deadline) return error.CatchUpDeadlineExceeded;
+        }
         var builder = ReplayChunkBuilder.init(alloc, index_ref, options.resource_manager, options.max_chunk_bytes);
         builder.max_items = options.max_items_per_window;
         builder.estimated_dense_vector_bytes = options.estimated_dense_vector_bytes;
@@ -258,6 +265,12 @@ pub fn catchUpIndexFromMatchingCursor(
         stats.window_collect_ns += monotonicTimeNs() - collect_started_ns;
         if (chunk_stats.last_sequence == 0) {
             break;
+        }
+        // Never begin a storage mutation after the caller's deadline. The
+        // replay cursor is disposable; a retry reopens it from the last
+        // durably persisted applied sequence.
+        if (options.deadline_ns) |deadline| {
+            if (monotonicTimeNs() >= deadline) return error.CatchUpDeadlineExceeded;
         }
         stats.scanned_entries += if (chunk_stats.scanned_entries != 0) chunk_stats.scanned_entries else chunk_stats.matched_entries;
         stats.replay_scan_batches += chunk_stats.scan_batches;
@@ -331,6 +344,9 @@ pub fn catchUpIndexFromMatchingCursor(
         }
         derived_types.deinitDerivedBatch(alloc, &batch);
         completed_windows += 1;
+        if (options.deadline_ns) |deadline| {
+            if (monotonicTimeNs() >= deadline) break;
+        }
         if (options.max_windows_per_call > 0 and completed_windows >= options.max_windows_per_call) break;
     }
     return stats;
@@ -975,6 +991,32 @@ test "catchUpIndex window hooks fire once per replay window" {
     try std.testing.expectEqual(@as(usize, 2), hooks.begin_calls);
     try std.testing.expectEqual(@as(usize, 2), hooks.finish_calls);
     try std.testing.expectEqual(@as(usize, 2), hooks.successful_finishes);
+}
+
+test "catchUpIndex refuses to open an apply window after its deadline" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-expired-deadline-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
+    defer journal.close();
+
+    var capture = TestApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    try std.testing.expectError(error.CatchUpDeadlineExceeded, catchUpIndexWithOptions(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        .{ .name = "dv_v1", .kind = .dense_vector },
+        0,
+        &capture,
+        testApplyCapture,
+        .{ .deadline_ns = 1 },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), capture.call_count);
 }
 
 test "catchUpIndex can stop after bounded replay windows" {

@@ -177,6 +177,35 @@ fn recordPointRunPrecheckSurvivor(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordPointRunPrecheckSurvivor")) backend.recordPointRunPrecheckSurvivor();
 }
 
+fn canBorrowReaderRetainedState(backend: anytype) bool {
+    const BackendType = @TypeOf(backend.*);
+    if (@hasDecl(BackendType, "hasVersionReaderPins")) return backend.hasVersionReaderPins();
+    return @hasField(BackendType, "active_readers") and backend.active_readers > 0;
+}
+
+fn retainActiveMutableValueReader(backend: anytype) bool {
+    if (@hasDecl(@TypeOf(backend.*), "retainActiveMutableValueReader")) {
+        backend.retainActiveMutableValueReader();
+        return true;
+    }
+    return false;
+}
+
+fn releaseActiveMutableValueReader(backend: anytype, retained: bool) void {
+    if (!retained) return;
+    if (@hasDecl(@TypeOf(backend.*), "releaseActiveMutableValueReader")) backend.releaseActiveMutableValueReader();
+}
+
+fn canBorrowActiveMutableValues(backend: anytype) bool {
+    if (@hasDecl(@TypeOf(backend.*), "canBorrowActiveMutableValues")) return backend.canBorrowActiveMutableValues();
+    return false;
+}
+
+fn shouldRetainActiveMutableValueReader(backend: anytype) bool {
+    if (@hasDecl(@TypeOf(backend.*), "bulkIngestActive") and backend.bulkIngestActive()) return false;
+    return true;
+}
+
 fn prepareMutableForWrite(backend: anytype) !void {
     if (@hasDecl(@TypeOf(backend.*), "prepareMutableForWrite")) try backend.prepareMutableForWrite();
 }
@@ -2584,7 +2613,10 @@ fn releaseMutableReadSnapshot(
     snapshot: *const State,
     owned: bool,
 ) void {
-    if (!owned and @hasDecl(BackendType, "releaseMutableStateSnapshot")) {
+    if (owned) return;
+    if (@hasDecl(BackendType, "releaseMutableReadSnapshot")) {
+        backend.releaseMutableReadSnapshot(snapshot);
+    } else if (@hasDecl(BackendType, "releaseMutableStateSnapshot")) {
         backend.releaseMutableStateSnapshot(snapshot);
     }
 }
@@ -3179,6 +3211,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         cursor_levels: []RunLevel = &.{},
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
         batch_options: backend_types.BatchOptions = .{},
+        cursor_reader_retained: bool = false,
         closed: bool = false,
 
         pub fn open(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
@@ -3212,6 +3245,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             backend.finishBatchMode(self.batch_options);
+            if (self.cursor_reader_retained) releaseWriteReader(BackendType, backend, .current_scan);
             releaseWriteReader(BackendType, backend, .write_txn);
             self.* = undefined;
         }
@@ -3229,6 +3263,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 self.invalidateCursorSnapshotLocked();
                 releaseHeldValues(&self.held_values, self.allocator);
                 self.backend.finishBatchMode(self.batch_options);
+                if (self.cursor_reader_retained) releaseWriteReader(BackendType, self.backend, .current_scan);
                 releaseWriteReader(BackendType, self.backend, .write_txn);
                 self.closed = true;
             };
@@ -3269,6 +3304,10 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             self.invalidateCursorSnapshotLocked();
             releaseHeldValues(&self.held_values, self.allocator);
             var finalize_err: ?anyerror = null;
+            if (self.cursor_reader_retained) {
+                releaseWriteReader(BackendType, self.backend, .current_scan);
+                self.cursor_reader_retained = false;
+            }
             finalizeWriteReader(BackendType, self.backend, .write_txn) catch |err| {
                 finalize_err = err;
             };
@@ -3592,6 +3631,17 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             if (self.cursor_overlay != null) return;
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
+
+            var retained_now = false;
+            if (!self.cursor_reader_retained) {
+                try retainReadReader(BackendType, self.backend, .current_scan);
+                self.cursor_reader_retained = true;
+                retained_now = true;
+            }
+            errdefer if (retained_now) {
+                releaseWriteReader(BackendType, self.backend, .current_scan);
+                self.cursor_reader_retained = false;
+            };
 
             var overlay: State = .{};
             errdefer overlay.deinit(self.allocator);
@@ -5803,6 +5853,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         cursor_levels: []RunLevel = &.{},
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
         batch_options: backend_types.BatchOptions = .{},
+        cursor_reader_retained: bool = false,
         closed: bool = false,
 
         pub fn open(backend: *BackendType) !@This() {
@@ -5835,6 +5886,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             backend.finishBatchMode(self.batch_options);
+            if (self.cursor_reader_retained) releaseWriteReader(BackendType, backend, .current_scan);
             releaseWriteReader(BackendType, backend, .write_txn);
             self.* = undefined;
         }
@@ -5852,6 +5904,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 self.invalidateCursorSnapshotLocked();
                 releaseHeldValues(&self.held_values, self.allocator);
                 self.backend.finishBatchMode(self.batch_options);
+                if (self.cursor_reader_retained) releaseWriteReader(BackendType, self.backend, .current_scan);
                 releaseWriteReader(BackendType, self.backend, .write_txn);
                 self.closed = true;
             };
@@ -5892,6 +5945,10 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             self.invalidateCursorSnapshotLocked();
             releaseHeldValues(&self.held_values, self.allocator);
             var finalize_err: ?anyerror = null;
+            if (self.cursor_reader_retained) {
+                releaseWriteReader(BackendType, self.backend, .current_scan);
+                self.cursor_reader_retained = false;
+            }
             finalizeWriteReader(BackendType, self.backend, .write_txn) catch |err| {
                 finalize_err = err;
             };
@@ -6099,6 +6156,17 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             if (self.cursor_overlay != null) return;
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
+
+            var retained_now = false;
+            if (!self.cursor_reader_retained) {
+                try retainReadReader(BackendType, self.backend, .current_scan);
+                self.cursor_reader_retained = true;
+                retained_now = true;
+            }
+            errdefer if (retained_now) {
+                releaseWriteReader(BackendType, self.backend, .current_scan);
+                self.cursor_reader_retained = false;
+            };
 
             var overlay = try self.mutable.clone(self.allocator);
             errdefer overlay.deinit(self.allocator);

@@ -166,8 +166,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         _ = bytes;
     }
 
-    pub fn shouldThrottleBacklog(_: *@This()) bool {
-        return false;
+    pub fn backlogThrottleTargetSequence(_: *@This()) ?u64 {
+        return null;
     }
 
     pub fn releaseBacklogThrough(self: *@This(), sequence: u64) void {
@@ -494,11 +494,11 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         return try self.backlog.track(self.alloc, sequence, bytes);
     }
 
-    pub fn shouldThrottleBacklog(self: *DerivedRuntime) bool {
+    pub fn backlogThrottleTargetSequence(self: *DerivedRuntime) ?u64 {
         const io = self.ioContext();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        return self.backlog.shouldThrottleWrites();
+        return self.backlog.throttleTargetSequence();
     }
 
     pub fn releaseBacklogThrough(self: *DerivedRuntime, sequence: u64) void {
