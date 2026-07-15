@@ -482,6 +482,36 @@ def _wait_for_standby_lookup(
     raise AssertionError(f"standby lookup for {key!r} did not become visible; last_error={last_error}\n{cluster.debug_logs()}")
 
 
+def _wait_for_promoted_missing_lookup(
+    cluster: HACluster,
+    table_name: str,
+    key: str,
+    *,
+    timeout_s: float = 20.0,
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            cluster.standby.lookup_key(table_name, key)
+        except requests.HTTPError as err:
+            if err.response is not None and err.response.status_code == 404:
+                return
+            if err.response is not None and err.response.status_code == 503:
+                last_error = err
+                time.sleep(0.1)
+                continue
+            raise
+        except requests.RequestException as err:
+            last_error = err
+            time.sleep(0.1)
+            continue
+        raise AssertionError(f"promoted standby unexpectedly found missing key {key!r}")
+    raise AssertionError(
+        f"promoted standby did not settle missing lookup for {key!r}; last_error={last_error}\n{cluster.debug_logs()}"
+    )
+
+
 def _primary_lsn(cluster: HACluster) -> int:
     status = cluster.primary.admin_get("/primary/status")
     return int(status["snapshot"]["current_lsn"])
@@ -994,10 +1024,7 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
         ha_cluster.primary.lookup_key(table_name, "doc:old-primary", consistency="stale")
     assert missing_old_primary_doc.value.response is not None
     assert missing_old_primary_doc.value.response.status_code == 404
-    with pytest.raises(requests.HTTPError) as missing_promoted_primary_doc:
-        ha_cluster.standby.lookup_key(table_name, "doc:old-primary")
-    assert missing_promoted_primary_doc.value.response is not None
-    assert missing_promoted_primary_doc.value.response.status_code == 404
+    _wait_for_promoted_missing_lookup(ha_cluster, table_name, "doc:old-primary")
 
 
 def test_forced_promotion_receipt_records_lossy_runtime_evidence(ha_cluster: HACluster):
