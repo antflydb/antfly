@@ -32,12 +32,14 @@ func TestNewArtifactEmbeddingIndexConfig(t *testing.T) {
 	}
 
 	idx, err := NewArtifactEmbeddingIndexConfig("document_vectors", ArtifactEmbeddingIndexConfig{
-		SourceArtifactName: "document_chunks_v1",
-		EmbeddingName:      "document_chunk_dense_v1",
-		SourceField:        "text",
-		ExpectedDims:       768,
-		Embedder:           *embedder,
-		DistanceMetric:     DistanceMetricCosine,
+		Sources: []ArtifactEmbeddingSource{{
+			ArtifactName:       "document_chunk_dense_v1",
+			SourceArtifactName: "document_chunks_v1",
+			SourceField:        "text",
+		}},
+		ExpectedDims:   768,
+		Embedder:       *embedder,
+		DistanceMetric: DistanceMetricCosine,
 	})
 	if err != nil {
 		t.Fatalf("NewArtifactEmbeddingIndexConfig failed: %v", err)
@@ -58,14 +60,22 @@ func TestNewArtifactEmbeddingIndexConfig(t *testing.T) {
 	if body["name"] != "document_vectors" {
 		t.Fatalf("name = %v, want document_vectors", body["name"])
 	}
-	if body["field"] != "embedding" {
-		t.Fatalf("field = %v, want embedding", body["field"])
+	if _, ok := body["field"]; ok {
+		t.Fatalf("field = %v, want omitted", body["field"])
 	}
-	if body["embedding_name"] != "document_chunk_dense_v1" {
-		t.Fatalf("embedding_name = %v, want document_chunk_dense_v1", body["embedding_name"])
+	if _, ok := body["embedding_name"]; ok {
+		t.Fatalf("embedding_name = %v, want omitted", body["embedding_name"])
 	}
-	if body["source_artifact_name"] != "document_chunks_v1" {
-		t.Fatalf("source_artifact_name = %v, want document_chunks_v1", body["source_artifact_name"])
+	if _, ok := body["source_artifact_name"]; ok {
+		t.Fatalf("source_artifact_name = %v, want omitted", body["source_artifact_name"])
+	}
+	sources, ok := body["sources"].([]any)
+	if !ok || len(sources) != 1 {
+		t.Fatalf("sources = %#v, want one source", body["sources"])
+	}
+	source, ok := sources[0].(map[string]any)
+	if !ok || source["artifact"] != "document_chunk_dense_v1" {
+		t.Fatalf("source = %#v, want document_chunk_dense_v1", sources[0])
 	}
 
 	enrichments, ok := body["enrichments"].([]any)
@@ -90,5 +100,103 @@ func TestNewArtifactEmbeddingIndexConfig(t *testing.T) {
 	}
 	if enrichment["expected_dims"] != float64(768) {
 		t.Fatalf("enrichment expected_dims = %v, want 768", enrichment["expected_dims"])
+	}
+}
+
+func TestNewArtifactEmbeddingIndexConfigSupportsMultipleSources(t *testing.T) {
+	embedder, err := NewEmbedderConfig(AntflyEmbedderConfig{Model: "antflydb/clipclap"})
+	if err != nil {
+		t.Fatalf("NewEmbedderConfig failed: %v", err)
+	}
+	idx, err := NewArtifactEmbeddingIndexConfig("document_vectors", ArtifactEmbeddingIndexConfig{
+		Sources: []ArtifactEmbeddingSource{
+			{ArtifactName: "title_dense_v1", SourceArtifactName: "title_chunks_v1"},
+			{ArtifactName: "body_dense_v1", SourceArtifactName: "body_chunks_v1"},
+		},
+		ExpectedDims: 384,
+		Embedder:     *embedder,
+	})
+	if err != nil {
+		t.Fatalf("NewArtifactEmbeddingIndexConfig failed: %v", err)
+	}
+	data, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatalf("marshal index config: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatalf("unmarshal index config: %v", err)
+	}
+	if got := len(body["sources"].([]any)); got != 2 {
+		t.Fatalf("sources len = %d, want 2", got)
+	}
+	if got := len(body["enrichments"].([]any)); got != 2 {
+		t.Fatalf("enrichments len = %d, want 2", got)
+	}
+}
+
+func TestGraphIndexConfigUsesPerSourcePathAndFormat(t *testing.T) {
+	idx, err := NewIndexConfig("knowledge_graph", GraphIndexConfig{
+		Sources: []GraphIndexSource{
+			{
+				Artifact: "title_relations_v1",
+				Path:     "$.relations[*]",
+				Format:   GraphIndexSourceFormatExtractionRelation,
+			},
+			{
+				Artifact: "entity_graph_v1",
+				Path:     "$.graph",
+				Format:   GraphIndexSourceFormatExtractionGraph,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewIndexConfig failed: %v", err)
+	}
+	data, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatalf("marshal index config: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatalf("unmarshal index config: %v", err)
+	}
+	if _, ok := body["path"]; ok {
+		t.Fatalf("graph path must be source-specific: %s", data)
+	}
+	sources, ok := body["sources"].([]any)
+	if !ok || len(sources) != 2 {
+		t.Fatalf("sources = %#v, want two graph sources", body["sources"])
+	}
+	first := sources[0].(map[string]any)
+	second := sources[1].(map[string]any)
+	if first["path"] != "$.relations[*]" || first["format"] != "extraction_relation" {
+		t.Fatalf("first source = %#v", first)
+	}
+	if second["path"] != "$.graph" || second["format"] != "extraction_graph" {
+		t.Fatalf("second source = %#v", second)
+	}
+}
+
+func TestNewArtifactIndexSources(t *testing.T) {
+	sources, err := NewArtifactIndexSources("title_chunks_v1", "body_chunks_v1")
+	if err != nil {
+		t.Fatalf("NewArtifactIndexSources failed: %v", err)
+	}
+	if len(sources) != 2 || sources[0].Artifact != "title_chunks_v1" || sources[1].Artifact != "body_chunks_v1" {
+		t.Fatalf("sources = %#v", sources)
+	}
+	if _, err := NewArtifactIndexSources("body_chunks_v1", "body_chunks_v1"); err == nil {
+		t.Fatal("duplicate artifact sources should fail")
+	}
+}
+
+func TestNewIndexConfigSupportsSchemaDerivedAlgebraicIndex(t *testing.T) {
+	idx, err := NewIndexConfig("algebraic", AlgebraicIndexConfig{DeriveFromSchema: true})
+	if err != nil {
+		t.Fatalf("NewIndexConfig failed: %v", err)
+	}
+	if idx.Type != IndexTypeAlgebraic {
+		t.Fatalf("index type = %q, want %q", idx.Type, IndexTypeAlgebraic)
 	}
 }

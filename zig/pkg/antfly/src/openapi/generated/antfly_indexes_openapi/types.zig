@@ -186,6 +186,12 @@ pub const AntflyType = enum {
     }
 };
 
+/// Named generated artifact stream consumed by an index. Producer inputs such as field and template belong on the matching enrichment, not on the index source.
+pub const ArtifactIndexSource = struct {
+    /// Stable name of the generated artifact.
+    artifact: []const u8,
+};
+
 /// A structured reason why the coverage projection cannot be treated as globally complete.
 pub const DerivedCoverageObservationIncompleteReason = enum {
     runtime_unavailable,
@@ -426,11 +432,13 @@ pub const EmbeddingsIndexConfig = struct {
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
-    /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
+    /// Field to extract embeddings from for direct managed indexes. Omit when sources is set.
     field: ?[]const u8 = null,
-    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
+    /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by the artifact name and its source key. All sources must use the same dense vector space or the same sparse token space. Not allowed for external or direct field/template indexes.
+    sources: ?[]const ArtifactIndexSource = null,
+    /// Deprecated single-source alias for sources: [{artifact: <embedding_name>}].
     embedding_name: ?[]const u8 = null,
-    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+    /// Deprecated descriptive field for the input to the legacy embedding_name enrichment. New configurations define that input only on the matching enrichment.
     source_artifact_name: ?[]const u8 = null,
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
@@ -630,6 +638,8 @@ pub const ExecutionPolicy = struct {
 };
 
 pub const FullTextIndexConfig = struct {
+    /// Chunk or textual asset artifact streams indexed together. Every artifact record is an independent full-text member.
+    sources: ?[]const ArtifactIndexSource = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
 };
@@ -730,6 +740,8 @@ pub const FullTextIndexStats = struct {
 
 /// Configuration for graph index type
 pub const GraphIndexConfig = struct {
+    /// Chunk or JSON asset artifact streams whose edge-like values are unioned into this graph index.
+    sources: ?[]const GraphIndexSource = null,
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
     summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
     /// Handlebars template for generating summarizer input text. Uses document fields as template variables. Same pattern as EmbeddingsConfig template.
@@ -738,6 +750,18 @@ pub const GraphIndexConfig = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
     max_edges_per_document: ?i64 = null,
+};
+
+/// Graph-specific artifact source. The source owns the payload path and format because different artifact streams in one graph index may require different interpretations.
+pub const GraphIndexSource = struct {
+    /// Stable name of the generated graph artifact.
+    artifact: []const u8,
+    /// Optional JSON path selecting edge records within this artifact payload.
+    path: ?[]const u8 = null,
+    /// Payload interpretation for this artifact source.
+    format: ?[]const u8 = null,
+    /// Optional provenance edge type emitted for resolver mention decisions from this source.
+    mention_edge_type: ?[]const u8 = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -982,6 +1006,8 @@ pub const IndexConfig = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
     enrichments: ?[]const EnrichmentConfig = null,
+    /// Chunk or textual asset artifact streams indexed together. Every artifact record is an independent full-text member.
+    sources: ?[]const ArtifactIndexSource = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
     /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
@@ -992,11 +1018,11 @@ pub const IndexConfig = struct {
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
-    /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
+    /// Field to extract embeddings from for direct managed indexes. Omit when sources is set.
     field: ?[]const u8 = null,
-    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
+    /// Deprecated single-source alias for sources: [{artifact: <embedding_name>}].
     embedding_name: ?[]const u8 = null,
-    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+    /// Deprecated descriptive field for the input to the legacy embedding_name enrichment. New configurations define that input only on the matching enrichment.
     source_artifact_name: ?[]const u8 = null,
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
@@ -1038,6 +1064,10 @@ pub const IndexConfig = struct {
         }
         if (self.enrichments) |value| {
             try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.sources) |value| {
+            try jw.objectField("sources");
             try jw.write(value);
         }
         if (self.mem_only) |value| {

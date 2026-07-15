@@ -152,6 +152,11 @@ func NewIndexConfig(name string, config any) (*IndexConfig, error) {
 		if err := idxConfig.FromGraphIndexConfig(v); err != nil {
 			return nil, fmt.Errorf("from graph index config: %w", err)
 		}
+	case AlgebraicIndexConfig:
+		t = IndexTypeAlgebraic
+		if err := idxConfig.FromAlgebraicIndexConfig(v); err != nil {
+			return nil, fmt.Errorf("from algebraic index config: %w", err)
+		}
 	default:
 		return nil, fmt.Errorf("unsupported index config type: %T", config)
 	}
@@ -160,21 +165,46 @@ func NewIndexConfig(name string, config any) (*IndexConfig, error) {
 	return idxConfig, nil
 }
 
-// ArtifactEmbeddingIndexConfig describes a managed vector index whose vectors
-// are generated from an existing generated artifact stream.
-type ArtifactEmbeddingIndexConfig struct {
+// NewArtifactIndexSources builds the shared artifact-only source shape used by
+// full-text, embeddings, and graph indexes.
+func NewArtifactIndexSources(artifacts ...string) ([]ArtifactIndexSource, error) {
+	sources := make([]ArtifactIndexSource, 0, len(artifacts))
+	seen := make(map[string]struct{}, len(artifacts))
+	for i, artifact := range artifacts {
+		if artifact == "" {
+			return nil, fmt.Errorf("artifacts[%d] is required", i)
+		}
+		if _, ok := seen[artifact]; ok {
+			return nil, fmt.Errorf("duplicate artifact source %q", artifact)
+		}
+		seen[artifact] = struct{}{}
+		sources = append(sources, ArtifactIndexSource{Artifact: artifact})
+	}
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("at least one artifact source is required")
+	}
+	return sources, nil
+}
+
+// ArtifactEmbeddingSource describes one generated embedding artifact stream and
+// the enrichment that produces it.
+type ArtifactEmbeddingSource struct {
+	// ArtifactName is the stable generated embedding artifact name.
+	ArtifactName string
 	// SourceArtifactName is the artifact stream to embed, for example
 	// "document_chunks_v1".
 	SourceArtifactName string
-	// EmbeddingName is the generated embedding artifact name consumed by the
-	// vector index. It defaults to the index name.
-	EmbeddingName string
 	// SourceField is the text field inside each source artifact payload. It
 	// defaults to "text".
 	SourceField string
-	// VectorField is the vector field exposed to the vector index. It defaults
-	// to "embedding".
-	VectorField string
+}
+
+// ArtifactEmbeddingIndexConfig describes a managed vector index whose vectors
+// are generated from one or more existing generated artifact streams.
+type ArtifactEmbeddingIndexConfig struct {
+	// Sources are the embedding artifact streams indexed together. Each source
+	// contributes independent vector members to the index.
+	Sources []ArtifactEmbeddingSource
 	// ExpectedDims is optional when the embedder can be probed by the server.
 	ExpectedDims int
 	Embedder     EmbedderConfig
@@ -186,45 +216,52 @@ func NewArtifactEmbeddingIndexConfig(name string, config ArtifactEmbeddingIndexC
 	if name == "" {
 		return nil, fmt.Errorf("index name is required")
 	}
-	if config.SourceArtifactName == "" {
-		return nil, fmt.Errorf("source artifact name is required")
-	}
 	if config.Embedder.Provider == "" {
 		return nil, fmt.Errorf("embedder provider is required")
 	}
 
-	embeddingName := config.EmbeddingName
-	if embeddingName == "" {
-		embeddingName = name
+	sources := config.Sources
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("at least one artifact embedding source is required")
 	}
-	sourceField := config.SourceField
-	if sourceField == "" {
-		sourceField = "text"
-	}
-	vectorField := config.VectorField
-	if vectorField == "" {
-		vectorField = "embedding"
+
+	seen := make(map[string]struct{}, len(sources))
+	publicSources := make([]ArtifactIndexSource, 0, len(sources))
+	enrichments := make([]EnrichmentConfig, 0, len(sources))
+	for i, source := range sources {
+		if source.ArtifactName == "" {
+			return nil, fmt.Errorf("sources[%d].artifact name is required", i)
+		}
+		if source.SourceArtifactName == "" {
+			return nil, fmt.Errorf("sources[%d].source artifact name is required", i)
+		}
+		if _, ok := seen[source.ArtifactName]; ok {
+			return nil, fmt.Errorf("duplicate embedding artifact source %q", source.ArtifactName)
+		}
+		seen[source.ArtifactName] = struct{}{}
+		sourceField := source.SourceField
+		if sourceField == "" {
+			sourceField = "text"
+		}
+		publicSources = append(publicSources, ArtifactIndexSource{Artifact: source.ArtifactName})
+		enrichments = append(enrichments, EnrichmentConfig{
+			Name:               source.ArtifactName,
+			Kind:               EnrichmentKindEmbedding,
+			Field:              sourceField,
+			SourceArtifactName: source.SourceArtifactName,
+			ExpectedDims:       config.ExpectedDims,
+		})
 	}
 
 	idx, err := NewIndexConfig(name, EmbeddingsIndexConfig{
-		Field:              vectorField,
-		EmbeddingName:      embeddingName,
-		SourceArtifactName: config.SourceArtifactName,
-		Dimension:          config.ExpectedDims,
-		Embedder:           config.Embedder,
-		DistanceMetric:     config.DistanceMetric,
+		Sources:        publicSources,
+		Dimension:      config.ExpectedDims,
+		Embedder:       config.Embedder,
+		DistanceMetric: config.DistanceMetric,
 	})
 	if err != nil {
 		return nil, err
 	}
-	idx.Enrichments = []EnrichmentConfig{
-		{
-			Name:               embeddingName,
-			Kind:               EnrichmentKindEmbedding,
-			Field:              sourceField,
-			SourceArtifactName: config.SourceArtifactName,
-			ExpectedDims:       config.ExpectedDims,
-		},
-	}
+	idx.Enrichments = enrichments
 	return idx, nil
 }

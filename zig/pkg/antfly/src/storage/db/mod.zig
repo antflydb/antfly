@@ -23,6 +23,7 @@ const planning_stats = @import("planning_stats.zig");
 const doc_identity_mod = @import("doc_identity.zig");
 const query_graph = @import("query/graph_exec.zig");
 const query_result_shape = @import("query/result_shape.zig");
+const replay_batcher = @import("batcher.zig");
 
 pub const types = @import("types.zig");
 pub const docstore = @import("../docstore.zig");
@@ -155,6 +156,11 @@ pub fn peekLastSortRejectionDiagnostic() ?SortRejectionDiagnostic {
 
 pub fn recordSortRejectionDiagnostic(field: []const u8, reason: []const u8, detail: []const u8) void {
     query_search.recordSortRejectionDiagnostic(field, reason, detail);
+}
+
+test "replay batcher preserves multi-source vector members" {
+    try replay_batcher.testDenseReplayPreservesMultipleArtifactMembers();
+    try replay_batcher.testSparseReplayPreservesMultipleArtifactMembers();
 }
 
 pub const testing = if (builtin.is_test) struct {

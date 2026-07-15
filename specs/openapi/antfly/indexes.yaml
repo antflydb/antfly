@@ -99,6 +99,45 @@ components:
         embedding:
           $ref: "#/components/schemas/ExecutionPolicy"
           description: "Embedding producer batching for shorthand-created embedding enrichments."
+    ArtifactIndexSource:
+      type: object
+      additionalProperties: false
+      description: "Named generated artifact stream consumed by an index. Producer inputs such as field and template belong on the matching enrichment, not on the index source."
+      required:
+        - artifact
+      properties:
+        artifact:
+          type: string
+          minLength: 1
+          description: "Stable name of the generated artifact."
+    GraphIndexSource:
+      type: object
+      additionalProperties: false
+      description: "Graph-specific artifact source. The source owns the payload path and format because different artifact streams in one graph index may require different interpretations."
+      required:
+        - artifact
+      properties:
+        artifact:
+          type: string
+          minLength: 1
+          description: "Stable name of the generated graph artifact."
+        path:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Optional JSON path selecting edge records within this artifact payload."
+          example: "$.relations[*]"
+        format:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - extraction_relation
+            - extraction_graph
+          default: extraction_relation
+          description: "Payload interpretation for this artifact source."
+        mention_edge_type:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Optional provenance edge type emitted for resolver mention decisions from this source."
     EnrichmentConfig:
       type: object
       description: "Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams."
@@ -161,6 +200,13 @@ components:
     FullTextIndexConfig:
       type: object
       properties:
+        sources:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ArtifactIndexSource"
+          x-go-type-skip-optional-pointer: true
+          description: "Chunk or textual asset artifact streams indexed together. Every artifact record is an independent full-text member."
         mem_only:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -398,15 +444,24 @@ components:
         field:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Field to extract embeddings from (managed indexes only; not allowed when external=true)"
+          description: "Field to extract embeddings from for direct managed indexes. Omit when sources is set."
+        sources:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ArtifactIndexSource"
+          x-go-type-skip-optional-pointer: true
+          description: "Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by the artifact name and its source key. All sources must use the same dense vector space or the same sparse token space. Not allowed for external or direct field/template indexes."
         embedding_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings."
+          deprecated: true
+          description: "Deprecated single-source alias for sources: [{artifact: <embedding_name>}]."
         source_artifact_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source."
+          deprecated: true
+          description: "Deprecated descriptive field for the input to the legacy embedding_name enrichment. New configurations define that input only on the matching enrichment."
         template:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -1220,6 +1275,13 @@ components:
       type: object
       description: "Configuration for graph index type"
       properties:
+        sources:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/GraphIndexSource"
+          x-go-type-skip-optional-pointer: true
+          description: "Chunk or JSON asset artifact streams whose edge-like values are unioned into this graph index."
         summarizer:
           description: "Configuration for generating node summaries (enables tree navigation in Retrieval Agent)"
           $ref: "../shared/generating.yaml#/components/schemas/GeneratorConfig"

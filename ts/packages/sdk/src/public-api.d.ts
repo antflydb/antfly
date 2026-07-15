@@ -7507,7 +7507,14 @@ export interface components {
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
         };
+        /** @description Named generated artifact stream consumed by an index. Producer inputs such as field and template belong on the matching enrichment, not on the index source. */
+        ArtifactIndexSource: {
+            /** @description Stable name of the generated artifact. */
+            artifact: string;
+        };
         FullTextIndexConfig: {
+            /** @description Chunk or textual asset artifact streams indexed together. Every artifact record is an independent full-text member. */
+            sources?: components["schemas"]["ArtifactIndexSource"][];
             /** @description Whether to use memory-only storage */
             mem_only?: boolean;
         };
@@ -8438,11 +8445,19 @@ export interface components {
             sparse?: boolean;
             /** @description Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes. */
             dimension?: number;
-            /** @description Field to extract embeddings from (managed indexes only; not allowed when external=true) */
+            /** @description Field to extract embeddings from for direct managed indexes. Omit when sources is set. */
             field?: string;
-            /** @description Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings. */
+            /** @description Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by the artifact name and its source key. All sources must use the same dense vector space or the same sparse token space. Not allowed for external or direct field/template indexes. */
+            sources?: components["schemas"]["ArtifactIndexSource"][];
+            /**
+             * @deprecated
+             * @description Deprecated single-source alias for sources: [{artifact: <embedding_name>}].
+             */
             embedding_name?: string;
-            /** @description Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source. */
+            /**
+             * @deprecated
+             * @description Deprecated descriptive field for the input to the legacy embedding_name enrichment. New configurations define that input only on the matching enrichment.
+             */
             source_artifact_name?: string;
             /**
              * @description Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
@@ -8476,6 +8491,24 @@ export interface components {
             chunk_size?: number;
             /** @description Non-semantic execution policy for shorthand-created chunking or embedding producers. */
             execution?: components["schemas"]["IndexExecutionConfig"];
+        };
+        /** @description Graph-specific artifact source. The source owns the payload path and format because different artifact streams in one graph index may require different interpretations. */
+        GraphIndexSource: {
+            /** @description Stable name of the generated graph artifact. */
+            artifact: string;
+            /**
+             * @description Optional JSON path selecting edge records within this artifact payload.
+             * @example $.relations[*]
+             */
+            path?: string;
+            /**
+             * @description Payload interpretation for this artifact source.
+             * @default extraction_relation
+             * @enum {string}
+             */
+            format?: "extraction_relation" | "extraction_graph";
+            /** @description Optional provenance edge type emitted for resolver mention decisions from this source. */
+            mention_edge_type?: string;
         };
         /** @description Configuration for a specific edge type */
         EdgeTypeConfig: {
@@ -8517,6 +8550,8 @@ export interface components {
         };
         /** @description Configuration for graph index type */
         GraphIndexConfig: {
+            /** @description Chunk or JSON asset artifact streams whose edge-like values are unioned into this graph index. */
+            sources?: components["schemas"]["GraphIndexSource"][];
             /** @description Configuration for generating node summaries (enables tree navigation in Retrieval Agent) */
             summarizer?: components["schemas"]["GeneratorConfig"];
             /**

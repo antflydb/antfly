@@ -390,36 +390,84 @@ the embedding batching policy applies to the producer that creates that
 artifact. Vector-index ingestion batching is not exposed here until it has a
 runtime consumer.
 
-For artifact-backed indexes that point at an existing embedding artifact,
-embedder batching belongs on the matching embedding enrichment:
+### Artifact index sources
+
+Every artifact-consuming index uses `sources` for terminal selection. A source
+always names an artifact stream, not the enrichment producer or the producer's
+input field. `field`, `template`, and `source_artifact_name` therefore remain
+exclusively on enrichments. Full-text and vector sources use the minimal
+`ArtifactIndexSource` shape, `{"artifact":"..."}`. Graph sources use
+`GraphIndexSource`, which adds per-source `path` and `format` because two graph
+artifact streams can require different payload interpretations.
+
+The compatibility matrix is:
+
+- full-text sources resolve to `chunk` or textual/JSON `asset` enrichments;
+- dense and sparse vector sources resolve to `embedding` enrichments;
+- graph sources resolve to `chunk` or JSON `asset` enrichments;
+- algebraic indexes do not expose `sources`, because their sidecars are derived
+  from table schema and engine-owned materializations rather than artifacts.
+
+For example, an artifact-backed embeddings index declares:
 
 ```json
 {
   "type": "embeddings",
-  "field": "embedding",
-  "embedding_name": "document_chunk_dense_v1",
-  "source_artifact_name": "document_chunks_v1",
-  "dimension": 384
-}
-```
-
-```json
-{
-  "name": "document_chunk_dense_v1",
-  "kind": "embedding",
-  "field": "text",
-  "source_artifact_name": "document_chunks_v1",
-  "expected_dims": 384,
+  "sources": [
+    {"artifact": "title_dense_v1"},
+    {"artifact": "body_dense_v1"}
+  ],
+  "dimension": 384,
+  "distance_metric": "cosine",
   "embedder": {
     "provider": "antfly",
     "model": "bge-base-en-v1.5"
   },
-  "execution": {
-    "batch_items": 32,
-    "batch_bytes": 524288
-  }
+  "enrichments": [
+    {
+      "name": "title_dense_v1",
+      "kind": "embedding",
+      "field": "text",
+      "source_artifact_name": "title_chunks_v1",
+      "expected_dims": 384
+    },
+    {
+      "name": "body_dense_v1",
+      "kind": "embedding",
+      "field": "text",
+      "source_artifact_name": "body_chunks_v1",
+      "expected_dims": 384
+    }
+  ]
 }
 ```
+
+`sources` has union semantics. Every record in every named artifact stream is
+an independent index member. Vector membership identity is `(artifact, source
+key)`, so two embeddings derived from the same document do not overwrite one
+another. Full-text and graph indexes likewise union every selected terminal
+artifact stream.
+
+All sources in one index must have the same dense dimension and must inhabit a
+compatible vector space. The index has one distance metric and one query
+embedder, so mixing unrelated models in one `sources` list is invalid even when
+their dimensions happen to match. Each source must resolve to a matching
+`kind: embedding` enrichment. Producer input remains defined only on that
+enrichment (`source_artifact_name`, `field`, or `template`); it is not repeated
+on the index.
+
+For vector indexes, `sources` is mutually exclusive with direct managed
+`field`/`template`/`chunker` configuration and `external: true`; it is supported
+for both dense and sparse indexes. Dense sources share dimensions, metric, and
+vector space. Sparse sources share one tokenizer/model token space. The legacy
+single-source `embedding_name` is accepted as a compatibility alias for
+`sources: [{"artifact": embedding_name}]`; `source_artifact_name` is also read
+for legacy status/config compatibility. New configurations and SDK output must
+use `sources`.
+
+Embedder batching belongs on each matching embedding enrichment. When an index
+declares multiple sources, each producer may use its own `execution` policy;
+vector-index ingestion still uses the index's shared maintenance policy.
 
 Existing `embedder.batch_size` should be treated as a compatibility alias for
 the embedder-side batch size: `execution.embedding.batch_items` in inline index
@@ -497,12 +545,18 @@ relations.
 ```json
 {
   "type": "graph",
-  "source": {
-    "kind": "artifact",
-    "artifact": "relations_v1",
-    "path": "$.relations[*]",
-    "format": "extraction_relation"
-  }
+  "sources": [
+    {
+      "artifact": "title_relations_v1",
+      "path": "$.relations[*]",
+      "format": "extraction_relation"
+    },
+    {
+      "artifact": "entity_graph_v1",
+      "path": "$.graph",
+      "format": "extraction_graph"
+    }
+  ]
 }
 ```
 
@@ -532,12 +586,11 @@ artifact producer policy under graph root `execution`:
       "batch_bytes": 262144
     }
   },
-  "source": {
-    "kind": "artifact",
+  "sources": [{
     "artifact": "relations_v1",
     "path": "$.relations[*]",
     "format": "extraction_relation"
-  }
+  }]
 }
 ```
 

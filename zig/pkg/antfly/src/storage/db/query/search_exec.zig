@@ -20,6 +20,7 @@ const index_manager_mod = @import("../catalog/index_manager.zig");
 const runtime_schema_mod = @import("../../schema.zig");
 const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
+const artifact_ids = @import("../artifact_ids.zig");
 const doc_set = @import("../doc_set.zig");
 const doc_identity = @import("../doc_identity.zig");
 const typed_dv_coverage = @import("../typed_doc_values_coverage.zig");
@@ -334,6 +335,12 @@ pub const DenseSearchExecutor = struct {
         index_name: []const u8,
         vector_id: u64,
     ) anyerror!?[]u8,
+    resolve_hit_key: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        entry: *index_manager_mod.IndexManager.DenseIndex,
+        key: []const u8,
+    ) anyerror![]u8 = null,
     lookup_vector_id: *const fn (
         ctx: ?*anyopaque,
         index_name: []const u8,
@@ -12195,7 +12202,7 @@ fn searchDenseInternal(
         for (raw_hits[@intCast(start)..@intCast(end)], 0..) |hit, i| {
             const result_index: usize = @as(usize, @intCast(start)) + i;
             const resolve_start = platform_time.monotonicNs();
-            const doc_key = if (results.takeMetadata(result_index)) |metadata| blk: {
+            var doc_key = if (results.takeMetadata(result_index)) |metadata| blk: {
                 profile.inline_metadata_hits += 1;
                 break :blk metadata;
             } else blk: {
@@ -12214,6 +12221,11 @@ fn searchDenseInternal(
                 profile.lookup_doc_key_hits += 1;
                 break :blk looked_up;
             };
+            if (executor.resolve_hit_key) |resolve_hit_key| {
+                const resolved = try resolve_hit_key(executor.ctx, alloc, entry, doc_key);
+                alloc.free(doc_key);
+                doc_key = resolved;
+            }
             profile.doc_key_resolve_ns += platform_time.monotonicNs() - resolve_start;
             var doc_key_owned = true;
             errdefer if (doc_key_owned) alloc.free(doc_key);
@@ -12881,6 +12893,7 @@ pub fn searchSparse(
     const end: u32 = if (full_candidate_window) @intCast(raw_hits.len) else @min(start + paging.limit, @as(u32, @intCast(raw_hits.len)));
     const sparse_doc_nums_are_ordinals =
         !chunk_backed and
+        entry.embedding_names.len == 0 and
         native_constraints.positive_filter and
         native_constraints.filter_doc_nums.len > 0 and
         native_constraints.filter_doc_ids.len == 0;
@@ -12897,7 +12910,7 @@ pub fn searchSparse(
 
     var batch_doc_ordinals: []?doc_set.DocOrdinal = &.{};
     defer if (batch_doc_ordinals.len > 0) alloc.free(batch_doc_ordinals);
-    if (!chunk_backed and !sparse_doc_nums_are_ordinals) {
+    if (!chunk_backed and entry.embedding_names.len == 0 and !sparse_doc_nums_are_ordinals) {
         if (executor.lookup_doc_ordinals) |lookup_many| {
             const selected = raw_hits[@intCast(start)..@intCast(end)];
             if (selected.len > 0) {
@@ -12912,16 +12925,22 @@ pub fn searchSparse(
 
     const hit_build_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     for (raw_hits[@intCast(start)..@intCast(end)], 0..) |hit, i| {
+        const hit_id = if (entry.embedding_names.len > 0) blk: {
+            var identity = (try artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, hit.doc_id)) orelse return error.InvalidInternalUserKey;
+            defer identity.deinit(alloc);
+            break :blk try alloc.dupe(u8, identity.doc_key);
+        } else try alloc.dupe(u8, hit.doc_id);
+        errdefer alloc.free(hit_id);
         hits[i] = .{
-            .id = try alloc.dupe(u8, hit.doc_id),
-            .doc_ordinal = if (chunk_backed)
-                try sparseHitParentOrdinal(alloc, executor, hit.doc_id, req.identity_read_generation)
+            .id = hit_id,
+            .doc_ordinal = if (chunk_backed or (entry.embedding_names.len > 0 and internal_keys.isChunkArtifactRecordKey(hit_id)))
+                try sparseHitParentOrdinal(alloc, executor, hit_id, req.identity_read_generation)
             else if (sparse_doc_nums_are_ordinals and hit.doc_num != null)
                 hit.doc_num.?
             else if (batch_doc_ordinals.len > 0)
                 batch_doc_ordinals[i]
             else
-                try sparseHitOrdinal(alloc, executor, hit.doc_id, req.identity_read_generation),
+                try sparseHitOrdinal(alloc, executor, hit_id, req.identity_read_generation),
             .score = hit.score,
             .stored_data = null,
         };

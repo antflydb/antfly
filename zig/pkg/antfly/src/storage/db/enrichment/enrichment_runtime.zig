@@ -3808,8 +3808,7 @@ fn materializeGraphAssetForRuntime(
     const artifact_name = requestArtifactName(request);
 
     for (runtime.index_manager.graphIndexes()) |graph_entry| {
-        const source = graph_entry.artifact_source orelse continue;
-        if (!std.mem.eql(u8, source.artifact_name, artifact_name)) continue;
+        const source = runtime.index_manager.graphArtifactSourceForArtifact(graph_entry.config.name, artifact_name) orelse continue;
 
         const graph_writes = try runtimeGraphWritesFromArtifactValueAlloc(runtime.alloc, graph_entry.config.name, request.doc_key, value, source, request.content_type, raw_doc);
         defer runtimeFreeGraphWrites(runtime.alloc, graph_writes);
@@ -3850,7 +3849,7 @@ fn materializeGraphAssetForRuntime(
                 try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
                 try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
             }
-        } else {
+        } else if (runtime.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1) {
             const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
             defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
             const prefix = try internal_keys.graphArtifactIndexPrefixAlloc(runtime.alloc, request.doc_key, graph_entry.config.name);
@@ -3889,8 +3888,7 @@ fn materializeGraphAssetDeleteForRuntime(
     const artifact_name = requestArtifactName(request);
 
     for (runtime.index_manager.graphIndexes()) |graph_entry| {
-        const source = graph_entry.artifact_source orelse continue;
-        if (!std.mem.eql(u8, source.artifact_name, artifact_name)) continue;
+        const source = runtime.index_manager.graphArtifactSourceForArtifact(graph_entry.config.name, artifact_name) orelse continue;
 
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer {
@@ -3906,7 +3904,7 @@ fn materializeGraphAssetDeleteForRuntime(
                 try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
                 try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
             }
-        } else {
+        } else if (runtime.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1) {
             const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
             defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
             const prefix = try internal_keys.graphArtifactIndexPrefixAlloc(runtime.alloc, request.doc_key, graph_entry.config.name);
@@ -7743,11 +7741,18 @@ fn denseArtifactTargetsForArtifact(
     out: *std.ArrayListUnmanaged(usize),
 ) !void {
     for (runtime.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
-        const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null;
+        const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null or entry.embedding_names.len > 0;
         if (!artifact_backed) continue;
         if (entry.dims != dims) continue;
+        var source_match = false;
+        for (entry.embedding_names) |embedding_name| {
+            if (std.mem.eql(u8, embedding_name, artifact_name)) {
+                source_match = true;
+                break;
+            }
+        }
         if (std.mem.eql(u8, entry.config.name, artifact_name) or
-            (entry.embedding_name != null and std.mem.eql(u8, entry.embedding_name.?, artifact_name)))
+            (entry.embedding_name != null and std.mem.eql(u8, entry.embedding_name.?, artifact_name)) or source_match)
         {
             try out.append(runtime.alloc, dense_index_idx);
         }

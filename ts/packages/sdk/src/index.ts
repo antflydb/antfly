@@ -118,6 +118,7 @@ export type {
   AggregationResult,
   // Search and aggregation types
   AggregationType,
+  AlgebraicIndexConfig,
   // Authentication
   AntflyAuth,
   // Configuration
@@ -125,6 +126,7 @@ export type {
   // Error type
   AntflyError,
   AntflyType,
+  ArtifactIndexSource,
   // Backup/Restore types
   BackupRequest,
   BatchRequest, // Now using our custom type
@@ -177,6 +179,7 @@ export type {
   EmbedderProvider,
   // Embedding types
   Embedding,
+  EmbeddingsIndexConfig,
   // Eval types
   EvalConfig,
   EvalResult,
@@ -188,10 +191,12 @@ export type {
   ExternalIoProtocol,
   FetchConfig,
   FilterSpec,
+  FullTextIndexConfig,
   GenerationConfidence,
   GeneratorConfig,
   GeneratorProvider,
   GraphIndexConfig,
+  GraphIndexSource,
   GraphNodeSelector,
   GraphQuery,
   GraphQueryParams,

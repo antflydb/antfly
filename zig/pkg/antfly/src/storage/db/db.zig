@@ -118,6 +118,7 @@ const db_query_projection = @import("query/projection.zig");
 const db_query_result_shape = @import("query/result_shape.zig");
 const db_query_search = @import("query/search_exec.zig");
 const db_query_metrics = @import("query_metrics.zig");
+const replay_batcher_mod = @import("batcher.zig");
 const ttl_runtime_mod = @import("maintenance/ttl_runtime.zig");
 const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
 const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
@@ -2793,6 +2794,24 @@ const ShadowState = struct {
     range_start: []u8,
     range_end: []u8,
 };
+
+fn resolveMultiSourceDenseHitKeyAlloc(alloc: Allocator, artifact_key: []const u8) ![]u8 {
+    var identity = (try artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key)) orelse return error.InvalidInternalUserKey;
+    defer identity.deinit(alloc);
+    return try alloc.dupe(u8, identity.doc_key);
+}
+
+test "multi-source dense hit identity resolves to its source key" {
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(std.testing.allocator, "doc:multi", "title_dense_v1");
+    defer std.testing.allocator.free(artifact_key);
+    const source_key = try resolveMultiSourceDenseHitKeyAlloc(std.testing.allocator, artifact_key);
+    defer std.testing.allocator.free(source_key);
+    try std.testing.expectEqualStrings("doc:multi", source_key);
+}
+
+test "multi-source dense replay retains each artifact member" {
+    try replay_batcher_mod.testDenseReplayPreservesMultipleArtifactMembers();
+}
 
 pub const DB = struct {
     closed: bool = false,
@@ -9417,7 +9436,7 @@ pub const DB = struct {
         changed: *std.ArrayListUnmanaged([]u8),
     ) !void {
         for (self.core.graphIndexes()) |graph_entry| {
-            const source = graph_entry.artifact_source orelse continue;
+            const source = self.core.index_manager.graphArtifactSourceForArtifact(graph_entry.config.name, cfg.source_artifact) orelse continue;
             if (source.mention_edge_type.len == 0) continue;
             if (!std.mem.eql(u8, source.artifact_name, cfg.source_artifact)) continue;
 
@@ -10933,6 +10952,7 @@ pub const DB = struct {
     }
 
     fn denseArtifactNameForEntry(entry: anytype) []const u8 {
+        if (entry.embedding_names.len > 0) return entry.config.name;
         return entry.embedding_name orelse entry.config.name;
     }
 
@@ -11022,11 +11042,18 @@ pub const DB = struct {
         alloc: Allocator,
     ) !void {
         for (index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
-            const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null;
+            const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null or entry.embedding_names.len > 0;
             if (!artifact_backed) continue;
             if (entry.dims != dims) continue;
+            var source_match = false;
+            for (entry.embedding_names) |embedding_name| {
+                if (std.mem.eql(u8, embedding_name, artifact_name)) {
+                    source_match = true;
+                    break;
+                }
+            }
             if (std.mem.eql(u8, entry.config.name, artifact_name) or
-                (entry.embedding_name != null and std.mem.eql(u8, entry.embedding_name.?, artifact_name)))
+                (entry.embedding_name != null and std.mem.eql(u8, entry.embedding_name.?, artifact_name)) or source_match)
             {
                 try out.append(alloc, dense_index_idx);
             }
@@ -11131,10 +11158,11 @@ pub const DB = struct {
                         try target_lookup.add(alloc, embedding_name, entry.dims, target.dense_index_idx);
                     }
                 }
+                for (entry.embedding_names) |embedding_name| try target_lookup.add(alloc, embedding_name, entry.dims, target.dense_index_idx);
             }
         } else {
             for (self.core.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
-                const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null;
+                const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null or entry.embedding_names.len > 0;
                 if (!artifact_backed) continue;
                 try counts.per_target_index.put(alloc, dense_index_idx, 0);
                 try target_lookup.add(alloc, entry.config.name, entry.dims, dense_index_idx);
@@ -11143,6 +11171,7 @@ pub const DB = struct {
                         try target_lookup.add(alloc, embedding_name, entry.dims, dense_index_idx);
                     }
                 }
+                for (entry.embedding_names) |embedding_name| try target_lookup.add(alloc, embedding_name, entry.dims, dense_index_idx);
             }
         }
 
@@ -11261,7 +11290,7 @@ pub const DB = struct {
         }
 
         for (self.core.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
-            const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null;
+            const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null or entry.embedding_names.len > 0;
             const status_snapshot = try self.loadIndexStatusSnapshot(alloc, entry.config.name);
             const watermark_count = if (status_snapshot) |status_value|
                 if (status_value.kind == .dense_vector) status_value.doc_count else 0
@@ -11439,7 +11468,7 @@ pub const DB = struct {
 
         var repaired: usize = 0;
         for (self.core.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
-            const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null;
+            const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null or entry.embedding_names.len > 0;
             if (!artifact_backed) continue;
 
             const artifact_target_count = target_counts.per_target_index.get(dense_index_idx) orelse 0;
@@ -14489,6 +14518,17 @@ pub const DB = struct {
         return try self.core.index_manager.searchDenseEntryWithRequest(entry, req);
     }
 
+    fn resolveDenseHitKeyCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        entry: *index_manager_mod.IndexManager.DenseIndex,
+        key: []const u8,
+    ) anyerror![]u8 {
+        _ = ctx;
+        if (entry.embedding_names.len == 0) return try alloc.dupe(u8, key);
+        return try resolveMultiSourceDenseHitKeyAlloc(alloc, key);
+    }
+
     fn hbcSearchProfiledCallback(
         ctx: ?*anyopaque,
         entry: *index_manager_mod.IndexManager.DenseIndex,
@@ -14824,6 +14864,7 @@ pub const DB = struct {
             .text_index_entry = textIndexEntryCallback,
             .dense_index = denseIndexCallback,
             .lookup_doc_key = denseDocKeyCallback,
+            .resolve_hit_key = resolveDenseHitKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
             .lookup_vector_ids_for_ordinals = denseVectorIdsForOrdinalsCallback,
             .all_docs_visible_fast = allDocsVisibleFastCallback,
@@ -14873,6 +14914,7 @@ pub const DB = struct {
             .text_index_entry = textIndexEntryCallback,
             .dense_index = denseIndexCallback,
             .lookup_doc_key = denseDocKeyCallback,
+            .resolve_hit_key = resolveDenseHitKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
             .lookup_vector_ids_for_ordinals = denseVectorIdsForOrdinalsCallback,
             .all_docs_visible_fast = allDocsVisibleFastCallback,
@@ -21845,7 +21887,7 @@ fn appendPrecomputedGraphSourceArtifactKey(
     defer artifact_ref.deinit(self.alloc);
 
     for (self.core.graphIndexes()) |graph_entry| {
-        const source = graph_entry.artifact_source orelse continue;
+        const source = self.core.index_manager.graphArtifactSourceForArtifact(graph_entry.config.name, artifact_ref.name) orelse continue;
         if (!graphArtifactSourceConsumesRef(self.core.index_manager, source, artifact_ref)) continue;
 
         var graph_store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
@@ -21886,7 +21928,7 @@ fn appendPrecomputedGraphSourceArtifactKey(
                 try delete_keys.append(self.alloc, owned_key);
                 try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, previous_key);
             }
-        } else if (graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
+        } else if (self.core.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1 and graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
             const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(self.alloc, self.core.store, self.core.index_manager, artifact_ref.document_id, graph_entry.config.name, source);
             defer freeOwnedConstKeySlice(self.alloc, protected_keys);
             const existing = try collectGraphArtifactsForDocIndex(self.alloc, self.core.store, artifact_ref.document_id, graph_entry.config.name);
@@ -25780,19 +25822,21 @@ fn managedIndexBatchApplicability(
             }
             for (batch.changed_artifact_keys) |artifact_key| {
                 if (!internal_keys.isResolutionArtifactKey(artifact_key) and !internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
-                    const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
-                    if (graphArtifactSourceConsumesArtifactKey(index_manager, source, artifact_key)) return .relevant;
+                    for (index_manager.graphArtifactSources(index_ref.name)) |source| {
+                        if (graphArtifactSourceConsumesArtifactKey(index_manager, source, artifact_key)) return .relevant;
+                    }
                     continue;
                 }
                 if (internal_keys.isResolutionArtifactKey(artifact_key)) {
-                    const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
-                    if (source.mention_edge_type.len == 0) continue;
                     const parsed = (internal_keys.parseResolutionArtifactKeyAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
                     defer {
                         index_manager.alloc.free(parsed.doc_key);
                         index_manager.alloc.free(parsed.artifact_name);
                     }
-                    if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return .relevant;
+                    for (index_manager.graphArtifactSources(index_ref.name)) |source| {
+                        if (source.mention_edge_type.len == 0) continue;
+                        if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return .relevant;
+                    }
                     if (resolverConfigForResolutionArtifact(index_manager, parsed.artifact_name) != null) continue;
                     return .missing_dependency;
                 }
@@ -25913,19 +25957,21 @@ fn managedIndexRecordApplicability(
             if (record.deleted_doc_keys.len > 0) return .relevant;
             for (record.changed_artifact_keys) |artifact_key| {
                 if (!internal_keys.isResolutionArtifactKey(artifact_key) and !internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
-                    const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
-                    if (graphArtifactSourceConsumesArtifactKey(index_manager, source, artifact_key)) return .relevant;
+                    for (index_manager.graphArtifactSources(index_ref.name)) |source| {
+                        if (graphArtifactSourceConsumesArtifactKey(index_manager, source, artifact_key)) return .relevant;
+                    }
                     continue;
                 }
                 if (internal_keys.isResolutionArtifactKey(artifact_key)) {
-                    const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
-                    if (source.mention_edge_type.len == 0) continue;
                     const parsed = (internal_keys.parseResolutionArtifactKeyAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
                     defer {
                         index_manager.alloc.free(parsed.doc_key);
                         index_manager.alloc.free(parsed.artifact_name);
                     }
-                    if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return .relevant;
+                    for (index_manager.graphArtifactSources(index_ref.name)) |source| {
+                        if (source.mention_edge_type.len == 0) continue;
+                        if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return .relevant;
+                    }
                     if (resolverConfigForResolutionArtifact(index_manager, parsed.artifact_name) != null) continue;
                     return .missing_dependency;
                 }
@@ -26880,19 +26926,28 @@ fn materializeGraphSourceArtifactsForIndex(
     index_name: []const u8,
     options: GraphMaterializationOptions,
 ) ![][]u8 {
-    const source = index_manager.graphArtifactSource(index_name) orelse return try alloc.alloc([]u8, 0);
+    const sources = index_manager.graphArtifactSources(index_name);
+    if (sources.len == 0) return try alloc.alloc([]u8, 0);
 
     var changed = std.ArrayListUnmanaged([]u8).empty;
     errdefer freeOwnedKeySlice(alloc, changed.items);
 
     for (changed_artifact_keys) |artifact_key| {
         if (internal_keys.isResolutionArtifactKey(artifact_key)) {
-            try materializeMentionEdgesForResolutionKey(alloc, store, index_manager, &changed, index_name, source, artifact_key, options);
+            for (sources) |source| {
+                if (source.mention_edge_type.len == 0) continue;
+                try materializeMentionEdgesForResolutionKey(alloc, store, index_manager, &changed, index_name, source, artifact_key, options);
+            }
             continue;
         }
         var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse continue;
         defer artifact_ref.deinit(alloc);
-        if (!graphArtifactSourceConsumesRef(index_manager, source, artifact_ref)) continue;
+        const source = blk: {
+            for (sources) |candidate| {
+                if (graphArtifactSourceConsumesRef(index_manager, candidate, artifact_ref)) break :blk candidate;
+            }
+            continue;
+        };
 
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer {
@@ -26954,7 +27009,7 @@ fn materializeGraphSourceArtifactsForIndex(
                 try deletes.append(alloc, try alloc.dupe(u8, previous_key));
                 try appendUniqueOwnedKey(alloc, &changed, previous_key);
             }
-        } else if (graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
+        } else if (sources.len <= 1 and graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
             const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(alloc, store, index_manager, artifact_ref.document_id, index_name, source);
             defer freeOwnedConstKeySlice(alloc, protected_keys);
             const existing = try collectGraphArtifactsForDocIndex(alloc, store, artifact_ref.document_id, index_name);
@@ -29657,7 +29712,7 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
 }
 
 fn denseIndexIsArtifactBacked(entry: anytype) bool {
-    return entry.external or entry.chunk_name != null or entry.embedding_name != null;
+    return entry.external or entry.chunk_name != null or entry.embedding_name != null or entry.embedding_names.len > 0;
 }
 
 fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !?u64 {

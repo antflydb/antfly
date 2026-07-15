@@ -39,6 +39,7 @@ from .anthropic_generator_config import AnthropicGeneratorConfig
 from .api_key import ApiKey
 from .api_key_row_filter_type_0 import ApiKeyRowFilterType0
 from .api_key_with_secret import ApiKeyWithSecret
+from .artifact_index_source import ArtifactIndexSource
 from .artifact_repair_kind import ArtifactRepairKind
 from .artifact_repair_reason import ArtifactRepairReason
 from .audio_chunk_options import AudioChunkOptions
@@ -254,6 +255,8 @@ from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDe
 from .google_embedder_config import GoogleEmbedderConfig
 from .google_generator_config import GoogleGeneratorConfig
 from .graph_index_config import GraphIndexConfig
+from .graph_index_source import GraphIndexSource
+from .graph_index_source_format import GraphIndexSourceFormat
 from .graph_index_stats import GraphIndexStats
 from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
 from .graph_index_stats_algebraic_graph_traversal import GraphIndexStatsAlgebraicGraphTraversal
@@ -706,6 +709,7 @@ __all__ = (
     "ApiKey",
     "ApiKeyRowFilterType0",
     "ApiKeyWithSecret",
+    "ArtifactIndexSource",
     "ArtifactRepairKind",
     "ArtifactRepairReason",
     "AudioChunkOptions",
@@ -919,6 +923,8 @@ __all__ = (
     "GoogleEmbedderConfig",
     "GoogleGeneratorConfig",
     "GraphIndexConfig",
+    "GraphIndexSource",
+    "GraphIndexSourceFormat",
     "GraphIndexStats",
     "GraphIndexStatsAlgebraicGraph",
     "GraphIndexStatsAlgebraicGraphTraversal",

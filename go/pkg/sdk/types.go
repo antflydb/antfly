@@ -52,12 +52,16 @@ type (
 
 	// Index config types
 	EmbeddingsIndexConfig = oapi.EmbeddingsIndexConfig
-	DistanceMetric        = oapi.DistanceMetric
-	EmbeddingsIndexStats  = oapi.EmbeddingsIndexStats
-	EnrichmentConfig      = oapi.EnrichmentConfig
-	EnrichmentKind        = oapi.EnrichmentKind
-	FullTextIndexConfig   = oapi.FullTextIndexConfig
-	FullTextIndexStats    = oapi.FullTextIndexStats
+	ArtifactIndexSource   = oapi.ArtifactIndexSource
+	// EmbeddingIndexSource is kept as a source-compatible alias.
+	EmbeddingIndexSource = ArtifactIndexSource
+	AlgebraicIndexConfig = oapi.AlgebraicIndexConfig
+	DistanceMetric       = oapi.DistanceMetric
+	EmbeddingsIndexStats = oapi.EmbeddingsIndexStats
+	EnrichmentConfig     = oapi.EnrichmentConfig
+	EnrichmentKind       = oapi.EnrichmentKind
+	FullTextIndexConfig  = oapi.FullTextIndexConfig
+	FullTextIndexStats   = oapi.FullTextIndexStats
 
 	EmbedderProvider         = oapi.EmbedderProvider
 	GeneratorProvider        = oapi.GeneratorProvider
@@ -236,6 +240,8 @@ type (
 
 	// Graph index types
 	GraphIndexConfig       = oapi.GraphIndexConfig
+	GraphIndexSource       = oapi.GraphIndexSource
+	GraphIndexSourceFormat = oapi.GraphIndexSourceFormat
 	GraphIndexStats        = oapi.GraphIndexStats
 	EdgeTypeConfig         = oapi.EdgeTypeConfig
 	EdgeTypeConfigTopology = oapi.EdgeTypeConfigTopology
@@ -341,6 +347,10 @@ const (
 	IndexTypeEmbeddings = oapi.IndexTypeEmbeddings
 	IndexTypeFullText   = oapi.IndexTypeFullText
 	IndexTypeGraph      = oapi.IndexTypeGraph
+	IndexTypeAlgebraic  = oapi.IndexTypeAlgebraic
+
+	GraphIndexSourceFormatExtractionRelation = oapi.GraphIndexSourceFormatExtractionRelation
+	GraphIndexSourceFormatExtractionGraph    = oapi.GraphIndexSourceFormatExtractionGraph
 
 	// EnrichmentKind values
 	EnrichmentKindAsset     = oapi.EnrichmentKindAsset

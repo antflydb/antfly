@@ -938,6 +938,24 @@ const GraphSourceStatus = struct {
 
 fn graphSourceStatus(config: std.json.Value) ?GraphSourceStatus {
     if (config != .object) return null;
+    if (config.object.get("sources")) |sources| {
+        if (sources != .array or sources.array.items.len == 0) return null;
+        const first = sources.array.items[0];
+        if (first != .object) return null;
+        const artifact = first.object.get("artifact") orelse return null;
+        if (artifact != .string or artifact.string.len == 0) return null;
+        return .{
+            .artifact = artifact.string,
+            .path = if (first.object.get("path")) |value| switch (value) {
+                .string => value.string,
+                else => "",
+            } else "",
+            .format = if (first.object.get("format")) |value| switch (value) {
+                .string => value.string,
+                else => "extraction_relation",
+            } else "extraction_relation",
+        };
+    }
     const source = config.object.get("source") orelse return null;
     if (source != .object) return null;
     const kind = source.object.get("kind") orelse return null;
