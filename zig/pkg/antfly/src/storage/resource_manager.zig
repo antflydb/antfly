@@ -740,6 +740,20 @@ pub const ResourceManager = struct {
         return sliceStatsFromState(slice, state);
     }
 
+    /// Returns whether replay retention has reached a hard limit while a
+    /// repair is pinning the projection cursor. Keeping this policy here
+    /// prevents write paths from owning resource thresholds or taking the
+    /// manager mutex once per slice.
+    pub fn denseRepairReplayPressureIsHard(self: *ResourceManager) bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const wal = self.slices[sliceIndex(.lsm_wal_retention)];
+        const backlog = self.slices[sliceIndex(.derived_backlog)];
+        return pressureFor(wal.budget, wal.used_bytes) == .hard or
+            pressureFor(backlog.budget, backlog.used_bytes) == .hard;
+    }
+
     /// Derive HBC's internal count ceilings from the resource manager's byte
     /// budget. A shared cache owns its own dynamic CLOCK, so local arrays only
     /// need a non-zero gate. Local caches retain bounded arrays while exact
@@ -1097,6 +1111,25 @@ test "resource manager records soft and hard budget pressure" {
     try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserve(.derived_backlog, 9));
     stats = manager.snapshot();
     try std.testing.expectEqual(@as(u64, 1), stats.slices[sliceIndex(.derived_backlog)].hard_limit_rejections);
+}
+
+test "resource manager owns dense repair replay pressure policy" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.lsm_wal_retention)] = .{ .hard_limit_bytes = 10 };
+    budgets[sliceIndex(.derived_backlog)] = .{ .hard_limit_bytes = 20 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+
+    var wal_bytes: u64 = 0;
+    var backlog_bytes: u64 = 0;
+    manager.observeUsage(.lsm_wal_retention, &wal_bytes, 10);
+    manager.observeUsage(.derived_backlog, &backlog_bytes, 20);
+    try std.testing.expect(!manager.denseRepairReplayPressureIsHard());
+
+    manager.observeUsage(.derived_backlog, &backlog_bytes, 21);
+    try std.testing.expect(manager.denseRepairReplayPressureIsHard());
+    manager.observeUsage(.derived_backlog, &backlog_bytes, 0);
+    manager.observeUsage(.lsm_wal_retention, &wal_bytes, 11);
+    try std.testing.expect(manager.denseRepairReplayPressureIsHard());
 }
 
 test "resource manager owns HBC cache ceilings" {

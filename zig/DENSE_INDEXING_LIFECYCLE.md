@@ -21,6 +21,16 @@ Implemented in the current tree:
   including quarantined status-only configs, so writes remain accounted while
   the affected runtime index is absent. Document-only commits bypass catalog
   construction entirely
+- document deletion, TTL cleanup, and remote document-child artifact batches
+  commit artifact writes/deletes, the derived journal record, and dense repair
+  target-counter mutations in one primary-store transaction. Duplicate keys and
+  delete-then-rewrite batches are normalized to their final state before the
+  counter delta is calculated. The old helper that deleted artifacts in a
+  separate transaction has been removed
+- dense replay distinguishes a genuinely missing source artifact from an
+  artifact removed by a later document deletion. A stale upsert whose source
+  document is already absent advances without creating repair debt; a missing
+  or corrupt artifact for a live source document still fails closed
 - explicit generation rebuilds for dense, sparse, graph, and full-text indexes
   use the same durable intent and post-pointer restart reconciliation
 - startup repair is ownership-fenced, resource-admitted, and driven by a
@@ -106,6 +116,11 @@ Implemented in the current tree:
   write-throttle pressure; if per-sequence accounting allocation fails, an
   allocation-free aggregate keeps exact byte pressure and fails closed through
   the newest affected sequence
+- managed-Raft writes apply repair admission on the confirmed leader before
+  proposal. Followers forward normally and committed apply always bypasses the
+  gate, preserving replica determinism. The normal path performs one combined
+  `ResourceManager` pressure check per distinct manager and only scans the
+  exact group/table writer cache after hard replay pressure is present
 - mutable LSM snapshots have generation-specific reader references, so an old
   replay scan cannot retain unrelated later snapshots; write transactions keep
   backend-close fencing without pinning versions unless they open a cursor
@@ -1088,8 +1103,7 @@ the protected backlog fail with a stable retryable response:
 ```text
 HTTP 429
 code = dense_repair_backpressure
-index_name
-repair_id
+retryable = true
 retry_after_ms
 ```
 
@@ -1455,6 +1469,9 @@ The minimum deterministic test matrix is:
    For a counterless quarantined dense index, perform artifact insert,
    replacement, and deletion while the bootstrap snapshot is open; verify the
    signed delta, durable target count, and repaired search result.
+   Repeat deletes through the normal document path and TTL cleanup, and route
+   generated embedding writes/deletes through a remote document-child batch;
+   each primary mutation, replay record, and counter delta must be atomic.
 5. Stop after candidate readiness but before pointer swap; restart must validate
    and activate the identified candidate without rebuilding it.
 6. Stop after pointer swap but before replacement validation, checkpoint
@@ -1499,7 +1516,7 @@ The minimum deterministic test matrix is:
     time must remain below the configured maximum; non-convergence must return
     to `waiting_for_convergence` and eventually apply documented backpressure.
 21. Drop executor notifications and restart the executor while intents exist;
-    periodic durable discovery must reclaim each eligible intent within the
+    adaptive bounded durable discovery must reclaim each eligible intent within the
     configured scan SLO without duplicate execution.
 22. Cancel the current attempt, durably pause automatic repair, restart, and
     resume. Only cancel permits automatic retry; pause survives restart.
@@ -1512,6 +1529,10 @@ The minimum deterministic test matrix is:
     budget without reaching the hard limit. Counter bootstrap and shadow batch
     planning must defer without consuming additional bytes or recording a hard
     rejection.
+26. Under hard replay pressure, verify standalone writes and only the active
+    managed-Raft leader reject uncommitted work with the compact retryable 429;
+    committed entries must continue applying on every replica. Remove pressure
+    and verify admission recovers without a configuration change.
 
 This track prevents wipe/re-ingest and does not require changing the successful
 normal-ingest path. The streaming-session track separately prevents ordinary

@@ -4311,10 +4311,17 @@ pub const DataServer = struct {
         var last_metadata_sync_ns = platform_time.monotonicNs();
         var last_local_campaign_ns: u64 = 0;
         while (true) {
+            const preflighted_local_leader = raft.host.http_host.host.isLocalLeader(group_id);
+            if (preflighted_local_leader) {
+                const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
+                try admission_source.preflightDenseRepairWriteAdmission(group_id, table_name);
+            }
+
             var target_index: ?u64 = null;
             var leader_node_id: ?u64 = null;
             var local_node_id: u64 = 0;
             var local_status_missing = false;
+            var retry_for_leader_preflight = false;
 
             {
                 lockAtomic(&self.data_raft_mutex);
@@ -4322,13 +4329,20 @@ pub const DataServer = struct {
 
                 local_node_id = raft.host.http_host.host.cfg.local_node_id;
                 if (raft.host.http_host.host.isLocalLeader(group_id)) {
-                    const encoded = try data_raft_batch.encode(alloc, table_name, req);
-                    defer alloc.free(encoded);
-                    try raft.host.http_host.propose(group_id, encoded);
-                    target_index = if (raft.host.http_host.host.raftStatus(group_id)) |status|
-                        status.last_index
-                    else
-                        return error.UnknownGroup;
+                    if (!preflighted_local_leader) {
+                        // Leadership changed after the lock-free admission
+                        // probe. Retry once as the confirmed leader rather than
+                        // proposing a batch that skipped pressure admission.
+                        retry_for_leader_preflight = true;
+                    } else {
+                        const encoded = try data_raft_batch.encode(alloc, table_name, req);
+                        defer alloc.free(encoded);
+                        try raft.host.http_host.propose(group_id, encoded);
+                        target_index = if (raft.host.http_host.host.raftStatus(group_id)) |status|
+                            status.last_index
+                        else
+                            return error.UnknownGroup;
+                    }
                 } else {
                     const status = raft.host.http_host.host.raftStatus(group_id);
                     local_status_missing = status == null;
@@ -4348,6 +4362,11 @@ pub const DataServer = struct {
                         };
                     }
                 }
+            }
+
+            if (retry_for_leader_preflight) {
+                if (platform_time.monotonicNs() >= deadline_ns) return error.LeaderUnavailable;
+                continue;
             }
 
             if (target_index) |index| {
@@ -4919,13 +4938,10 @@ pub const DataServer = struct {
         }
 
         const median_key = if (self.data_raft_apply) |apply_sm|
-            (apply_sm.write_source.findMedianKeyForGroup(alloc, group_id, lsm_root_generation) catch |err| switch (err) {
+            apply_sm.write_source.findMedianKeyForGroup(alloc, group_id, lsm_root_generation) catch |err| switch (err) {
                 error.FileNotFound => return error.UnknownGroup,
                 else => return err,
-            }) orelse (self.write_source.findMedianKeyForGroup(alloc, group_id, lsm_root_generation) catch |err| switch (err) {
-                error.FileNotFound => return error.UnknownGroup,
-                else => return err,
-            })
+            }
         else
             self.write_source.findMedianKeyForGroup(alloc, group_id, lsm_root_generation) catch |err| switch (err) {
                 error.FileNotFound => return error.UnknownGroup,

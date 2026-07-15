@@ -1655,6 +1655,20 @@ pub const ProvisionedTableWriteCache = struct {
         return null;
     }
 
+    fn groupDenseRepairWriteBackpressuredLocked(
+        self: *const ProvisionedTableWriteCache,
+        group_id: u64,
+        table_name: []const u8,
+    ) bool {
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id) continue;
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (!self.entryHAWriteGateCurrent(entry)) continue;
+            return entry.db.denseRepairWriteBackpressured();
+        }
+        return false;
+    }
+
     fn publishCachedLeaseGeneration(
         self: *ProvisionedTableWriteCache,
         cached: *const CachedDb,
@@ -4915,6 +4929,44 @@ pub const ProvisionedTableWriteSource = struct {
         return self.visibleRootGeneration(group_id);
     }
 
+    /// Leader-side admission for writes that have not yet entered Raft. Once a
+    /// batch is committed it must apply on every replica, so replicated apply
+    /// deliberately bypasses this gate. The resource check keeps the ordinary
+    /// proposal path allocation-free and avoids touching the writer cache until
+    /// the node is actually under hard replay/backlog pressure.
+    pub fn preflightDenseRepairWriteAdmission(
+        self: *ProvisionedTableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+    ) !void {
+        if (self.local_write_owner) |owner| return owner.preflightDenseRepairWriteAdmission(group_id, table_name);
+
+        const write_manager = if (self.write_cache) |cache| cache.resource_manager else null;
+        const startup_manager = if (self.startup_write_cache) |cache| cache.resource_manager else null;
+        const write_cache_hard = if (write_manager) |manager| manager.denseRepairReplayPressureIsHard() else false;
+        const startup_cache_hard = if (startup_manager) |manager|
+            if (write_manager != null and manager == write_manager.?)
+                write_cache_hard
+            else
+                manager.denseRepairReplayPressureIsHard()
+        else
+            false;
+        if (!write_cache_hard and !startup_cache_hard) return;
+
+        lockAtomic(&self.local_db_mutex);
+        defer self.local_db_mutex.unlock();
+        if (write_cache_hard) {
+            if (self.write_cache.?.groupDenseRepairWriteBackpressuredLocked(group_id, table_name)) {
+                return error.DenseRepairBackpressure;
+            }
+        }
+        if (startup_cache_hard) {
+            if (self.startup_write_cache.?.groupDenseRepairWriteBackpressuredLocked(group_id, table_name)) {
+                return error.DenseRepairBackpressure;
+            }
+        }
+    }
+
     fn droppedTableDeleteOwnerId(self: *ProvisionedTableWriteSource, runtime: *db_mod.background_runtime.BackendRuntime) u64 {
         if (self.dropped_table_delete_owner_id == 0) {
             self.dropped_table_delete_owner_id = runtime.allocOwnerId();
@@ -6792,6 +6844,35 @@ pub const ProvisionedTableWriteSource = struct {
 
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
+
+        // Startup catch-up and Raft apply intentionally use separate caches,
+        // but there may only be one writer for an LSM root. Prefer the writer
+        // that already owns the root; opening through the other cache would
+        // turn a healthy split into LsmRootWriterAlreadyOpen and eventually
+        // surface to metadata as GroupLeaderUnavailable.
+        var existing: ?ProvisionedTableWriteCache.CachedDb = null;
+        lockAtomic(&self.local_db_mutex);
+        if (self.write_cache) |cache| {
+            existing = cache.snapshotLeaseLocked(group_id, lsm_root_generation, table_name);
+        }
+        if (existing == null) {
+            if (self.startup_write_cache) |cache| {
+                existing = cache.snapshotLeaseLocked(group_id, lsm_root_generation, table_name);
+            }
+        }
+        self.local_db_mutex.unlock();
+        if (existing) |leased| {
+            var cached = leased;
+            defer cached.deinit(alloc);
+            if (cached.entry) |entry| {
+                try self.finishEntryAutoBulkIngestForForegroundVisibility(cached.cache.?, entry);
+            }
+            try drainManagedDbBeforeClose(cached.db);
+            return cached.db.findMedianKey(alloc) catch |err| switch (err) {
+                error.NotFound => null,
+                else => err,
+            };
+        }
 
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, lsm_root_generation, table_name, .default_async, null, null, null);
@@ -32333,4 +32414,172 @@ test "write cache retires adoptable seed when transfer allocators differ" {
     try std.testing.expectEqual(@as(usize, 1), retired);
     try std.testing.expectEqual(@as(usize, 0), source_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), apply_cache.entries.items.len);
+}
+
+test "provisioned leader admission rejects uncommitted writes under dense repair pressure" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/dense-repair-leader-admission", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = .{
+        .soft_limit_bytes = 1,
+        .hard_limit_bytes = 1,
+    };
+    var resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    write_cache.resource_manager = &resources;
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+
+    var cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 1, "docs");
+    cached.deinit(alloc);
+    const entry = write_cache.entries.items[0];
+
+    // Normal pressure-free writes avoid the cache scan and remain admitted even
+    // while a repair owns a replay pin.
+    entry.db.index_repair_replay_pinned.store(true, .release);
+    try source.preflightDenseRepairWriteAdmission(7001, "docs");
+
+    var tracked: u64 = 0;
+    resources.observeUsage(.derived_backlog, &tracked, 2);
+    defer resources.observeUsage(.derived_backlog, &tracked, 0);
+    try std.testing.expectError(
+        error.DenseRepairBackpressure,
+        source.preflightDenseRepairWriteAdmission(7001, "docs"),
+    );
+
+    // Pressure on one group must not reject unrelated groups, and clearing the
+    // durable repair pin immediately reopens admission for this group.
+    try source.preflightDenseRepairWriteAdmission(7002, "docs");
+    entry.db.index_repair_replay_pinned.store(false, .release);
+    try source.preflightDenseRepairWriteAdmission(7001, "docs");
+}
+
+test "median key lookup reuses startup writer instead of reopening its root" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/median-startup-owner", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var foreground_cache = ProvisionedTableWriteCache.init(alloc);
+    defer foreground_cache.deinit();
+    var startup_cache = ProvisionedTableWriteCache.init(alloc);
+    defer startup_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+    source.bindWriteCaches(&foreground_cache, &startup_cache);
+
+    var startup_writer = try source.getOrOpenCachedDbModeAtGeneration(
+        alloc,
+        &startup_cache,
+        path,
+        7001,
+        0,
+        "docs",
+        .default_async,
+        null,
+        null,
+        null,
+    );
+    defer startup_writer.deinit(alloc);
+    try startup_writer.db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"a\"}" },
+            .{ .key = "doc:m", .value = "{\"title\":\"m\"}" },
+            .{ .key = "doc:z", .value = "{\"title\":\"z\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const median = (try source.findMedianKeyForTableGroup(alloc, 7001, 0, "docs")) orelse
+        return error.TestUnexpectedResult;
+    defer alloc.free(median);
+    try std.testing.expectEqualStrings("doc:m", median);
+    try std.testing.expectEqual(@as(usize, 0), foreground_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), startup_cache.entries.items.len);
 }

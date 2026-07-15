@@ -4874,6 +4874,15 @@ pub const DB = struct {
         const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), derived_batch, sequence);
         defer self.alloc.free(replay_payload);
 
+        try appendDenseArtifactCounterMutations(
+            self.alloc,
+            self.core.store,
+            self.core.index_manager,
+            &store_writes,
+            delete_keys.items,
+            &owned_store_keys,
+            &owned_store_values,
+        );
         try self.core.store.putBatchWithReplay(
             self.backend_runtime.io(),
             store_writes.items,
@@ -5267,8 +5276,14 @@ pub const DB = struct {
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_writes_ns, extract_writes_start_ns);
 
         const delete_artifacts_start_ns = monotonicTimeNs();
-        const deleted_artifact_keys = try deleteEnrichmentArtifactsForBatch(self, effective_req, extracted[0..extracted_initialized]);
-        defer freeOwnedKeySlice(self.alloc, deleted_artifact_keys);
+        const deleted_artifact_keys = try collectEnrichmentArtifactDeletesForBatch(
+            self,
+            effective_req,
+            extracted[0..extracted_initialized],
+            &delete_keys,
+            &owned_delete_keys,
+        );
+        defer self.alloc.free(deleted_artifact_keys);
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.delete_artifacts_ns, delete_artifacts_start_ns);
 
         const use_thin_replay_fast_path =
@@ -8376,11 +8391,10 @@ pub const DB = struct {
         );
     }
 
-    fn denseRepairWriteBackpressured(self: *const DB) bool {
+    pub fn denseRepairWriteBackpressured(self: *const DB) bool {
         if (!self.index_repair_replay_pinned.load(.acquire)) return false;
         const manager = self.core.index_manager.resource_manager orelse return false;
-        return manager.sliceStats(.lsm_wal_retention).pressure == .hard or
-            manager.sliceStats(.derived_backlog).pressure == .hard;
+        return manager.denseRepairReplayPressureIsHard();
     }
 
     fn discardInactiveIndexRepairCandidate(
@@ -13726,26 +13740,35 @@ pub const DB = struct {
         if (catalog.targets.items.len == 0) return;
         var mutations = std.AutoHashMapUnmanaged(usize, PendingDenseArtifactCounterMutation){};
         defer mutations.deinit(alloc);
+        const deleted_sentinel = std.math.maxInt(usize);
+        var final_artifact_mutations = std.StringHashMapUnmanaged(usize).empty;
+        defer final_artifact_mutations.deinit(alloc);
 
         for (delete_keys) |key| {
-            const old_value = store.get(alloc, key) catch |err| switch (err) {
-                error.NotFound => continue,
-                else => return err,
-            };
-            defer alloc.free(old_value);
-            try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, key, old_value, -1);
+            if (!internal_keys.isEmbeddingArtifactKey(key) and !internal_keys.isDerivedEmbeddingArtifactKey(key)) continue;
+            const gop = try final_artifact_mutations.getOrPut(alloc, key);
+            if (!gop.found_existing) gop.value_ptr.* = deleted_sentinel;
+        }
+        for (store_writes.items, 0..) |write, write_idx| {
+            if (!internal_keys.isEmbeddingArtifactKey(write.key) and !internal_keys.isDerivedEmbeddingArtifactKey(write.key)) continue;
+            try final_artifact_mutations.put(alloc, write.key, write_idx);
         }
 
-        for (store_writes.items) |write| {
-            const old_value = store.get(alloc, write.key) catch |err| switch (err) {
+        var final_it = final_artifact_mutations.iterator();
+        while (final_it.next()) |entry| {
+            const artifact_key = entry.key_ptr.*;
+            const old_value = store.get(alloc, artifact_key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
             defer if (old_value) |value| alloc.free(value);
             if (old_value) |value| {
-                try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, write.key, value, -1);
+                try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, artifact_key, value, -1);
             }
-            try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, write.key, write.value, 1);
+            if (entry.value_ptr.* != deleted_sentinel) {
+                const write = store_writes.items[entry.value_ptr.*];
+                try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, write.key, write.value, 1);
+            }
         }
 
         var it = mutations.iterator();
@@ -25651,48 +25674,62 @@ fn generatedRequestHasTerminalCoverage(self: *DB, request: enrichment_types.Gene
     return true;
 }
 
-fn deleteEnrichmentArtifactsForBatch(self: *DB, req: types.BatchRequest, extracted: []const mapper.ExtractedWrite) ![][]u8 {
+fn collectEnrichmentArtifactDeletesForBatch(
+    self: *DB,
+    req: types.BatchRequest,
+    extracted: []const mapper.ExtractedWrite,
+    delete_keys: *std.ArrayListUnmanaged([]const u8),
+    owned_delete_keys: *std.ArrayListUnmanaged([]u8),
+) ![][]u8 {
     _ = extracted;
     if (!self.core.hasArtifactCleanupMaybe()) return try self.alloc.alloc([]u8, 0);
 
     var deleted = std.ArrayListUnmanaged([]u8).empty;
-    errdefer freeOwnedKeySlice(self.alloc, deleted.items);
+    errdefer deleted.deinit(self.alloc);
+    var seen_docs = std.StringHashMapUnmanaged(void).empty;
+    defer seen_docs.deinit(self.alloc);
 
     for (req.deletes) |key| {
-        try self.core.collectAndDeleteEnrichmentArtifactsForDocContext(self.alloc, key, &deleted);
+        const gop = try seen_docs.getOrPut(self.alloc, key);
+        if (gop.found_existing) continue;
+        try collectEnrichmentArtifactDeleteKeysForDocContext(
+            self.alloc,
+            self.core.store,
+            key,
+            delete_keys,
+            owned_delete_keys,
+            &deleted,
+        );
     }
     return try deleted.toOwnedSlice(self.alloc);
 }
 
-fn collectAndDeleteEnrichmentArtifactsForDocContext(
+fn collectEnrichmentArtifactDeleteKeysForDocContext(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     doc_key: []const u8,
-    deleted: *std.ArrayListUnmanaged([]u8),
+    delete_keys: *std.ArrayListUnmanaged([]const u8),
+    owned_delete_keys: *std.ArrayListUnmanaged([]u8),
+    deleted_artifact_keys: *std.ArrayListUnmanaged([]u8),
 ) !void {
-    var deletes = std.ArrayListUnmanaged([]const u8).empty;
-    defer deletes.deinit(alloc);
-    var unrecorded_delete_keys = std.ArrayListUnmanaged([]u8).empty;
-    defer {
-        for (unrecorded_delete_keys.items) |key| alloc.free(key);
-        unrecorded_delete_keys.deinit(alloc);
-    }
-
     const artifact_prefix = try internal_keys.artifactRootPrefixAlloc(alloc, doc_key);
     defer alloc.free(artifact_prefix);
-    try collectDeleteKeysForPrefix(alloc, store, artifact_prefix, &deletes, deleted, &unrecorded_delete_keys);
+    try collectDeleteKeysForPrefix(
+        alloc,
+        store,
+        artifact_prefix,
+        delete_keys,
+        owned_delete_keys,
+        deleted_artifact_keys,
+    );
 
     const asset_state_prefix = try internal_keys.assetStateRootPrefixAlloc(alloc, doc_key);
     defer alloc.free(asset_state_prefix);
-    try collectDeleteKeysForPrefix(alloc, store, asset_state_prefix, &deletes, null, &unrecorded_delete_keys);
+    try collectDeleteKeysForPrefix(alloc, store, asset_state_prefix, delete_keys, owned_delete_keys, null);
 
     const graph_asset_state_prefix = try internal_keys.graphAssetStateRootPrefixAlloc(alloc, doc_key);
     defer alloc.free(graph_asset_state_prefix);
-    try collectDeleteKeysForPrefix(alloc, store, graph_asset_state_prefix, &deletes, null, &unrecorded_delete_keys);
-
-    if (deletes.items.len > 0) {
-        try store.putBatch(&.{}, deletes.items);
-    }
+    try collectDeleteKeysForPrefix(alloc, store, graph_asset_state_prefix, delete_keys, owned_delete_keys, null);
 }
 
 fn collectDeleteKeysForPrefix(
@@ -25700,20 +25737,19 @@ fn collectDeleteKeysForPrefix(
     store: *docstore_mod.DocStore,
     prefix: []const u8,
     deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_delete_keys: *std.ArrayListUnmanaged([]u8),
     recorded: ?*std.ArrayListUnmanaged([]u8),
-    unrecorded: *std.ArrayListUnmanaged([]u8),
 ) !void {
     const existing = try store.scanPrefix(alloc, prefix);
     defer docstore_mod.DocStore.freeResults(alloc, existing);
     for (existing) |entry| {
         const owned = try alloc.dupe(u8, entry.key);
         errdefer alloc.free(owned);
+        try owned_delete_keys.append(alloc, owned);
+        errdefer _ = owned_delete_keys.pop();
         try deletes.append(alloc, owned);
-        if (recorded) |out| {
-            try out.append(alloc, owned);
-        } else {
-            try unrecorded.append(alloc, owned);
-        }
+        errdefer _ = deletes.pop();
+        if (recorded) |out| try out.append(alloc, owned);
     }
 }
 
@@ -25731,6 +25767,9 @@ fn collectGraphArtifactsForDocIndex(
 fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []const u8, sync_level: types.SyncLevel) !void {
     if (keys.len == 0) return;
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
+    ctx.apply_mutex.lockExclusive();
+    var apply_mutex_held = true;
+    errdefer if (apply_mutex_held) ctx.apply_mutex.unlockExclusive();
 
     var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer store_writes.deinit(ctx.alloc);
@@ -25781,17 +25820,27 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     }
 
     var deleted_artifact_keys = std.ArrayListUnmanaged([]u8).empty;
-    defer freeOwnedKeySlice(ctx.alloc, deleted_artifact_keys.items);
+    defer deleted_artifact_keys.deinit(ctx.alloc);
     const should_scan_artifacts = if (ctx.artifact_cleanup_maybe) |artifact_cleanup_maybe|
         artifact_cleanup_maybe.load(.acquire) or ctx.index_manager.hasGeneratedEnrichmentTargets()
     else
         true;
     if (should_scan_artifacts) {
+        var seen_docs = std.StringHashMapUnmanaged(void).empty;
+        defer seen_docs.deinit(ctx.alloc);
         for (keys) |key| {
-            try collectAndDeleteEnrichmentArtifactsForDocContext(ctx.alloc, ctx.store, key, &deleted_artifact_keys);
+            const gop = try seen_docs.getOrPut(ctx.alloc, key);
+            if (gop.found_existing) continue;
+            try collectEnrichmentArtifactDeleteKeysForDocContext(
+                ctx.alloc,
+                ctx.store,
+                key,
+                &delete_keys,
+                &owned_delete_keys,
+                &deleted_artifact_keys,
+            );
         }
     }
-
     const req = types.BatchRequest{
         .deletes = keys,
         .sync_level = sync_level,
@@ -25820,6 +25869,15 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         &owned_store_values,
         &owned_delete_keys,
     );
+    try DB.appendDenseArtifactCounterMutations(
+        ctx.alloc,
+        ctx.store,
+        ctx.index_manager,
+        &store_writes,
+        delete_keys.items,
+        &owned_store_keys,
+        &owned_store_values,
+    );
     try delete_keys.appendSlice(ctx.alloc, identity_visibility_deletes.items);
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
@@ -25827,6 +25885,8 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         .sequence = sequence,
         .payload = replay_payload,
     });
+    ctx.apply_mutex.unlockExclusive();
+    apply_mutex_held = false;
     mirrorHAReplayPayloadBestEffortContext(ctx, replay_payload);
     var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, derived_batch);
     defer sync_targets.deinit(ctx.alloc);
@@ -28167,19 +28227,66 @@ fn sparseEmbeddingArtifactRepairReason(
     return null;
 }
 
-fn recordDenseEmbeddingArtifactRepairIssuesForReplay(
+fn embeddingWriteSourceDocumentExists(
+    ctx: *const AsyncContext,
+    write: mapper.DenseEmbeddingWrite,
+) !bool {
+    const source_doc_key = write.parent_doc_key orelse write.doc_key;
+    const store_key = try replayDocumentStoreKeyAlloc(ctx.alloc, source_doc_key);
+    defer ctx.alloc.free(store_key);
+    const raw = ctx.store.get(ctx.alloc, store_key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    ctx.alloc.free(raw);
+    return true;
+}
+
+fn filterAndRecordDenseEmbeddingArtifactRepairIssuesForReplay(
     ctx: *const AsyncContext,
     index_name: []const u8,
     dims: u32,
-    writes: []const mapper.DenseEmbeddingWrite,
+    owned: *OwnedDenseEmbeddingWrites,
     sequence: u64,
 ) !void {
-    for (writes) |write| {
+    var removed_indices = std.ArrayListUnmanaged(usize).empty;
+    defer removed_indices.deinit(ctx.alloc);
+    for (owned.writes, 0..) |write, write_idx| {
         const artifact_key = write.artifact_key orelse continue;
         if (try denseEmbeddingArtifactRepairReason(ctx, dims, artifact_key)) |reason| {
+            // A delete can commit after this journal record but before replay
+            // reads its artifact. That is an ordinary supersession, not
+            // corruption: advance past the stale upsert and let the following
+            // delete record remove any indexed value. This also prevents TTL
+            // cleanup from wedging replay on an artifact it correctly removed.
+            if (reason == .missing_artifact and !try embeddingWriteSourceDocumentExists(ctx, write)) {
+                try removed_indices.append(ctx.alloc, write_idx);
+                continue;
+            }
             try recordEmbeddingArtifactRepairIssueContext(ctx, index_name, artifact_key, sequence, reason);
         }
     }
+    if (removed_indices.items.len == 0) return;
+
+    const kept_len = owned.writes.len - removed_indices.items.len;
+    const kept = try owned.alloc.alloc(mapper.DenseEmbeddingWrite, kept_len);
+    var kept_idx: usize = 0;
+    var removed_idx: usize = 0;
+    for (owned.writes, 0..) |write, write_idx| {
+        if (removed_idx < removed_indices.items.len and removed_indices.items[removed_idx] == write_idx) {
+            removed_idx += 1;
+            if (owned.owns_doc_keys) {
+                owned.alloc.free(@constCast(write.doc_key));
+                if (write.parent_doc_key) |parent_doc_key| owned.alloc.free(@constCast(parent_doc_key));
+            }
+            continue;
+        }
+        kept[kept_idx] = write;
+        kept_idx += 1;
+    }
+    if (owned.allocation_len > 0) owned.alloc.free(owned.writes.ptr[0..owned.allocation_len]);
+    owned.writes = kept;
+    owned.allocation_len = kept.len;
 }
 
 fn recordSparseEmbeddingArtifactRepairIssuesForReplay(
@@ -28245,7 +28352,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             );
             defer dense_embeddings.deinit();
             if (ctx.index_manager.denseIndex(index_ref.name)) |entry| {
-                try recordDenseEmbeddingArtifactRepairIssuesForReplay(ctx, index_ref.name, entry.dims, dense_embeddings.writes, batch.sequence);
+                try filterAndRecordDenseEmbeddingArtifactRepairIssuesForReplay(ctx, index_ref.name, entry.dims, &dense_embeddings, batch.sequence);
             }
             try ctx.index_manager.validateDenseEmbeddingArtifactsByName(ctx.store, index_ref.name, dense_embeddings.writes);
 
@@ -28720,6 +28827,7 @@ const OwnedDenseEmbeddingWrites = struct {
     alloc: Allocator,
     owns_doc_keys: bool = false,
     writes: []mapper.DenseEmbeddingWrite = &.{},
+    allocation_len: usize = 0,
 
     fn deinit(self: *@This()) void {
         if (self.owns_doc_keys) {
@@ -28728,7 +28836,7 @@ const OwnedDenseEmbeddingWrites = struct {
                 if (write.parent_doc_key) |parent_doc_key| self.alloc.free(@constCast(parent_doc_key));
             }
         }
-        if (self.writes.len > 0) self.alloc.free(self.writes);
+        if (self.allocation_len > 0) self.alloc.free(self.writes.ptr[0..self.allocation_len]);
         self.* = undefined;
     }
 };
@@ -29335,10 +29443,12 @@ fn collectDenseEmbeddingWritesForArtifacts(
         identity_transferred = true;
     }
 
+    const writes = try filtered.toOwnedSlice(alloc);
     return .{
         .alloc = alloc,
         .owns_doc_keys = true,
-        .writes = try filtered.toOwnedSlice(alloc),
+        .writes = writes,
+        .allocation_len = writes.len,
     };
 }
 
@@ -29398,10 +29508,12 @@ fn collectDenseEmbeddingWritesForBatch(
     }
     try appendDenseEmbeddingWritesForArtifacts(alloc, index_manager, &filtered, artifact_keys, index_name);
 
+    const writes = try filtered.toOwnedSlice(alloc);
     return .{
         .alloc = alloc,
         .owns_doc_keys = true,
-        .writes = try filtered.toOwnedSlice(alloc),
+        .writes = writes,
+        .allocation_len = writes.len,
     };
 }
 
@@ -33373,34 +33485,6 @@ fn putDenseEmbeddingArtifactWithCounterForTest(db: *DB, alloc: Allocator, artifa
     );
     try db.core.store.putBatch(writes.items, &.{});
     try markArtifactPresenceForTest(db);
-}
-
-fn deleteDenseEmbeddingArtifactWithCounterForTest(db: *DB, alloc: Allocator, artifact_key: []const u8) !void {
-    lockApply(db);
-    defer db.core.unlockApply();
-
-    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
-    defer writes.deinit(alloc);
-    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
-    defer {
-        for (owned_keys.items) |key| alloc.free(key);
-        owned_keys.deinit(alloc);
-    }
-    var owned_values = std.ArrayListUnmanaged([]u8).empty;
-    defer {
-        for (owned_values.items) |value| alloc.free(value);
-        owned_values.deinit(alloc);
-    }
-    try DB.appendDenseArtifactCounterMutations(
-        alloc,
-        db.core.store,
-        db.core.index_manager,
-        &writes,
-        &.{artifact_key},
-        &owned_keys,
-        &owned_values,
-    );
-    try db.core.store.putBatch(writes.items, &.{artifact_key});
 }
 
 fn writeRawProjectionCheckpointSidecarForTest(path: []const u8, raw: []const u8) !void {
@@ -43039,6 +43123,60 @@ test "db applies document artifact child range batch without source row write" {
     });
     try std.testing.expect(delete_sequence > sequence);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, artifact_key));
+}
+
+test "db document artifact child range batch atomically tracks dense artifact counters" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+    const artifact_key = try expectedChunkEmbeddingArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0, "chunk_dense_v1");
+    defer alloc.free(artifact_key);
+    const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &[_]f32{ 1, 0, 0 });
+    defer alloc.free(payload);
+
+    _ = try db.applyDocumentArtifactChildRangeBatch(.{
+        .artifact_writes = &.{.{ .key = artifact_key, .value = payload }},
+        .sync_level = .write,
+    });
+    try std.testing.expectEqual(
+        @as(?u64, 1),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "semantic_idx"),
+    );
+
+    const replacement_payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &[_]f32{ 0, 1, 0 });
+    defer alloc.free(replacement_payload);
+    _ = try db.applyDocumentArtifactChildRangeBatch(.{
+        .artifact_writes = &.{.{ .key = artifact_key, .value = replacement_payload }},
+        .artifact_delete_keys = &.{artifact_key},
+        .sync_level = .write,
+    });
+    try std.testing.expectEqual(
+        @as(?u64, 1),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "semantic_idx"),
+    );
+
+    _ = try db.applyDocumentArtifactChildRangeBatch(.{
+        .artifact_delete_keys = &.{artifact_key},
+        .sync_level = .write,
+    });
+    try std.testing.expectEqual(
+        @as(?u64, 0),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "semantic_idx"),
+    );
 }
 
 test "db dispatches generated document child range artifacts to remote owner" {
@@ -53453,6 +53591,48 @@ test "db replay blocks dense embedding writes when artifact payload is missing" 
     try std.testing.expect(appended_sequence > dense_applied);
 }
 
+test "db replay skips a missing dense artifact after its source document was deleted" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var appended_sequence: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+
+        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:deleted", "dv_v1");
+        defer alloc.free(artifact_key);
+        appended_sequence = try appendDerivedBatchRecord(&db, .{
+            .dense_embeddings = &.{.{
+                .index_name = "dv_v1",
+                .doc_key = "doc:deleted",
+                .artifact_key = artifact_key,
+                .vector = &[_]f32{ 1, 0 },
+            }},
+        });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const issues = try reopened.listEmbeddingArtifactRepairIssues(alloc, "dv_v1", 0);
+    defer types.freeEmbeddingArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 0), issues.len);
+    try std.testing.expectEqual(appended_sequence, try reopened.core.loadAppliedSequence(alloc, "dv_v1"));
+}
+
 test "db replay blocks and preserves corrupt dense embedding artifacts" {
     const alloc = std.testing.allocator;
 
@@ -56129,9 +56309,10 @@ test "db quarantined dense bootstrap tracks concurrent insert update and delete"
         @as(i64, 1),
         (try DB.loadDenseArtifactCounterBootstrap(alloc, reopened.core.store, cfg.name)).?.delta,
     );
-    const artifact_a = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", cfg.name);
-    defer alloc.free(artifact_a);
-    try deleteDenseEmbeddingArtifactWithCounterForTest(&reopened, alloc, artifact_a);
+    try reopened.batch(.{
+        .deletes = &.{"doc:a"},
+        .sync_level = .write,
+    });
     try std.testing.expectEqual(
         @as(i64, 0),
         (try DB.loadDenseArtifactCounterBootstrap(alloc, reopened.core.store, cfg.name)).?.delta,
@@ -63957,7 +64138,6 @@ test "db ttl cleanup reclaims expired documents through normal delete semantics"
         .kind = .full_text,
         .config_json = "{}",
     });
-
     const now_ns = currentTimeNs();
     try db.batch(.{
         .writes = &.{.{ .key = "doc:expired", .value = "{\"title\":\"gone\",\"body\":\"common token\"}" }},
@@ -63991,6 +64171,68 @@ test "db ttl cleanup reclaims expired documents through normal delete semantics"
     });
     defer text.deinit();
     try std.testing.expectEqual(@as(u32, 0), text.total_hits);
+}
+
+test "db ttl delete callback atomically removes dense artifacts and updates repair counters" {
+    const alloc = std.testing.allocator;
+    const ttl_duration_ns: u64 = std.time.ns_per_s;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = ttl_duration_ns,
+    });
+    try db.addIndex(.{
+        .name = "external_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
+    });
+
+    const timestamp_ns = currentTimeNs() - 2 * ttl_duration_ns;
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:expired",
+            .value = "{\"title\":\"gone\",\"_embeddings\":{\"external_v1\":[1,0]}}",
+        }},
+        .timestamp_ns = timestamp_ns,
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(
+        @as(?u64, 1),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "external_v1"),
+    );
+
+    var ttl_ctx = TtlCleanupContext{
+        .batch = db.batchContext(),
+        .grace_period_ns = 0,
+    };
+    const candidate_key = try alloc.dupe(u8, "doc:expired");
+    defer alloc.free(candidate_key);
+    const candidates = [_]ttl_runtime_mod.DeleteCandidate{.{
+        .key = candidate_key,
+        .timestamp_ns = timestamp_ns,
+    }};
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        try deleteExpiredDocumentsFromCandidates(&ttl_ctx, &candidates),
+    );
+
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:expired", "external_v1");
+    defer alloc.free(artifact_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, artifact_key));
+    try std.testing.expectEqual(
+        @as(?u64, 0),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "external_v1"),
+    );
 }
 
 test "db stats expose ttl cleanup activity" {
