@@ -1592,6 +1592,15 @@ const HASeedSnapshotTopologyReplica = antfly.ha.seed_materialization.ReplicaSnap
 const HASeedSnapshotExtensionArtifact = antfly.ha.seed_materialization.ExtensionArtifact;
 const HASeedSnapshotTopology = antfly.ha.seed_materialization.Topology;
 
+const HASeedExtensionCaptureProbe = struct {
+    ptr: *anyopaque,
+    after_copy_fn: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror!void,
+
+    fn afterCopy(self: @This(), alloc: std.mem.Allocator) !void {
+        try self.after_copy_fn(self.ptr, alloc);
+    }
+};
+
 fn freeHASeedSnapshotExtensionArtifacts(
     alloc: std.mem.Allocator,
     artifacts: *std.ArrayListUnmanaged(HASeedSnapshotExtensionArtifact),
@@ -3302,6 +3311,7 @@ pub const DataServer = struct {
             building_root,
             metadata_snapshot.extension_packages,
             &topology_extension_artifacts,
+            null,
         );
 
         const topology_json = try std.json.Stringify.valueAlloc(alloc, HASeedSnapshotTopology{
@@ -3361,7 +3371,9 @@ pub const DataServer = struct {
         building_root: []const u8,
         packages: []const antfly.extensions.PackageManifest,
         artifacts: *std.ArrayListUnmanaged(HASeedSnapshotExtensionArtifact),
+        probe: ?HASeedExtensionCaptureProbe,
     ) !void {
+        _ = probe;
         const store_root = self.api_server_cfg.extension_package_store_dir orelse {
             if (packages.len != 0) return error.HASeedExtensionCatalogMismatch;
             return;
@@ -17716,6 +17728,43 @@ test "data server wires configured HA executors into API server" {
         defer alloc.free(source_extension);
         try std.testing.expectEqualStrings(source_extension, captured_extension);
     }
+
+    // Deterministically mutate a source binary after the first copy pass.
+    // Capture must discard the whole building generation rather than publish
+    // a mixed package-store observation.
+    const extension_race_building_root = try std.fs.path.join(alloc, &.{ capture_fixture_root, "extension-race-building" });
+    defer alloc.free(extension_race_building_root);
+    try fs_paths.createDirPathPortable(io_impl.io(), extension_race_building_root);
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), extension_race_building_root) catch {};
+    const ExtensionRaceProbe = struct {
+        runtime_path: []const u8,
+
+        fn afterCopy(ptr: *anyopaque, hook_alloc: std.mem.Allocator) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var hook_io_impl = std.Io.Threaded.init(hook_alloc, .{});
+            defer hook_io_impl.deinit();
+            var file = try std.Io.Dir.cwd().createFile(hook_io_impl.io(), self.runtime_path, .{ .truncate = true });
+            defer file.close(hook_io_impl.io());
+            try file.writeStreamingAll(hook_io_impl.io(), "raced-extension-runtime");
+            try file.sync(hook_io_impl.io());
+        }
+    };
+    var extension_race_probe = ExtensionRaceProbe{ .runtime_path = extension_runtime_path };
+    var raced_artifacts = std.ArrayListUnmanaged(HASeedSnapshotExtensionArtifact).empty;
+    defer freeHASeedSnapshotExtensionArtifacts(alloc, &raced_artifacts);
+    try std.testing.expectError(error.HASeedExtensionChangedDuringCapture, server.captureHASeedExtensionArtifacts(
+        alloc,
+        io_impl.io(),
+        extension_race_building_root,
+        &.{.{
+            .name = "memoryaf",
+            .version = "1.0.0",
+            .digest = "sha256:fixture",
+            .install = .{ .scopes_supported = &.{.cluster} },
+        }},
+        &raced_artifacts,
+        .{ .ptr = &extension_race_probe, .after_copy_fn = ExtensionRaceProbe.afterCopy },
+    ));
     const default_raft_wal = try std.fs.path.join(alloc, &.{ default_capture.capture.content_root, "replicas/group-1/raft/wal-000001" });
     defer alloc.free(default_raft_wal);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io_impl.io(), default_raft_wal, .{}));
