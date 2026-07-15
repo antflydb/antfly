@@ -8340,21 +8340,14 @@ fn applySoftMaskAlpha(rgba: []u8, smask_rgba: []const u8) void {
 }
 
 fn applyExplicitMaskAlpha(rgba: []u8, mask_rgba: []const u8, mask_is_stencil: bool) void {
-    const Vec16 = @Vector(16, u8);
-    const Vec4 = @Vector(4, u8);
     const lanes = 16;
     var i: usize = 0;
     while (i + lanes <= rgba.len and i + lanes <= mask_rgba.len) : (i += lanes) {
         var dst_block: [16]u8 = rgba[i..][0..16].*;
         const src_block: [16]u8 = mask_rgba[i..][0..16].*;
-        const src_vec: Vec16 = @bitCast(src_block);
-        const alpha_vec: Vec4 = @shuffle(u8, src_vec, undefined, [_]i32{ 3, 7, 11, 15 });
-        const gray_vec: Vec4 = @shuffle(u8, src_vec, undefined, [_]i32{ 0, 4, 8, 12 });
-        const use_alpha_vec = @as(@Vector(4, bool), @splat(mask_is_stencil));
-        const effective_vec = @select(u8, use_alpha_vec, alpha_vec, gray_vec);
-        const effective_arr: [4]u8 = @bitCast(effective_vec);
         inline for (0..4) |lane| {
-            dst_block[lane * 4 + 3] = effective_arr[lane];
+            const src_channel: usize = if (mask_is_stencil) 3 else 0;
+            dst_block[lane * 4 + 3] = src_block[lane * 4 + src_channel];
         }
         rgba[i..][0..16].* = dst_block;
     }
@@ -11145,7 +11138,7 @@ test "apply color key mask zeroes matching alpha across vector lane block" {
 }
 
 test "apply explicit mask alpha uses mask alpha or grayscale channel" {
-    var rgba = [_]u8{
+    const original = [_]u8{
         10,  20,  30,  255,
         40,  50,  60,  255,
         70,  80,  90,  255,
@@ -11158,12 +11151,21 @@ test "apply explicit mask alpha uses mask alpha or grayscale channel" {
         44, 44, 44, 0,
     };
 
-    applyExplicitMaskAlpha(&rgba, &mask, false);
+    var grayscale_rgba = original;
+    applyExplicitMaskAlpha(&grayscale_rgba, &mask, false);
 
-    try std.testing.expectEqual(@as(u8, 11), rgba[3]);
-    try std.testing.expectEqual(@as(u8, 22), rgba[7]);
-    try std.testing.expectEqual(@as(u8, 33), rgba[11]);
-    try std.testing.expectEqual(@as(u8, 44), rgba[15]);
+    try std.testing.expectEqual(@as(u8, 11), grayscale_rgba[3]);
+    try std.testing.expectEqual(@as(u8, 22), grayscale_rgba[7]);
+    try std.testing.expectEqual(@as(u8, 33), grayscale_rgba[11]);
+    try std.testing.expectEqual(@as(u8, 44), grayscale_rgba[15]);
+
+    var stencil_rgba = original;
+    applyExplicitMaskAlpha(&stencil_rgba, &mask, true);
+
+    try std.testing.expectEqual(@as(u8, 255), stencil_rgba[3]);
+    try std.testing.expectEqual(@as(u8, 255), stencil_rgba[7]);
+    try std.testing.expectEqual(@as(u8, 128), stencil_rgba[11]);
+    try std.testing.expectEqual(@as(u8, 0), stencil_rgba[15]);
 }
 
 test "reader preserves rotated image xobject transform" {
