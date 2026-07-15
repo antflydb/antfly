@@ -132,7 +132,7 @@ pub fn addCommand(ctx: Context, spec: CommandSpec) void {
         }),
     });
     addImports(ctx, exe.root_module, spec.imports);
-    configureNative(ctx, exe, spec.native_link);
+    configureNative(ctx, exe, spec.native_link, spec.imports);
     if (spec.link_libc) exe.root_module.link_libc = true;
 
     const run = b.addRunArtifact(exe);
@@ -151,7 +151,7 @@ pub fn addTest(ctx: Context, spec: TestSpec) *std.Build.Step {
         }),
     });
     addImports(ctx, test_exe.root_module, spec.imports);
-    configureNative(ctx, test_exe, spec.native_link);
+    configureNative(ctx, test_exe, spec.native_link, spec.imports);
 
     const run = b.addRunArtifact(test_exe);
     const step = b.step(spec.step_name, spec.description);
@@ -165,19 +165,41 @@ fn addImports(ctx: Context, module: *std.Build.Module, imports: []const Import) 
     }
 }
 
-fn configureNative(ctx: Context, artifact: *std.Build.Step.Compile, native_link: NativeLink) void {
+fn configureNative(
+    ctx: Context,
+    artifact: *std.Build.Step.Compile,
+    native_link: NativeLink,
+    imports: []const Import,
+) void {
+    // inference_internal already owns the Metal translation unit. Adding it to
+    // the importing executable as well makes Zig pass the same object to the
+    // linker twice. Keep frameworks on the final artifact, but compile the
+    // kernels at exactly one module boundary.
+    const owns_metal_kernels = !containsImport(imports, .inference_internal);
     switch (native_link) {
         .none => {},
-        .default => configureNativeTool(ctx, artifact, ctx.enable_metal),
-        .no_accel => configureNativeTool(ctx, artifact, false),
+        .default => configureNativeTool(ctx, artifact, ctx.enable_metal, owns_metal_kernels),
+        .no_accel => configureNativeTool(ctx, artifact, false, false),
     }
 }
 
-fn configureNativeTool(ctx: Context, artifact: *std.Build.Step.Compile, enable_metal: bool) void {
+fn containsImport(imports: []const Import, needle: Import) bool {
+    for (imports) |import| {
+        if (import == needle) return true;
+    }
+    return false;
+}
+
+fn configureNativeTool(
+    ctx: Context,
+    artifact: *std.Build.Step.Compile,
+    enable_metal: bool,
+    owns_metal_kernels: bool,
+) void {
     if (ctx.enable_system_blas) {
         configureSystemBlas(ctx, artifact.root_module);
     }
-    configureMetal(ctx, artifact.root_module, enable_metal);
+    configureMetal(ctx, artifact.root_module, enable_metal, owns_metal_kernels);
     artifact.root_module.link_libc = true;
 }
 
@@ -195,13 +217,20 @@ fn configureSystemBlas(ctx: Context, module: *std.Build.Module) void {
     module.linkSystemLibrary("openblas", .{});
 }
 
-fn configureMetal(ctx: Context, module: *std.Build.Module, enable_metal: bool) void {
+fn configureMetal(
+    ctx: Context,
+    module: *std.Build.Module,
+    enable_metal: bool,
+    owns_metal_kernels: bool,
+) void {
     if (!enable_metal or ctx.target.result.os.tag != .macos) return;
     addMacosSdkPaths(ctx, module);
     module.linkFramework("Foundation", .{});
     module.linkFramework("Metal", .{});
     module.linkFramework("MetalPerformanceShaders", .{});
-    module.addCSourceFile(.{ .file = ctx.b.path("src/backends/metal_kernels.m"), .flags = &.{"-fobjc-arc"} });
+    if (owns_metal_kernels) {
+        module.addCSourceFile(.{ .file = ctx.b.path("src/backends/metal_kernels.m"), .flags = &.{"-fobjc-arc"} });
+    }
 }
 
 fn addMacosSdkPaths(ctx: Context, module: *std.Build.Module) void {

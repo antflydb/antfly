@@ -28,7 +28,34 @@ pub const Stats = struct {
     malloc_zone_bytes: u64 = 0,
 };
 
+/// Memory that contributes to process pressure rather than clean file-backed
+/// mappings. RSS is still reported separately for diagnostics, but durable
+/// stores can map large files whose resident clean pages are reclaimable.
+pub fn pressureWorkingSetBytes(stats: Stats) u64 {
+    if (builtin.os.tag == .macos and stats.footprint_bytes != 0) return stats.footprint_bytes;
+    if (builtin.os.tag == .linux) {
+        const private_bytes = @max(stats.anonymous_bytes, stats.private_dirty_bytes);
+        if (private_bytes != 0) return private_bytes;
+    }
+    if (stats.footprint_bytes != 0) return stats.footprint_bytes;
+    return stats.resident_bytes;
+}
+
 pub fn snapshot() Stats {
+    var stats = pressureSnapshot();
+    if (!stats.available or builtin.os.tag != .macos) return stats;
+
+    const malloc_stats = darwin.mallocStats();
+    stats.malloc_available = malloc_stats.available;
+    stats.malloc_allocated_bytes = malloc_stats.allocated_bytes;
+    stats.malloc_zone_bytes = malloc_stats.zone_bytes;
+    return stats;
+}
+
+/// Low-overhead OS memory-pressure sample for hot qualification loops. This
+/// intentionally excludes allocator-zone enumeration, which is expensive and
+/// can double-count allocations when zones overlap.
+pub fn pressureSnapshot() Stats {
     if (builtin.os.tag == .linux) return linuxSnapshot();
     if (builtin.os.tag != .macos) return .{};
 
@@ -36,18 +63,13 @@ pub fn snapshot() Stats {
     const rc = darwin.proc_pid_rusage(darwin.getpid(), darwin.RUSAGE_INFO_CURRENT, @ptrCast(&info));
     if (rc != 0) return .{};
 
-    var stats = Stats{
+    return .{
         .available = true,
         .resident_bytes = info.ri_resident_size,
         .footprint_bytes = info.ri_phys_footprint,
         .wired_bytes = info.ri_wired_size,
         .pageins = info.ri_pageins,
     };
-    const malloc_stats = darwin.mallocStats();
-    stats.malloc_available = malloc_stats.available;
-    stats.malloc_allocated_bytes = malloc_stats.allocated_bytes;
-    stats.malloc_zone_bytes = malloc_stats.zone_bytes;
-    return stats;
 }
 
 fn linuxSnapshot() Stats {

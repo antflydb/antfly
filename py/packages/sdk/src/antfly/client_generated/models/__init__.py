@@ -116,6 +116,8 @@ from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
 from .date_range_string_query import DateRangeStringQuery
 from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
+from .dense_repair_backpressure_error import DenseRepairBackpressureError
+from .dense_repair_backpressure_error_code import DenseRepairBackpressureErrorCode
 from .derived_coverage_observation_incomplete_reason import DerivedCoverageObservationIncompleteReason
 from .derived_coverage_policy import DerivedCoveragePolicy
 from .derived_coverage_status import DerivedCoverageStatus
@@ -288,6 +290,8 @@ from .image_url_content_part_type import ImageURLContentPartType
 from .incomplete_details import IncompleteDetails
 from .incomplete_details_reason import IncompleteDetailsReason
 from .index_execution_config import IndexExecutionConfig
+from .index_repair_status import IndexRepairStatus
+from .index_repair_status_state import IndexRepairStatusState
 from .index_status import IndexStatus
 from .index_status_shard_status import IndexStatusShardStatus
 from .index_type import IndexType
@@ -532,6 +536,7 @@ from .query_string_query import QueryStringQuery
 from .regexp_query import RegexpQuery
 from .repair_issue_list_request import RepairIssueListRequest
 from .repair_run_request import RepairRunRequest
+from .repair_run_request_control import RepairRunRequestControl
 from .repair_target import RepairTarget
 from .replication_source_action_hint import ReplicationSourceActionHint
 from .replication_source_status import ReplicationSourceStatus
@@ -791,6 +796,8 @@ __all__ = (
     "DataShapeKind",
     "DateRangeStringQuery",
     "DeleteArtifactEnrichmentResponse201",
+    "DenseRepairBackpressureError",
+    "DenseRepairBackpressureErrorCode",
     "DerivedCoverageObservationIncompleteReason",
     "DerivedCoveragePolicy",
     "DerivedCoverageStatus",
@@ -961,6 +968,8 @@ __all__ = (
     "IncompleteDetails",
     "IncompleteDetailsReason",
     "IndexExecutionConfig",
+    "IndexRepairStatus",
+    "IndexRepairStatusState",
     "IndexStatus",
     "IndexStatusShardStatus",
     "IndexType",
@@ -1205,6 +1214,7 @@ __all__ = (
     "RegexpQuery",
     "RepairIssueListRequest",
     "RepairRunRequest",
+    "RepairRunRequestControl",
     "RepairTarget",
     "ReplicationSourceActionHint",
     "ReplicationSourceStatus",

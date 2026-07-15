@@ -47,6 +47,19 @@ pub const OpenedBackend = union(enum) {
         self.* = undefined;
     }
 
+    pub fn abandonAfterCrash(self: *OpenedBackend, alloc: Allocator) void {
+        switch (self.*) {
+            // LMDB has no modeled unclean-close hook. Closing releases process
+            // resources without adding an HBC publication transition.
+            .lmdb => |backend| {
+                backend.close();
+                alloc.destroy(backend);
+            },
+            .lsm => |*handle| handle.abandonAfterCrash(),
+        }
+        self.* = undefined;
+    }
+
     pub fn sync(self: *OpenedBackend, force: bool) !void {
         switch (self.*) {
             .lmdb => |backend| try backend.sync(force),

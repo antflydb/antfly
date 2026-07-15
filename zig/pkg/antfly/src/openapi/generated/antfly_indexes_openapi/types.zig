@@ -48,6 +48,7 @@ pub const AlgebraicIndexStats = struct {
     disk_usage: ?i64 = null,
     /// Whether the sidecar is currently rebuilding
     rebuilding: ?bool = null,
+    repair: ?IndexRepairStatus = null,
     /// Whether the sidecar is actively rebuilding, replaying, or catching up.
     backfill_active: ?bool = null,
     /// Backfill progress as a ratio from 0.0 to 1.0
@@ -496,6 +497,7 @@ pub const EmbeddingsIndexStats = struct {
     total_terms: ?i64 = null,
     /// Whether the index enricher is currently backfilling
     rebuilding: ?bool = null,
+    repair: ?IndexRepairStatus = null,
     /// Number of documents pending enrichment in the WAL
     wal_backlog: ?i64 = null,
     /// Whether the index is actively rebuilding, replaying, enriching, or catching up.
@@ -676,6 +678,7 @@ pub const FullTextIndexStats = struct {
     disk_usage: ?i64 = null,
     /// Whether the index is currently rebuilding
     rebuilding: ?bool = null,
+    repair: ?IndexRepairStatus = null,
     /// Whether the index is actively rebuilding, replaying, or catching up.
     backfill_active: ?bool = null,
     /// Progress of ongoing rebuild as fraction [0.0, 1.0]
@@ -825,6 +828,7 @@ pub const GraphIndexStats = struct {
     edge_types: ?std.json.ArrayHashMap(i64) = null,
     /// Whether the index is currently rebuilding
     rebuilding: ?bool = null,
+    repair: ?IndexRepairStatus = null,
     /// Whether the index is actively rebuilding, materializing, or catching up.
     backfill_active: ?bool = null,
     /// Rebuild progress as a ratio from 0.0 to 1.0
@@ -1186,6 +1190,14 @@ pub const IndexExecutionConfig = struct {
     chunking: ?ExecutionPolicy = null,
     /// Embedding producer batching for shorthand-created embedding enrichments.
     embedding: ?ExecutionPolicy = null,
+};
+
+/// Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics.
+pub const IndexRepairStatus = struct {
+    /// Stable repair state. Internal state-machine phases are intentionally not exposed here.
+    state: []const u8,
+    /// Whether an operator must resume, retry, reconfigure, or drop the affected index.
+    action_required: bool,
 };
 
 /// Statistics for an index

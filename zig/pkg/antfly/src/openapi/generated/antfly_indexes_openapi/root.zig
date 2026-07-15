@@ -37,6 +37,7 @@ pub const GraphResultNode = types.GraphResultNode;
 pub const GraphSourceArtifactStatus = types.GraphSourceArtifactStatus;
 pub const IndexConfig = types.IndexConfig;
 pub const IndexExecutionConfig = types.IndexExecutionConfig;
+pub const IndexRepairStatus = types.IndexRepairStatus;
 pub const IndexStats = types.IndexStats;
 pub const IndexType = types.IndexType;
 pub const MergeConfig = types.MergeConfig;

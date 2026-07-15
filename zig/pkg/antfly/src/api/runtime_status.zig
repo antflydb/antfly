@@ -824,6 +824,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         for (indexes[0..initialized]) |item| {
             alloc.free(item.name);
             if (item.load_error) |value| alloc.free(value);
+            if (item.index_repair_last_error) |value| alloc.free(value);
             if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
             if (item.algebraic_last_error_reason) |value| alloc.free(value);
             if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
@@ -875,6 +876,11 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         else
             null;
         errdefer if (load_error) |value| alloc.free(value);
+        const index_repair_last_error = if (item.index_repair_last_error) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
+        errdefer if (index_repair_last_error) |value| alloc.free(value);
         const algebraic_last_error_doc_key = if (item.algebraic_last_error_doc_key) |value|
             try alloc.dupe(u8, value)
         else
@@ -985,6 +991,19 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .repair_summary_ready = item.repair_summary_ready,
             .repair_issue_count_estimated = item.repair_issue_count_estimated,
             .repair_scan_issue_count = item.repair_scan_issue_count,
+            .index_repair_id = item.index_repair_id,
+            .index_repair_trigger = item.index_repair_trigger,
+            .index_repair_phase = item.index_repair_phase,
+            .index_repair_automation = item.index_repair_automation,
+            .index_repair_attempts = item.index_repair_attempts,
+            .index_repair_started_at_ms = item.index_repair_started_at_ms,
+            .index_repair_updated_at_ms = item.index_repair_updated_at_ms,
+            .index_repair_build_floor_sequence = item.index_repair_build_floor_sequence,
+            .index_repair_applied_sequence = item.index_repair_applied_sequence,
+            .index_repair_target_sequence = item.index_repair_target_sequence,
+            .index_repair_next_retry_at_ms = item.index_repair_next_retry_at_ms,
+            .index_repair_last_error = index_repair_last_error,
+            .index_repair_wait_reason = item.index_repair_wait_reason,
             .projection_checkpoint_status = item.projection_checkpoint_status,
             .projection_checkpoint_applied_sequence = item.projection_checkpoint_applied_sequence,
             .projection_checkpoint_generation = item.projection_checkpoint_generation,

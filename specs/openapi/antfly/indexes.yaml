@@ -307,6 +307,24 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API."
+    IndexRepairStatus:
+      type: object
+      description: Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics.
+      required:
+        - state
+        - action_required
+      properties:
+        state:
+          type: string
+          enum:
+            - rebuilding
+            - waiting
+            - paused
+            - failed
+          description: Stable repair state. Internal state-machine phases are intentionally not exposed here.
+        action_required:
+          type: boolean
+          description: Whether an operator must resume, retry, reconfigure, or drop the affected index.
     FullTextIndexStats:
       type: object
       required:
@@ -336,6 +354,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether the index is currently rebuilding"
+        repair:
+          $ref: '#/components/schemas/IndexRepairStatus'
         backfill_active:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -731,6 +751,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether the index enricher is currently backfilling"
+        repair:
+          $ref: '#/components/schemas/IndexRepairStatus'
         wal_backlog:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -986,6 +1008,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether the sidecar is currently rebuilding"
+        repair:
+          $ref: '#/components/schemas/IndexRepairStatus'
         backfill_active:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -1465,6 +1489,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether the index is currently rebuilding"
+        repair:
+          $ref: '#/components/schemas/IndexRepairStatus'
         backfill_active:
           x-go-type-skip-optional-pointer: true
           type: boolean

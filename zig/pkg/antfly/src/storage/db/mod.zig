@@ -45,6 +45,7 @@ pub const enrichment_utf8_text = @import("enrichment/utf8_text.zig");
 pub const derived_types = @import("derived/derived_types.zig");
 pub const derived_worker = @import("derived/derived_worker.zig");
 pub const derived_executor = @import("derived/derived_executor.zig");
+pub const derived_backlog_tracker = @import("derived/backlog_tracker.zig");
 pub const replay_stream = @import("derived/replay_stream.zig");
 pub const replay_source = @import("derived/replay_source.zig");
 pub const runtime_backend = @import("../runtime_backend.zig");
@@ -188,6 +189,7 @@ test {
     _ = derived_types;
     _ = derived_worker;
     _ = derived_executor;
+    _ = derived_backlog_tracker;
     _ = replay_stream;
     _ = replay_source;
     _ = runtime_backend;

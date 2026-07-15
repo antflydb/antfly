@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from ..models.graph_index_stats_resolution import GraphIndexStatsResolution
     from ..models.graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
     from ..models.graph_source_artifact_status import GraphSourceArtifactStatus
+    from ..models.index_repair_status import IndexRepairStatus
 
 
 T = TypeVar("T", bound="GraphIndexStats")
@@ -32,6 +33,8 @@ class GraphIndexStats:
         total_edges (int | Unset): Total number of edges in the graph
         edge_types (GraphIndexStatsEdgeTypes | Unset): Count of edges per edge type
         rebuilding (bool | Unset): Whether the index is currently rebuilding
+        repair (IndexRepairStatus | Unset): Compact user-facing state for an automatic index repair. Detailed
+            diagnostics are available from the admin API and metrics.
         backfill_active (bool | Unset): Whether the index is actively rebuilding, materializing, or catching up.
         backfill_progress (float | Unset): Rebuild progress as a ratio from 0.0 to 1.0
         backfill_items_processed (int | Unset): Number of edges indexed during current rebuild
@@ -87,6 +90,7 @@ class GraphIndexStats:
     total_edges: int | Unset = UNSET
     edge_types: GraphIndexStatsEdgeTypes | Unset = UNSET
     rebuilding: bool | Unset = UNSET
+    repair: IndexRepairStatus | Unset = UNSET
     backfill_active: bool | Unset = UNSET
     backfill_progress: float | Unset = UNSET
     backfill_items_processed: int | Unset = UNSET
@@ -142,6 +146,10 @@ class GraphIndexStats:
             edge_types = self.edge_types.to_dict()
 
         rebuilding = self.rebuilding
+
+        repair: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.repair, Unset):
+            repair = self.repair.to_dict()
 
         backfill_active = self.backfill_active
 
@@ -255,6 +263,8 @@ class GraphIndexStats:
             field_dict["edge_types"] = edge_types
         if rebuilding is not UNSET:
             field_dict["rebuilding"] = rebuilding
+        if repair is not UNSET:
+            field_dict["repair"] = repair
         if backfill_active is not UNSET:
             field_dict["backfill_active"] = backfill_active
         if backfill_progress is not UNSET:
@@ -349,6 +359,7 @@ class GraphIndexStats:
         from ..models.graph_index_stats_resolution import GraphIndexStatsResolution
         from ..models.graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
         from ..models.graph_source_artifact_status import GraphSourceArtifactStatus
+        from ..models.index_repair_status import IndexRepairStatus
 
         d = dict(src_dict)
         index_type = GraphIndexStatsIndexType(d.pop("index_type"))
@@ -365,6 +376,13 @@ class GraphIndexStats:
             edge_types = GraphIndexStatsEdgeTypes.from_dict(_edge_types)
 
         rebuilding = d.pop("rebuilding", UNSET)
+
+        _repair = d.pop("repair", UNSET)
+        repair: IndexRepairStatus | Unset
+        if isinstance(_repair, Unset):
+            repair = UNSET
+        else:
+            repair = IndexRepairStatus.from_dict(_repair)
 
         backfill_active = d.pop("backfill_active", UNSET)
 
@@ -486,6 +504,7 @@ class GraphIndexStats:
             total_edges=total_edges,
             edge_types=edge_types,
             rebuilding=rebuilding,
+            repair=repair,
             backfill_active=backfill_active,
             backfill_progress=backfill_progress,
             backfill_items_processed=backfill_items_processed,

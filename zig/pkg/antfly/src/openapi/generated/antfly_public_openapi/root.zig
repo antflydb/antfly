@@ -58,6 +58,7 @@ pub const ConnectionsResponse = types.ConnectionsResponse;
 pub const CreateApiKeyRequest = types.CreateApiKeyRequest;
 pub const CreateTableRequest = types.CreateTableRequest;
 pub const CreateUserRequest = types.CreateUserRequest;
+pub const DenseRepairBackpressureError = types.DenseRepairBackpressureError;
 pub const DistanceRange = types.DistanceRange;
 pub const DistanceUnit = types.DistanceUnit;
 pub const DocumentArtifactChildRange = types.DocumentArtifactChildRange;
