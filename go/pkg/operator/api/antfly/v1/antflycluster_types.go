@@ -1922,9 +1922,9 @@ type HAStatus struct {
 	StartupGate *HAStartupGateStatus `json:"startupGate,omitempty"`
 }
 
-// HAWatchdogProofStatus records an authenticated primary runtime observation.
-// It is not itself a fencing receipt: physical isolation additionally binds it
-// to the uncached Kubernetes Pod and container incarnation.
+// HAWatchdogProofStatus records an authenticated runtime observation. It is not
+// itself a fencing receipt: automatic failover additionally binds it to the
+// exact Kubernetes Pod/container incarnation and an uncached Lease transfer.
 type HAWatchdogProofStatus struct {
 	CapabilityVersion int32 `json:"capabilityVersion"`
 
@@ -2102,6 +2102,8 @@ type HAPhysicalIsolationPodIdentity struct {
 // HAPhysicalIsolationLeaseScope records the complete topology scope frozen in
 // the Kubernetes fencing Lease at holder transfer.
 type HAPhysicalIsolationLeaseScope struct {
+	TopologyID string `json:"topologyID"`
+
 	ClusterID uint64 `json:"clusterID"`
 
 	ShardID uint64 `json:"shardID,omitempty"`
@@ -2117,12 +2119,13 @@ type HAPhysicalIsolationLeaseScope struct {
 	PrimaryLSN uint64 `json:"primaryLSN"`
 }
 
-// HAPhysicalIsolationReceiptStatus is the typed, immutable proof that an
-// automatic failover crossed the Kubernetes physical-isolation boundary. The
-// intent half is checkpointed before the old StatefulSet is scaled. The final
-// half is populated only from uncached API-server observations after that
-// mutation. AbsenceProven is the preferred proof; a node-partition fallback is
-// permitted only after the runtime Lease watchdog grace has elapsed.
+// HAPhysicalIsolationReceiptStatus is the compatibility-named, typed receipt
+// that an automatic failover crossed its logical write-authority boundary. It
+// is not proof of power-off or process exit. The intent half is checkpointed
+// before the old StatefulSet is scaled. The final half is populated only after
+// exact runtime watchdog proof, an uncached Lease transfer, and a fresh
+// controller-local monotonic wait of the proof-bound maximum fence latency.
+// Pod absence is supplemental Kubernetes topology evidence only.
 type HAPhysicalIsolationReceiptStatus struct {
 	ClusterUID string `json:"clusterUID"`
 
@@ -2154,13 +2157,12 @@ type HAPhysicalIsolationReceiptStatus struct {
 
 	LeaseTransferTime metav1.Time `json:"leaseTransferTime"`
 
-	// WatchdogGraceSeconds is the frozen runtime self-fencing grace. It is an
-	// extension point for alternative watchdog policies, not a controller-local
-	// sleep knob, and must be positive for every completed receipt.
-	WatchdogGraceSeconds int32 `json:"watchdogGraceSeconds"`
+	// WatchdogMaxFenceLatencyMS is copied exactly from the authenticated old
+	// runtime proof and must equal the configured runtime watchdog bound.
+	WatchdogMaxFenceLatencyMS int32 `json:"watchdogMaxFenceLatencyMS"`
 
-	// WatchdogProof is optional while Pod absence remains possible, but is
-	// mandatory for the live-Pod fallback after WatchdogGraceSeconds.
+	// WatchdogProof is mandatory for every automatic Lease-transfer path. Pod
+	// API absence can result from force deletion while the old process survives.
 	// +optional
 	WatchdogProof *HAPhysicalIsolationWatchdogProofStatus `json:"watchdogProof,omitempty"`
 
@@ -2178,9 +2180,8 @@ type HAPhysicalIsolationReceiptStatus struct {
 	// +optional
 	ObservedLeaseResourceVersion string `json:"observedLeaseResourceVersion,omitempty"`
 
-	// AbsenceProven distinguishes the preferred uncached PodList proof from the
-	// watchdog fallback used when a partitioned kubelet leaves a Running Pod
-	// object behind indefinitely.
+	// AbsenceProven records an uncached PodList observation. It never asserts
+	// that a force-deleted or partitioned process has exited.
 	// +optional
 	AbsenceProven bool `json:"absenceProven,omitempty"`
 
@@ -2204,13 +2205,17 @@ type HAPhysicalIsolationWatchdogProofStatus struct {
 
 	Active bool `json:"active"`
 
+	AuthorityGranted bool `json:"authorityGranted"`
+
 	LeaseName string `json:"leaseName"`
 
 	LeaseNamespace string `json:"leaseNamespace"`
 
 	TopologyID string `json:"topologyID"`
 
-	HolderNodeID string `json:"holderNodeID"`
+	LocalNodeID string `json:"localNodeID"`
+
+	ObservedHolderNodeID string `json:"observedHolderNodeID"`
 
 	PodName string `json:"podName"`
 
@@ -2227,6 +2232,8 @@ type HAPhysicalIsolationWatchdogProofStatus struct {
 	ProcessBootID string `json:"processBootID"`
 
 	ObservedLeaseTransitions int32 `json:"observedLeaseTransitions"`
+
+	MaxFenceLatencyMS int32 `json:"maxFenceLatencyMS"`
 
 	RuntimeObservedAt metav1.Time `json:"runtimeObservedAt"`
 }

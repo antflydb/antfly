@@ -4838,12 +4838,15 @@ spec:
                                 timelineID:
                                   format: int64
                                   type: integer
+                                topologyID:
+                                  type: string
                               required:
                               - clusterID
                               - currentPrimaryID
                               - epoch
                               - primaryLSN
                               - timelineID
+                              - topologyID
                               type: object
                             leaseTransferTime:
                               format: date-time
@@ -4859,12 +4862,14 @@ spec:
                               type: string
                             statefulSetUID:
                               type: string
-                            watchdogGraceSeconds:
+                            watchdogMaxFenceLatencyMS:
                               format: int32
                               type: integer
                             watchdogProof:
                               properties:
                                 active:
+                                  type: boolean
+                                authorityGranted:
                                   type: boolean
                                 capabilityVersion:
                                   format: int32
@@ -4879,11 +4884,16 @@ spec:
                                 containerStartedAt:
                                   format: date-time
                                   type: string
-                                holderNodeID:
-                                  type: string
                                 leaseName:
                                   type: string
                                 leaseNamespace:
+                                  type: string
+                                localNodeID:
+                                  type: string
+                                maxFenceLatencyMS:
+                                  format: int32
+                                  type: integer
+                                observedHolderNodeID:
                                   type: string
                                 observedLeaseTransitions:
                                   format: int32
@@ -4901,14 +4911,17 @@ spec:
                                   type: string
                               required:
                               - active
+                              - authorityGranted
                               - capabilityVersion
                               - containerID
                               - containerName
                               - containerRestartCount
                               - containerStartedAt
-                              - holderNodeID
                               - leaseName
                               - leaseNamespace
+                              - localNodeID
+                              - maxFenceLatencyMS
+                              - observedHolderNodeID
                               - observedLeaseTransitions
                               - podName
                               - podUID
@@ -4930,7 +4943,7 @@ spec:
                           - leaseUID
                           - statefulSetName
                           - statefulSetUID
-                          - watchdogGraceSeconds
+                          - watchdogMaxFenceLatencyMS
                           type: object
                         prerequisiteDeadlineAt:
                           format: date-time

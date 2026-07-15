@@ -12,7 +12,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-const haRuntimeLeaseRBACSuffix = "-ha-runtime-lease"
+const (
+	haRuntimeLeaseRBACSuffix                  = "-ha-runtime-lease"
+	defaultHARuntimeLeaseWatchdogGraceSeconds = int32(10)
+)
 
 // reconcileHARuntimeLeaseRBAC grants the runtime only get/watch access to its
 // exact fencing Lease. It does not grant list, create, update, patch, or delete:
@@ -76,17 +79,35 @@ func haRuntimeLeaseEnv(cluster *antflyv1.AntflyCluster) []corev1.EnvVar {
 		return nil
 	}
 	lease := cluster.Spec.HighAvailability.Runtime.FencingLease
-	graceSeconds := lease.WatchdogGraceSeconds
-	if graceSeconds == 0 {
-		graceSeconds = 10
+	maxFenceLatencyMS, ok := haRuntimeLeaseMaxFenceLatencyMS(cluster)
+	if !ok {
+		return nil
 	}
 	return []corev1.EnvVar{
 		{Name: "ANTFLY_HA_LEASE_NAME", Value: lease.Name},
 		{Name: "ANTFLY_HA_LEASE_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "metadata.namespace"}}},
 		{Name: "ANTFLY_HA_LEASE_TOPOLOGY_ID", Value: lease.TopologyID},
-		{Name: "ANTFLY_HA_LEASE_GRACE_MS", Value: fmt.Sprintf("%d", graceSeconds*1000)},
+		{Name: "ANTFLY_HA_LEASE_GRACE_MS", Value: fmt.Sprintf("%d", maxFenceLatencyMS)},
 		{Name: "ANTFLY_HA_LEASE_SENTINEL_PATH", Value: "/antflydb/ha/lease-fenced"},
 	}
+}
+
+// haRuntimeLeaseMaxFenceLatencyMS is the single conversion used both to
+// configure the runtime and to validate its authenticated proof. The receipt
+// must not invent an independent grace period.
+func haRuntimeLeaseMaxFenceLatencyMS(cluster *antflyv1.AntflyCluster) (int32, bool) {
+	if !haRuntimeLeaseWatchdogEnabled(cluster) {
+		return 0, false
+	}
+	seconds := cluster.Spec.HighAvailability.Runtime.FencingLease.WatchdogGraceSeconds
+	if seconds == 0 {
+		seconds = defaultHARuntimeLeaseWatchdogGraceSeconds
+	}
+	milliseconds := int64(seconds) * 1000
+	if seconds <= 0 || milliseconds > int64(^uint32(0)>>1) {
+		return 0, false
+	}
+	return int32(milliseconds), true
 }
 
 func haRuntimeLeaseWatchdogEnabled(cluster *antflyv1.AntflyCluster) bool {

@@ -67,11 +67,18 @@ type AntflyClusterReconciler struct {
 	ManageInferencePools  bool
 	DefaultInferenceImage string
 	Now                   func() time.Time
+	// MonotonicNow is a test hook for process-local HA watchdog barriers. In
+	// production it is nil and time.Now retains its monotonic clock reading.
+	MonotonicNow func() time.Time
 
 	// validationAttempts tracks consecutive validation failure counts per cluster
 	// (namespace/name -> int). Reset on successful validation. Used for
 	// exponential backoff on repeated validation failures.
 	validationAttempts sync.Map
+	// haIsolationGraceStarts is intentionally process-local and unpersisted. A
+	// controller or leader restart must observe the exact Lease transfer again
+	// and wait a fresh full runtime maximum fence latency.
+	haIsolationGraceStarts sync.Map
 }
 
 var defaultOperatorHTTPClient = &http.Client{Timeout: 10 * time.Second}
@@ -4109,6 +4116,12 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 				fmt.Sprintf("Unable to observe HA admin status: %v", haAdminStatusErr),
 			)
 		}
+		// Revalidate a previously succeeded physical-isolation receipt against
+		// current uncached Kubernetes objects before any dependent admin action
+		// can observe it as satisfied in this reconciliation.
+		if err := r.reconcileHAFormerPrimaryIsolation(ctx, cluster); err != nil {
+			return err
+		}
 		if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
 			if stderrors.Is(err, errHAPlanNeedsPersistence) {
 				if persistErr := r.persistHAActionPlanBarrier(ctx, cluster); persistErr != nil {
@@ -4116,9 +4129,6 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 				}
 				return errHAStatusCheckpointed
 			}
-			return err
-		}
-		if err := r.reconcileHAFormerPrimaryIsolation(ctx, cluster); err != nil {
 			return err
 		}
 		r.updateHAStartupGateStatus(ctx, cluster)
@@ -4215,6 +4225,10 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 			fmt.Sprintf("Unable to observe HA admin status: %v", haAdminStatusErr),
 		)
 	}
+	// Revalidate physical isolation before releasing any dependent action.
+	if err := r.reconcileHAFormerPrimaryIsolation(ctx, cluster); err != nil {
+		return err
+	}
 	if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
 		if stderrors.Is(err, errHAPlanNeedsPersistence) {
 			if persistErr := r.persistHAActionPlanBarrier(ctx, cluster); persistErr != nil {
@@ -4222,9 +4236,6 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 			}
 			return errHAStatusCheckpointed
 		}
-		return err
-	}
-	if err := r.reconcileHAFormerPrimaryIsolation(ctx, cluster); err != nil {
 		return err
 	}
 	r.updateHAStartupGateStatus(ctx, cluster)

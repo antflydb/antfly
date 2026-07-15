@@ -3727,6 +3727,7 @@ func TestUpdateHAStatusBlocksAutomaticPromotionWithoutRouteSelector(t *testing.T
 
 func TestPlanHAContinuesCommittedFenceTransactionWhenPrimaryAdminRecovers(t *testing.T) {
 	cluster := haCluster()
+	cluster.UID = types.UID("cluster-uid")
 	ha := cluster.Spec.HighAvailability
 	ha.Admin = &antflyv1.HAAdminSpec{
 		PrimaryURL:            "http://primary-ha.default.svc:8081",
@@ -3751,10 +3752,15 @@ func TestPlanHAContinuesCommittedFenceTransactionWhenPrimaryAdminRecovers(t *tes
 		Enabled:          true,
 		FencingAuthority: antflyv1.HAFencingAuthorityKubernetesLease,
 	}
+	ha.Runtime = &antflyv1.HARuntimeSpec{
+		Role: antflyv1.HARuntimeRolePrimary, NodeID: "primary-a",
+		FencingLease: &antflyv1.HARuntimeFencingLeaseSpec{Name: "topology-ha-fence", TopologyID: "topology-anchor-uid", WatchdogGraceSeconds: 10},
+	}
 	cluster.Status.HAStatus = caughtUpHAStatus()
 	cluster.Status.HAStatus.PrimaryAdminReachable = true
 	cluster.Status.HAStatus.PrimaryAdminLastError = ""
 	cluster.Status.HAStatus.Fencing = readyFencingStatus()
+	cluster.Status.HAStatus.Fencing.Generation = 2
 	cluster.Status.HAStatus.PlannedActions = []antflyv1.HAPlannedActionStatus{{
 		Kind:            string(haActionIsolateFormerPrimary),
 		Executor:        string(haActionExecutorControllerAction),
@@ -3764,7 +3770,7 @@ func TestPlanHAContinuesCommittedFenceTransactionWhenPrimaryAdminRecovers(t *tes
 		RouteTo:         "standby-a",
 		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
 		FenceHolder:     "standby-a",
-		FenceGeneration: 1,
+		FenceGeneration: 2,
 		FenceReason:     "LeaseHeld",
 		AdminJobName:    haKubernetesPhysicalFenceName,
 		AdminJobPhase:   haAdminJobPhaseRunning,
@@ -3833,6 +3839,13 @@ func TestReconcileHAFormerPrimaryIsolationStopsOldWriterBeforeCandidateFence(t *
 	cluster.Status.HAStatus.PrimaryAdminFailureThresholdMet = true
 	cluster.Status.HAStatus.Standbys[0].CaughtUpToReceived = true
 	cluster.Status.HAStatus.Fencing = readyFencingStatus()
+	cluster.Status.HAStatus.Fencing.Generation = 2
+	proofObserved := metav1.NewTime(now.Add(-time.Second))
+	cluster.Status.HAStatus.PrimaryWatchdogProof = &antflyv1.HAWatchdogProofStatus{
+		CapabilityVersion: 1, Active: true, AuthorityGranted: true, LeaseName: "topology-ha-fence", LeaseNamespace: "default",
+		TopologyID: "topology-anchor-uid", LocalNodeID: "primary-a", ObservedHolderNodeID: "primary-a", PodUID: "former-primary-pod-uid",
+		ProcessBootID: strings.Repeat("a", 64), ObservedLeaseTransitions: 1, MaxFenceLatencyMS: 10_000, ObservedAt: proofObserved,
+	}
 	(&AntflyClusterReconciler{}).updateHAStatusAndConditions(cluster)
 
 	if len(cluster.Status.HAStatus.PlannedActions) < 2 ||
@@ -3868,9 +3881,12 @@ func TestReconcileHAFormerPrimaryIsolationStopsOldWriterBeforeCandidateFence(t *
 			DeletionTimestamp: ptr.To(metav1.NewTime(now)),
 			Finalizers:        []string{"test.antfly.io/keep-terminating"},
 		},
-		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: []corev1.ContainerStatus{{
+			Name: "antfly", ContainerID: "containerd://former-primary-process",
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(now.Add(-time.Minute))}},
+		}}},
 	}
-	lease := haFenceLease(cluster, now, haFencingLeaseDefaultDurationSeconds, 1, "standby-a")
+	lease := haFenceLease(cluster, now, haFencingLeaseDefaultDurationSeconds, 2, "standby-a")
 	// The cached client deliberately omits the still-running Pod. The uncached
 	// boundary reader sees it and must prevent a false isolation receipt.
 	reconciler := testHAReconciler(t, cluster, sts, lease)
@@ -3909,14 +3925,23 @@ func TestReconcileHAFormerPrimaryIsolationStopsOldWriterBeforeCandidateFence(t *
 	reconciler = testHAReconciler(t, cluster, observedSTS, lease.DeepCopy())
 	reconciler.BoundaryReader = haTestResourceVersionReader{Reader: reconciler.Client, listResourceVersion: "pods-absence-rv"}
 	reconciler.Now = func() time.Time { return now.Add(11 * time.Second) }
+	monotonicNow := now
+	reconciler.MonotonicNow = func() time.Time { return monotonicNow }
+	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); err != nil {
+		t.Fatalf("start process-local watchdog fence-latency barrier: %v", err)
+	}
+	if cluster.Status.HAStatus.PlannedActions[0].PhysicalIsolationReceipt.ObservedAt != nil {
+		t.Fatal("topology observation was recorded before the local monotonic watchdog bound elapsed")
+	}
+	monotonicNow = monotonicNow.Add(10 * time.Second)
 	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); !errors.Is(err, errHAStatusCheckpointed) {
 		t.Fatalf("expected pod-absence checkpoint before boundary freeze, got %v", err)
 	}
 	if haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, 1) {
 		t.Fatal("candidate fence passed before a post-isolation standby observation could refresh the durable tail")
 	}
-	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); err != nil {
-		t.Fatalf("complete physical isolation after post-absence observation: %v", err)
+	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); !errors.Is(err, errHAStatusCheckpointed) {
+		t.Fatalf("expected durable final isolation receipt checkpoint: %v", err)
 	}
 	action := cluster.Status.HAStatus.PlannedActions[0]
 	if action.AdminJobPhase != haAdminJobPhaseSucceeded || action.AdminJobName != haKubernetesPhysicalFenceName || action.TargetLSN != 12 {
@@ -3924,6 +3949,9 @@ func TestReconcileHAFormerPrimaryIsolationStopsOldWriterBeforeCandidateFence(t *
 	}
 	if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, 1, cluster) {
 		t.Fatal("candidate fence remained blocked after StatefulSet zero and exact old-pod absence")
+	}
+	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); err != nil {
+		t.Fatalf("revalidate checkpointed final isolation receipt: %v", err)
 	}
 }
 
@@ -3948,7 +3976,26 @@ func TestPhysicalIsolationReceiptRejectsForgedPartialAndStaleEvidence(t *testing
 		"cached omission without PodList RV": func(a *antflyv1.HAPlannedActionStatus) {
 			a.PhysicalIsolationReceipt.AbsencePodListResourceVersion = ""
 		},
-		"completed before watchdog grace": func(a *antflyv1.HAPlannedActionStatus) {
+		"force-deleted Pod without watchdog proof": func(a *antflyv1.HAPlannedActionStatus) {
+			a.PhysicalIsolationReceipt.WatchdogProof = nil
+		},
+		"watchdog lacked old writer authority": func(a *antflyv1.HAPlannedActionStatus) {
+			a.PhysicalIsolationReceipt.WatchdogProof.AuthorityGranted = false
+		},
+		"watchdog observed candidate before transfer": func(a *antflyv1.HAPlannedActionStatus) {
+			a.PhysicalIsolationReceipt.WatchdogProof.ObservedHolderNodeID = "standby-a"
+		},
+		"watchdog fence latency differs from receipt": func(a *antflyv1.HAPlannedActionStatus) {
+			a.PhysicalIsolationReceipt.WatchdogProof.MaxFenceLatencyMS++
+		},
+		"watchdog proof predates its maximum fence latency": func(a *antflyv1.HAPlannedActionStatus) {
+			stale := metav1.NewTime(a.PhysicalIsolationReceipt.LeaseTransferTime.Add(-11 * time.Second))
+			a.PhysicalIsolationReceipt.WatchdogProof.RuntimeObservedAt = stale
+		},
+		"receipt fence latency differs from configuration": func(a *antflyv1.HAPlannedActionStatus) {
+			a.PhysicalIsolationReceipt.WatchdogMaxFenceLatencyMS++
+		},
+		"completed before recorded observation": func(a *antflyv1.HAPlannedActionStatus) {
 			early := metav1.NewTime(now.Add(time.Second))
 			a.CompletedAt = &early
 			a.PhysicalIsolationReceipt.CompletedAt = early.DeepCopy()
@@ -3981,10 +4028,23 @@ func TestPhysicalIsolationReceiptRejectsForgedPartialAndStaleEvidence(t *testing
 	replacement := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
 		Name: "antfly-standalone", UID: types.UID("replacement-sts-uid"), ResourceVersion: "3",
 	}}
-	lease := haFenceLease(cluster, now, haFencingLeaseDefaultDurationSeconds, 1, "standby-a")
+	lease := haFenceLease(cluster, now, haFencingLeaseDefaultDurationSeconds, 2, "standby-a")
 	lease.UID = types.UID("lease-uid")
 	if err := validateCurrentPhysicalIsolationObjects(cluster, &action, replacement, lease, scope); err == nil {
 		t.Fatal("replacement StatefulSet UID was accepted against the frozen receipt")
+	}
+	exact := replacement.DeepCopy()
+	exact.UID = types.UID("sts-uid")
+	laterRenew := metav1.NewMicroTime(now.Add(5 * time.Second))
+	lease.Spec.RenewTime = &laterRenew
+	lease.ResourceVersion = "3"
+	if err := validateCurrentPhysicalIsolationObjects(cluster, &action, exact, lease, scope); err != nil {
+		t.Fatalf("Lease renewal incorrectly changed the frozen holder-transfer clock: %v", err)
+	}
+	shiftedAcquire := metav1.NewMicroTime(now.Add(time.Second))
+	lease.Spec.AcquireTime = &shiftedAcquire
+	if err := validateCurrentPhysicalIsolationObjects(cluster, &action, exact, lease, scope); err == nil {
+		t.Fatal("changed Lease holder-transfer time was accepted as an ordinary renewal")
 	}
 }
 
@@ -4017,10 +4077,11 @@ func TestPhysicalIsolationReceiptRejectsLiveOldRuntimeWithoutWatchdogCapability(
 	action.FenceGeneration = 2
 	action.PhysicalIsolationReceipt.LeaseGeneration = 2
 	action.PhysicalIsolationReceipt.WatchdogProof = &antflyv1.HAPhysicalIsolationWatchdogProofStatus{
-		CapabilityVersion: 1, Active: true, LeaseName: "antfly-ha-fence", LeaseNamespace: "default",
-		TopologyID: "stable-topology", HolderNodeID: "primary-a", PodName: "antfly-standalone-0", PodUID: "old-pod-uid",
+		CapabilityVersion: 1, Active: true, AuthorityGranted: true, LeaseName: "topology-ha-fence", LeaseNamespace: "default",
+		TopologyID: "topology-anchor-uid", LocalNodeID: "primary-a", ObservedHolderNodeID: "primary-a", PodName: "antfly-standalone-0", PodUID: "old-pod-uid",
 		ContainerName: "antfly", ContainerID: "containerd://old-process", ContainerRestartCount: 2,
-		ContainerStartedAt: started, ProcessBootID: "process-boot-id", ObservedLeaseTransitions: 1, RuntimeObservedAt: runtimeObserved,
+		ContainerStartedAt: started, ProcessBootID: strings.Repeat("b", 64), ObservedLeaseTransitions: 1, RuntimeObservedAt: runtimeObserved,
+		MaxFenceLatencyMS: 10_000,
 	}
 	if !haPhysicalIsolationWatchdogFallbackProven(action, &corev1.PodList{Items: []corev1.Pod{*live}}) {
 		t.Fatal("exact runtime-originated watchdog proof did not bind to the live old process")
@@ -4032,6 +4093,32 @@ func TestPhysicalIsolationReceiptRejectsLiveOldRuntimeWithoutWatchdogCapability(
 	}
 }
 
+func TestReconcilePhysicalIsolationRevalidatesSucceededReceiptBeforeDependencies(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	cluster, action := validPhysicalIsolationReceiptFixture(now)
+	cluster.Status.HAStatus.PlannedActions = []antflyv1.HAPlannedActionStatus{action}
+	zero := int32(0)
+	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+		Name: "antfly-standalone", Namespace: "default", UID: types.UID("sts-uid"), ResourceVersion: "3", Generation: 3,
+		OwnerReferences: []metav1.OwnerReference{{UID: cluster.UID, Controller: ptr.To(true)}},
+	}, Spec: appsv1.StatefulSetSpec{Replicas: &zero}, Status: appsv1.StatefulSetStatus{ObservedGeneration: 3}}
+	lease := haFenceLease(cluster, now, haFencingLeaseDefaultDurationSeconds, 2, "standby-a")
+	lease.UID = types.UID("lease-uid")
+	reconciler := testHAReconciler(t, cluster, sts, lease)
+	reconciler.BoundaryReader = haTestResourceVersionReader{Reader: reconciler.Client, listResourceVersion: "pods-current"}
+	reconciler.Now = func() time.Time { return now.Add(11 * time.Second) }
+	monotonicNow := now
+	reconciler.MonotonicNow = func() time.Time { return monotonicNow }
+	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); !errors.Is(err, errHAPhysicalIsolationGracePending) {
+		t.Fatalf("fresh controller did not start a local watchdog barrier: %v", err)
+	}
+	monotonicNow = monotonicNow.Add(10 * time.Second)
+	err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "no longer match the checkpointed physical-isolation observation") {
+		t.Fatalf("phase=Succeeded bypassed current StatefulSet generation validation: %v", err)
+	}
+}
+
 func validPhysicalIsolationReceiptFixture(now time.Time) (*antflyv1.AntflyCluster, antflyv1.HAPlannedActionStatus) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 	cluster.UID = types.UID("cluster-uid")
@@ -4040,20 +4127,26 @@ func validPhysicalIsolationReceiptFixture(now time.Time) (*antflyv1.AntflyCluste
 	action := antflyv1.HAPlannedActionStatus{
 		Kind: string(haActionIsolateFormerPrimary), Executor: string(haActionExecutorControllerAction),
 		StandbyName: "primary-a", TargetLSN: 12, ObservedLSN: 12, RouteFrom: "primary-a", RouteTo: "standby-a",
-		FenceAuthority: antflyv1.HAFencingAuthorityKubernetesLease, FenceHolder: "standby-a", FenceGeneration: 1,
+		FenceAuthority: antflyv1.HAFencingAuthorityKubernetesLease, FenceHolder: "standby-a", FenceGeneration: 2,
 		AdminJobName: haKubernetesPhysicalFenceName, AdminJobPhase: haAdminJobPhaseSucceeded, CompletedAt: observed.DeepCopy(),
 	}
 	action.PhysicalIsolationReceipt = &antflyv1.HAPhysicalIsolationReceiptStatus{
 		ClusterUID: "cluster-uid", StatefulSetName: "antfly-standalone", StatefulSetUID: "sts-uid",
 		InitialStatefulSetGeneration: 1, InitialStatefulSetResourceVersion: "1",
 		InitialOldPods:                []antflyv1.HAPhysicalIsolationPodIdentity{{Name: "antfly-standalone-0", UID: "old-pod-uid"}},
-		InitialPodListResourceVersion: "pods-initial", LeaseName: "antfly-ha-fence", LeaseUID: "lease-uid",
-		LeaseResourceVersion: "1", LeaseHolder: "standby-a", LeaseGeneration: 1,
-		LeaseScope:        antflyv1.HAPhysicalIsolationLeaseScope{ClusterID: 100, TimelineID: 4, Epoch: 6, CurrentPrimaryID: "primary-a", PrimaryLSN: 12},
-		LeaseTransferTime: metav1.NewTime(now), WatchdogGraceSeconds: 10,
+		InitialPodListResourceVersion: "pods-initial", LeaseName: "topology-ha-fence", LeaseUID: "lease-uid",
+		LeaseResourceVersion: "1", LeaseHolder: "standby-a", LeaseGeneration: 2,
+		LeaseScope:        antflyv1.HAPhysicalIsolationLeaseScope{TopologyID: "topology-anchor-uid", ClusterID: 100, TimelineID: 4, Epoch: 6, CurrentPrimaryID: "primary-a", PrimaryLSN: 12},
+		LeaseTransferTime: metav1.NewTime(now), WatchdogMaxFenceLatencyMS: 10_000,
 		IsolatedStatefulSetGeneration: 2, IsolatedStatefulSetObservedGeneration: 2,
 		IsolatedStatefulSetResourceVersion: "2", ObservedLeaseResourceVersion: "2", AbsenceProven: true,
 		AbsencePodListResourceVersion: "pods-absence", FrozenBoundaryLSN: 12, ObservedAt: observed.DeepCopy(), CompletedAt: observed.DeepCopy(),
+		WatchdogProof: &antflyv1.HAPhysicalIsolationWatchdogProofStatus{
+			CapabilityVersion: 1, Active: true, AuthorityGranted: true, LeaseName: "topology-ha-fence", LeaseNamespace: "default",
+			TopologyID: "topology-anchor-uid", LocalNodeID: "primary-a", ObservedHolderNodeID: "primary-a", PodName: "antfly-standalone-0", PodUID: "old-pod-uid",
+			ContainerName: "antfly", ContainerID: "containerd://old-process", ContainerStartedAt: metav1.NewTime(now.Add(-time.Minute)),
+			ProcessBootID: strings.Repeat("a", 64), ObservedLeaseTransitions: 1, MaxFenceLatencyMS: 10_000, RuntimeObservedAt: metav1.NewTime(now.Add(-time.Second)),
+		},
 	}
 	return cluster, action
 }
@@ -5153,8 +5246,11 @@ func TestReconcileHAFencingLeaseCreatesReadyLeaseForCaughtUpStandby(t *testing.T
 		lease.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "12" {
 		t.Fatalf("expected HA fence scope annotations, got %#v", lease.Annotations)
 	}
-	if len(lease.OwnerReferences) != 1 || lease.OwnerReferences[0].Name != cluster.Name {
-		t.Fatalf("expected cluster owner reference, got %#v", lease.OwnerReferences)
+	if len(lease.OwnerReferences) != 0 {
+		t.Fatalf("shared topology Lease must outlive any one primary CR, got owner references %#v", lease.OwnerReferences)
+	}
+	if lease.Annotations[haFencingLeaseAnnotationTopologyID] != "topology-anchor-uid" {
+		t.Fatalf("shared topology Lease lost its stable topology identity: %#v", lease.Annotations)
 	}
 
 	if err := reconciler.observeHAFencingStatus(context.Background(), cluster); err != nil {
@@ -5383,7 +5479,8 @@ func TestReconcileHAFencingLeaseSkipsWithoutPromotionBoundary(t *testing.T) {
 	cluster.Status.HAStatus.PrimaryLSN = 0
 	cluster.Status.HAStatus.PrimaryAdminReachable = false
 	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin timeout"
-	reconciler := testHAReconciler(t, cluster)
+	existing := haFenceLease(cluster, time.Now(), haFencingLeaseDefaultDurationSeconds, 1, "primary-a")
+	reconciler := testHAReconciler(t, cluster, existing)
 
 	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
 		t.Fatalf("reconcile fencing lease: %v", err)
