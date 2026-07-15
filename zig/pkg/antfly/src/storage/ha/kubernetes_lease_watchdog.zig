@@ -40,6 +40,9 @@ pub const Decision = enum {
     waiting,
     /// The exact, unexpired Lease was validated and is held by another node.
     observed,
+    /// The Lease now names this node, but no strictly newer renewal has yet
+    /// proven that the new holder is actively renewing its authority.
+    pending_authority,
     authorized,
     grace,
     fence,
@@ -140,7 +143,7 @@ pub const Watchdog = struct {
             if (self.authorized_once) return self.latch(.generation_rollback);
             return error.LeaseGenerationRollback;
         }
-        if (generation == self.last_generation and self.last_renew_ns != 0 and renew_ns < self.last_renew_ns) {
+        if (self.last_renew_ns != 0 and renew_ns < self.last_renew_ns) {
             if (self.authorized_once) return self.latch(.renewal_rollback);
             return error.LeaseRenewalRollback;
         }
@@ -154,7 +157,6 @@ pub const Watchdog = struct {
         // A standby must publish proof that it is actively monitoring this
         // exact topology before the holder transfer. Preserve the monotonic
         // Lease generation even though public authority is not yet granted.
-        const exact_transfer = generation > self.last_generation;
         const newer_renewal = renew_ns > self.last_renew_ns;
         self.last_generation = @max(self.last_generation, generation);
         self.last_renew_ns = @max(self.last_renew_ns, renew_ns);
@@ -162,7 +164,8 @@ pub const Watchdog = struct {
         self.last_observed_holder_len = @intCast(holder.len);
         if (!std.mem.eql(u8, holder, self.cfg.scope.node_id)) return .observed;
 
-        if (!self.authorized_once or exact_transfer or newer_renewal) {
+        if (!self.authorized_once and !newer_renewal) return .pending_authority;
+        if (!self.authorized_once or newer_renewal) {
             self.authorized_once = true;
             self.local_deadline_ns = monotonic_ns +| self.cfg.grace_ns;
             return .authorized;
@@ -481,6 +484,33 @@ test "kubernetes lease watchdog strictly newer renewal extends authority deadlin
     try std.testing.expectEqual(Decision.authorized, try watchdog.observe(std.testing.allocator, newer, realtime, 5 * std.time.ns_per_s));
     try std.testing.expect(watchdog.local_deadline_ns > first_deadline);
     try std.testing.expectEqual(5 * std.time.ns_per_s + grace, watchdog.local_deadline_ns);
+}
+
+test "kubernetes lease watchdog transfer requires nonregressing then strictly newer renewal" {
+    const before =
+        \\{"metadata":{"annotations":{"antfly.io/ha-fence-topology-id":"topology-7"}},"spec":{"holderIdentity":"primary-a","leaseDurationSeconds":30,"renewTime":"2026-07-15T12:00:02Z","leaseTransitions":3}}
+    ;
+    const transfer_older =
+        \\{"metadata":{"annotations":{"antfly.io/ha-fence-topology-id":"topology-7"}},"spec":{"holderIdentity":"standby-a","leaseDurationSeconds":30,"renewTime":"2026-07-15T12:00:01Z","leaseTransitions":4}}
+    ;
+    const transfer_equal =
+        \\{"metadata":{"annotations":{"antfly.io/ha-fence-topology-id":"topology-7"}},"spec":{"holderIdentity":"standby-a","leaseDurationSeconds":30,"renewTime":"2026-07-15T12:00:02Z","leaseTransitions":4}}
+    ;
+    const renewed =
+        \\{"metadata":{"annotations":{"antfly.io/ha-fence-topology-id":"topology-7"}},"spec":{"holderIdentity":"standby-a","leaseDurationSeconds":30,"renewTime":"2026-07-15T12:00:03Z","leaseTransitions":4}}
+    ;
+    const realtime = try rfc3339UnixNs("2026-07-15T12:00:03Z");
+
+    var older = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "standby-a", .data_generation = "seed-a" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, true);
+    try std.testing.expectEqual(Decision.observed, try older.observe(std.testing.allocator, before, realtime, 1));
+    try std.testing.expectError(error.LeaseRenewalRollback, older.observe(std.testing.allocator, transfer_older, realtime, 2));
+
+    var equal = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "standby-a", .data_generation = "seed-a" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, true);
+    try std.testing.expectEqual(Decision.observed, try equal.observe(std.testing.allocator, before, realtime, 1));
+    try std.testing.expectEqual(Decision.pending_authority, try equal.observe(std.testing.allocator, transfer_equal, realtime, 2));
+    try std.testing.expect(!equal.authorityGranted());
+    try std.testing.expectEqual(Decision.authorized, try equal.observe(std.testing.allocator, renewed, realtime, 3));
+    try std.testing.expect(equal.authorityGranted());
 }
 
 test "kubernetes lease watchdog persisted fence only rotates after validated new data generation" {

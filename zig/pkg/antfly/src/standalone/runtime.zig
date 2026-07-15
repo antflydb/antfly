@@ -323,7 +323,7 @@ const RuntimeLeaseWatchdog = struct {
         // reports active after validating the shared Lease while another node
         // still holds it, allowing the controller to certify the exact process
         // before an in-place promotion.
-        if (decision == .observed or decision == .authorized or decision == .grace) {
+        if (decision == .observed or decision == .pending_authority or decision == .authorized or decision == .grace) {
             self.proof_transitions.store(self.watchdog.last_generation, .release);
             self.proof_active.store(true, .release);
             self.proof_capability_deadline_ns.store(observed_monotonic_ns +| self.watchdog.cfg.grace_ns, .release);
@@ -370,7 +370,7 @@ const RuntimeLeaseWatchdog = struct {
         decision: antfly.ha.kubernetes_lease_watchdog.Decision,
     ) !void {
         switch (decision) {
-            .waiting, .observed, .grace => {},
+            .waiting, .observed, .pending_authority, .grace => {},
             .authorized => {
                 self.proof_transitions.store(self.watchdog.last_generation, .release);
                 self.proof_active.store(true, .release);
