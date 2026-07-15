@@ -59,6 +59,15 @@ pub const OpenedObjectStore = struct {
         return try initRemoteUriWithS3Options(alloc, uri, file_bucket, null);
     }
 
+    /// Opens an existing S3 namespace without creating a missing bucket. This
+    /// is the only safe constructor for destructive cleanup: a missing bucket
+    /// must be observed as an error, not manufactured into an empty success.
+    pub fn initExistingS3RemoteUri(alloc: Allocator, uri: []const u8) !OpenedObjectStore {
+        var value = try remote_uri.bucketPathFromS3UriAlloc(alloc, uri);
+        defer value.deinit(alloc);
+        return try initExistingS3UriWithOptions(alloc, value.bucket, value.prefix, null);
+    }
+
     pub fn initRemoteUriWithS3Options(
         alloc: Allocator,
         uri: []const u8,
@@ -128,13 +137,33 @@ pub const OpenedObjectStore = struct {
         prefix: []const u8,
         options: ?S3Options,
     ) !OpenedObjectStore {
+        return try initS3UriWithOptionsAndBucketPolicy(alloc, bucket, prefix, options, true);
+    }
+
+    fn initExistingS3UriWithOptions(
+        alloc: Allocator,
+        bucket: []const u8,
+        prefix: []const u8,
+        options: ?S3Options,
+    ) !OpenedObjectStore {
+        return try initS3UriWithOptionsAndBucketPolicy(alloc, bucket, prefix, options, false);
+    }
+
+    fn initS3UriWithOptionsAndBucketPolicy(
+        alloc: Allocator,
+        bucket: []const u8,
+        prefix: []const u8,
+        options: ?S3Options,
+        create_missing_bucket: bool,
+    ) !OpenedObjectStore {
         const s3 = try alloc.create(object_storage.S3.Client);
         errdefer alloc.destroy(s3);
         const cfg = try s3ConfigAlloc(alloc, options);
         s3.* = try object_storage.S3.Client.init(alloc, cfg);
 
         var owned_client = s3.client();
-        if (!(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        if (create_missing_bucket and !(try owned_client.bucketExists(bucket)))
+            try owned_client.makeBucket(bucket);
         return .{
             .alloc = alloc,
             .client = owned_client,
@@ -152,6 +181,18 @@ pub const OpenedObjectStore = struct {
             .client = owned_client,
             .owns_client = false,
             .bucket = try alloc.dupe(u8, bucket),
+            .prefix = try alloc.dupe(u8, prefix),
+        };
+    }
+
+    pub fn initWithExistingClient(alloc: Allocator, client: object_storage.ObjectStorage, bucket: []const u8, prefix: []const u8) !OpenedObjectStore {
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
+        return .{
+            .alloc = alloc,
+            .client = client,
+            .owns_client = false,
+            .bucket = owned_bucket,
             .prefix = try alloc.dupe(u8, prefix),
         };
     }

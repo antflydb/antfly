@@ -111,7 +111,8 @@ pub fn receiptSha256Alloc(alloc: Allocator, receipt: Receipt) ![]u8 {
 }
 
 pub fn deleteAll(alloc: Allocator, store: Store, request: Request, options: Options) !Result {
-    try validateRequest(alloc, store, request);
+    try validateRequestAuthority(alloc, request);
+    try validateStoreBinding(alloc, store, request);
     if (options.max_keys == 0 or options.max_quiescence_rounds == 0)
         return error.InvalidSeedPrefixCleanupLimits;
 
@@ -208,7 +209,9 @@ pub fn validateReceipt(alloc: Allocator, receipt: Receipt, request: Request) !vo
         return error.SeedPrefixCleanupReceiptDigestMismatch;
 }
 
-fn validateRequest(alloc: Allocator, store: Store, request: Request) !void {
+/// Validates the immutable controller authority before any remote object-store
+/// handle is opened. This keeps malformed bucket/prefix input side-effect free.
+pub fn validateRequestAuthority(alloc: Allocator, request: Request) !void {
     if (request.version != request_version or !std.mem.eql(u8, request.kind, request_kind))
         return error.InvalidSeedPrefixCleanupSchema;
     if (!validation.isIdentifier(request.operation_id) or !validation.isIdentifier(request.retry_token) or
@@ -233,10 +236,7 @@ fn validateRequest(alloc: Allocator, store: Store, request: Request) !void {
     defer alloc.free(expected_prefix);
     const expected_location = try std.fmt.allocPrint(alloc, "s3://{s}/{s}", .{ bucket, expected_prefix });
     defer alloc.free(expected_location);
-    if (!std.mem.eql(u8, request.location, expected_location) or
-        !std.mem.eql(u8, store.bucket, bucket) or
-        !std.mem.eql(u8, store.prefix, expected_prefix))
-    {
+    if (!std.mem.eql(u8, request.location, expected_location)) {
         return error.InvalidSeedPrefixCleanupPrefix;
     }
 
@@ -250,6 +250,16 @@ fn validateRequest(alloc: Allocator, store: Store, request: Request) !void {
     defer alloc.free(request_sha256);
     if (!std.mem.eql(u8, request_sha256, request.request_sha256))
         return error.SeedPrefixCleanupRequestDigestMismatch;
+}
+
+fn validateStoreBinding(alloc: Allocator, store: Store, request: Request) !void {
+    const rest = request.location["s3://".len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse unreachable;
+    const bucket = rest[0..slash];
+    const expected_prefix = try std.fmt.allocPrint(alloc, "instances/{s}/ha-seeds/", .{request.instance_id});
+    defer alloc.free(expected_prefix);
+    if (!std.mem.eql(u8, store.bucket, bucket) or !std.mem.eql(u8, store.prefix, expected_prefix))
+        return error.InvalidSeedPrefixCleanupPrefix;
 }
 
 fn listAllKeysAlloc(alloc: Allocator, store: Store, max_keys: u32) ![][]u8 {

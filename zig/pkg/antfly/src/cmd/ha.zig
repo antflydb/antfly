@@ -219,7 +219,7 @@ pub fn runArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !
     std.Io.File.stdout().writeStreamingAll(io, "\n") catch {};
 }
 
-const ArtifactAction = enum { publish, restore, verify, activate, prune, gc_source, gc_target };
+const ArtifactAction = enum { publish, restore, verify, activate, prune, gc_source, gc_target, delete_prefix };
 
 const ArtifactFlag = enum {
     location,
@@ -248,6 +248,42 @@ const ArtifactFlag = enum {
     target_replica_id,
     retain_generations,
     protect_generation,
+    operation_id,
+    retry_token,
+    instance_id,
+    prefix_sha256,
+    credentials_secret_name,
+    delete_all,
+    request_sha256,
+};
+
+const PrefixCleanupOptions = struct {
+    operation_id: ?[]const u8 = null,
+    retry_token: ?[]const u8 = null,
+    instance_id: ?[]const u8 = null,
+    topology_id: ?[]const u8 = null,
+    topology_generation: ?u64 = null,
+    prefix_sha256: ?[]const u8 = null,
+    credentials_secret_name: ?[]const u8 = null,
+    delete_all: bool = false,
+    request_sha256: ?[]const u8 = null,
+
+    fn finish(self: PrefixCleanupOptions, location: ?[]const u8) !ha.seed_prefix_cleanup.Request {
+        return .{
+            .version = ha.seed_prefix_cleanup.request_version,
+            .kind = ha.seed_prefix_cleanup.request_kind,
+            .operation_id = self.operation_id orelse return error.SeedPrefixCleanupOperationIdMissing,
+            .retry_token = self.retry_token orelse return error.SeedPrefixCleanupRetryTokenMissing,
+            .instance_id = self.instance_id orelse return error.SeedPrefixCleanupInstanceIdMissing,
+            .topology_id = self.topology_id orelse return error.TopologyIdMissing,
+            .topology_generation = self.topology_generation orelse return error.TopologyGenerationMissing,
+            .location = location orelse return error.SeedLocationMissing,
+            .prefix_sha256 = self.prefix_sha256 orelse return error.SeedPrefixCleanupPrefixDigestMissing,
+            .credentials_secret_name = self.credentials_secret_name orelse return error.SeedPrefixCleanupCredentialsSecretMissing,
+            .delete_all = self.delete_all,
+            .request_sha256 = self.request_sha256 orelse return error.SeedPrefixCleanupRequestDigestMissing,
+        };
+    }
 };
 
 const ActivationBindingOptions = struct {
@@ -295,6 +331,7 @@ const ArtifactOptions = struct {
     retain_generations: usize = 2,
     protected_generations: []const []const u8 = &.{},
     owns_protected_generations: bool = false,
+    cleanup: PrefixCleanupOptions = .{},
 
     fn deinit(self: *ArtifactOptions, alloc: std.mem.Allocator) void {
         if (self.owns_protected_generations) alloc.free(self.protected_generations);
@@ -466,6 +503,21 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             defer result.deinit(alloc);
             try writeArtifactResult(io, result.result_json);
         },
+        .delete_prefix => {
+            const request = try options.cleanup.finish(options.location);
+            // Validate every controller-bound field and digest before opening a
+            // remote client, so malformed cleanup authority has no side effect.
+            try ha.seed_prefix_cleanup.validateRequestAuthority(alloc, request);
+            var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initExistingS3RemoteUri(alloc, request.location);
+            defer opened.deinit();
+            var result = try ha.seed_prefix_cleanup.deleteAll(alloc, .{
+                .client = &opened.client,
+                .bucket = opened.bucket,
+                .prefix = opened.prefix,
+            }, request, .{});
+            defer result.deinit(alloc);
+            try writeArtifactResult(io, result.receipt_json);
+        },
     }
 }
 
@@ -485,6 +537,8 @@ fn parseArtifactArgs(alloc: std.mem.Allocator, argv: []const []const u8) !Artifa
         .gc_source
     else if (std.mem.eql(u8, argv[0], "gc-target"))
         .gc_target
+    else if (std.mem.eql(u8, argv[0], "delete-prefix"))
+        .delete_prefix
     else
         return error.InvalidSeedArtifactAction };
     var protected_generations = std.ArrayListUnmanaged([]const u8).empty;
@@ -518,8 +572,20 @@ fn parseArtifactArgs(alloc: std.mem.Allocator, argv: []const []const u8) !Artifa
             .ha_timeline_id => options.identity.timeline_id = try parseU64(try artifactValue(argv, &idx)),
             .ha_epoch => options.identity.epoch = try parseU64(try artifactValue(argv, &idx)),
             .minimum_checkpoint_lsn => options.minimum_checkpoint_lsn = try parseU64(try artifactValue(argv, &idx)),
-            .topology_id => options.binding.topology_id = try artifactValue(argv, &idx),
-            .topology_generation => options.binding.topology_generation = try parseU64(try artifactValue(argv, &idx)),
+            .topology_id => {
+                const raw = try artifactValue(argv, &idx);
+                if (options.action == .delete_prefix)
+                    options.cleanup.topology_id = raw
+                else
+                    options.binding.topology_id = raw;
+            },
+            .topology_generation => {
+                const raw = try parseU64(try artifactValue(argv, &idx));
+                if (options.action == .delete_prefix)
+                    options.cleanup.topology_generation = raw
+                else
+                    options.binding.topology_generation = raw;
+            },
             .node_id => options.binding.node_id = try artifactValue(argv, &idx),
             .target_pvc_name => options.binding.target_pvc_name = try artifactValue(argv, &idx),
             .target_pvc_uid => options.binding.target_pvc_uid = try artifactValue(argv, &idx),
@@ -538,6 +604,13 @@ fn parseArtifactArgs(alloc: std.mem.Allocator, argv: []const []const u8) !Artifa
                 }
                 try protected_generations.append(alloc, generation);
             },
+            .operation_id => options.cleanup.operation_id = try artifactValue(argv, &idx),
+            .retry_token => options.cleanup.retry_token = try artifactValue(argv, &idx),
+            .instance_id => options.cleanup.instance_id = try artifactValue(argv, &idx),
+            .prefix_sha256 => options.cleanup.prefix_sha256 = try artifactValue(argv, &idx),
+            .credentials_secret_name => options.cleanup.credentials_secret_name = try artifactValue(argv, &idx),
+            .delete_all => options.cleanup.delete_all = true,
+            .request_sha256 => options.cleanup.request_sha256 = try artifactValue(argv, &idx),
         }
     }
     options.protected_generations = try protected_generations.toOwnedSlice(alloc);
@@ -573,14 +646,21 @@ fn artifactFlag(raw: []const u8) ?ArtifactFlag {
         .{ "--target-replica-id", .target_replica_id },
         .{ "--retain-generations", .retain_generations },
         .{ "--protect-generation", .protect_generation },
+        .{ "--operation-id", .operation_id },
+        .{ "--retry-token", .retry_token },
+        .{ "--instance-id", .instance_id },
+        .{ "--prefix-sha256", .prefix_sha256 },
+        .{ "--credentials-secret-name", .credentials_secret_name },
+        .{ "--delete-all", .delete_all },
+        .{ "--request-sha256", .request_sha256 },
     });
     return names.get(raw);
 }
 
 fn artifactFlagAllowed(action: ArtifactAction, flag: ArtifactFlag) bool {
     return switch (flag) {
-        .location => action == .publish or action == .restore or action == .prune or action == .gc_source,
-        .generation, .slot => action != .gc_target,
+        .location => action == .publish or action == .restore or action == .prune or action == .gc_source or action == .delete_prefix,
+        .generation, .slot => action != .gc_target and action != .delete_prefix,
         .manifest, .content_root => action == .publish,
         .capture_receipt => action == .publish,
         .capture_receipt_sha256 => action == .publish or action == .restore or action == .verify or action == .activate,
@@ -589,10 +669,12 @@ fn artifactFlagAllowed(action: ArtifactAction, flag: ArtifactFlag) bool {
         .capture_root => action == .gc_source,
         .slot_activation_receipt => action == .gc_target,
         .ha_cluster_id, .ha_shard_id, .ha_table_id, .ha_timeline_id, .ha_epoch, .minimum_checkpoint_lsn => action == .restore or action == .verify or action == .activate,
-        .topology_id, .topology_generation, .node_id, .target_pvc_name, .target_pvc_uid => action == .publish or action == .restore or action == .verify or action == .activate,
+        .topology_id, .topology_generation => action == .publish or action == .restore or action == .verify or action == .activate or action == .delete_prefix,
+        .node_id, .target_pvc_name, .target_pvc_uid => action == .publish or action == .restore or action == .verify or action == .activate,
         .target_local_node_id, .target_replica_id => action == .activate,
         .retain_generations => action == .prune or action == .gc_source or action == .gc_target,
         .protect_generation => action == .gc_source or action == .gc_target,
+        .operation_id, .retry_token, .instance_id, .prefix_sha256, .credentials_secret_name, .delete_all, .request_sha256 => action == .delete_prefix,
     };
 }
 
