@@ -18227,7 +18227,7 @@ fn completeDocumentExtractionGeneratedText(
                 continue;
             };
             errdefer alloc.free(produced);
-            try applyGeneratedUnitText(alloc, unit, produced, "ocr_text", "completed", .ocr, config.ocr_quality, config.ocr_prompt);
+            try applyGeneratedUnitText(alloc, unit, produced, "ocr_text", "completed", .ocr, config.ocr_quality, document_extraction_mod.effectiveOcrPrompt(config));
             continue;
         }
         if (config.transcription_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_transcription")) {
