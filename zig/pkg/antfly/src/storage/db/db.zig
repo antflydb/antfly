@@ -8160,6 +8160,50 @@ pub const DB = struct {
         try self.refreshSplitBootstrapRangeInMemory(byte_range);
     }
 
+    /// Appends a bounded chunk into an isolated Raft snapshot generation.
+    /// The caller owns generation publication and must never call this against
+    /// a live generation because chunks are independently durable.
+    pub fn appendRaftDocumentSnapshotChunk(
+        self: *DB,
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        byte_range: types.ByteRange,
+        writes: []const types.BatchWrite,
+    ) !void {
+        try staged_generation.validatePath(self.core.path);
+        if (byte_range.start.len > 0 and byte_range.end.len > 0 and
+            std.mem.order(u8, byte_range.start, byte_range.end) != .lt)
+        {
+            return error.InvalidAppliedDataRange;
+        }
+        for (writes) |write| if (!byte_range.contains(write.key)) return error.KeyOutOfRange;
+        try self.batchInternal(.{
+            .writes = writes,
+            .sync_level = .write,
+        }, null, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+            .bypass_ha_write_gate = true,
+        });
+    }
+
+    /// Finalizes the range metadata after all chunks have been imported.
+    pub fn finishRaftDocumentSnapshot(
+        self: *DB,
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        byte_range: types.ByteRange,
+    ) !void {
+        try staged_generation.validatePath(self.core.path);
+        var range_buf: [1024]u8 = undefined;
+        const range_write = try range_state_mod.rangeMetadataWrite(byte_range, &range_buf);
+        try self.batchInternal(.{ .sync_level = .write }, null, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+            .bypass_ha_write_gate = true,
+            .extra_store_writes = &.{range_write},
+        });
+        try self.refreshSplitBootstrapRangeInMemory(byte_range);
+    }
+
     /// Atomically replaces a split destination generation. The primary
     /// document mutations, derived replay record, range, replay fence, and
     /// completed marker share one storage commit. Callers must hold the
@@ -61987,6 +62031,62 @@ test "db raft snapshot replacement preserves overlapping incoming documents" {
     defer alloc.free(added);
     try std.testing.expectEqualStrings("{\"new\":true}", added);
     try std.testing.expect((try db.get(alloc, "doc:stale")) == null);
+}
+
+test "db staged raft snapshot chunks atomically replace the live generation" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var live = try DB.open(alloc, std.mem.span(path), .{});
+        defer live.close();
+        try live.batch(.{ .writes = &.{.{ .key = "doc:stale", .value = "{\"stale\":true}" }} });
+    }
+
+    var preparation = try generation_lifecycle.beginProcessPreparationWithRuntime(std.mem.span(path), null);
+    defer preparation.deinit();
+    var staged = try preparation.beginStaging();
+    defer staged.deinit();
+    {
+        var candidate = try DB.open(alloc, staged.path(), .{
+            .staged_generation = &staged,
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+        });
+        defer candidate.close();
+        const byte_range: types.ByteRange = .{ .start = "doc:a", .end = "doc:z" };
+        try candidate.appendRaftDocumentSnapshotChunk(&staged, byte_range, &.{.{
+            .key = "doc:keep",
+            .value = "{\"version\":2}",
+        }});
+        try candidate.appendRaftDocumentSnapshotChunk(&staged, byte_range, &.{.{
+            .key = "doc:new",
+            .value = "{\"new\":true}",
+        }});
+        try candidate.finishRaftDocumentSnapshot(&staged, byte_range);
+        try candidate.sync(true);
+    }
+    try staged.seal();
+    var exclusive = try preparation.promote();
+    defer exclusive.deinit();
+    _ = try staged.publish();
+    exclusive.deinit();
+    staged.deinit();
+    preparation.deinit();
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    const retained = (try reopened.get(alloc, "doc:keep")).?;
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("{\"version\":2}", retained);
+    const added = (try reopened.get(alloc, "doc:new")).?;
+    defer alloc.free(added);
+    try std.testing.expectEqualStrings("{\"new\":true}", added);
+    try std.testing.expect((try reopened.get(alloc, "doc:stale")) == null);
+    try std.testing.expectEqualStrings("doc:a", reopened.getRange().start);
+    try std.testing.expectEqualStrings("doc:z", reopened.getRange().end);
 }
 
 test "db split bootstrap replacement preserves overlapping incoming documents" {

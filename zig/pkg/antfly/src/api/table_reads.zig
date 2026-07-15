@@ -937,12 +937,31 @@ pub const backend_current_root_generation: u64 = 0;
 pub const GroupVisibleRootGenerationSource = struct {
     ptr: *anyopaque,
     visible_root_generation_for_group: *const fn (ptr: *anyopaque, group_id: u64) u64,
+    prepare_root_generation_for_group: ?*const fn (ptr: *anyopaque, group_id: u64) anyerror!void = null,
+    advance_root_generation_for_group: ?*const fn (ptr: *anyopaque, group_id: u64) void = null,
 
     /// Shared LSM/HBC cache namespace for the currently visible replica root.
     /// This is advanced when local root/catalog visibility is reconciled; it is
     /// not the storage engine's physical per-write generation.
     pub fn visibleRootGenerationForGroup(self: GroupVisibleRootGenerationSource, group_id: u64) u64 {
         return self.visible_root_generation_for_group(self.ptr, group_id);
+    }
+
+    /// Reserves generation bookkeeping before a fallible publication starts.
+    pub fn prepareRootGenerationForGroup(self: GroupVisibleRootGenerationSource, group_id: u64) !bool {
+        const prepare = self.prepare_root_generation_for_group orelse {
+            if (self.advance_root_generation_for_group != null) return error.InvalidRootGenerationSource;
+            return false;
+        };
+        if (self.advance_root_generation_for_group == null) return error.InvalidRootGenerationSource;
+        try prepare(self.ptr, group_id);
+        return true;
+    }
+
+    /// Advances a previously reserved generation after an atomic root swap.
+    pub fn advanceRootGenerationForGroup(self: GroupVisibleRootGenerationSource, group_id: u64) void {
+        const advance = self.advance_root_generation_for_group orelse return;
+        advance(self.ptr, group_id);
     }
 };
 

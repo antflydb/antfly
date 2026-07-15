@@ -1613,6 +1613,31 @@ pub const DocStore = struct {
         return owned;
     }
 
+    /// Scan only keys in [lower, upper). This avoids copying document values
+    /// when callers need an atomic delete set for generation replacement.
+    pub fn scanRangeKeys(self: *DocStore, alloc: Allocator, lower: []const u8, upper: []const u8) ![][]u8 {
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+
+        var cur = try txn.openCursor();
+        defer cur.close();
+        cur.setUpperBound(if (upper.len > 0) upper else null);
+
+        var keys = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (keys.items) |key| alloc.free(key);
+            keys.deinit(alloc);
+        }
+        var entry = if (lower.len == 0) try cur.first() else try cur.seekAtOrAfter(lower);
+        while (entry) |kv| : (entry = try cur.next()) {
+            if (upper.len > 0 and std.mem.order(u8, kv.key, upper) != .lt) break;
+            const key = try alloc.dupe(u8, kv.key);
+            errdefer alloc.free(key);
+            try keys.append(alloc, key);
+        }
+        return try keys.toOwnedSlice(alloc);
+    }
+
     pub fn findMedianKey(self: *DocStore, alloc: Allocator, lower: []const u8, upper: []const u8, options: ScanOptions) ![]u8 {
         var txn = try self.beginReadTxn();
         defer txn.abort();

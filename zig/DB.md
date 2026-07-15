@@ -71,6 +71,18 @@ namespace. After durable publication, the exchanged old root is submitted to
 the shared backend runtime's cleanup lane; recursive reclamation is not part of
 the admission-critical publication path.
 
+Data-Raft snapshot apply follows the same generation boundary. The apply path
+validates the canonical snapshot stream without materializing document values
+or a descriptor per document, builds a fresh staged DB in fixed-size borrowed
+batches, syncs and seals it, then atomically publishes it under the table and
+shard transition capabilities. It never scans or deletes the old live table.
+Shared cache-generation bookkeeping is reserved before staging and advanced
+without allocation immediately after the namespace exchange, so no fallible
+bookkeeping step can leave the new root visible under the old cache identity.
+Schema validation is parsed once per snapshot and applied per bounded batch;
+derived replay remains durable in the staged generation for normal workers to
+resume after publication.
+
 `DB.restoreSnapshotToDeferredRuntimeRepair()` accepts a `StagedGeneration`
 capability and rejects a path that is not the capability's staging root. Raw
 path possession is therefore insufficient to mutate a serving root. Startup,

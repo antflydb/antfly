@@ -1291,6 +1291,42 @@ pub const RaftApplyStore = struct {
         .{ .projection = .reallocation_request, .key = .{ .point = reallocationRequestKeyForGroup } },
     };
 
+    fn metadataSnapshotProjectionBit(projection: MetadataSnapshotProjection) u32 {
+        return @as(u32, 1) << @intFromEnum(projection);
+    }
+
+    /// Exhaustively ties every durable transition command to the projection
+    /// classes that must survive a metadata Raft snapshot. Adding a command
+    /// without classifying its durable output is therefore a compile error.
+    fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) u32 {
+        return switch (tag) {
+            .upsert_node, .register_node, .remove_node => metadataSnapshotProjectionBit(.node),
+            .request_node_shutdown, .cancel_node_shutdown, .finalize_node_shutdown => metadataSnapshotProjectionBit(.node) | metadataSnapshotProjectionBit(.store),
+            .upsert_store, .register_store, .remove_store => metadataSnapshotProjectionBit(.store),
+            .upsert_replica_intent, .remove_replica_intent => metadataSnapshotProjectionBit(.placement),
+            .upsert_table, .remove_table => metadataSnapshotProjectionBit(.table),
+            .upsert_schema_progress, .remove_schema_progress => metadataSnapshotProjectionBit(.schema_progress),
+            .upsert_restore_progress, .remove_restore_progress => metadataSnapshotProjectionBit(.restore_progress),
+            .upsert_replication_source_status, .remove_replication_source_status => metadataSnapshotProjectionBit(.replication_source_status),
+            .upsert_range, .remove_range => metadataSnapshotProjectionBit(.range),
+            .admit_split_transition => metadataSnapshotProjectionBit(.split_transition) | metadataSnapshotProjectionBit(.range),
+            .upsert_split_transition, .remove_split_transition => metadataSnapshotProjectionBit(.split_transition),
+            .upsert_merge_transition, .remove_merge_transition => metadataSnapshotProjectionBit(.merge_transition),
+            .upsert_reconcile_lease, .remove_reconcile_lease => metadataSnapshotProjectionBit(.reconcile_lease),
+            .upsert_shuffle_join_lease, .remove_shuffle_join_lease => metadataSnapshotProjectionBit(.shuffle_join_lease),
+            .upsert_restore_job, .remove_restore_job, .remove_restore_jobs => metadataSnapshotProjectionBit(.restore_job),
+            .upsert_reallocation_request, .remove_reallocation_request => metadataSnapshotProjectionBit(.reallocation_request),
+            .upsert_extension_package, .remove_extension_package => metadataSnapshotProjectionBit(.extension_package),
+            .upsert_installed_extension, .remove_installed_extension => metadataSnapshotProjectionBit(.installed_extension),
+            .upsert_extension_member, .remove_extension_member => metadataSnapshotProjectionBit(.extension_member),
+            .upsert_extension_dependency, .remove_extension_dependency => metadataSnapshotProjectionBit(.extension_dependency),
+            .apply_extension_lifecycle => metadataSnapshotProjectionBit(.table) |
+                metadataSnapshotProjectionBit(.installed_extension) |
+                metadataSnapshotProjectionBit(.extension_member) |
+                metadataSnapshotProjectionBit(.extension_dependency),
+        };
+    }
+
     const PreparedSnapshot = struct {
         owner: *RaftApplyStore,
         txn: docstore.DocStore.Txn,
@@ -4746,6 +4782,18 @@ test "metadata raft apply store snapshot key registry covers every durable proje
         try std.testing.expect(!metadataSnapshotKeyBelongsToGroup(42, key));
     }
     for (seen) |present| try std.testing.expect(present);
+
+    var descriptor_mask: u32 = 0;
+    for (RaftApplyStore.metadata_snapshot_projections) |descriptor| {
+        descriptor_mask |= RaftApplyStore.metadataSnapshotProjectionBit(descriptor.projection);
+    }
+    var command_mask: u32 = 0;
+    inline for (std.meta.tags(std.meta.Tag(TransitionCommand))) |tag| {
+        const mask = RaftApplyStore.transitionCommandProjectionMask(tag);
+        try std.testing.expect(mask != 0);
+        command_mask |= mask;
+    }
+    try std.testing.expectEqual(descriptor_mask, command_mask);
 }
 
 fn appendInt(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), comptime T: type, value: T) !void {

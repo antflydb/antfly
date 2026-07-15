@@ -759,3 +759,82 @@ test "persistent replica state publishes an artifact snapshot and reopens it" {
     defer snapshot.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("artifact-state", snapshot.data);
 }
+
+test "persistent replica state recovers both snapshot publication crash windows" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/persistent-snapshot-crash-windows", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(std.testing.allocator, root, 91, 4);
+    defer layout.deinit(std.testing.allocator);
+
+    {
+        var state = try PersistentReplicaState.init(std.testing.allocator, layout);
+        defer state.deinit();
+        try state.groupStorage().persistReady(91, .{
+            .snapshot = .{
+                .metadata = .{ .index = 5, .term = 2 },
+                .data = @constCast("generation-five"),
+            },
+        });
+    }
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    // Crash after the next sidecar is durable but before the replica
+    // checkpoint names it: reopen must retain generation five and remove six.
+    try snapshot_payload_store.writeAtomically(
+        std.testing.allocator,
+        io,
+        layout.snapshot_dir,
+        6,
+        3,
+        "generation-six",
+    );
+    {
+        var state = try PersistentReplicaState.init(std.testing.allocator, layout);
+        defer state.deinit();
+        var snapshot = try state.storage().snapshot(std.testing.allocator);
+        defer snapshot.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u64, 5), snapshot.metadata.index);
+        try std.testing.expectEqualStrings("generation-five", snapshot.data);
+    }
+    const generation_six_path = try snapshot_payload_store.pathAlloc(std.testing.allocator, layout.snapshot_dir, 6, 3);
+    defer std.testing.allocator.free(generation_six_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, generation_six_path, .{}));
+
+    {
+        var state = try PersistentReplicaState.init(std.testing.allocator, layout);
+        defer state.deinit();
+        try state.groupStorage().persistReady(91, .{
+            .snapshot = .{
+                .metadata = .{ .index = 6, .term = 3 },
+                .data = @constCast("generation-six"),
+            },
+        });
+    }
+
+    // Crash after the checkpoint names generation six but before stale
+    // sidecar cleanup: reopen must validate six and remove the old sidecar.
+    try snapshot_payload_store.writeAtomically(
+        std.testing.allocator,
+        io,
+        layout.snapshot_dir,
+        5,
+        2,
+        "generation-five",
+    );
+    {
+        var state = try PersistentReplicaState.init(std.testing.allocator, layout);
+        defer state.deinit();
+        var snapshot = try state.storage().snapshot(std.testing.allocator);
+        defer snapshot.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u64, 6), snapshot.metadata.index);
+        try std.testing.expectEqualStrings("generation-six", snapshot.data);
+    }
+    const generation_five_path = try snapshot_payload_store.pathAlloc(std.testing.allocator, layout.snapshot_dir, 5, 2);
+    defer std.testing.allocator.free(generation_five_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, generation_five_path, .{}));
+}

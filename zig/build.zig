@@ -3464,6 +3464,7 @@ pub fn build(b: *std.Build) void {
         "raft snapshot payload cleanup retains only the durable identity",
         "persistent replica state refuses a corrupt durable snapshot payload on reopen",
         "persistent replica state publishes an artifact snapshot and reopens it",
+        "persistent replica state recovers both snapshot publication crash windows",
         "wal replica state refuses a missing durable snapshot payload on reopen",
         "db merge coordinator opt-in applies configured receiver identity namespace",
         "db merge coordinator reapplies target namespace for persisted reassignment opt-in",

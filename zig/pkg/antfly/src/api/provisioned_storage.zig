@@ -272,6 +272,20 @@ pub const ProvisionedGroupStorage = struct {
         }
     }
 
+    fn prepareGroupVisibleRootGeneration(self: *ProvisionedGroupStorage, group_id: u64) !void {
+        lockAtomic(&self.group_visible_root_generation_mutex);
+        defer self.group_visible_root_generation_mutex.unlock();
+        const entry = try self.group_visible_root_generations.getOrPut(self.alloc, group_id);
+        if (!entry.found_existing) entry.value_ptr.* = table_reads.backend_current_root_generation;
+    }
+
+    fn advancePreparedGroupVisibleRootGeneration(self: *ProvisionedGroupStorage, group_id: u64) void {
+        lockAtomic(&self.group_visible_root_generation_mutex);
+        defer self.group_visible_root_generation_mutex.unlock();
+        const generation = self.group_visible_root_generations.getPtr(group_id) orelse unreachable;
+        generation.* +%= 1;
+    }
+
     pub fn pruneGroupVisibleRootGenerations(self: *ProvisionedGroupStorage, retain_group_ids: []const u64) void {
         lockAtomic(&self.group_visible_root_generation_mutex);
         defer self.group_visible_root_generation_mutex.unlock();
@@ -293,6 +307,8 @@ pub const ProvisionedGroupStorage = struct {
         return .{
             .ptr = self,
             .visible_root_generation_for_group = groupVisibleRootGenerationForGroup,
+            .prepare_root_generation_for_group = prepareGroupVisibleRootGenerationForGroup,
+            .advance_root_generation_for_group = advancePreparedGroupVisibleRootGenerationForGroup,
         };
     }
 
@@ -300,11 +316,27 @@ pub const ProvisionedGroupStorage = struct {
         const self: *ProvisionedGroupStorage = @ptrCast(@alignCast(ptr));
         return self.visibleRootGenerationForGroup(group_id);
     }
+
+    fn prepareGroupVisibleRootGenerationForGroup(ptr: *anyopaque, group_id: u64) !void {
+        const self: *ProvisionedGroupStorage = @ptrCast(@alignCast(ptr));
+        try self.prepareGroupVisibleRootGeneration(group_id);
+    }
+
+    fn advancePreparedGroupVisibleRootGenerationForGroup(ptr: *anyopaque, group_id: u64) void {
+        const self: *ProvisionedGroupStorage = @ptrCast(@alignCast(ptr));
+        self.advancePreparedGroupVisibleRootGeneration(group_id);
+    }
 };
 
 test "provisioned group storage prunes stale visible root generations" {
     var storage = ProvisionedGroupStorage.init(std.testing.allocator);
     defer storage.deinit();
+
+    const generation_source = storage.groupVisibleRootGenerationSource();
+    try std.testing.expect(try generation_source.prepareRootGenerationForGroup(44));
+    try std.testing.expectEqual(@as(u64, table_reads.backend_current_root_generation), storage.visibleRootGenerationForGroup(44));
+    generation_source.advanceRootGenerationForGroup(44);
+    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(44));
 
     try storage.bumpGroupVisibleRootGenerations(&.{ 11, 22, 33 });
     try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(11));

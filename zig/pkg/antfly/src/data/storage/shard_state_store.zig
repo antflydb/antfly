@@ -175,17 +175,14 @@ fn replaceGroupSnapshotWithMetadataAndDeletes(
     const upper = (try internal_keys.documentRangeUpperAlloc(alloc, logical_prefix)) orelse return error.InvalidAppliedDataRange;
     defer alloc.free(upper);
 
-    const existing = try store.scanRange(alloc, lower, upper);
+    const existing = try store.scanRangeKeys(alloc, lower, upper);
     defer {
-        for (existing) |kv| {
-            alloc.free(kv.key);
-            alloc.free(kv.value);
-        }
+        for (existing) |key| alloc.free(key);
         alloc.free(existing);
     }
     var deletes = try alloc.alloc([]const u8, existing.len + metadata_deletes.len);
     defer alloc.free(deletes);
-    for (existing, 0..) |kv, i| deletes[i] = kv.key;
+    for (existing, 0..) |key, i| deletes[i] = key;
     for (metadata_deletes, existing.len..) |key, i| deletes[i] = key;
 
     var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
@@ -514,15 +511,101 @@ pub const GroupStateSnapshot = struct {
     }
 };
 
-const GroupStateSnapshotView = struct {
+pub const GroupStateSnapshotView = struct {
     byte_range: AppliedDataRange,
     entries: []AppliedDataKV,
     controls: []AppliedDataKV,
 
-    fn deinit(self: *GroupStateSnapshotView, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *GroupStateSnapshotView, alloc: std.mem.Allocator) void {
         alloc.free(self.entries);
         alloc.free(self.controls);
         self.* = undefined;
+    }
+};
+
+pub const GroupStateSnapshotStream = struct {
+    encoded: []const u8,
+    byte_range: AppliedDataRange,
+    entries_pos: usize,
+    controls_pos: usize,
+    first_entry_key: ?[]const u8,
+    last_entry_key: ?[]const u8,
+
+    pub const Iterator = struct {
+        encoded: []const u8,
+        pos: usize,
+        finished: bool = false,
+
+        pub fn next(self: *Iterator) !?AppliedDataKV {
+            if (self.finished) return null;
+            if (self.pos >= self.encoded.len) return error.InvalidGroupStateSnapshot;
+            const tag = self.encoded[self.pos];
+            self.pos += 1;
+            if (tag == 0) {
+                self.finished = true;
+                return null;
+            }
+            if (tag != 1) return error.InvalidGroupStateSnapshot;
+            return .{
+                .key = try readSnapshotBytesView(self.encoded, &self.pos),
+                .value = try readSnapshotBytesView(self.encoded, &self.pos),
+            };
+        }
+    };
+
+    pub fn init(encoded: []const u8) !GroupStateSnapshotStream {
+        if (encoded.len < group_snapshot_magic.len + 1 or
+            !std.mem.eql(u8, encoded[0..group_snapshot_magic.len], group_snapshot_magic) or
+            encoded[group_snapshot_magic.len] != group_snapshot_version)
+        {
+            return error.InvalidGroupStateSnapshot;
+        }
+        var pos: usize = group_snapshot_magic.len + 1;
+        const start = try readSnapshotBytesView(encoded, &pos);
+        const end = try readSnapshotBytesView(encoded, &pos);
+        const entries_pos = pos;
+        var entry_iterator = Iterator{ .encoded = encoded, .pos = entries_pos };
+        var first_entry_key: ?[]const u8 = null;
+        var last_entry_key: ?[]const u8 = null;
+        while (try entry_iterator.next()) |entry| {
+            if (last_entry_key) |previous| {
+                if (std.mem.order(u8, previous, entry.key) != .lt) return error.InvalidGroupStateSnapshot;
+            } else {
+                first_entry_key = entry.key;
+            }
+            last_entry_key = entry.key;
+        }
+        pos = entry_iterator.pos;
+        const controls_pos = pos;
+        try skipSnapshotTerminatedEntries(encoded, &pos);
+        if (pos != encoded.len) return error.InvalidGroupStateSnapshot;
+        return .{
+            .encoded = encoded,
+            .byte_range = .{ .start = start, .end = end },
+            .entries_pos = entries_pos,
+            .controls_pos = controls_pos,
+            .first_entry_key = first_entry_key,
+            .last_entry_key = last_entry_key,
+        };
+    }
+
+    pub fn entries(self: GroupStateSnapshotStream) Iterator {
+        return .{ .encoded = self.encoded, .pos = self.entries_pos };
+    }
+
+    fn controls(self: GroupStateSnapshotStream) Iterator {
+        return .{ .encoded = self.encoded, .pos = self.controls_pos };
+    }
+};
+
+const SliceSnapshotIterator = struct {
+    values: []const AppliedDataKV,
+    index: usize = 0,
+
+    fn next(self: *SliceSnapshotIterator) !?AppliedDataKV {
+        if (self.index >= self.values.len) return null;
+        defer self.index += 1;
+        return self.values[self.index];
     }
 };
 
@@ -551,7 +634,7 @@ pub fn decodeGroupStateSnapshotAlloc(alloc: std.mem.Allocator, encoded: []const 
     };
 }
 
-fn decodeGroupStateSnapshotViewAlloc(alloc: std.mem.Allocator, encoded: []const u8) !GroupStateSnapshotView {
+pub fn decodeGroupStateSnapshotViewAlloc(alloc: std.mem.Allocator, encoded: []const u8) !GroupStateSnapshotView {
     if (encoded.len < group_snapshot_magic.len + 1 or
         !std.mem.eql(u8, encoded[0..group_snapshot_magic.len], group_snapshot_magic) or
         encoded[group_snapshot_magic.len] != group_snapshot_version)
@@ -571,6 +654,17 @@ fn decodeGroupStateSnapshotViewAlloc(alloc: std.mem.Allocator, encoded: []const 
         .entries = entries,
         .controls = controls,
     };
+}
+
+pub fn validateGroupStateSnapshotStream(alloc: std.mem.Allocator, group_id: u64, snapshot: GroupStateSnapshotStream) !void {
+    try validateGroupStateSnapshotEntryBounds(
+        alloc,
+        group_id,
+        snapshot.byte_range,
+        snapshot.first_entry_key,
+        snapshot.last_entry_key,
+        snapshot.controls(),
+    );
 }
 
 pub fn installSnapshot(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64, encoded: []const u8) !void {
@@ -609,35 +703,65 @@ pub fn installSnapshotWithMetadata(
 }
 
 pub fn validateGroupStateSnapshot(alloc: std.mem.Allocator, group_id: u64, snapshot: anytype) !void {
-    if (snapshot.byte_range.start.len > 0 and
-        snapshot.byte_range.end.len > 0 and
-        std.mem.order(u8, snapshot.byte_range.start, snapshot.byte_range.end) != .lt)
+    var first_entry_key: ?[]const u8 = null;
+    var previous_entry_key: ?[]const u8 = null;
+    for (snapshot.entries) |entry| {
+        if (previous_entry_key) |previous| {
+            if (std.mem.order(u8, previous, entry.key) != .lt) return error.InvalidGroupStateSnapshot;
+        } else {
+            first_entry_key = entry.key;
+        }
+        previous_entry_key = entry.key;
+    }
+    try validateGroupStateSnapshotEntryBounds(
+        alloc,
+        group_id,
+        .{ .start = snapshot.byte_range.start, .end = snapshot.byte_range.end },
+        first_entry_key,
+        previous_entry_key,
+        SliceSnapshotIterator{ .values = snapshot.controls },
+    );
+}
+
+fn validateGroupStateSnapshotEntryBounds(
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    byte_range: AppliedDataRange,
+    first_entry_key: ?[]const u8,
+    last_entry_key: ?[]const u8,
+    controls_iterator: anytype,
+) !void {
+    if (byte_range.start.len > 0 and byte_range.end.len > 0 and
+        std.mem.order(u8, byte_range.start, byte_range.end) != .lt)
     {
         return error.InvalidGroupStateSnapshot;
     }
 
-    var seen_entries = std.StringHashMapUnmanaged(void).empty;
-    defer seen_entries.deinit(alloc);
-    try seen_entries.ensureTotalCapacity(alloc, @intCast(snapshot.entries.len));
-    for (snapshot.entries) |entry| {
-        const result = try seen_entries.getOrPut(alloc, entry.key);
-        if (result.found_existing) return error.InvalidGroupStateSnapshot;
-    }
-
-    var seen_controls = std.StringHashMapUnmanaged(void).empty;
-    defer seen_controls.deinit(alloc);
-    try seen_controls.ensureTotalCapacity(alloc, @intCast(snapshot.controls.len));
     var state_entry: ?AppliedDataKV = null;
     var sequence: ?u64 = null;
     var acknowledgement: ?SplitAcknowledgement = null;
     var terminal_entry: ?AppliedDataKV = null;
     var delta_count: u64 = 0;
     var max_delta_sequence: u64 = 0;
-    for (snapshot.controls) |control| {
-        const result = try seen_controls.getOrPut(alloc, control.key);
-        if (result.found_existing) return error.InvalidGroupStateSnapshot;
+    var previous_control_order: ?u8 = null;
+    var previous_delta_sequence: u64 = 0;
+    var controls = controls_iterator;
+    while (try controls.next()) |control| {
         try validateGroupControlEntry(alloc, group_id, control);
-        switch (groupControlKind(group_id, control.key) orelse unreachable) {
+        const kind = groupControlKind(group_id, control.key) orelse unreachable;
+        const control_order: u8 = switch (kind) {
+            .split_state => 0,
+            .delta_sequence => 1,
+            .acknowledgement => 2,
+            .terminal => 3,
+            .delta => 4,
+        };
+        if (previous_control_order) |previous| {
+            if (control_order < previous or (control_order == previous and control_order != 4))
+                return error.InvalidGroupStateSnapshot;
+        }
+        previous_control_order = control_order;
+        switch (kind) {
             .split_state => state_entry = control,
             .delta_sequence => sequence = std.mem.readInt(u64, control.value[0..8], .little),
             .acknowledgement => acknowledgement = .{
@@ -648,7 +772,9 @@ pub fn validateGroupStateSnapshot(alloc: std.mem.Allocator, group_id: u64, snaps
             },
             .terminal => terminal_entry = control,
             .delta => |delta_sequence| {
-                if (delta_sequence == 0) return error.InvalidGroupStateSnapshot;
+                if (delta_sequence == 0 or delta_sequence <= previous_delta_sequence)
+                    return error.InvalidGroupStateSnapshot;
+                previous_delta_sequence = delta_sequence;
                 delta_count += 1;
                 max_delta_sequence = @max(max_delta_sequence, delta_sequence);
             },
@@ -680,8 +806,8 @@ pub fn validateGroupStateSnapshot(alloc: std.mem.Allocator, group_id: u64, snaps
     }
 
     const snapshot_range = AppliedDataRange{
-        .start = snapshot.byte_range.start,
-        .end = snapshot.byte_range.end,
+        .start = byte_range.start,
+        .end = byte_range.end,
     };
     const document_range = if (state) |active|
         AppliedDataRange{
@@ -698,9 +824,8 @@ pub fn validateGroupStateSnapshot(alloc: std.mem.Allocator, group_id: u64, snaps
     {
         return error.InvalidGroupStateSnapshot;
     }
-    for (snapshot.entries) |entry| {
-        if (!document_range.contains(entry.key)) return error.InvalidGroupStateSnapshot;
-    }
+    if (first_entry_key) |key| if (!document_range.contains(key)) return error.InvalidGroupStateSnapshot;
+    if (last_entry_key) |key| if (!document_range.contains(key)) return error.InvalidGroupStateSnapshot;
 
     if (acknowledgement) |ack| {
         if (state) |active| {
@@ -828,6 +953,18 @@ fn readSnapshotTerminatedEntryViewsAlloc(alloc: std.mem.Allocator, encoded: []co
         });
     }
     return try entries.toOwnedSlice(alloc);
+}
+
+fn skipSnapshotTerminatedEntries(encoded: []const u8, pos: *usize) !void {
+    while (true) {
+        if (pos.* >= encoded.len) return error.InvalidGroupStateSnapshot;
+        const tag = encoded[pos.*];
+        pos.* += 1;
+        if (tag == 0) return;
+        if (tag != 1) return error.InvalidGroupStateSnapshot;
+        _ = try readSnapshotBytesView(encoded, pos);
+        _ = try readSnapshotBytesView(encoded, pos);
+    }
 }
 
 fn readSnapshotBytesAlloc(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) ![]u8 {
@@ -2156,6 +2293,18 @@ test "shard state snapshot rejects duplicate and out-of-range documents" {
         },
     ));
 
+    const encoded = try encodeGroupStateSnapshot(
+        std.testing.allocator,
+        .{ .start = "doc:a", .end = "doc:m" },
+        &duplicate_entries,
+        &.{},
+    );
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectError(
+        error.InvalidGroupStateSnapshot,
+        GroupStateSnapshotStream.init(encoded),
+    );
+
     var out_of_range_entries = [_]AppliedDataKV{
         .{ .key = "doc:z", .value = "outside" },
     };
@@ -2168,6 +2317,18 @@ test "shard state snapshot rejects duplicate and out-of-range documents" {
             .controls = &.{},
         },
     ));
+    const encoded_out_of_range = try encodeGroupStateSnapshot(
+        std.testing.allocator,
+        .{ .start = "doc:a", .end = "doc:m" },
+        &out_of_range_entries,
+        &.{},
+    );
+    defer std.testing.allocator.free(encoded_out_of_range);
+    const streamed_out_of_range = try GroupStateSnapshotStream.init(encoded_out_of_range);
+    try std.testing.expectError(
+        error.InvalidGroupStateSnapshot,
+        validateGroupStateSnapshotStream(std.testing.allocator, 91, streamed_out_of_range),
+    );
 }
 
 test "shard state store finalize split reclaims right-hand document range" {

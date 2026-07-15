@@ -8314,6 +8314,36 @@ pub const ProvisionedTableWriteSource = struct {
         return db;
     }
 
+    fn openRaftSnapshotStagingDbForGroup(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        staged_generation: *const db_mod.generation_lifecycle.StagedGeneration,
+        group_id: u64,
+        table_name: []const u8,
+        indexes_json: []const u8,
+    ) !db_mod.DB {
+        const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
+        var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+            alloc,
+            staged_generation.path(),
+            indexes_json,
+            null,
+            null,
+            self.visibleRootGeneration(group_id),
+            null,
+            .startup_catch_up,
+            self.backend_runtime,
+            self.antfly_provider,
+            self.secret_store,
+            self.remote_content,
+            identity_namespace,
+            .{ .staged_generation = staged_generation },
+        );
+        errdefer db.close();
+        try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
+        return db;
+    }
+
     fn repairRestoredTableRuntimeStateBlocking(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
@@ -10275,9 +10305,8 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         encoded: []const u8,
     ) !void {
-        var state = try shard_state_store.decodeGroupStateSnapshotAlloc(alloc, encoded);
-        defer state.deinit(alloc);
-        try shard_state_store.validateGroupStateSnapshot(alloc, group_id, state);
+        const state = try shard_state_store.GroupStateSnapshotStream.init(encoded);
+        try shard_state_store.validateGroupStateSnapshotStream(alloc, group_id, state);
 
         var catalog_snapshot = try self.catalog.adminSnapshot();
         defer self.catalog.freeAdminSnapshot(&catalog_snapshot);
@@ -10286,61 +10315,83 @@ pub const ProvisionedTableWriteSource = struct {
         const table_name = table.name;
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        const writes = try alloc.alloc(db_mod.types.BatchWrite, state.entries.len);
-        defer alloc.free(writes);
-        for (state.entries, 0..) |entry, i| writes[i] = .{ .key = entry.key, .value = entry.value };
 
-        self.beginGroupOperation(table_name, group_id);
-        defer self.endGroupOperation(table_name, group_id);
-        lockAtomic(&self.local_db_mutex);
-        self.invalidateReadCache(table_name);
-        self.markWriteCacheDirty(table_name);
-        self.local_db_mutex.unlock();
-        errdefer {
-            lockAtomic(&self.local_db_mutex);
-            defer self.local_db_mutex.unlock();
-            self.invalidateReadCache(table_name);
-            self.invalidateWriteCache(table_name);
-        }
+        self.beginRestoreLifecycleActivity(table_name);
+        var preparation_activity = true;
+        defer if (preparation_activity) self.endRestoreLifecycleActivity(table_name);
 
-        if (self.write_cache) |cache| {
-            const target_generation = self.visibleRootGeneration(group_id);
-            var cached = try self.getOrOpenCachedDbForLocalMutation(
+        const generation_source = self.groupVisibleRootGenerationSource();
+        const generation_reserved = if (generation_source) |root_generation_source|
+            try root_generation_source.prepareRootGenerationForGroup(group_id)
+        else
+            false;
+
+        var preparation = try db_mod.generation_lifecycle.beginProcessPreparationWithRuntime(path, self.backend_runtime);
+        defer preparation.deinit();
+        var staged = try preparation.beginStaging();
+        defer staged.deinit();
+
+        var parsed_schema: ?tables_api.ParsedTableSchema = null;
+        if (table.schema_json.len > 0) parsed_schema = try tables_api.parseValidatedTableSchema(alloc, table.schema_json);
+        defer if (parsed_schema) |*schema| schema.deinit(alloc);
+
+        {
+            var staged_db = try self.openRaftSnapshotStagingDbForGroup(
                 alloc,
-                cache,
-                path,
+                &staged,
                 group_id,
-                target_generation,
                 table_name,
-                true,
+                table.indexes_json,
             );
-            defer cached.deinit(alloc);
-            try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, writes, &.{}, &.{});
-            try cached.db.replaceRaftDocumentSnapshot(alloc, state.byte_range, writes);
-            cache.publishCachedLeaseGeneration(&cached, target_generation);
-        } else {
-            var db = try openManagedDbForReplicatedApply(
-                alloc,
-                path,
-                self.catalog,
-                table_name,
-                group_id,
-                self.backend_runtime,
-                self.ha_write_gate,
-                self.ha_async_mirror,
-                null,
-            );
-            defer db.close();
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, writes, &.{}, &.{});
-            try db.replaceRaftDocumentSnapshot(alloc, state.byte_range, writes);
-            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+            defer staged_db.close();
+            try applyLocalTableSchemaJson(alloc, &staged_db, table.schema_json);
+
+            const max_chunk_entries = 512;
+            const max_chunk_payload_bytes = 4 * 1024 * 1024;
+            var writes_buffer: [max_chunk_entries]db_mod.types.BatchWrite = undefined;
+            var entries = state.entries();
+            var exhausted = false;
+            while (!exhausted) {
+                var chunk_len: usize = 0;
+                var chunk_payload_bytes: usize = 0;
+                while (chunk_len < writes_buffer.len) {
+                    var candidate_entries = entries;
+                    const entry = (try candidate_entries.next()) orelse {
+                        exhausted = true;
+                        break;
+                    };
+                    const entry_bytes = std.math.add(usize, entry.key.len, entry.value.len) catch return error.SnapshotTooLarge;
+                    if (chunk_len > 0 and entry_bytes > max_chunk_payload_bytes -| chunk_payload_bytes) break;
+                    entries = candidate_entries;
+                    writes_buffer[chunk_len] = .{ .key = entry.key, .value = entry.value };
+                    chunk_len += 1;
+                    chunk_payload_bytes = std.math.add(usize, chunk_payload_bytes, entry_bytes) catch return error.SnapshotTooLarge;
+                }
+                if (chunk_len == 0) break;
+                const writes = writes_buffer[0..chunk_len];
+                if (parsed_schema) |schema| try tables_api.validateWritesAgainstTableSchema(alloc, schema, writes);
+                try staged_db.appendRaftDocumentSnapshotChunk(&staged, state.byte_range, writes);
+            }
+            try staged_db.finishRaftDocumentSnapshot(&staged, state.byte_range);
+            try staged_db.sync(true);
+            try staged_db.syncIndexes(true);
         }
-        lockAtomic(&self.local_db_mutex);
-        self.markWriteCacheDirty(table_name);
-        self.local_db_mutex.unlock();
-        self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+        try staged.seal();
+
+        var transition = try self.beginLocalTableGenerationTransitionFromPreparation(table_name);
+        preparation_activity = false;
+        errdefer transition.abort();
+        defer transition.deinit();
+        self.invalidateSharedPathCaches(path);
+        var shard_transition = try preparation.promote();
+        defer shard_transition.deinit();
+        const publication_outcome = try staged.publish();
+        if (generation_reserved) generation_source.?.advanceRootGenerationForGroup(group_id);
+        self.invalidateSharedPathCaches(path);
+        transition.finishMutation();
+        self.notifyLocalChange(table_name, .structural);
         self.notifyLocalChange(table_name, .data);
+        if (publication_outcome == .durability_uncertain) return error.GenerationDurabilityUncertain;
     }
 
     pub fn applyHAReplicationRecordGroupLocal(
@@ -14776,6 +14827,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                     .ttl_cleanup = .{ .enabled = false },
                     .transaction_recovery = .{ .enabled = false },
                     .text_merge = .{ .enabled = false },
+                    .staged_generation = open_options.staged_generation,
                 }),
                 .restore_repair => if (enrichment_cfg != null)
                     try db_mod.DB.open(allocator, db_path, .{
