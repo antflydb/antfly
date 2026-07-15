@@ -123,8 +123,8 @@ const async_runtime_mod = if (builtin.os.tag == .freestanding) struct {
             _ = bytes;
         }
 
-        pub fn shouldThrottleBacklog(_: *@This()) bool {
-            return false;
+        pub fn backlogThrottleTargetSequence(_: *@This()) ?u64 {
+            return null;
         }
 
         pub fn releaseBacklogThrough(self: *@This(), sequence: u64) void {
@@ -179,7 +179,7 @@ pub const Executor = struct {
         notify_except_kind: *const fn (ptr: *anyopaque, sequence: u64, excluded_kind: types.IndexKind) void,
         force_sequence: *const fn (ptr: *anyopaque, sequence: u64) void,
         track_backlog_bytes: *const fn (ptr: *anyopaque, sequence: u64, bytes: u64) anyerror!void,
-        should_throttle_backlog: *const fn (ptr: *anyopaque) bool,
+        backlog_throttle_target_sequence: *const fn (ptr: *anyopaque) ?u64,
         release_backlog_through: *const fn (ptr: *anyopaque, sequence: u64) void,
         wait_for_all: *const fn (ptr: *anyopaque, sequence: u64) anyerror!void,
         wait_for_indexes: *const fn (ptr: *anyopaque, sequence: u64, index_names: []const []const u8) anyerror!void,
@@ -230,8 +230,8 @@ pub const Executor = struct {
         return try self.vtable.track_backlog_bytes(self.ptr, sequence, bytes);
     }
 
-    pub fn shouldThrottleBacklog(self: *Executor) bool {
-        return self.vtable.should_throttle_backlog(self.ptr);
+    pub fn backlogThrottleTargetSequence(self: *Executor) ?u64 {
+        return self.vtable.backlog_throttle_target_sequence(self.ptr);
     }
 
     pub fn releaseBacklogThrough(self: *Executor, sequence: u64) void {
@@ -360,8 +360,8 @@ const ManualRuntime = struct {
         return try self.backlog.track(self.alloc, sequence, bytes);
     }
 
-    fn shouldThrottleBacklog(self: *ManualRuntime) bool {
-        return self.backlog.shouldThrottleWrites();
+    fn backlogThrottleTargetSequence(self: *ManualRuntime) ?u64 {
+        return self.backlog.throttleTargetSequence();
     }
 
     fn releaseBacklogThrough(self: *ManualRuntime, sequence: u64) void {
@@ -511,7 +511,7 @@ const manual_vtable = Executor.VTable{
     .notify_except_kind = manualNotifyExceptKind,
     .force_sequence = manualForceSequence,
     .track_backlog_bytes = manualTrackBacklogBytes,
-    .should_throttle_backlog = manualShouldThrottleBacklog,
+    .backlog_throttle_target_sequence = manualBacklogThrottleTargetSequence,
     .release_backlog_through = manualReleaseBacklogThrough,
     .wait_for_all = manualWaitForAll,
     .wait_for_indexes = manualWaitForIndexes,
@@ -573,9 +573,9 @@ fn manualTrackBacklogBytes(ptr: *anyopaque, sequence: u64, bytes: u64) !void {
     return try runtime.trackBacklogBytes(sequence, bytes);
 }
 
-fn manualShouldThrottleBacklog(ptr: *anyopaque) bool {
+fn manualBacklogThrottleTargetSequence(ptr: *anyopaque) ?u64 {
     const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
-    return runtime.shouldThrottleBacklog();
+    return runtime.backlogThrottleTargetSequence();
 }
 
 fn manualReleaseBacklogThrough(ptr: *anyopaque, sequence: u64) void {
@@ -634,7 +634,7 @@ const io_threaded_vtable = Executor.VTable{
     .notify_except_kind = ioThreadedNotifyExceptKind,
     .force_sequence = ioThreadedForceSequence,
     .track_backlog_bytes = ioThreadedTrackBacklogBytes,
-    .should_throttle_backlog = ioThreadedShouldThrottleBacklog,
+    .backlog_throttle_target_sequence = ioThreadedBacklogThrottleTargetSequence,
     .release_backlog_through = ioThreadedReleaseBacklogThrough,
     .wait_for_all = ioThreadedWaitForAll,
     .wait_for_indexes = ioThreadedWaitForIndexes,
@@ -696,9 +696,9 @@ fn ioThreadedTrackBacklogBytes(ptr: *anyopaque, sequence: u64, bytes: u64) !void
     return try runtime.trackBacklogBytes(sequence, bytes);
 }
 
-fn ioThreadedShouldThrottleBacklog(ptr: *anyopaque) bool {
+fn ioThreadedBacklogThrottleTargetSequence(ptr: *anyopaque) ?u64 {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
-    return runtime.shouldThrottleBacklog();
+    return runtime.backlogThrottleTargetSequence();
 }
 
 fn ioThreadedReleaseBacklogThrough(ptr: *anyopaque, sequence: u64) void {

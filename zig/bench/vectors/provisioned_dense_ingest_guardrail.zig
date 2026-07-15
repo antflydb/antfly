@@ -206,7 +206,7 @@ fn runProvisionedDenseIngest(
         catalog,
         raft_mod.read_gate.noopReadableLeaseRequester(),
     );
-    storage.attachSources(&read_source, &write_source);
+    try storage.attachSources(&read_source, &write_source);
 
     const resolved_group = try public_api.table_catalog.resolveSingleRangeGroup(alloc, catalog, table_name);
     if (resolved_group == null) {

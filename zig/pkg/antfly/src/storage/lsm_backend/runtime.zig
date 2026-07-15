@@ -179,6 +179,7 @@ fn recordPointRunPrecheckSurvivor(backend: anytype) void {
 
 fn canBorrowReaderRetainedState(backend: anytype) bool {
     const BackendType = @TypeOf(backend.*);
+    if (@hasDecl(BackendType, "hasVersionReaderPins")) return backend.hasVersionReaderPins();
     return @hasField(BackendType, "active_readers") and backend.active_readers > 0;
 }
 
@@ -2547,6 +2548,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
+            releaseBorrowedMutableReadSnapshot(BackendType, backend, self.mutable_snapshot, self.owns_mutable_snapshot);
             releaseReadReader(BackendType, backend, .bound_read_txn);
             self.* = undefined;
         }
@@ -2637,6 +2639,11 @@ fn snapshotReadMutable(comptime BackendType: type, backend: *BackendType, reason
     errdefer backend.allocator.destroy(snapshot);
     snapshot.* = try backend.mutable.clone(backend.allocator);
     return .{ .state = snapshot, .owned = true };
+}
+
+fn releaseBorrowedMutableReadSnapshot(comptime BackendType: type, backend: *BackendType, snapshot: *const State, owned: bool) void {
+    if (owned) return;
+    if (@hasDecl(BackendType, "releaseMutableReadSnapshot")) backend.releaseMutableReadSnapshot(snapshot);
 }
 
 pub fn BoundProbeTxn(comptime BackendType: type) type {
@@ -3014,6 +3021,9 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
                 if (self.mutable_snapshot_is_bulk_current_scan_clone and @hasDecl(BackendType, "releaseCurrentScanMutableStateForBulkIngest")) {
                     if (self.mutable_snapshot.ownedPtr()) |snapshot| backend.releaseCurrentScanMutableStateForBulkIngest(snapshot);
                 }
+                if (self.mutable_snapshot.ptr()) |snapshot| {
+                    releaseBorrowedMutableReadSnapshot(BackendType, backend, snapshot, self.mutable_snapshot.ownedPtr() != null);
+                }
                 releaseReadReader(BackendType, backend, .current_scan);
             }
             self.mutable_snapshot.deinitOwned(self.allocator);
@@ -3157,6 +3167,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         cursor_levels: []RunLevel = &.{},
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
         batch_options: backend_types.BatchOptions = .{},
+        cursor_reader_retained: bool = false,
         closed: bool = false,
 
         pub fn open(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
@@ -3190,6 +3201,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             backend.finishBatchMode(self.batch_options);
+            if (self.cursor_reader_retained) releaseWriteReader(BackendType, backend, .current_scan);
             releaseWriteReader(BackendType, backend, .write_txn);
             self.* = undefined;
         }
@@ -3207,6 +3219,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 self.invalidateCursorSnapshot();
                 releaseHeldValues(&self.held_values, self.allocator);
                 self.backend.finishBatchMode(self.batch_options);
+                if (self.cursor_reader_retained) releaseWriteReader(BackendType, self.backend, .current_scan);
                 releaseWriteReader(BackendType, self.backend, .write_txn);
                 self.closed = true;
             };
@@ -3244,6 +3257,10 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             self.invalidateCursorSnapshot();
             releaseHeldValues(&self.held_values, self.allocator);
             var finalize_err: ?anyerror = null;
+            if (self.cursor_reader_retained) {
+                releaseWriteReader(BackendType, self.backend, .current_scan);
+                self.cursor_reader_retained = false;
+            }
             finalizeWriteReader(BackendType, self.backend, .write_txn) catch |err| {
                 finalize_err = err;
             };
@@ -3568,6 +3585,17 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
 
+            var retained_now = false;
+            if (!self.cursor_reader_retained) {
+                try retainReadReader(BackendType, self.backend, .current_scan);
+                self.cursor_reader_retained = true;
+                retained_now = true;
+            }
+            errdefer if (retained_now) {
+                releaseWriteReader(BackendType, self.backend, .current_scan);
+                self.cursor_reader_retained = false;
+            };
+
             var overlay: State = .{};
             errdefer overlay.deinit(self.allocator);
             try state_mod.applyState(&overlay, self.allocator, &self.mutable);
@@ -3703,6 +3731,7 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
+            releaseBorrowedMutableReadSnapshot(BackendType, backend, self.mutable_snapshot, self.owns_mutable_snapshot);
             releaseReadReader(BackendType, backend, .namespace_read_txn);
             self.* = undefined;
         }
@@ -5749,6 +5778,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         cursor_levels: []RunLevel = &.{},
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
         batch_options: backend_types.BatchOptions = .{},
+        cursor_reader_retained: bool = false,
         closed: bool = false,
 
         pub fn open(backend: *BackendType) !@This() {
@@ -5781,6 +5811,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             backend.finishBatchMode(self.batch_options);
+            if (self.cursor_reader_retained) releaseWriteReader(BackendType, backend, .current_scan);
             releaseWriteReader(BackendType, backend, .write_txn);
             self.* = undefined;
         }
@@ -5798,6 +5829,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 self.invalidateCursorSnapshot();
                 releaseHeldValues(&self.held_values, self.allocator);
                 self.backend.finishBatchMode(self.batch_options);
+                if (self.cursor_reader_retained) releaseWriteReader(BackendType, self.backend, .current_scan);
                 releaseWriteReader(BackendType, self.backend, .write_txn);
                 self.closed = true;
             };
@@ -5835,6 +5867,10 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             self.invalidateCursorSnapshot();
             releaseHeldValues(&self.held_values, self.allocator);
             var finalize_err: ?anyerror = null;
+            if (self.cursor_reader_retained) {
+                releaseWriteReader(BackendType, self.backend, .current_scan);
+                self.cursor_reader_retained = false;
+            }
             finalizeWriteReader(BackendType, self.backend, .write_txn) catch |err| {
                 finalize_err = err;
             };
@@ -6042,6 +6078,17 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             if (self.cursor_overlay != null) return;
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
+
+            var retained_now = false;
+            if (!self.cursor_reader_retained) {
+                try retainReadReader(BackendType, self.backend, .current_scan);
+                self.cursor_reader_retained = true;
+                retained_now = true;
+            }
+            errdefer if (retained_now) {
+                releaseWriteReader(BackendType, self.backend, .current_scan);
+                self.cursor_reader_retained = false;
+            };
 
             var overlay = try self.mutable.clone(self.allocator);
             errdefer overlay.deinit(self.allocator);

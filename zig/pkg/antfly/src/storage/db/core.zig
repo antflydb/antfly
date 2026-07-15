@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 const db_config = @import("config.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const apply_state = @import("derived/apply_state.zig");
+const index_repair_state = @import("derived/index_repair_state.zig");
 const doc_identity = @import("doc_identity.zig");
 const internal_keys = @import("../internal_keys.zig");
 const docstore_mod = @import("../docstore.zig");
@@ -238,13 +239,16 @@ pub const OpenedPrimaryStore = struct {
 
 pub const OpenedCoreResources = struct {
     path: []u8,
+    root_generation: u64,
     applied_sequence_checkpoint_path: ?[]u8,
+    index_repair_checkpoint_path: ?[]u8,
     store: *docstore_mod.DocStore,
     primary_store_owner: PrimaryStoreOwner,
     change_journal: *change_journal_mod.Journal,
     shard_manager: *shard_mod.ShardManager,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    repair_replay_mutex: *std.atomic.Mutex,
     log_mutex: *std.atomic.Mutex,
     schema: ?schema_mod.TableSchema,
     identity_namespace: doc_identity.Namespace,
@@ -256,6 +260,8 @@ pub const OpenedCoreResources = struct {
         alloc.destroy(self.log_mutex);
         self.apply_mutex.* = undefined;
         alloc.destroy(self.apply_mutex);
+        self.repair_replay_mutex.* = undefined;
+        alloc.destroy(self.repair_replay_mutex);
         self.index_manager.deinit();
         alloc.destroy(self.index_manager);
         self.shard_manager.deinit();
@@ -266,6 +272,7 @@ pub const OpenedCoreResources = struct {
         alloc.destroy(self.store);
         self.primary_store_owner.close(alloc);
         if (self.applied_sequence_checkpoint_path) |checkpoint_path| alloc.free(checkpoint_path);
+        if (self.index_repair_checkpoint_path) |checkpoint_path| alloc.free(checkpoint_path);
         alloc.free(self.path);
         self.* = undefined;
     }
@@ -274,18 +281,22 @@ pub const OpenedCoreResources = struct {
 pub const AsyncResources = struct {
     store: *docstore_mod.DocStore,
     applied_sequence_checkpoint_path: ?[]const u8,
+    index_repair_checkpoint_path: ?[]const u8,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    repair_replay_mutex: *std.atomic.Mutex,
 };
 
 pub const BatchExecutionResources = struct {
     store: *docstore_mod.DocStore,
     applied_sequence_checkpoint_path: ?[]const u8,
+    index_repair_checkpoint_path: ?[]const u8,
     shard_manager: *shard_mod.ShardManager,
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    repair_replay_mutex: *std.atomic.Mutex,
     log_mutex: *std.atomic.Mutex,
     identity_namespace: doc_identity.Namespace,
     artifact_cleanup_maybe: *std.atomic.Value(bool),
@@ -310,13 +321,16 @@ pub const SplitIndexHandoffs = struct {
 pub const DBCore = struct {
     alloc: Allocator,
     path: []u8,
+    root_generation: u64,
     applied_sequence_checkpoint_path: ?[]u8,
+    index_repair_checkpoint_path: ?[]u8,
     store: *docstore_mod.DocStore,
     primary_store_owner: PrimaryStoreOwner,
     change_journal: *change_journal_mod.Journal,
     shard_manager: *shard_mod.ShardManager,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    repair_replay_mutex: *std.atomic.Mutex,
     log_mutex: *std.atomic.Mutex,
     schema: ?schema_mod.TableSchema,
     identity_namespace: doc_identity.Namespace,
@@ -326,13 +340,16 @@ pub const DBCore = struct {
         return .{
             .alloc = alloc,
             .path = opened.path,
+            .root_generation = opened.root_generation,
             .applied_sequence_checkpoint_path = opened.applied_sequence_checkpoint_path,
+            .index_repair_checkpoint_path = opened.index_repair_checkpoint_path,
             .store = opened.store,
             .primary_store_owner = opened.primary_store_owner,
             .change_journal = opened.change_journal,
             .shard_manager = opened.shard_manager,
             .index_manager = opened.index_manager,
             .apply_mutex = opened.apply_mutex,
+            .repair_replay_mutex = opened.repair_replay_mutex,
             .log_mutex = opened.log_mutex,
             .schema = opened.schema,
             .identity_namespace = opened.identity_namespace,
@@ -346,6 +363,8 @@ pub const DBCore = struct {
         self.alloc.destroy(self.log_mutex);
         self.apply_mutex.* = undefined;
         self.alloc.destroy(self.apply_mutex);
+        self.repair_replay_mutex.* = undefined;
+        self.alloc.destroy(self.repair_replay_mutex);
         self.index_manager.deinit();
         self.alloc.destroy(self.index_manager);
         self.shard_manager.deinit();
@@ -356,6 +375,7 @@ pub const DBCore = struct {
         self.alloc.destroy(self.store);
         self.primary_store_owner.close(self.alloc);
         if (self.applied_sequence_checkpoint_path) |checkpoint_path| self.alloc.free(checkpoint_path);
+        if (self.index_repair_checkpoint_path) |checkpoint_path| self.alloc.free(checkpoint_path);
         self.alloc.free(self.path);
         self.* = undefined;
     }
@@ -372,8 +392,10 @@ pub const DBCore = struct {
         return .{
             .store = self.store,
             .applied_sequence_checkpoint_path = self.applied_sequence_checkpoint_path,
+            .index_repair_checkpoint_path = self.index_repair_checkpoint_path,
             .index_manager = self.index_manager,
             .apply_mutex = self.apply_mutex,
+            .repair_replay_mutex = self.repair_replay_mutex,
         };
     }
 
@@ -381,11 +403,13 @@ pub const DBCore = struct {
         return .{
             .store = self.store,
             .applied_sequence_checkpoint_path = self.applied_sequence_checkpoint_path,
+            .index_repair_checkpoint_path = self.index_repair_checkpoint_path,
             .shard_manager = self.shard_manager,
             .change_journal = self.change_journal,
             .replay_source = self.replaySource(),
             .index_manager = self.index_manager,
             .apply_mutex = self.apply_mutex,
+            .repair_replay_mutex = self.repair_replay_mutex,
             .log_mutex = self.log_mutex,
             .identity_namespace = self.identity_namespace,
             .artifact_cleanup_maybe = &self.artifact_cleanup_maybe,
@@ -823,61 +847,6 @@ pub const DBCore = struct {
             .key = internal_keys.artifact_presence_key[0..],
             .value = "1",
         });
-    }
-
-    pub fn collectAndDeleteEnrichmentArtifactsForDocContext(
-        self: *DBCore,
-        alloc: Allocator,
-        doc_key: []const u8,
-        deleted: *std.ArrayListUnmanaged([]u8),
-    ) !void {
-        if (!self.hasArtifactCleanupMaybe()) return;
-
-        var deletes = std.ArrayListUnmanaged([]const u8).empty;
-        defer deletes.deinit(alloc);
-        var unrecorded_delete_keys = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (unrecorded_delete_keys.items) |key| alloc.free(key);
-            unrecorded_delete_keys.deinit(alloc);
-        }
-
-        const artifact_prefix = try internal_keys.artifactRootPrefixAlloc(alloc, doc_key);
-        defer alloc.free(artifact_prefix);
-        try self.collectDeleteKeysForPrefix(alloc, artifact_prefix, &deletes, deleted, &unrecorded_delete_keys);
-
-        const asset_state_prefix = try internal_keys.assetStateRootPrefixAlloc(alloc, doc_key);
-        defer alloc.free(asset_state_prefix);
-        try self.collectDeleteKeysForPrefix(alloc, asset_state_prefix, &deletes, null, &unrecorded_delete_keys);
-
-        const graph_asset_state_prefix = try internal_keys.graphAssetStateRootPrefixAlloc(alloc, doc_key);
-        defer alloc.free(graph_asset_state_prefix);
-        try self.collectDeleteKeysForPrefix(alloc, graph_asset_state_prefix, &deletes, null, &unrecorded_delete_keys);
-
-        if (deletes.items.len > 0) {
-            try self.putStoreBatch(&.{}, deletes.items);
-        }
-    }
-
-    fn collectDeleteKeysForPrefix(
-        self: *DBCore,
-        alloc: Allocator,
-        prefix: []const u8,
-        deletes: *std.ArrayListUnmanaged([]const u8),
-        recorded: ?*std.ArrayListUnmanaged([]u8),
-        unrecorded: *std.ArrayListUnmanaged([]u8),
-    ) !void {
-        const existing = try self.scanStorePrefix(alloc, prefix);
-        defer docstore_mod.DocStore.freeResults(alloc, existing);
-        for (existing) |entry| {
-            const owned = try alloc.dupe(u8, entry.key);
-            errdefer alloc.free(owned);
-            try deletes.append(alloc, owned);
-            if (recorded) |out| {
-                try out.append(alloc, owned);
-            } else {
-                try unrecorded.append(alloc, owned);
-            }
-        }
     }
 
     pub fn loadIndexes(self: *DBCore) !void {
@@ -1486,19 +1455,23 @@ pub fn openCoreResourcesFromPrimaryStore(
     persist_identity_namespace_if_missing: bool,
     identity_namespace_mismatch_policy: doc_identity.NamespaceMismatchPolicy,
     external_derived_checkpoints: bool,
+    root_generation: u64,
     read_only: bool,
 ) !OpenedCoreResources {
     var owned_path: ?[]u8 = null;
     var owned_applied_sequence_checkpoint_path: ?[]u8 = null;
+    var owned_index_repair_checkpoint_path: ?[]u8 = null;
     var owned_store: ?*docstore_mod.DocStore = null;
     var owned_primary_store_owner = opened_primary.owner;
     var owned_change_journal: ?*change_journal_mod.Journal = null;
     var owned_shard_manager: ?*shard_mod.ShardManager = null;
     var owned_index_manager: ?*index_manager_mod.IndexManager = null;
     var owned_apply_mutex: ?*apply_rw_lock_mod.ApplyRwLock = null;
+    var owned_repair_replay_mutex: ?*std.atomic.Mutex = null;
     var owned_log_mutex: ?*std.atomic.Mutex = null;
     errdefer {
         if (owned_log_mutex) |ptr| alloc.destroy(ptr);
+        if (owned_repair_replay_mutex) |ptr| alloc.destroy(ptr);
         if (owned_apply_mutex) |ptr| alloc.destroy(ptr);
         if (owned_index_manager) |ptr| alloc.destroy(ptr);
         if (owned_shard_manager) |ptr| alloc.destroy(ptr);
@@ -1509,6 +1482,7 @@ pub fn openCoreResourcesFromPrimaryStore(
         }
         owned_primary_store_owner.close(alloc);
         if (owned_applied_sequence_checkpoint_path) |buf| alloc.free(buf);
+        if (owned_index_repair_checkpoint_path) |buf| alloc.free(buf);
         if (owned_path) |buf| alloc.free(buf);
     }
 
@@ -1525,6 +1499,9 @@ pub fn openCoreResourcesFromPrimaryStore(
     const apply_mutex = try alloc.create(apply_rw_lock_mod.ApplyRwLock);
     apply_mutex.* = .{};
     owned_apply_mutex = apply_mutex;
+    const repair_replay_mutex = try alloc.create(std.atomic.Mutex);
+    repair_replay_mutex.* = .unlocked;
+    owned_repair_replay_mutex = repair_replay_mutex;
     const log_mutex = try alloc.create(std.atomic.Mutex);
     log_mutex.* = .unlocked;
     owned_log_mutex = log_mutex;
@@ -1535,6 +1512,11 @@ pub fn openCoreResourcesFromPrimaryStore(
         .mem, .lsm_memory => null,
     } else null;
     owned_applied_sequence_checkpoint_path = applied_sequence_checkpoint_path;
+    const index_repair_checkpoint_path = switch (primary_backend_kind) {
+        .lmdb, .lsm => try index_repair_state.checkpointPathAlloc(alloc, path),
+        .mem, .lsm_memory => null,
+    };
+    owned_index_repair_checkpoint_path = index_repair_checkpoint_path;
 
     const change_journal_path = try std.fmt.allocPrint(alloc, "{s}/change_journal", .{path});
     defer alloc.free(change_journal_path);
@@ -1578,23 +1560,28 @@ pub fn openCoreResourcesFromPrimaryStore(
 
     owned_path = null;
     owned_applied_sequence_checkpoint_path = null;
+    owned_index_repair_checkpoint_path = null;
     owned_store = null;
     owned_primary_store_owner = .none;
     owned_change_journal = null;
     owned_shard_manager = null;
     owned_index_manager = null;
     owned_apply_mutex = null;
+    owned_repair_replay_mutex = null;
     owned_log_mutex = null;
 
     return .{
         .path = path_copy,
+        .root_generation = root_generation,
         .applied_sequence_checkpoint_path = applied_sequence_checkpoint_path,
+        .index_repair_checkpoint_path = index_repair_checkpoint_path,
         .store = store,
         .primary_store_owner = opened_primary.owner,
         .change_journal = change_journal,
         .shard_manager = shard_manager,
         .index_manager = index_manager,
         .apply_mutex = apply_mutex,
+        .repair_replay_mutex = repair_replay_mutex,
         .log_mutex = log_mutex,
         .schema = schema,
         .identity_namespace = identity_namespace,

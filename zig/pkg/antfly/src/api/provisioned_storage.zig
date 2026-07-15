@@ -20,6 +20,7 @@ const background_runtime_mod = @import("../storage/background_runtime.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const raft_mod = @import("../raft/mod.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
+const filesystem_capacity = @import("../storage/filesystem_capacity.zig");
 const runtime_status = @import("runtime_status.zig");
 const scraping = @import("antfly_scraping");
 const table_catalog = @import("table_catalog.zig");
@@ -51,6 +52,8 @@ const MinSmartTextMergeBytes: u64 = 32 * 1024 * 1024;
 const MaxSmartTextMergeBytes: u64 = 256 * 1024 * 1024;
 const MinSmartAlgebraicTensorBytes: u64 = 32 * 1024 * 1024;
 const MaxSmartAlgebraicTensorBytes: u64 = 256 * 1024 * 1024;
+const MinSmartDenseRepairBytes: u64 = 64 * 1024 * 1024;
+const MaxSmartDenseRepairBytes: u64 = 512 * 1024 * 1024;
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
@@ -133,6 +136,7 @@ fn smartResourceBudgets() SmartResourceBudgets {
     const derived_hard = adaptiveSliceHardLimit(total, 32, MinSmartDerivedBacklogBytes, MaxSmartDerivedBacklogBytes);
     const text_merge_hard = adaptiveSliceHardLimit(total, 64, MinSmartTextMergeBytes, MaxSmartTextMergeBytes);
     const algebraic_tensor_hard = adaptiveSliceHardLimit(total, 64, MinSmartAlgebraicTensorBytes, MaxSmartAlgebraicTensorBytes);
+    const dense_repair_hard = adaptiveSliceHardLimit(total, 24, MinSmartDenseRepairBytes, MaxSmartDenseRepairBytes);
 
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, lsm_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)] = resourceBudget(3, lsm_compaction_hard);
@@ -149,6 +153,7 @@ fn smartResourceBudgets() SmartResourceBudgets {
     options.budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = resourceBudget(3, derived_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = resourceBudget(3, text_merge_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.algebraic_tensor_accumulators)] = resourceBudget(3, algebraic_tensor_hard);
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_repair_working_set)] = resourceBudget(3, dense_repair_hard);
 
     return .{
         .options = options,
@@ -166,6 +171,7 @@ pub const ProvisionedGroupStorage = struct {
     group_visible_root_generation_mutex: std.atomic.Mutex = .unlocked,
     group_visible_root_generations: std.AutoHashMapUnmanaged(u64, VisibleRootGeneration) = .empty,
     resource_manager: resource_manager_mod.ResourceManager,
+    filesystem_capacity_probe: ?filesystem_capacity.Probe = null,
     lsm_cache: lsm_backend.Cache,
     hbc_cache: hbc_mod.Cache,
     runtime_status_cache: runtime_status.TableRuntimeSnapshotCache,
@@ -196,6 +202,7 @@ pub const ProvisionedGroupStorage = struct {
         self.runtime_status_cache.deinit();
         self.hbc_cache.deinit();
         self.lsm_cache.deinit();
+        self.resource_manager.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -203,7 +210,21 @@ pub const ProvisionedGroupStorage = struct {
         self: *ProvisionedGroupStorage,
         read_source: *table_reads.ProvisionedTableReadSource,
         write_source: *table_writes.ProvisionedTableWriteSource,
-    ) void {
+    ) !void {
+        // All provisioned DBs under one replica root share the ResourceManager
+        // and therefore one physical capacity domain. BackendRuntime remains
+        // the execution abstraction; filesystem policy and accounting stay in
+        // the ResourceManager.
+        if (filesystem_capacity.supported) {
+            if (self.filesystem_capacity_probe) |probe| {
+                if (!std.mem.eql(u8, probe.path, write_source.replica_root_dir)) {
+                    return error.CapacitySourceAlreadyInstalled;
+                }
+            } else {
+                self.filesystem_capacity_probe = filesystem_capacity.Probe.init(write_source.replica_root_dir, 1);
+            }
+            try self.resource_manager.installCapacitySource(self.filesystem_capacity_probe.?.source());
+        }
         if (self.backend_runtime) |runtime| {
             read_source.backend_runtime = runtime;
             write_source.backend_runtime = runtime;
@@ -385,17 +406,22 @@ test "provisioned group storage wires remote content to writer caches" {
         .ptr = undefined,
         .vtable = undefined,
     }, raft_mod.read_gate.noopReadableLeaseRequester());
-    var write_source = table_writes.ProvisionedTableWriteSource.init("/tmp/unused-antfly-write", table_catalog.CatalogSource{
+    var write_source = table_writes.ProvisionedTableWriteSource.init(".", table_catalog.CatalogSource{
         .ptr = undefined,
         .vtable = undefined,
     });
     const remote_content = scraping.RemoteContentConfig{};
     _ = write_source.withRemoteContent(&remote_content);
 
-    storage.attachSources(&read_source, &write_source);
+    try storage.attachSources(&read_source, &write_source);
 
     try std.testing.expectEqual(&remote_content, storage.write_cache.remote_content.?);
     try std.testing.expectEqual(&remote_content, storage.startup_write_cache.remote_content.?);
+    if (filesystem_capacity.supported) {
+        const capacity = try storage.resource_manager.capacitySource().?.current();
+        try std.testing.expect(capacity.capacity_bytes.? > 0);
+        try std.testing.expect(capacity.available_bytes.? <= capacity.capacity_bytes.?);
+    }
 }
 
 test "provisioned group storage derives all resource budgets" {
@@ -418,6 +444,7 @@ test "provisioned group storage derives all resource budgets" {
         resource_manager_mod.Slice.algebraic_tensor_accumulators,
         resource_manager_mod.Slice.lite_native_page_cache,
         resource_manager_mod.Slice.lite_native_link_cache,
+        resource_manager_mod.Slice.dense_repair_working_set,
     }) |slice| {
         const stats = storage.resource_manager.sliceStats(slice);
         try std.testing.expect(stats.hard_limit_bytes > 0);

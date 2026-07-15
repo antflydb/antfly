@@ -142,6 +142,11 @@ pub const MutableSnapshotCloneReasonStats = struct {
     peak_bytes: u64 = 0,
 };
 
+const MutableSnapshotReaderRef = struct {
+    state: *State,
+    readers: usize,
+};
+
 pub const MaintenanceWaker = struct {
     ptr: *anyopaque,
     wake_fn: *const fn (ptr: *anyopaque) void,
@@ -1217,11 +1222,14 @@ pub const Backend = struct {
     mutable_wal_range: WalSegmentRange = .{},
     empty_mutable_snapshot: State = .{},
     mutable_read_snapshot: ?*State = null,
+    mutable_snapshot_reader_refs: std.ArrayListUnmanaged(MutableSnapshotReaderRef) = .empty,
+    mutable_snapshot_reader_ref_by_state: std.AutoHashMapUnmanaged(*const State, usize) = .empty,
     immutable_memtables: std.ArrayListUnmanaged(*State) = .empty,
     immutable_wal_ranges: std.ArrayListUnmanaged(WalSegmentRange) = .empty,
     immutable_head: usize = 0,
     retired_immutable_memtables: std.ArrayListUnmanaged(*State) = .empty,
     retired_mutable_snapshots: std.ArrayListUnmanaged(*State) = .empty,
+    retired_mutable_snapshot_by_state: std.AutoHashMapUnmanaged(*const State, usize) = .empty,
     closing: std.atomic.Value(bool) = .init(false),
     recovery_replaying_wal: bool = false,
     runs: std.ArrayListUnmanaged(repository_mod.Run) = .empty,
@@ -2083,16 +2091,65 @@ pub const Backend = struct {
     }
 
     pub fn snapshotMutableStateWithReason(self: *Backend, reason: MutableSnapshotReason) !*const State {
-        if (self.mutable_read_snapshot) |snapshot| return snapshot;
+        if (self.mutable_read_snapshot) |snapshot| {
+            self.retainMutableSnapshotReader(snapshot);
+            return snapshot;
+        }
         if (self.mutable.entries.items.len == 0) return &self.empty_mutable_snapshot;
         const snapshot = try self.allocator.create(State);
         errdefer self.allocator.destroy(snapshot);
         snapshot.* = try self.cloneMutableStateWithReason(reason);
         errdefer snapshot.deinit(self.allocator);
         try self.retired_mutable_snapshots.ensureUnusedCapacity(self.allocator, 1);
+        try self.retired_mutable_snapshot_by_state.ensureUnusedCapacity(self.allocator, 1);
+        try self.mutable_snapshot_reader_refs.ensureUnusedCapacity(self.allocator, 1);
+        try self.mutable_snapshot_reader_ref_by_state.ensureUnusedCapacity(self.allocator, 1);
+        const ref_index = self.mutable_snapshot_reader_refs.items.len;
+        self.mutable_snapshot_reader_refs.appendAssumeCapacity(.{
+            .state = snapshot,
+            .readers = 1,
+        });
+        self.mutable_snapshot_reader_ref_by_state.putAssumeCapacity(snapshot, ref_index);
         self.mutable_read_snapshot = snapshot;
         self.syncTrackedInMemoryStateUsageCurrentLocked();
         return snapshot;
+    }
+
+    fn mutableSnapshotReaderRefIndex(self: *const Backend, state: *const State) ?usize {
+        return self.mutable_snapshot_reader_ref_by_state.get(state);
+    }
+
+    fn removeMutableSnapshotReaderRef(self: *Backend, index: usize) MutableSnapshotReaderRef {
+        const removed = self.mutable_snapshot_reader_refs.items[index];
+        _ = self.mutable_snapshot_reader_ref_by_state.remove(removed.state);
+        _ = self.mutable_snapshot_reader_refs.swapRemove(index);
+        if (index < self.mutable_snapshot_reader_refs.items.len) {
+            const moved = self.mutable_snapshot_reader_refs.items[index];
+            self.mutable_snapshot_reader_ref_by_state.getPtr(moved.state).?.* = index;
+        }
+        return removed;
+    }
+
+    fn retainMutableSnapshotReader(self: *Backend, state: *State) void {
+        const index = self.mutableSnapshotReaderRefIndex(state) orelse unreachable;
+        self.mutable_snapshot_reader_refs.items[index].readers += 1;
+    }
+
+    pub fn releaseMutableReadSnapshot(self: *Backend, state: *const State) void {
+        const index = self.mutableSnapshotReaderRefIndex(state) orelse {
+            std.debug.assert(state == &self.empty_mutable_snapshot);
+            return;
+        };
+        const ref = &self.mutable_snapshot_reader_refs.items[index];
+        std.debug.assert(ref.readers > 0);
+        ref.readers -= 1;
+        if (ref.readers != 0 or self.mutable_read_snapshot == state) return;
+
+        const remove_index = self.retired_mutable_snapshot_by_state.get(state) orelse unreachable;
+        self.removeRetiredMutableSnapshot(remove_index);
+        const owned = self.removeMutableSnapshotReaderRef(index).state;
+        self.destroyMutableSnapshot(owned);
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
     }
 
     pub fn cloneCurrentScanMutableStateForBulkIngest(self: *Backend) !?State {
@@ -2161,7 +2218,7 @@ pub const Backend = struct {
     }
 
     fn retireImmutableMemtable(self: *Backend, state: *State) !void {
-        if (self.active_readers == 0) {
+        if (self.activeVersionReaders() == 0) {
             self.destroyImmutableMemtable(state);
             return;
         }
@@ -2169,14 +2226,28 @@ pub const Backend = struct {
     }
 
     fn retireMutableSnapshot(self: *Backend, state: *State) void {
-        if (self.active_readers == 0) {
+        const ref_index = self.mutableSnapshotReaderRefIndex(state) orelse unreachable;
+        if (self.mutable_snapshot_reader_refs.items[ref_index].readers == 0) {
+            _ = self.removeMutableSnapshotReaderRef(ref_index);
             self.destroyMutableSnapshot(state);
             return;
         }
-        self.retired_mutable_snapshots.append(self.allocator, state) catch {
-            // Keep the old snapshot alive rather than risk invalidating
-            // active readers when we cannot queue it for retirement.
-        };
+        // Capacity is reserved when the snapshot is published, before any
+        // reader can observe it. Retirement therefore cannot fail while a
+        // reader still owns the generation.
+        const retired_index = self.retired_mutable_snapshots.items.len;
+        self.retired_mutable_snapshots.appendAssumeCapacity(state);
+        self.retired_mutable_snapshot_by_state.putAssumeCapacity(state, retired_index);
+    }
+
+    fn removeRetiredMutableSnapshot(self: *Backend, index: usize) void {
+        const removed = self.retired_mutable_snapshots.items[index];
+        _ = self.retired_mutable_snapshot_by_state.remove(removed);
+        _ = self.retired_mutable_snapshots.swapRemove(index);
+        if (index < self.retired_mutable_snapshots.items.len) {
+            const moved = self.retired_mutable_snapshots.items[index];
+            self.retired_mutable_snapshot_by_state.getPtr(moved).?.* = index;
+        }
     }
 
     fn drainRetiredImmutableMemtables(self: *Backend) void {
@@ -2188,9 +2259,14 @@ pub const Backend = struct {
 
     fn drainRetiredMutableSnapshots(self: *Backend) void {
         for (self.retired_mutable_snapshots.items) |state| {
+            if (self.mutableSnapshotReaderRefIndex(state)) |index| {
+                std.debug.assert(self.mutable_snapshot_reader_refs.items[index].readers == 0);
+                _ = self.removeMutableSnapshotReaderRef(index);
+            }
             self.destroyMutableSnapshot(state);
         }
         self.retired_mutable_snapshots.clearRetainingCapacity();
+        self.retired_mutable_snapshot_by_state.clearRetainingCapacity();
         self.syncTrackedInMemoryStateUsageCurrentLocked();
     }
 
@@ -3458,6 +3534,17 @@ pub const Backend = struct {
         return self.active_mutable_value_readers > 0;
     }
 
+    /// Write transactions are counted for backend-close fencing, but point
+    /// reads execute under the backend lock and do not retain an LSM version.
+    /// A write cursor takes an additional `.current_scan` pin.
+    fn activeVersionReaders(self: *const Backend) usize {
+        return self.active_readers -| self.active_readers_by_kind[readerPinKindIndex(.write_txn)];
+    }
+
+    pub fn hasVersionReaderPins(self: *const Backend) bool {
+        return self.activeVersionReaders() != 0;
+    }
+
     pub fn recordPointGet(self: *Backend) void {
         _ = self.read_stats.point_gets.fetchAdd(1, .monotonic);
     }
@@ -3695,7 +3782,7 @@ pub const Backend = struct {
         std.debug.assert(self.active_readers_by_kind[index] > 0);
         self.active_readers -= 1;
         self.active_readers_by_kind[index] -= 1;
-        if (self.active_readers == 0) {
+        if (self.activeVersionReaders() == 0) {
             self.drainObsoleteRuns();
             self.drainRetiredImmutableMemtables();
             self.drainRetiredMutableSnapshots();
@@ -3728,7 +3815,7 @@ pub const Backend = struct {
             return;
         }
         try self.obsolete_runs.append(self.allocator, runs);
-        if (self.active_readers == 0) self.drainObsoleteRuns();
+        if (self.activeVersionReaders() == 0) self.drainObsoleteRuns();
     }
 
     pub fn getCachedRunState(self: *Backend, path: []const u8, run_id: u64) !*const State {
@@ -11767,6 +11854,52 @@ test "lsm backend reuses mutable read snapshot until writes invalidate it" {
     try std.testing.expect(first_snapshot != backend.mutable_read_snapshot.?);
 }
 
+test "lsm backend reclaims unreferenced mutable snapshot generations independently" {
+    var backend = Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+
+    {
+        var writer = try backend.beginWrite();
+        try writer.put(.{ .name = "docs" }, "doc:a", "A");
+        try writer.commit();
+    }
+
+    var read_a = try backend.beginRead();
+    var read_a_open = true;
+    defer if (read_a_open) read_a.abort();
+    try std.testing.expectEqualStrings("A", try read_a.get(.{ .name = "docs" }, "doc:a"));
+
+    {
+        var writer = try backend.beginWrite();
+        try writer.put(.{ .name = "docs" }, "doc:b", "B");
+        try writer.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), backend.retired_mutable_snapshots.items.len);
+
+    {
+        var read_b = try backend.beginRead();
+        try std.testing.expectEqualStrings("B", try read_b.get(.{ .name = "docs" }, "doc:b"));
+        read_b.abort();
+    }
+    {
+        var writer = try backend.beginWrite();
+        try writer.put(.{ .name = "docs" }, "doc:c", "C");
+        try writer.commit();
+    }
+
+    // The reader of generation A must not retain the unreferenced generation B.
+    try std.testing.expectEqual(@as(usize, 1), backend.retired_mutable_snapshots.items.len);
+    try std.testing.expectEqualStrings("A", try read_a.get(.{ .name = "docs" }, "doc:a"));
+    try std.testing.expectError(error.NotFound, read_a.get(.{ .name = "docs" }, "doc:c"));
+
+    read_a.abort();
+    read_a_open = false;
+    try std.testing.expectEqual(@as(usize, 0), backend.retired_mutable_snapshots.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable_snapshot_reader_refs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable_snapshot_reader_ref_by_state.count());
+    try std.testing.expectEqual(@as(usize, 0), backend.retired_mutable_snapshot_by_state.count());
+}
+
 test "lsm backend close drains generation readers before teardown" {
     const CloseState = struct {
         backend: *Backend,
@@ -11926,6 +12059,7 @@ test "lsm backend write txns retain reader guards until completion" {
 
         var txn = try runtime.beginWrite();
         try std.testing.expectEqual(@as(usize, 1), backend.active_readers);
+        try std.testing.expectEqual(@as(usize, 0), backend.activeVersionReaders());
         try txn.put("doc:a", "A");
         try std.testing.expectEqualStrings("A", try txn.get("doc:a"));
         try txn.commit();
@@ -11938,6 +12072,8 @@ test "lsm backend write txns retain reader guards until completion" {
         try txn.put(.{ .name = "docs" }, "doc:b", "B");
         var cur = try txn.openCursor(.{ .name = "docs" });
         defer cur.close();
+        try std.testing.expectEqual(@as(usize, 2), backend.active_readers);
+        try std.testing.expectEqual(@as(usize, 1), backend.activeVersionReaders());
         try std.testing.expectEqualStrings("doc:a", (try cur.first()).?.key);
         txn.abort();
         try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
@@ -11952,6 +12088,42 @@ test "lsm backend write txns retain reader guards until completion" {
         txn.abort();
         try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
     }
+}
+
+test "lsm backend write txn guard does not retain obsolete versions" {
+    var backend = Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+
+    {
+        var seed = try backend.beginWrite();
+        try seed.put(.{ .name = "docs" }, "doc:a", "A");
+        try seed.commit();
+    }
+
+    var long_write = try backend.beginWrite();
+    defer long_write.abort();
+    try std.testing.expectEqual(@as(usize, 1), backend.active_readers);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeVersionReaders());
+
+    {
+        var read = try backend.beginRead();
+        try std.testing.expectEqualStrings("A", try read.get(.{ .name = "docs" }, "doc:a"));
+        read.abort();
+    }
+    try std.testing.expect(backend.mutable_read_snapshot != null);
+
+    {
+        var writer = try backend.beginWrite();
+        try writer.put(.{ .name = "docs" }, "doc:b", "B");
+        try writer.commit();
+    }
+
+    try std.testing.expectEqual(@as(?*State, null), backend.mutable_read_snapshot);
+    try std.testing.expectEqual(@as(usize, 0), backend.retired_mutable_snapshots.items.len);
+    try std.testing.expectEqualStrings("A", try long_write.get(.{ .name = "docs" }, "doc:a"));
+    const stats = backend.snapshotReadStats();
+    try std.testing.expect(stats.point_value_copies > 0);
+    try std.testing.expectEqual(@as(u64, 0), stats.point_value_borrows);
 }
 
 test "lsm backend close reclaims eligible queued obsolete files" {
