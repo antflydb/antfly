@@ -1,0 +1,40 @@
+{
+  "version": "0.8",
+  "index_id": "antfly-benchmark",
+  "doc_mapping": {
+    "mode": "strict",
+    "store_source": false,
+    "field_mappings": [
+      {
+        "name": "corpus_ordinal",
+        "type": "u64",
+        "stored": true,
+        "indexed": true,
+        "fast": true
+      },
+      {
+        "name": "body",
+        "type": "text",
+        "stored": false,
+        "indexed": true,
+        "tokenizer": "default",
+        "record": "position",
+        "fieldnorms": true
+      },
+      {
+        "name": "marker",
+        "type": "text",
+        "stored": true,
+        "indexed": true,
+        "tokenizer": "raw",
+        "record": "basic",
+        "fieldnorms": false
+      }
+    ]
+  },
+  "search_settings": {
+    "default_search_fields": [
+      "body"
+    ]
+  }
+}

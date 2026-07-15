@@ -34,7 +34,11 @@ const MaxSmartLsmCompactionBytes: u64 = 1024 * 1024 * 1024;
 const MinSmartLsmTableBuilderBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartLsmTableBuilderBytes: u64 = 512 * 1024 * 1024;
 const MinSmartLsmInMemoryStateBytes: u64 = 256 * 1024 * 1024;
-const MaxSmartLsmInMemoryStateBytes: u64 = 2 * 1024 * 1024 * 1024;
+// Allocator-backed LSM state has substantial process-footprint amplification
+// while immutable tables are being encoded and published. Do not scale this
+// slice to multi-gigabyte queues on large hosts; local backend limits provide
+// fairness, while this remains the aggregate process admission ceiling.
+const MaxSmartLsmInMemoryStateBytes: u64 = 768 * 1024 * 1024;
 const MinSmartHbcCacheBytes: u64 = 128 * 1024 * 1024;
 const MaxSmartHbcCacheBytes: u64 = 2 * 1024 * 1024 * 1024;
 const MinSmartDenseApplyBytes: u64 = 64 * 1024 * 1024;
@@ -346,6 +350,14 @@ test "provisioned group storage wires remote content to writer caches" {
 
     try std.testing.expectEqual(&remote_content, storage.write_cache.remote_content.?);
     try std.testing.expectEqual(&remote_content, storage.startup_write_cache.remote_content.?);
+
+    // Keep the production aggregate LSM admission policy covered by the API
+    // module's permanent root-test filter as well as the exhaustive budget
+    // fixture below.
+    const lsm_state = storage.resource_manager.sliceStats(.lsm_in_memory_state);
+    try std.testing.expect(lsm_state.hard_limit_bytes <= MaxSmartLsmInMemoryStateBytes);
+    try std.testing.expectEqual(resource_manager_mod.PressureAction.throttle_writes, lsm_state.soft_action);
+    try std.testing.expectEqual(resource_manager_mod.PressureAction.throttle_writes, lsm_state.hard_action);
 }
 
 test "provisioned group storage derives all resource budgets" {
@@ -375,4 +387,9 @@ test "provisioned group storage derives all resource budgets" {
         try std.testing.expect(stats.soft_limit_bytes > 0);
         try std.testing.expect(stats.soft_limit_bytes <= stats.hard_limit_bytes);
     }
+
+    const lsm_state = storage.resource_manager.sliceStats(.lsm_in_memory_state);
+    try std.testing.expect(lsm_state.hard_limit_bytes <= MaxSmartLsmInMemoryStateBytes);
+    try std.testing.expectEqual(resource_manager_mod.PressureAction.throttle_writes, lsm_state.soft_action);
+    try std.testing.expectEqual(resource_manager_mod.PressureAction.throttle_writes, lsm_state.hard_action);
 }

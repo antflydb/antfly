@@ -1,0 +1,14 @@
+{
+  "method": "POST",
+  "path": "/tables/antfly-benchmark/query",
+  "expect_nonempty_hits": true,
+  "body": {
+    "full_text_search": {
+      "match": "alpha",
+      "field": "body"
+    },
+    "fields": [],
+    "limit": 10,
+    "count": false
+  }
+}

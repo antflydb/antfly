@@ -10889,7 +10889,10 @@ pub fn searchTextQuery(
     const full_candidate_limit = effectiveTextCandidateLimit(snapshot.global_doc_count, native_constraints);
     const requires_field_sort = effective_req.order_by.len > 0;
     const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, effective_req.count_only);
-    const load_stored_in_search_engine = effective_req.include_stored and !chunk_backed and !requires_field_sort;
+    // The primary document store is the source of truth. Production text
+    // segments retain compact keys for hit identity, but no longer duplicate
+    // source bodies merely to project a result page.
+    const load_stored_in_search_engine = false;
     var field_sort_plan = SortExecutionPlan{ .kind = .none };
     if (requires_field_sort) field_sort_plan = try planTextNativeSortFields(effective_req, snapshot, text_entry.runtime_schema);
     if (requires_field_sort and
@@ -11172,11 +11175,6 @@ pub fn searchTextQuery(
             } else {
                 try sortAndPageSearchResultInPlace(&out, effective_req, executor.ctx, executor.load_stored, field_sort_plan, null);
             }
-            if (effective_req.include_stored and !chunk_backed) {
-                const source_profile = try loadMissingProjectedTextHitDocuments(alloc, effective_req, executor, out.hits);
-                applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
-                logBenchProjectedSourceLoadProfile(effective_req, field_sort_plan, "text", source_profile);
-            }
         } else if (late_visibility_paginate and !effective_req.count_only) {
             try paginateSearchResultInPlace(&out, effective_req.offset, effective_req.limit);
         }
@@ -11190,6 +11188,11 @@ pub fn searchTextQuery(
                 .window_len = out.hits.len,
                 .total_ns = execute_ns + hits_ns + postprocess_ns,
             });
+        }
+        if (effective_req.include_stored and !chunk_backed) {
+            const source_profile = try loadMissingProjectedTextHitDocuments(alloc, effective_req, executor, out.hits);
+            applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
+            logBenchProjectedSourceLoadProfile(effective_req, if (requires_field_sort) field_sort_plan else .{ .kind = .score_top_k }, "text", source_profile);
         }
         if (bench_query_profile) {
             std.log.info(
@@ -11644,27 +11647,31 @@ pub fn collectExplicitBackgroundTextStats(
             initialized_terms += 1;
         }
 
+        const term_doc_sets = try alloc.alloc(roaring.RoaringBitmap, request.terms.len);
+        var initialized_sets: usize = 0;
+        defer {
+            for (term_doc_sets[0..initialized_sets]) |*set| set.deinit();
+            if (term_doc_sets.len > 0) alloc.free(term_doc_sets);
+        }
+        for (request.terms, 0..) |term, term_index| {
+            term_doc_sets[term_index] = roaring.RoaringBitmap.init(alloc);
+            initialized_sets += 1;
+            const doc_nums = try snapshot.executeFilter(alloc, .{ .term = .{
+                .field = request.field,
+                .term = term,
+            } });
+            defer alloc.free(doc_nums);
+            for (doc_nums) |doc_num| try term_doc_sets[term_index].add(doc_num);
+        }
+
         var background_doc_count: u32 = 0;
         for (background_result.hits) |hit| {
             if (request.resolved_doc_filter) |filter| {
                 if (!(try docAllowedByResolvedFilter(snapshot, hit.doc_id, filter))) continue;
             }
             background_doc_count += 1;
-            const stored = hit.stored_data orelse continue;
-            var parsed = std.json.parseFromSlice(std.json.Value, alloc, stored, .{}) catch continue;
-            defer parsed.deinit();
-            const value = extractJsonValueAtPath(parsed.value, request.field) orelse continue;
-
-            var seen_terms = std.StringHashMap(void).init(alloc);
-            defer {
-                var it = seen_terms.keyIterator();
-                while (it.next()) |key| alloc.free(key.*);
-                seen_terms.deinit();
-            }
-            try collectSignificantTermsFromJsonValue(alloc, value, &seen_terms);
-
-            for (term_doc_freqs) |*item| {
-                if (seen_terms.contains(item.term)) item.doc_freq +|= 1;
+            for (term_doc_freqs, 0..) |*item, term_index| {
+                if (term_doc_sets[term_index].contains(hit.doc_id)) item.doc_freq +|= 1;
             }
         }
 
@@ -11697,9 +11704,86 @@ pub fn executeBackgroundQuery(
             } },
         },
         .k = snapshot.global_doc_count,
-        .include_stored = true,
+        .include_stored = false,
     };
     return search_mod.execute(alloc, snapshot, request);
+}
+
+test "background text stats use postings when segment source is omitted" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/background-postings", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const segment = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(
+        alloc,
+        &.{
+            .{
+                .id = "doc:a",
+                .stored_data = "{\"body\":\"alpha\"}",
+                .text_fields = &.{.{ .field_name = "body", .text = "alpha" }},
+            },
+            .{
+                .id = "doc:b",
+                .stored_data = "{\"body\":\"alpha beta\"}",
+                .text_fields = &.{.{ .field_name = "body", .text = "alpha beta" }},
+            },
+        },
+        &analysis_mod.default_analyzer,
+        .{},
+        .{ .store_document_source = false },
+    );
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = null,
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const Harness = struct {
+        entry: *index_manager_mod.IndexManager.TextIndex,
+
+        fn textIndexEntry(ctx: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.entry;
+        }
+    };
+    var harness = Harness{ .entry = &text_entry };
+    const stats = try collectExplicitBackgroundTextStats(alloc, &.{.{
+        .aggregation_name = "sig",
+        .index_name = "ft",
+        .field = "body",
+        .terms = &.{ "alpha", "beta" },
+        .background_query = .{ .match_all = {} },
+    }}, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+    });
+    defer aggregations_mod.deinitDistributedBackgroundTextStats(alloc, stats);
+
+    try std.testing.expectEqual(@as(usize, 1), stats.len);
+    try std.testing.expectEqual(@as(u32, 2), stats[0].background_doc_count);
+    try std.testing.expectEqual(@as(u32, 2), stats[0].term_doc_freqs[0].doc_freq);
+    try std.testing.expectEqual(@as(u32, 1), stats[0].term_doc_freqs[1].doc_freq);
 }
 
 fn collectQueryTerms(
@@ -21618,6 +21702,7 @@ test "text score query exposes score top k sort profile" {
     const Harness = struct {
         text_entry: *index_manager_mod.IndexManager.TextIndex,
         postprocess_count: usize = 0,
+        load_count: usize = 0,
 
         fn textIndexEntry(
             ctx: ?*anyopaque,
@@ -21654,11 +21739,13 @@ test "text score query exposes score top k sort profile" {
         }
 
         fn loadStored(
-            _: ?*anyopaque,
-            _: Allocator,
-            _: []const u8,
+            ctx: ?*anyopaque,
+            load_alloc: Allocator,
+            key: []const u8,
         ) anyerror!?[]u8 {
-            return error.UnexpectedTestCall;
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.load_count += 1;
+            return try std.fmt.allocPrint(load_alloc, "{{\"body\":\"primary:{s}\"}}", .{key});
         }
 
         fn isExpiredKey(
@@ -21715,6 +21802,26 @@ test "text score query exposes score top k sort profile" {
     try std.testing.expectEqualStrings("", profile.sort_rejection_reason);
     try std.testing.expectEqualStrings("", profile.sort_rejection_detail);
     try std.testing.expectEqualStrings("", profile.sort_rejection_field.slice());
+    try std.testing.expectEqual(@as(usize, 0), harness.load_count);
+
+    var source_result = try searchTextQuery(alloc, .{
+        .index_name = "ft",
+        .include_stored = true,
+        .limit = 2,
+    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+        .search_match_all = Harness.searchMatchAll,
+        .project_stored_search = Harness.projectStoredSearch,
+        .load_stored = Harness.loadStored,
+        .postprocess = Harness.postprocess,
+    });
+    defer source_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), source_result.hits.len);
+    try std.testing.expectEqual(@as(usize, 1), harness.load_count);
+    try std.testing.expectEqualStrings("{\"body\":\"primary:doc:a\"}", source_result.hits[0].stored_data.?);
 }
 
 test "text ordered query rejects unresolved stored pattern filters" {

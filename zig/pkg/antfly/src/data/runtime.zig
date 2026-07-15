@@ -607,6 +607,11 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_memtables", "gauge", "Cached write LSM immutable memtables waiting to flush", stats.immutable_memtables);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_entries", "gauge", "Cached write LSM immutable memtable entries waiting to flush", stats.immutable_entries);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_bytes", "gauge", "Cached write LSM immutable memtable estimated bytes waiting to flush", stats.immutable_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_retired_immutable_memtables", "gauge", "Flushed LSM immutable generations retained by exact readers", stats.retired_immutable_memtables);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_retired_immutable_entries", "gauge", "Entries in flushed LSM immutable generations retained by exact readers", stats.retired_immutable_entries);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_retired_immutable_bytes", "gauge", "Actual bytes in flushed LSM immutable generations retained by exact readers", stats.retired_immutable_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_pinned_generations", "gauge", "Immutable LSM generations with one or more exact reader pins", stats.immutable_pinned_generations);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_pin_refs", "gauge", "Exact reader references across immutable LSM generations", stats.immutable_pin_refs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_total_runs", "gauge", "Cached write LSM active run count", stats.total_runs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_total_run_bytes", "gauge", "Cached write LSM active run bytes on disk", stats.total_run_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_snapshot_clone_calls_total", "counter", "LSM mutable snapshot clone calls issued by snapshot reads", stats.mutable_snapshot_clone_calls);
@@ -1087,6 +1092,7 @@ fn writeProcessMemoryMetrics(writer: *std.Io.Writer, stats: process_memory_mod.S
     try health_metrics.appendPromMetric(writer, "antfly_process_anonymous_bytes", "gauge", "Process anonymous resident bytes reported by the operating system", stats.anonymous_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_private_dirty_bytes", "gauge", "Process private dirty bytes reported by the operating system", stats.private_dirty_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_footprint_bytes", "gauge", "Process physical footprint bytes reported by the operating system", stats.footprint_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_process_peak_footprint_bytes", "gauge", "Peak process physical footprint bytes reported by the operating system", stats.peak_footprint_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_wired_bytes", "gauge", "Process wired bytes reported by the operating system", stats.wired_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_pageins_total", "counter", "Process page-ins reported by the operating system", stats.pageins);
     try health_metrics.appendPromMetric(writer, "antfly_process_malloc_available", "gauge", "Whether process malloc zone metrics are available on this platform", if (stats.malloc_available) 1 else 0);

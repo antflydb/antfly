@@ -4514,7 +4514,10 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "resource manager observes over-budget external usage",
+            "resource manager evaluates projected admission with configured action",
             "cache reports shared byte usage to resource manager",
+            "lsm backend resource manager throttles projected immutable state",
+            "lsm backend resource manager rejects before wal apply",
             "derived backlog tracker accounts and releases payload bytes",
             "hbc shared cache namespaces entries",
             "hbc shared cache evicts across namespaces under one resource budget",
@@ -5952,6 +5955,76 @@ pub fn build(b: *std.Build) void {
     });
     const install_search_benchmark_query = b.addInstallArtifact(search_benchmark_query, .{});
 
+    const search_benchmark_common_test_mod = b.createModule(.{
+        .root_source_file = b.path("bench/full_text/search_benchmark_common.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    search_benchmark_common_test_mod.addImport("antfly-zig", lib_mod);
+    const search_benchmark_common_tests = b.addTest(.{
+        .root_module = search_benchmark_common_test_mod,
+    });
+    const run_search_benchmark_common_tests = b.addRunArtifact(search_benchmark_common_tests);
+    const search_bench_test_step = b.step("search-bench-test", "Run search benchmark grammar and protocol tests");
+    search_bench_test_step.dependOn(&run_search_benchmark_common_tests.step);
+
+    const search_performance_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "search bool conjunction query",
+            "search bool should-only query",
+            "streaming boolean scorer matches all-hit reference on randomized corpus",
+            "search pure bool should uses WAND top-k",
+            "search term phrase uses exact positional BM25 top-k",
+            "streaming phrase scorer matches randomized positional reference",
+            "phrase filter exact adjacency",
+            "phrase filter with slop",
+            "PostingsIterator positional seek decodes only selected records",
+            "PostingsIterator deferred positional seek decodes only accepted candidates",
+            "production reader rejects branch-only v24-v36 formats",
+            "v12 positions are bit-packed smaller than raw u32",
+            "v12 reads back positions with wide packed deltas",
+            "v37 adaptive impact palette preserves conservative bound pairs",
+            "v37 one posting block retains one global impact bound",
+            "v29 impact frequency escape remains a conservative upper bound",
+            "v29 adaptive impact IDs use runs and round-trip",
+            "v29 one-payload-block postings omit sparse impact range IDs",
+            "v30 contiguous grouped positions retain direct document round-trip",
+            "v31 inline single-document postings retain frequency positions and direct iteration",
+            "v32 posting-count metadata derives chunk ordinal and document count",
+            "v33 constant-frequency blocks omit packed frequency payload",
+            "v34 five-bit impact frequencies are conservative upper bounds",
+            "v35 full posting blocks use portable vertical BP128 for docs and frequencies",
+            "PostingsIterator advanceTo uses sparse skip data for long postings",
+            "current reader reopens origin-main v23 postings and block-max layout",
+            "index-only stored fields preserve ordinals key ranges and merges",
+            "v25 field norms match Tantivy quantization",
+            "v25 norm table uses one byte per document and reads legacy packed norms",
+            "v22 term dictionary block values compact one-hit terms and delta postings offsets",
+            "v23 term dictionary stores front-coded blocks indexed by block ceiling",
+            "WAND pivot bound remains conservative across later high-impact blocks",
+            "single-term block scan preserves a later higher-impact chunk",
+            "single-term equality pruning retains earliest cutoff ties",
+            "pure conjunction block pruning retains earliest cutoff ties",
+            "pure conjunction metadata scan preserves later competitive block",
+            "multi-segment filter execution",
+            "multi-segment search merges per-segment top-k globally",
+            "fragmented snapshot retains segment bound pruning",
+            "bool fallback applies native doc number constraints",
+            "db text kernel search matches projected search without stored bodies",
+            "split preserves postings when text segments omit source bodies",
+            "background text stats use postings when segment source is omitted",
+            "text score query exposes score top k sort profile",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_search_performance_tests = b.addRunArtifact(search_performance_tests);
+    const search_performance_test_step = b.step("search-performance-test", "Run focused full-text scorer regression tests");
+    search_performance_test_step.dependOn(&run_search_performance_tests.step);
+
     const search_benchmark_codec_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/search_benchmark_codec_bench.zig"),
         .target = target,
@@ -5970,6 +6043,22 @@ pub fn build(b: *std.Build) void {
     }
     const search_bench_codec_step = b.step("search-bench-codec-bench", "Benchmark StreamVByte codec used by search postings");
     search_bench_codec_step.dependOn(&run_search_benchmark_codec_bench.step);
+
+    const search_benchmark_bitpack_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/full_text/search_benchmark_bitpack_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    search_benchmark_bitpack_bench_mod.addImport("antfly-zig", lib_mod);
+    const search_benchmark_bitpack_bench = b.addExecutable(.{
+        .name = "search_benchmark_bitpack_bench",
+        .root_module = search_benchmark_bitpack_bench_mod,
+    });
+    const install_search_benchmark_bitpack_bench = b.addInstallArtifact(search_benchmark_bitpack_bench, .{});
+    const run_search_benchmark_bitpack_bench = b.addRunArtifact(search_benchmark_bitpack_bench);
+    if (b.args) |args| run_search_benchmark_bitpack_bench.addArgs(args);
+    const search_bench_bitpack_step = b.step("search-bench-bitpack-bench", "Benchmark portable Zig vector BP128 against horizontal bit packing");
+    search_bench_bitpack_step.dependOn(&run_search_benchmark_bitpack_bench.step);
 
     const wand_skip_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/wand_skip_bench.zig"),
@@ -5992,6 +6081,7 @@ pub fn build(b: *std.Build) void {
     search_bench_build_step.dependOn(&install_search_benchmark_index.step);
     search_bench_build_step.dependOn(&install_search_benchmark_query.step);
     search_bench_build_step.dependOn(&install_search_benchmark_codec_bench.step);
+    search_bench_build_step.dependOn(&install_search_benchmark_bitpack_bench.step);
 
     const storage_fixture_promote_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/storage_fixture_promote.zig"),

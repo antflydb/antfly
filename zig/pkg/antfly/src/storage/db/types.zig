@@ -1737,10 +1737,14 @@ pub const TextMergeStats = struct {
     merge_input_bytes_total: u64 = 0,
     merge_output_segments_total: u64 = 0,
     merge_output_bytes_total: u64 = 0,
+    merge_elapsed_ns_total: u64 = 0,
+    merge_peak_task_alloc_bytes: u64 = 0,
     last_merge_input_segments: u64 = 0,
     last_merge_input_bytes: u64 = 0,
     last_merge_output_segments: u64 = 0,
     last_merge_output_bytes: u64 = 0,
+    last_merge_elapsed_ns: u64 = 0,
+    last_merge_peak_task_alloc_bytes: u64 = 0,
     quarantined_merges: u64 = 0,
     quarantined_segments: u64 = 0,
     last_merge_error: []const u8 = "",
@@ -1768,10 +1772,14 @@ pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void 
     dst.merge_input_bytes_total +|= src.merge_input_bytes_total;
     dst.merge_output_segments_total +|= src.merge_output_segments_total;
     dst.merge_output_bytes_total +|= src.merge_output_bytes_total;
+    dst.merge_elapsed_ns_total +|= src.merge_elapsed_ns_total;
+    dst.merge_peak_task_alloc_bytes = @max(dst.merge_peak_task_alloc_bytes, src.merge_peak_task_alloc_bytes);
     dst.last_merge_input_segments = @max(dst.last_merge_input_segments, src.last_merge_input_segments);
     dst.last_merge_input_bytes = @max(dst.last_merge_input_bytes, src.last_merge_input_bytes);
     dst.last_merge_output_segments = @max(dst.last_merge_output_segments, src.last_merge_output_segments);
     dst.last_merge_output_bytes = @max(dst.last_merge_output_bytes, src.last_merge_output_bytes);
+    dst.last_merge_elapsed_ns = @max(dst.last_merge_elapsed_ns, src.last_merge_elapsed_ns);
+    dst.last_merge_peak_task_alloc_bytes = @max(dst.last_merge_peak_task_alloc_bytes, src.last_merge_peak_task_alloc_bytes);
     dst.quarantined_merges +|= src.quarantined_merges;
     dst.quarantined_segments +|= src.quarantined_segments;
     if (src.last_merge_error.len != 0) dst.last_merge_error = src.last_merge_error;
@@ -2205,6 +2213,88 @@ pub const DBIndexStats = struct {
     algebraic_candidates: []const AlgebraicCandidateStatus = &.{},
     algebraic_candidate_decision_history: []const AlgebraicCandidateDecisionStatus = &.{},
     algebraic_progress: []const AlgebraicProgressStatus = &.{},
+};
+
+/// Read-only physical layout of a full-text index snapshot. This is an
+/// internal diagnostics/benchmark surface: callers must not use segment IDs or
+/// positions as durable document identity.
+pub const TextSegmentLayoutStats = struct {
+    segment_id: u64,
+    doc_count: u32,
+    live_doc_count: u32,
+    deleted_count: u32,
+    bytes: u64,
+    file_backed: bool,
+};
+
+pub const TextMergePolicyStats = struct {
+    max_segments_per_tier: u32,
+    max_merge_at_once: u32,
+    max_segment_size: u64,
+    floor_segment_size: u64,
+    skew_weight: f64,
+    size_weight: f64,
+    delete_reclaim_weight: f64,
+};
+
+pub const TextIndexLayoutStats = struct {
+    global_doc_count: u32,
+    total_bytes: u64,
+    segments: []TextSegmentLayoutStats,
+    merge_policy: TextMergePolicyStats,
+    merge_stats: TextMergeStats,
+
+    pub fn deinit(self: *TextIndexLayoutStats, alloc: Allocator) void {
+        if (self.segments.len > 0) alloc.free(self.segments);
+        self.* = undefined;
+    }
+};
+
+pub const TextKernelHit = struct {
+    /// Stable, one-based native document ordinal. Benchmark adapters may
+    /// normalize this to their declared external ordinal base.
+    doc_ordinal: u32,
+    score: f32,
+};
+
+pub const TextBM25Config = struct {
+    k1: f32 = 1.2,
+    b: f32 = 0.75,
+};
+
+pub const TextKernelSearchOptions = struct {
+    limit: u32 = 10,
+    bm25: TextBM25Config = .{},
+    collect_diagnostics: bool = false,
+};
+
+pub const TextKernelDiagnostics = struct {
+    segments_considered: u64 = 0,
+    segments_searched: u64 = 0,
+    segments_pruned: u64 = 0,
+    postings_iterators_opened: u64 = 0,
+    wand_next_in_score: u64 = 0,
+    wand_next_in_advance: u64 = 0,
+    wand_pivots_scored: u64 = 0,
+    wand_pivots_advanced: u64 = 0,
+    wand_chunks_skipped: u64 = 0,
+    boolean_candidates_scored: u64 = 0,
+    boolean_chunks_skipped: u64 = 0,
+    phrase_candidates_verified: u64 = 0,
+    phrase_position_records_decoded: u64 = 0,
+    phrase_matches_scored: u64 = 0,
+};
+
+pub const TextKernelResult = struct {
+    hits: []TextKernelHit,
+    total_hits: u32,
+    total_hits_relation: TotalHitsRelation,
+    diagnostics: TextKernelDiagnostics = .{},
+
+    pub fn deinit(self: *TextKernelResult, alloc: Allocator) void {
+        if (self.hits.len > 0) alloc.free(self.hits);
+        self.* = undefined;
+    }
 };
 
 pub const AlgebraicMaterializationState = struct {

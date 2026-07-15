@@ -207,6 +207,10 @@ const LiveDocCollector = struct {
         return self.base.minCompetitiveScore();
     }
 
+    pub fn worstCompetitiveDocId(self: *const LiveDocCollector) ?u32 {
+        return self.base.worstCompetitiveDocId();
+    }
+
     pub fn markLowerBound(self: *LiveDocCollector) void {
         self.base.markLowerBound();
     }
@@ -350,6 +354,29 @@ pub const IndexSnapshot = struct {
         return self.searchWithOverride(alloc, field, terms, k, null);
     }
 
+    pub fn searchWithConfig(
+        self: *const IndexSnapshot,
+        alloc: Allocator,
+        field: []const u8,
+        terms: []const []const u8,
+        k: u32,
+        bm25_config: inverted.BM25Config,
+    ) !scorer_mod.SearchResults {
+        return self.searchWithOverrideAndConfig(alloc, field, terms, k, null, bm25_config);
+    }
+
+    pub fn searchWithConfigDiagnostics(
+        self: *const IndexSnapshot,
+        alloc: Allocator,
+        field: []const u8,
+        terms: []const []const u8,
+        k: u32,
+        bm25_config: inverted.BM25Config,
+        diagnostics: *scorer_mod.SearchDiagnostics,
+    ) !scorer_mod.SearchResults {
+        return self.searchInternal(alloc, field, terms, k, null, bm25_config, diagnostics);
+    }
+
     pub fn searchWithOverride(
         self: *const IndexSnapshot,
         alloc: Allocator,
@@ -358,13 +385,42 @@ pub const IndexSnapshot = struct {
         k: u32,
         override: ?distributed_stats_mod.TextFieldStats,
     ) !scorer_mod.SearchResults {
+        return self.searchWithOverrideAndConfig(alloc, field, terms, k, override, .{});
+    }
+
+    pub fn searchWithOverrideAndConfig(
+        self: *const IndexSnapshot,
+        alloc: Allocator,
+        field: []const u8,
+        terms: []const []const u8,
+        k: u32,
+        override: ?distributed_stats_mod.TextFieldStats,
+        bm25_config: inverted.BM25Config,
+    ) !scorer_mod.SearchResults {
+        return self.searchInternal(alloc, field, terms, k, override, bm25_config, null);
+    }
+
+    fn searchInternal(
+        self: *const IndexSnapshot,
+        alloc: Allocator,
+        field: []const u8,
+        terms: []const []const u8,
+        k: u32,
+        override: ?distributed_stats_mod.TextFieldStats,
+        bm25_config: inverted.BM25Config,
+        diagnostics: ?*scorer_mod.SearchDiagnostics,
+    ) !scorer_mod.SearchResults {
         if (self.global_doc_count == 0 or terms.len == 0) return .{ .hits = try alloc.alloc(scorer_mod.ScoredHit, 0), .total_count = 0 };
 
         const global_doc_count = if (override) |stats| stats.global_doc_count else self.global_doc_count;
         if (global_doc_count == 0) return .{ .hits = try alloc.alloc(scorer_mod.ScoredHit, 0), .total_count = 0 };
         const avg_dl = if (override) |stats| stats.avgDocLen() else self.avgDocLen(field);
-        const term_doc_freqs = try alloc.alloc(u32, terms.len);
-        defer alloc.free(term_doc_freqs);
+        var term_doc_freq_stack: [16]u32 = undefined;
+        const term_doc_freqs = if (terms.len <= term_doc_freq_stack.len)
+            term_doc_freq_stack[0..terms.len]
+        else
+            try alloc.alloc(u32, terms.len);
+        defer if (terms.len > term_doc_freq_stack.len) alloc.free(term_doc_freqs);
         for (terms, 0..) |term, i| {
             term_doc_freqs[i] = if (override) |stats|
                 stats.termDocFreq(term) orelse try self.termDocFreq(alloc, field, term)
@@ -377,15 +433,79 @@ pub const IndexSnapshot = struct {
         var collector = scorer_mod.TopKCollector.init(alloc, k);
         defer collector.deinit();
 
+        // Computing query-specific bounds opens every segment dictionary and
+        // walks each term's block-max table before opening them again for
+        // scoring. On a healthy tiered index (normally <= 10 segments), that
+        // fixed work costs more than it saves. Reserve global segment ordering
+        // for genuinely fragmented snapshots where pruning can amortize the
+        // prepass; WAND still performs block-level pruning inside every
+        // segment in the normal production state.
+        const use_segment_bound_planning = self.segments.len > 16;
+
+        const SegmentPlan = struct {
+            segment_idx: usize,
+            doc_offset: u32,
+            score_upper_bound: f32,
+        };
+        var single_plan_storage: [1]SegmentPlan = undefined;
+        const plans = if (self.segments.len <= single_plan_storage.len)
+            single_plan_storage[0..self.segments.len]
+        else
+            try alloc.alloc(SegmentPlan, self.segments.len);
+        defer if (self.segments.len > single_plan_storage.len) alloc.free(plans);
         var doc_offset: u32 = 0;
-        for (self.segments) |*seg| {
+        for (self.segments, 0..) |*seg, segment_idx| {
+            var upper_bound: f32 = std.math.inf(f32);
+            if (use_segment_bound_planning) {
+                upper_bound = 0;
+                if (try seg.reader.invertedIndex(field)) |inv_reader| {
+                    for (terms, 0..) |term, term_idx| {
+                        const lookup_result = inv_reader.lookup(term) orelse continue;
+                        const df = if (term_doc_freqs[term_idx] != 0) term_doc_freqs[term_idx] else lookup_result.docFreq();
+                        upper_bound += switch (lookup_result) {
+                            .postings => |p| if (p.block_max) |block_max|
+                                block_max.maxImpactAll(global_doc_count, df, avg_dl, bm25_config)
+                            else
+                                inverted.bm25MaxScore(global_doc_count, df, bm25_config),
+                            .one_hit => |hit| inverted.bm25Score(1, hit.norm_bits, global_doc_count, df, avg_dl, bm25_config),
+                        };
+                    }
+                }
+            }
+            plans[segment_idx] = .{
+                .segment_idx = segment_idx,
+                .doc_offset = doc_offset,
+                .score_upper_bound = upper_bound,
+            };
+            doc_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch return error.CountOverflow;
+        }
+        if (use_segment_bound_planning) {
+            std.mem.sort(SegmentPlan, plans, {}, struct {
+                fn lessThan(_: void, a: SegmentPlan, b: SegmentPlan) bool {
+                    if (a.score_upper_bound == b.score_upper_bound) return a.segment_idx < b.segment_idx;
+                    return a.score_upper_bound > b.score_upper_bound;
+                }
+            }.lessThan);
+        }
+        if (diagnostics) |diag| diag.segments_considered +|= @intCast(plans.len);
+
+        for (plans) |plan| {
+            const seg = &self.segments[plan.segment_idx];
+            // Strict inequality preserves deterministic tie-breaking: a
+            // segment whose bound equals the threshold may still contain a
+            // lower document ID at the cutoff.
+            const threshold = collector.minCompetitiveScore();
+            if (threshold > 0 and plan.score_upper_bound < threshold) {
+                collector.markLowerBound();
+                if (diagnostics) |diag| diag.segments_pruned +|= 1;
+                continue;
+            }
             const inv_reader = (try seg.reader.invertedIndex(field)) orelse {
-                doc_offset += seg.reader.doc_count;
                 continue;
             };
 
             {
-                var wand = scorer_mod.WANDScorer.init(alloc, k, global_doc_count, avg_dl, .{});
+                var wand = scorer_mod.WANDScorer.init(alloc, k, global_doc_count, avg_dl, bm25_config);
                 defer wand.deinit();
                 var added_terms: usize = 0;
 
@@ -398,7 +518,7 @@ pub const IndexSnapshot = struct {
                         .one_hit => null,
                     };
                     const chunk_size: u32 = switch (lookup_result) {
-                        .postings => |p| p.chunk_size,
+                        .postings => |p| p.scoringChunkSize(),
                         .one_hit => 1024,
                     };
 
@@ -407,26 +527,26 @@ pub const IndexSnapshot = struct {
                         if (term_doc_freqs[term_idx] != 0) term_doc_freqs[term_idx] else lookup_result.docFreq(),
                         block_max,
                         chunk_size,
-                        doc_offset,
+                        plan.doc_offset,
                     );
                     added_terms += 1;
                 }
 
                 if (added_terms == 0) {
-                    doc_offset += seg.reader.doc_count;
                     continue;
                 }
+                if (diagnostics) |diag| diag.segments_searched +|= 1;
 
                 var live_collector = LiveDocCollector{
                     .base = &collector,
-                    .doc_offset = doc_offset,
+                    .doc_offset = plan.doc_offset,
                 };
                 if (seg.shared.deleted) |*deleted| {
                     live_collector.deleted = deleted;
                 }
                 try wand.executeInto(&live_collector);
+                if (diagnostics) |diag| diag.addWand(&wand);
             }
-            doc_offset += seg.reader.doc_count;
         }
 
         return collector.finishOwned();
@@ -435,6 +555,11 @@ pub const IndexSnapshot = struct {
     /// Execute a filter across all segments, returning matching global doc IDs.
     pub fn executeFilter(self: *const IndexSnapshot, alloc: Allocator, filter: query_mod.Filter) ![]u32 {
         return query_mod.executeFilter(alloc, self, filter);
+    }
+
+    /// Count filter matches without materializing global document IDs.
+    pub fn countFilter(self: *const IndexSnapshot, alloc: Allocator, filter: query_mod.Filter) !usize {
+        return query_mod.countFilter(alloc, self, filter);
     }
 
     /// Map a global doc ID back to the segment and local doc ID.
@@ -582,11 +707,63 @@ pub const IndexSnapshot = struct {
         return self.avgDocLen(field);
     }
 
+    /// Return the exact scoring inputs for one term/document pair. This is a
+    /// read-only engineering diagnostic used by the correctness-gated search
+    /// kernel benchmark; production search does not call it.
+    pub fn textTermStats(
+        self: *const IndexSnapshot,
+        alloc: Allocator,
+        field: []const u8,
+        term: []const u8,
+        doc_ordinal: u32,
+    ) !?TextTermStats {
+        const doc_nums = try self.docNumsForOrdinalsAlloc(alloc, &.{doc_ordinal});
+        defer alloc.free(doc_nums);
+        if (doc_nums.len != 1) return null;
+
+        const resolved = self.resolveDocId(doc_nums[0]) orelse return null;
+        const inv_reader = (try self.segments[resolved.seg_idx].reader.invertedIndex(field)) orelse return null;
+        const lookup = inv_reader.lookup(term) orelse return null;
+        var postings = try lookup.iterator(alloc);
+        defer postings.deinit();
+        const hit = (try postings.advanceTo(resolved.local_id)) orelse return null;
+        if (hit.doc_id != resolved.local_id) return null;
+
+        const total_field_len = self.global_total_field_len.get(field) orelse 0;
+        const document_frequency = try self.termDocFreq(alloc, field, term);
+        return .{
+            .global_doc_count = self.global_doc_count,
+            .total_field_len = total_field_len,
+            .average_doc_length = self.avgDocLen(field),
+            .document_frequency = document_frequency,
+            .document_length = hit.norm,
+            .term_frequency = hit.freq,
+            .score = inverted.bm25Score(
+                hit.freq,
+                hit.norm,
+                self.global_doc_count,
+                document_frequency,
+                self.avgDocLen(field),
+                .{},
+            ),
+        };
+    }
+
     fn avgDocLen(self: *const IndexSnapshot, field: []const u8) f32 {
         if (self.global_doc_count == 0) return 0;
         const total = self.global_total_field_len.get(field) orelse 0;
         return @as(f32, @floatFromInt(total)) / @as(f32, @floatFromInt(self.global_doc_count));
     }
+};
+
+pub const TextTermStats = struct {
+    global_doc_count: u32,
+    total_field_len: u64,
+    average_doc_length: f32,
+    document_frequency: u32,
+    document_length: u32,
+    term_frequency: u32,
+    score: f32,
 };
 
 fn containsOrdinal(ordinals: []const u32, expected: u32) bool {
@@ -1301,6 +1478,38 @@ test "multi-segment search merges per-segment top-k globally" {
     try std.testing.expectEqual(@as(u32, 0), results.hits[0].doc_id);
     try std.testing.expectEqual(@as(u32, 2), results.hits[1].doc_id);
     try std.testing.expect(results.hits[0].score >= results.hits[1].score);
+}
+
+test "fragmented snapshot retains segment bound pruning" {
+    const alloc = std.testing.allocator;
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+
+    for (0..17) |segment_idx| {
+        const freq: u32 = if (segment_idx == 0) 100 else 1;
+        const norm: u32 = if (segment_idx == 0) 1 else 100;
+        const segment = try buildTestSegment(alloc, &.{
+            .{ .terms = &.{.{ .term = "rare", .freq = freq, .norm = norm }} },
+        });
+        defer alloc.free(segment);
+        try writer.addSegment(segment);
+    }
+
+    var diagnostics: scorer_mod.SearchDiagnostics = .{};
+    const results = try writer.snapshot().searchWithConfigDiagnostics(
+        alloc,
+        "body",
+        &.{"rare"},
+        1,
+        .{},
+        &diagnostics,
+    );
+    defer alloc.free(results.hits);
+
+    try std.testing.expectEqual(@as(usize, 1), results.hits.len);
+    try std.testing.expectEqual(@as(u32, 0), results.hits[0].doc_id);
+    try std.testing.expectEqual(@as(u64, 17), diagnostics.segments_considered);
+    try std.testing.expect(diagnostics.segments_pruned > 0);
 }
 
 test "retained snapshot remains readable after segment replacement" {

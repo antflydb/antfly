@@ -100,7 +100,7 @@ const FieldPostingsBuilder = struct {
     fn init(alloc: Allocator) !FieldPostingsBuilder {
         return .{
             .active = true,
-            .builder = inverted.InvertedIndexBuilder.init(alloc, .{}),
+            .builder = inverted.InvertedIndexBuilder.init(alloc, inverted.productionIndexConfig()),
         };
     }
 
@@ -287,6 +287,13 @@ pub const BuildTextOptions = struct {
     doc_scratch_retained_bytes: usize = default_doc_scratch_retained_bytes,
     profile_timings: bool = true,
     profile_working_set: bool = true,
+    /// Omit per-document primary keys and stored source. Stable result IDs
+    /// must then be supplied by `doc_ordinal`. This is used by the embedded
+    /// kernel benchmark only; normal database/product segments keep storage.
+    store_documents: bool = true,
+    /// Retain the document key but omit the source body from the text segment.
+    /// The primary database remains authoritative for source projection.
+    store_document_source: bool = true,
 };
 
 pub const BuildTextProfile = struct {
@@ -607,6 +614,8 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
     var doc_ordinals = std.ArrayListUnmanaged(u32).empty;
     defer doc_ordinals.deinit(alloc);
     var has_doc_ordinal = false;
+    var min_doc_key: ?[]const u8 = null;
+    var max_doc_key: ?[]const u8 = null;
 
     var typed_fields = std.StringHashMapUnmanaged(TypedFieldCollector).empty;
     defer {
@@ -641,7 +650,17 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
         const doc_alloc = doc_arena_state.allocator();
 
         const stored_attach_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
-        try seg_writer.addStoredDocBorrowed(text_doc.id, text_doc.stored_data);
+        if (options.store_documents) {
+            try seg_writer.addStoredDocBorrowed(
+                text_doc.id,
+                if (options.store_document_source) text_doc.stored_data else "{}",
+            );
+        } else {
+            if (text_doc.doc_ordinal == null) return error.MissingTextDocOrdinal;
+            try seg_writer.addUnstoredDoc();
+            if (min_doc_key == null or std.mem.order(u8, text_doc.id, min_doc_key.?) == .lt) min_doc_key = text_doc.id;
+            if (max_doc_key == null or std.mem.order(u8, text_doc.id, max_doc_key.?) == .gt) max_doc_key = text_doc.id;
+        }
         if (profile_timings) {
             if (profile) |p| p.stored_doc_attach_ns +|= platform_time.monotonicNs() - stored_attach_start_ns;
         }
@@ -812,6 +831,9 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
 
     const segment_encode_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
     if (has_doc_ordinal) try seg_writer.addDocOrdinals(doc_ordinals.items);
+    if (!options.store_documents) {
+        try seg_writer.addDocKeyRange(min_doc_key orelse return error.InvalidSegment, max_doc_key orelse return error.InvalidSegment);
+    }
     if (options.index_sort.len > 0) {
         if (doc_order.len > 0) {
             var bounds = try textIndexSortBoundsAlloc(alloc, doc_order[0].keys, doc_order[doc_order.len - 1].keys);

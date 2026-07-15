@@ -1,0 +1,5 @@
+{"class":"term","query":"V1 TERM text alpha","top_k":3}
+{"class":"term","query":"V1 TERM text gamma","top_k":3}
+{"class":"union","query":"V1 UNION text alpha beta","top_k":3}
+{"class":"intersection","query":"V1 INTERSECTION text alpha beta","top_k":3}
+{"class":"phrase","query":"V1 PHRASE text alpha beta","top_k":3}

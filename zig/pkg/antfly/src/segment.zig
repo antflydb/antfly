@@ -48,6 +48,10 @@ const segment_version: u32 = 3; // v3: footer checksum is optional to avoid eage
 const stored_fields_version_compressed_per_doc: u8 = 2;
 const stored_fields_version_uncompressed_offsets: u8 = 3;
 const stored_fields_version_block_compressed: u8 = 4;
+/// Index-only segments carry document ordinals and search sections but no
+/// primary-key or source record per document. The footer remains authoritative
+/// for doc_count; the repeated u32 lets the stored section validate itself.
+const stored_fields_version_omitted: u8 = 5;
 const stored_fields_block_doc_target: usize = 128;
 const stored_fields_block_raw_target: usize = 512 * 1024;
 const stored_fields_v4_doc_entry_size: usize = 24;
@@ -71,10 +75,12 @@ pub const SectionType = enum(u16) {
     doc_ordinals = 5,
     index_sort = 6,
     index_sort_bounds = 7,
+    doc_key_range = 8,
 };
 
 pub const doc_ordinals_field = "\x00__antfly_doc_ordinals";
 pub const index_sort_field = "\x00__antfly_index_sort";
+pub const doc_key_range_field = "\x00__antfly_doc_key_range";
 
 pub const SegmentIndexSortField = struct {
     field: []const u8,
@@ -135,7 +141,12 @@ pub const SegmentLayoutStats = struct {
     inverted_positions_bytes: u64 = 0,
     inverted_skip_bytes: u64 = 0,
     inverted_one_hit_terms: u64 = 0,
+    inverted_single_doc_postings_terms: u64 = 0,
     inverted_postings_terms: u64 = 0,
+    inverted_postings_doc_frequency_total: u64 = 0,
+    inverted_projected_posting_count_blocks_64: u64 = 0,
+    inverted_projected_posting_count_blocks_128: u64 = 0,
+    inverted_projected_posting_count_blocks_256: u64 = 0,
     typed_doc_values_bytes: u64 = 0,
     doc_ordinals_bytes: u64 = 0,
     index_sort_bytes: u64 = 0,
@@ -209,6 +220,7 @@ pub const SegmentWriter = struct {
 
     /// Store a document's raw data.
     pub fn addStoredDoc(self: *SegmentWriter, doc_id: []const u8, data: []const u8) !void {
+        if (self.doc_count != self.stored_fields.items.len) return error.InvalidSegment;
         const owned_id = try self.alloc.dupe(u8, doc_id);
         errdefer self.alloc.free(owned_id);
         const owned_data = try self.alloc.dupe(u8, data);
@@ -224,6 +236,7 @@ pub const SegmentWriter = struct {
 
     /// Store a document while borrowing raw data until `build` completes.
     pub fn addStoredDocBorrowed(self: *SegmentWriter, doc_id: []const u8, data: []const u8) !void {
+        if (self.doc_count != self.stored_fields.items.len) return error.InvalidSegment;
         const owned_id = try self.alloc.dupe(u8, doc_id);
         errdefer self.alloc.free(owned_id);
         try self.stored_fields.append(self.alloc, .{
@@ -237,6 +250,7 @@ pub const SegmentWriter = struct {
 
     /// Store a document with Snappy-compressed data already prepared.
     pub fn addStoredDocCompressed(self: *SegmentWriter, doc_id: []const u8, compressed_data: []const u8) !void {
+        if (self.doc_count != self.stored_fields.items.len) return error.InvalidSegment;
         const owned_id = try self.alloc.dupe(u8, doc_id);
         errdefer self.alloc.free(owned_id);
         const owned_data = try self.alloc.dupe(u8, compressed_data);
@@ -248,6 +262,15 @@ pub const SegmentWriter = struct {
             .owns_data = true,
         });
         self.doc_count += 1;
+    }
+
+    /// Add one logical document without a stored primary key or source body.
+    /// This is reserved for the embedded search-kernel boundary, where stable
+    /// result IDs come from the ordinal sidecar. It must not be mixed with
+    /// stored documents in the same segment.
+    pub fn addUnstoredDoc(self: *SegmentWriter) !void {
+        if (self.stored_fields.items.len != 0) return error.InvalidSegment;
+        self.doc_count = std.math.add(u32, self.doc_count, 1) catch return error.InvalidSegment;
     }
 
     pub fn addDocOrdinals(self: *SegmentWriter, ordinals: []const u32) !void {
@@ -287,6 +310,14 @@ pub const SegmentWriter = struct {
         const field_idx = try self.addField(index_sort_field);
         try self.addSectionOwned(field_idx, .index_sort, metadata);
         try self.addSectionOwned(field_idx, .index_sort_bounds, bounds_data);
+    }
+
+    pub fn addDocKeyRange(self: *SegmentWriter, min_key: []const u8, max_key: []const u8) !void {
+        if (std.mem.order(u8, min_key, max_key) == .gt) return error.InvalidSegment;
+        const data = try encodeDocKeyRangeAlloc(self.alloc, min_key, max_key);
+        errdefer self.alloc.free(data);
+        const field_idx = try self.addField(doc_key_range_field);
+        try self.addSectionOwned(field_idx, .doc_key_range, data);
     }
 
     /// Build the final segment file bytes. Caller owns result.
@@ -337,6 +368,17 @@ pub const SegmentWriter = struct {
     }
 
     fn estimatedBuildSize(self: *const SegmentWriter) usize {
+        if (self.doc_count > 0 and self.stored_fields.items.len == 0) {
+            var total: usize = 1 + 4;
+            for (self.fields.items) |field| {
+                total +|= 2 + field.name.len + 2;
+                for (field.sections.items) |section| {
+                    total +|= section.data.len;
+                    total +|= 2 + 8 + 8;
+                }
+            }
+            return total +| 40;
+        }
         var total: usize = 1 + 4 + 4 + 4 + 8 + self.stored_fields.items.len * stored_fields_v4_doc_entry_size;
         total +|= @as(usize, if (self.stored_fields.items.len == 0) 0 else (self.stored_fields.items.len - 1) / stored_fields_block_doc_target + 1) * 8;
         for (self.stored_fields.items) |doc| {
@@ -356,6 +398,11 @@ pub const SegmentWriter = struct {
     }
 
     fn writeStoredFields(self: *SegmentWriter, out: *std.ArrayListUnmanaged(u8)) !void {
+        if (self.doc_count > 0 and self.stored_fields.items.len == 0) {
+            try out.append(self.alloc, stored_fields_version_omitted);
+            try appendU32LE(self.alloc, out, self.doc_count);
+            return;
+        }
         // Format v3 (with uncompressed docs + offset table for random access):
         //   [version: u8 = 3]
         //   [num_docs: u32 LE]
@@ -414,6 +461,14 @@ pub const SegmentWriter = struct {
     }
 
     fn writeStoredFieldsToSink(self: *SegmentWriter, sink: *SegmentSink) !void {
+        if (self.doc_count > 0 and self.stored_fields.items.len == 0) {
+            try sink.appendByte(stored_fields_version_omitted);
+            try sinkAppendU32LE(sink, self.doc_count);
+            self.last_stored_compress_ns = 0;
+            self.last_stored_raw_bytes = 0;
+            self.last_stored_compressed_bytes = 0;
+            return;
+        }
         const num_docs: u32 = @intCast(self.stored_fields.items.len);
         try sink.appendByte(stored_fields_version_block_compressed);
         self.last_stored_compress_ns = 0;
@@ -737,7 +792,12 @@ pub const SegmentReader = struct {
                                 stats.inverted_positions_bytes +|= inverted_layout.positions_bytes;
                                 stats.inverted_skip_bytes +|= inverted_layout.skip_bytes;
                                 stats.inverted_one_hit_terms +|= inverted_layout.one_hit_terms;
+                                stats.inverted_single_doc_postings_terms +|= inverted_layout.single_doc_postings_terms;
                                 stats.inverted_postings_terms +|= inverted_layout.postings_terms;
+                                stats.inverted_postings_doc_frequency_total +|= inverted_layout.postings_doc_frequency_total;
+                                stats.inverted_projected_posting_count_blocks_64 +|= inverted_layout.projected_posting_count_blocks_64;
+                                stats.inverted_projected_posting_count_blocks_128 +|= inverted_layout.projected_posting_count_blocks_128;
+                                stats.inverted_projected_posting_count_blocks_256 +|= inverted_layout.projected_posting_count_blocks_256;
                             }
                         } else |_| {}
                     },
@@ -775,6 +835,8 @@ pub const SegmentReader = struct {
         const num_docs = std.mem.readInt(u32, self.data[pos..][0..4], .little);
         pos += 4;
         if (doc_idx >= num_docs) return null;
+
+        if (ver == stored_fields_version_omitted) return null;
 
         if (ver == stored_fields_version_block_compressed) {
             const loc = self.v4StoredDocLocation(pos, doc_idx) orelse return null;
@@ -846,6 +908,10 @@ pub const SegmentReader = struct {
         return ver == stored_fields_version_compressed_per_doc or ver == stored_fields_version_block_compressed;
     }
 
+    pub fn storedFieldsOmitted(self: *const SegmentReader) bool {
+        return self.data[@intCast(self.stored_offset)] == stored_fields_version_omitted;
+    }
+
     pub const V4StoredDocLocation = struct {
         id: []const u8,
         block_idx: u32,
@@ -896,6 +962,16 @@ pub const SegmentReader = struct {
     pub fn docOrdinal(self: *const SegmentReader, doc_idx: u32) !?u32 {
         const section = self.getSection(doc_ordinals_field, .doc_ordinals) orelse return null;
         return try decodeDocOrdinal(section, doc_idx);
+    }
+
+    pub const DocKeyRange = struct {
+        min_key: []const u8,
+        max_key: []const u8,
+    };
+
+    pub fn docKeyRange(self: *const SegmentReader) !?DocKeyRange {
+        const section = self.getSection(doc_key_range_field, .doc_key_range) orelse return null;
+        return try decodeDocKeyRange(section);
     }
 
     pub fn indexSortFieldsAlloc(self: *const SegmentReader, alloc: Allocator) !?[]SegmentIndexSortField {
@@ -1248,6 +1324,7 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
         for (input.reader.fields) |*f| {
             if (std.mem.eql(u8, f.name, doc_ordinals_field)) continue;
             if (std.mem.eql(u8, f.name, index_sort_field)) continue;
+            if (std.mem.eql(u8, f.name, doc_key_range_field)) continue;
             try field_set.put(alloc, f.name, {});
         }
     }
@@ -1296,9 +1373,13 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
             if (present_count == 1 and first_present_index.? == 0 and !only_present_deleted) {
                 try appendBuiltSection(alloc, sink, &built_field, .inverted_text, inv_sections[0].?);
             } else {
-                const merged = try inverted.mergeInvertedSectionSlotsWithDeletes(alloc, inv_sections, doc_counts, deleted_docs, .{});
-                defer alloc.free(merged);
-                try appendBuiltSection(alloc, sink, &built_field, .inverted_text, merged);
+                const offset = sink.len();
+                try inverted.writeMergedInvertedSectionSlotsWithDeletes(alloc, sink, inv_sections, doc_counts, deleted_docs, inverted.productionIndexConfig());
+                try built_field.sections.append(alloc, .{
+                    .section_type = .inverted_text,
+                    .offset = @intCast(offset),
+                    .length = @intCast(sink.len() - offset),
+                });
             }
         }
 
@@ -1315,6 +1396,13 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
         var built_field = BuiltField{ .name = doc_ordinals_field };
         errdefer built_field.deinit(alloc);
         try appendBuiltSection(alloc, sink, &built_field, .doc_ordinals, merged_doc_ordinals);
+        try built_fields.append(alloc, built_field);
+    }
+    if (try mergeDocKeyRangeSectionsAlloc(alloc, inputs)) |merged_key_range| {
+        defer alloc.free(merged_key_range);
+        var built_field = BuiltField{ .name = doc_key_range_field };
+        errdefer built_field.deinit(alloc);
+        try appendBuiltSection(alloc, sink, &built_field, .doc_key_range, merged_key_range);
         try built_fields.append(alloc, built_field);
     }
 
@@ -1350,6 +1438,7 @@ fn writeSortedMergedSegmentToSink(
         for (input.reader.fields) |*f| {
             if (std.mem.eql(u8, f.name, doc_ordinals_field)) continue;
             if (std.mem.eql(u8, f.name, index_sort_field)) continue;
+            if (std.mem.eql(u8, f.name, doc_key_range_field)) continue;
             try field_set.put(alloc, f.name, {});
         }
     }
@@ -1384,9 +1473,13 @@ fn writeSortedMergedSegmentToSink(
         }
 
         if (has_inverted) {
-            const merged = try inverted.mergeInvertedSectionSlotsWithDocMaps(alloc, inv_sections, doc_counts, plan.doc_maps, doc_count, .{});
-            defer alloc.free(merged);
-            try appendBuiltSection(alloc, sink, &built_field, .inverted_text, merged);
+            const offset = sink.len();
+            try inverted.writeMergedInvertedSectionSlotsWithDocMaps(alloc, sink, inv_sections, doc_counts, plan.doc_maps, doc_count, inverted.productionIndexConfig());
+            try built_field.sections.append(alloc, .{
+                .section_type = .inverted_text,
+                .offset = @intCast(offset),
+                .length = @intCast(sink.len() - offset),
+            });
         }
 
         if (try mergeTypedDocValuesSectionsInOrder(alloc, inputs, field_name, plan.records)) |merged| {
@@ -1402,6 +1495,13 @@ fn writeSortedMergedSegmentToSink(
         var built_field = BuiltField{ .name = doc_ordinals_field };
         errdefer built_field.deinit(alloc);
         try appendBuiltSection(alloc, sink, &built_field, .doc_ordinals, merged_doc_ordinals);
+        try built_fields.append(alloc, built_field);
+    }
+    if (try mergeDocKeyRangeSectionsAlloc(alloc, inputs)) |merged_key_range| {
+        defer alloc.free(merged_key_range);
+        var built_field = BuiltField{ .name = doc_key_range_field };
+        errdefer built_field.deinit(alloc);
+        try appendBuiltSection(alloc, sink, &built_field, .doc_key_range, merged_key_range);
         try built_fields.append(alloc, built_field);
     }
 
@@ -1443,7 +1543,30 @@ fn countLiveDocs(inputs: []const MergeInput) u32 {
     return total;
 }
 
+fn allStoredFieldsOmitted(inputs: []const MergeInput) bool {
+    var saw_live_docs = false;
+    for (inputs) |input| {
+        if (!inputHasLiveDocs(input)) continue;
+        saw_live_docs = true;
+        if (!input.reader.storedFieldsOmitted()) return false;
+    }
+    return saw_live_docs;
+}
+
+fn writeOmittedStoredFields(sink: *SegmentSink, doc_count: u32) !void {
+    try sink.appendByte(stored_fields_version_omitted);
+    try sinkAppendU32LE(sink, doc_count);
+}
+
+fn rejectMixedStoredFieldModes(inputs: []const MergeInput) !void {
+    for (inputs) |input| {
+        if (inputHasLiveDocs(input) and input.reader.storedFieldsOmitted()) return error.InvalidSegment;
+    }
+}
+
 fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const MergeInput, doc_count: u32) !void {
+    if (allStoredFieldsOmitted(inputs)) return writeOmittedStoredFields(sink, doc_count);
+    try rejectMixedStoredFieldModes(inputs);
     try sink.appendByte(stored_fields_version_block_compressed);
     try sinkAppendU32LE(sink, doc_count);
     const num_blocks = try countMergedStoredBlocks(alloc, inputs);
@@ -1535,6 +1658,8 @@ fn writeMergedStoredFieldsInOrder(
     records: []const SortedMergeRecord,
     doc_count: u32,
 ) !void {
+    if (allStoredFieldsOmitted(inputs)) return writeOmittedStoredFields(sink, doc_count);
+    try rejectMixedStoredFieldModes(inputs);
     try sink.appendByte(stored_fields_version_block_compressed);
     try sinkAppendU32LE(sink, doc_count);
     const num_blocks = try countStoredBlocksInOrder(alloc, inputs, records);
@@ -2122,6 +2247,54 @@ fn addTypedDocValueIfPresent(
     }
 }
 
+const doc_key_range_version: u8 = 1;
+
+fn encodeDocKeyRangeAlloc(alloc: Allocator, min_key: []const u8, max_key: []const u8) ![]u8 {
+    if (min_key.len > std.math.maxInt(u32) or max_key.len > std.math.maxInt(u32)) return error.InvalidSegment;
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, doc_key_range_version);
+    try appendU32LE(alloc, &out, @intCast(min_key.len));
+    try out.appendSlice(alloc, min_key);
+    try appendU32LE(alloc, &out, @intCast(max_key.len));
+    try out.appendSlice(alloc, max_key);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn decodeDocKeyRange(section: []const u8) !SegmentReader.DocKeyRange {
+    if (section.len < 9 or section[0] != doc_key_range_version) return error.InvalidSegment;
+    const min_len = std.mem.readInt(u32, section[1..5], .little);
+    const min_start: usize = 5;
+    const min_end = min_start + @as(usize, min_len);
+    if (min_end > section.len or section.len - min_end < 4) return error.InvalidSegment;
+    const max_len = std.mem.readInt(u32, section[min_end..][0..4], .little);
+    const max_start = min_end + 4;
+    if (max_start > section.len or max_len != section.len - max_start) return error.InvalidSegment;
+    const min_key = section[min_start..min_end];
+    const max_key = section[max_start..];
+    if (std.mem.order(u8, min_key, max_key) == .gt) return error.InvalidSegment;
+    return .{ .min_key = min_key, .max_key = max_key };
+}
+
+fn mergeDocKeyRangeSectionsAlloc(alloc: Allocator, inputs: []const MergeInput) !?[]u8 {
+    var min_key: ?[]const u8 = null;
+    var max_key: ?[]const u8 = null;
+    var saw_omitted = false;
+    for (inputs) |input| {
+        if (!inputHasLiveDocs(input) or !input.reader.storedFieldsOmitted()) continue;
+        saw_omitted = true;
+        const range = (try input.reader.docKeyRange()) orelse return error.InvalidSegment;
+        if (min_key == null or std.mem.order(u8, range.min_key, min_key.?) == .lt) min_key = range.min_key;
+        if (max_key == null or std.mem.order(u8, range.max_key, max_key.?) == .gt) max_key = range.max_key;
+    }
+    if (!saw_omitted) return null;
+    return try encodeDocKeyRangeAlloc(
+        alloc,
+        min_key orelse return error.InvalidSegment,
+        max_key orelse return error.InvalidSegment,
+    );
+}
+
 pub fn encodeDocOrdinalsAlloc(alloc: Allocator, ordinals: []const u32) ![]u8 {
     var has_ordinal = false;
     for (ordinals) |ordinal| {
@@ -2629,6 +2802,38 @@ test "segment append merge preserves bytes typed doc values" {
 
     try std.testing.expectEqualStrings("acme", tenant0);
     try std.testing.expectEqualStrings("beta", tenant1_value);
+}
+
+test "index-only stored fields preserve ordinals key ranges and merges" {
+    const alloc = std.testing.allocator;
+    var left_writer = SegmentWriter.init(alloc);
+    defer left_writer.deinit();
+    try left_writer.addUnstoredDoc();
+    try left_writer.addDocOrdinals(&.{11});
+    try left_writer.addDocKeyRange("doc:a", "doc:a");
+    const left = try left_writer.build();
+    defer alloc.free(left);
+
+    var right_writer = SegmentWriter.init(alloc);
+    defer right_writer.deinit();
+    try right_writer.addUnstoredDoc();
+    try right_writer.addDocOrdinals(&.{12});
+    try right_writer.addDocKeyRange("doc:z", "doc:z");
+    const right = try right_writer.build();
+    defer alloc.free(right);
+
+    const merged = try mergeSegments(alloc, &.{ left, right });
+    defer alloc.free(merged);
+    var reader = try SegmentReader.init(alloc, merged);
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(u32, 2), reader.doc_count);
+    try std.testing.expect(reader.storedFieldsOmitted());
+    try std.testing.expect(reader.storedDoc(0) == null);
+    try std.testing.expectEqual(@as(?u32, 11), try reader.docOrdinal(0));
+    try std.testing.expectEqual(@as(?u32, 12), try reader.docOrdinal(1));
+    const range = (try reader.docKeyRange()) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("doc:a", range.min_key);
+    try std.testing.expectEqualStrings("doc:z", range.max_key);
 }
 
 test "segment block-compressed stored fields cross block boundary" {

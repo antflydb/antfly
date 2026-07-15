@@ -397,6 +397,26 @@ pub const EntryDataWindow = struct {
     }
 };
 
+/// The metadata required by a forward-only table scan. Compaction never does
+/// point lookups, so retaining entry offsets, Bloom filters, per-block hash
+/// tables, and key bounds for every input run only multiplies memory by the
+/// merge fan-in.
+pub const SequentialTableIndex = struct {
+    pub const Block = struct {
+        window: EntryDataWindow,
+        entry_count: usize,
+    };
+
+    entry_data_start: usize,
+    entry_count: usize,
+    blocks: []Block,
+
+    pub fn deinit(self: *SequentialTableIndex, allocator: std.mem.Allocator) void {
+        allocator.free(self.blocks);
+        self.* = undefined;
+    }
+};
+
 pub const BorrowedDecoded = struct {
     pub const PositionedEntry = struct {
         index: usize,
@@ -2048,6 +2068,133 @@ pub fn decodeIndexFromFooterAlloc(
     return try decodeFooterMetadataAlloc(allocator, metadata, header_len, footer.entry_count, footer.entry_data_len);
 }
 
+pub fn decodeSequentialIndexFromFooterAlloc(
+    allocator: std.mem.Allocator,
+    footer: Footer,
+    metadata: []const u8,
+) !SequentialTableIndex {
+    if (metadata.len != footer.metadata_len) return error.InvalidTableFile;
+    var cursor: usize = 0;
+
+    // Entry offsets and all lookup accelerators are deliberately skipped.
+    if (footer.entry_count > (metadata.len - cursor) / @sizeOf(u32)) return error.InvalidTableFile;
+    _ = try readSlice(metadata, &cursor, footer.entry_count * @sizeOf(u32));
+    const bloom_len: usize = @intCast(try readU32(metadata, &cursor));
+    _ = try readSlice(metadata, &cursor, bloom_len);
+
+    if (cursor == metadata.len) {
+        if (footer.entry_count != 0) return error.InvalidTableFile;
+        return .{
+            .entry_data_start = header_len,
+            .entry_count = 0,
+            .blocks = try allocator.alloc(SequentialTableIndex.Block, 0),
+        };
+    }
+
+    const block_count: usize = @intCast(try readU32(metadata, &cursor));
+    const blocks = try allocator.alloc(SequentialTableIndex.Block, block_count);
+    errdefer allocator.free(blocks);
+    var expected_entry_index: usize = 0;
+    var expected_logical_offset: usize = 0;
+    for (blocks) |*block| {
+        const relative_offset = try readU32(metadata, &cursor);
+        const logical_len = try readU32(metadata, &cursor);
+        const first_entry_index = try readU32(metadata, &cursor);
+        const entry_count = try readU32(metadata, &cursor);
+        const largest_namespace_len = try readU32(metadata, &cursor);
+        const largest_key_len: usize = @intCast(try readU32(metadata, &cursor));
+        if (largest_namespace_len != std.math.maxInt(u32)) {
+            _ = try readSlice(metadata, &cursor, largest_namespace_len);
+        }
+        _ = try readSlice(metadata, &cursor, largest_key_len);
+        if (entry_count == 0 or first_entry_index != expected_entry_index or relative_offset != expected_logical_offset) {
+            return error.InvalidTableFile;
+        }
+        if (@as(usize, relative_offset) + logical_len > footer.entry_data_len) return error.InvalidTableFile;
+        block.* = .{
+            .window = .{
+                .relative_offset = relative_offset,
+                .len = logical_len,
+                .physical_relative_offset = relative_offset,
+                .physical_len = logical_len,
+                .compression = .none,
+            },
+            .entry_count = entry_count,
+        };
+        expected_entry_index += entry_count;
+        expected_logical_offset += logical_len;
+    }
+    if (expected_entry_index != footer.entry_count or expected_logical_offset != footer.entry_data_len) return error.InvalidTableFile;
+
+    // Per-block Bloom filters.
+    const block_filter_count: usize = @intCast(try readU32(metadata, &cursor));
+    if (block_filter_count != blocks.len) return error.InvalidTableFile;
+    for (blocks) |_| {
+        const filter_len: usize = @intCast(try readU32(metadata, &cursor));
+        _ = try readSlice(metadata, &cursor, filter_len);
+    }
+
+    // Per-block point-lookup hash slots.
+    const hash_block_count: usize = @intCast(try readU32(metadata, &cursor));
+    if (hash_block_count != blocks.len) return error.InvalidTableFile;
+    for (blocks) |_| {
+        const slot_count: usize = @intCast(try readU32(metadata, &cursor));
+        if (slot_count > (metadata.len - cursor) / @sizeOf(u32)) return error.InvalidTableFile;
+        _ = try readSlice(metadata, &cursor, slot_count * @sizeOf(u32));
+    }
+
+    // Physical block windows are the only optional lookup-era section the
+    // sequential cursor retains.
+    const physical_count: usize = @intCast(try readU32(metadata, &cursor));
+    if (physical_count != blocks.len) return error.InvalidTableFile;
+    var expected_physical_offset: usize = 0;
+    for (blocks) |*block| {
+        const physical_relative_offset = try readU32(metadata, &cursor);
+        const physical_len = try readU32(metadata, &cursor);
+        const compression = switch (try readU32(metadata, &cursor)) {
+            @intFromEnum(BlockCompression.none) => BlockCompression.none,
+            @intFromEnum(BlockCompression.snappy) => BlockCompression.snappy,
+            @intFromEnum(BlockCompression.prefix) => BlockCompression.prefix,
+            @intFromEnum(BlockCompression.prefix_snappy) => BlockCompression.prefix_snappy,
+            else => return error.InvalidTableFile,
+        };
+        if (physical_len == 0 or physical_relative_offset != expected_physical_offset) return error.InvalidTableFile;
+        block.window.physical_relative_offset = physical_relative_offset;
+        block.window.physical_len = physical_len;
+        block.window.compression = compression;
+        expected_physical_offset += physical_len;
+    }
+
+    // Smallest key bounds.
+    const smallest_count: usize = @intCast(try readU32(metadata, &cursor));
+    if (smallest_count != blocks.len) return error.InvalidTableFile;
+    for (blocks) |_| {
+        const namespace_len = try readU32(metadata, &cursor);
+        const key_len: usize = @intCast(try readU32(metadata, &cursor));
+        if (namespace_len != std.math.maxInt(u32)) {
+            _ = try readSlice(metadata, &cursor, namespace_len);
+        }
+        _ = try readSlice(metadata, &cursor, key_len);
+    }
+
+    _ = try decodePrefixExtractor(try readU32(metadata, &cursor));
+    const prefix_filter_len: usize = @intCast(try readU32(metadata, &cursor));
+    _ = try readSlice(metadata, &cursor, prefix_filter_len);
+    const block_prefix_filter_count: usize = @intCast(try readU32(metadata, &cursor));
+    if (block_prefix_filter_count != blocks.len) return error.InvalidTableFile;
+    for (blocks) |_| {
+        const filter_len: usize = @intCast(try readU32(metadata, &cursor));
+        _ = try readSlice(metadata, &cursor, filter_len);
+    }
+    if (cursor != metadata.len) return error.InvalidTableFile;
+
+    return .{
+        .entry_data_start = header_len,
+        .entry_count = footer.entry_count,
+        .blocks = blocks,
+    };
+}
+
 pub fn maybeContains(filter: anytype, namespace_name: ?[]const u8, key: []const u8) bool {
     const hashes = entryHashes(namespace_name, key);
     return filter.maybeContainsHashes(hashes[0], hashes[1]);
@@ -2592,6 +2739,17 @@ test "table file v9 footer metadata decodes through footer" {
     try std.testing.expectEqual(@as(usize, entries.len), index.entry_offsets.len);
     try std.testing.expect(maybeContains(index.borrowFilter(), "docs", "doc:a"));
     try std.testing.expect(maybeContains(index.borrowFilter(), "docs", "doc:b"));
+
+    var sequential = try decodeSequentialIndexFromFooterAlloc(
+        std.testing.allocator,
+        footer,
+        encoded[footer.metadata_offset .. footer.metadata_offset + footer.metadata_len],
+    );
+    defer sequential.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, entries.len), sequential.entry_count);
+    try std.testing.expectEqual(index.blocks.len, sequential.blocks.len);
+    try std.testing.expectEqual(index.blocks[0].entry_count, sequential.blocks[0].entry_count);
+    try std.testing.expectEqual(index.blockWindow(0), sequential.blocks[0].window);
 }
 
 test "table file footer metadata includes block bounds for point reads" {
@@ -2759,6 +2917,24 @@ test "table file prefix-compressed blocks round trip long shared keys" {
 
     var index = try decodeIndexAlloc(allocator, encoded);
     defer index.deinit(allocator);
+
+    const footer = try decodeFooter(encoded);
+    var sequential = try decodeSequentialIndexFromFooterAlloc(
+        allocator,
+        footer,
+        encoded[footer.metadata_offset .. footer.metadata_offset + footer.metadata_len],
+    );
+    defer sequential.deinit(allocator);
+    try std.testing.expectEqual(entries.len, sequential.entry_count);
+    try std.testing.expectEqual(index.blocks.len, sequential.blocks.len);
+    for (index.blocks, sequential.blocks) |block, sequential_block| {
+        try std.testing.expectEqual(block.entry_count, sequential_block.entry_count);
+        try std.testing.expectEqual(block.relative_offset, sequential_block.window.relative_offset);
+        try std.testing.expectEqual(block.len, sequential_block.window.len);
+        try std.testing.expectEqual(block.physicalRelativeOffset(), sequential_block.window.physicalRelativeOffset());
+        try std.testing.expectEqual(block.physicalLen(), sequential_block.window.physicalLen());
+        try std.testing.expectEqual(block.compression, sequential_block.window.compression);
+    }
 
     var prefix_blocks: usize = 0;
     for (index.blocks) |block| {

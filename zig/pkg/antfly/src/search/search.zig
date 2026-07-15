@@ -28,6 +28,7 @@ const Allocator = std.mem.Allocator;
 const analysis_mod = @import("analysis.zig");
 const index_mod = @import("../index.zig");
 const scorer_mod = @import("scorer.zig");
+pub const SearchDiagnostics = scorer_mod.SearchDiagnostics;
 const query_mod = @import("query.zig");
 const aggregation_mod = @import("aggregation.zig");
 const typed_dv = @import("../section/typed_doc_values.zig");
@@ -144,6 +145,8 @@ pub const SearchRequest = struct {
     filter_doc_nums: []const u32 = &.{},
     filter_doc_nums_positive: bool = false,
     exclude_doc_nums: []const u32 = &.{},
+    bm25_config: inverted.BM25Config = .{},
+    diagnostics: ?*scorer_mod.SearchDiagnostics = null,
 };
 
 pub const SearchQuery = union(enum) {
@@ -604,13 +607,7 @@ fn executeMatch(
         if (!found) try term_list.append(alloc, tok.term);
     }
 
-    const results = try snap.searchWithOverride(
-        alloc,
-        mq.field,
-        term_list.items,
-        effectiveK(request, snap),
-        matchingFieldStats(request.distributed_text_stats, mq.field, term_list.items),
-    );
+    const results = try searchSnapshotTerms(alloc, snap, mq.field, term_list.items, request);
     defer alloc.free(results.hits);
     if (mq.boost != 1.0) {
         for (results.hits) |*hit| hit.score *= mq.boost;
@@ -625,19 +622,43 @@ fn executeTerm(
     tq: TermQuery,
     request: SearchRequest,
 ) !SearchResult {
-    const results = try snap.searchWithOverride(
-        alloc,
-        tq.field,
-        &.{tq.term},
-        effectiveK(request, snap),
-        matchingFieldStats(request.distributed_text_stats, tq.field, &.{tq.term}),
-    );
+    const results = try searchSnapshotTerms(alloc, snap, tq.field, &.{tq.term}, request);
     defer alloc.free(results.hits);
     if (tq.boost != 1.0) {
         for (results.hits) |*hit| hit.score *= tq.boost;
     }
 
     return buildResult(alloc, snap, results.hits, results.total_count, results.total_relation, request);
+}
+
+fn searchSnapshotTerms(
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    field: []const u8,
+    terms: []const []const u8,
+    request: SearchRequest,
+) !scorer_mod.SearchResults {
+    const stats = matchingFieldStats(request.distributed_text_stats, field, terms);
+    if (request.diagnostics) |diagnostics| {
+        if (stats == null) {
+            return snap.searchWithConfigDiagnostics(
+                alloc,
+                field,
+                terms,
+                effectiveK(request, snap),
+                request.bm25_config,
+                diagnostics,
+            );
+        }
+    }
+    return snap.searchWithOverrideAndConfig(
+        alloc,
+        field,
+        terms,
+        effectiveK(request, snap),
+        stats,
+        request.bm25_config,
+    );
 }
 
 fn matchingFieldStats(
@@ -796,6 +817,152 @@ fn executeFilterQuery(
     return buildResult(alloc, snap, all_scored, @intCast(all_scored.len), .exact, request);
 }
 
+/// Exact positional verification plus bounded Tantivy-compatible phrase BM25
+/// top-k. Phrase frequency is the number of positional matches and phrase IDF
+/// is the sum of every constituent term's IDF (including repeated terms).
+fn executeScoredPhraseFilter(
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    phrase_filter: query_mod.PhraseFilter,
+    request: SearchRequest,
+    boost: f32,
+) !SearchResult {
+    if (phrase_filter.auto_fuzzy or
+        phrase_filter.max_edits > 0 or
+        phrase_filter.slop != 0 or
+        request.aggregations.len != 0 or
+        request.distributed_text_stats.len != 0)
+    {
+        return executeFilterQuery(alloc, snap, .{ .phrase = phrase_filter }, request, boost);
+    }
+
+    var phrase_idf_sum: f32 = 0;
+    for (phrase_filter.terms) |term| {
+        const df = try snap.termDocFreq(alloc, phrase_filter.field, term);
+        if (df == 0) return .{ .alloc = alloc, .hits = try alloc.alloc(ScoredHit, 0), .total_hits = 0 };
+        phrase_idf_sum += inverted.bm25Idf(snap.global_doc_count, df);
+    }
+
+    var collector = FastTopK{
+        .alloc = alloc,
+        .k = effectiveK(request, snap),
+        .filter_doc_nums = request.filter_doc_nums,
+        .filter_doc_nums_positive = request.filter_doc_nums_positive,
+        .exclude_doc_nums = request.exclude_doc_nums,
+    };
+    defer collector.deinit();
+
+    const avg_dl = snap.textAvgDocLen(phrase_filter.field);
+    if (request.diagnostics) |diag| diag.segments_considered +|= @intCast(snap.segments.len);
+    var doc_offset: u32 = 0;
+    for (snap.segments) |*segment| {
+        const segment_offset = doc_offset;
+        doc_offset += segment.reader.doc_count;
+
+        const inv_reader = (try segment.reader.invertedIndex(phrase_filter.field)) orelse continue;
+        const PhraseScoreState = struct {
+            iter: inverted.PostingsIterator,
+            current: ?inverted.PostingsIterator.Hit = null,
+            doc_freq: u32,
+        };
+        const states = try alloc.alloc(PhraseScoreState, phrase_filter.terms.len);
+        var initialized: usize = 0;
+        defer {
+            for (states[0..initialized]) |*state| state.iter.deinit();
+            alloc.free(states);
+        }
+        var missing_term = false;
+        var lead_index: usize = 0;
+        for (phrase_filter.terms, 0..) |term, i| {
+            const lookup = inv_reader.lookup(term) orelse {
+                missing_term = true;
+                break;
+            };
+            states[i] = .{
+                .iter = try lookup.iterator(alloc),
+                .doc_freq = lookup.docFreq(),
+            };
+            states[i].current = try states[i].iter.advanceToDeferredPositions(0);
+            initialized = i + 1;
+            if (states[i].current == null) {
+                missing_term = true;
+                break;
+            }
+            if (states[i].doc_freq < states[lead_index].doc_freq) lead_index = i;
+        }
+        if (missing_term) continue;
+        if (request.diagnostics) |diag| {
+            diag.segments_searched +|= 1;
+            diag.postings_iterators_opened +|= @intCast(states.len);
+        }
+
+        segment_candidates: while (states[lead_index].current != null) {
+            var local_doc_id = states[lead_index].current.?.doc_id;
+            var needs_realign = false;
+            for (states, 0..) |*state, state_index| {
+                if (state_index == lead_index) continue;
+                if (state.current.?.doc_id < local_doc_id) {
+                    state.current = try state.iter.advanceToDeferredPositions(local_doc_id);
+                    if (state.current == null) break :segment_candidates;
+                }
+                if (state.current.?.doc_id > local_doc_id) {
+                    local_doc_id = state.current.?.doc_id;
+                    needs_realign = true;
+                }
+            }
+            if (needs_realign) {
+                states[lead_index].current = try states[lead_index].iter.advanceToDeferredPositions(local_doc_id);
+                continue;
+            }
+            if (request.diagnostics) |diag| diag.phrase_candidates_verified +|= 1;
+            // The approximation is now a true document conjunction. Decode
+            // positions only for this shared candidate; documents skipped
+            // while realigning advanced over their position records without
+            // unpacking the deltas.
+            for (states) |*state| {
+                state.current = try state.iter.decodeDeferredPositions();
+                if (request.diagnostics) |diag| diag.phrase_position_records_decoded +|= 1;
+            }
+            const phrase_frequency = exactPhraseFrequency(states);
+            const deleted = if (segment.shared.deleted) |deleted_docs| deleted_docs.contains(local_doc_id) else false;
+            if (phrase_frequency > 0 and !deleted) {
+                const score = inverted.bm25ScoreWithIdf(
+                    phrase_frequency,
+                    states[0].current.?.norm,
+                    avg_dl,
+                    phrase_idf_sum,
+                    request.bm25_config,
+                );
+                try collector.collect(segment_offset + local_doc_id, score * boost);
+                if (request.diagnostics) |diag| diag.phrase_matches_scored +|= 1;
+            }
+            if (local_doc_id == std.math.maxInt(u32)) break;
+            states[lead_index].current = try states[lead_index].iter.advanceToDeferredPositions(local_doc_id + 1);
+        }
+    }
+
+    const scored = try collector.finish();
+    defer alloc.free(scored);
+    return try buildResult(alloc, snap, scored, collector.total_count, .exact, request);
+}
+
+fn exactPhraseFrequency(states: anytype) u32 {
+    if (states.len == 0 or states[0].current == null) return 0;
+    var frequency: u32 = 0;
+    for (states[0].current.?.positions) |start_position| {
+        var matches = true;
+        for (states[1..], 1..) |state, term_offset| {
+            const expected = start_position +| @as(u32, @intCast(term_offset));
+            if (!query_mod.positionWithinSlopForScoring(state.current.?.positions, expected, 0)) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) frequency +|= 1;
+    }
+    return frequency;
+}
+
 fn executePhrase(
     alloc: Allocator,
     snap: *const index_mod.IndexSnapshot,
@@ -807,7 +974,10 @@ fn executePhrase(
         return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
     };
     defer freePhraseFilterTerms(alloc, filter);
-    return executeFilterQuery(alloc, snap, filter, request, pq.boost);
+    return switch (filter) {
+        .phrase => |phrase_filter| executeScoredPhraseFilter(alloc, snap, phrase_filter, request, pq.boost),
+        else => executeFilterQuery(alloc, snap, filter, request, pq.boost),
+    };
 }
 
 fn executeTermPhrase(
@@ -819,13 +989,13 @@ fn executeTermPhrase(
     if (pq.terms.len == 0) {
         return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
     }
-    return executeFilterQuery(alloc, snap, .{ .phrase = .{
+    return executeScoredPhraseFilter(alloc, snap, .{
         .field = pq.field,
         .terms = pq.terms,
         .slop = 0,
         .max_edits = pq.max_edits,
         .auto_fuzzy = pq.auto_fuzzy,
-    } }, request, pq.boost);
+    }, request, pq.boost);
 }
 
 fn executeMultiPhrase(
@@ -1274,7 +1444,11 @@ const FastTermState = struct {
     iter: inverted.PostingsIterator,
     current: ?inverted.PostingsIterator.Hit = null,
     doc_freq: u32,
+    idf: f32,
     boost: f32,
+    block_max: ?inverted.BlockMaxInfo,
+    chunk_size: u32,
+    block_cursor: ?inverted.PostingsIterator.BlockCursor = null,
     exhausted: bool = false,
 
     fn deinit(self: *FastTermState) void {
@@ -1287,9 +1461,9 @@ const FastTermState = struct {
     }
 
     fn advanceTo(self: *FastTermState, target: u32) !void {
-        while (!self.exhausted and self.current.?.doc_id < target) {
-            try self.next();
-        }
+        if (self.exhausted or self.current.?.doc_id >= target) return;
+        self.current = try self.iter.advanceTo(target);
+        self.exhausted = self.current == null;
     }
 };
 
@@ -1301,6 +1475,8 @@ const FastTopK = struct {
     exclude_doc_nums: []const u32 = &.{},
     hits: std.ArrayListUnmanaged(scorer_mod.ScoredHit) = .empty,
     total_count: u32 = 0,
+    worst_index: usize = 0,
+    pruned: bool = false,
 
     fn deinit(self: *FastTopK) void {
         self.hits.deinit(self.alloc);
@@ -1309,7 +1485,17 @@ const FastTopK = struct {
     fn collect(self: *FastTopK, doc_id: u32, score: f32) !void {
         if (!self.allows(doc_id)) return;
         self.total_count += 1;
-        try scorer_mod.insertTopK(self.alloc, &self.hits, self.k, .{ .doc_id = doc_id, .score = score });
+        if (self.k == 0) return;
+        const hit = scorer_mod.ScoredHit{ .doc_id = doc_id, .score = score };
+        if (self.hits.items.len < self.k) {
+            try self.hits.append(self.alloc, hit);
+            if (self.hits.items.len == self.k) self.refreshWorst();
+            return;
+        }
+        if (fastHitBetter(hit, self.hits.items[self.worst_index])) {
+            self.hits.items[self.worst_index] = hit;
+            self.refreshWorst();
+        }
     }
 
     fn allows(self: *const FastTopK, doc_id: u32) bool {
@@ -1322,7 +1508,34 @@ const FastTopK = struct {
         scorer_mod.sortScoredHits(self.hits.items);
         return try self.alloc.dupe(scorer_mod.ScoredHit, self.hits.items);
     }
+
+    fn minCompetitiveScore(self: *const FastTopK) f32 {
+        if (self.k == 0 or self.hits.items.len < self.k) return 0;
+        return self.hits.items[self.worst_index].score;
+    }
+
+    fn worstCompetitiveDocId(self: *const FastTopK) ?u32 {
+        if (self.k == 0 or self.hits.items.len < self.k) return null;
+        return self.hits.items[self.worst_index].doc_id;
+    }
+
+    fn refreshWorst(self: *FastTopK) void {
+        self.worst_index = 0;
+        for (self.hits.items[1..], 1..) |candidate, i| {
+            if (fastHitWorse(candidate, self.hits.items[self.worst_index])) self.worst_index = i;
+        }
+    }
 };
+
+fn fastHitBetter(left: scorer_mod.ScoredHit, right: scorer_mod.ScoredHit) bool {
+    if (left.score != right.score) return left.score > right.score;
+    return left.doc_id < right.doc_id;
+}
+
+fn fastHitWorse(left: scorer_mod.ScoredHit, right: scorer_mod.ScoredHit) bool {
+    if (left.score != right.score) return left.score < right.score;
+    return left.doc_id > right.doc_id;
+}
 
 fn containsSortedU32(items: []const u32, value: u32) bool {
     return std.sort.binarySearch(u32, items, value, compareU32) != null;
@@ -1402,10 +1615,24 @@ fn initFastTermStates(
             if (require_all_terms) return null;
             continue;
         }
+        var iter = try lookup_result.iterator(alloc);
+        // Simple boolean scoring uses frequency and norm only. Avoid walking
+        // position varints just as the WAND scorer does for ranking-only term
+        // queries.
+        iter.decode_positions = false;
         var state = FastTermState{
-            .iter = try lookup_result.iterator(alloc),
+            .iter = iter,
             .doc_freq = df,
+            .idf = inverted.bm25Idf(snap.global_doc_count, df),
             .boost = term.boost,
+            .block_max = switch (lookup_result) {
+                .postings => |postings| postings.block_max,
+                .one_hit => null,
+            },
+            .chunk_size = switch (lookup_result) {
+                .postings => |postings| postings.scoringChunkSize(),
+                .one_hit => 0,
+            },
         };
         states.append(alloc, state) catch |err| {
             state.deinit();
@@ -1431,8 +1658,14 @@ fn deinitFastTermStates(alloc: Allocator, states: []FastTermState) void {
     alloc.free(states);
 }
 
-fn scoreFastTerm(state: FastTermState, hit: inverted.PostingsIterator.Hit, global_doc_count: u32, avg_dl: f32) f32 {
-    return inverted.bm25Score(hit.freq, hit.norm, global_doc_count, state.doc_freq, avg_dl, .{}) * state.boost;
+fn scoreFastTerm(
+    state: FastTermState,
+    hit: inverted.PostingsIterator.Hit,
+    global_doc_count: u32,
+    avg_dl: f32,
+    bm25_config: inverted.BM25Config,
+) f32 {
+    return inverted.bm25Score(hit.freq, hit.norm, global_doc_count, state.doc_freq, avg_dl, bm25_config) * state.boost;
 }
 
 fn isSegmentDocDeleted(seg: *const index_mod.SegmentEntry, doc_id: u32) bool {
@@ -1448,14 +1681,20 @@ fn isProhibited(states: []FastTermState, doc_id: u32) !bool {
     return false;
 }
 
-fn collectOptionalScores(states: []FastTermState, doc_id: u32, global_doc_count: u32, avg_dl: f32) !struct { count: u32, score: f32 } {
+fn collectOptionalScores(
+    states: []FastTermState,
+    doc_id: u32,
+    global_doc_count: u32,
+    avg_dl: f32,
+    bm25_config: inverted.BM25Config,
+) !struct { count: u32, score: f32 } {
     var count: u32 = 0;
     var score: f32 = 0;
     for (states) |*state| {
         try state.advanceTo(doc_id);
         if (!state.exhausted and state.current.?.doc_id == doc_id) {
             count += 1;
-            score += scoreFastTerm(state.*, state.current.?, global_doc_count, avg_dl);
+            score += scoreFastTerm(state.*, state.current.?, global_doc_count, avg_dl, bm25_config);
         }
     }
     return .{ .count = count, .score = score };
@@ -1470,6 +1709,7 @@ fn collectFastShouldSegment(
     doc_offset: u32,
     global_doc_count: u32,
     avg_dl: f32,
+    bm25_config: inverted.BM25Config,
     boost: f32,
 ) !void {
     while (true) {
@@ -1486,7 +1726,7 @@ fn collectFastShouldSegment(
         for (should_states) |*state| {
             if (state.exhausted or state.current.?.doc_id != doc_id) continue;
             should_count += 1;
-            score += scoreFastTerm(state.*, state.current.?, global_doc_count, avg_dl);
+            score += scoreFastTerm(state.*, state.current.?, global_doc_count, avg_dl, bm25_config);
             try state.next();
         }
 
@@ -1495,6 +1735,220 @@ fn collectFastShouldSegment(
             !(try isProhibited(must_not_states, doc_id)))
         {
             try collector.collect(doc_offset + doc_id, score * boost);
+        }
+    }
+}
+
+/// Scan common conjunction blocks using compact metadata only. Rejected
+/// blocks never decode their postings payload; all term iterators are loaded
+/// together only when their summed BM25 ceiling can enter the current top-k.
+fn skipNonCompetitiveConjunctionBlocks(
+    collector: *FastTopK,
+    must_states: []FastTermState,
+    current_doc: u32,
+    doc_offset: u32,
+    avg_dl: f32,
+    bm25_config: inverted.BM25Config,
+    boost: f32,
+    diagnostics: ?*scorer_mod.SearchDiagnostics,
+) !bool {
+    const threshold = collector.minCompetitiveScore();
+    const worst_doc_id = collector.worstCompetitiveDocId() orelse return false;
+    if (threshold <= 0 or must_states.len == 0) return false;
+
+    for (must_states) |*state| {
+        if (!state.iter.doc_range_aligned) {
+            return skipNonCompetitiveConjunctionPostingBlocks(
+                collector,
+                must_states,
+                current_doc,
+                doc_offset,
+                avg_dl,
+                bm25_config,
+                boost,
+                diagnostics,
+            );
+        }
+    }
+
+    var chunk_size: u32 = 0;
+    for (must_states) |*state| {
+        if (state.block_max == null or state.chunk_size == 0) return false;
+        if (chunk_size == 0) chunk_size = state.chunk_size else if (state.chunk_size != chunk_size) return false;
+        state.block_cursor = state.iter.currentBlockCursor() orelse return false;
+    }
+
+    var rejected_blocks: u64 = 0;
+    var current_block = true;
+    while (true) {
+        // Sparse terms need not store metadata for every logical block. Seek
+        // the metadata cursors to the next block present in every required
+        // term; a block absent from one term cannot contain a conjunction.
+        var candidate_chunk: u32 = 0;
+        for (must_states) |state| candidate_chunk = @max(candidate_chunk, state.block_cursor.?.chunk_id);
+        while (true) {
+            var candidate_changed = false;
+            for (must_states) |*state| {
+                while (state.block_cursor.?.chunk_id < candidate_chunk) {
+                    if (!try state.iter.advanceBlockCursor(&state.block_cursor.?)) {
+                        state.block_cursor = null;
+                        for (must_states) |*other| {
+                            other.current = null;
+                            other.exhausted = true;
+                        }
+                        collector.pruned = true;
+                        if (diagnostics) |diag| diag.boolean_chunks_skipped +|= rejected_blocks;
+                        return true;
+                    }
+                }
+                if (state.block_cursor.?.chunk_id > candidate_chunk) {
+                    candidate_chunk = state.block_cursor.?.chunk_id;
+                    candidate_changed = true;
+                }
+            }
+            if (!candidate_changed) break;
+        }
+
+        var bound: f32 = 0;
+        for (must_states) |state| {
+            const cursor = state.block_cursor.?;
+            bound += state.iter.blockCursorImpactWithIdf(
+                state.block_max.?,
+                cursor,
+                avg_dl,
+                state.idf,
+                bm25_config,
+            ) * state.boost * boost;
+        }
+        // Within the current block, monotonic conjunction iteration proves
+        // every remaining match is at or after current_doc. For later blocks,
+        // the aligned logical block start is the conservative tie boundary.
+        const earliest_candidate = if (current_block)
+            @as(u64, doc_offset) + current_doc
+        else
+            @as(u64, doc_offset) + @as(u64, candidate_chunk) * chunk_size;
+        const competitive = bound > threshold or
+            (bound == threshold and earliest_candidate < worst_doc_id);
+        if (competitive) {
+            if (rejected_blocks == 0) return false;
+            for (must_states) |*state| {
+                state.current = try state.iter.loadBlockCursor(state.block_cursor.?);
+                state.exhausted = state.current == null;
+            }
+            collector.pruned = true;
+            if (diagnostics) |diag| diag.boolean_chunks_skipped +|= rejected_blocks;
+            return true;
+        }
+
+        rejected_blocks +|= 1;
+        current_block = false;
+        for (must_states) |*state| {
+            if (!try state.iter.advanceBlockCursor(&state.block_cursor.?)) {
+                state.block_cursor = null;
+                for (must_states) |*other| {
+                    other.current = null;
+                    other.exhausted = true;
+                }
+                collector.pruned = true;
+                if (diagnostics) |diag| diag.boolean_chunks_skipped +|= rejected_blocks;
+                return true;
+            }
+        }
+    }
+}
+
+/// v28 posting-count blocks are not aligned by a shared logical chunk ID.
+/// Intersect their conservative [min_doc,max_doc] ranges instead. Blocks whose
+/// ranges cannot overlap are skipped without payload decode; overlapping block
+/// ceilings can be summed exactly as in the v27 aligned path.
+fn skipNonCompetitiveConjunctionPostingBlocks(
+    collector: *FastTopK,
+    must_states: []FastTermState,
+    current_doc: u32,
+    doc_offset: u32,
+    avg_dl: f32,
+    bm25_config: inverted.BM25Config,
+    boost: f32,
+    diagnostics: ?*scorer_mod.SearchDiagnostics,
+) !bool {
+    for (must_states) |*state| {
+        if (state.block_max == null) return false;
+        state.block_cursor = state.iter.currentBlockCursor() orelse return false;
+    }
+
+    var rejected_blocks: u64 = 0;
+    while (true) {
+        var overlap_start: u32 = 0;
+        var overlap_end: u32 = std.math.maxInt(u32);
+        for (must_states) |state| {
+            const cursor = state.block_cursor.?;
+            overlap_start = @max(overlap_start, cursor.min_doc);
+            overlap_end = @min(overlap_end, cursor.max_doc);
+        }
+
+        if (overlap_start > overlap_end) {
+            var advanced = false;
+            for (must_states) |*state| {
+                if (state.block_cursor.?.max_doc >= overlap_start) continue;
+                rejected_blocks +|= 1;
+                if (!try state.iter.advanceBlockCursor(&state.block_cursor.?)) {
+                    for (must_states) |*other| {
+                        other.current = null;
+                        other.exhausted = true;
+                    }
+                    collector.pruned = true;
+                    if (diagnostics) |diag| diag.boolean_chunks_skipped +|= rejected_blocks;
+                    return true;
+                }
+                advanced = true;
+            }
+            if (!advanced) return error.InvalidData;
+            continue;
+        }
+
+        var bound: f32 = 0;
+        for (must_states) |state| {
+            bound += state.iter.blockCursorImpactWithIdf(
+                state.block_max.?,
+                state.block_cursor.?,
+                avg_dl,
+                state.idf,
+                bm25_config,
+            ) * state.boost * boost;
+        }
+        const earliest_candidate = @as(u64, doc_offset) + @max(current_doc, overlap_start);
+        const threshold = collector.minCompetitiveScore();
+        const worst_doc_id = collector.worstCompetitiveDocId() orelse return false;
+        const competitive = bound > threshold or
+            (bound == threshold and earliest_candidate < worst_doc_id);
+        if (competitive) {
+            if (rejected_blocks == 0) return false;
+            const target = @max(current_doc, overlap_start);
+            for (must_states) |*state| {
+                state.current = try state.iter.loadBlockCursor(state.block_cursor.?);
+                state.exhausted = state.current == null;
+                if (!state.exhausted) try state.advanceTo(target);
+            }
+            collector.pruned = true;
+            if (diagnostics) |diag| diag.boolean_chunks_skipped +|= rejected_blocks;
+            return true;
+        }
+
+        // No conjunction in the overlapping range can enter top-k. Advancing
+        // every block that ends at the overlap boundary makes progress while
+        // retaining longer blocks that may overlap a later range.
+        for (must_states) |*state| {
+            if (state.block_cursor.?.max_doc != overlap_end) continue;
+            rejected_blocks +|= 1;
+            if (!try state.iter.advanceBlockCursor(&state.block_cursor.?)) {
+                for (must_states) |*other| {
+                    other.current = null;
+                    other.exhausted = true;
+                }
+                collector.pruned = true;
+                if (diagnostics) |diag| diag.boolean_chunks_skipped +|= rejected_blocks;
+                return true;
+            }
         }
     }
 }
@@ -1509,7 +1963,10 @@ fn collectFastMustSegment(
     doc_offset: u32,
     global_doc_count: u32,
     avg_dl: f32,
+    bm25_config: inverted.BM25Config,
     boost: f32,
+    allow_block_pruning: bool,
+    diagnostics: ?*scorer_mod.SearchDiagnostics,
 ) !void {
     var lead_idx: usize = 0;
     for (must_states[1..], 1..) |state, i| {
@@ -1540,12 +1997,23 @@ fn collectFastMustSegment(
             }
         }
 
+        if (allow_block_pruning and try skipNonCompetitiveConjunctionBlocks(
+            collector,
+            must_states,
+            target,
+            doc_offset,
+            avg_dl,
+            bm25_config,
+            boost,
+            diagnostics,
+        )) continue;
+
         var score: f32 = 0;
         for (must_states) |state| {
-            score += scoreFastTerm(state, state.current.?, global_doc_count, avg_dl);
+            score += scoreFastTerm(state, state.current.?, global_doc_count, avg_dl, bm25_config);
         }
 
-        const optional = try collectOptionalScores(should_states, target, global_doc_count, avg_dl);
+        const optional = try collectOptionalScores(should_states, target, global_doc_count, avg_dl, bm25_config);
         score += optional.score;
 
         if (optional.count >= min_should and
@@ -1604,6 +2072,37 @@ fn executeSimpleTextBool(
         return .{ .alloc = alloc, .hits = try alloc.alloc(ScoredHit, 0), .total_hits = 0 };
     }
 
+    // A pure, minimum-one disjunction is exactly the query shape handled by
+    // the production Block-Max WAND scorer. Keep constrained, prohibited,
+    // minimum-N, and per-term-boosted shapes on the boolean iterator path
+    // until their scorer semantics are represented directly in WAND.
+    if (must_terms.items.len == 0 and
+        must_not_terms.items.len == 0 and
+        effective_min_should == 1 and
+        !requestHasDocNumConstraints(request))
+    {
+        var wand_compatible = true;
+        for (should_terms.items) |term| {
+            if (term.boost != 1.0) {
+                wand_compatible = false;
+                break;
+            }
+        }
+        if (wand_compatible) {
+            const terms = try arena_alloc.alloc([]const u8, should_terms.items.len);
+            for (should_terms.items, 0..) |term, i| terms[i] = term.term;
+            const results = if (request.diagnostics) |diagnostics|
+                try snap.searchWithConfigDiagnostics(alloc, text_field, terms, effectiveK(request, snap), request.bm25_config, diagnostics)
+            else
+                try snap.searchWithConfig(alloc, text_field, terms, effectiveK(request, snap), request.bm25_config);
+            defer alloc.free(results.hits);
+            if (bq.boost != 1.0) {
+                for (results.hits) |*hit| hit.score *= bq.boost;
+            }
+            return try buildResult(alloc, snap, results.hits, results.total_count, results.total_relation, request);
+        }
+    }
+
     var collector = FastTopK{
         .alloc = alloc,
         .k = effectiveK(request, snap),
@@ -1614,6 +2113,20 @@ fn executeSimpleTextBool(
     defer collector.deinit();
 
     const avg_dl = snap.textAvgDocLen(text_field);
+    var allow_must_block_pruning = must_terms.items.len > 0 and
+        should_terms.items.len == 0 and
+        must_not_terms.items.len == 0 and
+        !requestHasDocNumConstraints(request) and
+        bq.boost > 0;
+    if (allow_must_block_pruning) {
+        for (must_terms.items) |term| {
+            if (term.boost <= 0) {
+                allow_must_block_pruning = false;
+                break;
+            }
+        }
+    }
+    if (request.diagnostics) |diag| diag.segments_considered +|= @intCast(snap.segments.len);
     var doc_offset: u32 = 0;
     for (snap.segments) |*seg| {
         const segment_doc_offset = doc_offset;
@@ -1634,18 +2147,23 @@ fn executeSimpleTextBool(
             var must_not_states: []FastTermState = &[_]FastTermState{};
             if (maybe_must_not_states) |states| must_not_states = states;
             defer if (maybe_must_not_states) |states| deinitFastTermStates(alloc, states);
+            if (request.diagnostics) |diag| {
+                diag.segments_searched +|= 1;
+                diag.postings_iterators_opened +|= @intCast(must_states.len + should_states.len + must_not_states.len);
+            }
 
             if (must_terms.items.len > 0) {
-                try collectFastMustSegment(&collector, seg, must_states, should_states, must_not_states, effective_min_should, segment_doc_offset, snap.global_doc_count, avg_dl, bq.boost);
+                try collectFastMustSegment(&collector, seg, must_states, should_states, must_not_states, effective_min_should, segment_doc_offset, snap.global_doc_count, avg_dl, request.bm25_config, bq.boost, allow_must_block_pruning, request.diagnostics);
             } else if (should_states.len > 0) {
-                try collectFastShouldSegment(&collector, seg, should_states, must_not_states, effective_min_should, segment_doc_offset, snap.global_doc_count, avg_dl, bq.boost);
+                try collectFastShouldSegment(&collector, seg, should_states, must_not_states, effective_min_should, segment_doc_offset, snap.global_doc_count, avg_dl, request.bm25_config, bq.boost);
             }
         }
     }
 
     const scored = try collector.finish();
     defer alloc.free(scored);
-    return try buildResult(alloc, snap, scored, collector.total_count, .exact, request);
+    if (request.diagnostics) |diag| diag.boolean_candidates_scored +|= collector.total_count;
+    return try buildResult(alloc, snap, scored, collector.total_count, if (collector.pruned) .gte else .exact, request);
 }
 
 fn executeBool(
@@ -1655,7 +2173,18 @@ fn executeBool(
     request: SearchRequest,
 ) anyerror!SearchResult {
     if (try executeSimpleTextBool(alloc, snap, bq, request)) |result| return result;
+    return executeBoolAllHit(alloc, snap, bq, request);
+}
 
+/// Correctness reference/fallback for boolean shapes that are not yet lowered
+/// to streaming scorers. Kept separate so differential tests can compare the
+/// bounded iterator tree against the former all-hit/hash-map implementation.
+fn executeBoolAllHit(
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    bq: BoolQuery,
+    request: SearchRequest,
+) anyerror!SearchResult {
     var combined: ScoreMap = .{};
     var initialized = false;
     errdefer combined.deinit(alloc);
@@ -3106,6 +3635,21 @@ test "search bool conjunction query" {
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc1", result.hits[0].id.?);
+
+    var custom_bm25 = try execute(alloc, snap, .{
+        .query = .{ .bool_query = .{
+            .must = &.{
+                .{ .match = .{ .field = "title", .text = "alpha" } },
+                .{ .match = .{ .field = "title", .text = "beta" } },
+            },
+        } },
+        .k = 10,
+        .include_stored = false,
+        .bm25_config = .{ .k1 = 2.0, .b = 0.0 },
+    });
+    defer custom_bm25.deinit();
+    try std.testing.expectEqual(@as(usize, 1), custom_bm25.hits.len);
+    try std.testing.expect(@abs(result.hits[0].score - custom_bm25.hits[0].score) > 0.0001);
 }
 
 test "search bool should-only query" {
@@ -3140,6 +3684,224 @@ test "search bool should-only query" {
 
     try std.testing.expectEqual(@as(u32, 2), result.total_hits);
     try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+}
+
+test "streaming boolean scorer matches all-hit reference on randomized corpus" {
+    const alloc = std.testing.allocator;
+    const vocabulary = [_][]const u8{ "alpha", "beta", "gamma", "delta" };
+    var prng = std.Random.DefaultPrng.init(0x51a7_b001);
+    const random = prng.random();
+
+    var inv_builder = inverted.InvertedIndexBuilder.init(alloc, .{ .chunk_size = 8 });
+    defer inv_builder.deinit();
+    for (0..96) |doc_id| {
+        var hits: [vocabulary.len]inverted.InvertedIndexBuilder.TermHit = undefined;
+        var hit_count: usize = 0;
+        for (vocabulary) |term| {
+            if (!random.boolean()) continue;
+            hits[hit_count] = .{
+                .term = term,
+                .freq = random.intRangeAtMost(u32, 1, 5),
+                .norm = random.intRangeAtMost(u32, 4, 40),
+            };
+            hit_count += 1;
+        }
+        try inv_builder.addDocument(@intCast(doc_id), hits[0..hit_count]);
+    }
+    const inv_data = try inv_builder.build();
+    defer alloc.free(inv_data);
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const field_idx = try seg_writer.addField("title");
+    try seg_writer.addSection(field_idx, .inverted_text, inv_data);
+    for (0..96) |doc_id| {
+        var id_buffer: [24]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buffer, "doc-{d}", .{doc_id});
+        try seg_writer.addStoredDoc(id, "{}");
+    }
+    const segment = try seg_writer.build();
+    defer alloc.free(segment);
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment);
+    const snap = writer.snapshot();
+
+    const term_queries = [_]SearchQuery{
+        .{ .term = .{ .field = "title", .term = "alpha" } },
+        .{ .term = .{ .field = "title", .term = "beta" } },
+        .{ .term = .{ .field = "title", .term = "gamma" } },
+        .{ .term = .{ .field = "title", .term = "delta" } },
+    };
+    for (0..48) |_| {
+        var must: [2]SearchQuery = undefined;
+        var should: [3]SearchQuery = undefined;
+        var must_not: [1]SearchQuery = undefined;
+        const must_len: usize = random.intRangeAtMost(usize, 0, must.len);
+        const should_len: usize = random.intRangeAtMost(usize, 1, should.len);
+        const must_not_len: usize = random.intRangeAtMost(usize, 0, must_not.len);
+        for (must[0..must_len]) |*item| item.* = term_queries[random.uintLessThan(usize, term_queries.len)];
+        for (should[0..should_len]) |*item| item.* = term_queries[random.uintLessThan(usize, term_queries.len)];
+        for (must_not[0..must_not_len]) |*item| item.* = term_queries[random.uintLessThan(usize, term_queries.len)];
+        const min_should: u32 = if (must_len == 0)
+            random.intRangeAtMost(u32, 1, @intCast(should_len))
+        else
+            random.intRangeAtMost(u32, 0, @intCast(should_len));
+        const bool_query = BoolQuery{
+            .must = must[0..must_len],
+            .should = should[0..should_len],
+            .must_not = must_not[0..must_not_len],
+            .min_should = min_should,
+        };
+        const request = SearchRequest{
+            .query = .{ .bool_query = bool_query },
+            .k = snap.global_doc_count,
+            .include_stored = false,
+        };
+        var streaming = (try executeSimpleTextBool(alloc, snap, bool_query, request)) orelse return error.TestExpectedEqual;
+        defer streaming.deinit();
+        var reference = try executeBoolAllHit(alloc, snap, bool_query, request);
+        defer reference.deinit();
+        try std.testing.expectEqual(reference.total_hits, streaming.total_hits);
+        try std.testing.expectEqual(reference.hits.len, streaming.hits.len);
+        for (reference.hits, streaming.hits) |expected, actual| {
+            try std.testing.expectEqual(expected.doc_id, actual.doc_id);
+            try std.testing.expectApproxEqAbs(expected.score, actual.score, 0.00001);
+        }
+    }
+}
+
+test "search pure bool should uses WAND top-k" {
+    const alloc = std.testing.allocator;
+
+    const seg_bytes = try buildTestSegmentWithStoredDocs(alloc, &.{
+        .{ .id = "doc1", .data = "{}", .terms = &.{
+            .{ .term = "alpha", .freq = 1, .norm = 10 },
+        } },
+        .{ .id = "doc2", .data = "{}", .terms = &.{
+            .{ .term = "beta", .freq = 1, .norm = 10 },
+        } },
+        .{ .id = "doc3", .data = "{}", .terms = &.{
+            .{ .term = "alpha", .freq = 2, .norm = 8 },
+            .{ .term = "beta", .freq = 2, .norm = 8 },
+        } },
+    });
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+
+    var result = try execute(alloc, writer.snapshot(), .{
+        .query = .{ .bool_query = .{
+            .should = &.{
+                .{ .term = .{ .field = "title", .term = "alpha" } },
+                .{ .term = .{ .field = "title", .term = "beta" } },
+            },
+        } },
+        .k = 1,
+        .include_stored = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), result.hits[0].doc_id);
+    try std.testing.expectEqual(TotalHitsRelation.gte, result.total_hits_relation);
+}
+
+test "pure conjunction block pruning retains earliest cutoff ties" {
+    const alloc = std.testing.allocator;
+    var inv_builder = inverted.InvertedIndexBuilder.init(alloc, .{ .chunk_size = 4 });
+    defer inv_builder.deinit();
+    for (0..40) |doc_id| {
+        try inv_builder.addDocument(@intCast(doc_id), &.{
+            .{ .term = "alpha", .freq = 1, .norm = 10 },
+            .{ .term = "beta", .freq = 1, .norm = 10 },
+        });
+    }
+    const inv_data = try inv_builder.build();
+    defer alloc.free(inv_data);
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const field_idx = try seg_writer.addField("title");
+    try seg_writer.addSection(field_idx, .inverted_text, inv_data);
+    for (0..40) |doc_id| {
+        var id_buf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "doc-{d}", .{doc_id});
+        try seg_writer.addStoredDoc(id, "{}");
+    }
+    const segment = try seg_writer.build();
+    defer alloc.free(segment);
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment);
+    var diagnostics: scorer_mod.SearchDiagnostics = .{};
+    var result = try execute(alloc, writer.snapshot(), .{
+        .query = .{ .bool_query = .{ .must = &.{
+            .{ .term = .{ .field = "title", .term = "alpha" } },
+            .{ .term = .{ .field = "title", .term = "beta" } },
+        } } },
+        .k = 2,
+        .include_stored = false,
+        .diagnostics = &diagnostics,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 0), result.hits[0].doc_id);
+    try std.testing.expectEqual(@as(u32, 1), result.hits[1].doc_id);
+    try std.testing.expectEqual(TotalHitsRelation.gte, result.total_hits_relation);
+    try std.testing.expect(diagnostics.boolean_chunks_skipped > 0);
+}
+
+test "pure conjunction metadata scan preserves later competitive block" {
+    const alloc = std.testing.allocator;
+    var inv_builder = inverted.InvertedIndexBuilder.init(alloc, .{ .chunk_size = 2 });
+    defer inv_builder.deinit();
+    try inv_builder.addDocument(0, &.{
+        .{ .term = "alpha", .freq = 1, .norm = 100 },
+        .{ .term = "beta", .freq = 1, .norm = 100 },
+    });
+    try inv_builder.addDocument(1, &.{
+        .{ .term = "alpha", .freq = 1, .norm = 100 },
+        .{ .term = "beta", .freq = 1, .norm = 100 },
+    });
+    var empty_doc: u32 = 2;
+    while (empty_doc < 1024) : (empty_doc += 1) try inv_builder.addDocument(empty_doc, &.{});
+    try inv_builder.addDocument(1024, &.{
+        .{ .term = "alpha", .freq = 100, .norm = 1 },
+        .{ .term = "beta", .freq = 100, .norm = 1 },
+    });
+    const inv_data = try inv_builder.build();
+    defer alloc.free(inv_data);
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const field_idx = try seg_writer.addField("title");
+    try seg_writer.addSection(field_idx, .inverted_text, inv_data);
+    for (0..1025) |doc_id| {
+        var id_buf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "doc-{d}", .{doc_id});
+        try seg_writer.addStoredDoc(id, "{}");
+    }
+    const segment = try seg_writer.build();
+    defer alloc.free(segment);
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment);
+    var diagnostics: scorer_mod.SearchDiagnostics = .{};
+    var result = try execute(alloc, writer.snapshot(), .{
+        .query = .{ .bool_query = .{ .must = &.{
+            .{ .term = .{ .field = "title", .term = "alpha" } },
+            .{ .term = .{ .field = "title", .term = "beta" } },
+        } } },
+        .k = 1,
+        .include_stored = false,
+        .diagnostics = &diagnostics,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 1024), result.hits[0].doc_id);
+    try std.testing.expect(diagnostics.boolean_chunks_skipped > 0);
 }
 
 test "search bool query general path respects doc number constraints" {
@@ -3323,6 +4085,151 @@ test "search phrase query with custom analyzer and shared positions" {
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc1", result.hits[0].id.?);
+}
+
+test "search term phrase uses exact positional BM25 top-k" {
+    const alloc = std.testing.allocator;
+    const seg_bytes = try buildTestSegmentWithStoredDocs(alloc, &.{
+        .{ .id = "doc1", .data = "{}", .terms = &.{
+            .{ .term = "hello", .freq = 1, .norm = 10, .positions = &.{0} },
+            .{ .term = "world", .freq = 1, .norm = 10, .positions = &.{1} },
+        } },
+        .{ .id = "doc2", .data = "{}", .terms = &.{
+            .{ .term = "hello", .freq = 3, .norm = 5, .positions = &.{ 0, 2, 4 } },
+            .{ .term = "world", .freq = 2, .norm = 5, .positions = &.{ 1, 3 } },
+        } },
+        .{ .id = "doc3", .data = "{}", .terms = &.{
+            .{ .term = "hello", .freq = 1, .norm = 10, .positions = &.{1} },
+            .{ .term = "world", .freq = 1, .norm = 10, .positions = &.{0} },
+        } },
+    });
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+
+    var result = try execute(alloc, writer.snapshot(), .{
+        .query = .{ .term_phrase = .{ .field = "title", .terms = &.{ "hello", "world" } } },
+        .k = 1,
+        .include_stored = false,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(TotalHitsRelation.exact, result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 1), result.hits[0].doc_id);
+    try std.testing.expect(result.hits[0].score > 0);
+    const snap = writer.snapshot();
+    const phrase_idf = inverted.bm25Idf(3, 3) * 2.0;
+    const expected_score = inverted.bm25ScoreWithIdf(2, 5, snap.textAvgDocLen("title"), phrase_idf, .{});
+    try std.testing.expectApproxEqAbs(expected_score, result.hits[0].score, 0.00001);
+
+    var custom_bm25 = try execute(alloc, writer.snapshot(), .{
+        .query = .{ .term_phrase = .{ .field = "title", .terms = &.{ "hello", "world" } } },
+        .k = 1,
+        .include_stored = false,
+        .bm25_config = .{ .k1 = 2.0, .b = 0.0 },
+    });
+    defer custom_bm25.deinit();
+    try std.testing.expectEqual(@as(u32, 1), custom_bm25.hits[0].doc_id);
+    try std.testing.expect(@abs(result.hits[0].score - custom_bm25.hits[0].score) > 0.0001);
+}
+
+test "streaming phrase scorer matches randomized positional reference" {
+    const alloc = std.testing.allocator;
+    const document_count = 64;
+    const document_length = 16;
+    var prng = std.Random.DefaultPrng.init(0xface_5102);
+    const random = prng.random();
+    var expected_frequency: [document_count]u32 = @splat(0);
+    var alpha_df: u32 = 0;
+    var beta_df: u32 = 0;
+
+    var inv_builder = inverted.InvertedIndexBuilder.init(alloc, .{ .chunk_size = 8 });
+    defer inv_builder.deinit();
+    for (0..document_count) |doc_id| {
+        var alpha_positions: [document_length]u32 = undefined;
+        var beta_positions: [document_length]u32 = undefined;
+        var alpha_len: usize = 0;
+        var beta_len: usize = 0;
+        var previous_alpha = false;
+        for (0..document_length) |position| {
+            const token = random.uintLessThan(u8, 3);
+            const is_alpha = token == 0;
+            const is_beta = token == 1;
+            if (is_alpha) {
+                alpha_positions[alpha_len] = @intCast(position);
+                alpha_len += 1;
+            } else if (is_beta) {
+                beta_positions[beta_len] = @intCast(position);
+                beta_len += 1;
+            }
+            if (previous_alpha and is_beta) expected_frequency[doc_id] += 1;
+            previous_alpha = is_alpha;
+        }
+        var hits: [2]inverted.InvertedIndexBuilder.TermHit = undefined;
+        var hit_len: usize = 0;
+        if (alpha_len > 0) {
+            alpha_df += 1;
+            hits[hit_len] = .{ .term = "alpha", .freq = @intCast(alpha_len), .norm = document_length, .positions = alpha_positions[0..alpha_len] };
+            hit_len += 1;
+        }
+        if (beta_len > 0) {
+            beta_df += 1;
+            hits[hit_len] = .{ .term = "beta", .freq = @intCast(beta_len), .norm = document_length, .positions = beta_positions[0..beta_len] };
+            hit_len += 1;
+        }
+        try inv_builder.addDocument(@intCast(doc_id), hits[0..hit_len]);
+    }
+    const inv_data = try inv_builder.build();
+    defer alloc.free(inv_data);
+    var segment_writer = segment_mod.SegmentWriter.init(alloc);
+    defer segment_writer.deinit();
+    const field_index = try segment_writer.addField("title");
+    try segment_writer.addSection(field_index, .inverted_text, inv_data);
+    for (0..document_count) |doc_id| {
+        var id_buffer: [24]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buffer, "phrase-{d}", .{doc_id});
+        try segment_writer.addStoredDoc(id, "{}");
+    }
+    const segment = try segment_writer.build();
+    defer alloc.free(segment);
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment);
+
+    var diagnostics: scorer_mod.SearchDiagnostics = .{};
+    var result = try execute(alloc, writer.snapshot(), .{
+        .query = .{ .term_phrase = .{ .field = "title", .terms = &.{ "alpha", "beta" } } },
+        .k = document_count,
+        .include_stored = false,
+        .diagnostics = &diagnostics,
+    });
+    defer result.deinit();
+
+    var expected = std.ArrayListUnmanaged(scorer_mod.ScoredHit).empty;
+    defer expected.deinit(alloc);
+    const idf_sum = inverted.bm25Idf(document_count, alpha_df) + inverted.bm25Idf(document_count, beta_df);
+    const average_document_length = writer.snapshot().textAvgDocLen("title");
+    for (expected_frequency, 0..) |frequency, doc_id| {
+        if (frequency == 0) continue;
+        try expected.append(alloc, .{
+            .doc_id = @intCast(doc_id),
+            .score = inverted.bm25ScoreWithIdf(frequency, document_length, average_document_length, idf_sum, .{}),
+        });
+    }
+    scorer_mod.sortScoredHits(expected.items);
+    try std.testing.expectEqual(@as(u32, @intCast(expected.items.len)), result.total_hits);
+    try std.testing.expectEqual(expected.items.len, result.hits.len);
+    for (expected.items, result.hits) |reference, actual| {
+        try std.testing.expectEqual(reference.doc_id, actual.doc_id);
+        try std.testing.expectApproxEqAbs(reference.score, actual.score, 0.00001);
+    }
+    try std.testing.expectEqual(
+        diagnostics.phrase_candidates_verified * 2,
+        diagnostics.phrase_position_records_decoded,
+    );
 }
 
 test "search with pagination offset" {

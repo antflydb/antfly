@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "status": "accepted_with_remaining_postings_metadata_gap",
+  "comparison_boundary": "settled_persisted_search_index_only",
+  "corpus": {
+    "documents": 5032105,
+    "normalized_bytes": 8473678432,
+    "sha256": "9078d9ea4783ab764fe246046efdc8062692f07afdd7c8749a74ebfe05c51ff4"
+  },
+  "format": {
+    "wire_version": 30,
+    "accepted_reader_versions": [23, 30],
+    "branch_only_rejected_versions": [24, 25, 26, 27, 28, 29],
+    "postings_per_payload_block": 128,
+    "impact_range_documents": 1024,
+    "position_width_group_documents": 8,
+    "position_group_packing": "contiguous_bits_without_per_document_byte_padding",
+    "stored_fields": "omitted_for_index_only_kernel_segments",
+    "merge_output": "term_streamed_through_1MiB_file_sink_buffer"
+  },
+  "correctness": {
+    "ok": true,
+    "queries": 5,
+    "strict_matches": 5,
+    "tie_aware_matches": 0
+  },
+  "settled_layout": {
+    "segments": 10,
+    "completed_merges": 267,
+    "pending_segments": 0,
+    "in_flight_merges": 0,
+    "failed_merges": 0,
+    "quarantined_merges": 0
+  },
+  "index_size": {
+    "antfly_bytes": 3614059644,
+    "tantivy_bytes": 3251494143,
+    "gap_bytes": 362565501,
+    "antfly_to_tantivy_ratio": 1.111507329,
+    "v29_bytes": 3905870509,
+    "reduction_from_v29_bytes": 291810865,
+    "reduction_from_v29_percent": 7.47108
+  },
+  "antfly_components": {
+    "stored_fields": 50,
+    "inverted": 3593929139,
+    "norms": 5032155,
+    "term_dictionary": 83790167,
+    "bloom": 23068872,
+    "postings": 3482037615,
+    "postings_header": 98520520,
+    "impact_records": 191023252,
+    "impact_range_ids_and_residual": 31330410,
+    "chunk_metadata": 128642938,
+    "doc_frequency_payload": 1176726009,
+    "positions": 1852638998,
+    "skip": 3155488,
+    "ordinals": 20128470,
+    "section_index": 1170,
+    "postings_terms": 12127373,
+    "single_document_postings_terms": 7523351,
+    "document_term_postings": 622897189
+  },
+  "indexing": {
+    "antfly_elapsed_ns": 443035949000,
+    "antfly_cpu_ns": 427459014000,
+    "antfly_peak_rss_bytes": 2118975488,
+    "tantivy_reference_elapsed_ns": 550244512584,
+    "tantivy_reference_peak_rss_bytes": 2810429440,
+    "antfly_to_tantivy_elapsed_ratio": 0.805162,
+    "antfly_to_tantivy_peak_rss_ratio": 0.753969,
+    "peak_rss_advantage_bytes": 691453952,
+    "merge_input_bytes": 21287020709,
+    "merge_output_bytes": 19766591996
+  },
+  "query_resources": {
+    "minimum_wall_seconds_per_class": 3,
+    "antfly_cpu_per_query_ns": {
+      "term": 102287,
+      "union": 265193,
+      "intersection": 240968,
+      "phrase": 615502
+    },
+    "tantivy_reference_cpu_per_query_ns": {
+      "term": 40028,
+      "union": 213284,
+      "intersection": 248616,
+      "phrase": 344910
+    },
+    "antfly_to_tantivy_cpu_ratio": {
+      "term": 2.55539,
+      "union": 1.24338,
+      "intersection": 0.969238,
+      "phrase": 1.78453
+    },
+    "antfly_peak_rss_bytes": 23232512,
+    "v29_phrase_cpu_per_query_ns": 549009,
+    "phrase_cpu_regression_from_v29_percent": 12.1115
+  },
+  "decision": {
+    "production_default": "accept_v30_contiguous_position_groups_and_streamed_merge_output",
+    "remaining_gap": "Positions are now approximately 77.6 MB smaller than Tantivy. The remaining size gap is the approximately 490 MB excess in postings headers, impact records, chunk metadata, payload, and residual structures, partly offset by smaller positions/dictionary and the omitted store.",
+    "next_size_priority": "Compress or eliminate redundant per-term postings headers and fixed posting-count chunk columns before weakening impact precision.",
+    "query_priority": "Recover the 12 percent phrase CPU regression without restoring per-document byte padding; term is flat and union/intersection improve versus v29.",
+    "source_artifact": "/private/tmp/antfly-wiki-full-production-v30-contiguous-positions"
+  }
+}

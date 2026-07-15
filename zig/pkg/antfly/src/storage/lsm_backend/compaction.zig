@@ -148,12 +148,21 @@ pub fn maybeCompactRuns(comptime BackendType: type, backend: *BackendType) !void
 }
 
 pub fn maybeCompactRunsScheduled(comptime BackendType: type, backend: *BackendType, score: u64) !bool {
+    return maybeCompactRunsScheduledWithL0Limit(BackendType, backend, backend.options.compact_threshold_runs, score);
+}
+
+pub fn maybeCompactRunsScheduledWithL0Limit(
+    comptime BackendType: type,
+    backend: *BackendType,
+    l0_limit: usize,
+    score: u64,
+) !bool {
     if (try compactRememberedPlanIfValid(BackendType, backend)) return true;
 
     var selection_stats: CompactionSelectionStats = .{};
     const plan = selectCompactionPlanWithStats(
         backend.runs.items,
-        backend.options.compact_threshold_runs,
+        l0_limit,
         backend.options.l0_overlap_compact_threshold_runs,
         backend.options.level_target_runs_base,
         backend.options.level_target_runs_multiplier,
@@ -873,7 +882,13 @@ fn selectCompactionPlanWithStats(
 ) ?CompactionPlan {
     if (runs.len < 2) return null;
     var best: ?ScoredCompactionPlan = null;
-    maybeAdoptBest(&best, selectL0OverlapCompactionCandidateWithStats(runs, l0_overlap_compact_threshold_runs, max_input_bytes, selection_stats));
+    maybeAdoptBest(&best, selectL0OverlapCompactionCandidateWithStats(
+        runs,
+        l0_overlap_compact_threshold_runs,
+        @max(l0_overlap_compact_threshold_runs, l0_limit),
+        max_input_bytes,
+        selection_stats,
+    ));
     maybeAdoptBest(&best, selectL0CompactionCandidateWithStats(runs, l0_limit, max_input_bytes, allow_oversized_single_job, selection_stats));
     maybeAdoptBest(&best, selectLowerLevelRepairCompactionCandidateWithStats(runs, max_input_bytes, allow_oversized_single_job, selection_stats));
     maybeAdoptBest(&best, selectLowerLevelPressureCompactionCandidateWithStats(
@@ -914,12 +929,13 @@ fn selectL0OverlapCompactionWithStats(
     max_input_bytes: u64,
     selection_stats: ?*CompactionSelectionStats,
 ) ?CompactionPlan {
-    return if (selectL0OverlapCompactionCandidateWithStats(runs, threshold, max_input_bytes, selection_stats)) |candidate| candidate.plan else null;
+    return if (selectL0OverlapCompactionCandidateWithStats(runs, threshold, threshold, max_input_bytes, selection_stats)) |candidate| candidate.plan else null;
 }
 
 fn selectL0OverlapCompactionCandidateWithStats(
     runs: []const Run,
     threshold: usize,
+    pressure_target: usize,
     max_input_bytes: u64,
     selection_stats: ?*CompactionSelectionStats,
 ) ?ScoredCompactionPlan {
@@ -948,7 +964,17 @@ fn selectL0OverlapCompactionCandidateWithStats(
             noteOversizedSelectionSkip(selection_stats, max_input_bytes);
             continue;
         }
-        const priority = @as(u64, @intCast(count)) * 2_000 +| bytes / (64 * 1024);
+        // Compare compaction pressure as a ratio, not as absolute run debt.
+        // Absolute L0 debt used to starve an already 10x-overfull L1: every
+        // small L0 job then rewrote the oversized L1 again before L1 was ever
+        // promoted. Ratio scoring is the standard leveled-LSM behavior and
+        // lets the downstream level win as soon as it is the greater pressure.
+        // The overlap threshold controls eligibility, but the configured L0
+        // soft bound controls how this work competes with lower levels. Using
+        // the small overlap trigger as the pressure denominator made 102
+        // overlapping L0 runs appear 25x urgent and starved an 8.5x-overfull
+        // L1 even though L0 was only 3.2x above its production soft bound.
+        const priority = normalizedPressurePriority(count, @max(@as(usize, 1), pressure_target)) +| bytes / (64 * 1024);
         maybeAdoptBest(&best, scoredPlan(runs, plan, priority));
     }
     return best;
@@ -985,15 +1011,17 @@ fn selectL0CompactionCandidateWithStats(
     if (l0_count == 0 or l0_count <= l0_limit) return null;
     const target_l0_count = @max(@as(usize, 1), l0_limit / 2);
     const excess_len = @max(@as(usize, 1), l0_count - target_l0_count);
-    const max_window_len = if (l0_limit == 0)
-        @as(usize, 2)
-    else
-        std.math.mul(usize, @max(@as(usize, 1), l0_limit), 2) catch std.math.maxInt(usize);
-    var source_len = @min(excess_len, max_window_len);
+    // Drain the pressure episode in one target-overlap closure when the byte
+    // budget permits. The old `2 * l0_limit` cap turned a 128-run backlog into
+    // roughly sixteen eight-run jobs. For broad key ranges every job rewrote
+    // the same large L1 target, multiplying CPU, I/O, and final-sync latency.
+    // `max_input_bytes` below remains the production bound: when configured,
+    // the loop shrinks this window until source plus overlapping target fits.
+    var source_len = if (l0_limit == 0) @min(excess_len, @as(usize, 2)) else excess_len;
     var oversized_plan: ?CompactionPlan = null;
     while (source_len > 0) : (source_len -= 1) {
         const plan = buildPlanForSourceRange(runs, 0, l0_count - source_len, source_len) orelse continue;
-        const priority = @as(u64, @intCast(l0_count - l0_limit)) * 1_000 +| @as(u64, @intCast(source_len)) * 10;
+        const priority = normalizedPressurePriority(l0_count, @max(@as(usize, 1), l0_limit)) +| @as(u64, @intCast(source_len)) * 10;
         if (planWithinInputBudget(runs, plan, max_input_bytes)) return scoredPlan(runs, plan, priority);
         if (allow_oversized_single_job and max_input_bytes > 0) {
             oversized_plan = plan;
@@ -1001,7 +1029,7 @@ fn selectL0CompactionCandidateWithStats(
             noteOversizedSelectionSkip(selection_stats, max_input_bytes);
         }
     }
-    return if (oversized_plan) |plan| scoredPlan(runs, plan, @as(u64, @intCast(l0_count - l0_limit)) * 1_000) else null;
+    return if (oversized_plan) |plan| scoredPlan(runs, plan, normalizedPressurePriority(l0_count, @max(@as(usize, 1), l0_limit))) else null;
 }
 
 fn selectLowerLevelRepairCompaction(runs: []const Run, max_input_bytes: u64, allow_oversized_single_job: bool) ?CompactionPlan {
@@ -1144,9 +1172,9 @@ fn selectLowerLevelPressureCompactionCandidateWithStats(
         const need_bytes = target_bytes > 0 and level_bytes > target_bytes;
         if (!need_runs and !need_bytes) continue;
 
-        const run_debt = if (need_runs) level_len - target_runs else 0;
-        const byte_debt = if (need_bytes) level_bytes - target_bytes else 0;
-        const priority = @as(u64, @intCast(run_debt)) * 500 +| byte_debt / (64 * 1024);
+        const run_pressure = if (need_runs) normalizedPressurePriority(level_len, target_runs) else 0;
+        const byte_pressure = if (need_bytes) normalizedPressurePriority(level_bytes, target_bytes) else 0;
+        const priority = @max(run_pressure, byte_pressure);
         const source_len = if (need_runs) @max(@as(usize, 1), level_len - target_runs) else 1;
         const source_bytes = if (need_bytes) @max(@as(u64, 1), level_bytes - target_bytes) else 0;
         maybeAdoptBest(&best, selectLowestOverlapWindowCandidate(
@@ -1258,6 +1286,18 @@ fn levelRunTarget(level: u32, base: usize, multiplier: usize) usize {
         target = std.math.mul(usize, target, factor) catch std.math.maxInt(usize);
     }
     return target;
+}
+
+const pressure_priority_scale: u64 = 1_000_000;
+
+fn normalizedPressurePriority(current: anytype, target: @TypeOf(current)) u64 {
+    if (target == 0) return std.math.maxInt(u64);
+    const current_u64: u64 = @intCast(current);
+    const target_u64: u64 = @intCast(target);
+    const whole = current_u64 / target_u64;
+    const remainder = current_u64 % target_u64;
+    return std.math.mul(u64, whole, pressure_priority_scale) catch std.math.maxInt(u64) +|
+        (std.math.mul(u64, remainder, pressure_priority_scale) catch std.math.maxInt(u64)) / target_u64;
 }
 
 fn levelByteTarget(level: u32, base: usize, multiplier: usize) u64 {
@@ -1402,6 +1442,66 @@ test "lsm compaction lower-level pressure can exceed input target for minimum jo
     try std.testing.expectEqual(@as(u32, 2), plan.output_level);
 }
 
+test "lsm compaction promotes overfull lower level before repeated L0 rewrites" {
+    var runs = std.ArrayListUnmanaged(Run).empty;
+    defer runs.deinit(std.testing.allocator);
+
+    // L0 remains well above its four-run trigger, but L1 is more than ten
+    // times its byte target. Continuing to compact L0 would rewrite these L1
+    // bytes repeatedly; normalized pressure must promote L1 first.
+    for (0..39) |i| {
+        try runs.append(std.testing.allocator, testRun(@intCast(i + 1), 0, "a", "z", 3 * 1024 * 1024));
+    }
+    try runs.append(std.testing.allocator, testRun(100, 1, "a", "f", 340 * 1024 * 1024));
+    try runs.append(std.testing.allocator, testRun(101, 1, "g", "l", 340 * 1024 * 1024));
+    try runs.append(std.testing.allocator, testRun(102, 1, "m", "r", 340 * 1024 * 1024));
+    try runs.append(std.testing.allocator, testRun(103, 1, "s", "z", 340 * 1024 * 1024));
+
+    const plan = selectCompactionPlan(
+        runs.items,
+        4,
+        4,
+        32,
+        4,
+        128 * 1024 * 1024,
+        10,
+        0,
+        false,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), plan.source_level);
+    try std.testing.expectEqual(@as(u32, 2), plan.output_level);
+}
+
+test "lsm maintenance compares soft L0 pressure with lower-level pressure" {
+    var runs = std.ArrayListUnmanaged(Run).empty;
+    defer runs.deinit(std.testing.allocator);
+
+    // Reproduces the post-ingest state from the 1M server gate. L0 is above
+    // its 32-run soft limit (3.2x), while L1 is about 8.5x its byte target.
+    // Using the four-run compaction trigger as the pressure denominator would
+    // incorrectly make L0 look 25x overfull and rewrite the entire L1.
+    for (0..102) |i| {
+        try runs.append(std.testing.allocator, testRun(@intCast(i + 1), 0, "a", "z", 3 * 1024 * 1024));
+    }
+    for (0..4) |i| {
+        try runs.append(std.testing.allocator, testRun(@intCast(200 + i), 1, "a", "z", 284 * 1024 * 1024));
+    }
+
+    const plan = selectCompactionPlan(
+        runs.items,
+        32,
+        4,
+        32,
+        4,
+        128 * 1024 * 1024,
+        10,
+        0,
+        false,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), plan.source_level);
+    try std.testing.expectEqual(@as(u32, 2), plan.output_level);
+}
+
 test "lsm compaction L0 pressure selects a wider assist window" {
     const runs = [_]Run{
         testRun(9, 0, "doc:009", "doc:009", 10),
@@ -1424,6 +1524,21 @@ test "lsm compaction L0 pressure selects a wider assist window" {
     const oldest_pair = selectL0Compaction(&runs, 0, 0, false) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 7), oldest_pair.source_start);
     try std.testing.expectEqual(@as(usize, 2), oldest_pair.source_len);
+}
+
+test "lsm compaction drains a hard L0 backlog in one byte-bounded window" {
+    var runs = std.ArrayListUnmanaged(Run).empty;
+    defer runs.deinit(std.testing.allocator);
+    for (0..128) |i| {
+        try runs.append(std.testing.allocator, testRun(@intCast(128 - i), 0, "doc:000000", "doc:999999", 3 * 1024 * 1024));
+    }
+
+    const unbounded = selectL0Compaction(runs.items, 4, 0, false) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 126), unbounded.source_len);
+
+    const bounded = selectL0Compaction(runs.items, 4, 20 * 1024 * 1024, false) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(bounded.source_len <= 6);
+    try std.testing.expect(bounded.source_len > 0);
 }
 
 test "lsm compaction plan selection chooses highest scored debt" {
@@ -1503,7 +1618,7 @@ fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *Backe
     for (window_runs, 0..) |run, i| {
         const path = run.path orelse return error.RunStateUnavailable;
         cursors[i] = try PersistedRunCursor.init(allocator, backend.storage.?, path);
-        if (cursors[i].index.entryCount() != run.entry_count) return error.InvalidTableFile;
+        if (cursors[i].index.entry_count != run.entry_count) return error.InvalidTableFile;
         initialized_cursors += 1;
     }
 
@@ -1702,20 +1817,24 @@ const PersistedRunCursor = struct {
     allocator: std.mem.Allocator,
     storage: @import("storage_io.zig").Storage,
     path: []const u8,
-    index: lsm_table_file.TableIndex,
+    index: lsm_table_file.SequentialTableIndex,
     position: ?usize = null,
+    block_index: usize = 0,
+    entry_in_block: usize = 0,
+    block_offset: usize = 0,
+    current_entry_len: usize = 0,
     loaded_window: ?lsm_table_file.EntryDataWindow = null,
     loaded_bytes: ?[]u8 = null,
 
     fn init(allocator: std.mem.Allocator, storage: @import("storage_io.zig").Storage, path: []const u8) !PersistedRunCursor {
-        var index = try repository_mod.loadRunTableIndexAllocWithStorage(storage, allocator, path);
+        var index = try repository_mod.loadRunSequentialTableIndexAllocWithStorage(storage, allocator, path);
         errdefer index.deinit(allocator);
         return .{
             .allocator = allocator,
             .storage = storage,
             .path = path,
             .index = index,
-            .position = if (index.entryCount() > 0) 0 else null,
+            .position = if (index.entry_count > 0) 0 else null,
         };
     }
 
@@ -1726,24 +1845,43 @@ const PersistedRunCursor = struct {
     }
 
     fn currentEntry(self: *PersistedRunCursor) !?lsm_table_file.Entry {
-        const pos = self.position orelse return null;
-        try self.ensureWindowForPosition(pos);
-        const window = self.loaded_window orelse return error.InvalidTableFile;
+        _ = self.position orelse return null;
+        try self.ensureCurrentWindow();
         const bytes = self.loaded_bytes orelse return error.InvalidTableFile;
-        const entry_start = self.index.entryStart(pos);
-        if (entry_start < window.relative_offset) return error.InvalidTableFile;
-        const relative_offset: usize = @intCast(entry_start - window.relative_offset);
-        return try lsm_table_file.parseEntryAt(bytes, relative_offset);
+        if (self.block_offset >= bytes.len) return error.InvalidTableFile;
+        const entry = try lsm_table_file.parseEntryAt(bytes, self.block_offset);
+        self.current_entry_len = tableEntryLogicalBytes(entry);
+        if (self.current_entry_len > bytes.len - self.block_offset) return error.InvalidTableFile;
+        return entry;
     }
 
-    fn advance(self: *PersistedRunCursor) void {
+    fn advance(self: *PersistedRunCursor) !void {
         const pos = self.position orelse return;
-        self.position = if (pos + 1 < self.index.entryCount()) pos + 1 else null;
+        if (self.current_entry_len == 0) _ = (try self.currentEntry()) orelse return error.InvalidTableFile;
+        self.block_offset += self.current_entry_len;
+        self.current_entry_len = 0;
+        self.entry_in_block += 1;
+        const block = self.index.blocks[self.block_index];
+        if (self.entry_in_block > block.entry_count) return error.InvalidTableFile;
+        if (self.entry_in_block == block.entry_count) {
+            const bytes = self.loaded_bytes orelse return error.InvalidTableFile;
+            if (self.block_offset != bytes.len) return error.InvalidTableFile;
+            self.block_index += 1;
+            self.entry_in_block = 0;
+            self.block_offset = 0;
+        }
+        if (pos + 1 < self.index.entry_count) {
+            if (self.block_index >= self.index.blocks.len) return error.InvalidTableFile;
+            self.position = pos + 1;
+        } else {
+            if (self.block_index != self.index.blocks.len) return error.InvalidTableFile;
+            self.position = null;
+        }
     }
 
-    fn ensureWindowForPosition(self: *PersistedRunCursor, pos: usize) !void {
-        const block_index = self.index.findBlockIndexForEntry(pos) orelse return error.InvalidTableFile;
-        const window = self.index.blockWindow(block_index);
+    fn ensureCurrentWindow(self: *PersistedRunCursor) !void {
+        if (self.block_index >= self.index.blocks.len) return error.InvalidTableFile;
+        const window = self.index.blocks[self.block_index].window;
         if (self.loaded_window) |loaded| {
             if (loaded.relative_offset == window.relative_offset and
                 loaded.len == window.len and
@@ -1815,7 +1953,7 @@ const PersistedRunMergeHeap = struct {
             const entry = (try self.cursors[source].currentEntry()) orelse return error.InvalidTableFile;
             if (compareTableEntry(entry, key_entry) != .eq) break;
             _ = try self.popSource();
-            self.cursors[source].advance();
+            try self.cursors[source].advance();
             self.advanced_sources[advanced_len] = source;
             advanced_len += 1;
         }

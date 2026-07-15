@@ -115,6 +115,9 @@ const db_query_graph = @import("query/graph_exec.zig");
 const db_query_projection = @import("query/projection.zig");
 const db_query_result_shape = @import("query/result_shape.zig");
 const db_query_search = @import("query/search_exec.zig");
+const search_mod = @import("../../search/search.zig");
+const index_mod = @import("../../index.zig");
+const introducer_mod = @import("../../introducer.zig");
 const db_query_metrics = @import("query_metrics.zig");
 const ttl_runtime_mod = @import("maintenance/ttl_runtime.zig");
 const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
@@ -4782,6 +4785,15 @@ pub const DB = struct {
         }
 
         try self.executor.failIfUnhealthy();
+
+        // Global LSM throttling must happen before the DB apply lock. Derived
+        // and maintenance workers may need that lock to publish or flush the
+        // state that releases aggregate pressure. The backend commit performs
+        // the final projected check before WAL append, so this non-reserving
+        // preflight is an early wait, not the durability guard.
+        if (self.core.index_manager.resource_manager) |manager| {
+            try manager.awaitAdmission(.lsm_in_memory_state, 0);
+        }
 
         lockApply(self);
         var apply_mutex_held = true;
@@ -9725,11 +9737,184 @@ pub const DB = struct {
         try self.core.drainScheduledTextMerges();
     }
 
+    /// Internal search-kernel indexing boundary. Source documents are already
+    /// projected and are published only to the production full-text index.
+    pub fn indexTextKernelDocuments(
+        self: *DB,
+        index_name: []const u8,
+        docs: []const introducer_mod.TextDocument,
+    ) !usize {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        const segment_count = self.core.index_manager.indexTextKernelDocuments(index_name, docs) catch |err| {
+            self.core.unlockApply();
+            return err;
+        };
+        self.core.unlockApply();
+        if (self.text_merge_runtime) |runtime| {
+            runtime.notify();
+            runtime.applyBackpressure();
+        }
+        return segment_count;
+    }
+
     pub fn forceCompactTextIndexes(self: *DB) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.forceCompactTextIndexes();
+    }
+
+    pub fn textIndexLayoutStats(self: *DB, alloc: Allocator, index_name: []const u8) !types.TextIndexLayoutStats {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+
+        const index = self.core.textIndex(index_name) orelse return error.IndexNotFound;
+        const text_snapshot = index.acquireSnapshot();
+        defer text_snapshot.release();
+
+        const segments = try alloc.alloc(types.TextSegmentLayoutStats, text_snapshot.segments.len);
+        errdefer alloc.free(segments);
+        var total_bytes: u64 = 0;
+        for (text_snapshot.segments, 0..) |*segment, i| {
+            const bytes: u64 = @intCast(segment.data.bytes().len);
+            const live_doc_count = segment.liveDocCount();
+            total_bytes +|= bytes;
+            segments[i] = .{
+                .segment_id = segment.id,
+                .doc_count = segment.reader.doc_count,
+                .live_doc_count = live_doc_count,
+                .deleted_count = segment.reader.doc_count -| live_doc_count,
+                .bytes = bytes,
+                .file_backed = segment.data.isFileBacked(),
+            };
+        }
+        return .{
+            .global_doc_count = text_snapshot.global_doc_count,
+            .total_bytes = total_bytes,
+            .segments = segments,
+            .merge_policy = index_manager_mod.defaultTextMergePolicyStats(),
+            .merge_stats = self.core.index_manager.textMergeStatsSnapshotForIndex(index_name),
+        };
+    }
+
+    /// Execute directly against an immutable production text-index snapshot.
+    /// This deliberately bypasses DB query envelopes, MVCC constraint
+    /// derivation, public projection, and stored-document loading. It is an
+    /// internal engineering/benchmark boundary, not a public query API.
+    pub fn searchTextKernel(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        text_query: types.TextQuery,
+        options: types.TextKernelSearchOptions,
+    ) !types.TextKernelResult {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+
+        const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        const text_snapshot = entry.persistent.acquireSnapshot();
+        defer text_snapshot.release();
+
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const query = try db_query_search.textQueryToSearchQuery(
+            arena_state.allocator(),
+            text_query,
+            entry.text_analysis,
+            entry.runtime_schema,
+        );
+        var search_diagnostics = search_mod.SearchDiagnostics{};
+        var result = try search_mod.execute(alloc, text_snapshot, .{
+            .query = query,
+            .k = options.limit,
+            .include_stored = false,
+            .bm25_config = .{ .k1 = options.bm25.k1, .b = options.bm25.b },
+            .diagnostics = if (options.collect_diagnostics) &search_diagnostics else null,
+        });
+        defer result.deinit();
+
+        const hits = try alloc.alloc(types.TextKernelHit, result.hits.len);
+        errdefer alloc.free(hits);
+        for (result.hits, 0..) |hit, i| {
+            hits[i] = .{
+                .doc_ordinal = (try text_snapshot.docOrdinal(hit.doc_id)) orelse return error.MissingTextDocOrdinal,
+                .score = hit.score,
+            };
+        }
+        return .{
+            .hits = hits,
+            .total_hits = result.total_hits,
+            .total_hits_relation = switch (result.total_hits_relation) {
+                .exact => .exact,
+                .gte => .gte,
+            },
+            .diagnostics = .{
+                .segments_considered = search_diagnostics.segments_considered,
+                .segments_searched = search_diagnostics.segments_searched,
+                .segments_pruned = search_diagnostics.segments_pruned,
+                .postings_iterators_opened = search_diagnostics.postings_iterators_opened,
+                .wand_next_in_score = search_diagnostics.wand_next_in_score,
+                .wand_next_in_advance = search_diagnostics.wand_next_in_advance,
+                .wand_pivots_scored = search_diagnostics.wand_pivots_scored,
+                .wand_pivots_advanced = search_diagnostics.wand_pivots_advanced,
+                .wand_chunks_skipped = search_diagnostics.wand_chunks_skipped,
+                .boolean_candidates_scored = search_diagnostics.boolean_candidates_scored,
+                .boolean_chunks_skipped = search_diagnostics.boolean_chunks_skipped,
+                .phrase_candidates_verified = search_diagnostics.phrase_candidates_verified,
+                .phrase_position_records_decoded = search_diagnostics.phrase_position_records_decoded,
+                .phrase_matches_scored = search_diagnostics.phrase_matches_scored,
+            },
+        };
+    }
+
+    /// Inspect the exact BM25 inputs for one term/document pair without
+    /// loading stored source. The ordinal uses Antfly's native one-based
+    /// convention, matching `TextKernelHit.doc_ordinal`.
+    pub fn textKernelTermStats(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        field: []const u8,
+        term: []const u8,
+        doc_ordinal: u32,
+    ) !?index_mod.TextTermStats {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+
+        const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        const text_snapshot = entry.persistent.acquireSnapshot();
+        defer text_snapshot.release();
+        return try text_snapshot.textTermStats(alloc, field, term, doc_ordinal);
+    }
+
+    /// Exact kernel count using the production bitmap/filter implementation,
+    /// without allocating public hits or loading stored documents.
+    pub fn countTextKernel(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        text_query: types.TextQuery,
+    ) !u32 {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+
+        const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        const text_snapshot = entry.persistent.acquireSnapshot();
+        defer text_snapshot.release();
+
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const query = try db_query_search.textQueryToSearchQuery(
+            arena,
+            text_query,
+            entry.text_analysis,
+            entry.runtime_schema,
+        );
+        const filter = try search_mod.searchQueryToFilterArena(arena, query);
+        return std.math.cast(u32, try text_snapshot.countFilter(alloc, filter)) orelse
+            error.CountOverflow;
     }
 
     pub fn bestEffortForceCompactTextIndexes(self: *DB) !void {
@@ -22972,10 +23157,7 @@ fn noteHAMirrorFailure(mirror: HAAsyncEffectMirror, comptime label: []const u8, 
 }
 
 fn applyDerivedBacklogPressureContext(ctx: *const BatchExecutionContext, sequence: u64, sync_level: types.SyncLevel, sync_targets: ManagedSyncTargets) !void {
-    switch (sync_level) {
-        .propose, .write => return,
-        .enrichments, .full_text, .full_index => {},
-    }
+    if (!syncLevelParticipatesInDerivedBacklogPressure(sync_level)) return;
     if (!ctx.executor.shouldThrottleBacklog()) return;
     if (sync_level == .full_text) {
         try runDerivedUntilTargetsContext(ctx, sequence, sync_targets.full_text_indexes);
@@ -22989,6 +23171,21 @@ fn applyDerivedBacklogPressureContext(ctx: *const BatchExecutionContext, sequenc
         },
         else => return err,
     };
+}
+
+fn syncLevelParticipatesInDerivedBacklogPressure(sync_level: types.SyncLevel) bool {
+    return switch (sync_level) {
+        .propose => false,
+        .write, .enrichments, .full_text, .full_index => true,
+    };
+}
+
+test "durable writes participate in derived backlog admission control" {
+    // `.write` controls visibility/durability, not admission. Once asynchronous
+    // derived payloads cross their memory budget, a normal durable writer must
+    // help the worker catch up instead of admitting an unbounded replay queue.
+    try std.testing.expect(syncLevelParticipatesInDerivedBacklogPressure(.write));
+    try std.testing.expect(!syncLevelParticipatesInDerivedBacklogPressure(.propose));
 }
 
 fn shouldDeferBacklogPressureForExternalDenseBulk(ctx: *const BatchExecutionContext, sync_level: types.SyncLevel) bool {
@@ -55212,7 +55409,7 @@ test "db runUntilIdle drains scheduled text merges after repeated writes" {
     try db.runUntilIdle();
 
     const text_index = db.core.index_manager.textIndex("ft_v1").?;
-    try std.testing.expect(text_index.snapshot().segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
+    try std.testing.expectEqual(@as(usize, 1), text_index.snapshot().segments.len);
 
     var result = try db.search(alloc, .{
         .index_name = "ft_v1",
@@ -55364,6 +55561,80 @@ test "db force compacts text index to searchable merge tier" {
     for (result.hits) |hit| {
         try std.testing.expect(!std.mem.eql(u8, hit.id, "doc:3"));
     }
+}
+
+test "db text kernel search matches projected search without stored bodies" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"type\":\"full_text\",\"analysis_config\":{\"field_analyzers\":{\"text\":\"simple\"}}}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "benchmark:0", .value = "{\"text\":\"alpha beta\"}" },
+            .{ .key = "benchmark:1", .value = "{\"text\":\"alpha gamma\"}" },
+            .{ .key = "benchmark:2", .value = "{\"text\":\"beta gamma\"}" },
+            .{ .key = "benchmark:3", .value = "{\"text\":\"alpha beta gamma\"}" },
+        },
+        .sync_level = .full_text,
+    });
+    try db.forceCompactTextIndexes();
+
+    const should = [_]types.TextQuery{
+        .{ .term = .{ .field = "text", .term = "alpha" } },
+        .{ .term = .{ .field = "text", .term = "beta" } },
+    };
+    const query = types.TextQuery{ .bool_query = .{ .should = &should, .min_should = 1 } };
+
+    var projected = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = query,
+        .limit = 3,
+        .include_stored = false,
+        .include_all_fields = false,
+    });
+    defer projected.deinit();
+    var kernel = try db.searchTextKernel(alloc, "ft_v1", query, .{ .limit = 3 });
+    defer kernel.deinit(alloc);
+    var custom_bm25 = try db.searchTextKernel(alloc, "ft_v1", query, .{
+        .limit = 3,
+        .bm25 = .{ .k1 = 2.0, .b = 0.0 },
+    });
+    defer custom_bm25.deinit(alloc);
+    var profiled = try db.searchTextKernel(alloc, "ft_v1", query, .{
+        .limit = 3,
+        .collect_diagnostics = true,
+    });
+    defer profiled.deinit(alloc);
+
+    try std.testing.expectEqual(projected.hits.len, kernel.hits.len);
+    for (projected.hits, kernel.hits) |projected_hit, kernel_hit| {
+        try std.testing.expectEqual(projected_hit.doc_ordinal.?, kernel_hit.doc_ordinal);
+        try std.testing.expectApproxEqRel(projected_hit.score.?, kernel_hit.score, 0.00001);
+    }
+    try std.testing.expectEqual(kernel.hits.len, custom_bm25.hits.len);
+    try std.testing.expectEqual(kernel.hits[0].doc_ordinal, custom_bm25.hits[0].doc_ordinal);
+    try std.testing.expect(@abs(kernel.hits[0].score - custom_bm25.hits[0].score) > 0.0001);
+    try std.testing.expect(profiled.diagnostics.segments_considered > 0);
+    try std.testing.expect(profiled.diagnostics.postings_iterators_opened > 0);
+    try std.testing.expectEqual(@as(u32, 4), try db.countTextKernel(alloc, "ft_v1", query));
+
+    var layout = try db.textIndexLayoutStats(alloc, "ft_v1");
+    defer layout.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), layout.segments.len);
+    try std.testing.expectEqual(@as(u32, 4), layout.global_doc_count);
+    try std.testing.expectEqual(@as(u32, 4), layout.segments[0].live_doc_count);
+    try std.testing.expect(layout.total_bytes > 0);
+    try std.testing.expectEqual(@as(u32, 10), layout.merge_policy.max_segments_per_tier);
+    try std.testing.expect(layout.merge_policy.max_segment_size > layout.merge_policy.floor_segment_size);
 }
 
 test "db text compaction preserves index sort acceleration" {

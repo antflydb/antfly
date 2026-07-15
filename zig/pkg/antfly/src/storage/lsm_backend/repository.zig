@@ -577,6 +577,21 @@ pub fn loadRunTableIndexAllocWithStorage(
     return error.UnsupportedVersion;
 }
 
+pub fn loadRunSequentialTableIndexAllocWithStorage(
+    storage: storage_io.Storage,
+    allocator: Allocator,
+    path: []const u8,
+) !lsm_table_file.SequentialTableIndex {
+    const footer_bytes = try storage.readFileTrailerAlloc(allocator, path, lsm_table_file.footer_len);
+    defer allocator.free(footer_bytes);
+    if (!lsm_table_file.hasFooterMagic(footer_bytes)) return error.UnsupportedVersion;
+
+    const footer = try lsm_table_file.decodeFooterBytes(footer_bytes);
+    const metadata_bytes = try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
+    defer allocator.free(metadata_bytes);
+    return try lsm_table_file.decodeSequentialIndexFromFooterAlloc(allocator, footer, metadata_bytes);
+}
+
 pub fn deleteFileAbsolute(path: []const u8) !void {
     var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
     defer native.deinit();

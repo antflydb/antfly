@@ -24,6 +24,49 @@ const dense_replay_window_shrink_denominator: u64 = 4;
 const dense_replay_finish_target_ns: u64 = 3 * std.time.ns_per_s;
 const dense_replay_finish_hard_ns: u64 = 8 * std.time.ns_per_s;
 const dense_replay_write_pressure_hard_ns: u64 = std.time.ns_per_s;
+const supports_pressure_wait = builtin.os.tag != .freestanding and
+    builtin.link_libc and
+    @hasDecl(std.c, "pthread_cond_wait");
+
+const PressureChange = if (supports_pressure_wait)
+    struct {
+        mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+        cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
+        epoch: std.atomic.Value(u64) = .init(0),
+
+        fn snapshot(self: *@This()) u64 {
+            return self.epoch.load(.acquire);
+        }
+
+        fn waitForChange(self: *@This(), observed: u64) void {
+            if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
+            defer if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
+            while (self.epoch.load(.acquire) == observed) {
+                if (std.c.pthread_cond_wait(&self.cond, &self.mutex) != .SUCCESS) unreachable;
+            }
+        }
+
+        fn advance(self: *@This()) void {
+            if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
+            _ = self.epoch.fetchAdd(1, .release);
+            if (std.c.pthread_cond_broadcast(&self.cond) != .SUCCESS) unreachable;
+            if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
+        }
+    }
+else
+    struct {
+        epoch: std.atomic.Value(u64) = .init(0),
+
+        fn snapshot(self: *@This()) u64 {
+            return self.epoch.load(.acquire);
+        }
+
+        fn waitForChange(_: *@This(), _: u64) void {}
+
+        fn advance(self: *@This()) void {
+            _ = self.epoch.fetchAdd(1, .release);
+        }
+    };
 
 pub const Slice = enum(u8) {
     lsm_block_table_cache,
@@ -108,6 +151,15 @@ pub const PressureAction = enum(u8) {
     }
 };
 
+pub const PressureDecision = struct {
+    pressure: Pressure = .normal,
+    action: PressureAction = .report,
+    used_bytes: u64 = 0,
+    soft_limit_bytes: u64 = 0,
+    hard_limit_bytes: u64 = 0,
+    change_epoch: u64 = 0,
+};
+
 pub const Policy = struct {
     soft_action: PressureAction = .report,
     hard_action: PressureAction = .report,
@@ -149,7 +201,7 @@ pub const Options = struct {
             .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .{ .soft_action = .throttle_writes, .hard_action = .throttle_writes },
             .{ .soft_action = .report, .hard_action = .throttle_writes },
             .{ .soft_action = .report, .hard_action = .throttle_writes },
             .{ .soft_action = .report, .hard_action = .report },
@@ -212,6 +264,7 @@ const MutableSlice = struct {
 
 pub const ResourceManager = struct {
     mutex: std.atomic.Mutex = .unlocked,
+    pressure_change: PressureChange = .{},
     slices: [slice_count]MutableSlice,
     dense_replay_window_budget_bytes: u64 = 0,
     dense_replay_last_finish_ns: u64 = 0,
@@ -250,6 +303,7 @@ pub const ResourceManager = struct {
         if (state.budget.soft_limit_bytes > 0 and next > state.budget.soft_limit_bytes) {
             state.soft_limit_events += 1;
         }
+        self.pressure_change.advance();
         return .{ .manager = self, .slice = slice, .bytes = bytes };
     }
 
@@ -260,6 +314,7 @@ pub const ResourceManager = struct {
 
         const state = &self.slices[sliceIndex(slice)];
         state.used_bytes -|= bytes;
+        self.pressure_change.advance();
     }
 
     pub fn adjustUsage(self: *ResourceManager, slice: Slice, current: *u64, next: u64) !void {
@@ -292,6 +347,7 @@ pub const ResourceManager = struct {
         if (state.budget.hard_limit_bytes > 0 and state.used_bytes > state.budget.hard_limit_bytes) {
             state.hard_limit_rejections += 1;
         }
+        self.pressure_change.advance();
     }
 
     pub fn snapshot(self: *ResourceManager) Stats {
@@ -323,6 +379,64 @@ pub const ResourceManager = struct {
 
         const state = self.slices[sliceIndex(slice)];
         return sliceStatsFromState(slice, state);
+    }
+
+    /// Returns the configured response for the slice's current pressure. Usage
+    /// observed outside ResourceManager (for example allocator-backed LSM
+    /// state) must consult this decision at its admission boundary; observing
+    /// usage alone intentionally does not reject an allocation after the fact.
+    pub fn pressureDecision(self: *ResourceManager, slice: Slice) PressureDecision {
+        return self.admissionDecision(slice, 0);
+    }
+
+    /// Evaluates an allocation before it joins an externally accounted slice.
+    /// The returned epoch can be used to sleep until some producer releases or
+    /// otherwise changes accounted usage.
+    pub fn admissionDecision(self: *ResourceManager, slice: Slice, additional_bytes: u64) PressureDecision {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const state = self.slices[sliceIndex(slice)];
+        const projected_bytes = state.used_bytes +| additional_bytes;
+        const pressure = pressureFor(state.budget, projected_bytes);
+        return .{
+            .pressure = pressure,
+            .action = switch (pressure) {
+                .normal => .report,
+                .soft => state.policy.soft_action,
+                .hard => state.policy.hard_action,
+            },
+            .used_bytes = projected_bytes,
+            .soft_limit_bytes = state.budget.soft_limit_bytes,
+            .hard_limit_bytes = state.budget.hard_limit_bytes,
+            .change_epoch = self.pressure_change.snapshot(),
+        };
+    }
+
+    pub fn canWaitForPressureChange(_: *const ResourceManager) bool {
+        return supports_pressure_wait;
+    }
+
+    pub fn waitForPressureChange(self: *ResourceManager, observed_epoch: u64) void {
+        self.pressure_change.waitForChange(observed_epoch);
+    }
+
+    /// Applies a slice's admission policy at a boundary that is safe to
+    /// block. This does not reserve `additional_bytes`; callers must still
+    /// re-check or reserve at their mutation/allocation boundary. Its purpose
+    /// is to keep pressure waits above higher-level critical sections while a
+    /// lower layer retains a non-blocking hard guard.
+    pub fn awaitAdmission(self: *ResourceManager, slice: Slice, additional_bytes: u64) !void {
+        while (true) {
+            const decision = self.admissionDecision(slice, additional_bytes);
+            switch (decision.action) {
+                .report, .shrink_cache, .defer_background_work => return,
+                .reject_work => return error.ResourceBudgetExceeded,
+                .throttle_writes => {},
+            }
+            if (!self.canWaitForPressureChange()) return error.ResourceBudgetExceeded;
+            self.waitForPressureChange(decision.change_epoch);
+        }
     }
 
     pub fn denseReplayWindowBudget(self: *ResourceManager, options: DenseReplayWindowBudgetOptions) u64 {
@@ -536,4 +650,30 @@ test "resource manager observes over-budget external usage" {
     try std.testing.expectEqual(@as(u64, 5), current);
     try std.testing.expectEqual(@as(u64, 5), stats.slices[sliceIndex(.lsm_block_table_cache)].used_bytes);
     try std.testing.expectEqual(Pressure.normal, stats.slices[sliceIndex(.lsm_block_table_cache)].pressure);
+}
+
+test "resource manager evaluates projected admission with configured action" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.lsm_in_memory_state)] = .{
+        .soft_limit_bytes = 10,
+        .hard_limit_bytes = 20,
+    };
+    var policies = Options.defaultPolicies();
+    policies[sliceIndex(.lsm_in_memory_state)] = .{
+        .soft_action = .report,
+        .hard_action = .reject_work,
+    };
+    var manager = ResourceManager.init(.{ .budgets = budgets, .policies = policies });
+    var current: u64 = 0;
+
+    manager.observeUsage(.lsm_in_memory_state, &current, 12);
+    const current_decision = manager.pressureDecision(.lsm_in_memory_state);
+    try std.testing.expectEqual(Pressure.soft, current_decision.pressure);
+    try std.testing.expectEqual(PressureAction.report, current_decision.action);
+
+    const projected = manager.admissionDecision(.lsm_in_memory_state, 9);
+    try std.testing.expectEqual(@as(u64, 21), projected.used_bytes);
+    try std.testing.expectEqual(Pressure.hard, projected.pressure);
+    try std.testing.expectEqual(PressureAction.reject_work, projected.action);
+    try std.testing.expect(projected.change_epoch >= current_decision.change_epoch);
 }

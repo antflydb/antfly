@@ -243,6 +243,9 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
         }
         backend.retired_immutable_memtables.deinit(backend.allocator);
     }
+    if (@hasField(BackendType, "immutable_memtable_pins")) {
+        backend.immutable_memtable_pins.deinit(backend.allocator);
+    }
     if (@hasField(BackendType, "retired_mutable_snapshots")) {
         for (backend.retired_mutable_snapshots.items) |state| {
             state.deinit(backend.allocator);
@@ -252,6 +255,7 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     }
     for (backend.runs.items) |*run| {
         if (@hasDecl(BackendType, "releaseRunVersionRef")) backend.releaseRunVersionRef(run);
+        if (@hasDecl(BackendType, "forgetRunSnapshotRef")) backend.forgetRunSnapshotRef(run);
         run.deinit(backend.allocator);
     }
     backend.runs.deinit(backend.allocator);
@@ -265,6 +269,7 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
         for (backend.obsolete_runs.items) |*runs| {
             for (runs.items) |*run| {
                 if (@hasDecl(BackendType, "releaseRunVersionRef")) backend.releaseRunVersionRef(run);
+                if (@hasDecl(BackendType, "forgetRunSnapshotRef")) backend.forgetRunSnapshotRef(run);
                 run.deinit(backend.allocator);
             }
             runs.deinit(backend.allocator);

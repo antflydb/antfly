@@ -149,6 +149,7 @@ pub const BuildTextSegmentsOptions = struct {
     index_sort: []const segment_mod.SegmentIndexSortField = &.{},
     profile: ?*introducer_mod.BuildTextProfile = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    store_document_source: bool = true,
 };
 
 pub const BuildTextSegmentsResult = struct {
@@ -518,6 +519,7 @@ fn buildTextOptionsFromSegmentOptions(options: BuildTextSegmentsOptions) introdu
         .profile = options.profile,
         .resource_manager = options.resource_manager,
         .index_sort = options.index_sort,
+        .store_document_source = options.store_document_source,
     };
     if (options.target_build_memory_bytes) |target| build_options.build_memory_target_bytes = target;
     if (options.doc_scratch_retained_bytes) |retained| build_options.doc_scratch_retained_bytes = retained;

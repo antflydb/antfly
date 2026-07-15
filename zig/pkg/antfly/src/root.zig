@@ -19,6 +19,7 @@ pub const roaring = @import("encoding/roaring.zig");
 pub const vellum = @import("antfly_vellum");
 pub const snappy = @import("encoding/snappy.zig");
 pub const streamvbyte = @import("encoding/streamvbyte.zig");
+pub const simd_bitpack = @import("encoding/simd_bitpack.zig");
 pub const chunked_coder = @import("encoding/chunked_coder.zig");
 
 // Vector math & quantization
@@ -178,6 +179,7 @@ test {
     _ = vellum;
     _ = snappy;
     _ = streamvbyte;
+    _ = simd_bitpack;
     _ = chunked_coder;
 
     // Vector
