@@ -20,7 +20,7 @@ const types = @import("../types.zig");
 
 const file_name = "index_repair.checkpoint";
 const magic = "AFIDXRP1";
-const format_version: u32 = 6;
+const format_version: u32 = 7;
 const max_file_bytes: usize = 16 * 1024 * 1024;
 const max_entries: usize = 65_536;
 const max_index_name_bytes: usize = 4 * 1024;
@@ -37,17 +37,22 @@ pub const Trigger = enum(u8) {
     /// the affected index remains unavailable.
     root_generation_rebuild = 3,
     /// The serving dense generation does not have the same artifact cardinality
-    /// as the authoritative source counter. A healthy serving generation stays
-    /// available while a replacement is reconstructed and validated.
+    /// as the authoritative source counter. It remains unavailable until a
+    /// replacement is reconstructed and validated.
     artifact_coverage_mismatch = 4,
-    /// The authoritative artifact counter is absent. The serving generation may
-    /// remain available but is explicitly degraded while the counter is
-    /// bootstrapped and a replacement is validated.
+    /// The authoritative artifact counter is absent. The serving generation
+    /// remains unavailable while the counter is bootstrapped and a replacement
+    /// is validated.
     artifact_counter_missing = 5,
     /// Configuration/checkpoint state or backend validation proves that the
     /// current generation is unsafe to serve. Repair remains fail-closed until
     /// a replacement reaches cleanup.
     projection_generation_invalid = 6,
+    /// An operator requested an online generation rebuild, but BackendRuntime
+    /// has not yet proved that the currently serving dense generation is safe.
+    /// This state is fail-closed and may be promoted to the online operator
+    /// rebuild trigger only after generation-scoped background validation.
+    operator_generation_validation = 7,
 };
 
 pub const Phase = enum(u8) {

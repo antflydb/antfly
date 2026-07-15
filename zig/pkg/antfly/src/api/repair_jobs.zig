@@ -13,10 +13,28 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const docstore_mod = @import("../storage/docstore.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const platform_time = @import("../platform/time.zig");
 const platform_sync = @import("antfly_platform").sync;
+
+fn testProcessId() u64 {
+    std.debug.assert(builtin.is_test);
+    return switch (builtin.os.tag) {
+        .windows => std.os.windows.kernel32.GetCurrentProcessId(),
+        else => @intCast(std.posix.system.getpid()),
+    };
+}
+
+fn attachOpenedTestStore(store: *Store, alloc: std.mem.Allocator, path: []const u8) !void {
+    std.debug.assert(builtin.is_test);
+    const opened = try alloc.create(OpenedStore);
+    errdefer alloc.destroy(opened);
+    opened.* = try OpenedStore.open(alloc, path);
+    errdefer opened.deinit();
+    try store.attachOpenedStore(opened);
+}
 
 pub const StoreConfig = struct {
     repair_job_store_path: ?[]const u8 = null,
@@ -117,6 +135,11 @@ pub const Store = struct {
     /// without losing work. Advancing it after every inspection prevents a
     /// backed-off head window from starving later runnable cancellations.
     pending_cancel_scan_cursor: ?u64 = null,
+    /// Corrupt maintenance records are isolated from the active scheduler
+    /// namespace instead of preventing the primary API server from starting.
+    /// The durable quarantine is intentionally operator-visible but is not a
+    /// user-facing configuration surface.
+    quarantined_record_count: u64 = 0,
 
     pub fn init(alloc: std.mem.Allocator, cfg: StoreConfig) Store {
         return .{
@@ -234,6 +257,10 @@ pub const Store = struct {
 
     pub fn retentionMillis(self: *const Store) u64 {
         return self.cfg.repair_job_retention_ms orelse 86_400_000;
+    }
+
+    pub fn quarantinedRecordCount(self: *const Store) u64 {
+        return self.quarantined_record_count;
     }
 
     pub fn attachOpenedStore(self: *Store, opened: *OpenedStore) !void {
@@ -838,13 +865,13 @@ pub const Store = struct {
             defer self.alloc.free(active_key);
             var writes: [3]docstore_mod.KVPair = undefined;
             var write_count: usize = 0;
+            var next_raw: [@sizeOf(u64)]u8 = undefined;
             writes[write_count] = .{ .key = key, .value = encoded };
             write_count += 1;
             if (next_job_id) |next| {
                 const durable_next = @max(next, self.next_job_id);
-                const next_raw = try encodeNextJobId(self.alloc, durable_next);
-                defer self.alloc.free(next_raw);
-                writes[write_count] = .{ .key = next_job_id_key, .value = next_raw };
+                std.mem.writeInt(u64, &next_raw, durable_next, .big);
+                writes[write_count] = .{ .key = next_job_id_key, .value = &next_raw };
                 write_count += 1;
             }
             if (!isTerminalPhase(parsed.value.phase)) {
@@ -877,10 +904,26 @@ pub const Store = struct {
 
     fn recoverPersistedJobsLocked(self: *Store, opened: *OpenedStore) !void {
         var recovered_max_job_id: u64 = 0;
+        const quarantine_count = opened.docstore.get(self.alloc, quarantine_job_count_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        defer if (quarantine_count) |value| self.alloc.free(value);
+        if (quarantine_count) |value| {
+            if (value.len == 8) {
+                self.quarantined_record_count = std.mem.readInt(u64, value[0..8], .little);
+            } else {
+                std.log.warn("ignoring malformed durable repair-job quarantine count", .{});
+            }
+        }
         const results = try opened.docstore.scanPrefix(self.alloc, active_job_key_prefix);
         defer docstore_mod.DocStore.freeResults(self.alloc, results);
         for (results) |kv| {
-            const marker_job_id = try activeJobIdFromKey(kv.key);
+            const marker_job_id = activeJobIdFromKey(kv.key) catch {
+                try self.quarantineRepairJobRecordLocked(opened, kv.key, kv.value, &.{kv.key});
+                continue;
+            };
+            recovered_max_job_id = @max(recovered_max_job_id, marker_job_id);
             const primary_key = try jobKey(self.alloc, marker_job_id);
             defer self.alloc.free(primary_key);
             const primary = opened.docstore.get(self.alloc, primary_key) catch |err| switch (err) {
@@ -893,12 +936,23 @@ pub const Store = struct {
                 else => return err,
             };
             defer self.alloc.free(primary);
-            if (primary.len > max_job_record_bytes) return error.InvalidRepairJobState;
-            var parsed = std.json.parseFromSlice(JobState, self.alloc, primary, .{ .ignore_unknown_fields = true }) catch
-                return error.InvalidRepairJobState;
+            if (primary.len > max_job_record_bytes) {
+                try self.quarantineRepairJobRecordLocked(opened, primary_key, primary, &.{ primary_key, kv.key });
+                continue;
+            }
+            var parsed = std.json.parseFromSlice(JobState, self.alloc, primary, .{ .ignore_unknown_fields = true }) catch {
+                try self.quarantineRepairJobRecordLocked(opened, primary_key, primary, &.{ primary_key, kv.key });
+                continue;
+            };
             defer parsed.deinit();
-            if (parsed.value.job_id != marker_job_id) return error.InvalidRepairJobState;
-            try validateJobState(parsed.value);
+            if (parsed.value.job_id != marker_job_id) {
+                try self.quarantineRepairJobRecordLocked(opened, primary_key, primary, &.{ primary_key, kv.key });
+                continue;
+            }
+            validateJobState(parsed.value) catch {
+                try self.quarantineRepairJobRecordLocked(opened, primary_key, primary, &.{ primary_key, kv.key });
+                continue;
+            };
             const now_ms = nowMillis();
             const was_running = std.mem.eql(u8, parsed.value.phase, phaseString(.running));
             const durable_cancel = requiresDurableCancel(parsed.value);
@@ -971,6 +1025,31 @@ pub const Store = struct {
         } else |_| {}
         self.next_job_id = @max(self.next_job_id, recovered_next_job_id);
         try persistNextJobId(opened.docstore, self.alloc, self.next_job_id);
+    }
+
+    fn quarantineRepairJobRecordLocked(
+        self: *Store,
+        opened: *OpenedStore,
+        source_key: []const u8,
+        source_value: []const u8,
+        delete_keys: []const []const u8,
+    ) !void {
+        const quarantine_key = try quarantineJobKey(self.alloc, source_key, source_value);
+        defer self.alloc.free(quarantine_key);
+        const payload = try encodeQuarantineRecord(self.alloc, source_key, source_value);
+        defer self.alloc.free(payload);
+        const next_count = self.quarantined_record_count +| 1;
+        var count_raw: [8]u8 = undefined;
+        std.mem.writeInt(u64, &count_raw, next_count, .little);
+        try opened.docstore.putBatch(&.{
+            .{ .key = quarantine_key, .value = payload },
+            .{ .key = quarantine_job_count_key, .value = &count_raw },
+        }, delete_keys);
+        self.quarantined_record_count = next_count;
+        std.log.warn(
+            "quarantined invalid durable repair job record key_hash={x} value_bytes={d}",
+            .{ std.hash.Wyhash.hash(0x5250524a4f424b59, source_key), source_value.len },
+        );
     }
 
     fn encodeCancelledCurrentLocked(self: *Store, alloc: std.mem.Allocator, current: JobState, now_ms: u64) ![]u8 {
@@ -1152,11 +1231,50 @@ fn persistNextJobId(store: *docstore_mod.DocStore, alloc: std.mem.Allocator, nex
 const job_key_prefix = "__api_table_repair_jobs__:";
 const next_job_id_key = "__api_table_repair_jobs_meta__:next_job_id";
 const active_job_key_prefix = "__api_table_repair_jobs_active__:";
+const quarantine_job_key_prefix = "__api_table_repair_jobs_quarantine__:";
+const quarantine_job_count_key = "__api_table_repair_jobs_quarantine_meta__:count";
 const active_job_marker_value = "1";
 const max_job_record_bytes: usize = 1024 * 1024;
 const max_job_string_bytes: usize = 64 * 1024;
+const quarantine_record_magic = "AFRPJQ01";
+const quarantine_record_header_bytes: usize = quarantine_record_magic.len + 8 + 8 + 4 + 4;
+const max_quarantine_record_bytes: usize = max_job_record_bytes + max_job_string_bytes + quarantine_record_header_bytes;
 const durable_cleanup_interval_ms: u64 = 60_000;
 const durable_cleanup_scan_limit: usize = 128;
+
+fn quarantineJobKey(alloc: std.mem.Allocator, source_key: []const u8, source_value: []const u8) ![]u8 {
+    const key_hash = std.hash.Wyhash.hash(0x5250524a4f424b59, source_key);
+    const value_hash = std.hash.Wyhash.hash(key_hash, source_value);
+    return try std.fmt.allocPrint(alloc, "{s}{x}-{x}", .{ quarantine_job_key_prefix, key_hash, value_hash });
+}
+
+/// Bounded binary forensic record. The header retains original lengths while
+/// the samples keep startup recovery memory and durable writes bounded even if
+/// corrupted storage advertises an unreasonable value size.
+fn encodeQuarantineRecord(
+    alloc: std.mem.Allocator,
+    source_key: []const u8,
+    source_value: []const u8,
+) ![]u8 {
+    const key_sample_len = @min(source_key.len, max_job_string_bytes);
+    const value_budget = max_quarantine_record_bytes - quarantine_record_header_bytes - key_sample_len;
+    const value_sample_len = @min(source_value.len, value_budget);
+    const payload = try alloc.alloc(u8, quarantine_record_header_bytes + key_sample_len + value_sample_len);
+    @memcpy(payload[0..quarantine_record_magic.len], quarantine_record_magic);
+    var offset: usize = quarantine_record_magic.len;
+    std.mem.writeInt(u64, payload[offset..][0..8], @intCast(source_key.len), .little);
+    offset += 8;
+    std.mem.writeInt(u64, payload[offset..][0..8], @intCast(source_value.len), .little);
+    offset += 8;
+    std.mem.writeInt(u32, payload[offset..][0..4], @intCast(key_sample_len), .little);
+    offset += 4;
+    std.mem.writeInt(u32, payload[offset..][0..4], @intCast(value_sample_len), .little);
+    offset += 4;
+    @memcpy(payload[offset..][0..key_sample_len], source_key[0..key_sample_len]);
+    offset += key_sample_len;
+    @memcpy(payload[offset..][0..value_sample_len], source_value[0..value_sample_len]);
+    return payload;
+}
 
 test "table repair job records bounded pass and continuation" {
     const alloc = std.testing.allocator;
@@ -1387,18 +1505,15 @@ test "named index repair cancellation restarts its durable traversal after job s
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repair-job-cancel-recovery", .{tmp.sub_path});
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repair-job-cancel-recovery-{d}-{x}", .{ tmp.sub_path, testProcessId(), std.testing.random_seed });
     defer alloc.free(path);
 
     var job_id: u64 = 0;
     var terminal_job_id: u64 = 0;
     {
-        const opened = try alloc.create(OpenedStore);
-        errdefer alloc.destroy(opened);
-        opened.* = try OpenedStore.open(alloc, path);
         var store = Store.init(alloc, .{});
         defer store.deinit();
-        try store.attachOpenedStore(opened);
+        try attachOpenedTestStore(&store, alloc, path);
 
         const started = try store.startJob(alloc, "docs", .{
             .target = "index",
@@ -1423,10 +1538,10 @@ test "named index repair cancellation restarts its durable traversal after job s
         // removed in-place.
         const damaged_marker = try activeJobKey(alloc, job_id);
         defer alloc.free(damaged_marker);
-        try opened.docstore.put(damaged_marker, "not-json");
+        try store.opened_store.?.docstore.put(damaged_marker, "not-json");
         const orphan_marker = try activeJobKey(alloc, 9_999_999);
         defer alloc.free(orphan_marker);
-        try opened.docstore.put(orphan_marker, active_job_marker_value);
+        try store.opened_store.?.docstore.put(orphan_marker, active_job_marker_value);
 
         const terminal_started = try store.startJob(alloc, "docs", .{ .target = "artifact" });
         defer alloc.free(terminal_started);
@@ -1438,18 +1553,15 @@ test "named index repair cancellation restarts its durable traversal after job s
     }
 
     {
-        const opened = try alloc.create(OpenedStore);
-        errdefer alloc.destroy(opened);
-        opened.* = try OpenedStore.open(alloc, path);
         var store = Store.init(alloc, .{});
         defer store.deinit();
-        try store.attachOpenedStore(opened);
+        try attachOpenedTestStore(&store, alloc, path);
 
         // Restart scans only the fixed-width active index and validates each
         // marker against its primary record. Retained terminal history remains
         // lazy and does not consume startup I/O or cache space.
         try std.testing.expectEqual(@as(usize, 1), store.jobs.count());
-        const active = try opened.docstore.scanPrefix(alloc, active_job_key_prefix);
+        const active = try store.opened_store.?.docstore.scanPrefix(alloc, active_job_key_prefix);
         defer docstore_mod.DocStore.freeResults(alloc, active);
         try std.testing.expectEqual(@as(usize, 1), active.len);
 
@@ -1471,58 +1583,74 @@ test "named index repair cancellation restarts its durable traversal after job s
     }
 }
 
-test "table repair job recovery rejects corrupt authoritative primary state" {
+test "table repair job recovery quarantines corrupt primary without blocking service" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repair-job-corrupt-primary", .{tmp.sub_path});
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repair-job-corrupt-primary-{d}-{x}", .{ tmp.sub_path, testProcessId(), std.testing.random_seed });
     defer alloc.free(path);
 
     {
-        const opened = try alloc.create(OpenedStore);
-        errdefer alloc.destroy(opened);
-        opened.* = try OpenedStore.open(alloc, path);
         var store = Store.init(alloc, .{});
         defer store.deinit();
-        try store.attachOpenedStore(opened);
+        try attachOpenedTestStore(&store, alloc, path);
         const started = try store.startJob(alloc, "docs", .{ .target = "artifact" });
         defer alloc.free(started);
         var parsed = try std.json.parseFromSlice(JobState, alloc, started, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const primary_key = try jobKey(alloc, parsed.value.job_id);
         defer alloc.free(primary_key);
-        try opened.docstore.put(primary_key, "{\"job_id\":1,\"phase\":\"unknown\"}");
+        try store.opened_store.?.docstore.put(primary_key, "{\"job_id\":1,\"phase\":\"unknown\"}");
     }
 
-    const opened = try alloc.create(OpenedStore);
-    opened.* = try OpenedStore.open(alloc, path);
     var store = Store.init(alloc, .{});
     defer store.deinit();
-    try std.testing.expectError(error.InvalidRepairJobState, store.attachOpenedStore(opened));
+    try attachOpenedTestStore(&store, alloc, path);
     try std.testing.expectEqual(@as(usize, 0), store.jobs.count());
-    opened.deinit();
-    alloc.destroy(opened);
+    try std.testing.expectEqual(@as(u64, 1), store.quarantinedRecordCount());
+    const replacement = try store.startJob(alloc, "docs", .{ .target = "artifact" });
+    defer alloc.free(replacement);
+    var parsed_replacement = try std.json.parseFromSlice(JobState, alloc, replacement, .{ .ignore_unknown_fields = true });
+    defer parsed_replacement.deinit();
+    try std.testing.expect(parsed_replacement.value.job_id >= 2);
 }
 
-test "active repair job keys reject malformed secondary entries" {
+test "active repair job recovery quarantines malformed secondary entries" {
+    const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidRepairJobState, activeJobIdFromKey(active_job_key_prefix));
     try std.testing.expectError(error.InvalidRepairJobState, activeJobIdFromKey(active_job_key_prefix ++ "short"));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repair-job-corrupt-marker-{d}-{x}", .{ tmp.sub_path, testProcessId(), std.testing.random_seed });
+    defer alloc.free(path);
+    {
+        const opened = try alloc.create(OpenedStore);
+        defer alloc.destroy(opened);
+        opened.* = try OpenedStore.open(alloc, path);
+        defer opened.deinit();
+        try opened.docstore.put(active_job_key_prefix ++ "short", active_job_marker_value);
+    }
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+    try attachOpenedTestStore(&store, alloc, path);
+    try std.testing.expectEqual(@as(u64, 1), store.quarantinedRecordCount());
+    const active = try store.opened_store.?.docstore.scanPrefix(alloc, active_job_key_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, active);
+    try std.testing.expectEqual(@as(usize, 0), active.len);
 }
 
 test "table repair job store persists monotonic next id across stale durable writes" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repair-jobs-monotonic-next-id", .{tmp.sub_path});
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repair-jobs-monotonic-next-id-{d}-{x}", .{ tmp.sub_path, testProcessId(), std.testing.random_seed });
     defer alloc.free(path);
 
     {
-        const opened = try alloc.create(OpenedStore);
-        errdefer alloc.destroy(opened);
-        opened.* = try OpenedStore.open(alloc, path);
         var store = Store.init(alloc, .{});
         defer store.deinit();
-        try store.attachOpenedStore(opened);
+        try attachOpenedTestStore(&store, alloc, path);
 
         const first = store.reserveJobId();
         const second = store.reserveJobId();
@@ -1562,12 +1690,9 @@ test "table repair job store persists monotonic next id across stale durable wri
     }
 
     {
-        const opened = try alloc.create(OpenedStore);
-        errdefer alloc.destroy(opened);
-        opened.* = try OpenedStore.open(alloc, path);
         var store = Store.init(alloc, .{});
         defer store.deinit();
-        try store.attachOpenedStore(opened);
+        try attachOpenedTestStore(&store, alloc, path);
 
         const third = try store.startJob(alloc, "docs", .{ .target = "artifact", .limit = 1 });
         defer alloc.free(third);
@@ -1593,15 +1718,12 @@ test "table repair job cleanup pages durable expired jobs" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repair-jobs-cleanup-page", .{tmp.sub_path});
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repair-jobs-cleanup-page-{d}-{x}", .{ tmp.sub_path, testProcessId(), std.testing.random_seed });
     defer alloc.free(path);
 
-    const opened = try alloc.create(OpenedStore);
-    errdefer alloc.destroy(opened);
-    opened.* = try OpenedStore.open(alloc, path);
     var store = Store.init(alloc, .{});
     defer store.deinit();
-    try store.attachOpenedStore(opened);
+    try attachOpenedTestStore(&store, alloc, path);
 
     const now_ms = nowMillis();
     var id: u64 = 1;

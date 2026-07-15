@@ -4401,6 +4401,18 @@ pub const HBCIndex = struct {
     }
 
     pub fn validateStoredStructure(self: *HBCIndex, alloc: Allocator) !void {
+        return try self.validateStoredStructureWithCancellation(alloc, null, null);
+    }
+
+    /// Validates the published tree through one stable runtime read snapshot.
+    /// Background repair preflight supplies a cooperative cancellation hook so
+    /// owner shutdown does not have to wait for a large tree walk to finish.
+    pub fn validateStoredStructureWithCancellation(
+        self: *HBCIndex,
+        alloc: Allocator,
+        cancel_ctx: ?*anyopaque,
+        cancel_fn: ?*const fn (*anyopaque) bool,
+    ) !void {
         if (self.metadata.active_count == 0) return;
         if (self.metadata.root_node == 0 or self.metadata.node_count == 0) return error.Corrupted;
 
@@ -4414,7 +4426,13 @@ pub const HBCIndex = struct {
         var seen = std.AutoHashMapUnmanaged(u64, void).empty;
         defer seen.deinit(alloc);
 
+        var visited_since_cancel_check: usize = 0;
         while (pending.pop()) |node_id| {
+            visited_since_cancel_check += 1;
+            if (visited_since_cancel_check == 256) {
+                visited_since_cancel_check = 0;
+                if (cancel_ctx != null and cancel_fn != null and cancel_fn.?(cancel_ctx.?)) return error.Canceled;
+            }
             if (node_id == 0) return error.Corrupted;
             const gop = try seen.getOrPut(alloc, node_id);
             if (gop.found_existing) continue;

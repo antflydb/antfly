@@ -7697,7 +7697,12 @@ pub const DB = struct {
             // is still proven healthy. Coverage mismatch or missing proof is
             // fail-closed until replacement validation publishes cleanup.
             .operator_generation_rebuild => intent.phase == .activating or intent.phase == .validating,
-            .artifact_coverage_mismatch, .artifact_counter_missing, .root_generation_rebuild, .projection_generation_invalid => intent.phase != .cleanup,
+            .artifact_coverage_mismatch,
+            .artifact_counter_missing,
+            .root_generation_rebuild,
+            .projection_generation_invalid,
+            .operator_generation_validation,
+            => intent.phase != .cleanup,
         };
     }
 
@@ -8071,6 +8076,12 @@ pub const DB = struct {
         last_error: []const u8,
     };
 
+    const OperatorDenseGenerationValidation = union(enum) {
+        online_safe,
+        replay_pending,
+        fail_closed: AutomaticDenseGenerationRepairClassification,
+    };
+
     fn classifyCurrentDenseGenerationRepair(
         self: *DB,
         alloc: Allocator,
@@ -8104,6 +8115,78 @@ pub const DB = struct {
             .trigger = .artifact_coverage_mismatch,
             .last_error = "dense_artifact_coverage_surplus",
         };
+    }
+
+    /// Performs the potentially linear structural proof only on the admitted
+    /// BackendRuntime repair worker, never on the HTTP/operator request path.
+    /// Cheap generation, replay, and cardinality checks run first so routine
+    /// lag avoids a tree walk. The validation read transaction is stable while
+    /// foreground writes continue through the ordinary derived stream.
+    fn validateOperatorDenseGenerationForOnlineRebuild(
+        self: *DB,
+        alloc: Allocator,
+        cfg: types.IndexConfig,
+        options: types.ArtifactRepairRunOptions,
+    ) !OperatorDenseGenerationValidation {
+        const checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
+        if (checkpoint.config_hash != types.indexConfigHash(cfg)) return .{ .fail_closed = .{
+            .trigger = .projection_generation_invalid,
+            .last_error = "dense_projection_config_mismatch",
+        } };
+        if (checkpoint.status != .clean) return .{ .fail_closed = .{
+            .trigger = .projection_generation_invalid,
+            .last_error = "dense_projection_checkpoint_not_clean",
+        } };
+        const target_sequence = try self.probeDerivedReplayTargetSequence(
+            alloc,
+            self.core.replaySource(),
+            .{ .name = cfg.name, .kind = .dense_vector },
+            checkpoint.applied_sequence,
+        );
+        if (checkpoint.applied_sequence < target_sequence) return .replay_pending;
+
+        // Pin both the catalog entry and its generation while inspecting the
+        // HBC metadata/tree. The read transaction stabilizes backend pages;
+        // this guard additionally prevents an apply or delete/recreate from
+        // changing the in-memory generation around that snapshot.
+        var apply_guard = self.core.index_manager.lockManagedIndexApply(.{
+            .name = cfg.name,
+            .kind = .dense_vector,
+        }) catch return .{ .fail_closed = .{
+            .trigger = .projection_generation_invalid,
+            .last_error = "dense_projection_generation_unavailable",
+        } };
+        defer apply_guard.unlock();
+
+        const entry = self.core.index_manager.denseIndex(cfg.name) orelse return .{ .fail_closed = .{
+            .trigger = .projection_generation_invalid,
+            .last_error = "dense_projection_generation_unavailable",
+        } };
+
+        if (try index_manager_mod.denseConfigRequiresArtifactCoverage(alloc, cfg)) {
+            const expected = (try loadDenseArtifactTargetCounter(alloc, self.core.store, cfg.name)) orelse
+                return .{ .fail_closed = .{
+                    .trigger = .artifact_counter_missing,
+                    .last_error = "dense_artifact_counter_missing",
+                } };
+            if (!denseCoverageMatchesTarget(entry.index.stats().active_count, expected)) {
+                return .{ .fail_closed = .{
+                    .trigger = .artifact_coverage_mismatch,
+                    .last_error = "dense_artifact_coverage_mismatch",
+                } };
+            }
+        }
+
+        const cancel_ctx = if (options.cancel_check) |check| check.ptr else null;
+        const cancel_fn = if (options.cancel_check) |check| check.is_requested else null;
+        entry.index.validateStoredStructureWithCancellation(alloc, cancel_ctx, cancel_fn) catch |err| switch (err) {
+            error.NotFound, error.FileNotFound, error.Corrupted => return .{ .fail_closed = .{
+                .trigger = .projection_generation_invalid,
+                .last_error = "dense_projection_structure_invalid",
+            } },
+            else => return err,
+        };
+        return .online_safe;
     }
 
     fn createGenerationRepairIntent(
@@ -8157,6 +8240,9 @@ pub const DB = struct {
             error.RepairTransitionConflict => return (try self.indexRepairIdForIndex(alloc, cfg.name)) orelse return err,
             else => return err,
         };
+        if (indexRepairIntentBlocksService(intent)) {
+            try self.core.index_manager.markRepairUnavailable(intent.index_name);
+        }
         notifyQueryVisibilityHook(self.async_context, .index_repair_pending);
         return repair_id;
     }
@@ -8171,7 +8257,7 @@ pub const DB = struct {
         const repair_id = try self.createGenerationRepairIntent(
             alloc,
             cfg,
-            .operator_generation_rebuild,
+            if (cfg.kind == .dense_vector) .operator_generation_validation else .operator_generation_rebuild,
             operator_job_id,
             operator_job_created_at_ms,
             null,
@@ -8215,7 +8301,7 @@ pub const DB = struct {
 
     fn automaticDenseGenerationRepairTriggerPriority(trigger: index_repair_state.Trigger) u8 {
         return switch (trigger) {
-            .operator_generation_rebuild => 0,
+            .operator_generation_rebuild, .operator_generation_validation => 0,
             .artifact_coverage_mismatch => 1,
             .artifact_counter_missing => 2,
             .incomplete_bulk_publish, .root_generation_rebuild, .projection_generation_invalid => 3,
@@ -9810,6 +9896,29 @@ pub const DB = struct {
         else
             null;
         defer if (repair_admission) |*reservation| reservation.release();
+
+        // A forced dense rebuild is initially fail-closed. Only the admitted
+        // background worker may prove the current generation safe enough to
+        // remain online during shadow construction. Automatic anomaly
+        // classifications stay fail-closed and reuse the same reconstruction.
+        if (durable_repair_id) |repair_id| {
+            var durable_entry = try self.loadIndexRepairEntryById(alloc, repair_id);
+            defer durable_entry.deinit(alloc);
+            if (durable_entry.intent.trigger == .operator_generation_validation) {
+                switch (try self.validateOperatorDenseGenerationForOnlineRebuild(alloc, cfg, options)) {
+                    .online_safe => try self.updateIndexRepairIntent(alloc, repair_id, .{
+                        .trigger = .operator_generation_rebuild,
+                        .replace_last_error = true,
+                    }),
+                    .replay_pending => return error.OperatorGenerationValidationPending,
+                    .fail_closed => |classification| try self.updateIndexRepairIntent(alloc, repair_id, .{
+                        .trigger = classification.trigger,
+                        .last_error = classification.last_error,
+                        .replace_last_error = true,
+                    }),
+                }
+            }
+        }
         var resume_candidate = false;
         var resume_building = false;
         var resume_requires_ready_manifest = false;
@@ -11898,13 +12007,13 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         const restart_enrichment = if (self.enrichment_runtime) |runtime| runtime.isStarted() else false;
         if (restart_enrichment) self.enrichment_runtime.?.stop();
-        const installed = self.installIndexWhileEnrichmentQuiesced(cfg) catch |install_err| {
-            if (restart_enrichment) try self.restartEnrichmentAfterStructuralMutation("failed index creation", cfg.name);
-            return install_err;
+        var enrichment_restarted = false;
+        errdefer if (restart_enrichment and !enrichment_restarted) {
+            self.restartEnrichmentAfterStructuralMutation("failed index creation", cfg.name) catch |restart_err| {
+                std.log.err("failed to restore enrichment runtime after index creation error index={s} err={s}", .{ cfg.name, @errorName(restart_err) });
+            };
         };
-        // Keep the global pause bounded to catalog/worker mutation. Corpus scans
-        // below are target-specific and may be arbitrarily large.
-        if (restart_enrichment) try self.restartEnrichmentAfterStructuralMutation("index creation", cfg.name);
+        const installed = try self.installIndexWhileEnrichmentQuiesced(cfg);
 
         const needs_enrichment_replay = installed.needs_enrichment_replay;
         const applied = installed.applied;
@@ -11946,6 +12055,16 @@ pub const DB = struct {
         // open an HBC bulk session while addIndex is still mutating the same index.
         if (self.start_index_workers) {
             try self.executor.addWorker(cfg.name, .{ .name = cfg.name, .kind = cfg.kind }, worker_applied);
+        }
+        // Keep enrichment stopped until the new generation's target-specific
+        // bulk rebuild and replay plan have closed. Otherwise a generated
+        // artifact callback can enter a streaming replay session while the
+        // same HBC index still owns a bulk-publication session. The corpus
+        // scan does not hold the global apply lock, so unrelated writes remain
+        // available throughout this structural operation.
+        if (restart_enrichment) {
+            try self.restartEnrichmentAfterStructuralMutation("index creation", cfg.name);
+            enrichment_restarted = true;
         }
         if (self.start_index_workers) {
             const current_target = self.core.nextDerivedSequence();
@@ -15212,7 +15331,11 @@ pub const DB = struct {
         else
             "none";
         switch (intent.trigger) {
-            .incomplete_bulk_publish, .root_generation_rebuild, .projection_generation_invalid => item.repair_degraded = true,
+            .incomplete_bulk_publish,
+            .root_generation_rebuild,
+            .projection_generation_invalid,
+            .operator_generation_validation,
+            => item.repair_degraded = true,
             .artifact_coverage_mismatch, .artifact_counter_missing => {
                 // Source-coverage proof is incomplete or false. Keep the
                 // compact degraded state visible while queries fail closed.
@@ -15234,6 +15357,7 @@ pub const DB = struct {
 
     fn durableGenerationBuildActive(item: *const types.DBIndexStats) bool {
         const generation_build = std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.operator_generation_rebuild)) or
+            std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.operator_generation_validation)) or
             std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.artifact_coverage_mismatch)) or
             std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.artifact_counter_missing)) or
             std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.projection_generation_invalid));
@@ -23619,12 +23743,12 @@ fn appendAssetArtifactSourceIndexWrite(
 
     const marker_key = try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, parsed.artifact_name, parsed.doc_key);
     var marker_key_owned = false;
-    errdefer if (!marker_key_owned) alloc.free(marker_key);
+    defer if (!marker_key_owned) alloc.free(marker_key);
     if (containsStoreWriteKey(store_writes.items, marker_key)) return;
 
     const marker_value = try alloc.dupe(u8, artifact_key);
     var marker_value_owned = false;
-    errdefer if (!marker_value_owned) alloc.free(marker_value);
+    defer if (!marker_value_owned) alloc.free(marker_value);
 
     try owned_store_keys.append(alloc, marker_key);
     marker_key_owned = true;
@@ -23651,7 +23775,7 @@ fn appendAssetArtifactSourceIndexDelete(
 
     const marker_key = try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, parsed.artifact_name, parsed.doc_key);
     var marker_key_owned = false;
-    errdefer if (!marker_key_owned) alloc.free(marker_key);
+    defer if (!marker_key_owned) alloc.free(marker_key);
     if (containsStoreWriteKey(store_writes, marker_key)) return;
     if (containsOwnedKey(owned_delete_keys.items, marker_key)) return;
 
@@ -47222,6 +47346,7 @@ test "db managed dense delete quiesces rate-limited enrichment and recreates cle
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
     try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
+    try std.testing.expect(!stats.enrichment.worker_failed);
     try std.testing.expectEqual(@as(u64, 3), stats.indexes[0].doc_count);
     try std.testing.expect(stats.indexes[0].replay_applied_sequence >= stats.indexes[0].replay_target_sequence);
 }
@@ -58237,7 +58362,7 @@ test "db dense repair uses resource manager capacity admission before building" 
         .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
     });
     try db.batch(.{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
         .sync_level = .full_index,
     });
 
@@ -58679,6 +58804,131 @@ test "db healthy dense generation remains searchable until replacement activatio
     defer result.deinit();
     try std.testing.expectEqual(@as(u32, 2), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db forced dense repair stays fail closed until background health proof" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
+        .sync_level = .full_index,
+    });
+
+    var queued = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
+        .target = .index,
+        .index_name = "dense_idx",
+        .limit = 1,
+        .force = true,
+    }, .{ .defer_durable_index_repair_execution = true });
+    defer queued.deinit(alloc);
+    const repair_id = (try db.indexRepairIdForIndex(alloc, "dense_idx")) orelse return error.TestUnexpectedResult;
+    var pending = try db.loadIndexRepairEntryById(alloc, repair_id);
+    try std.testing.expectEqual(index_repair_state.Trigger.operator_generation_validation, pending.intent.trigger);
+    pending.deinit(alloc);
+    try std.testing.expectError(error.IndexRebuilding, db.search(alloc, .{
+        .index_name = "dense_idx",
+        .query = .{ .dense_knn = .{ .vector = &.{ 1, 0 }, .k = 1 } },
+    }));
+
+    const AfterValidatedSnapshot = struct {
+        fn run(_: *anyopaque, hook_db: *DB, _: []const u8, _: u64) !void {
+            const current_id = (try hook_db.indexRepairIdForIndex(hook_db.alloc, "dense_idx")) orelse return error.TestUnexpectedResult;
+            var current = try hook_db.loadIndexRepairEntryById(hook_db.alloc, current_id);
+            defer current.deinit(hook_db.alloc);
+            try std.testing.expectEqual(index_repair_state.Trigger.operator_generation_rebuild, current.intent.trigger);
+            var result = try hook_db.search(hook_db.alloc, .{
+                .index_name = "dense_idx",
+                .query = .{ .dense_knn = .{ .vector = &.{ 1, 0 }, .k = 1 } },
+            });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+            return error.TestStopAfterOperatorGenerationValidation;
+        }
+    };
+    var hook_ctx: u8 = 0;
+    db.shadow_index_repair_hook = .{ .ptr = &hook_ctx, .after_snapshot_build = AfterValidatedSnapshot.run };
+    try std.testing.expectError(
+        error.TestStopAfterOperatorGenerationValidation,
+        db.advanceIndexRepairIntent(alloc, repair_id, .{}),
+    );
+    db.shadow_index_repair_hook = null;
+}
+
+test "db forced dense repair keeps structurally invalid generation fail closed" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true,\"leaf_size\":2}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}" },
+            .{ .key = "doc:b", .value = "{\"_embeddings\":{\"dense_idx\":[0,1]}}" },
+            .{ .key = "doc:c", .value = "{\"_embeddings\":{\"dense_idx\":[0.9,0.1]}}" },
+            .{ .key = "doc:d", .value = "{\"_embeddings\":{\"dense_idx\":[0.1,0.9]}}" },
+        },
+        .sync_level = .full_index,
+    });
+    const dense_entry = db.core.index_manager.denseIndex("dense_idx").?;
+    var read_txn = try dense_entry.index.beginReadTxn();
+    var root = try dense_entry.index.loadNode(&read_txn, dense_entry.index.metadata.root_node);
+    read_txn.abort();
+    defer root.deinit(alloc);
+    try std.testing.expect(!root.is_leaf);
+    try dense_entry.index.deleteNodeHeaderForTest(root.children[0]);
+
+    var queued = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
+        .target = .index,
+        .index_name = "dense_idx",
+        .limit = 1,
+        .force = true,
+    }, .{ .defer_durable_index_repair_execution = true });
+    defer queued.deinit(alloc);
+    const repair_id = (try db.indexRepairIdForIndex(alloc, "dense_idx")) orelse return error.TestUnexpectedResult;
+
+    const AfterInvalidSnapshot = struct {
+        fn run(_: *anyopaque, hook_db: *DB, _: []const u8, _: u64) !void {
+            const current_id = (try hook_db.indexRepairIdForIndex(hook_db.alloc, "dense_idx")) orelse return error.TestUnexpectedResult;
+            var current = try hook_db.loadIndexRepairEntryById(hook_db.alloc, current_id);
+            defer current.deinit(hook_db.alloc);
+            try std.testing.expectEqual(index_repair_state.Trigger.projection_generation_invalid, current.intent.trigger);
+            try std.testing.expectError(error.IndexRebuilding, hook_db.search(hook_db.alloc, .{
+                .index_name = "dense_idx",
+                .query = .{ .dense_knn = .{ .vector = &.{ 1, 0 }, .k = 1 } },
+            }));
+            return error.TestStopAfterInvalidOperatorGenerationValidation;
+        }
+    };
+    var hook_ctx: u8 = 0;
+    db.shadow_index_repair_hook = .{ .ptr = &hook_ctx, .after_snapshot_build = AfterInvalidSnapshot.run };
+    try std.testing.expectError(
+        error.TestStopAfterInvalidOperatorGenerationValidation,
+        db.advanceIndexRepairIntent(alloc, repair_id, .{}),
+    );
+    db.shadow_index_repair_hook = null;
 }
 
 test "db restart automatically resumes pinned explicit dense generation rebuild" {
@@ -60038,7 +60288,14 @@ test "db dense artifact rebuild force-resets corrupt external dense structure" {
     try std.testing.expect(try reopened.hasPendingDenseArtifactRebuild(alloc));
 
     const rebuilt = try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
-    try std.testing.expectEqual(@as(usize, 6), rebuilt);
+    // Discovery reports one scheduled generation repair, not the number of
+    // source documents that the BackendRuntime-owned state machine will
+    // reconstruct inside that generation.
+    try std.testing.expectEqual(@as(usize, 1), rebuilt);
+    try std.testing.expect(try reopened.hasPendingDenseArtifactRebuild(alloc));
+    const repair_id = (try reopened.indexRepairIdForIndex(alloc, "dense_idx")) orelse return error.TestUnexpectedResult;
+    const advanced = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+    try std.testing.expect(advanced.repaired);
     try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
 
     const stats = try reopened.stats(alloc);

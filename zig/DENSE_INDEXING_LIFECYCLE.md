@@ -102,8 +102,16 @@ Implemented in the current tree:
 - public repair status and errors are intentionally compact; detailed state is
   confined to operator metrics and logs; malformed durable repair state maps
   to the same compact `failed` status instead of disappearing from the response
+- malformed API repair-job records are atomically removed from active/primary
+  scheduler namespaces into a bounded forensic quarantine. They cannot prevent
+  the primary API server or unrelated valid repair jobs from starting; the
+  replica-local generation intent remains the correctness source of truth
 - cache policy is node-owned by `ResourceManager` and is absent from index
   configuration
+- managed index create/recreate keeps enrichment quiesced until its synchronous
+  generation build and replay plan close, preventing generated writes from
+  mixing streaming-replay and bulk-publication sessions on the same HBC index;
+  primary writes and unrelated query serving remain available
 - disk growth is estimated from the selected index generation and claimed by
   `ResourceManager` in a storage-backend capacity domain; provisioned storage
   supplies a live platform filesystem probe, and claims are rechecked and may
@@ -729,6 +737,7 @@ pub const IndexRepairIntent = struct {
         artifact_coverage_mismatch,
         artifact_counter_missing,
         projection_generation_invalid,
+        operator_generation_validation,
     },
     operator_job_id: u64 = 0,
     operator_job_created_at_ms: u64 = 0,
@@ -1481,7 +1490,12 @@ Operator actions follow these rules:
   atomically even when the existing intent was created by automatic coverage
   repair, and intent completion records that job before deletion. A forced
   request first performs the bounded current-generation classification, so it
-  cannot relabel missing coverage proof as a healthy operator rebuild
+  cannot relabel missing coverage proof as a healthy operator rebuild. A new
+  dense request then remains fail-closed in `operator_generation_validation`;
+  the admitted BackendRuntime worker checks replay convergence, exact source
+  coverage, and stored structure before promoting it to an online operator
+  rebuild. The potentially linear structural walk never runs on the HTTP path
+  and observes cooperative owner cancellation
 - `cancel_current_attempt` stops candidate work at a safe boundary, preserves
   the quarantined root and replay pin, releases admitted resources, records
   retryable debt, and permits the automatic executor to try again later
@@ -1516,8 +1530,10 @@ Operator actions follow these rules:
   in creation order, and leaves retained terminal history lazily loaded.
   Primary records are size-bounded and validated for job ID, phase, target,
   status, limit, and bounded strings before they enter scheduler memory.
-  Malformed marker keys or primary records fail attach visibly instead of
-  silently dropping work
+  Malformed marker keys or primary records are moved atomically to a bounded,
+  content-addressed forensic quarantine and logged; their active and primary
+  keys are removed so they cannot poison subsequent restarts. Valid job
+  recovery and primary API startup continue independently
 - a transient cancellation pass failure preserves `cancel_requested`, cursor,
   and accumulated results, then enters durable exponential backoff. The FIFO
   inspects a bounded window from a process-local round-robin cursor, advancing
