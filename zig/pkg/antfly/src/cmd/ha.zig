@@ -2126,6 +2126,10 @@ test "ha cmd remote commands prefer typed admin routes" {
     }, recorder.executor());
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_standby_bootstrap);
+    // Production bootstrap keeps the seed slot in the seeding lifecycle until
+    // the target has durably published its activation receipt. Model that
+    // explicit transition before asking the standby to consume later WAL.
+    try primary.activateSeededSlot("standby-seed", testIdentity().timeline_id, 2, 2, 2);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "status",
@@ -2197,6 +2201,16 @@ test "ha cmd remote commands prefer typed admin routes" {
     }, recorder.executor());
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_commit_append);
+
+    // Fence acquisition upgrades the caller's stale observation to the former
+    // primary's live durable tail. Catch the standby up before promotion so the
+    // integration test proves that stronger boundary is honored end to end.
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "stream",
+        "once",
+        "--slot",
+        "standby-seed",
+    }, recorder.executor());
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "commit",
