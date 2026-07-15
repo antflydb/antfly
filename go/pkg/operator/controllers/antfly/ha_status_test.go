@@ -96,6 +96,51 @@ func TestHASeedPlanPublishesSourcePVCNameOnEveryTopologyBoundAction(t *testing.T
 	}
 }
 
+func TestHASeedPlanPreservesObservedSourcePVCUIDOnlyForTheSameClaim(t *testing.T) {
+	standby := antflyv1.HAStandbySpec{
+		Name:     "standby-a",
+		SlotName: "standby-a",
+		SeedArtifact: &antflyv1.HASeedArtifactSpec{
+			Location: "s3://ha-seeds/cluster-a", Generation: "seed-standby-a-10", StagingRoot: "/target/staging",
+			TopologyID: "topology-a", TopologyGeneration: 7, NodeID: "standby-a", TargetPVCUID: "target-pvc-uid",
+			SourcePVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+			TargetPVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+		},
+	}
+	ha := &antflyv1.HighAvailabilitySpec{
+		Standbys: []antflyv1.HAStandbySpec{standby},
+		Runtime: &antflyv1.HARuntimeSpec{StartupGate: &antflyv1.HAStartupGateSpec{
+			RequiredReceipt: &antflyv1.HARequiredSeedActivationReceipt{
+				TopologyID: "topology-a", TopologyGeneration: 7, NodeID: "standby-a", SlotName: "standby-a",
+				Generation: "seed-standby-a-10", TargetPVCName: "standby-data", TargetPVCUID: "target-pvc-uid",
+			},
+		}},
+	}
+	actions := haSeedCompletionActions(standby, "standby-a", 10, "test", haActionReseedFormerPrimary)
+	first := haPlannedActionStatuses(actions, ha, &antflyv1.HAStatus{})
+	for i := range first {
+		first[i].SourcePVCUID = "source-pvc-uid"
+	}
+
+	replanned := haPlannedActionStatuses(actions, ha, &antflyv1.HAStatus{PlannedActions: first})
+	if len(replanned) != 8 {
+		t.Fatalf("expected complete eight-action portable seed chain, got %d", len(replanned))
+	}
+	for _, action := range replanned {
+		if action.SourcePVCName != "primary-data" || action.SourcePVCUID != "source-pvc-uid" {
+			t.Errorf("%s lost the live source PVC incarnation across a pure replan: %#v", action.Kind, action)
+		}
+	}
+
+	ha.Standbys[0].SeedArtifact.SourcePVC.ClaimName = "replacement-primary-data"
+	replanned = haPlannedActionStatuses(actions, ha, &antflyv1.HAStatus{PlannedActions: first})
+	for _, action := range replanned {
+		if action.SourcePVCName != "replacement-primary-data" || action.SourcePVCUID != "" {
+			t.Errorf("%s silently transferred the old UID to a replacement claim: %#v", action.Kind, action)
+		}
+	}
+}
+
 func TestHAReplicationIdentityAllowsWholeInstanceScope(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
 		Identity: &antflyv1.HAReplicationIdentitySpec{
