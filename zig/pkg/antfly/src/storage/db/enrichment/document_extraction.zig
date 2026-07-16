@@ -87,6 +87,18 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
         pub fn renderParsedPagePngAlloc(_: Allocator, _: *reader.Reader, _: usize, _: u16, _: u64) ![]u8 {
             return error.PdfRenderingUnavailable;
         }
+
+        pub const RenderedPagePng = struct {
+            png: []u8,
+            requested_dpi: u16,
+            effective_dpi: u16,
+            width: u32,
+            height: u32,
+        };
+
+        pub fn renderParsedPagePngAdaptiveAlloc(_: Allocator, _: *reader.Reader, _: usize, _: u16, _: u64, _: u32) !RenderedPagePng {
+            return error.PdfRenderingUnavailable;
+        }
     }
 else
     @import("antfly_pdf");
@@ -126,6 +138,8 @@ pub fn renderPdfPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_numbe
     return try pdf.renderPagePngAlloc(alloc, pdf_bytes, page_number, dpi, max_pixels);
 }
 
+pub const RenderedPdfPage = pdf.RenderedPagePng;
+
 pub const PdfRenderSession = struct {
     parsed: pdf.reader.Reader,
 
@@ -140,6 +154,10 @@ pub const PdfRenderSession = struct {
 
     pub fn renderPagePngAlloc(self: *PdfRenderSession, alloc: Allocator, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
         return try pdf.renderParsedPagePngAlloc(alloc, &self.parsed, page_number, dpi, max_pixels);
+    }
+
+    pub fn renderPagePngAdaptiveAlloc(self: *PdfRenderSession, alloc: Allocator, page_number: usize, dpi: u16, max_pixels: u64, max_dimension: u32) !RenderedPdfPage {
+        return try pdf.renderParsedPagePngAdaptiveAlloc(alloc, &self.parsed, page_number, dpi, max_pixels, max_dimension);
     }
 };
 
@@ -182,6 +200,11 @@ pub const Unit = struct {
     ocr_used: bool = false,
     ocr_attempted: bool = false,
     ocr_render_dpi: ?u16 = null,
+    ocr_effective_render_dpi: ?u16 = null,
+    ocr_rendered_width: ?u32 = null,
+    ocr_rendered_height: ?u32 = null,
+    ocr_rendered_bytes: ?u64 = null,
+    ocr_failure_stage: ?[]u8 = null,
     ocr_trigger_reasons: ?[]u8 = null,
     ocr_embedded_quality: ?[]u8 = null,
     ocr_output_quality: ?[]u8 = null,
@@ -210,6 +233,7 @@ pub const Unit = struct {
         if (self.ocr_trigger_reasons) |value| alloc.free(value);
         if (self.ocr_embedded_quality) |value| alloc.free(value);
         if (self.ocr_output_quality) |value| alloc.free(value);
+        if (self.ocr_failure_stage) |value| alloc.free(value);
         if (self.page_label) |value| alloc.free(value);
         if (self.text_regions.len > 0) alloc.free(self.text_regions);
         self.* = undefined;
@@ -245,6 +269,7 @@ pub const OcrFailureDetail = struct {
     unit_id: []const u8,
     retained_method: []const u8,
     error_message: []const u8,
+    failure_stage: ?[]const u8 = null,
 };
 
 pub const StreamInfo = struct {
@@ -280,6 +305,7 @@ pub const Config = struct {
     ocr_config_json: []const u8 = "",
     ocr_render_dpi: u16 = 150,
     ocr_max_rendered_pixels: u64 = 40_000_000,
+    ocr_max_rendered_dimension: u32 = 4096,
     ocr_prompt: []const u8 = "",
     ocr_model: []const u8 = "",
     ocr_quality: OcrQualityConfig = .{},
@@ -666,6 +692,10 @@ fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config
     if (intField(ocr, "max_rendered_pixels")) |pixels| {
         if (pixels < 1 or pixels > 100_000_000) return error.InvalidDocumentExtractionConfig;
         config.ocr_max_rendered_pixels = @intCast(pixels);
+    }
+    if (intField(ocr, "max_rendered_dimension")) |dimension| {
+        if (dimension < 512 or dimension > 16_384) return error.InvalidDocumentExtractionConfig;
+        config.ocr_max_rendered_dimension = @intCast(dimension);
     }
     if (ocr.get("config")) |producer| {
         if (producer == .object) if (producer.object.get("model")) |model| {
@@ -3360,18 +3390,22 @@ test "OCR text selection retains embedded text on ties and chooses a better tran
 test "OCR options parse configurable thresholds resolution model and explicit prompt" {
     const alloc = std.testing.allocator;
     var config = try parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"mode":"always","render_dpi":200,"max_rendered_pixels":123456,"quality":{"min_content_chars":75,"max_replacement_char_ratio":0.1},"config":{"provider":"antfly","model":"antflydb/Florence-2-base","prompt":"Preserve tables"}}}
+        \\{"ocr":{"enabled":true,"mode":"always","render_dpi":200,"max_rendered_pixels":123456,"max_rendered_dimension":3072,"quality":{"min_content_chars":75,"max_replacement_char_ratio":0.1},"config":{"provider":"antfly","model":"antflydb/Florence-2-base","prompt":"Preserve tables"}}}
     );
     defer config.deinit(alloc);
     try std.testing.expect(config.ocr_enabled);
     try std.testing.expectEqual(OcrMode.always, config.ocr_mode);
     try std.testing.expectEqual(@as(u16, 200), config.ocr_render_dpi);
     try std.testing.expectEqual(@as(u64, 123456), config.ocr_max_rendered_pixels);
+    try std.testing.expectEqual(@as(u32, 3072), config.ocr_max_rendered_dimension);
     try std.testing.expectEqual(@as(usize, 75), config.ocr_quality.min_content_chars);
     try std.testing.expectEqualStrings("antflydb/Florence-2-base", config.ocr_model);
     try std.testing.expectEqualStrings("Preserve tables", config.ocr_prompt);
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
         \\{"ocr":{"enabled":true,"max_rendered_pixels":100000001,"config":{"provider":"antfly"}}}
+    ));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
+        \\{"ocr":{"enabled":true,"max_rendered_dimension":511,"config":{"provider":"antfly"}}}
     ));
 }
 

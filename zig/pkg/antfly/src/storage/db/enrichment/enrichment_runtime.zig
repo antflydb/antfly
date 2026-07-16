@@ -2543,6 +2543,7 @@ fn processDocumentExtractionAsset(
                     .unit_id = unit.unit_id,
                     .retained_method = unit.method,
                     .error_message = unit.extraction_warning orelse "OCR failed without a recorded cause",
+                    .failure_stage = unit.ocr_failure_stage,
                 });
             }
         }
@@ -2867,6 +2868,11 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     };
     if (!enabled) return;
 
+    var source_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source_bytes, &source_digest, .{});
+    const source_hex = std.fmt.bytesToHex(source_digest, .lower);
+    const profile_source_id = source_hex[0..16];
+
     const pending_status = switch (kind) {
         .ocr => "pending_ocr",
         .transcript => "pending_transcription",
@@ -2911,11 +2917,20 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
             units[idx].ocr_attempted = true;
             if (std.mem.eql(u8, route_type, "pdf")) {
                 units[idx].ocr_render_dpi = config.ocr_render_dpi;
-                rendered = pdf_session.?.renderPagePngAlloc(runtime.alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels) catch |err| {
+                const render_started_ns = runtime.config.clock.nowRealtimeNs();
+                const rendered_page = pdf_session.?.renderPagePngAdaptiveAlloc(runtime.alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels, config.ocr_max_rendered_dimension) catch |err| {
+                    logRuntimeOcrRenderProfile(runtime, profile_source_id, unit.page_number, config.ocr_render_dpi, null, null, null, null, render_started_ns, @errorName(err));
                     if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+                    try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[idx], kind, "render");
                     try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[idx], method, kind, err);
                     continue;
                 };
+                units[idx].ocr_effective_render_dpi = rendered_page.effective_dpi;
+                units[idx].ocr_rendered_width = rendered_page.width;
+                units[idx].ocr_rendered_height = rendered_page.height;
+                units[idx].ocr_rendered_bytes = rendered_page.png.len;
+                rendered = rendered_page.png;
+                logRuntimeOcrRenderProfile(runtime, profile_source_id, unit.page_number, config.ocr_render_dpi, rendered_page.effective_dpi, rendered_page.width, rendered_page.height, rendered_page.png.len, render_started_ns, null);
             }
         }
         // Avoid allocating the base64 and JSON copies when the encoded PNG
@@ -2924,6 +2939,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
         if (rendered) |png| {
             const encoded_len = std.base64.standard.Encoder.calcSize(png.len);
             if (encoded_len >= batch_policy.max_bytes or config_json.len >= batch_policy.max_bytes - encoded_len) {
+                try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[idx], kind, "request");
                 try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[idx], method, kind, error.GeneratedTextRequestTooLarge);
                 continue;
             }
@@ -2943,13 +2959,14 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
         };
         const request_bytes = runtimeGeneratedTextRequestBytes(request);
         if (request_bytes > batch_policy.max_bytes) {
+            try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[idx], kind, "request");
             try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[idx], method, kind, error.GeneratedTextRequestTooLarge);
             runtime.alloc.free(parts_json);
             owns_parts_json = false;
             continue;
         }
         if (requests.items.len > 0 and (requests.items.len >= batch_policy.max_items or batch_bytes + request_bytes > batch_policy.max_bytes)) {
-            try flushRuntimeGeneratedTextBatch(runtime, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt);
+            try flushRuntimeGeneratedTextBatch(runtime, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, profile_source_id);
             requests.clearRetainingCapacity();
             unit_indices.clearRetainingCapacity();
             batch_bytes = 0;
@@ -2961,7 +2978,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
         batch_bytes = addUsizeSaturating(batch_bytes, request_bytes);
     }
     if (requests.items.len > 0) {
-        try flushRuntimeGeneratedTextBatch(runtime, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt);
+        try flushRuntimeGeneratedTextBatch(runtime, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, profile_source_id);
     }
 }
 
@@ -2991,21 +3008,28 @@ fn flushRuntimeGeneratedTextBatch(
     kind: RuntimeGeneratedUnitTextKind,
     quality_config: document_extraction_mod.OcrQualityConfig,
     ocr_prompt: []const u8,
+    profile_source_id: []const u8,
 ) !void {
     if (requests.len == 0) return;
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
 
+    const started_ns = runtime.config.clock.nowRealtimeNs();
+    const request_bytes = runtimeGeneratedTextBatchBytes(requests);
     var produced = producer.produceBatch(runtime.alloc, requests) catch |err| {
+        logRuntimeOcrBatchProfile(runtime, profile_source_id, units, unit_indices, requests.len, request_bytes, "serial_fallback", @errorName(err), started_ns);
         if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
-        return try flushRuntimeGeneratedTextBatchSequential(runtime, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt);
+        for (unit_indices) |unit_idx| try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[unit_idx], kind, "inference");
+        return try flushRuntimeGeneratedTextBatchSequential(runtime, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, profile_source_id, @errorName(err));
     };
     if (produced.len != requests.len) {
         for (produced) |item| {
             if (item.len > 0) runtime.alloc.free(item);
         }
         runtime.alloc.free(produced);
-        return try flushRuntimeGeneratedTextBatchSequential(runtime, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt);
+        logRuntimeOcrBatchProfile(runtime, profile_source_id, units, unit_indices, requests.len, request_bytes, "serial_fallback", "response_count_mismatch", started_ns);
+        return try flushRuntimeGeneratedTextBatchSequential(runtime, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, profile_source_id, "response_count_mismatch");
     }
+    logRuntimeOcrBatchProfile(runtime, profile_source_id, units, unit_indices, requests.len, request_bytes, "batch", null, started_ns);
 
     defer runtime.alloc.free(produced);
     errdefer {
@@ -3017,6 +3041,7 @@ fn flushRuntimeGeneratedTextBatch(
         produced[i] = &.{};
         applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], item, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
             if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+            try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[unit_idx], kind, "inference");
             try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
         };
     }
@@ -3034,20 +3059,80 @@ fn flushRuntimeGeneratedTextBatchSequential(
     kind: RuntimeGeneratedUnitTextKind,
     quality_config: document_extraction_mod.OcrQualityConfig,
     ocr_prompt: []const u8,
+    profile_source_id: []const u8,
+    fallback_reason: []const u8,
 ) !void {
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
     for (requests, unit_indices) |request, unit_idx| {
+        const started_ns = runtime.config.clock.nowRealtimeNs();
         const produced = producer.produce(runtime.alloc, request) catch |err| {
+            logRuntimeOcrBatchProfile(runtime, profile_source_id, units, &.{unit_idx}, 1, runtimeGeneratedTextRequestBytes(request), "serial", @errorName(err), started_ns);
             if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+            try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[unit_idx], kind, "inference");
             try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
             continue;
         };
+        logRuntimeOcrBatchProfile(runtime, profile_source_id, units, &.{unit_idx}, 1, runtimeGeneratedTextRequestBytes(request), "serial", fallback_reason, started_ns);
         applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], produced, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
             if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+            try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[unit_idx], kind, "inference");
             try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
         };
     }
     clearRuntimeGeneratedTextBatchParts(runtime.alloc, parts_values);
+}
+
+fn runtimeGeneratedTextBatchBytes(requests: []const asset_producer_mod.Request) usize {
+    var total: usize = 0;
+    for (requests) |request| total = addUsizeSaturating(total, runtimeGeneratedTextRequestBytes(request));
+    return total;
+}
+
+fn runtimeReadProfileEnabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_READ_PROFILE");
+}
+
+fn profileElapsedMs(runtime: *EnrichmentRuntime, started_ns: u64) f64 {
+    const finished_ns = runtime.config.clock.nowRealtimeNs();
+    const elapsed_ns = if (finished_ns >= started_ns) finished_ns - started_ns else 0;
+    return @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, std.time.ns_per_ms);
+}
+
+fn logRuntimeOcrRenderProfile(
+    runtime: *EnrichmentRuntime,
+    source_id: []const u8,
+    page_number: ?u32,
+    requested_dpi: u16,
+    effective_dpi: ?u16,
+    width: ?u32,
+    height: ?u32,
+    encoded_bytes: ?usize,
+    started_ns: u64,
+    failure: ?[]const u8,
+) void {
+    if (!runtimeReadProfileEnabled()) return;
+    std.log.info("read-profile phase=pdf_render source_sha256={s} page={?d} requested_dpi={d} effective_dpi={?d} width={?d} height={?d} encoded_bytes={?d} failure={?s} elapsed_ms={d:.3}", .{
+        source_id, page_number, requested_dpi, effective_dpi, width, height, encoded_bytes, failure, profileElapsedMs(runtime, started_ns),
+    });
+}
+
+fn logRuntimeOcrBatchProfile(
+    runtime: *EnrichmentRuntime,
+    source_id: []const u8,
+    units: []const document_extraction_mod.Unit,
+    unit_indices: []const usize,
+    batch_size: usize,
+    request_bytes: usize,
+    mode: []const u8,
+    fallback_reason: ?[]const u8,
+    started_ns: u64,
+) void {
+    if (!runtimeReadProfileEnabled()) return;
+    const first_page = if (unit_indices.len > 0) units[unit_indices[0]].page_number else null;
+    const last_page = if (unit_indices.len > 0) units[unit_indices[unit_indices.len - 1]].page_number else null;
+    std.log.info("read-profile phase=ocr_batch source_sha256={s} first_page={?d} last_page={?d} batch_size={d} request_bytes={d} mode={s} serial_fallback_reason={?s} elapsed_ms={d:.3}", .{
+        source_id, first_page, last_page, batch_size, request_bytes, mode, fallback_reason, profileElapsedMs(runtime, started_ns),
+    });
 }
 
 fn completeRuntimeDocumentExtractionGeneratedTextUnit(
@@ -3083,7 +3168,20 @@ fn completeRuntimeDocumentExtractionGeneratedTextUnit(
     unit.ocr_attempted = kind == .ocr;
     const rendered = if (kind == .ocr and std.mem.eql(u8, route_type, "pdf")) blk: {
         unit.ocr_render_dpi = config.ocr_render_dpi;
-        break :blk try document_extraction_mod.renderPdfPagePngAlloc(runtime.alloc, source_bytes, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels);
+        var rendered_page = document_extraction_mod.PdfRenderSession.init(runtime.alloc, source_bytes) catch |err| {
+            try setRuntimeGeneratedUnitFailureStage(runtime.alloc, unit, kind, "render");
+            return err;
+        };
+        defer rendered_page.deinit();
+        const page = rendered_page.renderPagePngAdaptiveAlloc(runtime.alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels, config.ocr_max_rendered_dimension) catch |err| {
+            try setRuntimeGeneratedUnitFailureStage(runtime.alloc, unit, kind, "render");
+            return err;
+        };
+        unit.ocr_effective_render_dpi = page.effective_dpi;
+        unit.ocr_rendered_width = page.width;
+        unit.ocr_rendered_height = page.height;
+        unit.ocr_rendered_bytes = page.png.len;
+        break :blk page.png;
     } else null;
     defer if (rendered) |png| runtime.alloc.free(png);
     const parts_json = if (rendered) |png|
@@ -3230,6 +3328,18 @@ fn markRuntimeGeneratedUnitTextFailure(
     unit.char_end = std.math.cast(u32, @as(usize, @intCast(start)) + unit.text.len);
 }
 
+fn setRuntimeGeneratedUnitFailureStage(
+    alloc: Allocator,
+    unit: *document_extraction_mod.Unit,
+    kind: RuntimeGeneratedUnitTextKind,
+    stage: []const u8,
+) !void {
+    if (kind != .ocr) return;
+    const owned = try alloc.dupe(u8, stage);
+    if (unit.ocr_failure_stage) |value| alloc.free(value);
+    unit.ocr_failure_stage = owned;
+}
+
 const RuntimeParsedGeneratedUnitText = struct {
     text: []u8,
     confidence: ?f64 = null,
@@ -3314,6 +3424,11 @@ fn runtimeDocumentGeneratedTextPartsJsonAlloc(
         .source_sha256 = unit.source_sha256,
         .ocr_attempted = unit.ocr_attempted,
         .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+        .ocr_rendered_width = unit.ocr_rendered_width,
+        .ocr_rendered_height = unit.ocr_rendered_height,
+        .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+        .ocr_failure_stage = unit.ocr_failure_stage,
         .ocr_trigger_reasons = unit.ocr_trigger_reasons,
         .ocr_embedded_quality = unit.ocr_embedded_quality,
         .ocr_output_quality = unit.ocr_output_quality,
@@ -3457,6 +3572,7 @@ fn runtimeDocumentExtractionUnitOwnedBytes(unit: document_extraction_mod.Unit) u
     if (unit.ocr_trigger_reasons) |value| total = addUsizeSaturating(total, value.len);
     if (unit.ocr_embedded_quality) |value| total = addUsizeSaturating(total, value.len);
     if (unit.ocr_output_quality) |value| total = addUsizeSaturating(total, value.len);
+    if (unit.ocr_failure_stage) |value| total = addUsizeSaturating(total, value.len);
     if (unit.page_label) |value| total = addUsizeSaturating(total, value.len);
     total = addUsizeSaturating(total, unit.text_regions.len * @sizeOf(document_extraction_mod.TextRegion));
     return total;
@@ -3489,6 +3605,8 @@ fn cloneDocumentExtractionUnit(alloc: Allocator, unit: document_extraction_mod.U
     errdefer if (ocr_embedded_quality) |value| alloc.free(value);
     var ocr_output_quality = try cloneOptionalBytes(alloc, unit.ocr_output_quality);
     errdefer if (ocr_output_quality) |value| alloc.free(value);
+    var ocr_failure_stage = try cloneOptionalBytes(alloc, unit.ocr_failure_stage);
+    errdefer if (ocr_failure_stage) |value| alloc.free(value);
     var page_label = try cloneOptionalBytes(alloc, unit.page_label);
     errdefer if (page_label) |value| alloc.free(value);
     var text_regions: []document_extraction_mod.TextRegion = if (unit.text_regions.len > 0) try alloc.dupe(document_extraction_mod.TextRegion, unit.text_regions) else &.{};
@@ -3506,6 +3624,11 @@ fn cloneDocumentExtractionUnit(alloc: Allocator, unit: document_extraction_mod.U
         .ocr_used = unit.ocr_used,
         .ocr_attempted = unit.ocr_attempted,
         .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+        .ocr_rendered_width = unit.ocr_rendered_width,
+        .ocr_rendered_height = unit.ocr_rendered_height,
+        .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+        .ocr_failure_stage = ocr_failure_stage,
         .ocr_trigger_reasons = ocr_trigger_reasons,
         .ocr_embedded_quality = ocr_embedded_quality,
         .ocr_output_quality = ocr_output_quality,
@@ -3533,6 +3656,7 @@ fn cloneDocumentExtractionUnit(alloc: Allocator, unit: document_extraction_mod.U
     ocr_trigger_reasons = null;
     ocr_embedded_quality = null;
     ocr_output_quality = null;
+    ocr_failure_stage = null;
     page_label = null;
     text_regions = &.{};
     return cloned;
@@ -4063,6 +4187,11 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .ocr_used = unit.ocr_used,
         .ocr_attempted = unit.ocr_attempted,
         .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+        .ocr_rendered_width = unit.ocr_rendered_width,
+        .ocr_rendered_height = unit.ocr_rendered_height,
+        .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+        .ocr_failure_stage = unit.ocr_failure_stage,
         .ocr_trigger_reasons = unit.ocr_trigger_reasons,
         .ocr_embedded_quality = unit.ocr_embedded_quality,
         .ocr_output_quality = unit.ocr_output_quality,
@@ -6725,6 +6854,15 @@ fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extra
         std.mem.writeInt(u16, &dpi_buf, dpi, .big);
         hasher.update(&dpi_buf);
     }
+    if (unit.ocr_effective_render_dpi) |dpi| {
+        var dpi_buf: [@sizeOf(u16)]u8 = undefined;
+        std.mem.writeInt(u16, &dpi_buf, dpi, .big);
+        hasher.update(&dpi_buf);
+    }
+    if (unit.ocr_rendered_width) |value| hasher.update(std.mem.asBytes(&value));
+    if (unit.ocr_rendered_height) |value| hasher.update(std.mem.asBytes(&value));
+    if (unit.ocr_rendered_bytes) |value| hasher.update(std.mem.asBytes(&value));
+    if (unit.ocr_failure_stage) |value| hasher.update(value);
     if (unit.ocr_trigger_reasons) |value| hasher.update(value);
     if (unit.ocr_embedded_quality) |value| hasher.update(value);
     if (unit.ocr_output_quality) |value| hasher.update(value);
@@ -6977,6 +7115,11 @@ fn documentUnitPayloadAlloc(
         .confidence = documentUnitConfidence(unit),
         .ocr_attempted = unit.ocr_attempted,
         .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+        .ocr_rendered_width = unit.ocr_rendered_width,
+        .ocr_rendered_height = unit.ocr_rendered_height,
+        .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+        .ocr_failure_stage = unit.ocr_failure_stage,
         .ocr_trigger_reasons = unit.ocr_trigger_reasons,
         .ocr_embedded_quality = unit.ocr_embedded_quality,
         .ocr_output_quality = unit.ocr_output_quality,
@@ -6995,6 +7138,11 @@ fn documentUnitPayloadAlloc(
             .ocr_used = unit.ocr_used,
             .ocr_attempted = unit.ocr_attempted,
             .ocr_render_dpi = unit.ocr_render_dpi,
+            .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+            .ocr_rendered_width = unit.ocr_rendered_width,
+            .ocr_rendered_height = unit.ocr_rendered_height,
+            .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+            .ocr_failure_stage = unit.ocr_failure_stage,
             .ocr_trigger_reasons = unit.ocr_trigger_reasons,
             .ocr_embedded_quality = unit.ocr_embedded_quality,
             .ocr_output_quality = unit.ocr_output_quality,
@@ -7024,6 +7172,11 @@ fn documentUnitPayloadAlloc(
                 .ocr_used = unit.ocr_used,
                 .ocr_attempted = unit.ocr_attempted,
                 .ocr_render_dpi = unit.ocr_render_dpi,
+                .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+                .ocr_rendered_width = unit.ocr_rendered_width,
+                .ocr_rendered_height = unit.ocr_rendered_height,
+                .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+                .ocr_failure_stage = unit.ocr_failure_stage,
                 .ocr_trigger_reasons = unit.ocr_trigger_reasons,
                 .ocr_embedded_quality = unit.ocr_embedded_quality,
                 .ocr_output_quality = unit.ocr_output_quality,
@@ -7615,6 +7768,7 @@ fn documentExtractionManifestPayloadAlloc(
         try appendJsonFieldString(alloc, &out, &detail_first, "unit_id", detail.unit_id);
         try appendJsonFieldString(alloc, &out, &detail_first, "retained_method", detail.retained_method);
         try appendJsonFieldString(alloc, &out, &detail_first, "error_message", detail.error_message);
+        if (detail.failure_stage) |stage| try appendJsonFieldString(alloc, &out, &detail_first, "failure_stage", stage);
         try appendJsonFieldBool(alloc, &out, &detail_first, "retryable", true);
         try out.append(alloc, '}');
     }
@@ -9584,6 +9738,7 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
             .unit_id = "unit:b",
             .retained_method = "pdf_text",
             .error_message = "pdf_ocr failed: UnsupportedStreamFilter",
+            .failure_stage = "render",
         }},
     };
     const desired_descriptors = [_]DocumentExtractionUnitDescriptor{
@@ -9669,6 +9824,7 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"ocr_failure_details\":[{\"page_number\":5") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"error_message\":\"pdf_ocr failed: UnsupportedStreamFilter\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"failure_stage\":\"render\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"retryable\":true") != null);
 
     const in_progress = try documentExtractionManifestPayloadAlloc(

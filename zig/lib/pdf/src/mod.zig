@@ -21,6 +21,19 @@ pub const render = @import("render.zig");
 
 const Allocator = std.mem.Allocator;
 
+pub const RenderedPagePng = struct {
+    png: []u8,
+    requested_dpi: u16,
+    effective_dpi: u16,
+    width: u32,
+    height: u32,
+
+    pub fn deinit(self: *RenderedPagePng, alloc: Allocator) void {
+        alloc.free(self.png);
+        self.* = undefined;
+    }
+};
+
 pub const Backend = struct {
     ptr: *const anyopaque,
     extract_text_fn: *const fn (ptr: *const anyopaque, alloc: Allocator, pdf_bytes: []const u8) anyerror![]u8,
@@ -200,6 +213,54 @@ pub fn renderParsedPagePngAlloc(alloc: Allocator, parsed: *reader.Reader, page_n
         }
     }.lessThan);
     return try render.renderPageContentPngInBox(alloc, page_box, plain_runs.items, image_runs, shading_runs, all_pattern_runs.items, all_shape_runs.items);
+}
+
+/// Renders at the requested DPI when safe, reducing it only enough to satisfy
+/// both the dimension and pixel guards. OCR below 72 DPI is intentionally
+/// refused because it is unlikely to produce useful text.
+pub fn renderParsedPagePngAdaptiveAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    requested_dpi: u16,
+    max_pixels: u64,
+    max_dimension: u32,
+) !RenderedPagePng {
+    if (page_number == 0) return error.InvalidPageNumber;
+    if (requested_dpi < 72 or requested_dpi > 600) return error.InvalidRenderDpi;
+    if (max_pixels == 0 or max_dimension == 0) return error.RenderedPageTooLarge;
+    const page_count = try parsed.pageCount();
+    if (page_number > page_count) return error.InvalidPageNumber;
+    const box = try parsed.extractPageBox(page_number);
+    const page_width = @max(1.0, box.max_x - box.min_x);
+    const page_height = @max(1.0, box.max_y - box.min_y);
+
+    var effective_dpi = requested_dpi;
+    var width: u32 = 0;
+    var height: u32 = 0;
+    while (true) {
+        const scale = @as(f64, @floatFromInt(effective_dpi)) / 72.0;
+        const width_f = @ceil(page_width * scale);
+        const height_f = @ceil(page_height * scale);
+        const fits_integer = width_f <= @as(f64, @floatFromInt(std.math.maxInt(u32))) and
+            height_f <= @as(f64, @floatFromInt(std.math.maxInt(u32)));
+        if (fits_integer) {
+            width = @intFromFloat(width_f);
+            height = @intFromFloat(height_f);
+            const pixels = @as(u64, width) * @as(u64, height);
+            if (width <= max_dimension and height <= max_dimension and pixels <= max_pixels) break;
+        }
+        if (effective_dpi == 72) return error.RenderedPageTooLarge;
+        effective_dpi -= 1;
+    }
+
+    return .{
+        .png = try renderParsedPagePngAlloc(alloc, parsed, page_number, effective_dpi, max_pixels),
+        .requested_dpi = requested_dpi,
+        .effective_dpi = effective_dpi,
+        .width = width,
+        .height = height,
+    };
 }
 
 fn scaleBox(box: *reader.PageBox, scale: f64) void {
@@ -2451,6 +2512,28 @@ test "native page renderer honors OCR DPI and pixel guard" {
     try std.testing.expect(decoded_150.height > decoded_72.height);
     try std.testing.expectError(error.RenderedPageTooLarge, renderPagePngAlloc(alloc, fixture, 1, 150, 10));
     try std.testing.expectError(error.InvalidPageNumber, renderPagePngAlloc(alloc, fixture, 2, 150, 40_000_000));
+}
+
+test "adaptive OCR rendering records effective DPI and enforces safety caps" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/simple_text_fixture.pdf");
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+
+    var adaptive = try renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 1000);
+    defer adaptive.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 150), adaptive.requested_dpi);
+    try std.testing.expect(adaptive.effective_dpi >= 72);
+    try std.testing.expect(adaptive.effective_dpi < adaptive.requested_dpi);
+    try std.testing.expect(adaptive.width <= 1000);
+    try std.testing.expect(adaptive.height <= 1000);
+    const decoded = try @import("antfly_image").png.decodeRgba(alloc, adaptive.png);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqual(adaptive.width, decoded.width);
+    try std.testing.expectEqual(adaptive.height, decoded.height);
+
+    try std.testing.expectError(error.RenderedPageTooLarge, renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 700));
+    try std.testing.expectError(error.RenderedPageTooLarge, renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 10, 4096));
 }
 
 test "OCR DPI scaling maps tiling patterns exactly once" {

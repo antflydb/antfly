@@ -76,6 +76,11 @@ pub const ProvenanceOptions = struct {
     ocr_used: bool = false,
     ocr_attempted: bool = false,
     ocr_render_dpi: ?u16 = null,
+    ocr_effective_render_dpi: ?u16 = null,
+    ocr_rendered_width: ?u32 = null,
+    ocr_rendered_height: ?u32 = null,
+    ocr_rendered_bytes: ?u64 = null,
+    ocr_failure_stage: ?[]const u8 = null,
     ocr_trigger_reasons: ?[]const u8 = null,
     ocr_embedded_quality: ?[]const u8 = null,
     ocr_output_quality: ?[]const u8 = null,
@@ -160,6 +165,11 @@ fn appendProvenanceFields(
     try provenance.put(alloc, try alloc.dupe(u8, "ocr_used"), .{ .bool = options.ocr_used });
     try provenance.put(alloc, try alloc.dupe(u8, "ocr_attempted"), .{ .bool = options.ocr_attempted });
     if (options.ocr_render_dpi) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_render_dpi"), .{ .integer = value });
+    if (options.ocr_effective_render_dpi) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_effective_render_dpi"), .{ .integer = value });
+    if (options.ocr_rendered_width) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_rendered_width"), .{ .integer = value });
+    if (options.ocr_rendered_height) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_rendered_height"), .{ .integer = value });
+    if (options.ocr_rendered_bytes) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_rendered_bytes"), .{ .integer = @intCast(value) });
+    if (options.ocr_failure_stage) |value| try putString(alloc, &provenance, "ocr_failure_stage", value);
     if (options.ocr_trigger_reasons) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_trigger_reasons"), .{ .string = try alloc.dupe(u8, value) });
     if (options.ocr_embedded_quality) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_embedded_quality"), .{ .string = try alloc.dupe(u8, value) });
     if (options.ocr_output_quality) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_output_quality"), .{ .string = try alloc.dupe(u8, value) });
@@ -203,7 +213,7 @@ fn appendFormatProvenance(
     provenance: *std.json.ObjectMap,
     options: ProvenanceOptions,
 ) !void {
-    if (options.page_number == null and options.page_label == null and options.page_bbox == null and options.page_rotation == null and options.extraction_status == null and options.confidence == null and !options.ocr_used and !options.ocr_attempted and options.ocr_confidence == null and options.ocr_bbox == null and !options.transcript_used and options.transcript_confidence == null and options.extraction_warning == null) return;
+    if (options.page_number == null and options.page_label == null and options.page_bbox == null and options.page_rotation == null and options.extraction_status == null and options.confidence == null and !options.ocr_used and !options.ocr_attempted and options.ocr_confidence == null and options.ocr_bbox == null and options.ocr_failure_stage == null and !options.transcript_used and options.transcript_confidence == null and options.extraction_warning == null) return;
 
     var format = std.json.ObjectMap.empty;
     errdefer {
@@ -223,6 +233,11 @@ fn appendFormatProvenance(
     try format.put(alloc, try alloc.dupe(u8, "ocr_used"), .{ .bool = options.ocr_used });
     try format.put(alloc, try alloc.dupe(u8, "ocr_attempted"), .{ .bool = options.ocr_attempted });
     if (options.ocr_render_dpi) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_render_dpi"), .{ .integer = value });
+    if (options.ocr_effective_render_dpi) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_effective_render_dpi"), .{ .integer = value });
+    if (options.ocr_rendered_width) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_rendered_width"), .{ .integer = value });
+    if (options.ocr_rendered_height) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_rendered_height"), .{ .integer = value });
+    if (options.ocr_rendered_bytes) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_rendered_bytes"), .{ .integer = @intCast(value) });
+    if (options.ocr_failure_stage) |value| try putString(alloc, &format, "ocr_failure_stage", value);
     if (options.ocr_trigger_reasons) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_trigger_reasons"), .{ .string = try alloc.dupe(u8, value) });
     if (options.ocr_embedded_quality) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_embedded_quality"), .{ .string = try alloc.dupe(u8, value) });
     if (options.ocr_output_quality) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_output_quality"), .{ .string = try alloc.dupe(u8, value) });
@@ -338,6 +353,13 @@ test "append artifact fields stores unit-local and document-global provenance" {
         .page_rotation = 90,
         .extraction_method = "pdf_text",
         .confidence = 0.94,
+        .ocr_attempted = true,
+        .ocr_render_dpi = 150,
+        .ocr_effective_render_dpi = 120,
+        .ocr_rendered_width = 1000,
+        .ocr_rendered_height = 1500,
+        .ocr_rendered_bytes = 42_000,
+        .ocr_failure_stage = "inference",
     });
     const provenance = obj.get("provenance").?.object;
     try std.testing.expectEqualStrings("unit", provenance.get("offset_basis").?.string);
@@ -356,6 +378,13 @@ test "append artifact fields stores unit-local and document-global provenance" {
     try std.testing.expectEqualStrings("pdf_text", format_provenance.get("extraction_method").?.string);
     try std.testing.expectEqual(@as(f64, 0.94), provenance.get("confidence").?.float);
     try std.testing.expectEqual(@as(f64, 0.94), format_provenance.get("confidence").?.float);
+    try std.testing.expectEqual(@as(i64, 150), provenance.get("ocr_render_dpi").?.integer);
+    try std.testing.expectEqual(@as(i64, 120), provenance.get("ocr_effective_render_dpi").?.integer);
+    try std.testing.expectEqual(@as(i64, 1000), provenance.get("ocr_rendered_width").?.integer);
+    try std.testing.expectEqual(@as(i64, 1500), provenance.get("ocr_rendered_height").?.integer);
+    try std.testing.expectEqual(@as(i64, 42_000), provenance.get("ocr_rendered_bytes").?.integer);
+    try std.testing.expectEqualStrings("inference", provenance.get("ocr_failure_stage").?.string);
+    try std.testing.expectEqualStrings("inference", format_provenance.get("ocr_failure_stage").?.string);
     try std.testing.expect(!format_provenance.get("ocr_used").?.bool);
     try std.testing.expectEqual(@as(i64, 5), provenance.get("unit_char_start").?.integer);
     try std.testing.expectEqual(@as(i64, 10), provenance.get("unit_char_end").?.integer);

@@ -8767,14 +8767,48 @@ fn downloadReadBatchContent(
 ) !scraping.DownloadedContent {
     if (current_bytes >= max_bytes) return error.ReadBatchTooLarge;
     const remaining = max_bytes - current_bytes;
-    var bounded_security = if (self.config.content_security) |cfg| cfg else scraping.ContentSecurityConfig{};
     const remaining_u64: u64 = @intCast(remaining);
-    bounded_security.max_download_size_bytes = if (bounded_security.max_download_size_bytes) |configured|
-        @min(configured, remaining_u64)
-    else
-        remaining_u64;
+    var bounded_security = boundedReadContentSecurity(self.config.content_security, url, remaining_u64);
     const s3_credentials = if (self.config.s3_credentials) |*cfg| cfg else null;
     return try scraping.downloadContentAlloc(alloc, url, &bounded_security, s3_credentials);
+}
+
+fn boundedReadContentSecurity(
+    configured: ?scraping.ContentSecurityConfig,
+    url: []const u8,
+    remaining_bytes: u64,
+) scraping.ContentSecurityConfig {
+    var bounded = configured orelse scraping.ContentSecurityConfig{};
+    // Generated OCR pages are already resident, trusted Antfly data. Keep the
+    // inference batch cap, but do not let the unrelated remote-download cap
+    // reject an internally rendered data URI. HTTP(S) sources retain every
+    // configured remote-content restriction.
+    if (std.mem.startsWith(u8, url, "data:")) {
+        bounded.max_download_size_bytes = remaining_bytes;
+    } else {
+        bounded.max_download_size_bytes = if (bounded.max_download_size_bytes) |limit|
+            @min(limit, remaining_bytes)
+        else
+            remaining_bytes;
+    }
+    return bounded;
+}
+
+test "read content caps internal data images by inference budget and preserves remote limits" {
+    const configured = scraping.ContentSecurityConfig{
+        .block_private_ips = true,
+        .max_download_size_bytes = 1024,
+        .max_image_dimension = 8192,
+    };
+    const inline_security = boundedReadContentSecurity(configured, "data:image/png;base64,AA==", 64 * 1024);
+    try std.testing.expectEqual(@as(?u64, 64 * 1024), inline_security.max_download_size_bytes);
+    try std.testing.expectEqual(@as(?bool, true), inline_security.block_private_ips);
+    try std.testing.expectEqual(@as(?u32, 8192), inline_security.max_image_dimension);
+
+    const remote = boundedReadContentSecurity(configured, "https://example.com/page.png", 64 * 1024);
+    try std.testing.expectEqual(@as(?u64, 1024), remote.max_download_size_bytes);
+    const tighter_batch = boundedReadContentSecurity(configured, "https://example.com/page.png", 512);
+    try std.testing.expectEqual(@as(?u64, 512), tighter_batch.max_download_size_bytes);
 }
 
 fn readBatchMaxBytes() usize {

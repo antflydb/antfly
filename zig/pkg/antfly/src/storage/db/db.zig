@@ -21604,14 +21604,19 @@ fn completeDocumentExtractionGeneratedText(
         if (config.ocr_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_ocr")) {
             unit.ocr_attempted = true;
             unit.ocr_render_dpi = if (std.mem.eql(u8, extraction.route_type, "pdf")) config.ocr_render_dpi else null;
-            const rendered = if (std.mem.eql(u8, extraction.route_type, "pdf"))
-                pdf_session.?.renderPagePngAlloc(alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels) catch |err| {
+            const rendered = if (std.mem.eql(u8, extraction.route_type, "pdf")) blk: {
+                const page = pdf_session.?.renderPagePngAdaptiveAlloc(alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels, config.ocr_max_rendered_dimension) catch |err| {
                     if (enrichment_runtime_mod.isRetryableEnrichmentError(err)) return err;
+                    try setGeneratedUnitFailureStage(alloc, unit, .ocr, "render");
                     try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, err);
                     continue;
-                }
-            else
-                null;
+                };
+                unit.ocr_effective_render_dpi = page.effective_dpi;
+                unit.ocr_rendered_width = page.width;
+                unit.ocr_rendered_height = page.height;
+                unit.ocr_rendered_bytes = page.png.len;
+                break :blk page.png;
+            } else null;
             defer if (rendered) |png| alloc.free(png);
             const parts_json = if (rendered) |png|
                 try document_extraction_mod.ocrPagePartsJsonAlloc(alloc, config, extraction.route_type, source_content_type, unit.*, png)
@@ -21626,12 +21631,14 @@ fn completeDocumentExtractionGeneratedText(
                 .content_type = "text/plain",
             }) catch |err| {
                 if (enrichment_runtime_mod.isRetryableEnrichmentError(err)) return err;
+                try setGeneratedUnitFailureStage(alloc, unit, .ocr, "inference");
                 try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, err);
                 continue;
             };
             errdefer alloc.free(produced);
             applyGeneratedUnitText(alloc, unit, produced, "ocr_text", "completed", .ocr, config.ocr_quality, document_extraction_mod.effectiveOcrPrompt(config)) catch |err| {
                 if (enrichment_runtime_mod.isRetryableEnrichmentError(err)) return err;
+                try setGeneratedUnitFailureStage(alloc, unit, .ocr, "inference");
                 try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, err);
                 continue;
             };
@@ -21754,6 +21761,13 @@ fn markGeneratedUnitTextFailure(alloc: Allocator, unit: *document_extraction_mod
     }
 }
 
+fn setGeneratedUnitFailureStage(alloc: Allocator, unit: *document_extraction_mod.Unit, kind: GeneratedUnitTextKind, stage: []const u8) !void {
+    if (kind != .ocr) return;
+    const owned = try alloc.dupe(u8, stage);
+    if (unit.ocr_failure_stage) |value| alloc.free(value);
+    unit.ocr_failure_stage = owned;
+}
+
 const ParsedGeneratedUnitText = struct {
     text: []u8,
     confidence: ?f64 = null,
@@ -21838,6 +21852,11 @@ fn documentGeneratedTextPartsJsonAlloc(
         .source_sha256 = unit.source_sha256,
         .ocr_attempted = unit.ocr_attempted,
         .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+        .ocr_rendered_width = unit.ocr_rendered_width,
+        .ocr_rendered_height = unit.ocr_rendered_height,
+        .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+        .ocr_failure_stage = unit.ocr_failure_stage,
         .ocr_trigger_reasons = unit.ocr_trigger_reasons,
         .ocr_embedded_quality = unit.ocr_embedded_quality,
         .ocr_output_quality = unit.ocr_output_quality,
@@ -22518,6 +22537,11 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .ocr_used = unit.ocr_used,
         .ocr_attempted = unit.ocr_attempted,
         .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+        .ocr_rendered_width = unit.ocr_rendered_width,
+        .ocr_rendered_height = unit.ocr_rendered_height,
+        .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+        .ocr_failure_stage = unit.ocr_failure_stage,
         .ocr_trigger_reasons = unit.ocr_trigger_reasons,
         .ocr_embedded_quality = unit.ocr_embedded_quality,
         .ocr_output_quality = unit.ocr_output_quality,
@@ -22572,6 +22596,15 @@ fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extra
         std.mem.writeInt(u16, &dpi_buf, dpi, .big);
         hasher.update(&dpi_buf);
     }
+    if (unit.ocr_effective_render_dpi) |dpi| {
+        var dpi_buf: [@sizeOf(u16)]u8 = undefined;
+        std.mem.writeInt(u16, &dpi_buf, dpi, .big);
+        hasher.update(&dpi_buf);
+    }
+    if (unit.ocr_rendered_width) |value| hasher.update(std.mem.asBytes(&value));
+    if (unit.ocr_rendered_height) |value| hasher.update(std.mem.asBytes(&value));
+    if (unit.ocr_rendered_bytes) |value| hasher.update(std.mem.asBytes(&value));
+    if (unit.ocr_failure_stage) |value| hasher.update(value);
     if (unit.ocr_trigger_reasons) |value| hasher.update(value);
     if (unit.ocr_embedded_quality) |value| hasher.update(value);
     if (unit.ocr_output_quality) |value| hasher.update(value);
@@ -22811,6 +22844,11 @@ fn documentUnitPayloadAlloc(
         .confidence = documentUnitConfidence(unit),
         .ocr_attempted = unit.ocr_attempted,
         .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+        .ocr_rendered_width = unit.ocr_rendered_width,
+        .ocr_rendered_height = unit.ocr_rendered_height,
+        .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+        .ocr_failure_stage = unit.ocr_failure_stage,
         .ocr_trigger_reasons = unit.ocr_trigger_reasons,
         .ocr_embedded_quality = unit.ocr_embedded_quality,
         .ocr_output_quality = unit.ocr_output_quality,
@@ -22829,6 +22867,11 @@ fn documentUnitPayloadAlloc(
             .ocr_used = unit.ocr_used,
             .ocr_attempted = unit.ocr_attempted,
             .ocr_render_dpi = unit.ocr_render_dpi,
+            .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+            .ocr_rendered_width = unit.ocr_rendered_width,
+            .ocr_rendered_height = unit.ocr_rendered_height,
+            .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+            .ocr_failure_stage = unit.ocr_failure_stage,
             .ocr_trigger_reasons = unit.ocr_trigger_reasons,
             .ocr_embedded_quality = unit.ocr_embedded_quality,
             .ocr_output_quality = unit.ocr_output_quality,
@@ -22858,6 +22901,11 @@ fn documentUnitPayloadAlloc(
                 .ocr_used = unit.ocr_used,
                 .ocr_attempted = unit.ocr_attempted,
                 .ocr_render_dpi = unit.ocr_render_dpi,
+                .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+                .ocr_rendered_width = unit.ocr_rendered_width,
+                .ocr_rendered_height = unit.ocr_rendered_height,
+                .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+                .ocr_failure_stage = unit.ocr_failure_stage,
                 .ocr_trigger_reasons = unit.ocr_trigger_reasons,
                 .ocr_embedded_quality = unit.ocr_embedded_quality,
                 .ocr_output_quality = unit.ocr_output_quality,
@@ -23497,6 +23545,7 @@ fn documentExtractionManifestPayloadAlloc(
         try appendJsonFieldString(alloc, &out, &detail_first, "unit_id", unit.unit_id);
         try appendJsonFieldString(alloc, &out, &detail_first, "retained_method", unit.method);
         try appendJsonFieldString(alloc, &out, &detail_first, "error_message", unit.extraction_warning orelse "OCR failed without a recorded cause");
+        if (unit.ocr_failure_stage) |stage| try appendJsonFieldString(alloc, &out, &detail_first, "failure_stage", stage);
         try appendJsonFieldBool(alloc, &out, &detail_first, "retryable", true);
         try out.append(alloc, '}');
     }
