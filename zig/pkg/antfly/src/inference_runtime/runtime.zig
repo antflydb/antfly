@@ -129,7 +129,7 @@ fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
     return null;
 }
 
-fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
+pub fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
     const separator = std.mem.indexOfScalar(u8, value, ':') orelse return error.InvalidArguments;
     const kind_name = value[0..separator];
     var model_name = value[separator + 1 ..];

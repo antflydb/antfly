@@ -2735,21 +2735,17 @@ fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
 }
 
 fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
-    const separator = std.mem.indexOfScalar(u8, value, ':') orelse return error.InvalidArguments;
-    const kind_name = value[0..separator];
-    var model_name = value[separator + 1 ..];
-    var backend: ?inference.backends.BackendType = null;
-    if (std.mem.indexOfScalar(u8, model_name, ':')) |backend_separator| {
-        const backend_name = model_name[0..backend_separator];
-        backend = antfly.inference_runtime.parseBackendType(backend_name) orelse return error.InvalidArguments;
-        model_name = model_name[backend_separator + 1 ..];
-    }
-    if (model_name.len == 0) return error.InvalidArguments;
-    return .{
-        .kind = parsePreloadModelKind(kind_name) orelse return error.InvalidArguments,
-        .name = model_name,
-        .backend = backend,
-    };
+    return antfly.inference_runtime.parsePreloadModelFlag(value);
+}
+
+test "standalone preload preserves artifact variant suffixes" {
+    const variant = try parsePreloadModelFlag("generator:hf:owner/model:gguf:Q8_0");
+    try std.testing.expectEqualStrings("hf:owner/model:gguf:Q8_0", variant.name);
+    try std.testing.expectEqual(@as(?inference.backends.BackendType, null), variant.backend);
+
+    const explicit_backend = try parsePreloadModelFlag("generator:cuda:hf:owner/model:gguf:Q8_0");
+    try std.testing.expectEqualStrings("hf:owner/model:gguf:Q8_0", explicit_backend.name);
+    try std.testing.expectEqual(inference.backends.BackendType.cuda, explicit_backend.backend.?);
 }
 
 fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConfig {
@@ -4104,6 +4100,8 @@ test "parse cli accepts canonical host port and models dir flags" {
         "/tmp/ml",
         "--preload-model",
         "generator:metal:gemma-e2b",
+        "--preload-model",
+        "generator:hf:owner/model:gguf:Q8_0",
         "--data-dir",
         "/tmp/antfly-data",
     };
@@ -4114,10 +4112,12 @@ test "parse cli accepts canonical host port and models dir flags" {
     try std.testing.expectEqual(@as(u16, 8080), cfg.bind_port.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference_models_dir.?);
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference_ml_dir.?);
-    try std.testing.expectEqual(@as(usize, 1), cfg.inference_preload_models.items.len);
+    try std.testing.expectEqual(@as(usize, 2), cfg.inference_preload_models.items.len);
     try std.testing.expectEqual(inference.server.WarmModelKind.generator, cfg.inference_preload_models.items[0].kind);
     try std.testing.expectEqualStrings("gemma-e2b", cfg.inference_preload_models.items[0].name);
     try std.testing.expectEqual(inference.backends.BackendType.metal, cfg.inference_preload_models.items[0].backend.?);
+    try std.testing.expectEqualStrings("hf:owner/model:gguf:Q8_0", cfg.inference_preload_models.items[1].name);
+    try std.testing.expectEqual(@as(?inference.backends.BackendType, null), cfg.inference_preload_models.items[1].backend);
     try std.testing.expectEqualStrings("/tmp/antfly-data", cfg.data_dir.?);
 }
 

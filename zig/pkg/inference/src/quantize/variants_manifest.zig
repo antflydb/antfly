@@ -465,11 +465,10 @@ fn florence2FormatSuffixFromGgufName(name: []const u8) []const u8 {
     const dot = std.mem.lastIndexOfScalar(u8, stem, '.') orelse return "";
     const suffix = stem[dot + 1 ..];
     const canonical = canonicalFormatSuffix(suffix);
-    if (canonical.len == 0) return "";
-    inline for (.{ "Q1_0", "Q2_K", "Q3_K", "Q4_0", "Q4_1", "Q4_K", "Q5_0", "Q5_1", "Q5_K", "Q6_K", "Q8_0", "Q8_1", "Q8_K" }) |known| {
-        if (std.mem.eql(u8, canonical, known)) return known;
-    }
-    return "";
+    // Only a genuinely unsuffixed filename denotes the F32 default. Explicit
+    // F32/FP32 suffixes remain variants, and newer GGUF formats (F16, BF16,
+    // IQ*, vendor formats) retain their selector instead of being mislabeled.
+    return if (canonical.len == 0) "F32" else canonical;
 }
 
 fn listFileNames(allocator: Allocator, io: std.Io, model_dir: []const u8) !std.ArrayListUnmanaged([]u8) {
@@ -603,6 +602,13 @@ test "Florence2 GGUF names leave F32 unsuffixed" {
     const q4_name = try florence2GgufName(std.testing.allocator, "q4_k");
     defer std.testing.allocator.free(q4_name);
     try std.testing.expectEqualStrings("florence-2-base.Q4_K.gguf", q4_name);
+}
+
+test "Florence2 manifest format parsing never treats suffixed files as the F32 default" {
+    try std.testing.expectEqualStrings("", florence2FormatSuffixFromGgufName("florence2.gguf"));
+    try std.testing.expectEqualStrings("F32", florence2FormatSuffixFromGgufName("florence2.F32.gguf"));
+    try std.testing.expectEqualStrings("F16", florence2FormatSuffixFromGgufName("florence2.F16.gguf"));
+    try std.testing.expectEqualStrings("IQ4_XS", florence2FormatSuffixFromGgufName("florence2.IQ4_XS.gguf"));
 }
 
 test "ClipClap variants manifest indexes complete GGUF and ONNX variants" {

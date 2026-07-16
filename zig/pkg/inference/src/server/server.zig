@@ -1343,7 +1343,7 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         model_path: []const u8,
         artifact_selection: manifest_mod.ArtifactSelection,
-    ) !?[]u8 {
+    ) !?backends_mod.ortgenai.PreparedGenerativeModelPackage {
         if (artifact_selection.quantization == null)
             return backends_mod.ortgenai.prepareGenerativeModelPackage(allocator, model_path);
 
@@ -1385,10 +1385,10 @@ pub const Node = struct {
                 return;
             }
 
-            const prepared_model_dir = try prepareOnnxGeneratorModelDir(allocator, model_path, artifact_selection) orelse
+            var prepared_package = try prepareOnnxGeneratorModelDir(allocator, model_path, artifact_selection) orelse
                 return error.UnsupportedGeneratorProvider;
-            defer allocator.free(prepared_model_dir);
-            defer backends_mod.ortgenai.releaseGenerativeModelPackage(prepared_model_dir);
+            defer prepared_package.deinit();
+            const prepared_model_dir = prepared_package.path;
 
             var manifest = try manifest_mod.loadFromDir(allocator, prepared_model_dir);
             defer manifest.deinit();
@@ -3250,11 +3250,11 @@ pub const Node = struct {
                 // artifact or local filesystem and must remain terminal; they
                 // are not evidence that the configured ONNX provider is
                 // unavailable.
-                const ort_model_dir = prepareOnnxGeneratorModelDir(ctx.allocator, model_path, artifact_selection) catch |err|
+                var ort_package = prepareOnnxGeneratorModelDir(ctx.allocator, model_path, artifact_selection) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
-                defer if (ort_model_dir) |prepared| ctx.allocator.free(prepared);
-                defer if (ort_model_dir) |prepared| ortgenai.releaseGenerativeModelPackage(prepared);
-                if (ort_model_dir) |prepared_model_dir| {
+                defer if (ort_package) |*package| package.deinit();
+                if (ort_package) |*package| {
+                    const prepared_model_dir = package.path;
                     if (config.grammar != null) {
                         return ctx.status(400).json(.{
                             .@"error" = "INVALID_REQUEST",

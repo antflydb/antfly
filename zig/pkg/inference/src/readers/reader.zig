@@ -155,7 +155,7 @@ const VlmLoadedReader = struct {
 const GenAiLoadedReader = struct {
     allocator: std.mem.Allocator,
     parser_kind: ParserKind,
-    prepared_model_dir: if (build_options.enable_onnx) []u8 else void,
+    prepared_package: if (build_options.enable_onnx) ortgenai.PreparedGenerativeModelPackage else void,
     model: if (build_options.enable_onnx) ortgenai.GenAiModel else void,
 
     pub fn loadFromDir(
@@ -167,11 +167,11 @@ const GenAiLoadedReader = struct {
         const parser_kind = try detectParserKind(allocator, model_path);
         if (parser_kind != .moondream) return error.InvalidModelForReading;
 
-        const prepared_model_dir = (try ortgenai.prepareGenerativeModelPackage(allocator, model_path)) orelse
+        var prepared_package = (try ortgenai.prepareGenerativeModelPackage(allocator, model_path)) orelse
             return error.InvalidModelForReading;
-        errdefer allocator.free(prepared_model_dir);
+        errdefer prepared_package.deinit();
 
-        const model = try ortgenai.GenAiModel.load(allocator, prepared_model_dir);
+        const model = try ortgenai.GenAiModel.load(allocator, prepared_package.path);
         errdefer {
             var model_mut = model;
             model_mut.deinit();
@@ -180,7 +180,7 @@ const GenAiLoadedReader = struct {
         return .{
             .allocator = allocator,
             .parser_kind = parser_kind,
-            .prepared_model_dir = prepared_model_dir,
+            .prepared_package = prepared_package,
             .model = model,
         };
     }
@@ -188,7 +188,7 @@ const GenAiLoadedReader = struct {
     pub fn deinit(self: *GenAiLoadedReader) void {
         if (!build_options.enable_onnx) return;
         self.model.deinit();
-        self.allocator.free(self.prepared_model_dir);
+        self.prepared_package.deinit();
     }
 
     pub fn read(self: *GenAiLoadedReader, image_data: []const u8, options: ReadOptions) !Result {
