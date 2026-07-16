@@ -661,11 +661,11 @@ pub fn parseConfig(alloc: Allocator, raw: []const u8) !Config {
     config.checksum_field = try dupeSourceStringField(alloc, object, "checksum_field");
     config.version_field = try dupeSourceStringField(alloc, object, "version_field");
     config.last_modified_field = try dupeSourceStringField(alloc, object, "last_modified_field");
-    config.html_strip_tags = boolField(object, "html_strip_tags") orelse true;
-    config.ocr_enabled = boolField(object, "ocr_fallback") orelse false;
+    config.html_strip_tags = (try boolField(object, "html_strip_tags")) orelse true;
+    config.ocr_enabled = (try boolField(object, "ocr_fallback")) orelse false;
     config.ocr_config_json = try parseOptionalProducerConfigJsonAlloc(alloc, object, "ocr", &config.ocr_enabled);
     try parseOcrOptions(alloc, object, &config);
-    config.transcription_enabled = boolField(object, "transcribe_audio") orelse false;
+    config.transcription_enabled = (try boolField(object, "transcribe_audio")) orelse false;
     config.transcription_config_json = try parseOptionalProducerConfigJsonAlloc(alloc, object, "transcription", &config.transcription_enabled);
     config.route_preset = try parseRoutePreset(object);
     config.routes = try parseRoutesAlloc(alloc, object);
@@ -685,15 +685,15 @@ fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config
         else
             return error.InvalidDocumentExtractionConfig;
     }
-    if (intField(ocr, "render_dpi")) |dpi| {
+    if (try intField(ocr, "render_dpi")) |dpi| {
         if (dpi < 72 or dpi > 600) return error.InvalidDocumentExtractionConfig;
         config.ocr_render_dpi = @intCast(dpi);
     }
-    if (intField(ocr, "max_rendered_pixels")) |pixels| {
+    if (try intField(ocr, "max_rendered_pixels")) |pixels| {
         if (pixels < 1 or pixels > 100_000_000) return error.InvalidDocumentExtractionConfig;
         config.ocr_max_rendered_pixels = @intCast(pixels);
     }
-    if (intField(ocr, "max_rendered_dimension")) |dimension| {
+    if (try intField(ocr, "max_rendered_dimension")) |dimension| {
         if (dimension < 512 or dimension > 16_384) return error.InvalidDocumentExtractionConfig;
         config.ocr_max_rendered_dimension = @intCast(dimension);
     }
@@ -715,39 +715,40 @@ fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config
     const quality_value = ocr.get("quality") orelse return;
     if (quality_value != .object) return error.InvalidDocumentExtractionConfig;
     const quality = quality_value.object;
-    if (intField(quality, "min_content_chars")) |v| {
+    if (try intField(quality, "min_content_chars")) |v| {
         if (v < 0) return error.InvalidDocumentExtractionConfig;
         config.ocr_quality.min_content_chars = @intCast(v);
     }
-    if (intField(quality, "garbled_min_words")) |v| {
+    if (try intField(quality, "garbled_min_words")) |v| {
         if (v < 0) return error.InvalidDocumentExtractionConfig;
         config.ocr_quality.garbled_min_words = @intCast(v);
     }
-    if (intField(quality, "garbled_sample_words")) |v| {
+    if (try intField(quality, "garbled_sample_words")) |v| {
         if (v < 1) return error.InvalidDocumentExtractionConfig;
         config.ocr_quality.garbled_sample_words = @intCast(v);
     }
-    if (floatField(quality, "max_single_char_word_ratio")) |v| config.ocr_quality.max_single_char_word_ratio = try ratio(v);
-    if (intField(quality, "substantial_line_min_chars")) |v| {
+    if (try floatField(quality, "max_single_char_word_ratio")) |v| config.ocr_quality.max_single_char_word_ratio = try ratio(v);
+    if (try intField(quality, "substantial_line_min_chars")) |v| {
         if (v < 1) return error.InvalidDocumentExtractionConfig;
         config.ocr_quality.substantial_line_min_chars = @intCast(v);
     }
-    if (floatField(quality, "max_corrupted_line_ratio")) |v| config.ocr_quality.max_corrupted_line_ratio = try ratio(v);
-    if (floatField(quality, "font_corruption_score_threshold")) |v| config.ocr_quality.font_corruption_score_threshold = try ratio(v);
-    if (floatField(quality, "max_replacement_char_ratio")) |v| config.ocr_quality.max_replacement_char_ratio = try ratio(v);
+    if (try floatField(quality, "max_corrupted_line_ratio")) |v| config.ocr_quality.max_corrupted_line_ratio = try ratio(v);
+    if (try floatField(quality, "font_corruption_score_threshold")) |v| config.ocr_quality.font_corruption_score_threshold = try ratio(v);
+    if (try floatField(quality, "max_replacement_char_ratio")) |v| config.ocr_quality.max_replacement_char_ratio = try ratio(v);
 }
 
-fn intField(object: std.json.ObjectMap, field: []const u8) ?i64 {
+fn intField(object: std.json.ObjectMap, field: []const u8) !?i64 {
     const value = object.get(field) orelse return null;
-    return if (value == .integer) value.integer else null;
+    if (value != .integer) return error.InvalidDocumentExtractionConfig;
+    return value.integer;
 }
 
-fn floatField(object: std.json.ObjectMap, field: []const u8) ?f64 {
+fn floatField(object: std.json.ObjectMap, field: []const u8) !?f64 {
     const value = object.get(field) orelse return null;
     return switch (value) {
         .float => |v| v,
         .integer => |v| @floatFromInt(v),
-        else => null,
+        else => error.InvalidDocumentExtractionConfig,
     };
 }
 
@@ -779,11 +780,11 @@ fn dupeSourceStringField(alloc: Allocator, object: std.json.ObjectMap, field: []
     return try dupeStringField(alloc, object, field);
 }
 
-fn boolField(object: std.json.ObjectMap, field: []const u8) ?bool {
+fn boolField(object: std.json.ObjectMap, field: []const u8) !?bool {
     const value = object.get(field) orelse return null;
     return switch (value) {
         .bool => |v| v,
-        else => null,
+        else => error.InvalidDocumentExtractionConfig,
     };
 }
 
@@ -800,7 +801,7 @@ fn parseOptionalProducerConfigJsonAlloc(
             return "";
         },
         .object => |producer_object| {
-            enabled.* = boolField(producer_object, "enabled") orelse true;
+            enabled.* = (try boolField(producer_object, "enabled")) orelse true;
             const config_value = producer_object.get("config") orelse .null;
             if (config_value == .null) return "";
             if (config_value != .object) return error.InvalidDocumentExtractionConfig;
@@ -3416,6 +3417,18 @@ test "generated text provider config is validated while parsing extraction confi
     ));
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
         \\{"ocr":{"enabled":true,"config":"not-an-object"}}
+    ));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
+        \\{"ocr":{"enabled":"false","config":{"provider":"antfly"}}}
+    ));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
+        \\{"ocr":{"enabled":true,"render_dpi":"150","config":{"provider":"antfly"}}}
+    ));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
+        \\{"ocr":{"enabled":true,"quality":{"min_content_chars":"50"},"config":{"provider":"antfly"}}}
+    ));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
+        \\{"ocr_fallback":"false"}
     ));
 }
 
