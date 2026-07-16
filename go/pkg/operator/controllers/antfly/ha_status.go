@@ -1059,19 +1059,32 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		plan.DesiredStandbyCount++
 		// Standby-local observation errors create a configured status entry even
 		// before the primary owns a replication slot. Runtime-owned portable
-		// seeding activates that slot only at the end of the seed chain, so entry
-		// presence alone must not turn initial bootstrap into ResumeSlot. A typed
-		// primary slot observation carries its required nonzero timeline.
-		if !ok || (haStandbyUsesRuntimeOwnedSeedCapture(standby) && observed.TimelineID == 0) {
+		// seeding activates that slot only at the end of the seed chain. A typed
+		// primary slot observation with a nonzero timeline can still describe the
+		// intermediate "seeding" lifecycle, so only active runtime state or a
+		// completed, validated ActivateSeededSlot receipt proves bootstrap crossed
+		// the activation boundary.
+		runtimeOwnedSeed := haStandbyUsesRuntimeOwnedSeedCapture(standby)
+		runtimeOwnedSeedTargetLSN := uint64(0)
+		runtimeOwnedSeedActivated := false
+		if runtimeOwnedSeed {
+			runtimeOwnedSeedTargetLSN = haRuntimeOwnedSeedTargetLSN(status, standby, slotName)
+			runtimeOwnedSeedActivated = observed.Active ||
+				haRuntimeOwnedSeedActivationCompleted(status, standby, slotName, runtimeOwnedSeedTargetLSN)
+		}
+		if !ok || (runtimeOwnedSeed && !runtimeOwnedSeedActivated) {
 			plan.UnhealthyStandbyCount++
 			seedTargetLSN := initialStandbyLSN(standby, status.PrimaryLSN)
-			if haStandbyUsesRuntimeOwnedSeedCapture(standby) {
-				seedTargetLSN = haRuntimeOwnedInitialSeedTargetLSN(status)
+			if runtimeOwnedSeed {
+				seedTargetLSN = runtimeOwnedSeedTargetLSN
+				if seedTargetLSN == 0 {
+					seedTargetLSN = haRuntimeOwnedInitialSeedTargetLSN(status)
+				}
 			}
 			if seedTargetLSN == 0 {
 				continue
 			}
-			if haStandbyUsesRuntimeOwnedSeedCapture(standby) {
+			if runtimeOwnedSeed {
 				plan.Actions = append(plan.Actions, haSeedCompletionActions(
 					standby,
 					slotName,
@@ -1355,6 +1368,53 @@ func haRuntimeOwnedInitialSeedTargetLSN(status *antflyv1.HAStatus) uint64 {
 		return 1
 	}
 	return 0
+}
+
+func haRuntimeOwnedSeedTargetLSN(status *antflyv1.HAStatus, standby antflyv1.HAStandbySpec, slotName string) uint64 {
+	if status == nil || !haStandbyUsesRuntimeOwnedSeedCapture(standby) {
+		return 0
+	}
+	explicitGeneration := ""
+	if standby.SeedArtifact != nil {
+		explicitGeneration = strings.TrimSpace(standby.SeedArtifact.Generation)
+	}
+	for _, action := range status.PlannedActions {
+		if !haPlannedActionKindIsPortableArtifact(haActionKind(action.Kind)) ||
+			strings.TrimSpace(action.StandbyName) != strings.TrimSpace(standby.Name) ||
+			strings.TrimSpace(action.SlotName) != strings.TrimSpace(slotName) ||
+			action.TargetLSN == 0 ||
+			(explicitGeneration != "" && strings.TrimSpace(action.SeedArtifactGeneration) != explicitGeneration) {
+			continue
+		}
+		return action.TargetLSN
+	}
+	return 0
+}
+
+func haRuntimeOwnedSeedActivationCompleted(
+	status *antflyv1.HAStatus,
+	standby antflyv1.HAStandbySpec,
+	slotName string,
+	targetLSN uint64,
+) bool {
+	if status == nil || targetLSN == 0 || !haStandbyUsesRuntimeOwnedSeedCapture(standby) {
+		return false
+	}
+	generation := haSeedArtifactGeneration(standby, slotName, targetLSN)
+	if generation == "" {
+		return false
+	}
+	for _, action := range status.PlannedActions {
+		if haActionKind(action.Kind) != haActionActivateSeededSlot ||
+			strings.TrimSpace(action.StandbyName) != strings.TrimSpace(standby.Name) ||
+			strings.TrimSpace(action.SlotName) != strings.TrimSpace(slotName) ||
+			action.TargetLSN != targetLSN ||
+			strings.TrimSpace(action.SeedArtifactGeneration) != generation {
+			continue
+		}
+		return haAdminActionSucceededWithEvidence(action)
+	}
+	return false
 }
 
 func haStandbyMatchesFormerPrimary(status *antflyv1.HAStatus, standbyName string, slotName string) bool {
@@ -2803,14 +2863,7 @@ func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, ta
 			(runtimeOwned && artifact.SourcePVC == nil) {
 			return nil
 		}
-		generation := strings.TrimSpace(artifact.Generation)
-		if generation == "" {
-			prefix := strings.TrimSpace(artifact.GenerationPrefix)
-			if prefix == "" {
-				prefix = "seed"
-			}
-			generation = fmt.Sprintf("%s-%s-%d", prefix, slotName, targetLSN)
-		}
+		generation := haSeedArtifactGeneration(standby, slotName, targetLSN)
 		retention := artifact.RetainGenerations
 		if retention == 0 {
 			retention = 2
@@ -2963,6 +3016,20 @@ func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, ta
 			Reason:           reason,
 		},
 	}
+}
+
+func haSeedArtifactGeneration(standby antflyv1.HAStandbySpec, slotName string, targetLSN uint64) string {
+	if standby.SeedArtifact == nil {
+		return ""
+	}
+	if generation := strings.TrimSpace(standby.SeedArtifact.Generation); generation != "" {
+		return generation
+	}
+	prefix := strings.TrimSpace(standby.SeedArtifact.GenerationPrefix)
+	if prefix == "" {
+		prefix = "seed"
+	}
+	return fmt.Sprintf("%s-%s-%d", prefix, slotName, targetLSN)
 }
 
 func haStandbyUsesRuntimeOwnedSeedCapture(standby antflyv1.HAStandbySpec) bool {

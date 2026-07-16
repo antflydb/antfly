@@ -1553,11 +1553,92 @@ func TestPlanHAInitialPortableSeedIgnoresSyntheticStandbyStatusUntilPrimarySlotO
 		}
 	})
 
-	t.Run("primary observed inactive slot still resumes", func(t *testing.T) {
-		cluster := newCluster(4)
+	t.Run("captured seed keeps the exact chain until activation completes", func(t *testing.T) {
+		cluster := newCluster(0)
+		reconciler := &AntflyClusterReconciler{}
+		reconciler.updateHAStatusAndConditions(cluster)
+		if len(cluster.Status.HAStatus.PlannedActions) != 8 {
+			t.Fatalf("expected initial portable seed chain, got %#v", cluster.Status.HAStatus.PlannedActions)
+		}
+
+		digest := strings.Repeat("a", 64)
+		capture := &cluster.Status.HAStatus.PlannedActions[0]
+		capture.AdminJobName = haAdminDirectAPIName
+		capture.AdminJobPhase = haAdminJobPhaseSucceeded
+		capture.AdminResult = &antflyv1.HAAdminActionResultStatus{
+			SchemaVersion:          1,
+			ActionID:               "seed_capture:initial-standby-a-1",
+			ActionKind:             "seed_capture",
+			ActionTarget:           "initial-standby-a-1",
+			ActionState:            "applied",
+			ActionNodeID:           "primary-a",
+			SlotName:               "standby-a",
+			ManifestID:             "initial-standby-a-1",
+			BackupLSN:              10,
+			CheckpointLSN:          10,
+			EndRecordLSN:           11,
+			SeedArtifactGeneration: "initial-standby-a-1",
+			ManifestSHA256:         digest,
+			CaptureReceiptSHA256:   digest,
+			SeedClusterID:          100,
+			SeedTimelineID:         4,
+			SeedEpoch:              6,
+			SeedSourcePlanSHA256:   digest,
+			SeedFileCount:          2,
+			SeedTotalBytes:         20,
+			SeedGenerationRoot:     "/antflydb/ha/seed-captures/generations/initial-standby-a-1",
+			SeedContentRoot:        "/antflydb/ha/seed-captures/generations/initial-standby-a-1/content",
+			SeedManifestPath:       "/antflydb/ha/seed-captures/generations/initial-standby-a-1/manifest.afha",
+		}
+
+		cluster.Status.HAStatus.PrimaryLSN = 11
+		cluster.Status.HAStatus.Standbys[0].TimelineID = 4
+		cluster.Status.HAStatus.Standbys[0].RestartLSN = 10
+		reconciler.updateHAStatusAndConditions(cluster)
+
+		actions := cluster.Status.HAStatus.PlannedActions
+		if len(actions) != 8 {
+			t.Fatalf("SLOT_SEEDING_PREMATURE_RESUME: captured-but-unactivated portable seed must keep the exact 8-action chain, got %#v", actions)
+		}
+		if actions[0].Kind != string(haActionCaptureSeedArtifact) ||
+			actions[0].AdminJobPhase != haAdminJobPhaseSucceeded ||
+			actions[0].AdminResult == nil {
+			t.Fatalf("CAPTURE_PROGRESS_DROPPED: replan must preserve completed capture evidence, got %#v", actions[0])
+		}
+		for _, action := range actions {
+			if action.TargetLSN != 10 {
+				t.Fatalf("SEED_TARGET_RETARGETED: in-flight portable seed must remain frozen at LSN 10, got %#v", action)
+			}
+		}
+	})
+
+	t.Run("completed slot activation evidence permits an inactive slot to resume", func(t *testing.T) {
+		cluster := newCluster(0)
+		(&AntflyClusterReconciler{}).updateHAStatusAndConditions(cluster)
+		activate := &cluster.Status.HAStatus.PlannedActions[5]
+		digest := strings.Repeat("a", 64)
+		activate.AdminJobName = haAdminDirectAPIName
+		activate.AdminJobPhase = haAdminJobPhaseSucceeded
+		activate.AdminResult = &antflyv1.HAAdminActionResultStatus{
+			SchemaVersion:          1,
+			ActionID:               "seeded_slot_activate:initial-standby-a-1",
+			ActionKind:             "seeded_slot_activate",
+			ActionTarget:           "initial-standby-a-1",
+			ActionState:            "applied",
+			ActionNodeID:           "primary-a",
+			SlotName:               "standby-a",
+			ManifestID:             "base-standby-a-10",
+			CheckpointLSN:          10,
+			SeedArtifactGeneration: "initial-standby-a-1",
+			SeedReceiptSHA256:      digest,
+			CaptureReceiptSHA256:   digest,
+			ManifestSHA256:         digest,
+			AggregateSHA256:        digest,
+		}
+		cluster.Status.HAStatus.Standbys[0].TimelineID = 4
 		plan := planHA(cluster)
 		if len(plan.Actions) != 1 || plan.Actions[0].Kind != haActionResumeSlot {
-			t.Fatalf("expected a genuine primary-observed inactive slot to resume, got %#v", plan.Actions)
+			t.Fatalf("expected a validated activated slot to resume, got %#v", plan.Actions)
 		}
 	})
 }
