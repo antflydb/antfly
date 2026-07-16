@@ -183,6 +183,14 @@ def directory_bytes(path: Path) -> int:
     return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
 
 
+def positive_manifest_metric(manifest: dict[str, Any], key: str) -> int | None:
+    """Return a persisted measurement without accepting booleans or sentinels."""
+    value = manifest.get(key)
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
 def rss_bytes(pid: int) -> int | None:
     try:
         value = subprocess.check_output(
@@ -493,6 +501,23 @@ def main() -> int:
     comparator_index_data = json.loads(comparator_manifest.read_text(encoding="utf-8")) if comparator_manifest.exists() else None
     if comparator_index_data:
         assert_compatible_manifests(index_data, comparator_index_data)
+
+    # A reused index is still an indexed artifact. Preserve the measurements
+    # recorded when it was built instead of emitting nulls that make reuse look
+    # cheaper or less well-qualified than a same-process build.
+    if index_elapsed is None:
+        index_elapsed = positive_manifest_metric(index_data, "index_elapsed_ns")
+    if index_cpu_ns is None:
+        index_cpu_ns = positive_manifest_metric(index_data, "process_cpu_ns")
+    if index_peak_rss is None:
+        index_peak_rss = positive_manifest_metric(index_data, "process_peak_rss_bytes")
+    if comparator_index_data:
+        if comparator_index_elapsed is None:
+            comparator_index_elapsed = positive_manifest_metric(comparator_index_data, "index_elapsed_ns")
+        if comparator_index_cpu_ns is None:
+            comparator_index_cpu_ns = positive_manifest_metric(comparator_index_data, "process_cpu_ns")
+        if comparator_index_peak_rss is None:
+            comparator_index_peak_rss = positive_manifest_metric(comparator_index_data, "process_peak_rss_bytes")
 
     queries = read_jsonl(args.queries)
     fixtures = read_jsonl(args.analyzer_fixtures)

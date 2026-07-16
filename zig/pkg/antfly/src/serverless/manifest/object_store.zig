@@ -18,6 +18,7 @@ const manifest_types = @import("types.zig");
 const manifest_codec = @import("codec.zig");
 const manifest_store = @import("store.zig");
 const object_store_support = @import("../object_store_support.zig");
+
 pub const ObjectStore = struct {
     alloc: std.mem.Allocator,
     opened: object_store_support.OpenedObjectStore,

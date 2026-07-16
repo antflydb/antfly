@@ -52,9 +52,11 @@ The earlier investigation identified these likely costs:
 - Query setup and allocations remained in the hot path.
 - Segment merging did not produce a controlled comparison state.
 
-Some of those findings have been addressed for simple ranked term queries.
-Others remain, particularly compound boolean and phrase execution, benchmark
-result validation, native result identity, and explicit segment-state control.
+Those findings are now addressed for every query class in the V1 kernel
+grammar. The implementation and qualification history below records the format,
+execution, LSM, and server work that closed them. Query shapes outside that
+explicit grammar remain product features rather than inputs to the kernel
+comparison and may retain correctness-first fallback plans.
 
 ## Goals
 
@@ -107,39 +109,51 @@ result validation, native result identity, and explicit segment-state control.
 - `DB.forceCompactTextIndexes()` and scheduled-merge drains provide separate
   maintenance controls.
 
-### Known benchmark gaps
+### Resolved benchmark gaps
 
-- The current `TOP_N` command executes a query, discards its hits and scores,
-  and emits `1`. It cannot prove top-k equivalence.
-- `TOP_N_COUNT` performs top-k search and exact count as two separate queries.
-  Its latency must not be presented as plain top-k latency.
-- The current Lucene-like parser recognizes a small whitespace/`+`/`-`/quote
-  subset. It is not a complete or explicitly versioned query grammar.
-- `include_stored = false` avoids stored bodies, but the DB path still resolves
-  result IDs and document ordinals after search.
-- The indexer drains scheduled merges but does not select or assert an exact
-  segment layout.
-- Analyzer and BM25 compatibility are described in adapter metadata but are not
-  enforced by cross-engine golden tests.
-- Index size, segment layout, peak memory, warmup behavior, and run metadata are
-  not emitted as one machine-readable result bundle.
+- Timed `TOP_N` deliberately returns only an acknowledgement so stdout and JSON
+  serialization are outside the timing. Before timing, the runner sends
+  `VERIFY_TOP_N_COUNT` to both engines and compares exact counts, stable corpus
+  ordinals, cutoff ties, ordering, and scores. A run cannot reach its timing
+  phase if this verification fails.
+- Exact-count work remains a separate operation. `TOP_N_COUNT` is never labeled
+  as plain top-k latency, and the competitive top-k result does not claim an
+  exact total.
+- The accepted input language is the explicitly versioned V1 query grammar,
+  shared by both adapters. Unsupported/skipped counts are recorded and a
+  declared V1 query rejected by either adapter fails the run.
+- The kernel API returns native ordinal/score pairs without stored-body or
+  public-ID projection. Product HTTP results retain normal identity and MVCC
+  semantics in the separate server benchmark.
+- Index manifests declare production or single-segment mode, enumerate the
+  actual layout, and reject unsettled merge debt. Cross-engine preflight
+  requires the same declared mode while preserving each engine's documented
+  production segment policy.
+- Golden analyzer streams, corpus hash/count, BM25 parameters, and the grammar
+  version are checked before correctness or timing.
+- The runner emits the complete machine-readable bundle described below,
+  including raw per-query samples, layout, indexing, memory, resource profiles,
+  warmup settings, build identity, and correctness diagnostics. Reused indexes
+  retain their original indexing elapsed/CPU/RSS measurements from the archived
+  index manifest.
 
-### Known execution gaps
+### Execution status
 
-- `executeBool` has a simple-text fast path, but unsupported shapes fall back to
-  `executeQueryAllScored`, set `k` to the global document count, combine results
-  in hash maps, and sort the full match set.
-- The simple boolean fast path merges postings directly, but its local
-  `FastTermState.advanceTo` currently loops over `next()` rather than using the
-  postings iterator's seek implementation.
-- Phrase search is a filter-first path: it materializes all matching document
-  IDs, creates a scored-hit array, and uses a constant boost as the score. It is
-  not a competitive BM25 phrase scorer.
-- Each segment benefits from the shared collector threshold, but there is no
-  query-specific segment ordering or segment-level maximum-score rejection.
-- Exact counts and top-k collection are not always planned as independent
-  operations, so callers can accidentally pay for more work than their result
-  contract requires.
+- V1 term, union, intersection, and phrase queries use the production postings
+  iterators and bounded global top-k collector. They do not use the
+  `executeQueryAllScored` hash-map/full-sort fallback reserved for unsupported
+  product shapes.
+- Boolean advancement delegates to the postings iterator's seek/skip path;
+  fixed-size stack workspaces cover normal small queries.
+- Phrase execution uses competitive BM25 scoring and defers position decoding
+  until a document survives the cheaper term-level tests. It does not
+  materialize the complete phrase hit set.
+- Block-Max WAND shares its threshold across segments. Highly fragmented
+  snapshots additionally compute query-specific segment bounds, order segments,
+  and reject segments whose strict upper bound cannot enter the result.
+- Exact counts and bounded top-k are separate plans. Competitive pruning may
+  honestly return only a lower-bound total relation; it is never promoted to an
+  exact count.
 
 ## Benchmark A: Embedded Search Kernel
 
