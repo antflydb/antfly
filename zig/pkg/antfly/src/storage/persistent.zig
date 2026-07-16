@@ -1868,6 +1868,19 @@ pub const PersistentIndex = struct {
     }
 
     pub fn prepareMergedSegmentToFile(self: *PersistentIndex, snap: *const index_mod.IndexSnapshot, segment_indices: []const usize) ![]PreparedMergeSegment {
+        return try self.prepareMergedSegmentToFileWithAllocator(self.alloc, snap, segment_indices);
+    }
+
+    /// File-backed merge with an explicit allocator for task-local working
+    /// state. Published mappings, key ranges, and the returned prepared list
+    /// remain owned by the persistent index allocator; only temporary merge
+    /// buffers use `work_alloc`.
+    pub fn prepareMergedSegmentToFileWithAllocator(
+        self: *PersistentIndex,
+        work_alloc: Allocator,
+        snap: *const index_mod.IndexSnapshot,
+        segment_indices: []const usize,
+    ) ![]PreparedMergeSegment {
         if (segment_indices.len == 0) return error.NoSegments;
         const store = &(self.segment_files orelse return error.Unsupported);
         if (store.storage_owner == null) return error.Unsupported;
@@ -1875,8 +1888,8 @@ pub const PersistentIndex = struct {
         const new_seg_id = self.reserveSegmentId();
         errdefer self.deleteSegmentFile(new_seg_id);
 
-        var inputs = try self.alloc.alloc(segment_mod.MergeInput, segment_indices.len);
-        defer self.alloc.free(inputs);
+        var inputs = try work_alloc.alloc(segment_mod.MergeInput, segment_indices.len);
+        defer work_alloc.free(inputs);
         for (segment_indices, 0..) |seg_idx, i| {
             const seg = &snap.segments[seg_idx];
             inputs[i] = .{
@@ -1884,20 +1897,20 @@ pub const PersistentIndex = struct {
                 .deleted = seg.shared.deleted,
             };
         }
-        const index_sort = try segment_mod.commonIndexSortForMergeInputsAlloc(self.alloc, inputs);
-        defer segment_mod.freeIndexSortFields(self.alloc, index_sort);
+        const index_sort = try segment_mod.commonIndexSortForMergeInputsAlloc(work_alloc, inputs);
+        defer segment_mod.freeIndexSortFields(work_alloc, index_sort);
 
         const path = try store.pathAlloc(new_seg_id);
         defer store.allocator.free(path);
 
-        var writer = try store.storage.beginAtomicWrite(self.alloc, path);
+        var writer = try store.storage.beginAtomicWrite(work_alloc, path);
         var writer_active = true;
         errdefer if (writer_active) writer.abort();
 
-        var sink_adapter = AtomicSegmentSink.init(self.alloc, &writer);
+        var sink_adapter = AtomicSegmentSink.init(work_alloc, &writer);
         defer sink_adapter.deinit();
         var sink = sink_adapter.sink();
-        try segment_mod.writeMergedSegmentToSinkWithOptions(self.alloc, &sink, inputs, .{
+        try segment_mod.writeMergedSegmentToSinkWithOptions(work_alloc, &sink, inputs, .{
             .index_sort = index_sort,
         });
         try sink_adapter.flush();

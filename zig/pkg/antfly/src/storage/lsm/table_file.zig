@@ -999,12 +999,15 @@ pub const StreamingEncoder = struct {
     allocator: std.mem.Allocator,
     sink: *TableSink,
     compression_policy: CompressionPolicy,
+    bloom_config: bloom.Config,
     prefix_extractor: PrefixExtractor,
     compression_stats_out: ?*CompressionStats,
     filter_builder: bloom.Builder,
     filter_builder_active: bool = true,
-    prefix_filter_builder: bloom.Builder,
-    prefix_filter_builder_active: bool = true,
+    /// Prefixes are leading key ranges, so equal prefixes are consecutive in
+    /// the sorted table stream. Retain one hash pair per distinct prefix rather
+    /// than sizing a second Bloom filter for every entry in the run.
+    prefix_hashes: std.ArrayListUnmanaged([2]u64) = .empty,
     entry_offsets: std.ArrayListUnmanaged(u32) = .empty,
     blocks: std.ArrayListUnmanaged(OwnedEncodedBlockMeta) = .empty,
     block_bytes: std.ArrayListUnmanaged(u8) = .empty,
@@ -1038,8 +1041,6 @@ pub const StreamingEncoder = struct {
         if (expected_entries > max_entry_count) return error.TableFileTooLarge;
         var filter_builder = try bloom.Builder.init(allocator, expected_entries, options.bloom_config);
         errdefer filter_builder.deinit();
-        var prefix_filter_builder = try bloom.Builder.init(allocator, expected_entries, options.bloom_config);
-        errdefer prefix_filter_builder.deinit();
 
         try sink.appendSlice(magic);
         try sinkAppendU32(sink, version);
@@ -1053,10 +1054,10 @@ pub const StreamingEncoder = struct {
             .allocator = allocator,
             .sink = sink,
             .compression_policy = options.block_compression,
+            .bloom_config = options.bloom_config,
             .prefix_extractor = options.prefix_extractor,
             .compression_stats_out = options.compression_stats,
             .filter_builder = filter_builder,
-            .prefix_filter_builder = prefix_filter_builder,
             .entry_count_offset = entry_count_offset,
             .entry_data_len_offset = entry_data_len_offset,
             .entry_data_start = entry_data_start,
@@ -1065,7 +1066,7 @@ pub const StreamingEncoder = struct {
 
     pub fn deinit(self: *StreamingEncoder) void {
         if (self.filter_builder_active) self.filter_builder.deinit();
-        if (self.prefix_filter_builder_active) self.prefix_filter_builder.deinit();
+        self.prefix_hashes.deinit(self.allocator);
         self.entry_offsets.deinit(self.allocator);
         for (self.blocks.items) |*block| block.deinit(self.allocator);
         self.blocks.deinit(self.allocator);
@@ -1082,7 +1083,7 @@ pub const StreamingEncoder = struct {
     pub fn workingSetBytes(self: *const StreamingEncoder) u64 {
         var bytes: u64 = 0;
         if (self.filter_builder_active) bytes +|= self.filter_builder.bytes.len;
-        if (self.prefix_filter_builder_active) bytes +|= self.prefix_filter_builder.bytes.len;
+        bytes +|= capacityBytes([2]u64, self.prefix_hashes.capacity);
         bytes +|= capacityBytes(u32, self.entry_offsets.capacity);
         bytes +|= capacityBytes(OwnedEncodedBlockMeta, self.blocks.capacity);
         bytes +|= capacityBytes(u8, self.block_bytes.capacity);
@@ -1130,8 +1131,8 @@ pub const StreamingEncoder = struct {
         self.filter_builder.addHashes(hashes[0], hashes[1]);
         try self.block_hashes.append(self.allocator, hashes);
         if (entryPrefixHashes(self.prefix_extractor, entry.namespace_name, entry.key)) |prefix_hashes| {
-            self.prefix_filter_builder.addHashes(prefix_hashes[0], prefix_hashes[1]);
-            try self.block_prefix_hashes.append(self.allocator, prefix_hashes);
+            try appendUniqueConsecutiveHash(self.allocator, &self.prefix_hashes, prefix_hashes);
+            try appendUniqueConsecutiveHash(self.allocator, &self.block_prefix_hashes, prefix_hashes);
         }
         try self.setBlockLargest(entry);
     }
@@ -1151,8 +1152,7 @@ pub const StreamingEncoder = struct {
         self.filter_builder_active = false;
         errdefer filter.deinit(self.allocator);
         const encoded_filter = try filter.encodeInto(self.allocator, &self.encoded_filter_bytes);
-        var prefix_filter = self.prefix_filter_builder.finish();
-        self.prefix_filter_builder_active = false;
+        var prefix_filter = try buildFilterFromHashesAlloc(self.allocator, self.prefix_hashes.items, self.bloom_config);
         defer prefix_filter.deinit(self.allocator);
         const encoded_prefix_filter = try prefix_filter.encodeAlloc(self.allocator);
         defer self.allocator.free(encoded_prefix_filter);
@@ -1267,7 +1267,12 @@ pub const StreamingEncoder = struct {
         errdefer block_filter.deinit(self.allocator);
         var block_prefix_filter = try buildFilterFromHashesAlloc(self.allocator, self.block_prefix_hashes.items, block_filter_config);
         errdefer block_prefix_filter.deinit(self.allocator);
-        const hash_slots = try buildBlockHashSlotsFromHashesAlloc(self.allocator, self.block_hashes.items, self.block_first_entry_index);
+        // Exact lookup already binary-searches entry_offsets within the block.
+        // The former 50%-load open-addressed table was never consulted by a
+        // reader, yet cost at least eight bytes per entry on disk and heap.
+        // Preserve the v9 metadata section with an empty slot vector so old and
+        // new runs remain wire-compatible.
+        const hash_slots = try self.allocator.alloc(u32, 0);
         errdefer self.allocator.free(hash_slots);
 
         const smallest_namespace_name = self.block_smallest_namespace_name;
@@ -1401,7 +1406,7 @@ fn flushEncodedBlock(
     errdefer block_filter.deinit(allocator);
     var block_prefix_filter = try buildPrefixFilterAlloc(allocator, entries[block_first_entry_index .. block_first_entry_index + block_entry_count], prefix_extractor, block_filter_config);
     errdefer block_prefix_filter.deinit(allocator);
-    const hash_slots = try buildBlockHashSlotsAlloc(allocator, entries[block_first_entry_index .. block_first_entry_index + block_entry_count], block_first_entry_index);
+    const hash_slots = try allocator.alloc(u32, 0);
     errdefer allocator.free(hash_slots);
     try blocks.append(allocator, .{
         .relative_offset = block_start,
@@ -1459,14 +1464,23 @@ pub fn buildPrefixFilterAlloc(
     extractor: PrefixExtractor,
     config: bloom.Config,
 ) !bloom.OwnedFilter {
-    var builder = try bloom.Builder.init(allocator, entries.len, config);
-    errdefer builder.deinit();
+    var prefix_hashes = std.ArrayListUnmanaged([2]u64).empty;
+    defer prefix_hashes.deinit(allocator);
     for (entries) |entry| {
         if (entryPrefixHashes(extractor, entry.namespace_name, entry.key)) |hashes| {
-            builder.addHashes(hashes[0], hashes[1]);
+            try appendUniqueConsecutiveHash(allocator, &prefix_hashes, hashes);
         }
     }
-    return builder.finish();
+    return buildFilterFromHashesAlloc(allocator, prefix_hashes.items, config);
+}
+
+fn appendUniqueConsecutiveHash(
+    allocator: std.mem.Allocator,
+    hashes: *std.ArrayListUnmanaged([2]u64),
+    value: [2]u64,
+) !void {
+    if (hashes.items.len > 0 and std.meta.eql(hashes.items[hashes.items.len - 1], value)) return;
+    try hashes.append(allocator, value);
 }
 
 fn buildFilterFromHashesAlloc(
@@ -1514,49 +1528,6 @@ fn compareBytesToPrefixSuccessor(bytes: []const u8, prefix: []const u8, pivot: u
     }
     if (bytes.len <= pivot) return .lt;
     return .eq;
-}
-
-fn buildBlockHashSlotsAlloc(
-    allocator: std.mem.Allocator,
-    entries: []const Entry,
-    first_entry_index: usize,
-) ![]u32 {
-    if (entries.len == 0) return try allocator.alloc(u32, 0);
-    const min_slots = @max(2, entries.len * 2);
-    const slot_count = std.math.ceilPowerOfTwo(usize, min_slots) catch min_slots;
-    const slots = try allocator.alloc(u32, slot_count);
-    @memset(slots, 0);
-    for (entries, 0..) |entry, local_index| {
-        const hashes = entryHashes(entry.namespace_name, entry.key);
-        var slot_index: usize = @intCast(hashes[0] % slots.len);
-        while (slots[slot_index] != 0) {
-            slot_index +%= 1;
-            if (slot_index >= slots.len) slot_index = 0;
-        }
-        slots[slot_index] = @intCast(first_entry_index + local_index + 1);
-    }
-    return slots;
-}
-
-fn buildBlockHashSlotsFromHashesAlloc(
-    allocator: std.mem.Allocator,
-    hashes: []const [2]u64,
-    first_entry_index: usize,
-) ![]u32 {
-    if (hashes.len == 0) return try allocator.alloc(u32, 0);
-    const min_slots = @max(2, hashes.len * 2);
-    const slot_count = std.math.ceilPowerOfTwo(usize, min_slots) catch min_slots;
-    const slots = try allocator.alloc(u32, slot_count);
-    @memset(slots, 0);
-    for (hashes, 0..) |entry_hashes, local_index| {
-        var slot_index: usize = @intCast(entry_hashes[0] % slots.len);
-        while (slots[slot_index] != 0) {
-            slot_index +%= 1;
-            if (slot_index >= slots.len) slot_index = 0;
-        }
-        slots[slot_index] = @intCast(first_entry_index + local_index + 1);
-    }
-    return slots;
 }
 
 pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) !Decoded {
@@ -2356,7 +2327,7 @@ fn decodeFooterMetadataAlloc(
         try decodeBlockFiltersAlloc(allocator, metadata, &cursor, blocks);
     }
     if (cursor < metadata.len) {
-        try decodeBlockHashSlotsAlloc(allocator, metadata, &cursor, blocks);
+        try skipBlockHashSlots(metadata, &cursor, blocks);
     }
     if (cursor < metadata.len) {
         try decodeBlockPhysicalMetas(metadata, &cursor, blocks);
@@ -2465,26 +2436,21 @@ fn decodeBlockFiltersAlloc(
     }
 }
 
-fn decodeBlockHashSlotsAlloc(
-    allocator: std.mem.Allocator,
+fn skipBlockHashSlots(
     metadata: []const u8,
     cursor: *usize,
     blocks: []TableIndex.BlockMeta,
 ) !void {
     const hash_count: usize = @intCast(try readU32(metadata, cursor));
     if (hash_count != blocks.len) return error.InvalidTableFile;
-    for (blocks) |*block| {
+    for (blocks) |_| {
         const slot_count: usize = @intCast(try readU32(metadata, cursor));
-        const slots = try allocator.alloc(u32, slot_count);
-        errdefer allocator.free(slots);
-        for (slots) |*slot| {
-            slot.* = try readU32(metadata, cursor);
-            if (slot.* != 0) {
-                const entry_index = slot.* - 1;
-                if (entry_index < block.first_entry_index or entry_index > block.lastEntryIndex()) return error.InvalidTableFile;
-            }
-        }
-        block.hash_slots = slots;
+        // v9 readers never consulted this open-addressed lookup structure;
+        // exact reads binary-search entry_offsets. Preserve old-run framing
+        // validation without materializing hundreds of MiB of dead u32 slots
+        // during DB.open.
+        if (slot_count > (metadata.len - cursor.*) / @sizeOf(u32)) return error.InvalidTableFile;
+        _ = try readSlice(metadata, cursor, slot_count * @sizeOf(u32));
     }
 }
 
@@ -2798,7 +2764,7 @@ test "table file footer metadata includes block bounds for point reads" {
     try std.testing.expect(index.blocks[target_block].rangeMayOverlap("docs", "doc:004", "docs", "doc:004"));
     try std.testing.expect(!index.blocks[target_block].rangeMayOverlap("docs", "doc:000", "docs", "doc:002"));
     try std.testing.expect(index.blocks[target_block].filter != null);
-    try std.testing.expect(index.blocks[target_block].hash_slots.len > 0);
+    try std.testing.expectEqual(@as(usize, 0), index.blocks[target_block].hash_slots.len);
     try std.testing.expect(index.blocks[target_block].maybeContains("docs", "doc:005"));
 
     const raw_block = try decodeWindowFromRawAlloc(allocator, encoded, &index, index.blockWindow(target_block));
@@ -2845,6 +2811,51 @@ test "table file footer metadata includes prefix bloom filters" {
     try std.testing.expect(!index.blocks[0].maybeContainsPrefix("docs", "tenant-b:"));
     try std.testing.expectEqualStrings("tenant-a:", extractKeyPrefix(default_prefix_extractor, "tenant-a:001").?);
     try std.testing.expect(upperBoundWithinPrefix("tenant-a:", "tenant-a;"));
+}
+
+test "table file prefix blooms scale with distinct prefixes rather than entries" {
+    const allocator = std.testing.allocator;
+    const entries = [_]Entry{.{ .namespace_name = "docs", .key = "doc:repeated", .value = "value" }} ** 128;
+
+    var filter = try buildPrefixFilterAlloc(allocator, &entries, default_prefix_extractor, default_filter_config);
+    defer filter.deinit(allocator);
+
+    // One distinct prefix uses the Bloom implementation's 64-bit minimum.
+    // Sizing by all 128 entries would instead allocate 2,048 bits.
+    try std.testing.expectEqual(@as(usize, 8), filter.bytes.len);
+    const hashes = prefixHashes("docs", "doc:");
+    try std.testing.expect(filter.maybeContainsHashes(hashes[0], hashes[1]));
+
+    const binary_entries = [_]Entry{
+        .{ .key = "a", .value = "1" },
+        .{ .key = "b", .value = "2" },
+    };
+    var binary_filter = try buildPrefixFilterAlloc(allocator, &binary_entries, default_prefix_extractor, default_filter_config);
+    defer binary_filter.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), binary_filter.bytes.len);
+}
+
+test "streaming table prefix blooms ignore expected entry overestimates" {
+    const allocator = std.testing.allocator;
+    var sink_impl = MemoryTableSink.init(allocator);
+    defer sink_impl.deinit();
+    var sink = sink_impl.sink();
+
+    var encoder = try StreamingEncoder.init(allocator, &sink, 1_000_000, .{});
+    defer encoder.deinit();
+    try encoder.appendEntry(.{ .namespace_name = "docs", .key = "doc:001", .value = "a" });
+    try encoder.appendEntry(.{ .namespace_name = "docs", .key = "doc:002", .value = "b" });
+    var result = try encoder.finish();
+    defer result.filter.deinit(allocator);
+
+    const encoded = try sink_impl.finishOwned();
+    defer allocator.free(encoded);
+    var index = try decodeIndexAlloc(allocator, encoded);
+    defer index.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 8), index.prefix_filter.?.bytes.len);
+    try std.testing.expectEqual(@as(usize, 8), index.blocks[0].prefix_filter.?.bytes.len);
+    try std.testing.expect(index.maybeContainsPrefix("docs", "doc:"));
 }
 
 test "table file adaptive snappy compression round trips repetitive blocks" {

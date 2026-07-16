@@ -2446,6 +2446,111 @@ This accepts the 2.2M production gate. The next scale validation is the full
 Quickwit corpus or comparator recollection is required; its archived
 authoritative result remains the comparison baseline.
 
+### Full 5.03M product-gate diagnosis (2026-07-15)
+
+The first complete product load was correct (`5,032,105` match-all hits and
+`15,818` hits for `alpha`) but was not acceptable as a performance result. It
+exposed three production-path costs that the kernel benchmark deliberately
+does not contain:
+
+1. The benchmark table had been created with schema-less dynamic indexing.
+   String inference indexed both analyzed `body` text and a `body.exact`
+   keyword for values up to 1 KiB. Most corpus passages qualify, so the product
+   index contained an additional mostly-unique whole-passage term stream. The
+   resulting v0 text index settled near 6.10 GB even though the equivalent v38
+   kernel index was 3.386 GB. This was a schema-equivalence failure, not an
+   unexplained format regression. The server fixture now declares a strict
+   schema containing only numeric `corpus_ordinal` and analyzed `body`, with no
+   `_all`, stored source, or inferred exact subfield.
+2. Schema backfill bypassed the bounded file-backed production segment sink and
+   flushed every 1,024 documents. An interrupted 2.55M-document migration had
+   created 2,855 files and roughly 4.4 GB in `full_text_index_v1`, leaving
+   extreme merge debt. Backfill now batches by the normal 8 MiB source budget
+   (with a 65,536-document ceiling), writes through the ResourceManager-aware
+   final-file sink, and applies the normal tiered merge policy at every durable
+   checkpoint. The asynchronous merge scheduler is gated during the bulk build
+   so it cannot compact the generation being replaced or compete for the merge
+   working-set budget. A forced one-document-per-checkpoint regression test
+   finishes at or below the production tier limit with exact search results.
+3. Operational `DB.stats()` contradicted its bounded-status contract by calling
+   `scanPrimaryDocCount()` unconditionally. Metadata schema-progress polling
+   therefore scanned and Snappy-decoded the entire 6.65 GB primary LSM every
+   round, holding one core continuously and driving transient RSS/footprint.
+   The durable document-identity counter is now the O(1) normal source; the
+   primary scan is lazy and is used only for the legacy incomplete-identity
+   sparse-index fallback. A second sample found that the same status call
+   derived full-text term counts with `layoutStatsWithInvertedDetails()`, which
+   iterated every term and decoded every posting in every segment each round.
+   Segment open now caches an exact term count by summing the entry-count
+   headers of 25-48-term dictionary blocks; operational status only sums those
+   cached values. Full primary scans and detailed postings attribution remain
+   available through diagnostic stats.
+
+The HTTP listener itself remained healthy during the reproduced restart; both
+the health and public endpoints responded. Earlier loopback refusals came from
+the command sandbox, while request delay came from the synchronous structural
+schema/rebuild path and the pathological status scans above. Treat availability
+of the listener, table-generation admission, and migration completion as three
+separate signals in future server runs.
+
+A later thread sample isolated an additional public-status stall: `GET /tables`
+and `GET /tables/:name` called a field named
+`bestEffortSingleTableStorageStatus`, but after reading the published runtime
+snapshot it opened a direct LSM status read. Normal read admission waits while
+schema backfill owns structural/group activity, so an optional response field
+blocked an HTTP worker indefinitely even though the listener and health server
+were live. Table status now uses the already-published runtime-status LSM
+snapshot only. It never acquires a normal table-read lease for observability;
+temporarily stale or absent optional LSM detail is preferable to making catalog
+status unavailable during maintenance. ReleaseFast validation against the
+preserved 5.03M-document corpus confirmed the distinction under active v1
+backfill: the process was using about 146% CPU, `/healthz` remained healthy,
+and `GET /db/v1/tables/antfly-benchmark` returned HTTP 200 in 0.8 ms with
+`migration.state = rebuilding`.
+
+The preserved corpus also reports 6.655 GB across 30 active primary LSM runs.
+This is not retained-generation or WAL amplification in this run: the manifest
+has no obsolete or untracked runs, and the WAL is only about 12 KiB. The active
+table files contain 9.837 GB of logical entry payload compressed to 5.621 GB,
+plus 1.033 GB of table metadata/non-entry bytes. The earlier observation of
+roughly 12 GiB of compaction generations and 1.9 GiB of WAL therefore describes
+a different ingestion state and must not be used to explain the preserved
+corpus.
+
+Two table-format costs in that 1.033 GB are now fixed without changing the v9
+wire version or dropping compatibility with runs written by `origin/main`:
+
+- Every block encoded a 50%-load open-addressed exact-key hash table, requiring
+  at least eight bytes per entry (at least 241.6 MB for 30.20M entries, and more
+  after per-block power-of-two rounding). No read path consulted those slots;
+  exact lookup already binary-searches the block entry offsets. New v9 writers
+  encode the existing hash section with zero slots. The compatibility reader
+  validates and skips old v9 slot-array framing without allocating it, avoiding
+  hundreds of MiB of dead heap while opening `origin/main` runs.
+- Global and per-block prefix Bloom filters were sized by entry count even when
+  binary identity keys had no extractable prefix, or millions of document keys
+  shared the same `doc:` prefix. New writers collect one hash pair per distinct
+  consecutive prefix and size the filter from that count. This preserves Bloom
+  membership semantics and the encoded section layout while eliminating the
+  entry-proportional disk and builder-memory cost.
+
+The remaining 5.621 GB compressed entry payload includes product source records
+and durable document-identity metadata that the kernel comparator intentionally
+does not store. Product comparisons must normalize requested/stored payloads
+before attributing this entire difference to the search index. Remaining LSM
+format work should separately quantify the 4-byte entry-offset array (about
+120.8 MB at this corpus size) and the value/identity payload; it must not remove
+metadata that is actually used merely to improve a benchmark number.
+
+On macOS, do not equate `ps` RSS with unreclaimable heap for this workload. In
+the reproduced interrupted migration, RSS was 4.88-7.48 GB while physical
+footprint was 945 MB (1.56 GB peak); clean file-backed full-text pages accounted
+for most of the difference. ResourceManager segment-residency accounting had
+already fallen from a 6.09 GB peak to 1.28 GB, below its 2 GiB hard limit, and
+the segment mmap eviction path issues clean-page discard advice. Report RSS,
+physical footprint, malloc live bytes, mmap logical bytes, and ResourceManager
+residency together rather than treating any one of them as heap usage.
+
 ## Result Artifact
 
 Each run should produce one directory containing at least:

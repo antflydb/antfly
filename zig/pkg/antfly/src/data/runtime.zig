@@ -1139,10 +1139,14 @@ fn writeTextMergeMetrics(writer: *std.Io.Writer, stats: antfly.db.types.TextMerg
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_input_bytes_total", "counter", "Source full-text segment bytes consumed by completed merges", stats.merge_input_bytes_total);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_output_segments_total", "counter", "Output full-text segments published by completed merges", stats.merge_output_segments_total);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_output_bytes_total", "counter", "Output full-text segment bytes published by completed merges", stats.merge_output_bytes_total);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_elapsed_ns_total", "counter", "Total elapsed nanoseconds spent building completed full-text merges", stats.merge_elapsed_ns_total);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_peak_task_alloc_bytes", "gauge", "Largest task-local allocation peak observed across completed full-text merges", stats.merge_peak_task_alloc_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_input_segments", "gauge", "Source full-text segments consumed by the last completed merge", stats.last_merge_input_segments);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_input_bytes", "gauge", "Source full-text segment bytes consumed by the last completed merge", stats.last_merge_input_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_output_segments", "gauge", "Output full-text segments published by the last completed merge", stats.last_merge_output_segments);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_output_bytes", "gauge", "Output full-text segment bytes published by the last completed merge", stats.last_merge_output_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_elapsed_ns", "gauge", "Elapsed nanoseconds spent building the last completed full-text merge", stats.last_merge_elapsed_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_peak_task_alloc_bytes", "gauge", "Task-local allocation peak of the last completed full-text merge", stats.last_merge_peak_task_alloc_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_quarantined_merges", "gauge", "Cached write full-text merge candidates currently quarantined after failure", stats.quarantined_merges);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_quarantined_segments", "gauge", "Cached write full-text source segments currently quarantined after failure", stats.quarantined_segments);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_retry_after_ns", "gauge", "Latest monotonic retry-after timestamp for cached write full-text merge work", stats.retry_after_ns);
@@ -1328,6 +1332,7 @@ fn writeResourceMetrics(writer: *std.Io.Writer, manager: *resource_manager_mod.R
     try writeResourceMetricFamily(writer, snapshot, .hard_limit_bytes, "antfly_resource_hard_limit_bytes", "gauge", "Resource slice hard limit in bytes");
     try writeResourceMetricFamily(writer, snapshot, .soft_limit_events, "antfly_resource_soft_limit_events_total", "counter", "Resource slice soft-limit events");
     try writeResourceMetricFamily(writer, snapshot, .hard_limit_rejections, "antfly_resource_hard_limit_rejections_total", "counter", "Resource slice hard-limit rejections");
+    try writeResourceMetricFamily(writer, snapshot, .oversized_single_grants, "antfly_resource_oversized_single_grants_total", "counter", "Resource slice bounded single-operation grants above the normal hard limit");
     try writeResourceMetricFamily(writer, snapshot, .pressure, "antfly_resource_pressure", "gauge", "Resource slice pressure state, 0 normal, 1 soft, 2 hard");
 }
 
@@ -1360,6 +1365,7 @@ const ResourceMetricField = enum {
     hard_limit_bytes,
     soft_limit_events,
     hard_limit_rejections,
+    oversized_single_grants,
     pressure,
 };
 
@@ -1410,6 +1416,7 @@ fn resourceMetricValue(stats: resource_manager_mod.SliceStats, field: ResourceMe
         .hard_limit_bytes => stats.hard_limit_bytes,
         .soft_limit_events => stats.soft_limit_events,
         .hard_limit_rejections => stats.hard_limit_rejections,
+        .oversized_single_grants => stats.oversized_single_grants,
         .pressure => pressureValue(stats.pressure),
     };
 }

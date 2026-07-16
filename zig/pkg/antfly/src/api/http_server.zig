@@ -2161,12 +2161,24 @@ pub const ApiHttpServer = struct {
         defer local_statuses.deinit(self.alloc);
 
         var doc_count: u64 = 0;
-        for (local_statuses.items) |item| doc_count +|= item.stats.doc_count;
-        const direct_lsm_status = try self.bestEffortLsmStorageStatus(table_name);
+        for (local_statuses.items) |item| {
+            // Derived visibility may trail a weak-sync primary write. The
+            // runtime snapshot's identity-backed source count is the O(1)
+            // authority for whether the table contains documents; retain the
+            // derived count as a compatibility floor for older/remote status
+            // producers that do not publish source_doc_count yet.
+            doc_count +|= @max(item.stats.source_doc_count, item.stats.doc_count);
+        }
         return .{
             .table_name = table_name,
             .empty = doc_count == 0,
-            .lsm = direct_lsm_status orelse liveLsmStorageStatusFromRuntimeStatuses(local_statuses.items),
+            // This endpoint is catalog/status observability and must remain
+            // available while structural maintenance owns the writer. The
+            // runtime-status cache is published from the live DB and already
+            // carries LSM stats; opening a direct read here waits behind schema
+            // backfill and turns a supposedly best-effort field into an
+            // unbounded GET /tables stall.
+            .lsm = liveLsmStorageStatusFromRuntimeStatuses(local_statuses.items),
         };
     }
 
@@ -2185,12 +2197,6 @@ pub const ApiHttpServer = struct {
         }
         if (!saw_lsm_stats) return null;
         return tables_api.lsmStorageStatusFromStats(aggregate);
-    }
-
-    fn bestEffortLsmStorageStatus(self: *ApiHttpServer, table_name: []const u8) !?tables_api.LsmStorageStatus {
-        const source = self.table_reads orelse return null;
-        const stats = (try source.lsmStorageStats(self.alloc, table_name)) orelse return null;
-        return tables_api.lsmStorageStatusFromStats(stats);
     }
 
     fn bestEffortObservedDynamicFieldCapabilitySets(
@@ -22594,12 +22600,12 @@ test "api http server table status uses runtime stats without probing storage" {
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqual(@as(u32, 1), reads.status_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 0), reads.scan_calls.load(.monotonic));
-    var parsed = try std.json.parseFromSlice(TableStatusResponse, alloc, resp.body, .{});
+    var parsed = try std.json.parseFromSlice(TableStatusResponse, alloc, resp.body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     try std.testing.expectEqual(@as(?bool, false), parsed.value.storage_status.empty);
 }
 
-test "api http server storage status prefers direct lsm stats over runtime cache" {
+test "api http server storage status does not block on a direct lsm probe" {
     const alloc = std.testing.allocator;
 
     const FakeSource = struct {
@@ -22694,13 +22700,13 @@ test "api http server storage status prefers direct lsm stats over runtime cache
 
     const status = (try server.bestEffortSingleTableStorageStatus("docs")).?;
     try std.testing.expectEqual(@as(u32, 1), reads.runtime_status_calls.load(.monotonic));
-    try std.testing.expectEqual(@as(u32, 1), reads.lsm_status_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), reads.lsm_status_calls.load(.monotonic));
     try std.testing.expectEqual(false, status.empty);
-    try std.testing.expectEqual(@as(u64, 9), status.lsm.?.run_count);
-    try std.testing.expectEqual(@as(u64, 4235293264), status.lsm.?.run_bytes);
-    try std.testing.expectEqual(@as(u64, 0), status.lsm.?.obsolete_path_count);
-    try std.testing.expectEqual(@as(u64, 0), status.lsm.?.obsolete_paths_pinned_by_readers);
-    try std.testing.expectEqual(@as(u64, 0), status.lsm.?.maintenance_score);
+    try std.testing.expectEqual(@as(u64, 72), status.lsm.?.run_count);
+    try std.testing.expectEqual(@as(u64, 8246715092), status.lsm.?.run_bytes);
+    try std.testing.expectEqual(@as(u64, 133), status.lsm.?.obsolete_path_count);
+    try std.testing.expectEqual(@as(u64, 133), status.lsm.?.obsolete_paths_pinned_by_readers);
+    try std.testing.expectEqual(@as(u64, 387208), status.lsm.?.maintenance_score);
 }
 
 test "api http server serves local index runtime backfill status" {

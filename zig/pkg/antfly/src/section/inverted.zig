@@ -2252,6 +2252,7 @@ pub const InvertedIndexReader = struct {
         postings_payload_bytes: u64 = 0,
         positions_bytes: u64 = 0,
         skip_bytes: u64 = 0,
+        term_count: u64 = 0,
         one_hit_terms: u64 = 0,
         single_doc_postings_terms: u64 = 0,
         postings_terms: u64 = 0,
@@ -2274,6 +2275,23 @@ pub const InvertedIndexReader = struct {
                 @intCast(self.data.len - v7_header_size - @as(usize, dict_len) - @as(usize, bloom_len) - @as(usize, norms_len))
             else
                 0,
+        };
+        // Each blocked-dictionary index record gives the corresponding block
+        // offset, and every block begins with prefix length plus entry count.
+        // This is O(number of 25-48 term blocks), touches dictionary metadata
+        // only, and is cached in SegmentEntry at open. It avoids deriving the
+        // public term count by decoding every posting on every status poll.
+        stats.term_count = count_terms: {
+            var total: u64 = 0;
+            for (0..self.dict_block_count) |block_idx| {
+                const block_offset = self.termBlockOffset(block_idx);
+                if (block_offset >= self.dict_blocks.len) break :count_terms 0;
+                var block_cursor: usize = block_offset;
+                _ = readVarintU32(self.dict_blocks, &block_cursor) catch break :count_terms 0;
+                const block_terms = readVarintU32(self.dict_blocks, &block_cursor) catch break :count_terms 0;
+                total +|= @as(u64, block_terms);
+            }
+            break :count_terms total;
         };
         const dict_offset = self.data.len - @as(usize, dict_len);
         if (dict_len >= term_dict_header_size and dict_offset < self.data.len) {
@@ -6059,6 +6077,7 @@ test "v21 postings keep norms in per-section table with bit-packed chunk metadat
     var reader = try InvertedIndexReader.init(alloc, section);
     const layout = reader.layoutStats();
     try std.testing.expectEqual(@as(u64, 9), layout.norm_bytes);
+    try std.testing.expectEqual(@as(u64, 1), layout.term_count);
 
     const result = reader.lookup("term") orelse return error.TestExpectedEqual;
     switch (result) {

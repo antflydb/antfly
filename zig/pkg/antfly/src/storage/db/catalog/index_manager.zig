@@ -197,7 +197,12 @@ fn withTextIndexSort(
     return out;
 }
 
-const text_backfill_batch_size: usize = 1024;
+// Backfill is a bulk build. Bound the retained source set by bytes first, while
+// retaining a document-count ceiling for very small documents. The former
+// 1,024-document limit produced thousands of undersized immutable segments on
+// large schema rebuilds and left more merge debt than the online scheduler
+// could retire.
+const text_backfill_batch_size: usize = 64 * 1024;
 const text_merge_scheduler_default_steps: usize = 1;
 const text_merge_quarantine_backoff_ns: u64 = 30 * std.time.ns_per_s;
 pub var test_text_backfill_batch_size: ?usize = null;
@@ -218,7 +223,7 @@ pub const IndexBatchOptions = struct {
     defer_text_compaction: bool = false,
 };
 
-const max_text_projection_docs_per_segment_build: usize = 4 * 1024;
+const max_text_projection_docs_per_segment_build: usize = 64 * 1024;
 
 const PhaseAllocStats = struct {
     current_bytes: usize = 0,
@@ -253,9 +258,26 @@ const PhaseAllocStats = struct {
 const PhaseTrackingAllocator = struct {
     backing: Allocator,
     stats: *PhaseAllocStats,
+    max_current_bytes: ?usize = null,
+    limit_exceeded: bool = false,
 
     fn init(backing: Allocator, stats: *PhaseAllocStats) PhaseTrackingAllocator {
         return .{ .backing = backing, .stats = stats };
+    }
+
+    fn initBounded(backing: Allocator, stats: *PhaseAllocStats, max_current_bytes: usize) PhaseTrackingAllocator {
+        return .{
+            .backing = backing,
+            .stats = stats,
+            .max_current_bytes = max_current_bytes,
+        };
+    }
+
+    fn permitsGrowth(self: *PhaseTrackingAllocator, additional_bytes: usize) bool {
+        const limit = self.max_current_bytes orelse return true;
+        if (additional_bytes <= limit -| self.stats.current_bytes) return true;
+        self.limit_exceeded = true;
+        return false;
     }
 
     fn allocator(self: *PhaseTrackingAllocator) Allocator {
@@ -272,6 +294,7 @@ const PhaseTrackingAllocator = struct {
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *PhaseTrackingAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.permitsGrowth(len)) return null;
         const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
         self.stats.noteAlloc(len);
         return ptr;
@@ -279,6 +302,7 @@ const PhaseTrackingAllocator = struct {
 
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *PhaseTrackingAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and !self.permitsGrowth(new_len - memory.len)) return false;
         if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
         self.stats.noteResize(memory.len, new_len);
         return true;
@@ -286,6 +310,7 @@ const PhaseTrackingAllocator = struct {
 
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         const self: *PhaseTrackingAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and !self.permitsGrowth(new_len - memory.len)) return null;
         const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
         self.stats.noteResize(memory.len, new_len);
         return ptr;
@@ -297,6 +322,24 @@ const PhaseTrackingAllocator = struct {
         self.stats.noteFree(memory.len);
     }
 };
+
+test "text merge bounded task allocator enforces live reservation" {
+    var stats = PhaseAllocStats{};
+    var tracking = PhaseTrackingAllocator.initBounded(std.testing.allocator, &stats, 64);
+    const alloc = tracking.allocator();
+
+    const first = try alloc.alloc(u8, 40);
+    defer alloc.free(first);
+    try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 25));
+    try std.testing.expect(tracking.limit_exceeded);
+    try std.testing.expectEqual(@as(usize, 40), stats.current_bytes);
+    try std.testing.expectEqual(@as(usize, 40), stats.peak_bytes);
+
+    const second = try alloc.alloc(u8, 24);
+    alloc.free(second);
+    try std.testing.expectEqual(@as(usize, 40), stats.current_bytes);
+    try std.testing.expectEqual(@as(usize, 64), stats.peak_bytes);
+}
 
 pub const TextMemoryAttributionStats = struct {
     text_indexes: u64 = 0,
@@ -846,6 +889,11 @@ pub const IndexManager = struct {
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
     /// 0 = idle, 1 = queued/running, 2 = rerun requested while active.
     repair_cleanup_state: std.atomic.Value(u8) = .init(0),
+    // Bulk text backfill performs its own policy compaction at durable batch
+    // boundaries. Keep the asynchronous scheduler from competing with it (or
+    // compacting an older schema generation) for CPU, mmap residency, and the
+    // shared text-merge resource budget.
+    text_backfill_active: std.atomic.Value(u32) = .init(0),
     load_parallelism: ?usize = null,
     full_text_pending_bytes_accounted: u64 = 0,
     text_indexes: std.ArrayListUnmanaged(TextIndex),
@@ -957,8 +1005,7 @@ pub const IndexManager = struct {
         prepared_owner: ?*persistent_mod.PersistentIndex = null,
         elapsed_ns: u64 = 0,
         /// Peak bytes allocated through the merge task allocator. File-backed
-        /// merge builders allocate outside this allocator and are covered by
-        /// process RSS sampling in the benchmark runner instead.
+        /// and heap-backed builders both run through this allocator.
         peak_task_alloc_bytes: u64 = 0,
 
         pub fn deinit(self: *TextMergeResult, alloc: Allocator) void {
@@ -6441,6 +6488,7 @@ pub const IndexManager = struct {
             errdefer self.cancelTextMergeTask(&task);
             var result = executeTextMergeTask(self.alloc, &task) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => {
+                    self.text_merge_scheduler.deferred_for_pressure += 1;
                     self.cancelTextMergeTask(&task);
                     break;
                 },
@@ -7077,7 +7125,27 @@ pub const IndexManager = struct {
         }
     }
 
+    fn beginTextBackfill(self: *IndexManager) void {
+        const prior = self.text_backfill_active.fetchAdd(1, .acq_rel);
+        if (prior != 0) return;
+
+        // A schema-generation rebuild supersedes useful merge work on the
+        // currently opened generation. Invalidate already-dispatched work so
+        // it cannot publish after the bulk builder has started, and leave the
+        // pending bit intact so a still-live index can resume afterwards.
+        for (self.text_indexes.items) |*existing| {
+            self.text_merge_scheduler.supersedeInFlightForIndex(self.alloc, existing.config.name);
+        }
+    }
+
+    fn endTextBackfill(self: *IndexManager) void {
+        const prior = self.text_backfill_active.fetchSub(1, .acq_rel);
+        std.debug.assert(prior > 0);
+    }
+
     fn backfillTextIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *TextIndex, resume_from: ?[]const u8) !void {
+        self.beginTextBackfill();
+        defer self.endTextBackfill();
         const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
@@ -7111,19 +7179,11 @@ pub const IndexManager = struct {
                 last_doc_key: []const u8,
                 flush_count: *usize,
             ) !void {
-                var built = try mapper.buildTextSegmentsFromDocumentsWithMetadata(manager.alloc, docs_buf.items, text_entry.text_analysis, text_entry.runtime_schema, .{
-                    .target_segment_bytes = default_text_segment_build_target_bytes,
-                    .store_document_source = false,
-                });
-                defer built.deinit(manager.alloc);
-                if (built.observed_field_analyzers.len > 0) {
-                    try mergeObservedTextFieldAnalyzers(manager, doc_store, text_entry, built.observed_field_analyzers);
-                }
-                for (built.segments) |*seg| {
-                    const owned = seg.*;
-                    seg.* = &.{};
-                    try text_entry.persistent.indexSegmentOwned(owned);
-                }
+                const stats = try manager.indexTextProjectionDocsMaybeChunked(doc_store, text_entry, docs_buf.items);
+                // Keep a bulk rebuild policy-settled as it grows. This bounds
+                // active segment count and restart merge debt, while the normal
+                // merge reservation and file-backed writer bound RSS.
+                try manager.finalizeTextBatchMutations(text_entry, .{}, stats);
                 try rebuild.update(last_doc_key);
                 for (docs_buf.items) |doc| {
                     manager.alloc.free(@constCast(doc.key));
@@ -7141,7 +7201,9 @@ pub const IndexManager = struct {
 
         var scan_lower_buf: ?[]u8 = if (resume_from) |buf| try self.alloc.dupe(u8, buf) else null;
         defer if (scan_lower_buf) |buf| self.alloc.free(buf);
-        const scan_budget_per_page = @max(text_backfill_batch_size * 32, 256);
+        const backfill_doc_limit = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
+        const backfill_source_target_bytes = textProjectionSourceBuildTargetBytes();
+        const scan_budget_per_page = @max(backfill_doc_limit * 2, 256);
         var reached_end = false;
 
         while (!reached_end) {
@@ -7161,6 +7223,9 @@ pub const IndexManager = struct {
                 page_last_seen_key: *?[]u8,
                 saw_visible_doc: *bool,
                 scan_budget: usize,
+                doc_limit: usize,
+                source_target_bytes: usize,
+                source_bytes: usize = 0,
                 scanned: usize = 0,
                 stopped_early: bool = false,
 
@@ -7202,12 +7267,15 @@ pub const IndexManager = struct {
                     });
                     doc_id_owned = false;
                     doc_value_owned = false;
+                    state.source_bytes +|= @sizeOf(mapper.MapperDoc) + doc_id.len + doc_value.len;
 
                     if (state.batch_last_doc_key.*) |old| state.manager.alloc.free(old);
                     state.batch_last_doc_key.* = try state.manager.alloc.dupe(u8, key);
 
-                    const backfill_batch_size = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
-                    if (state.mapped_docs.items.len >= backfill_batch_size or state.scanned >= state.scan_budget) {
+                    if (state.mapped_docs.items.len >= state.doc_limit or
+                        state.source_bytes >= state.source_target_bytes or
+                        state.scanned >= state.scan_budget)
+                    {
                         state.stopped_early = true;
                         return .stop;
                     }
@@ -7225,6 +7293,8 @@ pub const IndexManager = struct {
                 .page_last_seen_key = &page_last_seen_key,
                 .saw_visible_doc = &saw_visible_doc,
                 .scan_budget = scan_budget_per_page,
+                .doc_limit = backfill_doc_limit,
+                .source_target_bytes = backfill_source_target_bytes,
             };
             try backend_scan.scanWithContext(&runtime_store.store, if (scan_lower_buf) |buf| buf else lower, if (upper) |buf| buf else "", .{}, &scan_state, ScanState.scanEntry);
             identity_txn.abort();
@@ -7256,6 +7326,8 @@ pub const IndexManager = struct {
         cancel_check: ?types.RepairCancelCheck,
         capacity_check: ?types.RepairCapacityCheck,
     ) !void {
+        self.beginTextBackfill();
+        defer self.endTextBackfill();
         const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
 
         const lower = try internal_keys.documentRangeLowerAlloc(self.alloc, self.byte_range.start);
@@ -7291,19 +7363,8 @@ pub const IndexManager = struct {
             ) !void {
                 try checkRepairCancelled(check);
                 if (capacity) |admission| try admission.boundary();
-                var built = try mapper.buildTextSegmentsFromDocumentsWithMetadata(manager.alloc, docs_buf.items, text_entry.text_analysis, text_entry.runtime_schema, .{
-                    .target_segment_bytes = default_text_segment_build_target_bytes,
-                    .store_document_source = false,
-                });
-                defer built.deinit(manager.alloc);
-                if (built.observed_field_analyzers.len > 0) {
-                    try mergeObservedTextFieldAnalyzers(manager, doc_store, text_entry, built.observed_field_analyzers);
-                }
-                for (built.segments) |*seg| {
-                    const owned = seg.*;
-                    seg.* = &.{};
-                    try text_entry.persistent.indexSegmentOwned(owned);
-                }
+                const stats = try manager.indexTextProjectionDocsMaybeChunked(doc_store, text_entry, docs_buf.items);
+                try manager.finalizeTextBatchMutations(text_entry, .{}, stats);
                 try rebuild.update(last_doc_key);
                 for (docs_buf.items) |doc| {
                     manager.alloc.free(@constCast(doc.key));
@@ -7321,7 +7382,9 @@ pub const IndexManager = struct {
 
         var scan_lower_buf: ?[]u8 = if (resume_from) |buf| try self.alloc.dupe(u8, buf) else null;
         defer if (scan_lower_buf) |buf| self.alloc.free(buf);
-        const scan_budget_per_page = @max(text_backfill_batch_size * 32, 256);
+        const backfill_doc_limit = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
+        const backfill_source_target_bytes = textProjectionSourceBuildTargetBytes();
+        const scan_budget_per_page = @max(backfill_doc_limit * 2, 256);
         var reached_end = false;
 
         while (!reached_end) {
@@ -7339,6 +7402,9 @@ pub const IndexManager = struct {
                 page_last_seen_key: *?[]u8,
                 saw_visible_doc: *bool,
                 scan_budget: usize,
+                doc_limit: usize,
+                source_target_bytes: usize,
+                source_bytes: usize = 0,
                 scanned: usize = 0,
                 stopped_early: bool = false,
 
@@ -7380,12 +7446,15 @@ pub const IndexManager = struct {
                     });
                     doc_id_owned = false;
                     doc_value_owned = false;
+                    state.source_bytes +|= @sizeOf(mapper.MapperDoc) + doc_id.len + doc_value.len;
 
                     if (state.batch_last_doc_key.*) |old| state.manager.alloc.free(old);
                     state.batch_last_doc_key.* = try state.manager.alloc.dupe(u8, key);
 
-                    const backfill_batch_size = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
-                    if (state.mapped_docs.items.len >= backfill_batch_size or state.scanned >= state.scan_budget) {
+                    if (state.mapped_docs.items.len >= state.doc_limit or
+                        state.source_bytes >= state.source_target_bytes or
+                        state.scanned >= state.scan_budget)
+                    {
                         state.stopped_early = true;
                         return .stop;
                     }
@@ -7403,6 +7472,8 @@ pub const IndexManager = struct {
                 .page_last_seen_key = &page_last_seen_key,
                 .saw_visible_doc = &saw_visible_doc,
                 .scan_budget = scan_budget_per_page,
+                .doc_limit = backfill_doc_limit,
+                .source_target_bytes = backfill_source_target_bytes,
             };
             try store.scanReadTxnWithContext(read_txn, if (scan_lower_buf) |buf| buf else lower, if (upper) |buf| buf else "", .{}, &scan_state, ScanState.scanEntry);
             reached_end = !scan_state.stopped_early or page_last_seen_key == null;
@@ -8650,6 +8721,7 @@ pub const IndexManager = struct {
     }
 
     pub fn beginTextMergeTask(self: *IndexManager) !?TextMergeTask {
+        if (self.text_backfill_active.load(.acquire) != 0) return null;
         const now_ns = platform_time.monotonicNs();
         self.text_merge_scheduler.pruneExpiredQuarantines(self.alloc, now_ns);
         _ = self.textMergeStats();
@@ -8679,7 +8751,17 @@ pub const IndexManager = struct {
         const started_ns = platform_time.monotonicNs();
         defer task.discardSourceCleanPages();
         logTextMergeTaskMemory("before", task, 0);
-        if (task.persistent.prepareMergedSegmentToFile(task.snapshot, task.merge_indices)) |prepared| {
+        var alloc_stats = PhaseAllocStats{};
+        const file_backed_merge = task.persistent.supportsFileBackedSegmentArtifacts();
+        var tracking = if (file_backed_merge and task.buffer_reservation != null)
+            PhaseTrackingAllocator.initBounded(
+                alloc,
+                &alloc_stats,
+                std.math.cast(usize, task.buffer_reservation.?.bytes) orelse std.math.maxInt(usize),
+            )
+        else
+            PhaseTrackingAllocator.init(alloc, &alloc_stats);
+        if (task.persistent.prepareMergedSegmentToFileWithAllocator(tracking.allocator(), task.snapshot, task.merge_indices)) |prepared| {
             var output_bytes: u64 = 0;
             for (prepared) |*segment| output_bytes +|= @intCast(segment.data.bytes().len);
             logTextMergeTaskMemory("after_build", task, output_bytes);
@@ -8689,6 +8771,7 @@ pub const IndexManager = struct {
                 .prepared_segments = prepared,
                 .prepared_owner = task.persistent,
                 .elapsed_ns = platform_time.monotonicNs() -| started_ns,
+                .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
             };
         } else |err| switch (err) {
             error.EmptySegment => return .{
@@ -8697,6 +8780,7 @@ pub const IndexManager = struct {
             },
             error.Unsupported => {},
             else => {
+                if (tracking.limit_exceeded) return error.ResourceBudgetExceeded;
                 if (builtin.os.tag != .freestanding) {
                     std.log.err("scheduled text merge file-backed build failed index={s}: {s}", .{ task.index_name, @errorName(err) });
                 }
@@ -8704,11 +8788,10 @@ pub const IndexManager = struct {
             },
         }
 
-        var alloc_stats = PhaseAllocStats{};
-        var tracking = PhaseTrackingAllocator.init(alloc, &alloc_stats);
         const merged = merger_mod.mergeSegmentsBounded(tracking.allocator(), task.snapshot, task.merge_indices, .{
             .target_segment_bytes = @intCast(activeTextMergePolicy().max_segment_size),
         }) catch |err| {
+            if (tracking.limit_exceeded) return error.ResourceBudgetExceeded;
             if (err == error.EmptySegment) return .{
                 .elapsed_ns = platform_time.monotonicNs() -| started_ns,
                 .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
@@ -8871,7 +8954,11 @@ pub const IndexManager = struct {
             break self.copyTextMergeTask(entry.config.name, &entry.persistent, snap, planned[0..admitted_len]) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => {
                     if (admitted_len == 2) return err;
-                    admitted_len = @max(@as(usize, 2), admitted_len / 2);
+                    // Reservation cost is monotonic for this size-sorted
+                    // prefix. Walk down to the widest admissible group rather
+                    // than jumping from (for example) five sources to two and
+                    // paying avoidable pairwise write amplification.
+                    admitted_len -= 1;
                     continue;
                 },
                 else => return err,
@@ -8928,29 +9015,54 @@ pub const IndexManager = struct {
         const manager = self.resource_manager orelse return null;
 
         var source_bytes: u64 = 0;
-        var section_heap_bytes: u64 = 0;
+        var file_merge_working_set_bytes: u64 = 8 * 1024 * 1024;
         const file_backed_merge = persistent.supportsFileBackedSegmentArtifacts();
         for (planned) |seg_idx| {
             const seg = &snap.segments[seg_idx];
             source_bytes = std.math.add(u64, source_bytes, @as(u64, @intCast(seg.data.bytes().len))) catch return error.ResourceBudgetExceeded;
             if (file_backed_merge) {
-                section_heap_bytes = std.math.add(u64, section_heap_bytes, estimateFileBackedMergeSectionHeapBytes(seg)) catch return error.ResourceBudgetExceeded;
+                file_merge_working_set_bytes = std.math.add(
+                    u64,
+                    file_merge_working_set_bytes,
+                    estimateFileBackedMergeWorkingSetBytes(seg) catch return error.ResourceBudgetExceeded,
+                ) catch return error.ResourceBudgetExceeded;
             }
         }
 
         const segment_overhead = std.math.mul(u64, @as(u64, @intCast(planned.len)), 1024) catch return error.ResourceBudgetExceeded;
-        const reservation_base = if (file_backed_merge) section_heap_bytes else source_bytes;
-        const reservation_bytes = std.math.add(u64, reservation_base, segment_overhead) catch return error.ResourceBudgetExceeded;
-        return try manager.reserve(.text_merge_buffers, reservation_bytes);
-    }
-
-    fn estimateFileBackedMergeSectionHeapBytes(seg: *const index_mod.SegmentEntry) u64 {
-        var bytes: u64 = 0;
-        for (seg.reader.fields) |*field| {
-            for (field.sections) |*section| {
-                bytes +|= section.length;
+        const reservation_base = if (file_backed_merge) file_merge_working_set_bytes else source_bytes;
+        var reservation_bytes = std.math.add(u64, reservation_base, segment_overhead) catch return error.ResourceBudgetExceeded;
+        if (file_backed_merge) {
+            const hard_limit = manager.sliceStats(.text_merge_buffers).hard_limit_bytes;
+            if (hard_limit > 0) {
+                const enforced_cap = std.math.mul(u64, hard_limit, 2) catch std.math.maxInt(u64);
+                reservation_bytes = @min(reservation_bytes, enforced_cap);
             }
         }
+        // Permit one merge up to 2x the normal hard limit. ResourceManager
+        // keeps the operation exclusive, fully accounted, and visible as hard
+        // pressure. Above that envelope the task allocator, not a disk-size
+        // proxy, is authoritative: it enforces the exact same cap and turns a
+        // real working-set overrun into ResourceBudgetExceeded.
+        return try manager.reserveBoundedOversizedSingle(.text_merge_buffers, reservation_bytes, 2);
+    }
+
+    fn estimateFileBackedMergeWorkingSetBytes(seg: *const index_mod.SegmentEntry) !u64 {
+        const layout = seg.layoutStats(false);
+
+        // File-backed merges stream postings and stored fields directly to the
+        // atomic output file. Their live heap is driven by doc renumbering,
+        // the largest term accumulator, and compact dictionary/value builders;
+        // charging every serialized postings and positions byte rejected work
+        // that never becomes resident. Keep generous capacity/headroom factors
+        // here and enforce the reservation with the bounded task allocator.
+        const per_doc_bytes: u64 = if (layout.index_sort_bytes > 0) 128 else 64;
+        var bytes = try std.math.mul(u64, seg.reader.doc_count, per_doc_bytes);
+        bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.inverted_term_dict_bytes, 3));
+        bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.inverted_bloom_bytes, 3));
+        bytes = try std.math.add(u64, bytes, layout.inverted_norm_bytes);
+        bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.typed_doc_values_bytes, 2));
+        bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.doc_ordinals_bytes, 2));
         return bytes;
     }
 
@@ -21053,6 +21165,7 @@ test "text merge task records input and output bytes" {
     try std.testing.expectEqual(expected_output.bytes, stats.merge_output_bytes_total);
     try std.testing.expectEqual(result.elapsed_ns, stats.last_merge_elapsed_ns);
     try std.testing.expectEqual(result.elapsed_ns, stats.merge_elapsed_ns_total);
+    try std.testing.expect(result.peak_task_alloc_bytes > 0);
     try std.testing.expectEqual(result.peak_task_alloc_bytes, stats.last_merge_peak_task_alloc_bytes);
     try std.testing.expectEqual(result.peak_task_alloc_bytes, stats.merge_peak_task_alloc_bytes);
 }
@@ -21179,6 +21292,10 @@ test "text merge resource manager accounts pending bytes and active buffers" {
         .soft_action = .report,
         .hard_action = .report,
     };
+    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+        .soft_action = .report,
+        .hard_action = .report,
+    };
     var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets, .policies = policies });
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -21208,7 +21325,9 @@ test "text merge resource manager accounts pending bytes and active buffers" {
         .compact_text_segment_threshold = 2,
         .defer_text_compaction = true,
     };
-    for (0..12) |i| {
+    // Enough same-tier segments to make the policy select a wide backlog
+    // merge rather than its normal two-segment minimum.
+    for (0..32) |i| {
         var key_buf: [64]u8 = undefined;
         const key = try alloc.dupe(u8, std.fmt.bufPrint(&key_buf, "doc:{d:0>8}", .{i}) catch unreachable);
         defer alloc.free(key);
@@ -21228,17 +21347,65 @@ test "text merge resource manager accounts pending bytes and active buffers" {
         try std.testing.expect(resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)].soft_limit_events > 0);
     }
 
+    var wide_source_count: usize = 0;
+    var wide_reservation_bytes: u64 = 0;
     {
-        var task = (try manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
+        var task = (try manager.beginTextMergeTask()) orelse return error.WideMergeAdmissionMissing;
         defer task.deinit(alloc);
 
         resource_stats = resource_manager.snapshot();
         try std.testing.expect(resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].used_bytes > 0);
         try std.testing.expect(resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].soft_limit_events > 0);
+        wide_source_count = task.source.len;
+        wide_reservation_bytes = (task.buffer_reservation orelse return error.MissingWideMergeReservation).bytes;
+        manager.cancelTextMergeTask(&task);
     }
 
     resource_stats = resource_manager.snapshot();
     try std.testing.expectEqual(@as(u64, 0), resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].used_bytes);
+
+    // Reconfigure the same manager address so the policy-selected wide task
+    // is above the normal hard limit but within the bounded 2x allowance. It
+    // should remain wide rather than degrading to pairwise compaction.
+    try std.testing.expect(wide_reservation_bytes > 1);
+    var bounded_budgets = budgets;
+    bounded_budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_bytes =
+        (wide_reservation_bytes + 1) / 2;
+    resource_manager = resource_manager_mod.ResourceManager.init(.{
+        .budgets = bounded_budgets,
+        .policies = policies,
+    });
+    {
+        var task = (try manager.beginTextMergeTask()) orelse return error.BoundedWideMergeAdmissionMissing;
+        defer task.deinit(alloc);
+        try std.testing.expectEqual(wide_source_count, task.source.len);
+        manager.cancelTextMergeTask(&task);
+    }
+    resource_stats = resource_manager.snapshot();
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].oversized_single_grants,
+    );
+
+    // Restore the original budget for the concurrent-pressure case below.
+    resource_manager = resource_manager_mod.ResourceManager.init(.{
+        .budgets = budgets,
+        .policies = policies,
+    });
+
+    // A capped file-backed merge owns the working-set envelope exclusively.
+    // Even one byte of concurrent usage must reject another merge rather than
+    // multiplying the bounded allocator cap.
+    try std.testing.expect(wide_source_count > 2);
+    const hard_limit = budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_bytes;
+    try std.testing.expect(wide_reservation_bytes <= hard_limit * 2);
+    var tracked_merge_usage: u64 = 0;
+    resource_manager.observeUsage(.text_merge_buffers, &tracked_merge_usage, 1);
+    defer resource_manager.observeUsage(.text_merge_buffers, &tracked_merge_usage, 0);
+
+    try std.testing.expect((try manager.beginTextMergeTask()) == null);
+    resource_stats = resource_manager.snapshot();
+    try std.testing.expect(resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_rejections > 0);
 }
 
 test "text merge resource pressure defers background merges" {

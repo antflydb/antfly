@@ -15891,8 +15891,7 @@ pub const DB = struct {
         defer snap.release();
         var terms: u64 = 0;
         for (snap.segments) |*seg| {
-            const layout = seg.layoutStats(true);
-            terms +|= layout.inverted_one_hit_terms +| layout.inverted_postings_terms;
+            terms +|= seg.layoutStats(false).inverted_term_count;
         }
         return terms;
     }
@@ -16430,7 +16429,11 @@ pub const DB = struct {
         defer if (durable_index_repairs) |*state| state.deinit(alloc);
         const async_indexing = self.snapshotAsyncIndexingStats();
         const identity_stats = dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
-        const primary_doc_count = self.scanPrimaryDocCount(self.core.byteRange()) catch 0;
+        // Operational status is polled frequently. Identity metadata is the
+        // normal O(1) source of the live document count; retain the legacy
+        // primary-store scan only as a lazy fallback for an old/incomplete
+        // identity catalog and only when sparse-index capping needs it.
+        var primary_doc_count_fallback: ?u64 = null;
         const repair_summary = try self.artifactRepairSummaryRootSnapshot(alloc);
         const repair_issue_count = repair_summary.count;
         var repair_index_fallback = ArtifactRepairIndexFallbackCounts{ .alloc = alloc };
@@ -16524,10 +16527,15 @@ pub const DB = struct {
                         const sparse_snapshot = entry.index.stats();
                         const sparse_doc_cap = if (identity_stats.live_ordinals > 0)
                             identity_stats.live_ordinals
-                        else if (primary_doc_count > 0)
-                            primary_doc_count
-                        else
-                            visible_doc_count;
+                        else fallback: {
+                            if (primary_doc_count_fallback == null) {
+                                primary_doc_count_fallback = self.scanPrimaryDocCount(self.core.byteRange()) catch 0;
+                            }
+                            break :fallback if (primary_doc_count_fallback.? > 0)
+                                primary_doc_count_fallback.?
+                            else
+                                visible_doc_count;
+                        };
                         item.doc_count = if (entry.chunk_name == null and sparse_doc_cap > 0)
                             @min(sparse_snapshot.doc_count, sparse_doc_cap)
                         else
@@ -55623,6 +55631,60 @@ test "db full-text backfill resumes after interrupted reopen" {
     defer types.freeDBStats(alloc, stats);
     try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
     try std.testing.expectEqual(false, stats.indexes[0].backfill_active);
+}
+
+test "db full-text backfill retires segment fanout at durable batch boundaries" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer {
+            for (writes.items) |item| {
+                alloc.free(@constCast(item.key));
+                alloc.free(@constCast(item.value));
+            }
+            writes.deinit(alloc);
+        }
+        for (0..24) |i| {
+            try writes.append(alloc, .{
+                .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
+                .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"bulk backfill {d}\"}}", .{i}),
+            });
+        }
+        try db.batch(.{ .writes = writes.items });
+        try db.core.index_manager.addAllNoBackfill(db.core.store, &.{.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{\"field\":\"title\"}",
+        }});
+    }
+
+    // Force the pathological pre-fix shape: one published segment per
+    // backfill checkpoint. Production backfill uses much larger byte-bounded
+    // batches, but must also keep even this worst case policy-settled.
+    index_manager_mod.test_text_backfill_batch_size = 1;
+    defer index_manager_mod.test_text_backfill_batch_size = null;
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+
+    const entry = reopened.core.index_manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
+    try std.testing.expect(entry.persistent.snapshot().segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
+
+    var result = try reopened.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .term = .{ .field = "title", .term = "bulk" } },
+        .limit = 32,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 24), result.total_hits);
 }
 
 test "db sparse backfill resumes after interrupted reopen" {

@@ -523,9 +523,28 @@ def lsm_manifest_inventory(root: Path, manifest_path: Path) -> dict[str, Any] | 
         active_paths: list[Path] = []
         active_runs: list[dict[str, Any]] = []
         active_logical_bytes = 0
+        logical_entry_bytes = 0
+        physical_entry_bytes = 0
+        raw_blocks = 0
+        compressed_blocks = 0
+        compression_codec_mask = 0
         for _ in range(run_count):
             run_id, level, size_bytes = struct.unpack_from("<QIQ", raw, offset)
-            offset += 20 + 40  # id/level/size plus five compression counters
+            offset += 20
+            run_compression = struct.unpack_from("<QQQQQ", raw, offset)
+            offset += 40
+            (
+                run_logical_entry_bytes,
+                run_physical_entry_bytes,
+                run_raw_blocks,
+                run_compressed_blocks,
+                run_compression_codec_mask,
+            ) = run_compression
+            logical_entry_bytes += run_logical_entry_bytes
+            physical_entry_bytes += run_physical_entry_bytes
+            raw_blocks += run_raw_blocks
+            compressed_blocks += run_compressed_blocks
+            compression_codec_mask |= run_compression_codec_mask
             lengths = struct.unpack_from("<IIIII", raw, offset)
             offset += 20
             entry_count = struct.unpack_from("<I", raw, offset)[0]
@@ -549,6 +568,11 @@ def lsm_manifest_inventory(root: Path, manifest_path: Path) -> dict[str, Any] | 
                     "level": level,
                     "size_bytes": size_bytes,
                     "entry_count": entry_count,
+                    "logical_entry_bytes": run_logical_entry_bytes,
+                    "physical_entry_bytes": run_physical_entry_bytes,
+                    "raw_blocks": run_raw_blocks,
+                    "compressed_blocks": run_compressed_blocks,
+                    "compression_codec_mask": run_compression_codec_mask,
                     "smallest_namespace_hex": smallest_namespace.hex(),
                     "smallest_key_hex": smallest_key.hex(),
                     "largest_namespace_hex": largest_namespace.hex(),
@@ -578,6 +602,12 @@ def lsm_manifest_inventory(root: Path, manifest_path: Path) -> dict[str, Any] | 
     untracked_paths = [item for item in physical_paths if str(item) not in tracked]
     active = path_stats(active_paths)
     active["logical_bytes"] = active_logical_bytes
+    active["logical_entry_bytes"] = logical_entry_bytes
+    active["physical_entry_bytes"] = physical_entry_bytes
+    active["table_overhead_bytes"] = max(0, active["bytes"] - physical_entry_bytes)
+    active["raw_blocks"] = raw_blocks
+    active["compressed_blocks"] = compressed_blocks
+    active["compression_codec_mask"] = compression_codec_mask
     return {
         "path": str(manifest_path.relative_to(root)),
         "version": version,

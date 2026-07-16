@@ -279,6 +279,7 @@ pub const SliceStats = struct {
     hard_limit_bytes: u64 = 0,
     soft_limit_events: u64 = 0,
     hard_limit_rejections: u64 = 0,
+    oversized_single_grants: u64 = 0,
     pressure: Pressure = .normal,
     soft_action: PressureAction = .report,
     hard_action: PressureAction = .report,
@@ -398,6 +399,7 @@ const MutableSlice = struct {
     peak_bytes: u64 = 0,
     soft_limit_events: u64 = 0,
     hard_limit_rejections: u64 = 0,
+    oversized_single_grants: u64 = 0,
 };
 
 pub const ResourceManager = struct {
@@ -729,6 +731,45 @@ pub const ResourceManager = struct {
         return .{ .manager = self, .slice = slice, .bytes = bytes };
     }
 
+    /// Admits one bounded minimum-progress operation even when its working set
+    /// is larger than the slice's normal hard limit. The slice must otherwise
+    /// be idle, so this cannot multiply memory through concurrent oversized
+    /// jobs. Usage remains fully accounted and therefore exposes hard pressure
+    /// until the reservation is released.
+    pub fn reserveBoundedOversizedSingle(
+        self: *ResourceManager,
+        slice: Slice,
+        bytes: u64,
+        max_hard_limit_multiple: u64,
+    ) !Reservation {
+        if (bytes == 0) return .{ .manager = self, .slice = slice, .bytes = 0 };
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const state = &self.slices[sliceIndex(slice)];
+        const next = std.math.add(u64, state.used_bytes, bytes) catch {
+            state.hard_limit_rejections +|= 1;
+            return error.ResourceBudgetExceeded;
+        };
+        const hard_limit = state.budget.hard_limit_bytes;
+        if (hard_limit > 0 and next > hard_limit) {
+            const bounded_limit = std.math.mul(u64, hard_limit, max_hard_limit_multiple) catch std.math.maxInt(u64);
+            if (max_hard_limit_multiple <= 1 or state.used_bytes != 0 or bytes > bounded_limit) {
+                state.hard_limit_rejections +|= 1;
+                return error.ResourceBudgetExceeded;
+            }
+            state.oversized_single_grants +|= 1;
+        }
+        state.used_bytes = next;
+        state.peak_bytes = @max(state.peak_bytes, next);
+        if (state.budget.soft_limit_bytes > 0 and next > state.budget.soft_limit_bytes) {
+            state.soft_limit_events +|= 1;
+        }
+        self.pressure_change.advance();
+        return .{ .manager = self, .slice = slice, .bytes = bytes };
+    }
+
     pub fn releaseBytes(self: *ResourceManager, slice: Slice, bytes: u64) void {
         if (bytes == 0) return;
         lockAtomic(&self.mutex);
@@ -787,6 +828,7 @@ pub const ResourceManager = struct {
                 .hard_limit_bytes = state.budget.hard_limit_bytes,
                 .soft_limit_events = state.soft_limit_events,
                 .hard_limit_rejections = state.hard_limit_rejections,
+                .oversized_single_grants = state.oversized_single_grants,
                 .pressure = pressureFor(state.budget, state.used_bytes),
                 .soft_action = state.policy.soft_action,
                 .hard_action = state.policy.hard_action,
@@ -1066,6 +1108,7 @@ fn sliceStatsFromState(slice: Slice, state: MutableSlice) SliceStats {
         .hard_limit_bytes = state.budget.hard_limit_bytes,
         .soft_limit_events = state.soft_limit_events,
         .hard_limit_rejections = state.hard_limit_rejections,
+        .oversized_single_grants = state.oversized_single_grants,
         .pressure = pressureFor(state.budget, state.used_bytes),
         .soft_action = state.policy.soft_action,
         .hard_action = state.policy.hard_action,
@@ -1252,6 +1295,44 @@ test "resource manager records soft and hard budget pressure" {
     try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserve(.derived_backlog, 9));
     stats = manager.snapshot();
     try std.testing.expectEqual(@as(u64, 1), stats.slices[sliceIndex(.derived_backlog)].hard_limit_rejections);
+}
+
+test "resource manager bounds and serializes oversized minimum progress" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.text_merge_buffers)] = .{
+        .soft_limit_bytes = 8,
+        .hard_limit_bytes = 10,
+    };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        manager.reserve(.text_merge_buffers, 18),
+    );
+
+    var oversized = try manager.reserveBoundedOversizedSingle(.text_merge_buffers, 18, 2);
+    var stats = manager.sliceStats(.text_merge_buffers);
+    try std.testing.expectEqual(@as(u64, 18), stats.used_bytes);
+    try std.testing.expectEqual(@as(u64, 18), stats.peak_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.oversized_single_grants);
+    try std.testing.expectEqual(Pressure.hard, stats.pressure);
+
+    // A second job cannot join the slice while its oversized grant is active.
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        manager.reserveBoundedOversizedSingle(.text_merge_buffers, 1, 2),
+    );
+    oversized.release();
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.text_merge_buffers).used_bytes);
+
+    // The exception is bounded; it cannot silently turn the slice unlimited.
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        manager.reserveBoundedOversizedSingle(.text_merge_buffers, 21, 2),
+    );
+    stats = manager.sliceStats(.text_merge_buffers);
+    try std.testing.expectEqual(@as(u64, 1), stats.oversized_single_grants);
+    try std.testing.expectEqual(@as(u64, 3), stats.hard_limit_rejections);
 }
 
 test "resource manager owns dense repair replay pressure policy" {
