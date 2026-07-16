@@ -19,6 +19,7 @@
               "x-antfly-types": [
                 "text"
               ],
+              "x-antfly-analyzer": "simple",
               "x-antfly-include-in-all": false
             }
           },

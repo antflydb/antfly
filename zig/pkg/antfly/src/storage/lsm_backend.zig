@@ -1273,11 +1273,48 @@ pub const Backend = struct {
         }
     };
 
+    const L0OverlapCache = struct {
+        const max_run_ids = 64;
+
+        valid: bool = false,
+        threshold: usize = 0,
+        run_count: usize = 0,
+        run_ids: [max_run_ids]u64 = @splat(0),
+        result: usize = 0,
+
+        fn lookup(self: *const @This(), runs: []const Run, threshold: usize) ?usize {
+            if (!self.valid or self.threshold != threshold or self.run_count != runs.len) return null;
+            if (runs.len > max_run_ids) return null;
+            for (runs, self.run_ids[0..runs.len]) |run, cached_id| {
+                if (run.id != cached_id) return null;
+            }
+            return self.result;
+        }
+
+        fn store(self: *@This(), runs: []const Run, threshold: usize, result: usize) void {
+            if (runs.len > max_run_ids) {
+                self.valid = false;
+                return;
+            }
+            self.valid = true;
+            self.threshold = threshold;
+            self.run_count = runs.len;
+            for (runs, self.run_ids[0..runs.len]) |run, *cached_id| cached_id.* = run.id;
+            self.result = result;
+        }
+    };
+
     allocator: Allocator,
     mu: std.atomic.Mutex = .unlocked,
     // Cached score used by best-effort maintenance scheduling and metrics.
     // A value of 1 can still mean "known debt, exact score not refreshed yet".
     cached_maintenance_hint: CounterU64 = .init(1),
+    // Exact L0 overlap scoring is quadratic in the number of L0 runs. Runtime
+    // status and ResourceManager metrics can ask for the same score many times
+    // while the immutable run set is unchanged, so retain the exact result for
+    // the normal bounded-L0 case. Run IDs uniquely identify immutable metadata;
+    // comparing the complete sequence avoids stale heuristic scheduling.
+    l0_overlap_cache: L0OverlapCache = .{},
     options: Options,
     root_generation: u64 = 0,
     root_dir: ?[]u8 = null,
@@ -1789,7 +1826,7 @@ pub const Backend = struct {
                 if (level_len > self.options.compact_threshold_runs) {
                     stats.compactable_l0_runs = @intCast(level_len - self.options.compact_threshold_runs);
                 }
-                stats.overlapping_l0_runs = @intCast(compaction_mod.largestL0OverlapRunCount(self.runs.items, self.options.l0_overlap_compact_threshold_runs));
+                stats.overlapping_l0_runs = @intCast(self.largestL0OverlapRunCountLocked());
             } else {
                 stats.lower_level_runs += @intCast(level_len);
                 stats.lower_level_bytes += level_bytes;
@@ -1916,6 +1953,18 @@ pub const Backend = struct {
         return self.maintenanceScoreLocked();
     }
 
+    fn largestL0OverlapRunCountLocked(self: *Backend) usize {
+        const threshold = self.options.l0_overlap_compact_threshold_runs;
+        if (threshold == 0) return 0;
+        var l0_count: usize = 0;
+        while (l0_count < self.runs.items.len and self.runs.items[l0_count].level == 0) : (l0_count += 1) {}
+        const l0_runs = self.runs.items[0..l0_count];
+        if (self.l0_overlap_cache.lookup(l0_runs, threshold)) |cached| return cached;
+        const result = compaction_mod.largestL0OverlapRunCount(l0_runs, threshold);
+        self.l0_overlap_cache.store(l0_runs, threshold, result);
+        return result;
+    }
+
     fn maintenanceScoreLocked(self: *Backend) u64 {
         var score: u64 = 0;
 
@@ -1931,7 +1980,7 @@ pub const Backend = struct {
             if (l0_runs > self.options.compact_threshold_runs) {
                 score +|= (l0_runs - self.options.compact_threshold_runs) * 1_000;
             }
-            score +|= compaction_mod.largestL0OverlapRunCount(self.runs.items, self.options.l0_overlap_compact_threshold_runs) * 2_000;
+            score +|= self.largestL0OverlapRunCountLocked() * 2_000;
         }
 
         var l0_bytes: u64 = 0;
@@ -5870,6 +5919,35 @@ test "lsm backend default base level target absorbs L0 pressure output" {
     try std.testing.expectEqual(@as(u64, 0), stats.level_overflow_runs);
     try std.testing.expectEqual(@as(u64, 0), stats.level_overflow_bytes);
     try std.testing.expectEqual(@as(u64, 28), stats.lower_level_runs);
+}
+
+test "lsm backend caches exact L0 overlap score until immutable run IDs change" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .l0_overlap_compact_threshold_runs = 2,
+        .l0_hard_limit_runs = 16,
+    });
+    defer backend.close();
+    try appendSyntheticLevelRunsForTest(&backend, 0, 4, 1024);
+    compaction_mod.sortRuns(backend.runs.items);
+
+    var stats = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 4), stats.overlapping_l0_runs);
+    try std.testing.expect(backend.l0_overlap_cache.valid);
+    try std.testing.expectEqual(@as(usize, 4), backend.l0_overlap_cache.run_count);
+
+    // Run metadata is immutable for an ID. Changing the complete ID sequence
+    // models publication of a different run set with the same count and must
+    // invalidate the cached result rather than relying on length alone.
+    backend.runs.items[0].id = 99;
+    stats = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 4), stats.overlapping_l0_runs);
+    try std.testing.expectEqual(@as(u64, 99), backend.l0_overlap_cache.run_ids[0]);
+
+    backend.runs.items[0].level = 1;
+    compaction_mod.sortRuns(backend.runs.items);
+    stats = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 3), stats.overlapping_l0_runs);
+    try std.testing.expectEqual(@as(usize, 3), backend.l0_overlap_cache.run_count);
 }
 
 test "lsm backend tight base level target reports lower-level overflow" {

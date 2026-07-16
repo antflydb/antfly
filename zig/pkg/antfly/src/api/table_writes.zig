@@ -4454,6 +4454,11 @@ pub const ProvisionedTableWriteSource = struct {
         table_request_active: usize = 0,
         read_request_active: usize = 0,
         operation_active: bool = false,
+        // A schema/index backfill mutates only its unpublished target index.
+        // Reads routed to the retained read-schema generation may therefore
+        // share the resident DB while that operation is active. Ordinary
+        // writes, restores, and generation changes remain read-exclusive.
+        operation_allows_reads: bool = false,
         structural_active: bool = false,
         structural_reconcile_active: bool = false,
         structural_reconcile_queued: usize = 0,
@@ -5047,6 +5052,15 @@ pub const ProvisionedTableWriteSource = struct {
         return false;
     }
 
+    fn hasAnyReadBlockingGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
+        for (self.active_table_activities.items) |entry| {
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.group_id == null) continue;
+            if (entry.operation_active and !entry.operation_allows_reads) return true;
+        }
+        return false;
+    }
+
     fn waitForNoStructuralActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         const io = self.table_activity_threaded.io();
         while (true) {
@@ -5182,7 +5196,7 @@ pub const ProvisionedTableWriteSource = struct {
                     continue;
                 }
             }
-            if (self.hasAnyActiveGroupOperationLocked(table_name)) {
+            if (self.hasAnyReadBlockingGroupOperationLocked(table_name)) {
                 self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                 continue;
             }
@@ -5197,7 +5211,11 @@ pub const ProvisionedTableWriteSource = struct {
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
-                if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) {
+                // Reconciliation publishes immutable runtime snapshots and
+                // keeps the old schema generation readable. Status inspection
+                // must remain available for the entire (possibly multi-minute)
+                // backfill; only destructive generation transitions fence it.
+                if (entry.structural_active or entry.restore_preparations > 0) {
                     self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                     continue;
                 }
@@ -5242,6 +5260,7 @@ pub const ProvisionedTableWriteSource = struct {
             }
             const entry = self.activityEntryLocked(table_name, group_id);
             entry.operation_active = true;
+            entry.operation_allows_reads = false;
             return;
         }
     }
@@ -5257,6 +5276,21 @@ pub const ProvisionedTableWriteSource = struct {
         }
         const entry = self.activityEntryLocked(table_name, group_id);
         entry.operation_active = true;
+        entry.operation_allows_reads = false;
+        return true;
+    }
+
+    fn tryBeginReadCompatibleGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
+        if (self.findTableActivityLocked(table_name, null)) |index| {
+            const entry = self.active_table_activities.items[index];
+            if (entry.structural_active or entry.restore_preparations > 0) return false;
+        }
+        if (self.findTableActivityLocked(table_name, group_id)) |index| {
+            if (self.active_table_activities.items[index].operation_active) return false;
+        }
+        const entry = self.activityEntryLocked(table_name, group_id);
+        entry.operation_active = true;
+        entry.operation_allows_reads = true;
         return true;
     }
 
@@ -5265,6 +5299,7 @@ pub const ProvisionedTableWriteSource = struct {
         const index = self.findTableActivityLocked(table_name, group_id) orelse unreachable;
         std.debug.assert(self.active_table_activities.items[index].operation_active);
         self.active_table_activities.items[index].operation_active = false;
+        self.active_table_activities.items[index].operation_allows_reads = false;
         self.pruneTableActivityLocked(table_name, group_id);
         self.table_activity_ready.broadcast(io);
     }
@@ -5460,6 +5495,13 @@ pub const ProvisionedTableWriteSource = struct {
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.tryBeginGroupOperationLocked(table_name, group_id);
+    }
+
+    fn tryBeginReadCompatibleGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        return self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id);
     }
 
     fn endGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
@@ -7665,9 +7707,28 @@ pub const ProvisionedTableWriteSource = struct {
             if (entry.structural_active or entry.table_request_active > 0 or entry.read_request_active > 0) return true;
         }
         if (self.findTableActivityLocked(table_name, group_id)) |index| {
-            if (self.active_table_activities.items[index].operation_active) return true;
+            const entry = self.active_table_activities.items[index];
+            if (entry.operation_active and !entry.operation_allows_reads) return true;
         }
         return false;
+    }
+
+    fn structuralReconcileActiveBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const index = self.findTableActivityLocked(table_name, null) orelse return false;
+        const entry = self.active_table_activities.items[index];
+        return entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0;
+    }
+
+    fn readCompatibleGroupOperationActiveBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const index = self.findTableActivityLocked(table_name, group_id) orelse return false;
+        const entry = self.active_table_activities.items[index];
+        return entry.operation_active and entry.operation_allows_reads;
     }
 
     fn activeOperationGroupsForTable(
@@ -7904,8 +7965,14 @@ pub const ProvisionedTableWriteSource = struct {
         // after primary-write dirtiness has been cleared. Refresh stale/aged
         // snapshots from an already-open writer. Tables without one continue
         // to use the published snapshot, so polling never opens a DB.
-        try self.refreshRuntimeStatusesFromWriteCache(alloc, table_name, &cached);
-        self.overlayManagedWriterReplayTargetsBestEffort(table_name, &cached);
+        // Reconciliation can spend minutes building an unpublished index on
+        // the resident writer. Status is observational and already has an
+        // immutable published snapshot; do not contend on live DB stats merely
+        // to refresh optional counters during that interval.
+        if (!self.structuralReconcileActiveBestEffort(table_name)) {
+            try self.refreshRuntimeStatusesFromWriteCache(alloc, table_name, &cached);
+            self.overlayManagedWriterReplayTargetsBestEffort(table_name, &cached);
+        }
         return cached;
     }
 
@@ -8240,6 +8307,17 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
         self.local_db_mutex.unlock();
+
+        // Reconciliation retires the stale-schema writer before opening its
+        // replacement. During that short handoff, let the query path use its
+        // generation-pinned readonly cache instead of racing to create another
+        // writer-cache owner. Once the replacement is resident, subsequent
+        // queries lease it normally while the unpublished target builds.
+        if (cached == null and self.readCompatibleGroupOperationActiveBestEffort(table_name, group_id)) {
+            self.endReadRequest(table_name);
+            read_request_active = false;
+            return null;
+        }
 
         if (cached == null and mismatched_generation_resident) return error.ReadUnavailable;
 
@@ -8876,7 +8954,11 @@ pub const ProvisionedTableWriteSource = struct {
         lockAtomic(&self.local_db_mutex);
         self.invalidateWriteCache(table_name);
         self.invalidateReadCache(table_name);
-        self.invalidateRuntimeStatusCache(table_name);
+        // Keep the last published read-generation snapshot available while
+        // the replacement index builds. The migration state comes from the
+        // catalog; clearing this snapshot would force status requests to open
+        // the live writer and recreate the maintenance outage this background
+        // path is intended to avoid.
         self.local_db_mutex.unlock();
         self.drainWriteCachePendingCloses();
         var attempts: usize = 0;
@@ -8932,7 +9014,10 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         metadata: StartupCatchUpMetadata,
     ) !bool {
-        if (!self.tryBeginGroupOperation(table_name, group_id)) return true;
+        // The target generation is unpublished until catch-up and sync finish.
+        // Queries are routed to the retained read generation, so do not turn a
+        // corpus-sized backfill into a table-wide read outage.
+        if (!self.tryBeginReadCompatibleGroupOperation(table_name, group_id)) return true;
         defer self.endGroupOperation(table_name, group_id);
 
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -24707,6 +24792,42 @@ test "provisioned table write source group operation blocks read admission" {
         io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
     thread.join();
+}
+
+test "provisioned schema reconcile keeps reads and status available" {
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-reconcile-readable", NoCatalog.iface());
+    source.beginStructuralReconcileActivity("docs");
+    defer source.endStructuralReconcileActivity("docs");
+
+    try std.testing.expect(source.tryBeginReadCompatibleGroupOperation("docs", 7001));
+    defer source.endGroupOperation("docs", 7001);
+    try std.testing.expect(!source.hasReadBlockingActivityBestEffort("docs", 7001));
+
+    var activity = source.readPreparation().beginRead("docs", .general).?;
+    activity.deinit();
+
+    try std.testing.expect((try source.residentDbSource().leaseGroup(std.testing.allocator, "docs", 7001, 1)) == null);
+
+    source.beginStatusRequest("docs");
+    source.endReadRequest("docs");
 }
 
 test "provisioned runtime status inspection waits for structural transition" {

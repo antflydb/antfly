@@ -203,6 +203,10 @@ fn withTextIndexSort(
 // large schema rebuilds and left more merge debt than the online scheduler
 // could retire.
 const text_backfill_batch_size: usize = 64 * 1024;
+// An unpublished rebuild does not need to be policy-settled after every 8 MiB
+// page. Allow one bounded extra tier of immutable segments, then compact in a
+// larger policy batch. Completion still settles the index before publication.
+const text_backfill_compact_segment_threshold: usize = default_text_merge_max_segments_per_tier * 2;
 const text_merge_scheduler_default_steps: usize = 1;
 const text_merge_quarantine_backoff_ns: u64 = 30 * std.time.ns_per_s;
 pub var test_text_backfill_batch_size: ?usize = null;
@@ -7180,10 +7184,13 @@ pub const IndexManager = struct {
                 flush_count: *usize,
             ) !void {
                 const stats = try manager.indexTextProjectionDocsMaybeChunked(doc_store, text_entry, docs_buf.items);
-                // Keep a bulk rebuild policy-settled as it grows. This bounds
-                // active segment count and restart merge debt, while the normal
-                // merge reservation and file-backed writer bound RSS.
-                try manager.finalizeTextBatchMutations(text_entry, .{}, stats);
+                // Bound fanout without forcing a merge-policy walk after every
+                // page. Larger policy batches reduce incremental merge/write
+                // amplification while the target generation is unpublished.
+                try manager.finalizeTextBatchMutations(text_entry, .{
+                    .compact_text = false,
+                    .compact_text_segment_threshold = text_backfill_compact_segment_threshold,
+                }, stats);
                 try rebuild.update(last_doc_key);
                 for (docs_buf.items) |doc| {
                     manager.alloc.free(@constCast(doc.key));
@@ -7207,16 +7214,12 @@ pub const IndexManager = struct {
         var reached_end = false;
 
         while (!reached_end) {
-            var identity_txn = try runtime_store.store.beginProbe();
-            var identity_txn_open = true;
-            errdefer if (identity_txn_open) identity_txn.abort();
             var page_last_seen_key: ?[]u8 = null;
             defer if (page_last_seen_key) |buf| self.alloc.free(buf);
 
             const ScanState = struct {
                 manager: *IndexManager,
                 text_entry: *TextIndex,
-                identity_txn: *@TypeOf(identity_txn),
                 lower_exclusive: ?[]const u8,
                 mapped_docs: *std.ArrayListUnmanaged(mapper.MapperDoc),
                 batch_last_doc_key: *?[]const u8,
@@ -7239,9 +7242,9 @@ pub const IndexManager = struct {
                     if (state.lower_exclusive) |exclusive| {
                         if (std.mem.order(u8, key, exclusive) != .gt) return .@"continue";
                     }
-                    try state.rememberKey(key);
                     state.scanned += 1;
                     if (isMetadataKey(key) or !state.manager.keyInRange(key) or !try textIndexShouldConsumeDoc(state.manager, state.text_entry, key)) {
+                        try state.rememberKey(key);
                         if (state.scanned >= state.scan_budget) {
                             state.stopped_early = true;
                             return .stop;
@@ -7260,14 +7263,33 @@ pub const IndexManager = struct {
                     var doc_value_owned = true;
                     errdefer if (doc_value_owned) state.manager.alloc.free(doc_value);
 
+                    const doc_bytes = @sizeOf(mapper.MapperDoc) + doc_id.len + doc_value.len;
+                    if (state.mapped_docs.items.len > 0 and state.source_bytes +| doc_bytes > state.source_target_bytes) {
+                        // Do not consume this key. The next page resumes after
+                        // page_last_seen_key and visits it again. Including the
+                        // crossing document here created a one-document tail
+                        // segment for almost every rebuild page.
+                        state.manager.alloc.free(doc_id);
+                        state.manager.alloc.free(doc_value);
+                        doc_id_owned = false;
+                        doc_value_owned = false;
+                        state.stopped_early = true;
+                        return .stop;
+                    }
+
                     try state.mapped_docs.append(state.manager.alloc, .{
                         .key = doc_id,
                         .value = doc_value,
-                        .doc_ordinal = try doc_identity.lookupOrdinalTxn(state.manager.alloc, state.identity_txn, doc_id),
+                        // Resolve ordinals as one sorted batch in
+                        // textProjectionSourceDocsWithOrdinals. A point lookup
+                        // here turns a full rebuild into millions of sparse LSM
+                        // reads and repeatedly reacquires the backend lock.
+                        .doc_ordinal = null,
                     });
                     doc_id_owned = false;
                     doc_value_owned = false;
-                    state.source_bytes +|= @sizeOf(mapper.MapperDoc) + doc_id.len + doc_value.len;
+                    state.source_bytes +|= doc_bytes;
+                    try state.rememberKey(key);
 
                     if (state.batch_last_doc_key.*) |old| state.manager.alloc.free(old);
                     state.batch_last_doc_key.* = try state.manager.alloc.dupe(u8, key);
@@ -7286,7 +7308,6 @@ pub const IndexManager = struct {
             var scan_state = ScanState{
                 .manager = self,
                 .text_entry = entry,
-                .identity_txn = &identity_txn,
                 .lower_exclusive = scan_lower_buf,
                 .mapped_docs = &mapped_docs,
                 .batch_last_doc_key = &batch_last_doc_key,
@@ -7297,8 +7318,6 @@ pub const IndexManager = struct {
                 .source_target_bytes = backfill_source_target_bytes,
             };
             try backend_scan.scanWithContext(&runtime_store.store, if (scan_lower_buf) |buf| buf else lower, if (upper) |buf| buf else "", .{}, &scan_state, ScanState.scanEntry);
-            identity_txn.abort();
-            identity_txn_open = false;
             reached_end = !scan_state.stopped_early or page_last_seen_key == null;
 
             if (page_last_seen_key) |seen| {
@@ -7313,6 +7332,7 @@ pub const IndexManager = struct {
             }
         }
 
+        if (flushed_batches > 0) try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
         if (flushed_batches > 0) try entry.persistent.checkpointLsmWalAfterDurableBoundary();
     }
@@ -7358,13 +7378,27 @@ pub const IndexManager = struct {
                 docs_buf: *std.ArrayListUnmanaged(mapper.MapperDoc),
                 last_doc_key: []const u8,
                 flush_count: *usize,
+                identity_txn: *docstore_mod.DocStore.Txn,
                 check: ?types.RepairCancelCheck,
                 capacity: ?types.RepairCapacityCheck,
             ) !void {
                 try checkRepairCancelled(check);
                 if (capacity) |admission| try admission.boundary();
+
+                // Keep repair/backfill generation consistency while replacing
+                // per-document point reads with one sorted LSM batch lookup.
+                const doc_ids = try manager.alloc.alloc([]const u8, docs_buf.items.len);
+                defer manager.alloc.free(doc_ids);
+                for (docs_buf.items, 0..) |doc, i| doc_ids[i] = doc.key;
+                const ordinals = try doc_identity.lookupOrdinalsTxnAlloc(manager.alloc, identity_txn, doc_ids);
+                defer manager.alloc.free(ordinals);
+                for (docs_buf.items, ordinals) |*doc, ordinal| doc.doc_ordinal = ordinal;
+
                 const stats = try manager.indexTextProjectionDocsMaybeChunked(doc_store, text_entry, docs_buf.items);
-                try manager.finalizeTextBatchMutations(text_entry, .{}, stats);
+                try manager.finalizeTextBatchMutations(text_entry, .{
+                    .compact_text = false,
+                    .compact_text_segment_threshold = text_backfill_compact_segment_threshold,
+                }, stats);
                 try rebuild.update(last_doc_key);
                 for (docs_buf.items) |doc| {
                     manager.alloc.free(@constCast(doc.key));
@@ -7395,7 +7429,6 @@ pub const IndexManager = struct {
             const ScanState = struct {
                 manager: *IndexManager,
                 text_entry: *TextIndex,
-                identity_txn: *docstore_mod.DocStore.Txn,
                 lower_exclusive: ?[]const u8,
                 mapped_docs: *std.ArrayListUnmanaged(mapper.MapperDoc),
                 batch_last_doc_key: *?[]const u8,
@@ -7418,9 +7451,9 @@ pub const IndexManager = struct {
                     if (state.lower_exclusive) |exclusive| {
                         if (std.mem.order(u8, key, exclusive) != .gt) return .@"continue";
                     }
-                    try state.rememberKey(key);
                     state.scanned += 1;
                     if (isMetadataKey(key) or !state.manager.keyInRange(key) or !try textIndexShouldConsumeDoc(state.manager, state.text_entry, key)) {
+                        try state.rememberKey(key);
                         if (state.scanned >= state.scan_budget) {
                             state.stopped_early = true;
                             return .stop;
@@ -7439,14 +7472,28 @@ pub const IndexManager = struct {
                     var doc_value_owned = true;
                     errdefer if (doc_value_owned) state.manager.alloc.free(doc_value);
 
+                    const doc_bytes = @sizeOf(mapper.MapperDoc) + doc_id.len + doc_value.len;
+                    if (state.mapped_docs.items.len > 0 and state.source_bytes +| doc_bytes > state.source_target_bytes) {
+                        state.manager.alloc.free(doc_id);
+                        state.manager.alloc.free(doc_value);
+                        doc_id_owned = false;
+                        doc_value_owned = false;
+                        state.stopped_early = true;
+                        return .stop;
+                    }
+
                     try state.mapped_docs.append(state.manager.alloc, .{
                         .key = doc_id,
                         .value = doc_value,
-                        .doc_ordinal = try doc_identity.lookupOrdinalTxn(state.manager.alloc, state.identity_txn, doc_id),
+                        // Resolve the whole page with getManySorted when the
+                        // projection batch is built. The identity mapping is
+                        // stable for the lifetime of a document ordinal.
+                        .doc_ordinal = null,
                     });
                     doc_id_owned = false;
                     doc_value_owned = false;
-                    state.source_bytes +|= @sizeOf(mapper.MapperDoc) + doc_id.len + doc_value.len;
+                    state.source_bytes +|= doc_bytes;
+                    try state.rememberKey(key);
 
                     if (state.batch_last_doc_key.*) |old| state.manager.alloc.free(old);
                     state.batch_last_doc_key.* = try state.manager.alloc.dupe(u8, key);
@@ -7465,7 +7512,6 @@ pub const IndexManager = struct {
             var scan_state = ScanState{
                 .manager = self,
                 .text_entry = entry,
-                .identity_txn = read_txn,
                 .lower_exclusive = scan_lower_buf,
                 .mapped_docs = &mapped_docs,
                 .batch_last_doc_key = &batch_last_doc_key,
@@ -7492,6 +7538,7 @@ pub const IndexManager = struct {
                     &mapped_docs,
                     batch_last_doc_key.?,
                     &flushed_batches,
+                    read_txn,
                     cancel_check,
                     capacity_check,
                 );
@@ -7500,6 +7547,7 @@ pub const IndexManager = struct {
             }
         }
 
+        if (flushed_batches > 0) try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
         if (flushed_batches > 0) try entry.persistent.checkpointLsmWalAfterDurableBoundary();
     }

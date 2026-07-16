@@ -4854,10 +4854,18 @@ pub const ApiHttpServer = struct {
                 };
                 if (self.table_writes) |table_writes_source| {
                     if (!local_schema_applied) {
-                        _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
-                            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
-                            else => return write_err,
+                        const scheduled = table_writes_source.requestTableStructuralReconcile(self.alloc, table_name) catch |write_err| {
+                            std.log.err("public schema update structural reconcile enqueue failed table={s} err={s}", .{ table_name, @errorName(write_err) });
+                            return write_err;
                         };
+                        // Embedded/direct DB sources have no reconciliation
+                        // worker and retain their synchronous update contract.
+                        if (scheduled == null) {
+                            _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
+                                error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
+                                else => return write_err,
+                            };
+                        }
                     }
                     if (try self.source.runRound()) {
                         _ = try self.source.runRound();

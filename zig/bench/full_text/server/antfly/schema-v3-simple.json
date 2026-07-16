@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "default_type": "doc",
   "enforce_types": true,
   "document_schemas": {

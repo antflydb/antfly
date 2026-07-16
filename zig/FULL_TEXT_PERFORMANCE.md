@@ -2671,6 +2671,104 @@ then restarted with memory attribution every 64 batches rather than every batch
 so repeatedly walking the multi-gigabyte v1 layout does not dominate the
 remaining rebuild wall time.
 
+### Analyzer-equivalence correction and online migration admission (2026-07-16)
+
+The completed `full_text_index_v2` rebuild was operationally healthy but is not
+an acceptable Tantivy/Quickwit comparison. It contained all 5,032,105
+documents in 10 segments and occupied 2,602,844,009 bytes, but the benchmark
+fixture had omitted `x-antfly-analyzer`. Antfly therefore inherited its
+production `standard` pipeline: Unicode words, ASCII lowercase, English stop
+words, and Porter2 stemming. The embedded Tantivy comparator uses the Antfly
+simple contract with no stop-word removal or stemming, while the archived
+Quickwit 0.8.2 run used Tantivy's built-in simple tokenizer, 255-byte length
+filter, and lowercase filter. The apparent size win was reduced semantic work,
+not a storage-format win, and must not be published as such.
+
+Detailed v2 section accounting reconciles 2,602,843,609 of the 2,602,844,009
+segment bytes, leaving only 400 framing bytes unattributed. Stored fields use
+177,122,512 bytes; the inverted `body` field uses 2,366,293,153 bytes, including
+71,707,015 dictionary bytes, 22,020,296 Bloom bytes, 2,267,533,357 postings
+bytes, and 1,158,722,584 position bytes; typed values use 39,298,394 bytes;
+ordinals use 20,128,470 bytes; and section indexes use 1,080 bytes. The analyzer
+produced 10,503,292 posting terms, versus roughly 12.1 million in the valid v38
+kernel artifact. This directly explains why v2 cannot answer the remaining
+index-size question.
+
+The server fixture now declares `simple` in the initial schema and the v2
+migration fixture. Existing preserved generations are not rewritten. A
+corrective `schema-v3-simple.json` creates a new immutable generation for the
+diagnostic corpus, retains v2 as the read generation until readiness, and will
+provide the honest product-size/CPU/RSS result. Antfly simple and the embedded
+kernel contract both use ASCII lowercase with no stop words or stemming. The
+server comparison records Quickwit's remaining Unicode-lowercase/length-filter
+boundary explicitly instead of silently attributing analyzer differences to
+the format.
+
+Starting that corrective migration exposed a distinct availability defect.
+`PUT /schema` committed metadata and then synchronously applied and drained the
+corpus-sized rebuild on an HTTP worker. The listener and health server remained
+healthy, but table status and normal read admission waited behind structural
+and group activity. Provisioned schema updates now follow the already-existing
+index-create production pattern: after exact metadata projection they enqueue
+structural reconciliation and return; embedded/direct DB sources without a
+background owner retain their synchronous contract. Structural reconciliation
+uses a dedicated read-compatible group-operation class because it mutates only
+the unpublished target index. Queries routed to the retained read-schema
+generation and immutable runtime-status snapshots remain admitted, while
+ordinary writes, restore, drop, and root-generation transitions retain the
+existing exclusive read fence. Focused admission coverage distinguishes the
+two operation classes. Reconciliation retains the last published runtime-status
+snapshot instead of invalidating it and forcing a status-only DB reopen. During
+the brief stale-writer retirement/new-writer open handoff, resident-DB leasing
+returns control to the generation-pinned readonly query cache rather than
+racing to create a second writer owner; once the replacement writer is
+resident, reads lease it normally. Full HTTP validation is required against the
+corrective generation before accepting the product gate.
+
+The preserved accepted v38 kernel artifact provides the corrective semantic
+oracle: exact `alpha` count is 15,753 and exact phrase `alpha beta` count is
+525. The v2 `standard` generation returned 15,818 and 909 respectively because
+stemming changes both term membership and phrase candidates. Promotion of v3
+is accepted only if its full count is 5,032,105 and these simple-analyzer counts
+match exactly.
+
+A live v3 sample also found repeated LSM observability work rather than index
+construction at the top of one core: `maintenanceScoreLocked` called the
+quadratic `largestL0OverlapRunCount` on every runtime-status/ResourceManager
+sample even though the immutable L0 run set had not changed. The backend now
+caches that exact overlap result for the normal bounded-L0 case. Cache hits
+compare the complete ordered run-ID sequence and configured threshold, so a
+same-length publication cannot reuse stale scheduling state; oversized L0 sets
+fall back to the uncached exact calculation. Actual compaction-plan selection
+remains exact and unchanged. Focused coverage changes both an ID and the L0 run
+count and requires the cached result to refresh.
+
+The same v3 profile accounted for the large gap between segment-construction
+CPU and end-to-end migration wall time. The backfill cursor performed a sparse
+identity-map point read for every source document. On the production LSM this
+repeatedly acquired the backend lock and searched the same immutable run set;
+the sampled cursor path was dominated by `lookupOrdinalTxn` and LSM point-read
+lock waits. Backfill now collects document IDs with each byte-bounded page and
+resolves their ordinals through the existing sorted `getManySorted` path. The
+repair/read-transaction variant performs that batch lookup against its pinned
+transaction, preserving generation consistency; the current-state variant
+uses the normal projection batch lookup. Stable document ordinals and index
+semantics are unchanged.
+
+Instrumentation also showed exactly one `source_docs=1` segment build after
+almost every normal 8 MiB page. The scanner appended the document that crossed
+the byte target and the segment splitter consequently emitted a normal segment
+plus a one-document tail. The cursor now stops before consuming that crossing
+key, resumes from the preceding key on the next page, and permits a single
+oversized document only when the page is otherwise empty. This removes roughly
+half the segment publish operations in the observed rebuild without dropping
+or duplicating the boundary document. Finally, an unpublished rebuild may now
+accumulate at most one bounded extra merge-policy tier before synchronous
+compaction, instead of checking and settling policy after every page;
+completion still performs a policy-settling merge before clearing the durable
+rebuild marker and publishing the generation. The interrupted-resume and
+final-fanout tests remain the correctness gates for these changes.
+
 ## Result Artifact
 
 Each run should produce one directory containing at least:
