@@ -101,7 +101,7 @@ pub const QueuedApplyWorker = struct {
         };
     }
 
-    fn drain(ptr: *anyopaque) !void {
+    fn drain(ptr: *anyopaque) storage_iface.ApplyDrainResult {
         const self: *QueuedApplyWorker = @ptrCast(@alignCast(ptr));
         var completed: usize = 0;
         defer {
@@ -113,9 +113,12 @@ pub const QueuedApplyWorker = struct {
         }
         while (completed < self.tasks.items.len) : (completed += 1) {
             const task = &self.tasks.items[completed];
-            try self.state_machine.applyReady(task.group_id, task.snapshot, task.entries, task.read_states);
+            self.state_machine.applyReady(task.group_id, task.snapshot, task.entries, task.read_states) catch |err| {
+                return .{ .completed = completed, .failure = err };
+            };
             task.deinit(self.alloc);
         }
+        return .{ .completed = completed };
     }
 
     fn abort(ptr: *anyopaque) void {
@@ -165,7 +168,9 @@ test "queued apply worker drains queued tasks into state machine" {
     defer entry.deinit(std.testing.allocator);
 
     try worker.queue().enqueueApply(1, null, &.{entry}, &.{});
-    try worker.queue().drain();
+    const result = worker.queue().drain();
+    try std.testing.expectEqual(@as(usize, 1), result.completed);
+    try std.testing.expectEqual(@as(?anyerror, null), result.failure);
     try std.testing.expectEqual(@as(usize, 1), recorder.entries);
 }
 
@@ -205,12 +210,16 @@ test "queued apply worker consumes successful prefix when a later task fails" {
     try worker.queue().enqueueApply(1, null, &.{.{ .term = 1, .index = 1 }}, &.{});
     try worker.queue().enqueueApply(2, null, &.{.{ .term = 1, .index = 1 }}, &.{});
 
-    try std.testing.expectError(error.InjectedApplyFailure, worker.queue().drain());
+    const failed = worker.queue().drain();
+    try std.testing.expectEqual(@as(usize, 1), failed.completed);
+    try std.testing.expectEqual(error.InjectedApplyFailure, failed.failure.?);
     try std.testing.expectEqual(@as(usize, 1), recorder.first_applies);
     try std.testing.expectEqual(@as(usize, 1), worker.tasks.items.len);
 
     recorder.fail_second = false;
-    try worker.queue().drain();
+    const retried = worker.queue().drain();
+    try std.testing.expectEqual(@as(usize, 1), retried.completed);
+    try std.testing.expectEqual(@as(?anyerror, null), retried.failure);
     try std.testing.expectEqual(@as(usize, 1), recorder.first_applies);
     try std.testing.expectEqual(@as(usize, 1), recorder.second_applies);
     try std.testing.expectEqual(@as(usize, 0), worker.tasks.items.len);

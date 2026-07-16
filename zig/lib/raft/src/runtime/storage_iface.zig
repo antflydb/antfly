@@ -289,8 +289,16 @@ pub const StateMachine = struct {
     }
 };
 
+pub const ApplyDrainResult = struct {
+    completed: usize,
+    failure: ?anyerror = null,
+};
+
 // ApplyQueue lets the host enqueue apply work and then drain it once per host round.
 // Implementations must consume the passed slices synchronously and must not retain them.
+// Each apply_ready call must be atomic or idempotent on failure. drain reports the exact
+// successfully-applied task prefix so the host can retire it when a later task fails;
+// abort discards only work that drain did not report as completed.
 pub const ApplyQueue = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -303,7 +311,7 @@ pub const ApplyQueue = struct {
             committed_entries: []const core.Entry,
             read_states: []const core.ReadState,
         ) anyerror!void,
-        drain: *const fn (ptr: *anyopaque) anyerror!void,
+        drain: *const fn (ptr: *anyopaque) ApplyDrainResult,
         abort: *const fn (ptr: *anyopaque) void,
     };
 
@@ -317,8 +325,8 @@ pub const ApplyQueue = struct {
         return try self.vtable.enqueue_apply(self.ptr, group_id, snapshot, committed_entries, read_states);
     }
 
-    pub fn drain(self: ApplyQueue) !void {
-        return try self.vtable.drain(self.ptr);
+    pub fn drain(self: ApplyQueue) ApplyDrainResult {
+        return self.vtable.drain(self.ptr);
     }
 
     pub fn abort(self: ApplyQueue) void {

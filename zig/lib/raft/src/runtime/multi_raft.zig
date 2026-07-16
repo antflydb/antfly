@@ -991,16 +991,23 @@ pub const MultiRaft = struct {
             task.deinit(self.alloc);
             return err;
         };
+        if (snapshot != null) {
+            _ = self.snapshot_candidates.remove(group_id);
+            self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
+        }
     }
 
     fn flushPendingApply(self: *MultiRaft) !void {
-        try self.publishCompletedSnapshotCompaction();
-        try self.dispatchNextSnapshotCompaction();
-        if (self.pending_apply.items.len == 0) return;
+        if (self.pending_apply.items.len == 0) {
+            self.runSnapshotMaintenance();
+            return;
+        }
 
         const drain_count = @min(self.cfg.max_apply_tasks_per_round, self.pending_apply.items.len);
         if (drain_count == 0) return;
 
+        var completed: usize = 0;
+        var apply_failure: ?anyerror = null;
         if (self.hooks.apply_queue) |apply_queue| {
             for (self.pending_apply.items[0..drain_count]) |task| {
                 apply_queue.enqueueApply(task.group_id, task.snapshot, task.entries, task.read_states) catch |err| {
@@ -1008,27 +1015,53 @@ pub const MultiRaft = struct {
                     return err;
                 };
             }
-            apply_queue.drain() catch |err| {
+            const result = apply_queue.drain();
+            completed = result.completed;
+            apply_failure = result.failure;
+            if (completed > drain_count) {
                 apply_queue.abort();
-                return err;
-            };
+                return error.InvalidApplyProgress;
+            }
+            if (apply_failure == null and completed != drain_count) {
+                apply_failure = error.IncompleteApplyDrain;
+            } else if (apply_failure != null and completed == drain_count) {
+                apply_failure = error.InvalidApplyProgress;
+            }
+            apply_queue.abort();
             self.metrics.apply_queue_drains += 1;
         } else if (self.hooks.state_machine) |state_machine| {
             for (self.pending_apply.items[0..drain_count]) |task| {
-                try state_machine.applyReady(task.group_id, task.snapshot, task.entries, task.read_states);
+                state_machine.applyReady(task.group_id, task.snapshot, task.entries, task.read_states) catch |err| {
+                    apply_failure = err;
+                    break;
+                };
+                completed += 1;
             }
+        } else {
+            completed = drain_count;
         }
-        try self.scheduleAppliedLogCompaction(self.pending_apply.items[0..drain_count]);
 
-        self.consumePendingApplyPrefix(drain_count);
-        try self.publishCompletedSnapshotCompaction();
-        try self.dispatchNextSnapshotCompaction();
+        const applied_snapshot = self.scheduleAppliedLogCompaction(self.pending_apply.items[0..completed]);
+        self.consumePendingApplyPrefix(completed);
+        if (apply_failure) |err| return err;
+
+        // Async Ready advances its RawNode after apply drains. Defer maintenance
+        // for a round so an incoming snapshot is visible before stale local
+        // compaction results are considered for publication.
+        if (!applied_snapshot) self.runSnapshotMaintenance();
     }
 
-    fn scheduleAppliedLogCompaction(self: *MultiRaft, tasks: []const PendingApplyTask) !void {
-        if (self.cfg.applied_log_retained_entries == 0) return;
+    fn scheduleAppliedLogCompaction(self: *MultiRaft, tasks: []const PendingApplyTask) bool {
+        var applied_snapshot = false;
+        if (self.cfg.applied_log_retained_entries == 0) {
+            for (tasks) |task| applied_snapshot = applied_snapshot or task.snapshot != null;
+            return applied_snapshot;
+        }
         for (tasks, 0..) |task, task_index| {
-            if (task.snapshot != null) _ = self.snapshot_candidates.remove(task.group_id);
+            if (task.snapshot != null) {
+                applied_snapshot = true;
+                _ = self.snapshot_candidates.remove(task.group_id);
+            }
             if (task.entries.len == 0) continue;
             var has_later_group_task = false;
             for (tasks[task_index + 1 ..]) |later| {
@@ -1040,10 +1073,29 @@ pub const MultiRaft = struct {
             if (has_later_group_task) continue;
             const last_applied = task.entries[task.entries.len - 1].index;
             const incarnation = self.group_incarnations.get(task.group_id) orelse continue;
-            try self.queueSnapshotCandidate(task.group_id, last_applied, incarnation, false);
+            self.queueSnapshotCandidate(task.group_id, last_applied, incarnation, false) catch |err| {
+                self.metrics.snapshot_compaction_failures += 1;
+                std.log.warn("raft snapshot compaction candidate deferred group_id={d} applied_index={d} error={s}", .{
+                    task.group_id,
+                    last_applied,
+                    @errorName(err),
+                });
+            };
         }
         self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
-        try self.dispatchNextSnapshotCompaction();
+        return applied_snapshot;
+    }
+
+    fn runSnapshotMaintenance(self: *MultiRaft) void {
+        self.publishCompletedSnapshotCompaction() catch |err| {
+            self.metrics.snapshot_compaction_failures += 1;
+            std.log.warn("raft snapshot compaction publication maintenance deferred error={s}", .{@errorName(err)});
+            return;
+        };
+        self.dispatchNextSnapshotCompaction() catch |err| {
+            self.metrics.snapshot_compaction_failures += 1;
+            std.log.warn("raft snapshot compaction dispatch maintenance deferred error={s}", .{@errorName(err)});
+        };
     }
 
     fn queueSnapshotCandidate(
@@ -1137,16 +1189,40 @@ pub const MultiRaft = struct {
                 _ = self.snapshot_candidates.remove(group_id);
                 continue;
             }
-            const source = (try state_machine.prepareSnapshot(group_id, last_applied)) orelse {
+            const source = (state_machine.prepareSnapshot(group_id, last_applied) catch |err| {
+                self.metrics.snapshot_compaction_failures += 1;
+                try self.queueSnapshotCandidate(group_id, last_applied, incarnation, true);
+                std.log.warn("raft snapshot compaction preparation deferred group_id={d} applied_index={d} error={s}", .{
+                    group_id,
+                    last_applied,
+                    @errorName(err),
+                });
+                return;
+            }) orelse {
                 _ = self.snapshot_candidates.remove(group_id);
                 continue;
             };
             var source_owned = true;
             defer if (source_owned) source.deinit();
             const status = grp.status();
+            const snapshot_term = grp.termAt(last_applied) catch |err| {
+                if (err == error.IndexNotFound) {
+                    _ = self.snapshot_candidates.remove(group_id);
+                    self.metrics.snapshot_compaction_stale_drops += 1;
+                    continue;
+                }
+                self.metrics.snapshot_compaction_failures += 1;
+                try self.queueSnapshotCandidate(group_id, last_applied, incarnation, true);
+                std.log.warn("raft snapshot compaction term lookup deferred group_id={d} applied_index={d} error={s}", .{
+                    group_id,
+                    last_applied,
+                    @errorName(err),
+                });
+                return;
+            };
             var metadata = core.types.SnapshotMetadata{
                 .index = last_applied,
-                .term = try grp.termAt(last_applied),
+                .term = snapshot_term,
                 .conf_state = try status.conf_state.clone(std.heap.page_allocator),
             };
             var metadata_owned = true;
