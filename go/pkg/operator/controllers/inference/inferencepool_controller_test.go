@@ -17,6 +17,7 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -128,7 +129,10 @@ var _ = Describe("InferencePool Controller", func() {
 			Expect(createdSts.Spec.Template.Spec.Containers).To(HaveLen(1))
 			Expect(createdSts.Spec.Template.Spec.Containers[0].Name).To(Equal("inference"))
 			Expect(createdSts.Spec.Template.Spec.Containers[0].Command).To(Equal([]string{"/antfly"}))
-			Expect(createdSts.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"inference", "run", "--config", "/config/config.json"}))
+			Expect(createdSts.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
+				"inference", "run", "--config", "/config/config.json",
+				"--host", "0.0.0.0", "--port", strconv.Itoa(InferenceAPIPort),
+			}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers).To(HaveLen(1))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Command).To(Equal([]string{"/antfly"}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Args).To(Equal([]string{

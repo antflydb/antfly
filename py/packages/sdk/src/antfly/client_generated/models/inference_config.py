@@ -10,7 +10,6 @@ from ..models.inference_backend_priority_entry import InferenceBackendPriorityEn
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.inference_config_model_strategies import InferenceConfigModelStrategies
     from ..models.inference_content_security_config import InferenceContentSecurityConfig
     from ..models.inference_credentials import InferenceCredentials
     from ..models.inference_model_ref import InferenceModelRef
@@ -86,39 +85,13 @@ class InferenceConfig:
             Requests beyond the limit receive 503 Service Unavailable with Retry-After;
             they are not held in an in-process wait queue. Set to 0 for unlimited.
              Default: 32. Example: 4.
-        max_queue_size (int | Unset): Compatibility field retained for older configs. The Zig runtime does not keep
-            an in-process request wait queue and ignores this value; use
-            max_concurrent_requests to configure immediate backpressure.
-             Default: 0. Example: 100.
-        request_timeout (str | Unset): Compatibility field retained for older configs. The Zig runtime does not
-            currently apply a global request timeout from this value.
-             Default: '0'. Example: 30s.
         preload (list[InferenceModelRef] | Unset): Models to preload and warm at startup. Generators run a tiny
             generation
             request so native/Metal weights, KV setup, and kernels use the same
             budgeted path as request-time generation. Other model kinds use the
             best available warm path for that kind. Specialized request-scoped pipelines
             are capacity-bounded but may still initialize on their first request.
-             Example: [{'kind': 'generator', 'name': 'antflydb/gemma-e2b', 'backend': 'metal', 'format': 'gguf',
-            'quantization': 'q4_k'}].
-        max_memory_mb (int | Unset): Compatibility field for a future aggregate loaded-model memory limit. The Zig
-            runtime does not currently enforce this value; use max_loaded_models for the
-            logical-model admission and steady-state residency budget, not a byte limit. Set to
-            0 when unused (default).
-             Default: 0. Example: 4096.
-        model_strategies (InferenceConfigModelStrategies | Unset): Per-model loading strategy overrides for runtimes
-            that support them. Maps model
-            names to their loading strategy. Models not in this map follow `keep_alive`:
-            positive durations permit idle eviction, while "0" keeps a model resident after
-            it is loaded. Some compatibility runtimes also eagerly load models for "0".
-
-            When a model has strategy "eager" in this map:
-            - It is loaded at startup through the same startup warmup path
-            - It is never unloaded, even when keep_alive>0 (pinned in memory)
-
-            Strategy support varies by runtime. Use `preload` for portable, deterministic
-            startup loading.
-             Example: {'BAAI/bge-small-en-v1.5': 'eager', 'mirth/chonky-mmbert-small-multilingual-1': 'lazy'}.
+             Example: [{'kind': 'generator', 'name': 'antflydb/gemma-e2b', 'backend': 'metal'}].
         allow_downloads (bool | Unset): Whether the dashboard should show model download commands.
             Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed
             deployments (e.g., Kubernetes operator) where models are managed externally.
@@ -138,11 +111,7 @@ class InferenceConfig:
     prompt_cache: InferencePromptCacheConfig | Unset = UNSET
     backend_priority: list[InferenceBackendPriorityEntry] | Unset = UNSET
     max_concurrent_requests: int | Unset = 32
-    max_queue_size: int | Unset = 0
-    request_timeout: str | Unset = "0"
     preload: list[InferenceModelRef] | Unset = UNSET
-    max_memory_mb: int | Unset = 0
-    model_strategies: InferenceConfigModelStrategies | Unset = UNSET
     allow_downloads: bool | Unset = True
     log: InferenceschemasConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -183,22 +152,12 @@ class InferenceConfig:
 
         max_concurrent_requests = self.max_concurrent_requests
 
-        max_queue_size = self.max_queue_size
-
-        request_timeout = self.request_timeout
-
         preload: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.preload, Unset):
             preload = []
             for preload_item_data in self.preload:
                 preload_item = preload_item_data.to_dict()
                 preload.append(preload_item)
-
-        max_memory_mb = self.max_memory_mb
-
-        model_strategies: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.model_strategies, Unset):
-            model_strategies = self.model_strategies.to_dict()
 
         allow_downloads = self.allow_downloads
 
@@ -233,16 +192,8 @@ class InferenceConfig:
             field_dict["backend_priority"] = backend_priority
         if max_concurrent_requests is not UNSET:
             field_dict["max_concurrent_requests"] = max_concurrent_requests
-        if max_queue_size is not UNSET:
-            field_dict["max_queue_size"] = max_queue_size
-        if request_timeout is not UNSET:
-            field_dict["request_timeout"] = request_timeout
         if preload is not UNSET:
             field_dict["preload"] = preload
-        if max_memory_mb is not UNSET:
-            field_dict["max_memory_mb"] = max_memory_mb
-        if model_strategies is not UNSET:
-            field_dict["model_strategies"] = model_strategies
         if allow_downloads is not UNSET:
             field_dict["allow_downloads"] = allow_downloads
         if log is not UNSET:
@@ -252,7 +203,6 @@ class InferenceConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.inference_config_model_strategies import InferenceConfigModelStrategies
         from ..models.inference_content_security_config import InferenceContentSecurityConfig
         from ..models.inference_credentials import InferenceCredentials
         from ..models.inference_model_ref import InferenceModelRef
@@ -306,10 +256,6 @@ class InferenceConfig:
 
         max_concurrent_requests = d.pop("max_concurrent_requests", UNSET)
 
-        max_queue_size = d.pop("max_queue_size", UNSET)
-
-        request_timeout = d.pop("request_timeout", UNSET)
-
         _preload = d.pop("preload", UNSET)
         preload: list[InferenceModelRef] | Unset = UNSET
         if _preload is not UNSET:
@@ -318,15 +264,6 @@ class InferenceConfig:
                 preload_item = InferenceModelRef.from_dict(preload_item_data)
 
                 preload.append(preload_item)
-
-        max_memory_mb = d.pop("max_memory_mb", UNSET)
-
-        _model_strategies = d.pop("model_strategies", UNSET)
-        model_strategies: InferenceConfigModelStrategies | Unset
-        if isinstance(_model_strategies, Unset):
-            model_strategies = UNSET
-        else:
-            model_strategies = InferenceConfigModelStrategies.from_dict(_model_strategies)
 
         allow_downloads = d.pop("allow_downloads", UNSET)
 
@@ -350,11 +287,7 @@ class InferenceConfig:
             prompt_cache=prompt_cache,
             backend_priority=backend_priority,
             max_concurrent_requests=max_concurrent_requests,
-            max_queue_size=max_queue_size,
-            request_timeout=request_timeout,
             preload=preload,
-            max_memory_mb=max_memory_mb,
-            model_strategies=model_strategies,
             allow_downloads=allow_downloads,
             log=log,
         )

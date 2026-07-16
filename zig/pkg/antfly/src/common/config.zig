@@ -541,6 +541,7 @@ pub const Config = struct {
             .object => |object| object,
             else => return error.InvalidConfig,
         };
+        try rejectRemovedInferenceConfigFields(raw_root.get("inference"));
 
         var parsed_tree = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{
             .allocate = .alloc_always,
@@ -1999,6 +2000,25 @@ fn parseInferencePreloadModels(
     return out;
 }
 
+fn rejectRemovedInferenceConfigFields(value: ?std.json.Value) !void {
+    const inference_value = value orelse return;
+    const inference = switch (inference_value) {
+        .object => |object| object,
+        else => return error.InvalidConfig,
+    };
+    inline for (.{
+        "model_strategies",
+        "embedder_models_dir",
+        "chunker_models_dir",
+        "reranker_models_dir",
+        "max_queue_size",
+        "request_timeout",
+        "max_memory_mb",
+    }) |field| {
+        if (inference.contains(field)) return error.InvalidConfig;
+    }
+}
+
 fn contentSecurityFromOpenApi(
     alloc: std.mem.Allocator,
     value: scraping_openapi.ContentSecurityConfig,
@@ -2310,6 +2330,26 @@ test "common config rejects unsupported preload artifact selectors" {
         const raw = try std.fmt.allocPrint(
             std.testing.allocator,
             "{{\"inference\":{{\"preload\":[{{\"kind\":\"generator\",\"name\":\"model\",\"{s}\":\"value\"}}]}}}}",
+            .{field},
+        );
+        defer std.testing.allocator.free(raw);
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, raw));
+    }
+}
+
+test "common config rejects removed inference compatibility fields" {
+    inline for (.{
+        "model_strategies",
+        "embedder_models_dir",
+        "chunker_models_dir",
+        "reranker_models_dir",
+        "max_queue_size",
+        "request_timeout",
+        "max_memory_mb",
+    }) |field| {
+        const raw = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"inference\":{{\"{s}\":null}}}}",
             .{field},
         );
         defer std.testing.allocator.free(raw);

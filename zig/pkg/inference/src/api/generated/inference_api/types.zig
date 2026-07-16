@@ -217,16 +217,8 @@ pub const Config = struct {
     backend_priority: ?[]const BackendPriorityEntry = null,
     /// Maximum weighted inference work admitted concurrently by the Zig runtime. Requests beyond the limit receive 503 Service Unavailable with Retry-After; they are not held in an in-process wait queue. Set to 0 for unlimited.
     max_concurrent_requests: ?i64 = null,
-    /// Compatibility field retained for older configs. The Zig runtime does not keep an in-process request wait queue and ignores this value; use max_concurrent_requests to configure immediate backpressure.
-    max_queue_size: ?i64 = null,
-    /// Compatibility field retained for older configs. The Zig runtime does not currently apply a global request timeout from this value.
-    request_timeout: ?[]const u8 = null,
     /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind. Specialized request-scoped pipelines are capacity-bounded but may still initialize on their first request.
     preload: ?[]const ModelRef = null,
-    /// Compatibility field for a future aggregate loaded-model memory limit. The Zig runtime does not currently enforce this value; use max_loaded_models for the logical-model admission and steady-state residency budget, not a byte limit. Set to 0 when unused (default).
-    max_memory_mb: ?i64 = null,
-    /// Per-model loading strategy overrides for runtimes that support them. Maps model names to their loading strategy. Models not in this map follow `keep_alive`: positive durations permit idle eviction, while "0" keeps a model resident after it is loaded. Some compatibility runtimes also eagerly load models for "0". When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) Strategy support varies by runtime. Use `preload` for portable, deterministic startup loading.
-    model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
     /// Whether the dashboard should show model download commands. Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
     allow_downloads: ?bool = null,
     log: ?SchemasConfig = null,

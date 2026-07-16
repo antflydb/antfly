@@ -11866,23 +11866,6 @@ export interface components {
              */
             max_concurrent_requests?: number;
             /**
-             * @deprecated
-             * @description Compatibility field retained for older configs. The Zig runtime does not keep
-             *     an in-process request wait queue and ignores this value; use
-             *     max_concurrent_requests to configure immediate backpressure.
-             * @default 0
-             * @example 100
-             */
-            max_queue_size?: number;
-            /**
-             * @deprecated
-             * @description Compatibility field retained for older configs. The Zig runtime does not
-             *     currently apply a global request timeout from this value.
-             * @default 0
-             * @example 30s
-             */
-            request_timeout?: string;
-            /**
              * @description Models to preload and warm at startup. Generators run a tiny generation
              *     request so native/Metal weights, KV setup, and kernels use the same
              *     budgeted path as request-time generation. Other model kinds use the
@@ -11892,43 +11875,11 @@ export interface components {
              *       {
              *         "kind": "generator",
              *         "name": "antflydb/gemma-e2b",
-             *         "backend": "metal",
-             *         "format": "gguf",
-             *         "quantization": "q4_k"
+             *         "backend": "metal"
              *       }
              *     ]
              */
             preload?: components["schemas"]["InferenceModelRef"][];
-            /**
-             * @deprecated
-             * @description Compatibility field for a future aggregate loaded-model memory limit. The Zig
-             *     runtime does not currently enforce this value; use max_loaded_models for the
-             *     logical-model admission and steady-state residency budget, not a byte limit. Set to
-             *     0 when unused (default).
-             * @default 0
-             * @example 4096
-             */
-            max_memory_mb?: number;
-            /**
-             * @description Per-model loading strategy overrides for runtimes that support them. Maps model
-             *     names to their loading strategy. Models not in this map follow `keep_alive`:
-             *     positive durations permit idle eviction, while "0" keeps a model resident after
-             *     it is loaded. Some compatibility runtimes also eagerly load models for "0".
-             *
-             *     When a model has strategy "eager" in this map:
-             *     - It is loaded at startup through the same startup warmup path
-             *     - It is never unloaded, even when keep_alive>0 (pinned in memory)
-             *
-             *     Strategy support varies by runtime. Use `preload` for portable, deterministic
-             *     startup loading.
-             * @example {
-             *       "BAAI/bge-small-en-v1.5": "eager",
-             *       "mirth/chonky-mmbert-small-multilingual-1": "lazy"
-             *     }
-             */
-            model_strategies?: {
-                [key: string]: "eager" | "lazy" | "bounded";
-            };
             /**
              * @description Whether the dashboard should show model download commands.
              *     Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed

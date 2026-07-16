@@ -227,7 +227,15 @@ pub fn runFromIterator(
 }
 
 fn rejectUnsupportedInferenceFields(source: std.json.ObjectMap) !void {
-    inline for (.{ "model_strategies", "embedder_models_dir", "chunker_models_dir", "reranker_models_dir" }) |key| {
+    inline for (.{
+        "model_strategies",
+        "embedder_models_dir",
+        "chunker_models_dir",
+        "reranker_models_dir",
+        "max_queue_size",
+        "request_timeout",
+        "max_memory_mb",
+    }) |key| {
         if (source.contains(key)) return error.InvalidConfig;
     }
 }
@@ -793,7 +801,15 @@ test "inference run parses common config shape emitted by operator" {
 }
 
 test "inference run rejects unsupported config fields" {
-    inline for (.{ "model_strategies", "embedder_models_dir", "chunker_models_dir", "reranker_models_dir" }) |key| {
+    inline for (.{
+        "model_strategies",
+        "embedder_models_dir",
+        "chunker_models_dir",
+        "reranker_models_dir",
+        "max_queue_size",
+        "request_timeout",
+        "max_memory_mb",
+    }) |key| {
         const raw = try std.fmt.allocPrint(std.testing.allocator, "{{\"{s}\":{{}}}}", .{key});
         defer std.testing.allocator.free(raw);
         try std.testing.expectError(error.InvalidConfig, parseInferenceFileConfig(std.testing.allocator, raw));

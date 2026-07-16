@@ -87,6 +87,10 @@ const backend_order_capacity = std.meta.fields(BackendType).len;
 pub const SessionManager = struct {
     allocator: std.mem.Allocator,
     preferred_backends: []const BackendType,
+    /// Automatic defaults may apply model-aware placement heuristics. A
+    /// configured or request-scoped order is an operator contract and must be
+    /// tried exactly as written.
+    preserve_backend_order: bool = false,
     graph_runtime_strategy: ?graph_runtime_mod.Strategy = null,
     /// Maximum overlapping compute backends per model session. Metal uses
     /// this to bound its warm provider pool and backpressure excess work.
@@ -118,6 +122,7 @@ pub const SessionManager = struct {
         return .{
             .allocator = allocator,
             .preferred_backends = backend_priority orelse configuredPreferredBackends(),
+            .preserve_backend_order = backend_priority != null,
         };
     }
 
@@ -137,7 +142,10 @@ pub const SessionManager = struct {
         var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch null;
         defer if (manifest) |*m| m.deinit();
         var effective_buf: [backend_order_capacity]BackendType = undefined;
-        const effective_backends = effectiveBackendOrder(self.allocator, &effective_buf, self.preferred_backends, if (manifest) |m| m else null);
+        const effective_backends = if (self.preserve_backend_order)
+            self.preferred_backends
+        else
+            effectiveBackendOrder(self.allocator, &effective_buf, self.preferred_backends, if (manifest) |m| m else null);
 
         for (effective_backends) |backend| {
             if (!backend.available()) continue;
@@ -341,6 +349,16 @@ test "session manager normalizes provider pool size" {
     try std.testing.expectEqual(@as(usize, 1), manager.pool_size);
     manager.setPoolSize(4);
     try std.testing.expectEqual(@as(usize, 4), manager.pool_size);
+}
+
+test "configured backend priority disables automatic reordering" {
+    const configured = [_]BackendType{ .onnx, .native, .metal };
+    const manager = SessionManager.initWithBackendPriority(std.testing.allocator, &configured);
+    try std.testing.expect(manager.preserve_backend_order);
+    try std.testing.expectEqualSlices(BackendType, &configured, manager.preferred_backends);
+
+    const automatic = SessionManager.init(std.testing.allocator);
+    try std.testing.expect(!automatic.preserve_backend_order);
 }
 
 test "explicit graph runtime is independent from onnx runtime backend availability" {

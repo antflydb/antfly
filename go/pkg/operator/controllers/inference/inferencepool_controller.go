@@ -469,7 +469,12 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 							Name:    "inference",
 							Image:   image,
 							Command: []string{"/antfly"},
-							Args:    []string{"inference", "run", "--config", "/config/config.json"},
+							Args: []string{
+								"inference", "run",
+								"--config", "/config/config.json",
+								"--host", "0.0.0.0",
+								"--port", strconv.Itoa(InferenceAPIPort),
+							},
 							Ports: []corev1.ContainerPort{
 								{Name: "http", ContainerPort: InferenceAPIPort, Protocol: corev1.ProtocolTCP},
 							},

@@ -296,8 +296,6 @@ from .inference_chunk_request import InferenceChunkRequest
 from .inference_chunk_response import InferenceChunkResponse
 from .inference_chunk_response_object import InferenceChunkResponseObject
 from .inference_config import InferenceConfig
-from .inference_config_model_strategies import InferenceConfigModelStrategies
-from .inference_config_model_strategies_additional_property import InferenceConfigModelStrategiesAdditionalProperty
 from .inference_connection import InferenceConnection
 from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
@@ -960,8 +958,6 @@ __all__ = (
     "InferenceChunkResponse",
     "InferenceChunkResponseObject",
     "InferenceConfig",
-    "InferenceConfigModelStrategies",
-    "InferenceConfigModelStrategiesAdditionalProperty",
     "InferenceConnection",
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",

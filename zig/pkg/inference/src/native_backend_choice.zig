@@ -52,6 +52,7 @@ pub fn validate(choice: Choice) !void {
 }
 
 pub fn configureSessionPreference(session_manager: *backends.SessionManager, choice: Choice) void {
+    session_manager.preserve_backend_order = choice != .auto;
     session_manager.preferred_backends = switch (choice) {
         .auto => if (build_options.enable_wasm and build_options.enable_webgpu)
             &.{ backends.BackendType.webgpu, backends.BackendType.native }

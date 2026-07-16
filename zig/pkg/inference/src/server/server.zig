@@ -668,7 +668,18 @@ fn incrementModelCount(counts: *ModelCounts, task: []const u8) void {
     if (std.mem.eql(u8, task, "embedders")) counts.embedders += 1 else if (std.mem.eql(u8, task, "rerankers")) counts.rerankers += 1 else if (std.mem.eql(u8, task, "chunkers")) counts.chunkers += 1 else if (std.mem.eql(u8, task, "generators")) counts.generators += 1 else if (std.mem.eql(u8, task, "recognizers")) counts.recognizers += 1 else if (std.mem.eql(u8, task, "classifiers")) counts.classifiers += 1 else if (std.mem.eql(u8, task, "rewriters")) counts.rewriters += 1 else if (std.mem.eql(u8, task, "readers")) counts.readers += 1 else if (std.mem.eql(u8, task, "transcribers")) counts.transcribers += 1 else if (std.mem.eql(u8, task, "extractors")) counts.extractors += 1;
 }
 
-fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) ModelCounts {
+fn claimUndiscoveredLoadedModel(
+    allocator: std.mem.Allocator,
+    discovered_paths: *const std.StringHashMapUnmanaged(void),
+    seen_loaded_dirs: *std.StringHashMapUnmanaged(void),
+    model_dir: []const u8,
+) !bool {
+    if (discovered_paths.contains(model_dir)) return false;
+    const result = try seen_loaded_dirs.getOrPut(allocator, model_dir);
+    return !result.found_existing;
+}
+
+fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) !ModelCounts {
     const task_names = [_][]const u8{
         "embedders",  "rerankers",   "chunkers",
         "generators", "recognizers", "classifiers",
@@ -686,6 +697,11 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
         }
         if (discovered.len > 0) ra.free(discovered);
     }
+
+    var discovered_paths = std.StringHashMapUnmanaged(void).empty;
+    defer discovered_paths.deinit(allocator);
+    try discovered_paths.ensureTotalCapacity(allocator, @intCast(discovered.len));
+    for (discovered) |entry| discovered_paths.putAssumeCapacity(entry.path, {});
 
     for (discovered) |entry| {
         if (!model_manager_mod.isModelDirPotentiallyLoadableInCurrentBuild(allocator, entry.path)) continue;
@@ -706,27 +722,20 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
         }
     }
 
-    {
-        node.model_manager.lockState();
-        defer node.model_manager.unlockState();
-        var it = node.model_manager.loaded.iterator();
-        while (it.next()) |entry| {
-            var already_listed = false;
-            for (discovered) |d| {
-                if (std.mem.eql(u8, d.path, entry.key_ptr.*)) {
-                    already_listed = true;
-                    break;
-                }
-            }
-            if (already_listed) continue;
-
-            const model = entry.value_ptr.*;
-            const model_task = @tagName(model.manifest.model_type);
-            for (task_names) |task| {
-                if (std.mem.eql(u8, task, "chunkers")) continue;
-                if (taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) {
-                    incrementModelCount(&counts, task);
-                }
+    const request_id = try node.model_manager.beginRequest(modelLifecycleNowMs());
+    defer node.model_manager.endRequest(request_id, modelLifecycleNowMs());
+    const loaded_models = try node.model_manager.snapshotLoadedModelsForRequest(allocator, request_id);
+    defer allocator.free(loaded_models);
+    var seen_loaded_dirs = std.StringHashMapUnmanaged(void).empty;
+    defer seen_loaded_dirs.deinit(allocator);
+    try seen_loaded_dirs.ensureTotalCapacity(allocator, @intCast(loaded_models.len));
+    for (loaded_models) |model| {
+        if (!try claimUndiscoveredLoadedModel(allocator, &discovered_paths, &seen_loaded_dirs, model.model_dir)) continue;
+        const model_task = @tagName(model.manifest.model_type);
+        for (task_names) |task| {
+            if (std.mem.eql(u8, task, "chunkers")) continue;
+            if (taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) {
+                incrementModelCount(&counts, task);
             }
         }
     }
@@ -5910,6 +5919,19 @@ pub const Node = struct {
             if (discovered.len > 0) ra.free(discovered);
         }
 
+        var discovered_paths = std.StringHashMapUnmanaged(void).empty;
+        defer discovered_paths.deinit(a);
+        try discovered_paths.ensureTotalCapacity(a, @intCast(discovered.len));
+        for (discovered) |entry| discovered_paths.putAssumeCapacity(entry.path, {});
+
+        const listing_request_id = try self.model_manager.beginRequest(modelLifecycleNowMs());
+        defer self.model_manager.endRequest(listing_request_id, modelLifecycleNowMs());
+        const loaded_models = try self.model_manager.snapshotLoadedModelsForRequest(a, listing_request_id);
+        defer a.free(loaded_models);
+        var seen_loaded_dirs = std.StringHashMapUnmanaged(void).empty;
+        defer seen_loaded_dirs.deinit(a);
+        try seen_loaded_dirs.ensureTotalCapacity(a, @intCast(loaded_models.len));
+
         const task_names = [_][]const u8{
             "embedders",  "rerankers",   "chunkers",
             "generators", "recognizers", "classifiers",
@@ -5918,6 +5940,7 @@ pub const Node = struct {
         };
 
         for (task_names, 0..) |task, task_idx| {
+            seen_loaded_dirs.clearRetainingCapacity();
             if (task_idx > 0) try body.append(a, ',');
             try body.append(a, '"');
             try body.appendSlice(a, task);
@@ -5960,45 +5983,30 @@ pub const Node = struct {
             }
 
             // Add loaded models not yet listed (loaded by path, not discovered by name)
-            {
-                self.model_manager.lockState();
-                defer self.model_manager.unlockState();
-                var it = self.model_manager.loaded.iterator();
-                while (it.next()) |entry| {
-                    const model = entry.value_ptr.*;
-                    const model_task = @tagName(model.manifest.model_type);
-                    if (!taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) continue;
+            for (loaded_models) |model| {
+                const model_task = @tagName(model.manifest.model_type);
+                if (!taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) continue;
+                if (!try claimUndiscoveredLoadedModel(a, &discovered_paths, &seen_loaded_dirs, model.model_dir)) continue;
 
-                    // Skip if already listed from discovery
-                    var already_listed = false;
-                    for (discovered) |d| {
-                        if (std.mem.eql(u8, d.path, entry.key_ptr.*)) {
-                            already_listed = true;
-                            break;
-                        }
-                    }
-                    if (!already_listed) {
-                        if (model_count > 0) try body.append(a, ',');
-                        try jsonEncodeString(&body, a, entry.key_ptr.*);
-                        try body.append(a, ':');
-                        try appendModelInfo(
-                            &body,
-                            a,
-                            model_task,
-                            model.manifest.gliner_model_type,
-                            model.manifest.capabilities,
-                            model.manifest.inputs,
-                            model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
-                            model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
-                        );
-                        if (isOpenAiListTask(task)) {
-                            if (openai_data_count > 0) try openai_data.append(a, ',');
-                            try appendOpenAiModelEntry(&openai_data, a, entry.key_ptr.*, list_created);
-                            openai_data_count += 1;
-                        }
-                        model_count += 1;
-                    }
+                if (model_count > 0) try body.append(a, ',');
+                try jsonEncodeString(&body, a, model.model_dir);
+                try body.append(a, ':');
+                try appendModelInfo(
+                    &body,
+                    a,
+                    model_task,
+                    model.manifest.gliner_model_type,
+                    model.manifest.capabilities,
+                    model.manifest.inputs,
+                    model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
+                    model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
+                );
+                if (isOpenAiListTask(task)) {
+                    if (openai_data_count > 0) try openai_data.append(a, ',');
+                    try appendOpenAiModelEntry(&openai_data, a, model.model_dir, list_created);
+                    openai_data_count += 1;
                 }
+                model_count += 1;
             }
 
             try body.append(a, '}');
@@ -7373,6 +7381,33 @@ test "model listing satisfies generated backend capability contract" {
         try std.testing.expect(backend_object.get(name) != null);
     }
     try std.testing.expect(backend_object.get("wasm") == null);
+}
+
+test "loaded model listing deduplicates backend variants by public model directory" {
+    var discovered_paths = std.StringHashMapUnmanaged(void).empty;
+    defer discovered_paths.deinit(std.testing.allocator);
+    try discovered_paths.put(std.testing.allocator, "/models/discovered", {});
+    var seen_loaded_dirs = std.StringHashMapUnmanaged(void).empty;
+    defer seen_loaded_dirs.deinit(std.testing.allocator);
+
+    try std.testing.expect(!try claimUndiscoveredLoadedModel(
+        std.testing.allocator,
+        &discovered_paths,
+        &seen_loaded_dirs,
+        "/models/discovered",
+    ));
+    try std.testing.expect(try claimUndiscoveredLoadedModel(
+        std.testing.allocator,
+        &discovered_paths,
+        &seen_loaded_dirs,
+        "/models/direct",
+    ));
+    try std.testing.expect(!try claimUndiscoveredLoadedModel(
+        std.testing.allocator,
+        &discovered_paths,
+        &seen_loaded_dirs,
+        "/models/direct",
+    ));
 }
 
 test "configured warmup attaches io before loading models" {

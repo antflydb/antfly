@@ -1848,6 +1848,7 @@ pub const ModelManager = struct {
             model_dir,
             self.session_manager.preferred_backends,
             true,
+            self.session_manager.preserve_backend_order,
         );
     }
 
@@ -1862,6 +1863,7 @@ pub const ModelManager = struct {
             model_dir,
             preferred_backends,
             cache_default_alias,
+            true,
         );
     }
 
@@ -1877,6 +1879,7 @@ pub const ModelManager = struct {
             model_dir,
             preferred_backends,
             cache_default_alias,
+            true,
         );
     }
 
@@ -1886,6 +1889,7 @@ pub const ModelManager = struct {
         model_dir: []const u8,
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
+        preserve_backend_order: bool,
     ) !*LoadedModel {
         const pending_key = try self.pendingLoadKey(model_dir, preferred_backends);
         defer self.allocator.free(pending_key);
@@ -1956,7 +1960,12 @@ pub const ModelManager = struct {
                 self.finishPendingModelLoad(pending_key, null, err);
                 return err;
             };
-            var session_manager = sessionManagerForPreferredBackends(self.allocator, preferred_backends, &self.session_manager);
+            var session_manager = sessionManagerForPreferredBackends(
+                self.allocator,
+                preferred_backends,
+                preserve_backend_order,
+                &self.session_manager,
+            );
             const loaded = self.loadFromDirUncached(request_id, model_dir, &session_manager, cache_default_alias) catch |err| {
                 self.releaseLoadSlot();
                 self.finishPendingModelLoad(pending_key, null, err);
@@ -2228,7 +2237,9 @@ fn effectiveLoadBackends(
     scratch: *[7]backends.BackendType,
     preferred_backends: []const backends.BackendType,
     man: manifest_mod.ModelManifest,
+    preserve_backend_order: bool,
 ) []const backends.BackendType {
+    if (preserve_backend_order) return preferred_backends;
     if (!shouldPreferNativeSession(man)) return preferred_backends;
 
     var idx: usize = 0;
@@ -2249,11 +2260,13 @@ fn effectiveLoadBackends(
 fn sessionManagerForPreferredBackends(
     allocator: std.mem.Allocator,
     preferred_backends: []const backends.BackendType,
+    preserve_backend_order: bool,
     source: *const backends.SessionManager,
 ) backends.SessionManager {
     return .{
         .allocator = allocator,
         .preferred_backends = preferred_backends,
+        .preserve_backend_order = preserve_backend_order,
         .graph_runtime_strategy = source.graph_runtime_strategy,
         .pool_size = source.pool_size,
         .io = source.io,
@@ -2268,12 +2281,22 @@ fn loadSessionForPreferredBackends(
     source_session_manager: *const backends.SessionManager,
 ) !backends.Session {
     var effective_scratch: [7]backends.BackendType = undefined;
-    const effective_backends = effectiveLoadBackends(&effective_scratch, preferred_backends, man);
+    const effective_backends = effectiveLoadBackends(
+        &effective_scratch,
+        preferred_backends,
+        man,
+        source_session_manager.preserve_backend_order,
+    );
     for (effective_backends) |backend| {
         if (!backend.supportsDirectSessionLoad()) continue;
         const candidate_path = preferredModelPathForBackend(model_dir, man, backend) orelse continue;
         var single_backend = [_]backends.BackendType{backend};
-        var backend_session_manager = sessionManagerForPreferredBackends(allocator, single_backend[0..], source_session_manager);
+        var backend_session_manager = sessionManagerForPreferredBackends(
+            allocator,
+            single_backend[0..],
+            true,
+            source_session_manager,
+        );
         if (backend_session_manager.loadModel(candidate_path)) |session| {
             return session;
         } else |_| {}
@@ -2310,9 +2333,10 @@ test "model manager backend clones preserve explicit graph runtime" {
     source.graph_runtime_strategy = .partitioned;
     const preferred = [_]backends.BackendType{.onnx};
 
-    const cloned = sessionManagerForPreferredBackends(std.testing.allocator, preferred[0..], &source);
+    const cloned = sessionManagerForPreferredBackends(std.testing.allocator, preferred[0..], true, &source);
     try std.testing.expectEqual(source.graph_runtime_strategy, cloned.graph_runtime_strategy);
     try std.testing.expectEqual(source.pool_size, cloned.pool_size);
+    try std.testing.expect(cloned.preserve_backend_order);
     try std.testing.expectEqualSlices(backends.BackendType, preferred[0..], cloned.preferred_backends);
 }
 
@@ -2865,7 +2889,7 @@ test "effectiveLoadBackends keeps gpu native backends ahead of cpu native before
     defer classifier.deinit();
     classifier.safetensors_path = try allocator.dupe(u8, "model.safetensors");
 
-    const effective = effectiveLoadBackends(&scratch, &preferred, classifier);
+    const effective = effectiveLoadBackends(&scratch, &preferred, classifier, false);
     try std.testing.expectEqualSlices(backends.BackendType, &.{ .metal, .native, .onnx }, effective);
 }
 
@@ -2878,7 +2902,20 @@ test "effectiveLoadBackends preserves explicit onnx-only classifier preference" 
     defer classifier.deinit();
     classifier.safetensors_path = try allocator.dupe(u8, "model.safetensors");
 
-    const effective = effectiveLoadBackends(&scratch, &preferred, classifier);
+    const effective = effectiveLoadBackends(&scratch, &preferred, classifier, true);
+    try std.testing.expectEqualSlices(backends.BackendType, &preferred, effective);
+}
+
+test "effectiveLoadBackends preserves configured multi-backend order" {
+    const allocator = std.testing.allocator;
+    const preferred = [_]backends.BackendType{ .onnx, .native, .metal };
+    var scratch: [7]backends.BackendType = undefined;
+
+    var classifier = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .classifier };
+    defer classifier.deinit();
+    classifier.safetensors_path = try allocator.dupe(u8, "model.safetensors");
+
+    const effective = effectiveLoadBackends(&scratch, &preferred, classifier, true);
     try std.testing.expectEqualSlices(backends.BackendType, &preferred, effective);
 }
 
