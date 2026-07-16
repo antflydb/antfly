@@ -4750,6 +4750,7 @@ fn applyStreamFilterAlloc(
     name: []const u8,
     param: ?*const syntax.Object,
 ) ![]u8 {
+    const max_decoded_stream_bytes: usize = 256 * 1024 * 1024;
     if (std.mem.eql(u8, name, "FlateDecode")) {
         var in: std.Io.Reader = .fixed(input);
         var flate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
@@ -4757,7 +4758,6 @@ fn applyStreamFilterAlloc(
         var inflated_list = std.ArrayList(u8).empty;
         defer inflated_list.deinit(alloc);
         var read_buf: [64 * 1024]u8 = undefined;
-        const max_decoded_stream_bytes: usize = 256 * 1024 * 1024;
         while (true) {
             const n = try decompress.reader.readSliceShort(&read_buf);
             if (n == 0) break;
@@ -4766,21 +4766,30 @@ fn applyStreamFilterAlloc(
         }
         const inflated = try inflated_list.toOwnedSlice(alloc);
         defer alloc.free(inflated);
-        return try applyPredictorAlloc(alloc, inflated, param);
+        const decoded = try applyPredictorAlloc(alloc, inflated, param);
+        return try enforceDecodedStreamLimit(alloc, decoded, max_decoded_stream_bytes);
     }
     if (std.mem.eql(u8, name, "ASCIIHexDecode")) {
-        return try asciiHexDecodeAlloc(alloc, input);
+        const decoded = try asciiHexDecodeAlloc(alloc, input);
+        return try enforceDecodedStreamLimit(alloc, decoded, max_decoded_stream_bytes);
     }
     if (std.mem.eql(u8, name, "ASCII85Decode")) {
-        return try ascii85DecodeAlloc(alloc, input);
+        const decoded = try ascii85DecodeAlloc(alloc, input);
+        return try enforceDecodedStreamLimit(alloc, decoded, max_decoded_stream_bytes);
     }
     if (std.mem.eql(u8, name, "LZWDecode")) {
-        return try lzwDecodeAlloc(alloc, input, param);
+        return try lzwDecodeAlloc(alloc, input, param, max_decoded_stream_bytes);
     }
     if (std.mem.eql(u8, name, "RunLengthDecode")) {
-        return try runLengthDecodeAlloc(alloc, input);
+        return try runLengthDecodeAlloc(alloc, input, max_decoded_stream_bytes);
     }
     return error.UnsupportedStreamFilter;
+}
+
+fn enforceDecodedStreamLimit(alloc: Allocator, decoded: []u8, max_bytes: usize) ![]u8 {
+    if (decoded.len <= max_bytes) return decoded;
+    alloc.free(decoded);
+    return error.DecodedStreamTooLarge;
 }
 
 fn asciiHexDecodeAlloc(alloc: Allocator, input: []const u8) ![]u8 {
@@ -4844,7 +4853,7 @@ fn ascii85DecodeAlloc(alloc: Allocator, input: []const u8) ![]u8 {
     return try out.toOwnedSlice(alloc);
 }
 
-fn lzwDecodeAlloc(alloc: Allocator, input: []const u8, param: ?*const syntax.Object) ![]u8 {
+fn lzwDecodeAlloc(alloc: Allocator, input: []const u8, param: ?*const syntax.Object, max_bytes: usize) ![]u8 {
     const early_change: u16 = blk: {
         if (param) |obj| {
             if (obj.* == .dict) {
@@ -4899,6 +4908,7 @@ fn lzwDecodeAlloc(alloc: Allocator, input: []const u8, param: ?*const syntax.Obj
         } else return error.MalformedLzw;
         defer alloc.free(entry);
 
+        if (out.items.len > max_bytes or entry.len > max_bytes - out.items.len) return error.DecodedStreamTooLarge;
         try out.appendSlice(alloc, entry);
 
         if (prev_code) |prev| {
@@ -4920,10 +4930,11 @@ fn lzwDecodeAlloc(alloc: Allocator, input: []const u8, param: ?*const syntax.Obj
 
     const decoded = try out.toOwnedSlice(alloc);
     defer alloc.free(decoded);
-    return try applyPredictorAlloc(alloc, decoded, param);
+    const predicted = try applyPredictorAlloc(alloc, decoded, param);
+    return try enforceDecodedStreamLimit(alloc, predicted, max_bytes);
 }
 
-fn runLengthDecodeAlloc(alloc: Allocator, input: []const u8) ![]u8 {
+fn runLengthDecodeAlloc(alloc: Allocator, input: []const u8, max_bytes: usize) ![]u8 {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
 
@@ -4935,6 +4946,7 @@ fn runLengthDecodeAlloc(alloc: Allocator, input: []const u8) ![]u8 {
         if (length <= 127) {
             const literal_len = @as(usize, length) + 1;
             if (i + literal_len > input.len) return error.MalformedRunLength;
+            if (out.items.len > max_bytes or literal_len > max_bytes - out.items.len) return error.DecodedStreamTooLarge;
             try out.appendSlice(alloc, input[i .. i + literal_len]);
             i += literal_len;
             continue;
@@ -4944,6 +4956,7 @@ fn runLengthDecodeAlloc(alloc: Allocator, input: []const u8) ![]u8 {
         const repeat = input[i];
         i += 1;
         const repeat_len = 257 - @as(usize, length);
+        if (out.items.len > max_bytes or repeat_len > max_bytes - out.items.len) return error.DecodedStreamTooLarge;
         try out.appendNTimes(alloc, repeat, repeat_len);
     }
 
@@ -9268,6 +9281,15 @@ test "reader can decode run length stream object" {
     const decoded = try reader.readDecodedStreamData(&obj);
     defer alloc.free(decoded);
     try std.testing.expectEqualStrings("ABCZZZ", decoded);
+}
+
+test "stream decoders enforce the decoded byte budget before growth" {
+    const alloc = std.testing.allocator;
+    const lzw = &.{ 0x80, 0x0b, 0x60, 0x50, 0x22, 0x0c, 0x0c, 0x85, 0x01 };
+    try std.testing.expectError(error.DecodedStreamTooLarge, lzwDecodeAlloc(alloc, lzw, null, 5));
+
+    const run_length = &.{ 2, 'A', 'B', 'C', 254, 'Z', 128 };
+    try std.testing.expectError(error.DecodedStreamTooLarge, runLengthDecodeAlloc(alloc, run_length, 5));
 }
 
 test "reader can extract plain text from simple page content" {
