@@ -34,6 +34,7 @@ pub const TruncateFn = *const fn (ctx: *anyopaque, sequence: u64) anyerror!void;
 pub const BeginCatchUpFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) anyerror!void;
 pub const FinishCatchUpFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, success: bool) anyerror!void;
 pub const CanAdvanceToTargetFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) anyerror!bool;
+pub const AppliedSequenceAdvancedFn = *const fn (ctx: *anyopaque, index_name: []const u8, applied_sequence: u64) void;
 
 const Worker = struct {
     runtime: *DerivedRuntime,
@@ -79,6 +80,7 @@ pub const DerivedRuntime = struct {
     begin_catch_up_fn: ?BeginCatchUpFn,
     finish_catch_up_fn: ?FinishCatchUpFn,
     can_advance_to_target_fn: ?CanAdvanceToTargetFn,
+    applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
     mutex: std.atomic.Mutex = .unlocked,
     workers: std.ArrayListUnmanaged(*Worker) = .empty,
     shutdown: bool = false,
@@ -99,6 +101,7 @@ pub const DerivedRuntime = struct {
         begin_catch_up_fn: ?BeginCatchUpFn,
         finish_catch_up_fn: ?FinishCatchUpFn,
         can_advance_to_target_fn: ?CanAdvanceToTargetFn,
+        applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
         resource_manager: ?*resource_manager_mod.ResourceManager,
     ) DerivedRuntime {
         return .{
@@ -111,6 +114,7 @@ pub const DerivedRuntime = struct {
             .begin_catch_up_fn = begin_catch_up_fn,
             .finish_catch_up_fn = finish_catch_up_fn,
             .can_advance_to_target_fn = can_advance_to_target_fn,
+            .applied_sequence_advanced_fn = applied_sequence_advanced_fn,
             .backlog = backlog_tracker_mod.Tracker.init(resource_manager),
         };
     }
@@ -582,7 +586,8 @@ fn workerMain(worker: *Worker) void {
 
         var truncate_sequence: u64 = 0;
         lock(runtime);
-        if (caught_up_sequence > worker.applied_sequence) {
+        const applied_sequence_advanced = caught_up_sequence > worker.applied_sequence;
+        if (applied_sequence_advanced) {
             worker.applied_sequence = caught_up_sequence;
         }
         if (persisted and caught_up_sequence > worker.persisted_sequence) {
@@ -599,6 +604,9 @@ fn workerMain(worker: *Worker) void {
             runtime.truncates_in_flight += 1;
         }
         runtime.mutex.unlock();
+        if (applied_sequence_advanced) if (runtime.applied_sequence_advanced_fn) |callback| {
+            callback(runtime.ctx, worker.name, caught_up_sequence);
+        };
         worker.pressure_retry_backoff.reset();
 
         if (shouldRefreshReplayCursor(worker, caught_up_sequence)) {
@@ -1024,6 +1032,7 @@ test "async non-tail replay cursor refreshes before watermark advance" {
         testRuntimeFinishCatchUp,
         null,
         null,
+        null,
     );
     defer runtime.deinit();
 
@@ -1069,6 +1078,7 @@ test "async dense zero-applied replay window advances only through target covera
         testRuntimeBeginCatchUp,
         testRuntimeFinishCatchUp,
         testRuntimeCanAdvanceToTarget,
+        null,
         null,
     );
     defer runtime.deinit();
@@ -1167,6 +1177,7 @@ test "async dense workers advance zero-applied target while catch-up sessions ar
         testDenseTargetAdvanceSessionFinish,
         testDenseTargetAdvanceWhileSessionOpen,
         null,
+        null,
     );
     defer runtime.deinit();
 
@@ -1219,6 +1230,7 @@ test "async dense publish NotFound retries without failing runtime" {
         testRuntimeFinishCatchUp,
         null,
         null,
+        null,
     );
     defer runtime.deinit();
 
@@ -1266,6 +1278,7 @@ test "async dense catch-up NotFound retries without failing runtime" {
         testRuntimeTruncate,
         testRuntimeBeginCatchUp,
         testRuntimeFinishCatchUp,
+        null,
         null,
         null,
     );
@@ -1319,6 +1332,7 @@ test "async full-text catch-up uses generic publish lifecycle" {
         testRuntimeFinishCatchUp,
         null,
         null,
+        null,
     );
     defer runtime.deinit();
 
@@ -1369,6 +1383,7 @@ test "async worker retries idle applied sequence persist and releases backlog" {
         testRuntimeTruncate,
         testRuntimeBeginCatchUp,
         testRuntimeFinishCatchUp,
+        null,
         null,
         &manager,
     );
@@ -1421,6 +1436,7 @@ test "async dense publishes applied window before target tail is visible" {
         testRuntimeTruncate,
         testRuntimeBeginCatchUp,
         testRuntimeFinishCatchUp,
+        null,
         null,
         null,
     );

@@ -639,6 +639,7 @@ const AsyncContext = struct {
     require_graph_resolution_contract: bool = false,
     query_visibility_hook_mutex: std.atomic.Mutex = .unlocked,
     query_visibility_hook: ?QueryVisibilityHook = null,
+    query_visibility_hook_in_flight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
     dense_finish_mutex: std.atomic.Mutex = .unlocked,
@@ -3393,6 +3394,7 @@ pub const DB = struct {
             beginDerivedCatchUpSessionAsync,
             finishDerivedCatchUpSessionAsync,
             canAdvanceDerivedToTargetAsync,
+            notifyDerivedAppliedSequenceAdvanced,
             resource_manager,
             self.backend_runtime,
         );
@@ -3402,6 +3404,15 @@ pub const DB = struct {
         lockAtomic(&self.async_context.query_visibility_hook_mutex);
         self.async_context.query_visibility_hook = hook;
         self.async_context.query_visibility_hook_mutex.unlock();
+        if (hook == null) {
+            // A notifier copies the hook before invoking it so the callback may
+            // inspect the DB without holding this mutex. Detachment is also a
+            // teardown barrier: once it returns, no callback can still inspect
+            // optional runtimes or index state that close is about to destroy.
+            while (self.async_context.query_visibility_hook_in_flight.load(.acquire) != 0) {
+                spinOrYield();
+            }
+        }
         if (self.enrichment_runtime) |runtime| {
             runtime.setStatusHook(if (hook == null) null else .{
                 .ptr = self.async_context,
@@ -3415,14 +3426,33 @@ pub const DB = struct {
         notifyQueryVisibilityHook(ctx, .status);
     }
 
-    fn queryVisibilityHook(ctx: *AsyncContext) ?QueryVisibilityHook {
+    fn notifyDerivedAppliedSequenceAdvanced(ptr: *anyopaque, _: []const u8, _: u64) void {
+        const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
+        // The executor invokes this only after publishing its live applied
+        // watermark and releasing its mutex. Status callbacks may therefore
+        // snapshot the executor without deadlocking or observing the previous
+        // sequence at the end of a replay window.
+        notifyQueryVisibilityHook(ctx, .status);
+    }
+
+    fn acquireQueryVisibilityHook(ctx: *AsyncContext) ?QueryVisibilityHook {
         lockAtomic(&ctx.query_visibility_hook_mutex);
         defer ctx.query_visibility_hook_mutex.unlock();
-        return ctx.query_visibility_hook;
+        const hook = ctx.query_visibility_hook orelse return null;
+        _ = ctx.query_visibility_hook_in_flight.fetchAdd(1, .acquire);
+        return hook;
+    }
+
+    fn hasQueryVisibilityHook(ctx: *AsyncContext) bool {
+        lockAtomic(&ctx.query_visibility_hook_mutex);
+        defer ctx.query_visibility_hook_mutex.unlock();
+        return ctx.query_visibility_hook != null;
     }
 
     fn notifyQueryVisibilityHook(ctx: *AsyncContext, change: QueryVisibilityChange) void {
-        if (queryVisibilityHook(ctx)) |hook| hook.notify(change);
+        const hook = acquireQueryVisibilityHook(ctx) orelse return;
+        defer _ = ctx.query_visibility_hook_in_flight.fetchSub(1, .release);
+        hook.notify(change);
     }
 
     const DetachedEnrichmentRuntime = struct {
@@ -3536,7 +3566,7 @@ pub const DB = struct {
         var cfg_owned = true;
         errdefer if (cfg_owned) self.deinitEnrichmentConfig(&owned_cfg);
 
-        const query_visibility_hook = queryVisibilityHook(self.async_context);
+        const query_visibility_hook_present = hasQueryVisibilityHook(self.async_context);
         var detached = try self.createDetachedEnrichmentRuntime(owned_cfg);
         cfg_owned = false;
         errdefer if (detached) |*runtime| runtime.deinit(self.runtime_alloc);
@@ -3545,7 +3575,7 @@ pub const DB = struct {
                 const target_sequence = self.core.nextEnrichmentSequence();
                 if (target_sequence != 0) try runtime.runtime.?.resumeFrom(target_sequence, target_sequence);
             }
-            if (query_visibility_hook != null) {
+            if (query_visibility_hook_present) {
                 runtime.runtime.?.setStatusHook(.{
                     .ptr = self.async_context,
                     .on_change = notifyAsyncContextVisibilityHook,
@@ -3588,7 +3618,7 @@ pub const DB = struct {
             self.enrichment_append_context = owned.append_ctx;
             self.enrichment_runtime = owned.runtime;
         }
-        self.setQueryVisibilityHook(query_visibility_hook);
+        if (!query_visibility_hook_present) self.setQueryVisibilityHook(null);
     }
 
     fn initResolutionRuntime(self: *DB) !void {
@@ -16056,16 +16086,26 @@ pub const DB = struct {
         return applied_sequence;
     }
 
-    fn projectionStatsTargetSequence(self: *DB, alloc: Allocator, cfg: types.IndexConfig, applied_sequence: u64) !u64 {
+    pub fn managedIndexReplayTargetSequence(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        kind: types.IndexKind,
+        applied_sequence: u64,
+    ) !u64 {
         return try self.probeDerivedReplayTargetSequence(
             alloc,
             self.core.replaySource(),
             .{
-                .name = cfg.name,
-                .kind = cfg.kind,
+                .name = index_name,
+                .kind = kind,
             },
             applied_sequence,
         );
+    }
+
+    fn projectionStatsTargetSequence(self: *DB, alloc: Allocator, cfg: types.IndexConfig, applied_sequence: u64) !u64 {
+        return try self.managedIndexReplayTargetSequence(alloc, cfg.name, cfg.kind, applied_sequence);
     }
 
     fn overlayRuntimeStatusRuntimeOnly(self: *DB, runtime_stats: *types.DBStats) void {
@@ -33330,10 +33370,8 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     }
     finishDenseCatchUpSessionTracked(ctx, index_ref.name);
     catch_up_tracked = false;
-    if (DB.queryVisibilityHook(ctx)) |hook| {
-        if (!published_visibility) hook.notify(.publish_consistent);
-        hook.notify(.publish_blocking);
-    }
+    if (!published_visibility) DB.notifyQueryVisibilityHook(ctx, .publish_consistent);
+    DB.notifyQueryVisibilityHook(ctx, .publish_blocking);
 }
 
 fn storeHasReplayRecordForHintAfter(

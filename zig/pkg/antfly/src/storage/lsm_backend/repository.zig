@@ -533,7 +533,7 @@ pub fn loadRunStateAllocWithStorage(storage: storage_io.Storage, allocator: Allo
 
         const end = block.first_entry_index + block.entry_count;
         for (block.first_entry_index..end) |entry_index| {
-            const relative_offset: usize = @intCast(index.entryStart(entry_index) - window.relative_offset);
+            const relative_offset: usize = @intCast(index.entryStartInBlock(entry_index, block_index) - window.relative_offset);
             const entry = try lsm_table_file.parseEntryAt(bytes, relative_offset);
             try appendStateEntryClone(allocator, &state, entry);
         }

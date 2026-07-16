@@ -577,7 +577,13 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         };
         const cursor_storage_alignment = @max(
             @max(@alignOf(?usize), @alignOf(?SourceEntry)),
-            @max(@alignOf(SourceBlockLease), @max(@alignOf(?*const lsm_table_file.TableIndex), @alignOf(usize))),
+            @max(
+                @alignOf(SourceBlockLease),
+                @max(
+                    @alignOf(?*const lsm_table_file.TableIndex),
+                    @max(@alignOf(?cache_mod.Handle), @alignOf(usize)),
+                ),
+            ),
         );
         const default_max_retained_mutable_source_entry_scratch: usize = 1 * 1024 * 1024;
         const min_retained_mutable_source_entry_scratch: usize = 4096;
@@ -595,6 +601,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         source_blocks: []SourceBlockLease,
         source_block_indices: []?usize,
         source_table_indices: []?*const lsm_table_file.TableIndex,
+        source_table_index_handles: []?cache_mod.Handle,
         advance_sources: []usize,
         source_heap: []usize,
         source_heap_positions: []?usize,
@@ -615,6 +622,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             cursorStorageAdvance(SourceBlockLease, &offset, source_count);
             cursorStorageAdvance(?usize, &offset, source_count);
             cursorStorageAdvance(?*const lsm_table_file.TableIndex, &offset, source_count);
+            cursorStorageAdvance(?cache_mod.Handle, &offset, source_count);
             cursorStorageAdvance(usize, &offset, source_count);
             cursorStorageAdvance(usize, &offset, source_count);
             cursorStorageAdvance(?usize, &offset, source_count);
@@ -671,6 +679,8 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             @memset(source_block_indices, null);
             const source_table_indices = cursorStorageSlice(?*const lsm_table_file.TableIndex, storage, &offset, source_count);
             @memset(source_table_indices, null);
+            const source_table_index_handles = cursorStorageSlice(?cache_mod.Handle, storage, &offset, source_count);
+            @memset(source_table_index_handles, null);
             const advance_sources = cursorStorageSlice(usize, storage, &offset, source_count);
             const source_heap = cursorStorageSlice(usize, storage, &offset, source_count);
             const source_heap_positions = cursorStorageSlice(?usize, storage, &offset, source_count);
@@ -690,6 +700,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 .source_blocks = source_blocks,
                 .source_block_indices = source_block_indices,
                 .source_table_indices = source_table_indices,
+                .source_table_index_handles = source_table_index_handles,
                 .advance_sources = advance_sources,
                 .source_heap = source_heap,
                 .source_heap_positions = source_heap_positions,
@@ -700,6 +711,10 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
 
         pub fn close(self: *@This()) void {
             for (0..self.source_blocks.len) |source_index| self.clearSourceBlock(source_index);
+            for (self.source_table_index_handles) |*maybe_handle| {
+                if (maybe_handle.*) |*handle| handle.release();
+                maybe_handle.* = null;
+            }
             self.clearVisibleEntryBytes();
             self.clearMutableSourceEntryBytes();
             if (self.cursor_storage.len > 0) {
@@ -710,6 +725,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 self.allocator.free(self.source_entries);
                 self.allocator.free(self.positions);
                 self.allocator.free(self.source_table_indices);
+                self.allocator.free(self.source_table_index_handles);
                 self.allocator.free(self.advance_sources);
                 self.allocator.free(self.source_heap);
                 self.allocator.free(self.source_heap_positions);
@@ -1013,7 +1029,13 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 recordCursorTableIndexHit(self.backend);
                 return index;
             }
-            const index = try indexForRunNoCacheMaybeLocked(self.backend, run, self.backend_locked);
+            const index = if (self.backend.options.cache != null) blk: {
+                var handle = try loadRunTableIndexHandle(self.backend, run);
+                errdefer handle.release();
+                const retained_index = handle.runTableIndex();
+                self.source_table_index_handles[source_index] = handle;
+                break :blk retained_index;
+            } else try indexForRunNoCacheMaybeLocked(self.backend, run, self.backend_locked);
             self.source_table_indices[source_index] = index;
             recordCursorTableIndexMiss(self.backend);
             return index;
@@ -1464,7 +1486,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             const block_index = index.findBlockIndexForEntry(entry_index) orelse return error.InvalidTableFile;
             const window = index.blockWindow(block_index);
             const bytes = try self.ensureSourceBlockLoaded(source_index, run, index, window, block_index);
-            const relative_offset: usize = @intCast(index.entryStart(entry_index) - window.relative_offset);
+            const relative_offset: usize = @intCast(index.entryStartInBlock(entry_index, block_index) - window.relative_offset);
             const entry = try parseEntryAtWithStats(self.backend, bytes, relative_offset);
             return .{
                 .namespace_name = entry.namespace_name,
@@ -1671,7 +1693,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 const bytes = try self.ensureSourceBlockLoaded(source_index, run, index, window, block_index);
                 var probe = idx;
                 while (probe <= block.lastEntryIndex()) : (probe += 1) {
-                    const relative_offset: usize = @intCast(index.entryStart(probe) - window.relative_offset);
+                    const relative_offset: usize = @intCast(index.entryStartInBlock(probe, block_index) - window.relative_offset);
                     const entry = try parseEntryAtWithStats(self.backend, bytes, relative_offset);
                     const order = compareNamespace(.{ .name = entry.namespace_name }, self.namespace);
                     if (order == .eq) {
@@ -5685,14 +5707,15 @@ fn materializeRunBloomFilterForRead(backend: anytype, run: *Run, backend_locked:
     if (run.bloom_filter) |filter| return filter;
     if (run.path == null) return null;
 
-    const filter = if (backend.options.cache != null) blk: {
-        var handle = try loadRunTableIndexHandle(backend, run);
-        defer handle.release();
-        break :blk try handle.runTableIndex().borrowFilter().clone(backend.allocator);
-    } else blk: {
-        const index = try indexForRunNoCacheMaybeLocked(backend, run, backend_locked);
-        break :blk try index.borrowFilter().clone(backend.allocator);
-    };
+    // A shared-cache index already owns this filter. Cloning it into Run made
+    // the duplicate live for the backend lifetime, outside cache eviction and
+    // ResourceManager accounting. Cache-backed point-read paths retain an
+    // index handle while probing the borrowed filter; cached full-state paths
+    // may safely proceed without the optional Bloom precheck.
+    if (backend.options.cache != null) return null;
+
+    const index = try indexForRunNoCacheMaybeLocked(backend, run, backend_locked);
+    const filter = try index.borrowFilter().clone(backend.allocator);
     run.bloom_filter = filter;
     run.owns_bloom_filter = true;
     return run.bloom_filter.?;
@@ -6417,6 +6440,7 @@ test "lsm merge cursor frees loaded blocks with backend allocator" {
         .source_blocks = source_blocks,
         .source_block_indices = source_block_indices,
         .source_table_indices = source_table_indices,
+        .source_table_index_handles = &.{},
         .advance_sources = advance_sources,
         .source_heap = source_heap,
         .source_heap_positions = source_heap_positions,

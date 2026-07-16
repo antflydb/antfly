@@ -238,7 +238,11 @@ pub const TableIndex = struct {
         }
     };
 
-    entry_offsets: []u32,
+    // Current tables persist offsets as u16 values local to each block. Keep
+    // that representation in memory instead of expanding every entry to u32;
+    // legacy origin/main tables retain their absolute u32 offsets.
+    entry_offsets: []u32 = &.{},
+    block_entry_offsets: []u16 = &.{},
     entry_data_start: usize,
     entry_data_len: usize,
     filter: bloom.OwnedFilter,
@@ -248,6 +252,7 @@ pub const TableIndex = struct {
 
     pub fn deinit(self: *TableIndex, allocator: std.mem.Allocator) void {
         allocator.free(self.entry_offsets);
+        allocator.free(self.block_entry_offsets);
         for (self.blocks) |*block| block.deinit(allocator);
         allocator.free(self.blocks);
         self.filter.deinit(allocator);
@@ -266,13 +271,28 @@ pub const TableIndex = struct {
             blocks[i] = try block.clone(allocator);
             block_count += 1;
         }
+        const entry_offsets = try allocator.dupe(u32, self.entry_offsets);
+        errdefer allocator.free(entry_offsets);
+        const block_entry_offsets = try allocator.dupe(u16, self.block_entry_offsets);
+        errdefer allocator.free(block_entry_offsets);
+        const filter = try self.filter.clone(allocator);
+        errdefer {
+            var cleanup = filter;
+            cleanup.deinit(allocator);
+        }
+        const prefix_filter = if (self.prefix_filter) |owned_filter| try owned_filter.clone(allocator) else null;
+        errdefer if (prefix_filter) |owned_filter| {
+            var cleanup = owned_filter;
+            cleanup.deinit(allocator);
+        };
         return .{
-            .entry_offsets = try allocator.dupe(u32, self.entry_offsets),
+            .entry_offsets = entry_offsets,
+            .block_entry_offsets = block_entry_offsets,
             .entry_data_start = self.entry_data_start,
             .entry_data_len = self.entry_data_len,
-            .filter = try self.filter.clone(allocator),
+            .filter = filter,
             .prefix_extractor = self.prefix_extractor,
-            .prefix_filter = if (self.prefix_filter) |filter| try filter.clone(allocator) else null,
+            .prefix_filter = prefix_filter,
             .blocks = blocks,
         };
     }
@@ -294,7 +314,7 @@ pub const TableIndex = struct {
     }
 
     pub fn entryCount(self: *const TableIndex) usize {
-        return self.entry_offsets.len;
+        return @max(self.entry_offsets.len, self.block_entry_offsets.len);
     }
 
     pub fn blockCount(self: *const TableIndex) usize {
@@ -363,12 +383,27 @@ pub const TableIndex = struct {
     }
 
     pub fn entryStart(self: *const TableIndex, index: usize) u32 {
-        return self.entry_offsets[index];
+        if (self.block_entry_offsets.len == 0) return self.entry_offsets[index];
+        const block_index = self.findBlockIndexForEntry(index) orelse unreachable;
+        return self.entryStartInBlock(index, block_index);
+    }
+
+    pub fn entryStartInBlock(self: *const TableIndex, index: usize, block_index: usize) u32 {
+        if (self.block_entry_offsets.len == 0) return self.entry_offsets[index];
+        return self.blocks[block_index].relative_offset + self.block_entry_offsets[index];
     }
 
     pub fn entryEnd(self: *const TableIndex, index: usize) u32 {
-        if (index + 1 < self.entry_offsets.len) return self.entry_offsets[index + 1];
-        return @intCast(self.entry_data_len);
+        if (self.block_entry_offsets.len == 0) {
+            if (index + 1 < self.entry_offsets.len) return self.entry_offsets[index + 1];
+            return @intCast(self.entry_data_len);
+        }
+        const block_index = self.findBlockIndexForEntry(index) orelse unreachable;
+        const block = self.blocks[block_index];
+        if (index + 1 < block.first_entry_index + block.entry_count) {
+            return block.relative_offset + self.block_entry_offsets[index + 1];
+        }
+        return block.relative_offset + block.len;
     }
 };
 
@@ -433,6 +468,8 @@ pub const BorrowedDecoded = struct {
     owns_raw: bool = true,
     entry_offsets: []const u32,
     owns_entry_offsets: bool = true,
+    block_entry_offsets: []const u16 = &.{},
+    owns_block_entry_offsets: bool = true,
     entry_data_start: usize,
     filter: bloom.BorrowedFilter,
     owned_filter: ?bloom.OwnedFilter = null,
@@ -446,31 +483,42 @@ pub const BorrowedDecoded = struct {
             allocator.free(@constCast(self.blocks));
         }
         if (self.owns_entry_offsets) allocator.free(@constCast(self.entry_offsets));
+        if (self.owns_block_entry_offsets) allocator.free(@constCast(self.block_entry_offsets));
         if (self.owns_raw) allocator.free(self.raw);
         self.* = undefined;
     }
 
     pub fn entryCount(self: *const BorrowedDecoded) usize {
-        return self.entry_offsets.len;
+        return @max(self.entry_offsets.len, self.block_entry_offsets.len);
+    }
+
+    fn entryStart(self: *const BorrowedDecoded, index: usize) u32 {
+        if (self.block_entry_offsets.len == 0) return self.entry_offsets[index];
+        const block_index = findBlockIndexForEntryInMetas(self.blocks, index) orelse unreachable;
+        return self.blocks[block_index].relative_offset + self.block_entry_offsets[index];
     }
 
     pub fn entryAt(self: *const BorrowedDecoded, index: usize) !Entry {
-        return try parseEntryAt(self.raw, self.entry_data_start + self.entry_offsets[index]);
+        return try parseEntryAt(self.raw, self.entry_data_start + self.entryStart(index));
     }
 
     pub fn lowerBound(self: *const BorrowedDecoded, namespace_name: ?[]const u8, key: []const u8) !usize {
         if (self.blocks.len > 0) {
-            const block_index = findBlockLowerBoundInMetas(self.blocks, namespace_name, key) orelse return self.entry_offsets.len;
-            return try lowerBoundInBlockRaw(
-                self.raw[self.entry_data_start + self.blocks[block_index].relative_offset .. self.entry_data_start + self.blocks[block_index].relative_offset + self.blocks[block_index].len],
-                self.entry_offsets,
-                self.blocks[block_index],
-                namespace_name,
-                key,
-            );
+            const block_index = findBlockLowerBoundInMetas(self.blocks, namespace_name, key) orelse return self.entryCount();
+            const block = self.blocks[block_index];
+            const raw_block = self.raw[self.entry_data_start + block.relative_offset .. self.entry_data_start + block.relative_offset + block.len];
+            var lo: usize = block.first_entry_index;
+            var hi: usize = block.first_entry_index + block.entry_count;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const relative_offset: usize = @intCast(self.entryStart(mid) - block.relative_offset);
+                const entry = try parseEntryAt(raw_block, relative_offset);
+                if (compareEntryTo(entry, namespace_name, key) == .lt) lo = mid + 1 else hi = mid;
+            }
+            return lo;
         }
         var lo: usize = 0;
-        var hi: usize = self.entry_offsets.len;
+        var hi: usize = self.entryCount();
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
             const entry = try self.entryAt(mid);
@@ -486,7 +534,7 @@ pub const BorrowedDecoded = struct {
 
     pub fn findIndex(self: *const BorrowedDecoded, namespace_name: ?[]const u8, key: []const u8) !?usize {
         const idx = try self.lowerBound(namespace_name, key);
-        if (idx >= self.entry_offsets.len) return null;
+        if (idx >= self.entryCount()) return null;
         const entry = try self.entryAt(idx);
         if (compareEntryTo(entry, namespace_name, key) != .eq) return null;
         return idx;
@@ -613,6 +661,8 @@ pub fn borrowDecoded(raw: []u8, index: *const TableIndex) BorrowedDecoded {
         .owns_raw = false,
         .entry_offsets = index.entry_offsets,
         .owns_entry_offsets = false,
+        .block_entry_offsets = index.block_entry_offsets,
+        .owns_block_entry_offsets = false,
         .entry_data_start = index.entry_data_start,
         .filter = index.borrowFilter(),
         .blocks = index.blocks,
@@ -1589,6 +1639,8 @@ pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) !Borrow
             .owns_raw = true,
             .entry_offsets = index.entry_offsets,
             .owns_entry_offsets = true,
+            .block_entry_offsets = index.block_entry_offsets,
+            .owns_block_entry_offsets = true,
             .entry_data_start = index.entry_data_start,
             .filter = index.borrowFilter(),
             .owned_filter = index.filter,
@@ -1602,6 +1654,8 @@ pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) !Borrow
         .owns_raw = true,
         .entry_offsets = index.entry_offsets,
         .owns_entry_offsets = true,
+        .block_entry_offsets = index.block_entry_offsets,
+        .owns_block_entry_offsets = true,
         .entry_data_start = index.entry_data_start,
         .filter = index.borrowFilter(),
         .owned_filter = index.filter,
@@ -2211,6 +2265,23 @@ fn findBlockLowerBoundInMetas(blocks: []const TableIndex.BlockMeta, namespace_na
     return lo;
 }
 
+fn findBlockIndexForEntryInMetas(blocks: []const TableIndex.BlockMeta, entry_index: usize) ?usize {
+    var lo: usize = 0;
+    var hi: usize = blocks.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const block = blocks[mid];
+        if (entry_index < block.first_entry_index) {
+            hi = mid;
+        } else if (entry_index > block.lastEntryIndex()) {
+            lo = mid + 1;
+        } else {
+            return mid;
+        }
+    }
+    return null;
+}
+
 fn lowerBoundInBlockRaw(
     raw_block: []const u8,
     entry_offsets: []const u32,
@@ -2234,6 +2305,25 @@ fn lowerBoundInBlockRaw(
     return lo;
 }
 
+fn lowerBoundInIndexedBlockRaw(
+    index: *const TableIndex,
+    raw_block: []const u8,
+    block_index: usize,
+    namespace_name: ?[]const u8,
+    key: []const u8,
+) !usize {
+    const block = index.blocks[block_index];
+    var lo: usize = block.first_entry_index;
+    var hi: usize = block.first_entry_index + block.entry_count;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const relative_offset: usize = @intCast(index.entryStartInBlock(mid, block_index) - block.relative_offset);
+        const entry = try parseEntryAt(raw_block, relative_offset);
+        if (compareEntryTo(entry, namespace_name, key) == .lt) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
 pub fn lowerBoundPositionInBlock(
     index: *const TableIndex,
     raw_block: []const u8,
@@ -2243,9 +2333,9 @@ pub fn lowerBoundPositionInBlock(
     inclusive: bool,
 ) !?BorrowedDecoded.PositionedEntry {
     const block = index.blocks[block_index];
-    var idx = try lowerBoundInBlockRaw(raw_block, index.entry_offsets, block, namespace_name, key);
+    var idx = try lowerBoundInIndexedBlockRaw(index, raw_block, block_index, namespace_name, key);
     while (idx < block.first_entry_index + block.entry_count) : (idx += 1) {
-        const relative_offset: usize = @intCast(index.entryStart(idx) - block.relative_offset);
+        const relative_offset: usize = @intCast(index.entryStartInBlock(idx, block_index) - block.relative_offset);
         const entry = try parseEntryAt(raw_block, relative_offset);
         if (compareNamespace(entry.namespace_name, namespace_name) != .eq) return null;
         if (!inclusive and std.mem.eql(u8, entry.key, key)) continue;
@@ -2351,11 +2441,15 @@ fn decodeFooterMetadataAlloc(
         if ((expected == version) != packed_offsets) return error.InvalidTableFile;
         if (expected != version and expected != previous_version) return error.UnsupportedVersion;
     }
-    const offsets = try allocator.alloc(u32, entry_count);
+    var offsets: []u32 = &.{};
+    var block_offsets: []u16 = &.{};
     errdefer allocator.free(offsets);
+    errdefer allocator.free(block_offsets);
     if (packed_offsets) {
-        for (offsets) |*offset| offset.* = try readU16(metadata, &cursor);
+        block_offsets = try allocator.alloc(u16, entry_count);
+        for (block_offsets) |*offset| offset.* = try readU16(metadata, &cursor);
     } else {
+        offsets = try allocator.alloc(u32, entry_count);
         for (offsets) |*offset| offset.* = try readU32(metadata, &cursor);
     }
 
@@ -2396,10 +2490,11 @@ fn decodeFooterMetadataAlloc(
     }
     if (cursor != metadata.len) return error.InvalidTableFile;
 
-    try validateAndExpandEntryOffsets(offsets, blocks, entry_data_len, packed_offsets);
+    try validateEntryOffsets(offsets, block_offsets, blocks, entry_data_len);
 
     return .{
         .entry_offsets = offsets,
+        .block_entry_offsets = block_offsets,
         .entry_data_start = entry_data_start,
         .entry_data_len = entry_data_len,
         .filter = filter,
@@ -2409,13 +2504,15 @@ fn decodeFooterMetadataAlloc(
     };
 }
 
-fn validateAndExpandEntryOffsets(
-    offsets: []u32,
+fn validateEntryOffsets(
+    offsets: []const u32,
+    block_offsets: []const u16,
     blocks: []const TableIndex.BlockMeta,
     entry_data_len: usize,
-    packed_offsets: bool,
 ) !void {
-    if (offsets.len == 0) {
+    const entry_count = @max(offsets.len, block_offsets.len);
+    if (offsets.len != 0 and block_offsets.len != 0) return error.InvalidTableFile;
+    if (entry_count == 0) {
         if (blocks.len != 0 or entry_data_len != 0) return error.InvalidTableFile;
         return;
     }
@@ -2425,21 +2522,27 @@ fn validateAndExpandEntryOffsets(
     for (blocks) |block| {
         if (@as(usize, block.first_entry_index) != expected_entry_index) return error.InvalidTableFile;
         const block_end = @as(usize, block.first_entry_index) + block.entry_count;
-        if (block_end > offsets.len) return error.InvalidTableFile;
+        if (block_end > entry_count) return error.InvalidTableFile;
         var previous_local: u32 = 0;
-        for (offsets[block.first_entry_index..block_end], 0..) |*offset, local_index| {
-            if (!packed_offsets and offset.* < block.relative_offset) return error.InvalidTableFile;
-            const local = if (packed_offsets) offset.* else offset.* - block.relative_offset;
+        for (block.first_entry_index..block_end, 0..) |entry_index, local_index| {
+            const local = if (offsets.len != 0) blk: {
+                if (offsets[entry_index] < block.relative_offset) return error.InvalidTableFile;
+                break :blk offsets[entry_index] - block.relative_offset;
+            } else @as(u32, block_offsets[entry_index]);
             if (local_index == 0 and local != 0) return error.InvalidTableFile;
             if (local_index > 0 and local <= previous_local) return error.InvalidTableFile;
             if (local >= block.len) return error.InvalidTableFile;
-            if (packed_offsets) offset.* = std.math.add(u32, block.relative_offset, local) catch return error.InvalidTableFile;
             previous_local = local;
         }
         expected_entry_index = block_end;
     }
-    if (expected_entry_index != offsets.len) return error.InvalidTableFile;
-    if (@as(usize, offsets[offsets.len - 1]) >= entry_data_len) return error.InvalidTableFile;
+    if (expected_entry_index != entry_count) return error.InvalidTableFile;
+    const last_block = blocks[blocks.len - 1];
+    const last_local: usize = if (offsets.len != 0)
+        offsets[offsets.len - 1] - last_block.relative_offset
+    else
+        block_offsets[block_offsets.len - 1];
+    if (@as(usize, last_block.relative_offset) + last_local >= entry_data_len) return error.InvalidTableFile;
 }
 
 fn decodeBlockMetasAlloc(
@@ -2759,7 +2862,7 @@ fn encodeV9ForTest(allocator: std.mem.Allocator, entries: []const Entry) ![]u8 {
     try bytes.appendSlice(allocator, current[0..footer.metadata_offset]);
     std.mem.writeInt(u32, bytes.items[magic.len..][0..4], previous_version, .little);
 
-    for (index.entry_offsets) |offset| try appendU32(allocator, &bytes, offset);
+    for (0..index.entryCount()) |entry_index| try appendU32(allocator, &bytes, index.entryStart(entry_index));
     const packed_offsets_end = packed_offsets_magic.len + entries.len * @sizeOf(u16);
     try bytes.appendSlice(allocator, metadata[packed_offsets_end..]);
     const metadata_len = bytes.items.len - footer.metadata_offset;
@@ -2821,7 +2924,8 @@ test "table file v10 packed footer metadata decodes through footer" {
     );
     defer index.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, entries.len), index.entry_offsets.len);
+    try std.testing.expectEqual(@as(usize, entries.len), index.entryCount());
+    try std.testing.expectEqual(@as(usize, entries.len), index.block_entry_offsets.len);
     try std.testing.expect(maybeContains(index.borrowFilter(), "docs", "doc:a"));
     try std.testing.expect(maybeContains(index.borrowFilter(), "docs", "doc:b"));
 

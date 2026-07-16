@@ -2617,13 +2617,15 @@ table v10 stores a `u16` block-local entry offset instead of a `u32` table-globa
 offset. Logical blocks are capped at 32 KiB, while an oversized entry is a
 singleton at local offset zero, so the representation is exact. Footer-only
 readers dispatch from an explicit metadata marker and full readers accept both
-the shipped v9 layout and v10. Readers expand once to the existing global
-`u32` lookup array, preserving point/range CPU behavior; streaming builders
-retain the packed form. Across the preserved 30,199,943 entries and 30 runs,
-this projects a net 60,399,646-byte disk reduction after the eight-byte marker
-per run, and halves
-the offset portion of table-builder memory. A generated origin/main v9 fixture
-proves full-file, footer-only, sequential, and exact-lookup compatibility.
+the shipped v9 layout and v10. Current readers now retain v10 offsets in their
+native `u16` block-local representation instead of expanding all entries to a
+global `u32` array. Hot block scans use the already-known block ordinal for one
+add; legacy v9 runs retain their existing global `u32` array. Across the
+preserved 30,199,943 entries and 30 runs, v10 reduces disk by a net 60,399,646
+bytes after the eight-byte marker per run and halves the entry-offset portion
+of both table-builder and decoded-index memory. A generated origin/main v9
+fixture proves full-file, footer-only, sequential, and exact-lookup
+compatibility.
 
 The remaining 5.621 GB compressed entry payload includes product source records
 and durable document-identity metadata that the kernel comparator intentionally
@@ -2875,6 +2877,65 @@ lower. Follow-up memory work must measure per-section/page residency or use
 bounded post-query clean-page eviction, and separately attribute allocator
 zones, while preserving the accepted latency/CPU curve. Whole-segment eviction
 on every query is not accepted without page-in, CPU, and tail-latency evidence.
+
+### Shared primary-index cache and server RSS follow-up
+
+Full-corpus allocation attribution found a second, independent retained-memory
+cost below the public query path. `MergeCursor` unconditionally decoded a
+private point-query `TableIndex` for every primary LSM run even when its backend
+had the provisioned shared cache. The first query therefore retained about
+276.8 MB of run Bloom filters, 143.1 MB of prefix Bloom filters, 120.8 MB of
+expanded entry offsets, and 72 MB of block metadata outside the shared cache
+and outside its `ResourceManager` slice. In the matched pre-fix process, the
+first exact-term query grew logical heap by about 848 MB and physical footprint
+by about 599 MB.
+
+Production read, write/apply, and startup owners now all use the provisioned
+shared LSM cache. Cursor-held indexes retain cache handles for their exact
+lifetime and release them with the cursor; only explicitly cache-free embedded
+backends retain the private fallback. The normal hot scan also uses the known
+block-local offset directly rather than binary-searching block metadata for
+each entry. A regression requires a cached cursor scan to leave the backend's
+private index map empty while charging the shared cache.
+
+The cache budget is derived from detected node or cgroup memory, not the
+benchmark corpus: one sixteenth of memory, clamped to 64--512 MiB. The
+`ResourceManager` hard limit is the same computed ceiling and the soft limit is
+75 percent of it. On this host that produces a 512 MiB hard / 384 MiB soft
+slice. Entries are admitted on demand and evicted by normal LRU/resource
+pressure; 512 MiB is a ceiling, not a startup reservation. Unit coverage fixes
+the expected 2, 8, and 64 GiB host-memory cases.
+
+Keeping v10 entry offsets packed in memory and applying that bound reduced the
+full-corpus cache from 742,543,361 bytes / 93 entries to 399,905,718 bytes / 39
+entries at startup and 366,714,513 bytes / 57 entries after the first query.
+The matched first-query logical-heap increase fell from about 848 MB to about
+35 MB. The full LSM suite passes 259 tests with one platform skip, zero failures,
+and zero leaks; the 58-case full-text scorer/format gate also passes with zero
+failures or leaks. Current v10 and shipped origin/main v9 table fixtures both
+remain accepted. Branch-only table experiments are not compatibility targets.
+
+A short persistent-HTTP validation on the unchanged 5,032,105-document root
+issued the same ID-only exact-term request. Cold service time was 242 ms and
+five warm requests were 1.16--1.75 ms. At 64 clients and 1,200 offered RPS, the
+server delivered 1,199.85 RPS with zero errors and 0.747/0.928/1.228 ms
+p50/p95/p99 end-to-end latency. Mean server CPU was 52.3 percent. Sampled peak
+RSS was 920,125,440 bytes, sampled footprint at that point was 281,250,864
+bytes, lifetime peak physical footprint was 995,935,984 bytes, and peak live
+malloc allocation was 454,669,680 bytes. This read-only 15-second gate is not a
+replacement for the accepted mixed-write matrix, but it proves the bounded
+cache does not trade the memory reduction for recurring query latency.
+
+The remaining RSS is again mostly clean allocator and mapped residency rather
+than hidden live LSM objects: `vmmap` showed the 3.4 GiB full-text mapping with
+about 77.2 MB resident and only 4 KiB dirty, while live malloc was about 417 MB.
+Darwin `malloc_zone_pressure_relief(NULL, 0)` was tested after each 32 MiB of
+batched cache eviction. Twenty-two calls reported zero bytes released, so the
+hook and its metrics were rejected and removed rather than being credited for
+the lower RSS. Native LSM runs remain range-read and are not candidates for the
+full-text mmap eviction controller. Future allocator work needs a measured
+owner/lifetime defect or an A/B-proven reclamation mechanism; it must not add
+platform-specific tuning merely to improve one RSS sample.
 
 ## Result Artifact
 

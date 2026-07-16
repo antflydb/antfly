@@ -3317,7 +3317,10 @@ pub fn build(b: *std.Build) void {
 
     const lib_db_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &.{"storage.db.db.test."}),
+        .filters = selectTestFilters(b, &.{
+            "storage.db.db.test.",
+            "io threaded applied callback observes published watermark outside runtime lock",
+        }),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4495,6 +4498,9 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up finishes restore repair before terminal index load degradation",
             "table runtime snapshot cache clones stored status",
+            "table runtime snapshot cache rejects a late stale live observation",
+            "table runtime snapshot cache replacement preserves a newer live observation",
+            "provisioned managed replay tails converge and publish without later traffic",
             "provisioned runtime status overlays live writer replay target without republishing stats",
             "provisioned runtime status live replay overlay preserves cold dense visibility refresh",
             "provisioned runtime status live replay overlay clears ambiguous replay-only backfill",
@@ -4606,6 +4612,8 @@ pub fn build(b: *std.Build) void {
             "partial coverage embeddings readiness does not mask pending enrichment",
             "derived coverage reasons deduplicate overlapping freshness signals",
             "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery",
+            "single embeddings index encoder keeps retrying coverage gaps catch-up coherent",
+            "managed embeddings coverage debt does not fabricate replay debt",
             "external embeddings index readiness does not require table doc coverage",
             "api http server create index waits for exact target config projection",
         },

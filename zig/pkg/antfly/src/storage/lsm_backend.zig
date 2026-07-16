@@ -11167,6 +11167,10 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
         try std.testing.expect(read_stats.cursor_table_index_hits > read_stats.cursor_table_index_misses);
         try std.testing.expect(read_stats.cursor_value_borrows > 0);
         try std.testing.expectEqual(@as(u64, 0), read_stats.cursor_value_copies);
+        try std.testing.expectEqual(@as(usize, 0), backend.run_index_cache.items.len);
+        const cache_stats = cache.snapshotStats();
+        try std.testing.expectEqual(@as(u64, 1), cache_stats.run_table_index.inserts);
+        try std.testing.expect(cache_stats.run_table_index.used_bytes > 0);
     }
 
     {
@@ -13404,7 +13408,8 @@ test "lsm repository loads v4 table index from trailer plus metadata read" {
     var index = try repository_mod.loadRunTableIndexAllocWithStorage(host.storage(), alloc, run_path);
     defer index.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 2), index.entry_offsets.len);
+    try std.testing.expectEqual(@as(usize, 2), index.entryCount());
+    try std.testing.expectEqual(@as(usize, 2), index.block_entry_offsets.len);
     try std.testing.expectEqual(@as(usize, 0), ctx.run_file_reads);
     try std.testing.expectEqual(@as(usize, 1), ctx.run_range_reads);
     try std.testing.expectEqual(@as(usize, 1), ctx.run_trailer_reads);

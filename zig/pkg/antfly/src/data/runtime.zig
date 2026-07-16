@@ -533,9 +533,12 @@ const RaftTableApplyStateMachine = struct {
         self: *RaftTableApplyStateMachine,
         storage: *antfly.public_api.ProvisionedGroupStorage,
     ) void {
-        // Apply/write replay should not populate the shared query-side LSM
-        // block cache. This keeps indexing memory separate from read caching.
-        self.write_cache.lsm_cache = null;
+        // This resident writer is the preferred freshness-sensitive read
+        // owner. Without the shared cache, its first read decodes and retains
+        // a private index for every LSM run, bypassing both the cache bound and
+        // ResourceManager accounting. The shared cache already evicts ingest
+        // and query entries by budget.
+        self.write_cache.lsm_cache = &storage.lsm_cache;
         self.write_cache.hbc_cache = &storage.hbc_cache;
         self.write_cache.resource_manager = &storage.resource_manager;
         self.write_cache.backend_runtime = storage.backend_runtime;
@@ -12020,9 +12023,13 @@ test "data runtime live writer source follows raft apply ownership" {
 
     var apply_sm = RaftTableApplyStateMachine.init(std.testing.allocator, "/tmp/unused-antfly-live-writer-source", Catalog.iface(), null);
     defer apply_sm.deinit();
+    var storage = antfly.public_api.ProvisionedGroupStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    apply_sm.attachProvisionedStorage(&storage);
     server.data_raft_apply = &apply_sm;
 
     try std.testing.expectEqual(&apply_sm.write_source, server.liveRuntimeWriteSource());
+    try std.testing.expectEqual(&storage.lsm_cache, apply_sm.write_cache.lsm_cache.?);
 }
 
 test "data raft source split lifecycle commands bypass document db apply" {

@@ -6269,6 +6269,14 @@ pub const ProvisionedTableWriteSource = struct {
         // resolution workers started by this open drain the same backlog
         // asynchronously instead.
         if (mode != .default_async) try cached.db.drainResolverBackfill();
+        // DB.open starts and resumes derived workers before the cache can
+        // attach its provisioned visibility hook. A short persisted replay
+        // tail can therefore finish during open and miss the post-watermark
+        // callback entirely. Seed the status cache once after hook attachment;
+        // later watermark advances continue to publish through the hook.
+        if (mode == .default or mode == .default_async) {
+            _ = self.publishManagedRuntimeStatusBestEffort(table_name, group_id, cached.db);
+        }
         return cached;
     }
 
@@ -6436,6 +6444,7 @@ pub const ProvisionedTableWriteSource = struct {
         db: *db_mod.DB,
     ) bool {
         const snapshot_cache = self.runtime_status_cache orelse return false;
+        const observation_generation = snapshot_cache.beginStatusObservation();
         var status = (snapshot_cache.snapshotGroupStatus(snapshot_cache.alloc, table_name, group_id) catch |err| {
             std.log.warn("managed runtime status cached snapshot lookup failed table={s} group_id={} err={s}", .{
                 table_name,
@@ -6447,7 +6456,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer status.deinit(snapshot_cache.alloc);
 
         db.overlayRuntimeStatusBestEffort(snapshot_cache.alloc, &status.stats);
-        snapshot_cache.upsertGroupStatus(table_name, status) catch |err| {
+        _ = snapshot_cache.upsertObservedGroupStatus(table_name, status, observation_generation) catch |err| {
             std.log.warn("managed runtime status overlay publish failed table={s} group_id={} err={s}", .{
                 table_name,
                 group_id,
@@ -7939,7 +7948,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         markRecoveredRuntimeStatuses(&recovered);
         for (recovered.items) |item| try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, item);
-        self.overlayManagedWriterReplayTargetsBestEffort(table_name, &recovered);
+        self.overlayManagedWriterReplayTargetsBestEffort(alloc, table_name, &recovered);
         return recovered;
     }
 
@@ -7973,7 +7982,7 @@ pub const ProvisionedTableWriteSource = struct {
         // to refresh optional counters during that interval.
         if (!self.structuralStatusSnapshotOnlyBestEffort(table_name)) {
             try self.refreshRuntimeStatusesFromWriteCache(alloc, table_name, &cached);
-            self.overlayManagedWriterReplayTargetsBestEffort(table_name, &cached);
+            self.overlayManagedWriterReplayTargetsBestEffort(alloc, table_name, &cached);
         }
         return cached;
     }
@@ -8026,28 +8035,36 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn overlayManagedWriterReplayTargetsBestEffort(
         self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
         table_name: []const u8,
         statuses: *runtime_status.LocalTableRuntimeStatuses,
     ) void {
-        if (!self.local_db_mutex.tryLock()) return;
-        defer self.local_db_mutex.unlock();
-        self.overlayManagedWriterReplayTargetsFromCacheLocked(table_name, self.write_cache, statuses);
-        self.overlayManagedWriterReplayTargetsFromCacheLocked(table_name, self.startup_write_cache, statuses);
-    }
+        var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
+        defer {
+            for (leases.items) |*lease| {
+                const release_alloc = if (lease.cache) |cache| cache.alloc else std.heap.page_allocator;
+                lease.deinit(release_alloc);
+            }
+            leases.deinit(alloc);
+        }
 
-    fn overlayManagedWriterReplayTargetsFromCacheLocked(
-        self: *ProvisionedTableWriteSource,
-        table_name: []const u8,
-        maybe_cache: ?*ProvisionedTableWriteCache,
-        statuses: *runtime_status.LocalTableRuntimeStatuses,
-    ) void {
-        const cache = maybe_cache orelse return;
-        for (cache.entries.items) |entry| {
+        if (!self.local_db_mutex.tryLock()) return;
+        self.collectAllRuntimeStatusLeasesFromCacheLocked(alloc, self.write_cache, &leases) catch {
+            self.local_db_mutex.unlock();
+            return;
+        };
+        self.collectAllRuntimeStatusLeasesFromCacheLocked(alloc, self.startup_write_cache, &leases) catch {
+            self.local_db_mutex.unlock();
+            return;
+        };
+        self.local_db_mutex.unlock();
+
+        for (leases.items) |lease| {
+            const entry = lease.entry orelse continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.lsm_root_generation != self.visibleRootGeneration(entry.group_id)) continue;
             for (statuses.items) |*status| {
                 if (status.group_id != entry.group_id) continue;
-                overlayRuntimeStatusReplayTargetFromDb(status, &entry.db);
+                overlayRuntimeStatusReplayTargetFromDb(alloc, status, lease.db);
                 break;
             }
         }
@@ -15489,6 +15506,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
     mode: RuntimeStatusSnapshotMode,
     db: *db_mod.DB,
 ) !void {
+    const observation_generation = snapshot_cache.beginStatusObservation();
     const async_stats = db.snapshotAsyncIndexingStats();
     if (mode == .best_effort and phase != .idle) {
         if (try snapshot_cache.snapshotGroupStatus(alloc, table_name, group_id)) |cached_status| {
@@ -15498,7 +15516,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
             markStartupRuntimeStatus(&status, startup);
             status.metadata.lsm_root_generation = lsm_root_generation;
-            try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, status);
+            _ = try snapshot_cache.upsertObservedGroupStatusPreservingMetadata(table_name, status, observation_generation);
         } else {
             var status = runtime_status.LocalTableRuntimeStatus{
                 .group_id = group_id,
@@ -15509,7 +15527,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
             markStartupRuntimeStatus(&status, startup);
             status.metadata.lsm_root_generation = lsm_root_generation;
-            try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, status);
+            _ = try snapshot_cache.upsertObservedGroupStatusPreservingMetadata(table_name, status, observation_generation);
         }
         return;
     }
@@ -15589,11 +15607,11 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
         !statusHasRuntimeFactsIgnoringMetadataSource(status))
     {
         markClearedStartupRuntimeStatus(&status);
-        try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, status);
+        _ = try snapshot_cache.upsertObservedGroupStatusPreservingMetadata(table_name, status, observation_generation);
     } else {
         markRuntimeStatusFromDb(&status, phase);
         status.metadata.lsm_root_generation = lsm_root_generation;
-        try snapshot_cache.upsertGroupStatus(table_name, status);
+        _ = try snapshot_cache.upsertObservedGroupStatus(table_name, status, observation_generation);
     }
 }
 
@@ -15700,8 +15718,11 @@ fn overlayDenseHbcCacheStatsFromDb(stats: *db_mod.types.DBStats, db: *db_mod.DB)
     }
 }
 
-fn overlayRuntimeStatusReplayTargetFromDb(status: *runtime_status.LocalTableRuntimeStatus, db: *db_mod.DB) void {
-    const target_sequence = db.core.nextDerivedSequence();
+fn overlayRuntimeStatusReplayTargetFromDb(
+    alloc: std.mem.Allocator,
+    status: *runtime_status.LocalTableRuntimeStatus,
+    db: *db_mod.DB,
+) void {
     const async_stats = db.snapshotAsyncIndexingStats();
     status.stats.async_indexing = async_stats;
     for (status.stats.indexes) |*item| {
@@ -15710,15 +15731,18 @@ fn overlayRuntimeStatusReplayTargetFromDb(status: *runtime_status.LocalTableRunt
         const preserve_non_replay_backfill = runtimeStatusHasNonReplayBackfillSignal(item.*);
         if (db.executor.appliedSequence(item.name)) |live_applied| {
             item.replay_applied_sequence = @max(item.replay_applied_sequence, live_applied);
-            item.replay_target_sequence = @max(item.replay_target_sequence, live_applied);
         }
-        if (target_sequence > item.replay_target_sequence) {
-            item.replay_target_sequence = target_sequence;
-            item.catch_up_target_sequence = target_sequence;
-        }
-        if (item.catch_up_target_sequence < item.replay_target_sequence) {
-            item.catch_up_target_sequence = item.replay_target_sequence;
-        }
+        // The primary replay head is shared by every managed index. Derive the
+        // target from this index's matching replay lane so unrelated commits
+        // cannot manufacture replay debt in public provisioned status.
+        item.replay_target_sequence = db.managedIndexReplayTargetSequence(
+            alloc,
+            item.name,
+            item.kind,
+            item.replay_applied_sequence,
+        ) catch @max(item.replay_target_sequence, item.replay_applied_sequence);
+        item.replay_target_sequence = @max(item.replay_target_sequence, item.replay_applied_sequence);
+        item.catch_up_target_sequence = item.replay_target_sequence;
         item.catch_up_applied_sequence = item.replay_applied_sequence;
         item.catch_up_active = item.kind == .dense_vector and async_stats.dense_catch_up.active;
         item.catch_up_phase = if (item.kind == .dense_vector) async_stats.dense_catch_up.phase else .idle;
@@ -22332,6 +22356,339 @@ test "provisioned table write cache eventually runs managed dense enrichment for
     try std.testing.expect(FakeEmbeddingProvider.request_count.load(.monotonic) > 0);
 }
 
+test "provisioned managed replay tails converge and publish without later traffic" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-managed-replay-tail", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    const FakeEmbeddingProvider = struct {
+        var request_count: std.atomic.Value(u32) = .init(0);
+        var embedded_count: std.atomic.Value(u32) = .init(0);
+
+        fn executor() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, arena: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/v1/embeddings"));
+            _ = request_count.fetchAdd(1, .monotonic);
+
+            var parsed_req = try parseJsonBodyIgnoreUnknown(TestEmbeddingRequest, arena, req.body);
+            defer parsed_req.deinit();
+
+            const input_count: usize = switch (parsed_req.value.input) {
+                .string => 1,
+                .array => |inputs| inputs.items.len,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expect(input_count > 0);
+            _ = embedded_count.fetchAdd(@intCast(input_count), .monotonic);
+
+            var body = std.ArrayListUnmanaged(u8).empty;
+            defer body.deinit(arena);
+            try body.appendSlice(arena, "{\"object\":\"list\",\"data\":[");
+            for (0..input_count) |i| {
+                if (i > 0) try body.append(arena, ',');
+                var item_buf: [128]u8 = undefined;
+                const item = try std.fmt.bufPrint(
+                    &item_buf,
+                    "{{\"object\":\"embedding\",\"index\":{d},\"embedding\":[1,0,0]}}",
+                    .{i},
+                );
+                try body.appendSlice(arena, item);
+            }
+            try body.appendSlice(arena, "],\"model\":\"test-embed\",\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}");
+
+            return .{
+                .status = 200,
+                .content_type = try arena.dupe(u8, "application/json"),
+                .body = try body.toOwnedSlice(arena),
+            };
+        }
+    };
+
+    const Catalog = struct {
+        var indexes_json_buf: []const u8 = "";
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = indexes_json_buf,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Wait = struct {
+        const Progress = struct {
+            applied_sequence: u64,
+            target_sequence: u64,
+            catch_up_target_sequence: u64,
+        };
+
+        fn forPublishedConvergence(
+            snapshot_cache: *runtime_status.TableRuntimeSnapshotCache,
+            expected_docs: u64,
+        ) !Progress {
+            for (0..500) |_| {
+                if (try snapshot_cache.snapshot(std.testing.allocator, "docs")) |statuses_value| {
+                    var statuses = statuses_value;
+                    defer statuses.deinit(std.testing.allocator);
+                    if (statuses.items.len == 1 and statuses.items[0].stats.indexes.len == 1) {
+                        const item = statuses.items[0].stats.indexes[0];
+                        const enrichment = statuses.items[0].stats.enrichment;
+                        if (item.doc_count == expected_docs and
+                            item.replay_applied_sequence >= item.replay_target_sequence and
+                            enrichment.applied_sequence >= enrichment.target_sequence and
+                            !enrichment.retrying and
+                            !enrichment.worker_failed and
+                            !item.replay_catch_up_required and
+                            !item.catch_up_active and
+                            item.catch_up_phase == .idle and
+                            !item.backfill_active)
+                        {
+                            return .{
+                                .applied_sequence = item.replay_applied_sequence,
+                                .target_sequence = item.replay_target_sequence,
+                                .catch_up_target_sequence = item.catch_up_target_sequence,
+                            };
+                        }
+                    }
+                }
+                sleepNs(20 * std.time.ns_per_ms);
+            }
+            return error.TestExpectedConvergence;
+        }
+    };
+
+    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, FakeEmbeddingProvider.executor());
+    defer listener.deinit();
+    try listener.start();
+    const base_uri = try listener.baseUri(alloc);
+    defer alloc.free(base_uri);
+
+    Catalog.indexes_json_buf = try std.fmt.allocPrint(alloc,
+        \\{{"semantic_idx":{{"type":"embeddings","field":"semantic_content","dimension":3,"embedder":{{"provider":"openai","model":"test-embed","url":"{s}"}}}}}}
+    , .{base_uri});
+    defer alloc.free(Catalog.indexes_json_buf);
+    FakeEmbeddingProvider.request_count.store(0, .monotonic);
+    FakeEmbeddingProvider.embedded_count.store(0, .monotonic);
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    var snapshot_cache_live = true;
+    defer if (snapshot_cache_live) snapshot_cache.deinit();
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    var write_cache_live = true;
+    defer if (write_cache_live) write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(path, Catalog.iface());
+    source.write_cache = &write_cache;
+    source.runtime_status_cache = &snapshot_cache;
+
+    for (1..7) |i| {
+        var key_buf: [32]u8 = undefined;
+        var value_buf: [160]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc-{d}", .{i});
+        const value = try std.fmt.bufPrint(
+            &value_buf,
+            "{{\"content\":\"payload {d}\",\"semantic_content\":\"unique semantic payload {d}\"}}",
+            .{ i, i },
+        );
+        _ = try source.source().batch(alloc, "docs", .{
+            .writes = &.{.{ .key = key, .value = value }},
+            .sync_level = .write,
+        });
+    }
+    for (1..4) |i| {
+        var key_buf: [32]u8 = undefined;
+        var value_buf: [96]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "plain-{d}", .{i});
+        const value = try std.fmt.bufPrint(&value_buf, "{{\"content\":\"plain trailing document {d}\"}}", .{i});
+        _ = try source.source().batch(alloc, "docs", .{
+            .writes = &.{.{ .key = key, .value = value }},
+            .sync_level = .write,
+        });
+    }
+
+    const initial = try Wait.forPublishedConvergence(&snapshot_cache, 6);
+    try std.testing.expect(initial.applied_sequence > 0);
+
+    _ = try source.source().batch(alloc, "docs", .{
+        .deletes = &.{"doc-1"},
+        .sync_level = .write,
+    });
+    _ = try Wait.forPublishedConvergence(&snapshot_cache, 5);
+
+    // Repeated mixed bursts exercise notify/drain/park transitions. Every
+    // iteration ends in a no-op-for-this-index write, and there is no probe or
+    // explicit catch-up request after the final burst.
+    for (0..100) |i| {
+        var semantic_key_buf: [32]u8 = undefined;
+        var semantic_value_buf: [160]u8 = undefined;
+        var plain_key_buf: [32]u8 = undefined;
+        var plain_value_buf: [96]u8 = undefined;
+        const semantic_key = try std.fmt.bufPrint(&semantic_key_buf, "mixed-semantic-{d}", .{i});
+        const semantic_value = try std.fmt.bufPrint(
+            &semantic_value_buf,
+            "{{\"content\":\"mixed {d}\",\"semantic_content\":\"mixed semantic payload {d}\"}}",
+            .{ i, i },
+        );
+        const plain_key = try std.fmt.bufPrint(&plain_key_buf, "mixed-plain-{d}", .{i});
+        const plain_value = try std.fmt.bufPrint(&plain_value_buf, "{{\"content\":\"mixed plain {d}\"}}", .{i});
+
+        _ = try source.source().batch(alloc, "docs", .{
+            .writes = &.{.{ .key = semantic_key, .value = semantic_value }},
+            .sync_level = .write,
+        });
+        _ = try source.source().batch(alloc, "docs", .{
+            .writes = &.{.{ .key = plain_key, .value = plain_value }},
+            .sync_level = .write,
+        });
+    }
+
+    const final_status = try Wait.forPublishedConvergence(&snapshot_cache, 105);
+    try std.testing.expectEqual(final_status.target_sequence, final_status.catch_up_target_sequence);
+    try std.testing.expectEqual(
+        final_status.applied_sequence,
+        write_cache.entries.items[0].db.executor.appliedSequence("semantic_idx").?,
+    );
+    try std.testing.expect(FakeEmbeddingProvider.request_count.load(.monotonic) > 0);
+    try std.testing.expect(FakeEmbeddingProvider.embedded_count.load(.monotonic) >= 106);
+
+    const query_vec = [_]f32{ 1, 0, 0 };
+    {
+        var result = try write_cache.entries.items[0].db.search(alloc, .{
+            .index_name = "semantic_idx",
+            .dense = .{ .vector = query_vec[0..], .k = 128 },
+            .limit = 128,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 105), result.total_hits);
+        for (result.hits) |hit| try std.testing.expect(!std.mem.eql(u8, hit.id, "doc-1"));
+    }
+
+    write_cache.entries.items[0].db.setQueryVisibilityHook(null);
+    write_cache.deinit();
+    write_cache_live = false;
+    snapshot_cache.deinit();
+    snapshot_cache_live = false;
+
+    const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(group_path);
+
+    // Leave one real dense replay record beyond the persisted applied
+    // watermark while all workers are stopped. This models a process exiting
+    // after the commit became durable but before derived replay completed.
+    var restart_tail_sequence: u64 = 0;
+    {
+        var seeded = try db_mod.DB.open(alloc, group_path, .{
+            .open_mode = .writer_no_replay,
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+            .prefer_existing_identity_namespace = true,
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .ttl_cleanup = .{ .enabled = false },
+            .transaction_recovery = .{ .enabled = false },
+            .text_merge = .{ .enabled = false },
+        });
+        defer seeded.close();
+
+        const stored_key = try db_mod.internal_keys.documentKeyAlloc(alloc, "restart-tail");
+        defer alloc.free(stored_key);
+        try seeded.core.store.putBatch(&.{.{
+            .key = stored_key,
+            .value = "{\"content\":\"restart payload\",\"semantic_content\":\"restart semantic payload\"}",
+        }}, &.{});
+
+        var dense_embeddings = try alloc.alloc(db_mod.derived_types.DerivedDenseEmbeddingWrite, 1);
+        var derived_batch = db_mod.derived_types.DerivedBatch{
+            .dense_embeddings = dense_embeddings,
+        };
+        defer db_mod.derived_types.deinitDerivedBatch(alloc, &derived_batch);
+        dense_embeddings[0] = .{
+            .index_name = try alloc.dupe(u8, "semantic_idx"),
+            .doc_key = try alloc.dupe(u8, "restart-tail"),
+            .artifact_key = null,
+            .vector = try alloc.dupe(f32, &[_]f32{ 1, 0, 0 }),
+        };
+
+        restart_tail_sequence = seeded.core.store.reserveNextReplaySequence(1);
+        var replay_record = try change_journal_mod.recordFromDerivedBatch(alloc, derived_batch, restart_tail_sequence);
+        defer change_journal_mod.deinitRecord(alloc, &replay_record);
+        const encoded = try change_journal_mod.encodeRecord(alloc, replay_record);
+        defer alloc.free(encoded);
+        try db_mod.replay_stream.appendOpaque(alloc, seeded.core.store, restart_tail_sequence, encoded);
+
+        const debt = try seeded.stats(alloc);
+        defer db_mod.types.freeDBStats(alloc, debt);
+        try std.testing.expectEqual(@as(usize, 1), debt.indexes.len);
+        try std.testing.expect(debt.indexes[0].replay_applied_sequence < debt.indexes[0].replay_target_sequence);
+        try std.testing.expectEqual(restart_tail_sequence, debt.indexes[0].replay_target_sequence);
+    }
+
+    // Restart the provisioned owner without issuing another batch or manually
+    // publishing status. It must replay the persisted tail once, publish the
+    // post-watermark state, and then remain parked.
+    var restarted_snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer restarted_snapshot_cache.deinit();
+    var restarted_write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer restarted_write_cache.deinit();
+    var restarted_source = ProvisionedTableWriteSource.init(path, Catalog.iface());
+    restarted_source.write_cache = &restarted_write_cache;
+    restarted_source.runtime_status_cache = &restarted_snapshot_cache;
+
+    var reopened = try restarted_source.getOrOpenCachedDbMode(
+        alloc,
+        &restarted_write_cache,
+        group_path,
+        7001,
+        "docs",
+        .default,
+        null,
+        null,
+    );
+    defer reopened.deinit(alloc);
+    const restarted = try Wait.forPublishedConvergence(&restarted_snapshot_cache, 106);
+    try std.testing.expect(restarted.applied_sequence >= restart_tail_sequence);
+    try std.testing.expectEqual(restarted.target_sequence, restarted.catch_up_target_sequence);
+    sleepNs(100 * std.time.ns_per_ms);
+    const stable = try Wait.forPublishedConvergence(&restarted_snapshot_cache, 106);
+    try std.testing.expectEqual(restarted.applied_sequence, stable.applied_sequence);
+    reopened.db.setQueryVisibilityHook(null);
+}
+
 test "provisioned write cache invalidation closes failed managed enrichment db without aborting" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-managed-dense-write-cache-failed-close";
@@ -26356,6 +26713,22 @@ test "provisioned runtime status overlays live writer replay target without repu
     try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_applied_sequence);
     try std.testing.expect(!statuses.items[0].stats.indexes[0].replay_catch_up_required);
     try std.testing.expect(!statuses.items[0].stats.indexes[0].backfill_active);
+
+    const unrelated_sequence = cached.db.core.store.nextReplaySequence(1);
+    const unrelated_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = unrelated_sequence,
+        .target_hints = &.{.full_text},
+    });
+    defer alloc.free(unrelated_payload);
+    try cached.db.core.store.appendReplayOpaque(alloc, unrelated_sequence, unrelated_payload);
+    try std.testing.expectEqual(@as(u64, 3), cached.db.core.nextDerivedSequence());
+
+    // A global replay entry for another managed-index kind must not recreate
+    // dense replay debt in the public provisioned status overlay.
+    overlayRuntimeStatusReplayTargetFromDb(alloc, &statuses.items[0], cached.db);
+    try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_target_sequence);
+    try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_applied_sequence);
+    try std.testing.expect(!statuses.items[0].stats.indexes[0].replay_catch_up_required);
 }
 
 test "provisioned runtime status live replay overlay preserves cold dense visibility refresh" {
