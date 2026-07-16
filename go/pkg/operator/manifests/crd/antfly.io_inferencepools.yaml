@@ -725,6 +725,19 @@ spec:
                           items:
                             type: string
                           type: array
+                        kind:
+                          enum:
+                          - generator
+                          - embedder
+                          - reranker
+                          - chunker
+                          - classifier
+                          - recognizer
+                          - rewriter
+                          - reader
+                          - transcriber
+                          - extractor
+                          type: string
                         name:
                           minLength: 1
                           type: string
@@ -735,17 +748,12 @@ spec:
                           - medium
                           - low
                           type: string
-                        strategy:
-                          enum:
-                          - eager
-                          - lazy
-                          - bounded
-                          type: string
                         tasks:
                           items:
                             type: string
                           type: array
                       required:
+                      - kind
                       - name
                       type: object
                     type: array

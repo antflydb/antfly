@@ -116,6 +116,8 @@ from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
 from .date_range_string_query import DateRangeStringQuery
 from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
+from .dense_repair_backpressure_error import DenseRepairBackpressureError
+from .dense_repair_backpressure_error_code import DenseRepairBackpressureErrorCode
 from .derived_coverage_observation_incomplete_reason import DerivedCoverageObservationIncompleteReason
 from .derived_coverage_policy import DerivedCoveragePolicy
 from .derived_coverage_status import DerivedCoverageStatus
@@ -280,10 +282,13 @@ from .image_url_content_part_type import ImageURLContentPartType
 from .incomplete_details import IncompleteDetails
 from .incomplete_details_reason import IncompleteDetailsReason
 from .index_execution_config import IndexExecutionConfig
+from .index_repair_status import IndexRepairStatus
+from .index_repair_status_state import IndexRepairStatusState
 from .index_status import IndexStatus
 from .index_status_shard_status import IndexStatusShardStatus
 from .index_type import IndexType
 from .inference_audio_chunk_config import InferenceAudioChunkConfig
+from .inference_backend_priority_entry import InferenceBackendPriorityEntry
 from .inference_backend_runtimes import InferenceBackendRuntimes
 from .inference_binary_content import InferenceBinaryContent
 from .inference_chat_message import InferenceChatMessage
@@ -295,8 +300,6 @@ from .inference_chunk_request import InferenceChunkRequest
 from .inference_chunk_response import InferenceChunkResponse
 from .inference_chunk_response_object import InferenceChunkResponseObject
 from .inference_config import InferenceConfig
-from .inference_config_model_strategies import InferenceConfigModelStrategies
-from .inference_config_model_strategies_additional_property import InferenceConfigModelStrategiesAdditionalProperty
 from .inference_connection import InferenceConnection
 from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
@@ -354,7 +357,6 @@ from .inference_model_backend import InferenceModelBackend
 from .inference_model_format import InferenceModelFormat
 from .inference_model_info import InferenceModelInfo
 from .inference_model_kind import InferenceModelKind
-from .inference_model_quantization import InferenceModelQuantization
 from .inference_model_ref import InferenceModelRef
 from .inference_models_response import InferenceModelsResponse
 from .inference_models_response_chunkers import InferenceModelsResponseChunkers
@@ -524,6 +526,7 @@ from .query_string_query import QueryStringQuery
 from .regexp_query import RegexpQuery
 from .repair_issue_list_request import RepairIssueListRequest
 from .repair_run_request import RepairRunRequest
+from .repair_run_request_control import RepairRunRequestControl
 from .repair_target import RepairTarget
 from .replication_source_action_hint import ReplicationSourceActionHint
 from .replication_source_status import ReplicationSourceStatus
@@ -783,6 +786,8 @@ __all__ = (
     "DataShapeKind",
     "DateRangeStringQuery",
     "DeleteArtifactEnrichmentResponse201",
+    "DenseRepairBackpressureError",
+    "DenseRepairBackpressureErrorCode",
     "DerivedCoverageObservationIncompleteReason",
     "DerivedCoveragePolicy",
     "DerivedCoverageStatus",
@@ -945,10 +950,13 @@ __all__ = (
     "IncompleteDetails",
     "IncompleteDetailsReason",
     "IndexExecutionConfig",
+    "IndexRepairStatus",
+    "IndexRepairStatusState",
     "IndexStatus",
     "IndexStatusShardStatus",
     "IndexType",
     "InferenceAudioChunkConfig",
+    "InferenceBackendPriorityEntry",
     "InferenceBackendRuntimes",
     "InferenceBinaryContent",
     "InferenceChatMessage",
@@ -960,8 +968,6 @@ __all__ = (
     "InferenceChunkResponse",
     "InferenceChunkResponseObject",
     "InferenceConfig",
-    "InferenceConfigModelStrategies",
-    "InferenceConfigModelStrategiesAdditionalProperty",
     "InferenceConnection",
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
@@ -1019,7 +1025,6 @@ __all__ = (
     "InferenceModelFormat",
     "InferenceModelInfo",
     "InferenceModelKind",
-    "InferenceModelQuantization",
     "InferenceModelRef",
     "InferenceModelsResponse",
     "InferenceModelsResponseChunkers",
@@ -1189,6 +1194,7 @@ __all__ = (
     "RegexpQuery",
     "RepairIssueListRequest",
     "RepairRunRequest",
+    "RepairRunRequestControl",
     "RepairTarget",
     "ReplicationSourceActionHint",
     "ReplicationSourceStatus",

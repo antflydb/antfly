@@ -85,7 +85,9 @@ Model references in InferencePool specs are canonical tags in
 models:
   preload:
     - name: BAAI/bge-small-en-v1.5:i8
+      kind: embedder
     - name: hf:antflydb/clipclap:gguf:Q4_K
+      kind: embedder
       tasks: ["embed"]
       capabilities: ["text", "image", "audio"]
 ```
@@ -94,6 +96,15 @@ The operator should not synthesize a separate model `variant` field. The Zig
 runtime contract is `/antfly inference pull <model-ref> --models-dir /models`,
 with `--tasks` and `--capabilities` added when the model preload spec declares
 them.
+
+`models_dir` is part of that managed pod contract. If it is present in an
+InferencePool `spec.config`, it must be `/models`; the admission webhook rejects
+other values so model pulls cannot be disconnected from the runtime volume.
+
+TPU InferencePools configure `pjrt_plugin_path` as
+`/usr/local/lib/libtpu.so`, the operator's inference image contract. A custom
+inference image that installs the PJRT plugin elsewhere must override
+`pjrt_plugin_path` in the InferencePool `spec.config` JSON.
 
 ## Storage Resize
 

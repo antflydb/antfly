@@ -9,7 +9,6 @@ from attrs import field as _attrs_field
 from ..models.inference_model_backend import InferenceModelBackend
 from ..models.inference_model_format import InferenceModelFormat
 from ..models.inference_model_kind import InferenceModelKind
-from ..models.inference_model_quantization import InferenceModelQuantization
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="InferenceModelRef")
@@ -21,24 +20,33 @@ class InferenceModelRef:
 
     Attributes:
         kind (InferenceModelKind): Model registry kind.
-        name (str): Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
-            Example: antflydb/gemma-e2b.
+        name (str): Model name to resolve within the registry for the selected kind, usually in
+            `<owner>/<repo>` format. Model-backed requests can address a preloaded artifact
+            explicitly as `<owner>/<repo>:<format>[:<quantization>]`; the selector is not
+            part of the registry directory name. A bare model name continues to resolve the
+            directory's default artifact, so multiple selected variants can remain resident.
+             Example: antflydb/gemma-e2b.
         backend (InferenceModelBackend | Unset): Optional backend preference for model loading or request execution.
             `auto` keeps the node default behavior.
-            `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via
-            `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`,
-            `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
-            `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with
-            `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
-        format_ (InferenceModelFormat | Unset): Optional artifact format preference for loading a model.
-        quantization (InferenceModelQuantization | Unset): Optional quantization preference for loading a model.
+            `pjrt` selects the PJRT backend and requires `pjrt_plugin_path` unless
+            the standard `PJRT_PLUGIN_PATH` environment variable is set.
+            `webgpu` selects the Wasm/WebGPU backend in Wasm builds. Generation uses
+            WebGPU graph partition execution over the Wasm-native base session.
+            `mode: "compiled"` may be supplied explicitly but is not required.
+        format_ (InferenceModelFormat | Unset): Optional artifact family to select when a model directory contains
+            multiple loadable formats.
+        quantization (str | Unset): Optional exact quantization selector within the chosen artifact family. Matching is
+            case-insensitive and treats `-` and `_` equivalently (for example, `q4_k` matches
+            `Q4_K`). The configured model must contain exactly one matching artifact variant.
+            Quantization is not valid with the composite `hybrid` format.
+             Example: q4_k.
     """
 
     kind: InferenceModelKind
     name: str
     backend: InferenceModelBackend | Unset = UNSET
     format_: InferenceModelFormat | Unset = UNSET
-    quantization: InferenceModelQuantization | Unset = UNSET
+    quantization: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -54,9 +62,7 @@ class InferenceModelRef:
         if not isinstance(self.format_, Unset):
             format_ = self.format_.value
 
-        quantization: str | Unset = UNSET
-        if not isinstance(self.quantization, Unset):
-            quantization = self.quantization.value
+        quantization = self.quantization
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -96,12 +102,7 @@ class InferenceModelRef:
         else:
             format_ = InferenceModelFormat(_format_)
 
-        _quantization = d.pop("quantization", UNSET)
-        quantization: InferenceModelQuantization | Unset
-        if isinstance(_quantization, Unset):
-            quantization = UNSET
-        else:
-            quantization = InferenceModelQuantization(_quantization)
+        quantization = d.pop("quantization", UNSET)
 
         inference_model_ref = cls(
             kind=kind,

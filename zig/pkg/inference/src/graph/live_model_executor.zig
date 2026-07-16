@@ -70,7 +70,7 @@ const RuntimeContext = struct {
             .cuda => .cuda,
             .pjrt => return error.UnexpectedPjrtBackend,
             .onnx => return error.UnexpectedOnnxBackend,
-            .wasm => return error.UnexpectedWasmBackend,
+            .webgpu => return error.UnexpectedWasmBackend,
         };
         const kv_dtype = kv_dtype_override orelse session_factory.recommendedKvDTypeForSession(session, backend_kind);
         const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)

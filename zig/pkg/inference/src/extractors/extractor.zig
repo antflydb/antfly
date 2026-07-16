@@ -29,6 +29,7 @@ pub const Context = struct {
     models_dir: []const u8,
     session_manager: *backends_mod.SessionManager,
     model_manager: *model_manager_mod.ModelManager,
+    request_id: u64,
 };
 
 pub const Extractor = union(enum) {
@@ -36,15 +37,22 @@ pub const Extractor = union(enum) {
     reader: ReaderExtractor,
 
     pub fn initRecognizer(allocator: std.mem.Allocator, model_path: []const u8, model_name: []const u8) !Extractor {
+        const owned_path = try allocator.dupe(u8, model_path);
+        errdefer allocator.free(owned_path);
+        const owned_name = try allocator.dupe(u8, model_name);
         return .{ .recognizer = .{
-            .model_path = try allocator.dupe(u8, model_path),
-            .model_name = try allocator.dupe(u8, model_name),
+            .model_path = owned_path,
+            .model_name = owned_name,
         } };
     }
 
-    pub fn initReader(allocator: std.mem.Allocator, model_path: []const u8) !Extractor {
+    pub fn initReader(allocator: std.mem.Allocator, model_path: []const u8, model_name: []const u8) !Extractor {
+        const owned_path = try allocator.dupe(u8, model_path);
+        errdefer allocator.free(owned_path);
+        const owned_name = try allocator.dupe(u8, model_name);
         return .{ .reader = .{
-            .model_path = try allocator.dupe(u8, model_path),
+            .model_path = owned_path,
+            .model_name = owned_name,
         } };
     }
 
@@ -110,7 +118,11 @@ const RecognizerExtractor = struct {
         config: extraction_mod.ExtractionConfig,
         texts: []const []const u8,
     ) ![]extraction_mod.ExtractionResult {
-        const model = try ctx.model_manager.loadFromDir(self.model_path);
+        const selection = manifest_mod.ArtifactSelection.fromModelReference(self.model_name);
+        const model = if (!selection.isEmpty())
+            try ctx.model_manager.loadArtifactFromDirForRequest(ctx.request_id, self.model_path, selection, null)
+        else
+            try ctx.model_manager.loadFromDirForRequest(ctx.request_id, self.model_path);
         if (!model.isGlinerModel() or !model.supportsExtraction()) return error.InvalidModelForExtraction;
         if (!model_caps.modelAcceptsInput(&model.manifest, "text")) return error.UnsupportedInput;
 
@@ -128,7 +140,11 @@ const RecognizerExtractor = struct {
         image_datas: []const []const u8,
         read_options: readers_mod.ReadOptions,
     ) ![]extraction_mod.ExtractionResult {
-        const model = try ctx.model_manager.loadFromDir(self.model_path);
+        const selection = manifest_mod.ArtifactSelection.fromModelReference(self.model_name);
+        const model = if (!selection.isEmpty())
+            try ctx.model_manager.loadArtifactFromDirForRequest(ctx.request_id, self.model_path, selection, null)
+        else
+            try ctx.model_manager.loadFromDirForRequest(ctx.request_id, self.model_path);
         if (!model.isGlinerModel() or !model.supportsExtraction()) return error.InvalidModelForExtraction;
         if (!model_caps.modelAcceptsInput(&model.manifest, "text")) return error.UnsupportedInput;
 
@@ -143,9 +159,11 @@ const RecognizerExtractor = struct {
 
 const ReaderExtractor = struct {
     model_path: []const u8,
+    model_name: []const u8,
 
     fn deinit(self: *ReaderExtractor, allocator: std.mem.Allocator) void {
         allocator.free(self.model_path);
+        allocator.free(self.model_name);
     }
 
     fn extractImages(
@@ -161,6 +179,8 @@ const ReaderExtractor = struct {
             self.model_path,
             ctx.session_manager,
             ctx.model_manager,
+            ctx.request_id,
+            manifest_mod.ArtifactSelection.fromModelReference(self.model_name),
         );
         defer reader.deinit();
 
@@ -182,7 +202,11 @@ fn tryResolveRecognizer(ctx: Context, model_name: []const u8) !?Extractor {
     };
     defer ctx.allocator.free(path);
 
-    var manifest = manifest_mod.loadFromDir(ctx.allocator, path) catch return null;
+    var manifest = manifest_mod.loadFromDirWithArtifactSelection(
+        ctx.allocator,
+        path,
+        manifest_mod.ArtifactSelection.fromModelReference(model_name),
+    ) catch return null;
     defer manifest.deinit();
     if (!model_caps.modelSupportsCapability("recognizer", manifest.gliner_model_type, manifest.capabilities, "extraction")) return null;
 
@@ -196,12 +220,16 @@ fn tryResolveReader(ctx: Context, model_name: []const u8) !?Extractor {
     };
     defer ctx.allocator.free(path);
 
-    var manifest = manifest_mod.loadFromDir(ctx.allocator, path) catch return null;
+    var manifest = manifest_mod.loadFromDirWithArtifactSelection(
+        ctx.allocator,
+        path,
+        manifest_mod.ArtifactSelection.fromModelReference(model_name),
+    ) catch return null;
     defer manifest.deinit();
     if (!model_caps.modelSupportsCapability("reader", manifest.gliner_model_type, manifest.capabilities, "extraction")) return null;
     if (!model_caps.modelAcceptsInput(&manifest, "image")) return null;
 
-    return try Extractor.initReader(ctx.allocator, path);
+    return try Extractor.initReader(ctx.allocator, path, model_name);
 }
 
 fn readTextsForExtraction(
@@ -217,6 +245,10 @@ fn readTextsForExtraction(
         model_path,
         ctx.session_manager,
         ctx.model_manager,
+        ctx.request_id,
+        // This is a separately resolved fallback reader, not the explicitly
+        // selected recognizer artifact from the request.
+        .{},
     );
     defer reader.deinit();
 
@@ -368,6 +400,7 @@ test "resolve prefers reader for image extraction when both exist" {
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
+        .request_id = 0,
     }, "acme/doc-extract", true);
     defer extractor.deinit(allocator);
 
@@ -390,6 +423,7 @@ test "resolveNamedReaderPath supports flat default model layout" {
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
+        .request_id = 0,
     }, "Xenova/trocr-base-printed");
     defer allocator.free(path);
 
@@ -413,6 +447,7 @@ test "resolve prefers recognizer for text extraction when both exist" {
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
+        .request_id = 0,
     }, "acme/doc-extract", false);
     defer extractor.deinit(allocator);
 
@@ -421,7 +456,7 @@ test "resolve prefers recognizer for text extraction when both exist" {
 
 test "reader extractor does not accept text input" {
     const allocator = std.testing.allocator;
-    var extractor = try Extractor.initReader(allocator, "/tmp/model");
+    var extractor = try Extractor.initReader(allocator, "/tmp/model", "owner/model:onnx:q8_0");
     defer extractor.deinit(allocator);
 
     try std.testing.expectError(error.UnsupportedInput, extractor.extractText(.{
@@ -430,5 +465,6 @@ test "reader extractor does not accept text input" {
         .models_dir = ".",
         .session_manager = undefined,
         .model_manager = undefined,
+        .request_id = 0,
     }, &.{}, .{}, &.{}));
 }

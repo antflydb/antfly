@@ -884,9 +884,8 @@ pub fn aggregateStats(models: anytype) struct { snapshot: Snapshot, stats: Stats
     };
     var stats = Stats{};
 
-    var it = models.iterator();
-    while (it.next()) |entry| {
-        const coordinator = entry.value_ptr.*.native_generate_coordinator orelse continue;
+    for (models) |model| {
+        const coordinator = model.native_generate_coordinator orelse continue;
         const s = coordinator.snapshot();
         snapshot.waiting_requests += s.waiting_requests;
         snapshot.prefill_requests += s.prefill_requests;

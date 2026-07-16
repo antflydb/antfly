@@ -231,7 +231,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     const artifact_backend = switch (opts.backend) {
         .onnx => "onnx",
-        .xla => "xla",
+        .pjrt => "xla",
         else => null,
     };
     const resolved_artifact_dir = if (artifact_backend != null)
@@ -492,20 +492,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return error.DeepSeekV4CompressedGraphModeNotSupported;
     }
 
-    if (build_options.enable_metal and
-        graph_mode and
-        explicit_partition_backend == .metal and
-        compiled_attachment_target == .whole_model and
-        effective_draft_model == null and
-        opts.image_count == 0 and
-        opts.audio_count == 0 and
-        graph_mod.metal_executor.supportsSession(model.session))
-    {
-        _ = graph_mod.metal_executor.prewarmSharedDecoderRuntime(allocator, model.session, gpt_config) catch |err| {
-            std.log.warn("metal decoder-runtime prewarm failed for {s}: {s}", .{ opts.model_dir, @errorName(err) });
-        };
-    }
-
     debugGenerateSetup("live whole-model executor probe begin", .{});
     if (try tryRunLiveWholeModelExecutorGenerate(
         allocator,
@@ -555,7 +541,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
-        .wasm => return error.UnexpectedWasmBackend,
+        .webgpu => return error.UnexpectedWasmBackend,
     };
     const requested_kv_dtype = if (opts.cache_dtype) |name|
         runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDtype
@@ -571,6 +557,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (opts.print_timing and kv_dtype != requested_kv_dtype) {
         print("cache_dtype_effective: requested={s} effective={s}\n", .{ @tagName(requested_kv_dtype), @tagName(kv_dtype) });
     }
+    var graph_cache = graph_mod.cache.GraphCache.init(allocator);
+    defer graph_cache.deinit();
     const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
         .native => .cpu,
         else => .gpu,
@@ -630,6 +618,25 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 return err;
             };
         }
+    }
+    if (build_options.enable_metal and
+        graph_mode and
+        explicit_partition_backend == .metal and
+        compiled_attachment_target == .whole_model and
+        effective_draft_model == null and
+        opts.image_count == 0 and
+        opts.audio_count == 0 and
+        graph_mod.metal_executor.supportsSession(model.session))
+    {
+        _ = graph_mod.metal_executor.prewarmCompiledDecoderRuntime(
+            model.session,
+            gpt_config,
+            kv_dtype,
+            model.shared_moe_cache,
+            &graph_cache,
+        ) catch |err| {
+            std.log.warn("metal decoder-runtime prewarm failed for {s}: {s}", .{ opts.model_dir, @errorName(err) });
+        };
     }
     debugGenerateSetup("compute backend begin", .{});
     var cb = session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget) catch |err| {
@@ -754,8 +761,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     }
 
     const use_scheduler = !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and !graph_mode and !decoder_runtime_scheduler_override and nativeGenerateSchedulerEnabled();
-    var graph_cache = graph_mod.cache.GraphCache.init(allocator);
-    defer graph_cache.deinit();
     var pjrt_client: ?pjrt_lib.pjrt.Client = null;
     defer if (pjrt_client) |*client| client.deinit();
     var pjrt_plugin_path: ?[:0]u8 = null;
@@ -4719,7 +4724,7 @@ fn runOnnxWholeModelGraphGenerate(
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
-        .wasm => return error.UnexpectedWasmBackend,
+        .webgpu => return error.UnexpectedWasmBackend,
     };
     const kv_dtype = if (opts.cache_dtype) |name|
         runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDtype
@@ -5062,7 +5067,7 @@ fn generateBackendOverrideForChoice(choice: BackendChoice) ?api.ModelBackend {
         .native => .native,
         .metal => .metal,
         .cuda => .cuda,
-        .xla => .xla,
+        .pjrt => .pjrt,
         .webgpu => .webgpu,
     };
 }
@@ -5793,7 +5798,7 @@ fn predictedWeightTier(
             if (build_options.enable_metal and !shouldPreferNativeAheadOfMetal(allocator, manifest)) return .backend;
             return .host;
         },
-        .onnx, .xla, .webgpu => return .host,
+        .onnx, .pjrt, .webgpu => return .host,
     }
 }
 
@@ -5803,7 +5808,7 @@ fn predictedBackendType(choice: BackendChoice, tier: runtime.tier.memory.Residen
         .metal => .metal,
         .cuda => .cuda,
         .auto => .metal,
-        .onnx, .native, .xla, .webgpu => .native,
+        .onnx, .native, .pjrt, .webgpu => .native,
     };
 }
 
@@ -5850,7 +5855,7 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|pjrt|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --stream prints generated text incrementally as token deltas arrive.
@@ -5922,14 +5927,14 @@ test "parseArgs accepts artifact dir" {
         "/tmp/model",
         "hello",
         "--backend",
-        "xla",
+        "pjrt",
         "--artifact-dir",
         "/tmp/artifacts",
         "--max-tokens",
         "1",
         "--raw-prompt",
     });
-    try std.testing.expectEqual(BackendChoice.xla, opts.backend);
+    try std.testing.expectEqual(BackendChoice.pjrt, opts.backend);
     try std.testing.expectEqualStrings("/tmp/artifacts", opts.artifact_dir.?);
     try std.testing.expectEqual(@as(i32, 1), opts.max_tokens);
     try std.testing.expect(opts.raw_prompt);
@@ -5940,13 +5945,13 @@ test "parseArgs accepts compiled target" {
         "/tmp/model",
         "hello",
         "--backend",
-        "xla",
+        "pjrt",
         "--mode",
         "compiled",
         "--compiled-target",
         "whole-model",
     });
-    try std.testing.expectEqual(BackendChoice.xla, opts.backend);
+    try std.testing.expectEqual(BackendChoice.pjrt, opts.backend);
     try std.testing.expectEqual(ExecutionMode.compiled, opts.mode.?);
     try std.testing.expectEqual(CompiledTarget.whole_model, opts.compiled_target.?);
 }
