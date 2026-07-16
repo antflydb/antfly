@@ -5267,6 +5267,7 @@ pub fn build(b: *std.Build) void {
             "standalone validates effective Lite CLI and config settings",
             "standalone metadata rolls back an undurable catalog mutation",
             "standalone unified server lifecycle propagates startup failure",
+            "runtime lease watchdog fetch and validation failures publish no bootstrap capability",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

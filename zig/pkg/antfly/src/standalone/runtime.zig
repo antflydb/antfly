@@ -168,6 +168,8 @@ const CliConfig = struct {
 };
 
 const RuntimeLeaseWatchdog = struct {
+    const ObservationFailureStage = enum { fetch, validation };
+
     watchdog: antfly.ha.kubernetes_lease_watchdog.Watchdog,
     executor: antfly.common.http.StdHttpExecutor,
     uri: []u8,
@@ -186,6 +188,8 @@ const RuntimeLeaseWatchdog = struct {
     proof_mutex: std.atomic.Mutex = .unlocked,
     sentinel_persisted: bool = false,
     next_poll_ns: u64 = 0,
+    fetch_failure_logged: bool = false,
+    validation_failure_logged: bool = false,
 
     fn initFromEnv(
         alloc: std.mem.Allocator,
@@ -344,9 +348,9 @@ const RuntimeLeaseWatchdog = struct {
             self.uri,
             self.token_path,
             ha_lease_request_timeout_ms,
-        ) catch {
+        ) catch |err| {
             platform_sync.lockYielding(&self.proof_mutex);
-            const failure = self.watchdog.noteAPIFailure(authority_time.authorityNs());
+            const failure = self.noteObservationFailureLocked(.fetch, err, authority_time.authorityNs());
             self.proof_mutex.unlock();
             return try self.applyDecision(alloc, io, data_server, failure);
         };
@@ -358,12 +362,10 @@ const RuntimeLeaseWatchdog = struct {
             body,
             platform_time.realtimeNs(),
             observed_monotonic_ns,
-        ) catch {
+        ) catch |err| {
             // A syntactically valid HTTP response that cannot prove the exact
             // topology/generation is not current capability evidence.
-            self.proof_active.store(false, .release);
-            self.proof_capability_deadline_ns.store(0, .release);
-            const failure = self.watchdog.noteAPIFailure(authority_time.authorityNs());
+            const failure = self.noteObservationFailureLocked(.validation, err, authority_time.authorityNs());
             self.proof_mutex.unlock();
             return try self.applyDecision(alloc, io, data_server, failure);
         };
@@ -383,6 +385,34 @@ const RuntimeLeaseWatchdog = struct {
         }
         self.proof_mutex.unlock();
         try self.applyDecision(alloc, io, data_server, decision);
+    }
+
+    // Called with proof_mutex held. Each failure stage logs at most once per
+    // runtime process and includes only the Zig error name: bearer tokens,
+    // request headers, and response bodies are never rendered.
+    fn noteObservationFailureLocked(
+        self: *RuntimeLeaseWatchdog,
+        stage: ObservationFailureStage,
+        err: anyerror,
+        now_ns: u64,
+    ) antfly.ha.kubernetes_lease_watchdog.Decision {
+        switch (stage) {
+            .fetch => {
+                if (!self.fetch_failure_logged) {
+                    std.log.err("HA Lease watchdog Kubernetes Lease fetch failed err={s}", .{@errorName(err)});
+                    self.fetch_failure_logged = true;
+                }
+            },
+            .validation => {
+                self.proof_active.store(false, .release);
+                self.proof_capability_deadline_ns.store(0, .release);
+                if (!self.validation_failure_logged) {
+                    std.log.err("HA Lease watchdog Lease response validation failed err={s}", .{@errorName(err)});
+                    self.validation_failure_logged = true;
+                }
+            },
+        }
+        return self.watchdog.noteAPIFailure(now_ns);
     }
 
     fn runIndependent(
@@ -5881,4 +5911,43 @@ test "standalone unified server lifecycle propagates startup failure" {
     lifecycle.publishFailure(error.AddressInUse);
     try std.testing.expectError(error.AddressInUse, lifecycle.waitForStartup());
     try std.testing.expectEqual(error.AddressInUse, lifecycle.runtimeFailure().?);
+}
+
+test "runtime lease watchdog fetch and validation failures publish no bootstrap capability" {
+    inline for ([_]RuntimeLeaseWatchdog.ObservationFailureStage{ .fetch, .validation }) |stage| {
+        var runtime_watchdog = RuntimeLeaseWatchdog{
+            .watchdog = try antfly.ha.kubernetes_lease_watchdog.Watchdog.init(.{
+                .scope = .{
+                    .topology_id = "topology-7",
+                    .node_id = "primary-a",
+                    .data_generation = "initial",
+                },
+                .grace_ns = 10 * std.time.ns_per_s,
+                .sentinel_path = "/tmp/lease-fenced",
+            }, null, null),
+            .executor = undefined,
+            .uri = undefined,
+            .token_path = "",
+            .lease_name = "topology-ha-fence",
+            .lease_namespace = "default",
+            .stable_topology_id = "topology-7",
+            .node_id = "primary-a",
+            .pod_uid = "primary-pod-uid",
+            .process_boot_id = [_]u8{'a'} ** 64,
+        };
+        platform_sync.lockYielding(&runtime_watchdog.proof_mutex);
+        const decision = runtime_watchdog.noteObservationFailureLocked(stage, error.TestLeaseObservationFailure, 1);
+        runtime_watchdog.proof_mutex.unlock();
+        try std.testing.expectEqual(antfly.ha.kubernetes_lease_watchdog.Decision.waiting, decision);
+        try std.testing.expectEqual(stage == .fetch, runtime_watchdog.fetch_failure_logged);
+        try std.testing.expectEqual(stage == .validation, runtime_watchdog.validation_failure_logged);
+
+        const proof = (try RuntimeLeaseWatchdog.proofSnapshot(&runtime_watchdog, std.testing.allocator)).?;
+        defer std.testing.allocator.free(proof.observed_holder_node_id);
+        try std.testing.expect(!proof.active);
+        try std.testing.expect(!proof.authority_granted);
+        try std.testing.expectEqual(@as(i64, 0), proof.authority_remaining_ms);
+        try std.testing.expectEqual(@as(i64, 0), proof.observed_lease_transitions);
+        try std.testing.expectEqual(@as(usize, 0), proof.observed_holder_node_id.len);
+    }
 }

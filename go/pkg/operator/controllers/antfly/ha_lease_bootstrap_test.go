@@ -20,6 +20,64 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+func TestLiveInactivePrimaryWatchdogBootstrapIsRejected(t *testing.T) {
+	leaseTime := time.Date(2026, 7, 16, 4, 49, 20, 791401000, time.UTC)
+	podStart := time.Date(2026, 7, 16, 4, 49, 22, 0, time.UTC)
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Namespace = "ns-cloud-ha-stack-e2e-org-86eba4db-ha-stack-e2e-ha-86eba4db"
+	cluster.Spec.HighAvailability.Identity.ClusterID = 4269988322791086707
+	cluster.Spec.HighAvailability.Identity.ShardID = 5374372070817458355
+	cluster.Spec.HighAvailability.Identity.TableID = 7864918853449105232
+	cluster.Spec.HighAvailability.Identity.TimelineID = 1
+	cluster.Spec.HighAvailability.Identity.Epoch = 1
+	cluster.Spec.HighAvailability.Admin.PrimaryURL = "http://antflydb-standalone:8080"
+	cluster.Spec.HighAvailability.Runtime.FencingLease.Name = "antfly-ha-fence-b8861e1c725b7b50a6fde7aaee9ea8a9fb3a335d"
+	cluster.Spec.HighAvailability.Runtime.FencingLease.TopologyID = "3e0d1770-0aed-4661-8d6f-ead8c7bc3f4b"
+	cluster.Status.HAStatus = &antflyv1.HAStatus{PrimaryLSN: 1}
+	lease := haFenceLease(cluster, leaseTime, haFencingLeaseDefaultDurationSeconds, 1, "primary-a")
+	lease.Annotations[haFencingLeaseAnnotationPrimaryLSN] = "0"
+	cluster.Status.HAStatus = &antflyv1.HAStatus{}
+
+	const liveInactivePrimaryStatus = `{"schema_version":1,"snapshot":{"role":"primary","node_id":"primary-a","identity":{"cluster_id":4269988322791086707,"shard_id":5374372070817458355,"table_id":7864918853449105232,"timeline_id":1,"epoch":1},"current_lsn":0,"slots":[],"retention":{"primary_lsn":0,"oldest_restart_lsn":0,"retained_lsn_count":0,"retained_byte_count":0,"retained_age_ns":0,"active_slots":0,"reseed_recommended":0},"durability":null,"lease_watchdog":{"capability_version":1,"active":false,"authority_granted":false,"authority_remaining_ms":0,"lease_name":"antfly-ha-fence-b8861e1c725b7b50a6fde7aaee9ea8a9fb3a335d","lease_namespace":"ns-cloud-ha-stack-e2e-org-86eba4db-ha-stack-e2e-ha-86eba4db","stable_topology_id":"3e0d1770-0aed-4661-8d6f-ead8c7bc3f4b","local_node_id":"primary-a","observed_holder_node_id":"","pod_uid":"0e514125-1300-4156-b8a9-fd97cb34e16d","process_boot_id":"9a22b95343d3140879d5e0c185f787e6f4178ec1ba860690d773fcade9818005","observed_lease_transitions":0,"max_fence_latency_ms":10000}}}`
+	now := podStart.Add(time.Second)
+	pod := candidateLeasePod(now, "0e514125-1300-4156-b8a9-fd97cb34e16d")
+	pod.Namespace = cluster.Namespace
+	pod.Status.ContainerStatuses[0].State.Running.StartedAt = metav1.NewTime(podStart)
+	reconciler := testHAReconciler(t, lease, pod)
+	reconciler.Now = func() time.Time { return now }
+	reconciler.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/admin/v1/ha/primary/status" {
+			t.Fatalf("unexpected primary status path %q", req.URL.Path)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(liveInactivePrimaryStatus)),
+		}, nil
+	})}
+
+	if err := reconciler.observeHAPrimaryAdminStatus(context.Background(), cluster); err == nil {
+		t.Fatal("inactive bootstrap process was accepted as authoritative primary health")
+	}
+	status := cluster.Status.HAStatus
+	if status.PrimaryWatchdogProof != nil || status.PrimaryAdminReachable || status.PrimaryLSN != 0 || len(status.Standbys) != 0 {
+		t.Fatalf("inactive bootstrap proof merged authoritative primary state: %#v", status)
+	}
+
+	now = podStart.Add(2 * time.Second)
+	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("reject live inactive bootstrap renewal: %v", err)
+	}
+	observed := &coordinationv1.Lease{}
+	if err := reconciler.Get(context.Background(), client.ObjectKey{Name: lease.Name, Namespace: lease.Namespace}, observed); err != nil {
+		t.Fatal(err)
+	}
+	if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.Time.Equal(leaseTime) ||
+		strings.TrimSpace(observed.Annotations[haFencingLeaseAnnotationBootstrapReceipt]) != "" {
+		t.Fatalf("inactive unobserved process renewed the Lease: %#v", observed)
+	}
+}
+
 func TestInitialPrimaryLeaseBootstrapRequiresPendingProofThenFullAuthority(t *testing.T) {
 	leaseTime := time.Date(2026, 7, 16, 4, 21, 14, 680204000, time.UTC)
 	now := leaseTime.Add(time.Second)
