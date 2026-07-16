@@ -2917,25 +2917,34 @@ remain accepted. Branch-only table experiments are not compatibility targets.
 
 A short persistent-HTTP validation on the unchanged 5,032,105-document root
 issued the same ID-only exact-term request. Cold service time was 242 ms and
-five warm requests were 1.16--1.75 ms. At 64 clients and 1,200 offered RPS, the
-server delivered 1,199.85 RPS with zero errors and 0.747/0.928/1.228 ms
-p50/p95/p99 end-to-end latency. Mean server CPU was 52.3 percent. Sampled peak
-RSS was 920,125,440 bytes, sampled footprint at that point was 281,250,864
-bytes, lifetime peak physical footprint was 995,935,984 bytes, and peak live
-malloc allocation was 454,669,680 bytes. This read-only 15-second gate is not a
-replacement for the accepted mixed-write matrix, but it proves the bounded
-cache does not trade the memory reduction for recurring query latency.
+five warm requests were 1.10--1.99 ms. After removing the allocator-pressure
+experiment described below, the final binary's cold service time was 266 ms.
+At 64 clients and 1,200 offered RPS, it delivered 1,199.90 RPS with zero errors
+and 0.718/0.837/1.066 ms p50/p95/p99 end-to-end latency. Mean server CPU was
+47.9 percent. Sampled peak RSS was 1,421,524,992 bytes, sampled footprint at
+that point was 197,365,144 bytes, lifetime peak physical footprint was
+651,167,424 bytes, and peak live malloc allocation was 458,609,152 bytes. This
+read-only 15-second gate is not a replacement for the accepted mixed-write
+matrix, but it proves the bounded cache does not trade the memory reduction for
+recurring query latency.
 
 The remaining RSS is again mostly clean allocator and mapped residency rather
 than hidden live LSM objects: `vmmap` showed the 3.4 GiB full-text mapping with
 about 77.2 MB resident and only 4 KiB dirty, while live malloc was about 417 MB.
 Darwin `malloc_zone_pressure_relief(NULL, 0)` was tested after each 32 MiB of
-batched cache eviction. Twenty-two calls reported zero bytes released, so the
-hook and its metrics were rejected and removed rather than being credited for
-the lower RSS. Native LSM runs remain range-read and are not candidates for the
+batched cache eviction. Twenty-two calls reported zero bytes released. That
+binary sampled only 920,125,440 bytes peak RSS, but its sampled/lifetime
+physical footprints were 281,250,864 / 995,935,984 bytes--both worse than the
+197,365,144 / 651,167,424-byte final no-hook run. The hook changed reclaimable
+page accounting without demonstrating lower real memory pressure, so it and
+its metrics were rejected and removed rather than being credited for the RSS
+number. Native LSM runs remain range-read and are not candidates for the
 full-text mmap eviction controller. Future allocator work needs a measured
 owner/lifetime defect or an A/B-proven reclamation mechanism; it must not add
 platform-specific tuning merely to improve one RSS sample.
+
+Exact evidence and source-artifact hashes are checked in as
+`bench/full_text/results/full-corpus-v38-primary-cache-memory-qualification.json`.
 
 ## Result Artifact
 
