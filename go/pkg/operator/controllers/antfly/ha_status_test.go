@@ -5198,6 +5198,29 @@ func TestReconcileHAFencingLeaseAuthorizesHealthyPrimaryBeforeFailover(t *testin
 	}
 }
 
+func TestReconcileHAFencingLeaseBootstrapsEmptyPrimaryAtLSNZero(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Spec.HighAvailability.Identity.ShardID = 10
+	cluster.Spec.HighAvailability.Identity.TableID = 20
+	cluster.Status.HAStatus = &antflyv1.HAStatus{PrimaryLSN: 0}
+	reconciler := testHAReconciler(t, cluster)
+
+	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("reconcile empty-primary fencing lease: %v", err)
+	}
+
+	lease := &coordinationv1.Lease{}
+	if err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease); err != nil {
+		t.Fatalf("expected initial fencing authority for empty primary: %v", err)
+	}
+	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != "primary-a" {
+		t.Fatalf("expected configured empty primary to hold initial authority, got %#v", lease.Spec.HolderIdentity)
+	}
+	if lease.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "0" {
+		t.Fatalf("expected an explicit empty primary boundary, got %#v", lease.Annotations)
+	}
+}
+
 func TestReconcileHAFencingLeaseSkipsWhenAdminExecutionDisabled(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 	cluster.Spec.HighAvailability.Admin.ExecutePlannedActions = false

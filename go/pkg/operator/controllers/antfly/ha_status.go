@@ -705,7 +705,7 @@ func haCurrentFencingLeaseScope(cluster *antflyv1.AntflyCluster) (haFencingLease
 		return haFencingLeaseScope{}, false
 	}
 	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
-	if identity == nil || cluster.Status.HAStatus.PrimaryLSN == 0 {
+	if identity == nil {
 		return haFencingLeaseScope{}, false
 	}
 	return haFencingLeaseScope{
