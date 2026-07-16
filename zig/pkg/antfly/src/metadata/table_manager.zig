@@ -93,9 +93,6 @@ pub const RangeRecord = struct {
     end_key: ?[]const u8 = null,
     doc_identity_shard_id: u64 = 0,
     doc_identity_range_id: u64 = 0,
-    /// Monotonic source-local split attempt allocator. Gaps are valid: the
-    /// range update may commit before its transition record during recovery.
-    split_attempt_epoch: u64 = 0,
     restore_backup_id: []const u8 = "",
     restore_location: []const u8 = "",
     restore_snapshot_path: []const u8 = "",
@@ -110,7 +107,6 @@ pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
             (lhs.end_key != null and rhs.end_key != null and std.mem.eql(u8, lhs.end_key.?, rhs.end_key.?))) and
         lhs.doc_identity_shard_id == rhs.doc_identity_shard_id and
         lhs.doc_identity_range_id == rhs.doc_identity_range_id and
-        lhs.split_attempt_epoch == rhs.split_attempt_epoch and
         std.mem.eql(u8, lhs.restore_backup_id, rhs.restore_backup_id) and
         std.mem.eql(u8, lhs.restore_location, rhs.restore_location) and
         std.mem.eql(u8, lhs.restore_snapshot_path, rhs.restore_snapshot_path);
@@ -414,14 +410,12 @@ pub const ShuffleJoinLeaseRecord = struct {
 
 pub const SplitIntent = struct {
     transition_id: u64,
-    attempt_epoch: u64 = 0,
     table_id: u64,
     source_group_id: u64,
     destination_group_id: u64,
     split_key: []const u8,
     rollback_reason: ?[]const u8 = null,
     automatic: bool = false,
-    projected: bool = false,
 };
 
 pub const MergeIntent = struct {
@@ -432,7 +426,6 @@ pub const MergeIntent = struct {
     rollback_reason: ?[]const u8 = null,
     automatic: bool = false,
     allow_doc_identity_reassignment: bool = false,
-    projected: bool = false,
 };
 
 pub const TableManager = struct {
@@ -599,37 +592,19 @@ pub const TableManager = struct {
     pub fn requestSplit(self: *TableManager, intent: SplitIntent) !void {
         try group_ids.requireDataGroupId(intent.source_group_id);
         try group_ids.requireDataGroupId(intent.destination_group_id);
-        const source = self.ranges.getPtr(intent.source_group_id) orelse return error.UnknownSourceRange;
+        const source = self.ranges.get(intent.source_group_id) orelse return error.UnknownSourceRange;
         if (source.table_id != intent.table_id) return error.TableRangeMismatch;
         if (!keyStrictlyInsideRange(intent.split_key, source.start_key, source.end_key)) return error.InvalidSplitKey;
         if (self.ranges.contains(intent.destination_group_id)) return error.DestinationRangeAlreadyExists;
 
-        if (self.split_intents.get(intent.transition_id)) |existing| {
-            if (existing.table_id != intent.table_id or
-                existing.source_group_id != intent.source_group_id or
-                existing.destination_group_id != intent.destination_group_id or
-                (intent.attempt_epoch != 0 and intent.attempt_epoch != existing.attempt_epoch) or
-                !std.mem.eql(u8, existing.split_key, intent.split_key))
-            {
-                return error.ConflictingSplitTransition;
-            }
+        const owned = try cloneSplitIntent(self.alloc, intent);
+        errdefer freeSplitIntent(self.alloc, owned);
+        if (self.split_intents.getPtr(intent.transition_id)) |existing| {
+            freeSplitIntent(self.alloc, existing.*);
+            existing.* = owned;
             return;
         }
-
-        var allocated = intent;
-        if (allocated.attempt_epoch == 0) {
-            if (source.split_attempt_epoch == std.math.maxInt(u64)) return error.SplitAttemptEpochExhausted;
-            allocated.attempt_epoch = source.split_attempt_epoch + 1;
-        } else {
-            if (allocated.attempt_epoch <= source.split_attempt_epoch) return error.StaleSplitAttempt;
-        }
-
-        const owned = try cloneSplitIntent(self.alloc, allocated);
-        errdefer freeSplitIntent(self.alloc, owned);
         try self.split_intents.put(self.alloc, intent.transition_id, owned);
-        // Publish the epoch only after every fallible allocation succeeds. This
-        // keeps an OOM from consuming a durable fencing epoch without an intent.
-        source.split_attempt_epoch = allocated.attempt_epoch;
     }
 
     pub fn requestMerge(self: *TableManager, intent: MergeIntent) !void {
@@ -650,128 +625,6 @@ pub const TableManager = struct {
         try self.merge_intents.put(self.alloc, intent.transition_id, owned);
     }
 
-    /// Rehydrate active split intents from replicated metadata after a
-    /// reconciliation-authority handoff. Projected records are authoritative:
-    /// they replace a local copy with the same transition ID without allocating
-    /// a new fencing epoch. Local intents still awaiting admission are retained.
-    pub fn syncProjectedSplitTransitions(self: *TableManager, records: []const transition_state.SplitTransitionRecord) !void {
-        var hydrated = std.ArrayListUnmanaged(SplitIntent).empty;
-        defer hydrated.deinit(self.alloc);
-        errdefer for (hydrated.items) |intent| freeSplitIntent(self.alloc, intent);
-
-        for (records, 0..) |record, i| {
-            if (transitionTerminal(record.phase)) continue;
-            for (records[0..i]) |prior| {
-                if (!transitionTerminal(prior.phase) and prior.transition_id == record.transition_id) {
-                    return error.DuplicateProjectedSplitTransition;
-                }
-            }
-
-            try group_ids.requireDataGroupId(record.source_group_id);
-            try group_ids.requireDataGroupId(record.destination_group_id);
-            const source = self.ranges.get(record.source_group_id) orelse return error.UnknownSourceRange;
-            const split_key = record.split_key orelse return error.MissingSplitKey;
-            if (record.attempt_epoch == 0 or source.split_attempt_epoch != record.attempt_epoch) {
-                return error.ProjectedSplitEpochMismatch;
-            }
-            if (!keyStrictlyInsideRange(split_key, source.start_key, source.end_key)) return error.InvalidSplitKey;
-            if (!optionalBytesEqual(record.source_range_end, source.end_key)) return error.ProjectedSplitRangeMismatch;
-            if (self.ranges.contains(record.destination_group_id)) return error.DestinationRangeAlreadyExists;
-
-            const owned = try cloneSplitIntent(self.alloc, .{
-                .transition_id = record.transition_id,
-                .attempt_epoch = record.attempt_epoch,
-                .table_id = source.table_id,
-                .source_group_id = record.source_group_id,
-                .destination_group_id = record.destination_group_id,
-                .split_key = split_key,
-                .rollback_reason = record.rollback_reason,
-                .projected = true,
-            });
-            errdefer freeSplitIntent(self.alloc, owned);
-            try hydrated.append(self.alloc, owned);
-        }
-
-        var stale_ids = std.ArrayListUnmanaged(u64).empty;
-        defer stale_ids.deinit(self.alloc);
-        try stale_ids.ensureTotalCapacity(self.alloc, self.split_intents.count());
-        var existing_it = self.split_intents.iterator();
-        while (existing_it.next()) |entry| {
-            if (entry.value_ptr.projected and !containsActiveSplitRecord(records, entry.key_ptr.*)) {
-                stale_ids.appendAssumeCapacity(entry.key_ptr.*);
-            }
-        }
-        try self.split_intents.ensureUnusedCapacity(self.alloc, @intCast(hydrated.items.len));
-
-        for (stale_ids.items) |transition_id| _ = self.removeSplitIntent(transition_id);
-        for (hydrated.items) |intent| {
-            if (self.split_intents.getPtr(intent.transition_id)) |existing| {
-                freeSplitIntent(self.alloc, existing.*);
-                existing.* = intent;
-            } else {
-                self.split_intents.putAssumeCapacity(intent.transition_id, intent);
-            }
-        }
-        hydrated.items.len = 0;
-    }
-
-    /// Merge counterpart to syncProjectedSplitTransitions.
-    pub fn syncProjectedMergeTransitions(self: *TableManager, records: []const transition_state.MergeTransitionRecord) !void {
-        var hydrated = std.ArrayListUnmanaged(MergeIntent).empty;
-        defer hydrated.deinit(self.alloc);
-        errdefer for (hydrated.items) |intent| freeMergeIntent(self.alloc, intent);
-
-        for (records, 0..) |record, i| {
-            if (transitionTerminal(record.phase)) continue;
-            for (records[0..i]) |prior| {
-                if (!transitionTerminal(prior.phase) and prior.transition_id == record.transition_id) {
-                    return error.DuplicateProjectedMergeTransition;
-                }
-            }
-
-            try group_ids.requireDataGroupId(record.donor_group_id);
-            try group_ids.requireDataGroupId(record.receiver_group_id);
-            const donor = self.ranges.get(record.donor_group_id) orelse return error.UnknownDonorRange;
-            const receiver = self.ranges.get(record.receiver_group_id) orelse return error.UnknownReceiverRange;
-            if (donor.table_id != receiver.table_id) return error.TableRangeMismatch;
-            if (!rangesAdjacent(donor, receiver)) return error.RangesNotAdjacent;
-
-            const owned = try cloneMergeIntent(self.alloc, .{
-                .transition_id = record.transition_id,
-                .table_id = donor.table_id,
-                .donor_group_id = record.donor_group_id,
-                .receiver_group_id = record.receiver_group_id,
-                .rollback_reason = record.rollback_reason,
-                .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
-                .projected = true,
-            });
-            errdefer freeMergeIntent(self.alloc, owned);
-            try hydrated.append(self.alloc, owned);
-        }
-
-        var stale_ids = std.ArrayListUnmanaged(u64).empty;
-        defer stale_ids.deinit(self.alloc);
-        try stale_ids.ensureTotalCapacity(self.alloc, self.merge_intents.count());
-        var existing_it = self.merge_intents.iterator();
-        while (existing_it.next()) |entry| {
-            if (entry.value_ptr.projected and !containsActiveMergeRecord(records, entry.key_ptr.*)) {
-                stale_ids.appendAssumeCapacity(entry.key_ptr.*);
-            }
-        }
-        try self.merge_intents.ensureUnusedCapacity(self.alloc, @intCast(hydrated.items.len));
-
-        for (stale_ids.items) |transition_id| _ = self.removeMergeIntent(transition_id);
-        for (hydrated.items) |intent| {
-            if (self.merge_intents.getPtr(intent.transition_id)) |existing| {
-                freeMergeIntent(self.alloc, existing.*);
-                existing.* = intent;
-            } else {
-                self.merge_intents.putAssumeCapacity(intent.transition_id, intent);
-            }
-        }
-        hydrated.items.len = 0;
-    }
-
     pub fn removeSplitIntent(self: *TableManager, transition_id: u64) bool {
         if (self.split_intents.fetchRemove(transition_id)) |entry| {
             freeSplitIntent(self.alloc, entry.value);
@@ -789,7 +642,6 @@ pub const TableManager = struct {
     }
 
     pub fn applyFinalizedSplit(self: *TableManager, record: transition_state.SplitTransitionRecord) !void {
-        if (!self.split_intents.contains(record.transition_id)) return;
         const split_key = record.split_key orelse return error.MissingSplitKey;
         const source = self.ranges.get(record.source_group_id) orelse return error.UnknownSourceRange;
         const identity_shard_id = rangeDocIdentityShardId(source);
@@ -803,7 +655,6 @@ pub const TableManager = struct {
             .end_key = split_key,
             .doc_identity_shard_id = source.doc_identity_shard_id,
             .doc_identity_range_id = source.doc_identity_range_id,
-            .split_attempt_epoch = source.split_attempt_epoch,
         });
         try self.upsertRange(.{
             .group_id = record.destination_group_id,
@@ -813,7 +664,6 @@ pub const TableManager = struct {
             .end_key = record.source_range_end,
             .doc_identity_shard_id = identity_shard_id,
             .doc_identity_range_id = identity_range_id,
-            .split_attempt_epoch = 0,
         });
         _ = self.removeSplitIntent(record.transition_id);
     }
@@ -823,7 +673,6 @@ pub const TableManager = struct {
     }
 
     pub fn applyFinalizedMerge(self: *TableManager, record: transition_state.MergeTransitionRecord) !void {
-        if (!self.merge_intents.contains(record.transition_id)) return;
         const donor = self.ranges.get(record.donor_group_id) orelse return error.UnknownDonorRange;
         const receiver = self.ranges.get(record.receiver_group_id) orelse return error.UnknownReceiverRange;
         const merged_start = if (std.mem.order(u8, donor.start_key, receiver.start_key) == .lt) donor.start_key else receiver.start_key;
@@ -899,7 +748,6 @@ pub const TableManager = struct {
         const source = self.ranges.get(intent.source_group_id) orelse return error.UnknownSourceRange;
         return try cloneSplitTransitionRecord(self.alloc, .{
             .transition_id = intent.transition_id,
-            .attempt_epoch = intent.attempt_epoch,
             .source_group_id = intent.source_group_id,
             .destination_group_id = intent.destination_group_id,
             .phase = .prepare,
@@ -946,29 +794,6 @@ fn optionalBytesOrder(a: ?[]const u8, b: ?[]const u8) std.math.Order {
     const a_bytes = a orelse return if (b == null) .eq else .gt;
     const b_bytes = b orelse return .lt;
     return std.mem.order(u8, a_bytes, b_bytes);
-}
-
-fn optionalBytesEqual(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null or b == null) return a == null and b == null;
-    return std.mem.eql(u8, a.?, b.?);
-}
-
-fn transitionTerminal(phase: transition_state.TransitionPhase) bool {
-    return phase == .finalized or phase == .rolled_back;
-}
-
-fn containsActiveSplitRecord(records: []const transition_state.SplitTransitionRecord, transition_id: u64) bool {
-    for (records) |record| {
-        if (!transitionTerminal(record.phase) and record.transition_id == transition_id) return true;
-    }
-    return false;
-}
-
-fn containsActiveMergeRecord(records: []const transition_state.MergeTransitionRecord, transition_id: u64) bool {
-    for (records) |record| {
-        if (!transitionTerminal(record.phase) and record.transition_id == transition_id) return true;
-    }
-    return false;
 }
 
 fn cloneOwnedOptional(alloc: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
@@ -1045,7 +870,6 @@ pub fn cloneRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
         .end_key = end_key,
         .doc_identity_shard_id = record.doc_identity_shard_id,
         .doc_identity_range_id = record.doc_identity_range_id,
-        .split_attempt_epoch = record.split_attempt_epoch,
         .restore_backup_id = restore_backup_id,
         .restore_location = restore_location,
         .restore_snapshot_path = restore_snapshot_path,
@@ -1414,14 +1238,12 @@ pub fn freeRuntimeIndexStatusReports(alloc: std.mem.Allocator, records: []const 
 fn cloneSplitIntent(alloc: std.mem.Allocator, intent: SplitIntent) !SplitIntent {
     return .{
         .transition_id = intent.transition_id,
-        .attempt_epoch = intent.attempt_epoch,
         .table_id = intent.table_id,
         .source_group_id = intent.source_group_id,
         .destination_group_id = intent.destination_group_id,
         .split_key = try alloc.dupe(u8, intent.split_key),
         .rollback_reason = try cloneOwnedOptional(alloc, intent.rollback_reason),
         .automatic = intent.automatic,
-        .projected = intent.projected,
     };
 }
 
@@ -1439,7 +1261,6 @@ fn cloneMergeIntent(alloc: std.mem.Allocator, intent: MergeIntent) !MergeIntent 
         .rollback_reason = try cloneOwnedOptional(alloc, intent.rollback_reason),
         .automatic = intent.automatic,
         .allow_doc_identity_reassignment = intent.allow_doc_identity_reassignment,
-        .projected = intent.projected,
     };
 }
 
@@ -1456,7 +1277,6 @@ fn cloneSplitTransitionRecord(alloc: std.mem.Allocator, record: transition_state
     errdefer freeOwnedOptional(alloc, rollback_reason);
     return .{
         .transition_id = record.transition_id,
-        .attempt_epoch = record.attempt_epoch,
         .source_group_id = record.source_group_id,
         .destination_group_id = record.destination_group_id,
         .phase = record.phase,
@@ -1521,30 +1341,8 @@ test "table manager validates split and merge intents" {
     const splits = try manager.listDesiredSplitTransitions(std.testing.allocator);
     defer manager.freeSplitTransitions(std.testing.allocator, splits);
     try std.testing.expectEqual(@as(usize, 1), splits.len);
-    try std.testing.expectEqual(@as(u64, 1), splits[0].attempt_epoch);
     try std.testing.expectEqualStrings("doc:h", splits[0].split_key.?);
     try std.testing.expectEqualStrings("doc:m", splits[0].source_range_end.?);
-    try std.testing.expectError(error.ConflictingSplitTransition, manager.requestSplit(.{
-        .transition_id = 5001,
-        .attempt_epoch = 2,
-        .table_id = 10,
-        .source_group_id = 101,
-        .destination_group_id = 103,
-        .split_key = "doc:h",
-    }));
-
-    manager.applyRolledBackSplit(5001);
-    try manager.requestSplit(.{
-        .transition_id = 5001,
-        .table_id = 10,
-        .source_group_id = 101,
-        .destination_group_id = 103,
-        .split_key = "doc:h",
-    });
-    const retried_splits = try manager.listDesiredSplitTransitions(std.testing.allocator);
-    defer manager.freeSplitTransitions(std.testing.allocator, retried_splits);
-    try std.testing.expectEqual(@as(usize, 1), retried_splits.len);
-    try std.testing.expectEqual(@as(u64, 2), retried_splits[0].attempt_epoch);
 
     try manager.requestMerge(.{
         .transition_id = 6001,
@@ -1560,87 +1358,6 @@ test "table manager validates split and merge intents" {
     try std.testing.expectEqual(@as(u64, 102), merges[0].donor_group_id);
     try std.testing.expectEqual(@as(u64, 101), merges[0].receiver_group_id);
     try std.testing.expect(merges[0].allow_doc_identity_reassignment);
-}
-
-test "table manager rehydrates projected transitions without consuming split epochs" {
-    var manager = TableManager.init(std.testing.allocator);
-    defer manager.deinit();
-
-    try manager.upsertTable(.{ .table_id = 10, .name = "docs" });
-    try manager.upsertRange(.{
-        .group_id = 101,
-        .table_id = 10,
-        .start_key = "doc:a",
-        .end_key = "doc:m",
-        .split_attempt_epoch = 2,
-    });
-    try manager.upsertRange(.{
-        .group_id = 102,
-        .table_id = 10,
-        .start_key = "doc:m",
-        .end_key = "doc:z",
-    });
-
-    const projected_splits = [_]transition_state.SplitTransitionRecord{.{
-        .transition_id = 5001,
-        .attempt_epoch = 2,
-        .source_group_id = 101,
-        .destination_group_id = 103,
-        .split_key = "doc:h",
-        .source_range_end = "doc:m",
-    }};
-    const projected_merges = [_]transition_state.MergeTransitionRecord{.{
-        .transition_id = 6001,
-        .donor_group_id = 102,
-        .receiver_group_id = 101,
-        .allow_doc_identity_reassignment = true,
-    }};
-    try manager.syncProjectedSplitTransitions(&projected_splits);
-    try manager.syncProjectedMergeTransitions(&projected_merges);
-
-    const splits = try manager.listDesiredSplitTransitions(std.testing.allocator);
-    defer manager.freeSplitTransitions(std.testing.allocator, splits);
-    try std.testing.expectEqual(@as(usize, 1), splits.len);
-    try std.testing.expectEqual(@as(u64, 2), splits[0].attempt_epoch);
-    try std.testing.expectEqualStrings("doc:h", splits[0].split_key.?);
-
-    const merges = try manager.listDesiredMergeTransitions(std.testing.allocator);
-    defer manager.freeMergeTransitions(std.testing.allocator, merges);
-    try std.testing.expectEqual(@as(usize, 1), merges.len);
-    try std.testing.expect(merges[0].allow_doc_identity_reassignment);
-
-    const rolled_back_splits = [_]transition_state.SplitTransitionRecord{.{
-        .transition_id = 5001,
-        .attempt_epoch = 2,
-        .source_group_id = 101,
-        .destination_group_id = 103,
-        .phase = .rolled_back,
-        .split_key = "doc:h",
-        .source_range_end = "doc:m",
-    }};
-    const finalized_merges = [_]transition_state.MergeTransitionRecord{.{
-        .transition_id = 6001,
-        .donor_group_id = 102,
-        .receiver_group_id = 101,
-        .phase = .finalized,
-    }};
-    try manager.syncProjectedSplitTransitions(&rolled_back_splits);
-    try manager.syncProjectedMergeTransitions(&finalized_merges);
-    try std.testing.expectEqual(@as(usize, 0), manager.split_intents.count());
-    try std.testing.expectEqual(@as(usize, 0), manager.merge_intents.count());
-
-    try manager.requestSplit(.{
-        .transition_id = 5002,
-        .table_id = 10,
-        .source_group_id = 101,
-        .destination_group_id = 103,
-        .split_key = "doc:h",
-    });
-    try manager.syncProjectedSplitTransitions(&.{});
-    try std.testing.expectEqual(@as(usize, 1), manager.split_intents.count());
-    const local_splits = try manager.listDesiredSplitTransitions(std.testing.allocator);
-    defer manager.freeSplitTransitions(std.testing.allocator, local_splits);
-    try std.testing.expectEqual(@as(u64, 3), local_splits[0].attempt_epoch);
 }
 
 test "table manager applies finalized split to desired topology" {
@@ -1667,16 +1384,6 @@ test "table manager applies finalized split to desired topology" {
 
     try manager.applyFinalizedSplit(.{
         .transition_id = 5003,
-        .attempt_epoch = 1,
-        .source_group_id = 101,
-        .destination_group_id = 102,
-        .phase = .finalized,
-        .split_key = "doc:m",
-        .source_range_end = "doc:z",
-    });
-    try manager.applyFinalizedSplit(.{
-        .transition_id = 5003,
-        .attempt_epoch = 1,
         .source_group_id = 101,
         .destination_group_id = 102,
         .phase = .finalized,
@@ -1727,12 +1434,6 @@ test "table manager applies finalized merge preserving receiver range id" {
         .receiver_group_id = 101,
     });
 
-    try manager.applyFinalizedMerge(.{
-        .transition_id = 6003,
-        .donor_group_id = 102,
-        .receiver_group_id = 101,
-        .phase = .finalized,
-    });
     try manager.applyFinalizedMerge(.{
         .transition_id = 6003,
         .donor_group_id = 102,

@@ -47,7 +47,6 @@ pub const metal_executor = if (build_options.enable_metal) @import("metal_execut
     const backends = @import("../backends/backends.zig");
     const gpt_mod = @import("../models/gpt.zig");
     const runtime_root = @import("../runtime/root.zig");
-    const cache_mod = @import("cache.zig");
     const model_runtime_mod = @import("model_runtime.zig");
 
     pub const TimingStats = struct {
@@ -86,12 +85,10 @@ pub const metal_executor = if (build_options.enable_metal) @import("metal_execut
     pub fn supportsSession(_: backends.Session) bool {
         return false;
     }
-    pub fn prewarmCompiledDecoderRuntime(
+    pub fn prewarmSharedDecoderRuntime(
+        _: std.mem.Allocator,
         _: backends.Session,
         _: gpt_mod.Config,
-        _: runtime_root.kv.pool.KvDType,
-        _: ?*runtime_root.moe.shared.SharedExpertCache,
-        _: *cache_mod.GraphCache,
     ) !bool {
         return false;
     }

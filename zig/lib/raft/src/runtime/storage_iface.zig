@@ -12,59 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const std = @import("std");
 const core = @import("../core/mod.zig");
-
-/// An immutable, bounded-memory snapshot payload. Implementations own the
-/// backing resource and must support concurrent cancellation-safe reads until
-/// `deinit` is called.
-pub const SnapshotArtifact = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        len: *const fn (ptr: *anyopaque) u64,
-        write_to: *const fn (ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void,
-        read_all: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8,
-        deinit: *const fn (ptr: *anyopaque) void,
-    };
-
-    pub fn len(self: SnapshotArtifact) u64 {
-        return self.vtable.len(self.ptr);
-    }
-
-    pub fn writeTo(self: SnapshotArtifact, writer: *std.Io.Writer) !void {
-        return try self.vtable.write_to(self.ptr, writer);
-    }
-
-    pub fn readAll(self: SnapshotArtifact, alloc: std.mem.Allocator) ![]u8 {
-        return try self.vtable.read_all(self.ptr, alloc);
-    }
-
-    pub fn deinit(self: SnapshotArtifact) void {
-        self.vtable.deinit(self.ptr);
-    }
-};
-
-pub const SnapshotMaterialization = union(enum) {
-    bytes: []u8,
-    artifact: SnapshotArtifact,
-
-    pub fn len(self: SnapshotMaterialization) u64 {
-        return switch (self) {
-            .bytes => |bytes| bytes.len,
-            .artifact => |artifact| artifact.len(),
-        };
-    }
-
-    pub fn deinit(self: *SnapshotMaterialization, alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .bytes => |bytes| if (bytes.len > 0) alloc.free(bytes),
-            .artifact => |artifact| artifact.deinit(),
-        }
-        self.* = undefined;
-    }
-};
 
 pub const ReadyPersistenceDiagnostics = struct {
     skipped_no_durable_state: bool = false,
@@ -84,71 +32,24 @@ pub const ReadyPersistenceDiagnostics = struct {
     delta_bytes_since_checkpoint: u64 = 0,
 };
 
-// GroupStorage owns raft-log durability for one hosted group. Snapshot
-// publication records state at snapshot.metadata.index while compact_index is
-// the inclusive durable log-prefix boundary; entries after it remain available
-// for incremental follower catch-up. Implementations must consume passed
-// slices synchronously and must not retain them.
+// GroupStorage owns raft-log durability for one hosted group.
+// Implementations must consume the passed slices synchronously and must not retain them.
 pub const GroupStorage = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
         persist_ready: *const fn (ptr: *anyopaque, group_id: core.types.GroupId, ready: core.Ready) anyerror!void,
-        compact_snapshot: *const fn (
-            ptr: *anyopaque,
-            group_id: core.types.GroupId,
-            snapshot: core.types.Snapshot,
-            compact_index: core.types.Index,
-        ) anyerror!void,
-        compact_snapshot_artifact: ?*const fn (
-            ptr: *anyopaque,
-            group_id: core.types.GroupId,
-            metadata: core.types.SnapshotMetadata,
-            artifact: SnapshotArtifact,
-            compact_index: core.types.Index,
-        ) anyerror!void = null,
         persist_ready_diagnostics: ?*const fn (
             ptr: *anyopaque,
             group_id: core.types.GroupId,
             ready: core.Ready,
             diagnostics: *ReadyPersistenceDiagnostics,
         ) anyerror!void = null,
-        /// Infallibly releases process-owned state for a replica that has left
-        /// local placement. Durable files may be retained for generation-aware
-        /// GC, but a later replica incarnation must not reuse the open owner.
-        /// Implementations must report optional shutdown/flush failures through
-        /// diagnostics rather than leaving local retirement partially applied.
-        retire_group: ?*const fn (ptr: *anyopaque, group_id: core.types.GroupId) void = null,
     };
 
     pub fn persistReady(self: GroupStorage, group_id: core.types.GroupId, ready: core.Ready) !void {
         return try self.vtable.persist_ready(self.ptr, group_id, ready);
-    }
-
-    pub fn compactSnapshot(
-        self: GroupStorage,
-        group_id: core.types.GroupId,
-        snapshot: core.types.Snapshot,
-        compact_index: core.types.Index,
-    ) !void {
-        return try self.vtable.compact_snapshot(self.ptr, group_id, snapshot, compact_index);
-    }
-
-    pub fn compactSnapshotArtifact(
-        self: GroupStorage,
-        alloc: std.mem.Allocator,
-        group_id: core.types.GroupId,
-        metadata: core.types.SnapshotMetadata,
-        artifact: SnapshotArtifact,
-        compact_index: core.types.Index,
-    ) !void {
-        if (self.vtable.compact_snapshot_artifact) |compact| {
-            return try compact(self.ptr, group_id, metadata, artifact, compact_index);
-        }
-        const data = try artifact.readAll(alloc);
-        defer alloc.free(data);
-        return try self.compactSnapshot(group_id, .{ .metadata = metadata, .data = data }, compact_index);
     }
 
     pub fn persistReadyWithDiagnostics(
@@ -163,10 +64,6 @@ pub const GroupStorage = struct {
             }
         }
         return try self.persistReady(group_id, ready);
-    }
-
-    pub fn retireGroup(self: GroupStorage, group_id: core.types.GroupId) void {
-        if (self.vtable.retire_group) |retire_group| retire_group(self.ptr, group_id);
     }
 };
 
@@ -224,37 +121,6 @@ pub const DiskBatcher = struct {
     }
 };
 
-/// A point-in-time state-machine view prepared on the Raft host thread and
-/// materialized by the snapshot worker. Implementations must capture the view
-/// synchronously in `prepare_snapshot`. `cancel` may race with `materialize`
-/// and must return promptly without calling back into MultiRaft;
-/// and `deinit` may run on either the worker or shutdown thread, so both must be
-/// thread-safe. The state-machine owner must outlive every source it returns;
-/// MultiRaft enforces that by joining its snapshot worker on shutdown.
-pub const SnapshotSource = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        materialize: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror!SnapshotMaterialization,
-        cancel: ?*const fn (ptr: *anyopaque) void = null,
-        deinit: *const fn (ptr: *anyopaque) void,
-    };
-
-    pub fn materialize(self: SnapshotSource, alloc: std.mem.Allocator) !SnapshotMaterialization {
-        return try self.vtable.materialize(self.ptr, alloc);
-    }
-
-    pub fn cancel(self: SnapshotSource) void {
-        const cancel_fn = self.vtable.cancel orelse return;
-        cancel_fn(self.ptr);
-    }
-
-    pub fn deinit(self: SnapshotSource) void {
-        self.vtable.deinit(self.ptr);
-    }
-};
-
 // StateMachine owns apply-side effects for one hosted group.
 // Implementations must consume the slices synchronously and must not retain them.
 pub const StateMachine = struct {
@@ -262,60 +128,26 @@ pub const StateMachine = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        prepare_snapshot: ?*const fn (
-            ptr: *anyopaque,
-            group_id: core.types.GroupId,
-            applied_index: core.types.Index,
-        ) anyerror!?SnapshotSource = null,
-        build_snapshot: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: core.types.GroupId,
-        ) anyerror!?[]u8 = null,
         apply_ready: *const fn (
             ptr: *anyopaque,
             group_id: core.types.GroupId,
-            snapshot: ?core.types.Snapshot,
             committed_entries: []const core.Entry,
             read_states: []const core.ReadState,
         ) anyerror!void,
     };
 
-    pub fn prepareSnapshot(
-        self: StateMachine,
-        group_id: core.types.GroupId,
-        applied_index: core.types.Index,
-    ) !?SnapshotSource {
-        const prepare = self.vtable.prepare_snapshot orelse return null;
-        return try prepare(self.ptr, group_id, applied_index);
-    }
-
-    pub fn buildSnapshot(self: StateMachine, alloc: std.mem.Allocator, group_id: core.types.GroupId) !?[]u8 {
-        const build = self.vtable.build_snapshot orelse return null;
-        return try build(self.ptr, alloc, group_id);
-    }
-
     pub fn applyReady(
         self: StateMachine,
         group_id: core.types.GroupId,
-        snapshot: ?core.types.Snapshot,
         committed_entries: []const core.Entry,
         read_states: []const core.ReadState,
     ) !void {
-        return try self.vtable.apply_ready(self.ptr, group_id, snapshot, committed_entries, read_states);
+        return try self.vtable.apply_ready(self.ptr, group_id, committed_entries, read_states);
     }
-};
-
-pub const ApplyDrainResult = struct {
-    completed: usize,
-    failure: ?anyerror = null,
 };
 
 // ApplyQueue lets the host enqueue apply work and then drain it once per host round.
 // Implementations must consume the passed slices synchronously and must not retain them.
-// Each apply_ready call must be atomic or idempotent on failure. drain reports the exact
-// successfully-applied task prefix so the host can retire it when a later task fails;
-// abort discards only work that drain did not report as completed.
 pub const ApplyQueue = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -324,29 +156,22 @@ pub const ApplyQueue = struct {
         enqueue_apply: *const fn (
             ptr: *anyopaque,
             group_id: core.types.GroupId,
-            snapshot: ?core.types.Snapshot,
             committed_entries: []const core.Entry,
             read_states: []const core.ReadState,
         ) anyerror!void,
-        drain: *const fn (ptr: *anyopaque) ApplyDrainResult,
-        abort: *const fn (ptr: *anyopaque) void,
+        drain: *const fn (ptr: *anyopaque) anyerror!void,
     };
 
     pub fn enqueueApply(
         self: ApplyQueue,
         group_id: core.types.GroupId,
-        snapshot: ?core.types.Snapshot,
         committed_entries: []const core.Entry,
         read_states: []const core.ReadState,
     ) !void {
-        return try self.vtable.enqueue_apply(self.ptr, group_id, snapshot, committed_entries, read_states);
+        return try self.vtable.enqueue_apply(self.ptr, group_id, committed_entries, read_states);
     }
 
-    pub fn drain(self: ApplyQueue) ApplyDrainResult {
-        return self.vtable.drain(self.ptr);
-    }
-
-    pub fn abort(self: ApplyQueue) void {
-        self.vtable.abort(self.ptr);
+    pub fn drain(self: ApplyQueue) !void {
+        return try self.vtable.drain(self.ptr);
     }
 };

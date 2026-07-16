@@ -20,16 +20,16 @@ class InferenceBackendRuntimes:
         onnx (bool | Unset): Whether the ONNX Runtime backend is built into this runtime
         metal (bool | Unset): Whether the Metal backend is built into this runtime Example: True.
         cuda (bool | Unset): Whether the CUDA backend is built into this runtime
-        pjrt (bool | Unset): Whether the PJRT/XLA backend is built into this runtime
-        webgpu (bool | Unset): Whether the WebGPU backend is built into this runtime
+        xla (bool | Unset): Whether the PJRT/XLA backend is built into this runtime
+        wasm (bool | Unset): Whether the WASM backend is built into this runtime
     """
 
     native: bool | Unset = UNSET
     onnx: bool | Unset = UNSET
     metal: bool | Unset = UNSET
     cuda: bool | Unset = UNSET
-    pjrt: bool | Unset = UNSET
-    webgpu: bool | Unset = UNSET
+    xla: bool | Unset = UNSET
+    wasm: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -41,9 +41,9 @@ class InferenceBackendRuntimes:
 
         cuda = self.cuda
 
-        pjrt = self.pjrt
+        xla = self.xla
 
-        webgpu = self.webgpu
+        wasm = self.wasm
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -56,10 +56,10 @@ class InferenceBackendRuntimes:
             field_dict["metal"] = metal
         if cuda is not UNSET:
             field_dict["cuda"] = cuda
-        if pjrt is not UNSET:
-            field_dict["pjrt"] = pjrt
-        if webgpu is not UNSET:
-            field_dict["webgpu"] = webgpu
+        if xla is not UNSET:
+            field_dict["xla"] = xla
+        if wasm is not UNSET:
+            field_dict["wasm"] = wasm
 
         return field_dict
 
@@ -74,17 +74,17 @@ class InferenceBackendRuntimes:
 
         cuda = d.pop("cuda", UNSET)
 
-        pjrt = d.pop("pjrt", UNSET)
+        xla = d.pop("xla", UNSET)
 
-        webgpu = d.pop("webgpu", UNSET)
+        wasm = d.pop("wasm", UNSET)
 
         inference_backend_runtimes = cls(
             native=native,
             onnx=onnx,
             metal=metal,
             cuda=cuda,
-            pjrt=pjrt,
-            webgpu=webgpu,
+            xla=xla,
+            wasm=wasm,
         )
 
         inference_backend_runtimes.additional_properties = d

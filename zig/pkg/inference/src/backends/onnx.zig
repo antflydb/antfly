@@ -51,13 +51,6 @@ fn initEnv() !void {
     }
 }
 
-/// Initialize the linked ONNX Runtime without loading a model. Strict backend
-/// configurations use this before opening the listener so a missing or broken
-/// runtime cannot produce a falsely-ready server.
-pub fn probeRuntime() !void {
-    try initEnv();
-}
-
 /// Check an ORT status and return an error if non-null.
 fn checkStatus(api: *const OrtApi, status: ?*c.OrtStatus) !void {
     if (status) |s| {
@@ -70,83 +63,6 @@ fn checkStatus(api: *const OrtApi, status: ?*c.OrtStatus) !void {
         defer api.ReleaseStatus.?(s);
         return error.OrtApiFailed;
     }
-}
-
-fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    for (0..haystack.len - needle.len + 1) |offset| {
-        if (std.ascii.eqlIgnoreCase(haystack[offset .. offset + needle.len], needle)) return true;
-    }
-    return false;
-}
-
-fn isProviderInitializationMessage(message: []const u8) bool {
-    const provider_markers = [_][]const u8{
-        "execution provider is not available",
-        "failed to load execution provider",
-        "failed to initialize execution provider",
-        "loadlibrary failed",
-        "dlopen(",
-        "libonnxruntime_providers_cuda",
-        "libonnxruntime_providers_tensorrt",
-        "cuda driver version is insufficient",
-        "cuda initialization failure",
-        "no cuda-capable device",
-        "cudnn error",
-        "cublas error",
-    };
-    for (provider_markers) |marker| {
-        if (containsAsciiIgnoreCase(message, marker)) return true;
-    }
-    return false;
-}
-
-/// Session creation is where ONNX Runtime reports both provider failures and
-/// malformed model artifacts. Preserve that distinction so configured backend
-/// priorities may fall back for infrastructure failures without hiding a bad
-/// model behind another backend.
-fn checkSessionCreateStatus(api: *const OrtApi, status: ?*c.OrtStatus) !void {
-    if (status) |s| {
-        const code = api.GetErrorCode.?(s);
-        var provider_failure = false;
-        if (api.GetErrorMessage) |get_error_message| {
-            if (get_error_message(s)) |msg_ptr| {
-                const message = std.mem.span(msg_ptr);
-                std.log.err("onnxruntime: {s}", .{message});
-                provider_failure = isProviderInitializationMessage(message);
-            }
-        }
-        defer api.ReleaseStatus.?(s);
-        return switch (code) {
-            c.ORT_INVALID_ARGUMENT,
-            c.ORT_NO_SUCHFILE,
-            c.ORT_NO_MODEL,
-            c.ORT_INVALID_PROTOBUF,
-            c.ORT_INVALID_GRAPH,
-            c.ORT_NOT_FOUND,
-            c.ORT_MODEL_LOAD_CANCELED,
-            => error.InvalidOnnxModel,
-            c.ORT_EP_FAIL,
-            c.ORT_ENGINE_ERROR,
-            c.ORT_NOT_IMPLEMENTED,
-            c.ORT_MODEL_REQUIRES_COMPILATION,
-            => error.OnnxSessionInitializationFailed,
-            c.ORT_FAIL,
-            c.ORT_RUNTIME_EXCEPTION,
-            => if (provider_failure) error.OnnxSessionInitializationFailed else error.InvalidOnnxModel,
-            else => error.InvalidOnnxModel,
-        };
-    }
-}
-
-test "ONNX provider classification excludes artifact paths" {
-    try std.testing.expect(!isProviderInitializationMessage(
-        "invalid protobuf in /models/acme-cuda-model/decoder.onnx",
-    ));
-    try std.testing.expect(isProviderInitializationMessage(
-        "LoadLibrary failed for libonnxruntime_providers_cuda.so",
-    ));
 }
 
 /// ORT element type to our DType.
@@ -431,7 +347,7 @@ pub fn createSessionWithOptions(
 
     // Create session from model file
     var ort_session: ?*c.OrtSession = null;
-    try checkSessionCreateStatus(api, api.CreateSession.?(global_env.?, path_z.ptr, session_options.?, &ort_session));
+    try checkStatus(api, api.CreateSession.?(global_env.?, path_z.ptr, session_options.?, &ort_session));
 
     const impl = try allocator.create(OnnxSession);
     impl.* = .{

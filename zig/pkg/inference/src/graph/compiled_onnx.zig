@@ -352,11 +352,7 @@ fn executeModelForwardViaDefinition(
             shape.attention_mode,
             inferFallbackVocabSize(graph),
         ) catch |err| switch (err) {
-            // A missing model-specific package permits discovery of legacy
-            // manifests. A package that exists but cannot be parsed, validated,
-            // or matched is corrupt and must fail closed rather than silently
-            // selecting a stale artifact or lower-priority provider.
-            error.FileNotFound => blk: {
+            error.FileNotFound, error.InvalidCharacter, error.SyntaxError, error.UnexpectedToken, error.UnknownField, error.ArtifactShapeMismatch => blk: {
                 const found = try findMatchingOnnxWholeModelArtifact(
                     allocator,
                     artifact_dir,
@@ -426,11 +422,20 @@ fn executeModelForwardViaDefinition(
         },
         .prefill => |prefill_request| blk: {
             try runtime.reset();
-            // Artifact discovery has already selected an exact shape bucket.
-            // Structural failures from that artifact are corruption/package
-            // errors and must remain terminal rather than being disguised as
-            // provider unavailability.
-            break :blk try runtime.prefill(allocator, prefill_request);
+            break :blk runtime.prefill(allocator, prefill_request) catch |err| switch (err) {
+                error.ArtifactShapeMismatch,
+                error.UnsupportedArtifactInputs,
+                error.UnsupportedShape,
+                error.UnsupportedTensorType,
+                => {
+                    std.log.warn(
+                        "ONNX whole-model prefill artifact rejected request: err={s} seq_len={d} query_seq_len={d} attention_mode={s}",
+                        .{ @errorName(err), prefill_request.seq_len, prefill_request.query_seq_len, @tagName(prefill_request.attention_mode) },
+                    );
+                    return null;
+                },
+                else => return err,
+            };
         },
     };
     return try output.takeHostLogits(allocator);
@@ -592,7 +597,7 @@ fn findMatchingOnnxArtifactFromPackage(
     defer allocator.free(package_path);
 
     var parsed = compiled_artifact.readPackageManifest(allocator, io, package_path) catch |err| switch (err) {
-        error.FileNotFound => return null,
+        error.FileNotFound, error.InvalidCharacter, error.SyntaxError, error.UnexpectedToken, error.UnknownField => return null,
         else => return err,
     };
     defer parsed.deinit();
@@ -635,7 +640,7 @@ fn findMatchingOnnxDecodeArtifactFromPackage(
     defer allocator.free(package_path);
 
     var parsed = compiled_artifact.readPackageManifest(allocator, io, package_path) catch |err| switch (err) {
-        error.FileNotFound => return null,
+        error.FileNotFound, error.InvalidCharacter, error.SyntaxError, error.UnexpectedToken, error.UnknownField => return null,
         else => return err,
     };
     defer parsed.deinit();
@@ -757,45 +762,6 @@ test "ONNX whole-model artifact lookup resolves package manifest entries" {
         allocator.free(decode.?.artifact_path);
     }
     try std.testing.expectEqualStrings("/tmp/model.decode.onnx.inference.json", decode.?.manifest_path);
-}
-
-test "ONNX model-specific package corruption is terminal" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
-    defer allocator.free(base_dir);
-    const package_path = try compiled_artifact.packageManifestPath(
-        allocator,
-        base_dir,
-        "onnx",
-        "/tmp/model",
-        "onnx_graph",
-        null,
-    );
-    defer allocator.free(package_path);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = package_path, .data = "[1]" });
-
-    try std.testing.expectError(
-        error.UnexpectedToken,
-        findMatchingOnnxWholeModelArtifact(
-            allocator,
-            base_dir,
-            "/tmp/model",
-            .{ .prefill = .{
-                .input_ids = &.{1},
-                .seq_len = 1,
-                .query_seq_len = 1,
-                .attention_mode = .paged_prefill,
-            } },
-        ),
-    );
-    try std.testing.expectError(
-        error.UnexpectedToken,
-        findMatchingOnnxWholeModelDecodeArtifact(allocator, base_dir, "/tmp/model"),
-    );
 }
 
 const ArtifactShape = struct {

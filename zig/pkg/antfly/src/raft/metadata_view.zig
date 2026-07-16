@@ -271,7 +271,6 @@ fn deinitTransitionRecord(alloc: std.mem.Allocator, record: *metadata.Transition
 fn cloneSplitRecord(alloc: std.mem.Allocator, record: metadata.SplitTransitionRecord) !metadata.SplitTransitionRecord {
     return .{
         .transition_id = record.transition_id,
-        .attempt_epoch = record.attempt_epoch,
         .source_group_id = record.source_group_id,
         .destination_group_id = record.destination_group_id,
         .phase = record.phase,

@@ -6,43 +6,29 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..types import UNSET, Unset
-
-T = TypeVar("T", bound="FullTextIndexConfig")
+T = TypeVar("T", bound="GraphIndexStatsSourceArtifact")
 
 
 @_attrs_define
-class FullTextIndexConfig:
-    """
-    Attributes:
-        mem_only (bool | Unset): Whether to use memory-only storage
-    """
+class GraphIndexStatsSourceArtifact:
+    """Graph source artifact materialization status."""
 
-    mem_only: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        mem_only = self.mem_only
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({})
-        if mem_only is not UNSET:
-            field_dict["mem_only"] = mem_only
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        mem_only = d.pop("mem_only", UNSET)
+        graph_index_stats_source_artifact = cls()
 
-        full_text_index_config = cls(
-            mem_only=mem_only,
-        )
-
-        full_text_index_config.additional_properties = d
-        return full_text_index_config
+        graph_index_stats_source_artifact.additional_properties = d
+        return graph_index_stats_source_artifact
 
     @property
     def additional_keys(self) -> list[str]:

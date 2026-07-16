@@ -941,7 +941,6 @@ fn cloneProjectedSplitTransitionsOwned(
     for (records, 0..) |record, i| {
         out[i] = .{
             .transition_id = record.transition_id,
-            .attempt_epoch = record.attempt_epoch,
             .source_group_id = record.source_group_id,
             .destination_group_id = record.destination_group_id,
             .phase = record.phase,
@@ -1087,8 +1086,6 @@ pub const MetadataService = struct {
     placement_epoch: std.atomic.Value(u64) = .init(1),
     reconcile_lease_epoch: std.atomic.Value(u64) = .init(1),
     transition_epoch: std.atomic.Value(u64) = .init(1),
-    metadata_incarnation_candidate: ?metadata_mod.MetadataClusterIncarnation = null,
-    metadata_incarnation_proposal_pending: bool = false,
     local_placement_epoch: ?u64,
     last_local_placement_refresh_at_ms: u64,
     local_transition_epoch: ?u64,
@@ -1368,13 +1365,6 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .upsert_split_transition = record });
     }
 
-    pub fn admitSplitTransition(self: *MetadataService, admission: metadata_reconciler.SplitAdmission) !void {
-        try self.proposeTransitionCommand(.{ .admit_split_transition = .{
-            .expected_source_epoch = admission.expected_source_epoch,
-            .record = admission.record,
-        } });
-    }
-
     pub fn upsertReplicaIntent(self: *MetadataService, intent: raft_reconciler.PlacementIntent) !void {
         try self.proposeTransitionCommand(.{ .upsert_replica_intent = intent });
     }
@@ -1489,7 +1479,6 @@ pub const MetadataService = struct {
         try self.ensureLifecycleListenerRegistered();
         defer self.lifecycle_signal.notify(null);
         try self.raft.runRound();
-        if (!try self.ensureMetadataIncarnation()) return;
         if (!self.observe_local_replica_root) return;
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForRound();
         if ((self.store_status_ticks >= 40 or backfill_markers.len > 0) and shouldRefreshLocalStoreStatus(self, backfill_markers)) {
@@ -1519,7 +1508,6 @@ pub const MetadataService = struct {
         try self.ensureLifecycleListenerRegistered();
         defer self.lifecycle_signal.notify(null);
         try self.raft.runRound();
-        if (!try self.ensureMetadataIncarnation()) return;
         if (!self.observe_local_replica_root) return;
 
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForLifecycleRound();
@@ -1584,7 +1572,6 @@ pub const MetadataService = struct {
     pub fn applyReconciliationPlan(self: *MetadataService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
         for (plan.placement_upserts) |intent| try self.upsertReplicaIntent(intent);
         for (plan.table_upserts) |record| try self.upsertTable(record);
-        for (plan.split_admissions) |admission| try self.admitSplitTransition(admission);
         for (plan.range_upserts) |record| try self.upsertRange(record);
         for (plan.split_upserts) |record| try self.upsertSplitTransition(record);
         for (plan.merge_upserts) |record| try self.upsertMergeTransition(record);
@@ -1632,7 +1619,6 @@ pub const MetadataService = struct {
     pub fn head(self: *MetadataService) metadata_api.MetadataHead {
         return .{
             .metadata_group_id = self.metadata_group_id,
-            .metadata_incarnation = self.metadataIncarnation() catch null,
             .metadata_epoch = projectedProvisioningFingerprint(self.alloc, self) catch self.lifecycle_signal.currentEpoch(),
         };
     }
@@ -1661,34 +1647,6 @@ pub const MetadataService = struct {
 
     pub fn projectedStore(self: *MetadataService) ?*metadata_storage.RaftApplyStore {
         return self.raft.host.owned_metadata_store;
-    }
-
-    pub fn metadataIncarnation(self: *MetadataService) !?metadata_mod.MetadataClusterIncarnation {
-        const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        return try store.getMetadataIncarnation(self.metadata_group_id);
-    }
-
-    fn ensureMetadataIncarnation(self: *MetadataService) !bool {
-        if (try self.metadataIncarnation() != null) {
-            self.metadata_incarnation_proposal_pending = false;
-            return true;
-        }
-        if (!self.raft.host.host.isLocalLeader(self.metadata_group_id)) {
-            self.metadata_incarnation_proposal_pending = false;
-            return false;
-        }
-        if (self.metadata_incarnation_proposal_pending) return false;
-        if (self.metadata_incarnation_candidate == null) {
-            self.metadata_incarnation_candidate = try metadata_mod.incarnation.generate(std.Options.debug_io);
-        }
-        self.proposeTransitionCommand(.{
-            .initialize_metadata_incarnation = self.metadata_incarnation_candidate.?,
-        }) catch |err| switch (err) {
-            error.NotLeader => return false,
-            else => return err,
-        };
-        self.metadata_incarnation_proposal_pending = true;
-        return false;
     }
 
     pub fn getProjectedReconcileLease(self: *MetadataService) !?metadata_reconcile_lease.ReconcileLeaseRecord {
@@ -2259,7 +2217,6 @@ pub const MetadataService = struct {
             error.ForeignQueryFailed,
             error.ForeignReplicationSlotMissing,
             error.ForeignTableNotFound,
-            error.LibpqUnavailable,
             error.FileNotFound,
             error.InvalidQueryRequest,
             error.WriterLocked,
@@ -2308,7 +2265,6 @@ pub const MetadataService = struct {
             error.ForeignQueryFailed,
             error.ForeignReplicationSlotMissing,
             error.ForeignTableNotFound,
-            error.LibpqUnavailable,
             error.FileNotFound,
             error.InvalidQueryRequest,
             error.WriterLocked,
@@ -2348,8 +2304,6 @@ pub const MetadataHttpService = struct {
     placement_epoch: std.atomic.Value(u64) = .init(1),
     reconcile_lease_epoch: std.atomic.Value(u64) = .init(1),
     transition_epoch: std.atomic.Value(u64) = .init(1),
-    metadata_incarnation_candidate: ?metadata_mod.MetadataClusterIncarnation = null,
-    metadata_incarnation_proposal_pending: bool = false,
     local_placement_epoch: ?u64,
     last_local_placement_refresh_at_ms: u64,
     local_transition_epoch: ?u64,
@@ -2685,13 +2639,6 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .upsert_split_transition = record });
     }
 
-    pub fn admitSplitTransition(self: *MetadataHttpService, admission: metadata_reconciler.SplitAdmission) !void {
-        try self.proposeTransitionCommand(.{ .admit_split_transition = .{
-            .expected_source_epoch = admission.expected_source_epoch,
-            .record = admission.record,
-        } });
-    }
-
     pub fn upsertReplicaIntent(self: *MetadataHttpService, intent: raft_reconciler.PlacementIntent) !void {
         try self.proposeTransitionCommand(.{ .upsert_replica_intent = intent });
     }
@@ -2803,36 +2750,6 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn runRound(self: *MetadataHttpService) !void {
-        try self.runRoundInternal(true);
-    }
-
-    /// Advances only the latency-sensitive Raft runtime. Production runtimes
-    /// drive this from a dedicated ticker so control-plane I/O cannot starve
-    /// elections, heartbeats, or Ready processing.
-    pub fn runRaftRoundOnly(self: *MetadataHttpService) !void {
-        try self.ensureLifecycleListenerRegistered();
-        var raft_diagnostics_snapshot: MetadataRaftDiagnosticsSnapshot = .{};
-        self.lockRuntime();
-        {
-            defer self.unlockRuntime();
-            if (self.raft.pending_updates.items.len > 0) {
-                _ = try self.raft.syncPendingRaftOnly();
-            } else {
-                try self.raft.runRaftRoundOnly();
-            }
-            raft_diagnostics_snapshot = self.raftDiagnosticsSnapshotLocked();
-        }
-        if (raft_diagnostics_snapshot.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
-    }
-
-    /// Runs metadata projection and reconciliation without advancing Raft.
-    /// Callers must concurrently drive `runRaftRoundOnly` at the configured
-    /// tick cadence.
-    pub fn runControlRoundOnly(self: *MetadataHttpService) !void {
-        try self.runRoundInternal(false);
-    }
-
-    fn runRoundInternal(self: *MetadataHttpService, advance_raft: bool) !void {
         var run_round_trace = MetadataRunRoundTrace.init();
         defer run_round_trace.logIfSlow();
         var phase_start_ns = platform_time.monotonicNs();
@@ -2848,26 +2765,20 @@ pub const MetadataHttpService = struct {
             self.lifecycle_signal.notify(null);
             run_round_trace.recordSince("lifecycle_signal_notify", lifecycle_signal_phase_start_ns);
         }
+        phase_start_ns = platform_time.monotonicNs();
         var raft_diagnostics_snapshot: MetadataRaftDiagnosticsSnapshot = .{};
-        if (advance_raft) {
-            phase_start_ns = platform_time.monotonicNs();
-            self.lockRuntime();
-            {
-                defer self.unlockRuntime();
-                if (self.raft.pending_updates.items.len > 0) {
-                    _ = try self.raft.syncPendingRaftOnly();
-                } else {
-                    try self.raft.runRaftRoundOnly();
-                }
-                raft_diagnostics_snapshot = self.raftDiagnosticsSnapshotLocked();
+        self.lockRuntime();
+        {
+            defer self.unlockRuntime();
+            if (self.raft.pending_updates.items.len > 0) {
+                _ = try self.raft.syncPendingRaftOnly();
+            } else {
+                try self.raft.runRaftRoundOnly();
             }
-            run_round_trace.recordSince("raft_round", phase_start_ns);
-        }
-        if (!try self.ensureMetadataIncarnation()) {
-            self.probe_ready.store(false, .release);
-            return;
+            raft_diagnostics_snapshot = self.raftDiagnosticsSnapshotLocked();
         }
         self.refreshProbeReady();
+        run_round_trace.recordSince("raft_round", phase_start_ns);
         if (raft_diagnostics_snapshot.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
         if (!self.observe_local_replica_root) return;
 
@@ -2971,11 +2882,6 @@ pub const MetadataHttpService = struct {
                 try self.raft.runRaftRoundOnly();
             }
         }
-        if (!try self.ensureMetadataIncarnation()) {
-            self.probe_ready.store(false, .release);
-            return;
-        }
-        self.refreshProbeReady();
         if (!self.observe_local_replica_root) return;
 
         var local_transition_inputs = try captureLocalTransitionInputs(self);
@@ -3054,7 +2960,6 @@ pub const MetadataHttpService = struct {
     pub fn applyReconciliationPlan(self: *MetadataHttpService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
         for (plan.placement_upserts) |intent| try self.upsertReplicaIntent(intent);
         for (plan.table_upserts) |record| try self.upsertTable(record);
-        for (plan.split_admissions) |admission| try self.admitSplitTransition(admission);
         for (plan.range_upserts) |record| try self.upsertRange(record);
         for (plan.split_upserts) |record| try self.upsertSplitTransition(record);
         for (plan.merge_upserts) |record| try self.upsertMergeTransition(record);
@@ -3085,7 +2990,6 @@ pub const MetadataHttpService = struct {
     pub fn head(self: *MetadataHttpService) metadata_api.MetadataHead {
         return .{
             .metadata_group_id = self.metadata_group_id,
-            .metadata_incarnation = self.metadataIncarnation() catch null,
             .metadata_epoch = projectedProvisioningFingerprint(self.alloc, self) catch self.lifecycle_signal.currentEpoch(),
         };
     }
@@ -3425,39 +3329,6 @@ pub const MetadataHttpService = struct {
 
     pub fn projectedStore(self: *MetadataHttpService) ?*metadata_storage.RaftApplyStore {
         return self.raft.host.owned_metadata_store;
-    }
-
-    pub fn metadataIncarnation(self: *MetadataHttpService) !?metadata_mod.MetadataClusterIncarnation {
-        self.lockRuntime();
-        defer self.unlockRuntime();
-        const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        return try store.getMetadataIncarnation(self.metadata_group_id);
-    }
-
-    fn ensureMetadataIncarnation(self: *MetadataHttpService) !bool {
-        if (try self.metadataIncarnation() != null) {
-            self.metadata_incarnation_proposal_pending = false;
-            return true;
-        }
-        self.lockRuntime();
-        const is_local_leader = self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id);
-        self.unlockRuntime();
-        if (!is_local_leader) {
-            self.metadata_incarnation_proposal_pending = false;
-            return false;
-        }
-        if (self.metadata_incarnation_proposal_pending) return false;
-        if (self.metadata_incarnation_candidate == null) {
-            self.metadata_incarnation_candidate = try metadata_mod.incarnation.generate(std.Options.debug_io);
-        }
-        self.proposeTransitionCommand(.{
-            .initialize_metadata_incarnation = self.metadata_incarnation_candidate.?,
-        }) catch |err| switch (err) {
-            error.NotLeader => return false,
-            else => return err,
-        };
-        self.metadata_incarnation_proposal_pending = true;
-        return false;
     }
 
     /// Returns the current Raft term only while this node is the metadata
@@ -5872,18 +5743,8 @@ fn countHealthyStoresReportingGroup(
 }
 
 fn runServiceRounds(svc: *MetadataService, count: usize) !void {
-    try runServiceRoundsUntilMetadataReady(svc);
     var rounds: usize = 0;
     while (rounds < count) : (rounds += 1) try svc.runRound();
-}
-
-fn runServiceRoundsUntilMetadataReady(svc: *MetadataService) !void {
-    var rounds: usize = 0;
-    while (rounds < 32) : (rounds += 1) {
-        if (try svc.metadataIncarnation() != null) return;
-        try svc.runRound();
-    }
-    return error.MetadataIncarnationUnavailable;
 }
 
 fn logServiceWaitTimeout(svc: *MetadataService, label: []const u8, group_id: u64, desired: raft_host.HostedReplicaStatus, rounds: usize) !void {
@@ -6063,10 +5924,6 @@ pub fn snapshotStatusWithOptions(
         service.statusProjectedReconcileLease(now_ms) catch null
     else if (@hasDecl(SourceDeclType, "getProjectedReconcileLease"))
         service.getProjectedReconcileLease() catch null
-    else
-        null;
-    const metadata_incarnation = if (@hasDecl(SourceDeclType, "metadataIncarnation"))
-        try service.metadataIncarnation()
     else
         null;
     const projected_tables = try service.listProjectedTables(alloc);
@@ -6305,7 +6162,6 @@ pub fn snapshotStatusWithOptions(
 
     return .{
         .metadata_group_id = metadata_group_id,
-        .metadata_incarnation = metadata_incarnation,
         .metadata_raft_local_node_id = metadata_raft.local_node_id,
         .metadata_raft_role = metadata_raft.role,
         .metadata_raft_leader_id = metadata_raft.leader_id,
@@ -6508,22 +6364,12 @@ test "metadata service proposes split transitions into the metadata group" {
     try svc.campaignMetadataGroup();
     try svc.runRound();
 
-    try svc.upsertTable(.{ .table_id = 20, .name = "docs" });
-    try svc.upsertRange(.{
-        .group_id = 2001,
-        .table_id = 20,
-        .start_key = "",
-        .end_key = "doc:z",
-        .split_attempt_epoch = 1,
-    });
     try svc.upsertSplitTransition(.{
         .transition_id = 4001,
-        .attempt_epoch = 1,
         .source_group_id = 2001,
         .destination_group_id = 2002,
         .phase = .prepare,
         .split_key = "doc:m",
-        .source_range_end = "doc:z",
     });
 
     try runServiceRounds(&svc, 8);
@@ -6636,8 +6482,8 @@ test "metadata service status reflects reconcile lease ownership" {
     try std.testing.expectEqual(@as(u64, 0), before_leadership.reconcile_lease_owner_node_id);
 
     try svc.campaignMetadataGroup();
-    try runServiceRoundsUntilMetadataReady(&svc);
-    try runServiceRounds(&svc, 2);
+    try svc.runRound();
+    try svc.runRound();
 
     const held_status = try svc.status();
     try std.testing.expect(held_status.reconcile_lease_enabled);
@@ -6852,7 +6698,7 @@ test "metadata service can apply reconciliation plan proposals" {
         .bootstrap_mode = .empty,
     });
     try svc.campaignMetadataGroup();
-    try runServiceRoundsUntilMetadataReady(&svc);
+    try svc.runRound();
 
     var manager = metadata_table_manager.TableManager.init(std.testing.allocator);
     defer manager.deinit();
@@ -6993,8 +6839,7 @@ test "metadata control loop can drive the real metadata service" {
     });
 
     const summary = try svc.reconcileOnceEnsuringLease(&loop);
-    try std.testing.expectEqual(@as(usize, 1), summary.split_admissions);
-    try std.testing.expectEqual(@as(usize, 0), summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), summary.split_upserts);
 
     try runServiceRounds(&svc, 8);
 
@@ -7272,8 +7117,7 @@ test "table workflow can drive real metadata service topology and split setup" {
         .destination_group_id = 8802,
         .split_key = "doc:m",
     });
-    try std.testing.expectEqual(@as(usize, 1), split_summary.split_admissions);
-    try std.testing.expectEqual(@as(usize, 0), split_summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), split_summary.split_upserts);
 
     rounds = 0;
     while (rounds < 8) : (rounds += 1) try svc.runRound();
@@ -8786,7 +8630,7 @@ test "metadata service lifecycle round backs off empty backfill probes after ini
         .bootstrap_mode = .empty,
     });
     try svc.campaignMetadataGroup();
-    try runServiceRoundsUntilMetadataReady(&svc);
+    try svc.runRound();
 
     try std.testing.expectEqual(@as(usize, 0), svc.store_status_backfill_marker_cache.markers.len);
     const first_scanned_at_ms = svc.store_status_backfill_marker_cache.scanned_at_ms;
@@ -9911,7 +9755,6 @@ test "metadata http projected clone helpers clean up on allocation failure" {
             const split_transitions = [_]transition_state.SplitTransitionRecord{
                 .{
                     .transition_id = 91,
-                    .attempt_epoch = 1,
                     .source_group_id = 11,
                     .destination_group_id = 12,
                     .phase = .prepare,

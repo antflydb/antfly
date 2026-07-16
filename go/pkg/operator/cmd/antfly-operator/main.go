@@ -38,7 +38,7 @@ var (
 	setupLog = ctrl.Log.WithName("setup")
 )
 
-const defaultInferenceImage = "ghcr.io/antflydb/antfly:latest"
+const defaultInferenceOmniImage = "ghcr.io/antflydb/antfly:omni"
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -64,8 +64,8 @@ func main() {
 		"Skip automatic CRD installation (use if CRDs managed externally)")
 	flag.BoolVar(&enableInferenceControllers, "enable-inference-controllers", true,
 		"Enable InferencePool and InferenceProxy controllers and AntflyCluster.spec.inference management. CRD installation remains unconditional unless --skip-crd-install is set.")
-	flag.StringVar(&inferenceAntflyImage, "inference-antfly-image", defaultInferenceImage,
-		"Default supported Antfly Zig runtime image for InferencePool pods. Production deployments should override this with an immutable release tag or digest.")
+	flag.StringVar(&inferenceAntflyImage, "inference-antfly-image", defaultInferenceOmniImage,
+		"Default omni Antfly image for InferencePool pods. The image must provide the /antfly inference runtime contract.")
 	opts := zap.Options{
 		Development: false,
 		TimeEncoder: zapcore.RFC3339TimeEncoder,

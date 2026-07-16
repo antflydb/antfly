@@ -125,17 +125,12 @@ pub const TransitionService = struct {
     pub fn submitSplit(self: *TransitionService, record: metadata.SplitTransitionRecord) !void {
         _ = self.removeCompletedSplit(record.transition_id);
         if (findSplitIndex(self.pending_split.items, record.transition_id)) |index| {
-            const attempt_changed = self.pending_split.items[index].attempt_epoch != record.attempt_epoch;
             const phase_changed = self.pending_split.items[index].phase != record.phase;
-            var replacement = try cloneSplitRecord(self.alloc, record);
-            errdefer deinitSplitRecord(self.alloc, &replacement);
             deinitSplitRecord(self.alloc, &self.pending_split.items[index]);
-            self.pending_split.items[index] = replacement;
-            if (attempt_changed or phase_changed) _ = self.split_retries.remove(record.transition_id);
+            self.pending_split.items[index] = try cloneSplitRecord(self.alloc, record);
+            if (phase_changed) _ = self.split_retries.remove(record.transition_id);
         } else {
-            var owned = try cloneSplitRecord(self.alloc, record);
-            errdefer deinitSplitRecord(self.alloc, &owned);
-            try self.pending_split.append(self.alloc, owned);
+            try self.pending_split.append(self.alloc, try cloneSplitRecord(self.alloc, record));
         }
         self.metrics.queued_split_transitions = self.pending_split.items.len;
     }
@@ -144,15 +139,11 @@ pub const TransitionService = struct {
         _ = self.removeCompletedMerge(record.transition_id);
         if (findMergeIndex(self.pending_merge.items, record.transition_id)) |index| {
             const phase_changed = self.pending_merge.items[index].phase != record.phase;
-            var replacement = try cloneMergeRecord(self.alloc, record);
-            errdefer deinitMergeRecord(self.alloc, &replacement);
             deinitMergeRecord(self.alloc, &self.pending_merge.items[index]);
-            self.pending_merge.items[index] = replacement;
+            self.pending_merge.items[index] = try cloneMergeRecord(self.alloc, record);
             if (phase_changed) _ = self.merge_retries.remove(record.transition_id);
         } else {
-            var owned = try cloneMergeRecord(self.alloc, record);
-            errdefer deinitMergeRecord(self.alloc, &owned);
-            try self.pending_merge.append(self.alloc, owned);
+            try self.pending_merge.append(self.alloc, try cloneMergeRecord(self.alloc, record));
         }
         self.metrics.queued_merge_transitions = self.pending_merge.items.len;
     }
@@ -367,7 +358,7 @@ pub const TransitionService = struct {
     fn compactCompletedSplits(self: *TransitionService) usize {
         var write_index: usize = 0;
         var removed: usize = 0;
-        for (self.pending_split.items, 0..) |record, read_index| {
+        for (self.pending_split.items) |record| {
             if (record.phase == .finalized or record.phase == .rolled_back) {
                 _ = self.split_retries.remove(record.transition_id);
                 var doomed = record;
@@ -375,7 +366,7 @@ pub const TransitionService = struct {
                 removed += 1;
                 continue;
             }
-            if (write_index != read_index) self.pending_split.items[write_index] = record;
+            if (write_index != removed) self.pending_split.items[write_index] = record;
             write_index += 1;
         }
         self.pending_split.items.len = write_index;
@@ -385,7 +376,7 @@ pub const TransitionService = struct {
     fn compactCompletedMerges(self: *TransitionService) usize {
         var write_index: usize = 0;
         var removed: usize = 0;
-        for (self.pending_merge.items, 0..) |record, read_index| {
+        for (self.pending_merge.items) |record| {
             if (record.phase == .finalized or record.phase == .rolled_back) {
                 _ = self.merge_retries.remove(record.transition_id);
                 var doomed = record;
@@ -393,7 +384,7 @@ pub const TransitionService = struct {
                 removed += 1;
                 continue;
             }
-            if (write_index != read_index) self.pending_merge.items[write_index] = record;
+            if (write_index != removed) self.pending_merge.items[write_index] = record;
             write_index += 1;
         }
         self.pending_merge.items.len = write_index;
@@ -497,21 +488,15 @@ fn findCompletedMergeIndex(records: []const metadata.MergeRuntimeObservation, tr
 }
 
 fn cloneSplitRecord(alloc: std.mem.Allocator, record: metadata.SplitTransitionRecord) !metadata.SplitTransitionRecord {
-    var owned: metadata.SplitTransitionRecord = .{
+    return .{
         .transition_id = record.transition_id,
-        .attempt_epoch = record.attempt_epoch,
         .source_group_id = record.source_group_id,
         .destination_group_id = record.destination_group_id,
         .phase = record.phase,
-        .split_key = null,
-        .source_range_end = null,
-        .rollback_reason = null,
+        .split_key = if (record.split_key) |split_key| try alloc.dupe(u8, split_key) else null,
+        .source_range_end = if (record.source_range_end) |end| try alloc.dupe(u8, end) else null,
+        .rollback_reason = if (record.rollback_reason) |reason| try alloc.dupe(u8, reason) else null,
     };
-    errdefer deinitSplitRecord(alloc, &owned);
-    if (record.split_key) |split_key| owned.split_key = try alloc.dupe(u8, split_key);
-    if (record.source_range_end) |end| owned.source_range_end = try alloc.dupe(u8, end);
-    if (record.rollback_reason) |reason| owned.rollback_reason = try alloc.dupe(u8, reason);
-    return owned;
 }
 
 fn deinitSplitRecord(alloc: std.mem.Allocator, record: *metadata.SplitTransitionRecord) void {
@@ -566,19 +551,19 @@ test "transition service steps split and merge queues through runtime" {
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !data.SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data.SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
 
-        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
+        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .prepare;
             self.status.source_split_phase = .prepare;
             return true;
         }
 
-        fn startSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn startSource(ptr: *anyopaque, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .bootstrap_peer;
             self.status.source_split_phase = .splitting;
@@ -586,7 +571,7 @@ test "transition service steps split and merge queues through runtime" {
             return true;
         }
 
-        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .replay_deltas;
             self.status.bootstrapped = true;
@@ -595,7 +580,7 @@ test "transition service steps split and merge queues through runtime" {
             return true;
         }
 
-        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
+        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64) !usize {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .cutover_ready;
             self.status.replay_caught_up = true;
@@ -605,7 +590,7 @@ test "transition service steps split and merge queues through runtime" {
             return 1;
         }
 
-        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .finalized;
             self.status.source_split_phase = .none;
@@ -613,7 +598,7 @@ test "transition service steps split and merge queues through runtime" {
             return true;
         }
 
-        fn rollbackSource(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn rollbackSource(_: *anyopaque, _: u64, _: u64) !bool {
             return true;
         }
     };
@@ -698,7 +683,6 @@ test "transition service steps split and merge queues through runtime" {
 
     try svc.submitSplit(.{
         .transition_id = 1,
-        .attempt_epoch = 1,
         .source_group_id = 11,
         .destination_group_id = 12,
     });
@@ -736,13 +720,11 @@ test "transition service upserts and removes queued transitions by id" {
 
     try svc.submitSplit(.{
         .transition_id = 7,
-        .attempt_epoch = 1,
         .source_group_id = 1,
         .destination_group_id = 2,
     });
     try svc.submitSplit(.{
         .transition_id = 7,
-        .attempt_epoch = 1,
         .source_group_id = 1,
         .destination_group_id = 3,
         .phase = .replay_deltas,
@@ -771,110 +753,6 @@ test "transition service upserts and removes queued transitions by id" {
     try std.testing.expectEqual(@as(usize, 0), svc.pending_merge.items.len);
 }
 
-test "transition service queue replacement is allocation-failure safe" {
-    const Runner = struct {
-        fn run(alloc: std.mem.Allocator) !void {
-            var svc = TransitionService.init(alloc, .{});
-            defer svc.deinit();
-            try svc.submitSplit(.{
-                .transition_id = 7,
-                .attempt_epoch = 1,
-                .source_group_id = 11,
-                .destination_group_id = 12,
-                .split_key = "doc:m",
-                .source_range_end = "doc:z",
-                .rollback_reason = "first",
-            });
-            try svc.submitSplit(.{
-                .transition_id = 7,
-                .attempt_epoch = 2,
-                .source_group_id = 11,
-                .destination_group_id = 12,
-                .phase = .replay_deltas,
-                .split_key = "doc:n",
-                .source_range_end = "doc:z",
-                .rollback_reason = "replacement",
-            });
-            try svc.submitMerge(.{
-                .transition_id = 8,
-                .donor_group_id = 21,
-                .receiver_group_id = 22,
-                .rollback_reason = "first",
-            });
-            try svc.submitMerge(.{
-                .transition_id = 8,
-                .donor_group_id = 21,
-                .receiver_group_id = 22,
-                .phase = .finalizing,
-                .rollback_reason = "replacement",
-            });
-        }
-    };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
-}
-
-test "transition service compaction preserves live records after terminal records" {
-    var svc = TransitionService.init(std.testing.allocator, .{});
-    defer svc.deinit();
-
-    try svc.submitSplit(.{
-        .transition_id = 1,
-        .attempt_epoch = 1,
-        .source_group_id = 11,
-        .destination_group_id = 12,
-        .split_key = "doc:b",
-    });
-    try svc.submitSplit(.{
-        .transition_id = 2,
-        .attempt_epoch = 1,
-        .source_group_id = 21,
-        .destination_group_id = 22,
-        .phase = .finalized,
-        .split_key = "doc:m",
-    });
-    try svc.submitSplit(.{
-        .transition_id = 3,
-        .attempt_epoch = 1,
-        .source_group_id = 31,
-        .destination_group_id = 32,
-        .phase = .replay_deltas,
-        .split_key = "doc:t",
-    });
-
-    try std.testing.expectEqual(@as(usize, 1), svc.compactCompletedSplits());
-    try std.testing.expectEqual(@as(usize, 2), svc.pending_split.items.len);
-    try std.testing.expectEqual(@as(u64, 1), svc.pending_split.items[0].transition_id);
-    try std.testing.expectEqual(@as(u64, 3), svc.pending_split.items[1].transition_id);
-    try std.testing.expectEqualStrings("doc:t", svc.pending_split.items[1].split_key.?);
-
-    try svc.submitMerge(.{
-        .transition_id = 11,
-        .donor_group_id = 111,
-        .receiver_group_id = 112,
-        .rollback_reason = "keep-first",
-    });
-    try svc.submitMerge(.{
-        .transition_id = 12,
-        .donor_group_id = 121,
-        .receiver_group_id = 122,
-        .phase = .rolled_back,
-        .rollback_reason = "remove",
-    });
-    try svc.submitMerge(.{
-        .transition_id = 13,
-        .donor_group_id = 131,
-        .receiver_group_id = 132,
-        .phase = .replay_deltas,
-        .rollback_reason = "keep-last",
-    });
-
-    try std.testing.expectEqual(@as(usize, 1), svc.compactCompletedMerges());
-    try std.testing.expectEqual(@as(usize, 2), svc.pending_merge.items.len);
-    try std.testing.expectEqual(@as(u64, 11), svc.pending_merge.items[0].transition_id);
-    try std.testing.expectEqual(@as(u64, 13), svc.pending_merge.items[1].transition_id);
-    try std.testing.expectEqualStrings("keep-last", svc.pending_merge.items[1].rollback_reason.?);
-}
-
 test "transition service clears completed observations on resubmit and remove" {
     var svc = TransitionService.init(std.testing.allocator, .{});
     defer svc.deinit();
@@ -895,7 +773,6 @@ test "transition service clears completed observations on resubmit and remove" {
     try std.testing.expect(svc.hasCompletedSplit(17));
     try svc.submitSplit(.{
         .transition_id = 17,
-        .attempt_epoch = 1,
         .source_group_id = 71,
         .destination_group_id = 72,
     });
@@ -931,7 +808,7 @@ test "transition service clears completed observations on resubmit and remove" {
 test "transition service clones queued transition record strings" {
     const RecordingSplit = struct {
         status: data.SplitTransitionStatus = .{
-            .phase = .prepare,
+            .phase = .rolled_back,
             .source_split_phase = null,
             .bootstrapped = false,
             .replay_required = false,
@@ -965,12 +842,12 @@ test "transition service clones queued transition record strings" {
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !data.SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data.SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
 
-        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64, split_key: []const u8, source_range_end: ?[]const u8) !bool {
+        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, split_key: []const u8, source_range_end: ?[]const u8) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.last_split_key) |existing| std.testing.allocator.free(existing);
             if (self.last_source_range_end) |existing| std.testing.allocator.free(existing);
@@ -981,11 +858,11 @@ test "transition service clones queued transition record strings" {
             return true;
         }
 
-        fn unsupportedBool(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn unsupportedBool(_: *anyopaque, _: u64, _: u64) !bool {
             return error.TestUnexpectedResult;
         }
 
-        fn unsupportedUsize(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
+        fn unsupportedUsize(_: *anyopaque, _: u64, _: u64) !usize {
             return error.TestUnexpectedResult;
         }
     };
@@ -1061,7 +938,6 @@ test "transition service clones queued transition record strings" {
     defer std.testing.allocator.free(rollback_a);
     try svc.submitSplit(.{
         .transition_id = 17,
-        .attempt_epoch = 1,
         .source_group_id = 71,
         .destination_group_id = 72,
         .split_key = split_key_a,
@@ -1075,7 +951,6 @@ test "transition service clones queued transition record strings" {
     defer std.testing.allocator.free(split_end_b);
     try svc.submitSplit(.{
         .transition_id = 17,
-        .attempt_epoch = 1,
         .source_group_id = 71,
         .destination_group_id = 73,
         .split_key = split_key_b,
@@ -1134,20 +1009,20 @@ test "transition service observes queued split and merge transitions through run
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !data.SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data.SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
 
-        fn unsupportedPrepare(_: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
+        fn unsupportedPrepare(_: *anyopaque, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
             return error.TestUnexpectedResult;
         }
 
-        fn unsupportedBool(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn unsupportedBool(_: *anyopaque, _: u64, _: u64) !bool {
             return error.TestUnexpectedResult;
         }
 
-        fn unsupportedUsize(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
+        fn unsupportedUsize(_: *anyopaque, _: u64, _: u64) !usize {
             return error.TestUnexpectedResult;
         }
     };
@@ -1208,7 +1083,6 @@ test "transition service observes queued split and merge transitions through run
 
     try svc.submitSplit(.{
         .transition_id = 71,
-        .attempt_epoch = 1,
         .source_group_id = 11,
         .destination_group_id = 12,
     });
@@ -1258,7 +1132,7 @@ test "transition service steps real split coordinator from prepared source state
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:991:1:2302:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -1269,8 +1143,6 @@ test "transition service steps real split coordinator from prepared source state
     }
 
     var split = try transition_runtime.SplitCoordinatorRuntime.init(std.testing.allocator, .{
-        .transition_id = 991,
-        .attempt_epoch = 1,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 2301,
@@ -1285,7 +1157,6 @@ test "transition service steps real split coordinator from prepared source state
 
     try svc.submitSplit(.{
         .transition_id = 991,
-        .attempt_epoch = 1,
         .source_group_id = 2301,
         .destination_group_id = 2302,
     });

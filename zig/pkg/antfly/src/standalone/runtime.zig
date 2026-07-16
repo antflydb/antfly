@@ -1283,11 +1283,6 @@ pub fn runFromIterator(
     // server for compatibility with external clients.
     var resolved_warm_models = try resolveInferenceWarmModels(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer resolved_warm_models.deinit(alloc);
-    var resolved_backend_priority = try antfly.inference_runtime.resolveBackendPriority(
-        alloc,
-        if (loaded_config) |*cfg| cfg.inference.backend_priority else null,
-    );
-    defer resolved_backend_priority.deinit(alloc);
     var antfly_node_cfg = inference.server.NodeConfig{
         .models_dir = resolveInferenceModelsDir(cli, if (loaded_config) |*cfg| cfg else null) orelse
             antfly.inference_runtime.defaultModelsDirForDataDir(alloc, data_dir),
@@ -1295,31 +1290,14 @@ pub fn runFromIterator(
             antfly.inference_runtime.defaultMlDirForDataDir(alloc, data_dir),
         .generation_budget_overrides = resolveInferenceBudgetOverrides(cli),
         .preload = resolved_warm_models.items,
-        .backend_priority = resolved_backend_priority.items,
-        .pjrt_plugin_path = if (loaded_config) |*cfg| cfg.inference.pjrt_plugin_path else null,
     };
     if (loaded_config) |*cfg| {
         if (cfg.effectiveAntflyContentSecurity()) |security| antfly_node_cfg.content_security = security.*;
         if (cfg.inference.s3_credentials) |creds| antfly_node_cfg.s3_credentials = creds;
-        antfly_node_cfg.keep_alive_ms = cfg.inference.keep_alive_ms;
-        antfly_node_cfg.max_loaded_models = cfg.inference.max_loaded_models;
-        antfly_node_cfg.max_concurrent_requests = cfg.inference.max_concurrent_requests;
-        antfly_node_cfg.pool_size = cfg.inference.pool_size;
-        antfly_node_cfg.allow_downloads = cfg.inference.allow_downloads;
-        antfly_node_cfg.prompt_cache = .{
-            .enabled = cfg.inference.prompt_cache.enabled,
-            .mode = switch (cfg.inference.prompt_cache.mode) {
-                .simple => .simple,
-                .block_hash => .block_hash,
-            },
-            .max_bytes_mb = cfg.inference.prompt_cache.max_bytes_mb,
-            .min_tokens = cfg.inference.prompt_cache.min_tokens,
-            .ttl_ms = cfg.inference.prompt_cache.ttl_ms,
-        };
     }
     var antfly_node = try inference.server.Node.init(alloc, antfly_node_cfg);
     defer antfly_node.deinit();
-    try antfly_node.warmConfiguredModelsWithIo(alloc, init.io);
+    try antfly_node.warmConfiguredModels(alloc);
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,
@@ -2735,17 +2713,23 @@ fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
 }
 
 fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
-    return antfly.inference_runtime.parsePreloadModelFlag(value);
-}
-
-test "standalone preload preserves artifact variant suffixes" {
-    const variant = try parsePreloadModelFlag("generator:hf:owner/model:gguf:Q8_0");
-    try std.testing.expectEqualStrings("hf:owner/model:gguf:Q8_0", variant.name);
-    try std.testing.expectEqual(@as(?inference.backends.BackendType, null), variant.backend);
-
-    const explicit_backend = try parsePreloadModelFlag("generator:cuda:hf:owner/model:gguf:Q8_0");
-    try std.testing.expectEqualStrings("hf:owner/model:gguf:Q8_0", explicit_backend.name);
-    try std.testing.expectEqual(inference.backends.BackendType.cuda, explicit_backend.backend.?);
+    const separator = std.mem.indexOfScalar(u8, value, ':') orelse return error.InvalidArguments;
+    const kind_name = value[0..separator];
+    var model_name = value[separator + 1 ..];
+    var backend: ?inference.backends.BackendType = null;
+    if (std.mem.indexOfScalar(u8, model_name, ':')) |backend_separator| {
+        const backend_name = model_name[0..backend_separator];
+        backend = antfly.inference_runtime.parseBackendType(backend_name) orelse return error.InvalidArguments;
+        model_name = model_name[backend_separator + 1 ..];
+    }
+    if (model_name.len == 0) return error.InvalidArguments;
+    return .{
+        .kind = parsePreloadModelKind(kind_name) orelse return error.InvalidArguments,
+        .name = model_name,
+        .backend = backend,
+        .format = null,
+        .quantization = null,
+    };
 }
 
 fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConfig {
@@ -4100,8 +4084,6 @@ test "parse cli accepts canonical host port and models dir flags" {
         "/tmp/ml",
         "--preload-model",
         "generator:metal:gemma-e2b",
-        "--preload-model",
-        "generator:hf:owner/model:gguf:Q8_0",
         "--data-dir",
         "/tmp/antfly-data",
     };
@@ -4112,12 +4094,10 @@ test "parse cli accepts canonical host port and models dir flags" {
     try std.testing.expectEqual(@as(u16, 8080), cfg.bind_port.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference_models_dir.?);
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference_ml_dir.?);
-    try std.testing.expectEqual(@as(usize, 2), cfg.inference_preload_models.items.len);
+    try std.testing.expectEqual(@as(usize, 1), cfg.inference_preload_models.items.len);
     try std.testing.expectEqual(inference.server.WarmModelKind.generator, cfg.inference_preload_models.items[0].kind);
     try std.testing.expectEqualStrings("gemma-e2b", cfg.inference_preload_models.items[0].name);
     try std.testing.expectEqual(inference.backends.BackendType.metal, cfg.inference_preload_models.items[0].backend.?);
-    try std.testing.expectEqualStrings("hf:owner/model:gguf:Q8_0", cfg.inference_preload_models.items[1].name);
-    try std.testing.expectEqual(@as(?inference.backends.BackendType, null), cfg.inference_preload_models.items[1].backend);
     try std.testing.expectEqualStrings("/tmp/antfly-data", cfg.data_dir.?);
 }
 
@@ -5005,6 +4985,8 @@ test "inference config falls back to common config" {
                     .kind = try alloc.dupe(u8, "generator"),
                     .name = try alloc.dupe(u8, "antflydb/gemma-e2b"),
                     .backend = try alloc.dupe(u8, "metal"),
+                    .format = try alloc.dupe(u8, "gguf"),
+                    .quantization = try alloc.dupe(u8, "q4_k"),
                 },
             }),
         },
@@ -5019,6 +5001,8 @@ test "inference config falls back to common config" {
     try std.testing.expectEqual(inference.server.WarmModelKind.generator, warm_models.items[0].kind);
     try std.testing.expectEqualStrings("antflydb/gemma-e2b", warm_models.items[0].name);
     try std.testing.expectEqual(inference.backends.BackendType.metal, warm_models.items[0].backend.?);
+    try std.testing.expectEqualStrings("gguf", warm_models.items[0].format.?);
+    try std.testing.expectEqualStrings("q4_k", warm_models.items[0].quantization.?);
 }
 
 test "standalone runtime resolves paths from common storage base dir" {

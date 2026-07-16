@@ -1255,14 +1255,10 @@ export interface paths {
         put?: never;
         /**
          * Cancel a table repair job
-         * @description Requests cancellation at a bounded repair boundary. For a named-index
-         *     job, the server also traverses the table in bounded passes, durably
-         *     pauses matching automatic repair, and asks an active owner to yield.
-         *     The job remains nonterminal until that traversal completes, so a
-         *     `cancelled` response means detached reconstruction will not restart
-         *     without an explicit resume action. If the API process restarts during
-         *     the traversal, server maintenance resumes it automatically; clients do
-         *     not need to advance or repeat the cancellation request.
+         * @description Cancels a queued table repair job. If a repair pass is already running,
+         *     the response returns the current running state; cancellation is applied
+         *     only at pass boundaries so the API never reports a committed in-flight
+         *     pass as cancelled.
          */
         post: operations["cancelTableRepairJob"];
         delete?: never;
@@ -3140,17 +3136,10 @@ export interface components {
             /** @description Opaque cursor returned by a prior repair response. */
             cursor?: string;
             /**
-             * @description Force one named-index replacement generation even when no repair debt is currently recorded. The force is dispatched once across the initial bounded group traversal; later convergence passes only observe that generation. Only applies to target=index.
+             * @description Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
              * @default false
              */
             force?: boolean;
-            /**
-             * @description Applies one control to an existing named index repair. Requires target=index and index; cannot be combined with force, kind, or cursor.
-             * @enum {string}
-             */
-            control?: "pause_automatic" | "resume_automatic" | "cancel_current_attempt";
-            /** @description Optional opaque generation fence for a repair control. A stale value is rejected instead of affecting a newer repair. */
-            repair_id?: string;
             /**
              * Format: uint32
              * @description Maximum artifact repair records to attempt. For target=index, any positive value permits one named index repair.
@@ -3215,11 +3204,6 @@ export interface components {
              * @description Number of selected indexes that were already degraded or quarantined before repair.
              */
             indexes_degraded: number;
-            /**
-             * Format: uint64
-             * @description Number of existing index repairs that accepted the requested control.
-             */
-            controls_applied: number;
             /**
              * Format: uint32
              * @description Effective repair limit.
@@ -3305,12 +3289,12 @@ export interface components {
              * @description Effective per-pass repair limit.
              */
             limit: number;
-            /** @description Whether the next bounded pass still needs to dispatch the job's one forced named-index generation. */
+            /** @description Whether the job forces a named index rebuild. */
             force: boolean;
             result: components["schemas"]["TableRepairRunResult"];
             /** @description Last stable job-level error code. */
             last_error?: string | null;
-            /** @description Whether cancellation is pending. For a named-index job, cancellation durably pauses the matching repair in every group and becomes terminal only after that bounded traversal completes. */
+            /** @description Whether cancellation has been requested for a running pass. Running passes finish at a bounded repair boundary before the job transitions to cancelled. */
             cancel_requested: boolean;
             /**
              * Format: uint64
@@ -4489,19 +4473,6 @@ export interface components {
             deleted?: number;
             /** @description Number of documents successfully transformed */
             transformed?: number;
-        };
-        /** @description A dense-index rebuild is retaining replay history and the node has reached its hard safety budget. */
-        DenseRepairBackpressureError: {
-            /** @enum {string} */
-            code: "dense_repair_backpressure";
-            message: string;
-            /** @enum {boolean} */
-            retryable: true;
-            /**
-             * Format: uint32
-             * @description Suggested delay before retrying the write.
-             */
-            retry_after_ms: number;
         };
         /**
          * @description Cross-table batch operations in a single atomic transaction.
@@ -7518,8 +7489,6 @@ export interface components {
             source_artifact_name?: string;
             /** @description Expected embedding dimension for embedding enrichments. */
             expected_dims?: number;
-            /** @description Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producer models to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed. Dimensions are always validated independently. */
-            vector_space?: string;
             /** @description Chunk size for chunk enrichments. */
             chunk_size?: number;
             /** @description Chunk overlap for chunk enrichments. */
@@ -7533,19 +7502,12 @@ export interface components {
             full_text_index?: boolean;
             /** @description Produced asset content type for asset enrichments. */
             content_type?: string;
-            /** @description Serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded. */
+            /** @description Serialized asset producer configuration. */
             producer_json?: string;
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
         };
-        /** @description Named generated artifact stream consumed by an index. Producer inputs such as field and template belong on the matching enrichment, not on the index source. */
-        ArtifactIndexSource: {
-            /** @description Stable name of the generated artifact. */
-            artifact: string;
-        };
         FullTextIndexConfig: {
-            /** @description Chunk or textual asset artifact streams indexed together. Every artifact record is an independent full-text member. */
-            sources?: components["schemas"]["ArtifactIndexSource"][];
             /** @description Whether to use memory-only storage */
             mem_only?: boolean;
         };
@@ -8476,10 +8438,12 @@ export interface components {
             sparse?: boolean;
             /** @description Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes. */
             dimension?: number;
-            /** @description Field to extract embeddings from for direct managed indexes. Omit when sources is set. */
+            /** @description Field to extract embeddings from (managed indexes only; not allowed when external=true) */
             field?: string;
-            /** @description Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by the artifact name and its source key. All sources must use the same dense vector space or the same sparse token space. Not allowed for external or direct field/template indexes. */
-            sources?: components["schemas"]["ArtifactIndexSource"][];
+            /** @description Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings. */
+            embedding_name?: string;
+            /** @description Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source. */
+            source_artifact_name?: string;
             /**
              * @description Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
              * @example Hello, {{#if (eq Name "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old.
@@ -8512,55 +8476,6 @@ export interface components {
             chunk_size?: number;
             /** @description Non-semantic execution policy for shorthand-created chunking or embedding producers. */
             execution?: components["schemas"]["IndexExecutionConfig"];
-        };
-        GraphIndexSourceNodes: {
-            /**
-             * @default document
-             * @enum {string}
-             */
-            model?: "document" | "external";
-            /** @description Template for the source node identifier. */
-            source?: string;
-            /** @description Template for the target node identifier. */
-            target?: string;
-        };
-        GraphIndexSourceEdge: {
-            /** @description Template or literal edge type. */
-            type?: string | number;
-            /** @description Template or numeric literal edge weight. */
-            weight?: string | number;
-            /** @description Metadata object whose string leaves may contain templates. */
-            metadata?: {
-                [key: string]: unknown;
-            };
-        };
-        GraphIndexSourceContext: {
-            /** @description Document fields that source templates may reference through _doc.value. */
-            doc_fields?: string[];
-        };
-        /** @description Graph-specific artifact source. The source owns the payload path and format because different artifact streams in one graph index may require different interpretations. */
-        GraphIndexSource: {
-            /** @description Stable name of the generated graph artifact. */
-            artifact: string;
-            /**
-             * @description Optional JSON path selecting edge records within this artifact payload.
-             * @example $.relations[*]
-             */
-            path?: string;
-            /**
-             * @description Payload interpretation for this artifact source.
-             * @default extraction_relation
-             * @enum {string}
-             */
-            format?: "extraction_relation" | "extraction_graph";
-            /** @description Optional provenance edge type emitted for resolver mention decisions from this source. */
-            mention_edge_type?: string;
-            /** @description Optional node mapping templates for this artifact stream. */
-            nodes?: components["schemas"]["GraphIndexSourceNodes"];
-            /** @description Optional edge mapping templates for this artifact stream. */
-            edge?: components["schemas"]["GraphIndexSourceEdge"];
-            /** @description Document fields explicitly available to this source's mapping templates. */
-            context?: components["schemas"]["GraphIndexSourceContext"];
         };
         /** @description Configuration for a specific edge type */
         EdgeTypeConfig: {
@@ -8602,8 +8517,6 @@ export interface components {
         };
         /** @description Configuration for graph index type */
         GraphIndexConfig: {
-            /** @description Chunk or JSON asset artifact streams whose edge-like values are unioned into this graph index. */
-            sources?: components["schemas"]["GraphIndexSource"][];
             /** @description Configuration for generating node summaries (enables tree navigation in Retrieval Agent) */
             summarizer?: components["schemas"]["GeneratorConfig"];
             /**
@@ -8998,16 +8911,6 @@ export interface components {
             boost?: components["schemas"]["Boost"];
         };
         Query: components["schemas"]["TermQuery"] | components["schemas"]["MatchQuery"] | components["schemas"]["MultiMatchQuery"] | components["schemas"]["MatchPhraseQuery"] | components["schemas"]["PhraseQuery"] | components["schemas"]["MultiPhraseQuery"] | components["schemas"]["FuzzyQuery"] | components["schemas"]["PrefixQuery"] | components["schemas"]["RegexpQuery"] | components["schemas"]["WildcardQuery"] | components["schemas"]["QueryStringQuery"] | components["schemas"]["NumericRangeQuery"] | components["schemas"]["TermRangeQuery"] | components["schemas"]["DateRangeStringQuery"] | components["schemas"]["BooleanQuery"] | components["schemas"]["ConjunctionQuery"] | components["schemas"]["DisjunctionQuery"] | components["schemas"]["MatchAllQuery"] | components["schemas"]["MatchNoneQuery"] | components["schemas"]["DocIdQuery"] | components["schemas"]["BoolFieldQuery"] | components["schemas"]["IPRangeQuery"] | components["schemas"]["GeoBoundingBoxQuery"] | components["schemas"]["GeoDistanceQuery"] | components["schemas"]["GeoBoundingPolygonQuery"] | components["schemas"]["GeoShapeQuery"];
-        /** @description Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics. */
-        IndexRepairStatus: {
-            /**
-             * @description Stable repair state. Internal state-machine phases are intentionally not exposed here.
-             * @enum {string}
-             */
-            state: "rebuilding" | "waiting" | "paused" | "failed";
-            /** @description Whether an operator must resume, retry, reconfigure, or drop the affected index. */
-            action_required: boolean;
-        };
         FullTextIndexStats: {
             /**
              * @description Discriminator for the index stats variant. (enum property replaced by openapi-typescript)
@@ -9028,7 +8931,6 @@ export interface components {
             disk_usage?: number;
             /** @description Whether the index is currently rebuilding */
             rebuilding?: boolean;
-            repair?: components["schemas"]["IndexRepairStatus"];
             /** @description Whether the index is actively rebuilding, replaying, or catching up. */
             backfill_active?: boolean;
             /**
@@ -9230,7 +9132,6 @@ export interface components {
             total_terms?: number;
             /** @description Whether the index enricher is currently backfilling */
             rebuilding?: boolean;
-            repair?: components["schemas"]["IndexRepairStatus"];
             /**
              * Format: uint64
              * @description Number of documents pending enrichment in the WAL
@@ -9366,20 +9267,6 @@ export interface components {
                 [key: string]: unknown;
             };
         };
-        /** @description Materialization status for one configured graph artifact source. */
-        GraphSourceArtifactStatus: {
-            /** @description Configured artifact source name. */
-            name: string;
-            /** @description Configured JSON path, or an empty string when the payload root is consumed. */
-            path: string;
-            /**
-             * @description Payload interpretation configured for this source.
-             * @enum {string}
-             */
-            format: "extraction_relation" | "extraction_graph";
-            /** @description Whether index-wide replay or catch-up can still change this source's visible graph materialization. */
-            materialization_pending: boolean;
-        };
         /** @description Statistics for graph index */
         GraphIndexStats: {
             /**
@@ -9400,7 +9287,6 @@ export interface components {
             };
             /** @description Whether the index is currently rebuilding */
             rebuilding?: boolean;
-            repair?: components["schemas"]["IndexRepairStatus"];
             /** @description Whether the index is actively rebuilding, materializing, or catching up. */
             backfill_active?: boolean;
             /**
@@ -9445,8 +9331,10 @@ export interface components {
             catch_up_applied_sequence?: number;
             /** Format: uint64 */
             catch_up_target_sequence?: number;
-            /** @description Materialization status for every configured graph source artifact. */
-            source_artifacts?: components["schemas"]["GraphSourceArtifactStatus"][];
+            /** @description Graph source artifact materialization status. */
+            source_artifact?: {
+                [key: string]: unknown;
+            };
             /** @description Resolver replay diagnostics for graph materialization. */
             resolver_replay?: {
                 [key: string]: unknown;
@@ -9545,7 +9433,6 @@ export interface components {
             disk_usage?: number;
             /** @description Whether the sidecar is currently rebuilding */
             rebuilding?: boolean;
-            repair?: components["schemas"]["IndexRepairStatus"];
             /** @description Whether the sidecar is actively rebuilding, replaying, or catching up. */
             backfill_active?: boolean;
             /**
@@ -9680,8 +9567,10 @@ export interface components {
             missing_groups?: number;
             /** Format: uint64 */
             unknown_remote_groups?: number;
-            /** @description All source artifact streams used to materialize graph edges, in configured order. */
-            source_artifacts?: components["schemas"]["GraphSourceArtifactStatus"][];
+            /** @description Source artifact stream used to materialize graph edges. */
+            source_artifact?: {
+                [key: string]: unknown;
+            };
             /** @description Graph resolver replay diagnostics. */
             resolver_replay?: {
                 [key: string]: unknown;
@@ -10952,10 +10841,8 @@ export interface components {
             retrieved_ids?: string[];
         };
         InferenceError: {
-            /** @description Stable machine-readable error code when available; legacy responses may contain a human-readable error string. */
+            /** @description Error message */
             error: string;
-            /** @description Optional human-readable detail for the error. */
-            message?: string;
         };
         InferencePredictRequest: {
             /** @description Predictor name from the model catalog. */
@@ -11537,7 +11424,7 @@ export interface components {
         };
         InferenceGenerateRequest: {
             /**
-             * @description Name of the generator model from models_dir/generators/. Use `<owner>/<repo>:<format>:<quantization>` to select a preloaded artifact variant.
+             * @description Name of the generator model from models_dir/generators/
              * @example google/gemma-3-1b-it
              */
             model: string;
@@ -11811,50 +11698,48 @@ export interface components {
         /**
          * @description Optional backend preference for model loading or request execution.
          *     `auto` keeps the node default behavior.
-         *     `pjrt` selects the PJRT backend and requires `pjrt_plugin_path` unless
-         *     the standard `PJRT_PLUGIN_PATH` environment variable is set.
-         *     `webgpu` selects the Wasm/WebGPU backend in Wasm builds. Generation uses
-         *     WebGPU graph partition execution over the Wasm-native base session.
-         *     `mode: "compiled"` may be supplied explicitly but is not required.
+         *     `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via
+         *     `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`,
+         *     `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
+         *     `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with
+         *     `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
          * @enum {string}
          */
-        InferenceModelBackend: "auto" | "native" | "onnx" | "metal" | "cuda" | "pjrt" | "webgpu";
+        InferenceModelBackend: "auto" | "native" | "onnx" | "metal" | "cuda" | "xla" | "webgpu" | "wasm";
         /**
-         * @description Backend priority entry for inference. Device policy is expressed by the
-         *     backend name itself, so device suffixes are not accepted.
-         *
-         *     Backends (depend on build flags):
-         *     - `native` - Native CPU backend
-         *     - `onnx` - ONNX Runtime backend
-         *     - `metal` - Apple Metal backend
-         *     - `cuda` - NVIDIA CUDA backend
-         *     - `pjrt` - PJRT compiled graph backend
-         *     - `webgpu` - WebGPU backend for Wasm builds
-         * @enum {string}
-         */
-        InferenceBackendPriorityEntry: "native" | "onnx" | "metal" | "cuda" | "pjrt" | "webgpu";
-        /**
-         * @description Optional artifact family to select when a model directory contains multiple loadable formats.
+         * @description Optional artifact format preference for loading a model.
          * @enum {string}
          */
         InferenceModelFormat: "gguf" | "onnx" | "safetensors" | "hybrid";
         /**
-         * @description Optional exact quantization selector within the chosen artifact family. Matching is
-         *     case-insensitive and treats `-` and `_` equivalently (for example, `q4_k` matches
-         *     `Q4_K`). The configured model must contain exactly one matching artifact variant.
-         *     Quantization is not valid with the composite `hybrid` format.
-         * @example q4_k
+         * @description Optional quantization preference for loading a model.
+         * @enum {string}
          */
-        InferenceModelQuantization: string;
+        InferenceModelQuantization: "q4_k" | "q8" | "fp16";
+        /**
+         * @description Backend priority entry for model loading. Use `backend` or `backend:device`,
+         *     where device defaults to `auto`.
+         *
+         *     Backends:
+         *     - `native` - Native CPU backend
+         *     - `onnx` - ONNX Runtime backend
+         *     - `metal` - Apple Metal backend
+         *     - `cuda` - NVIDIA CUDA backend
+         *     - `xla` - PJRT/XLA compiled backend
+         *     - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds
+         *
+         *     Devices:
+         *     - `auto` - Auto-detect best available (default)
+         *     - `cuda` - NVIDIA CUDA GPU
+         *     - `tpu` - Google TPU (used by XLA)
+         *     - `cpu` - Force CPU only
+         */
+        InferenceBackendPriorityEntry: string;
         /** @description Model reference used by startup preload and model-loading configuration. */
         InferenceModelRef: {
             kind: components["schemas"]["InferenceModelKind"];
             /**
-             * @description Model name to resolve within the registry for the selected kind, usually in
-             *     `<owner>/<repo>` format. Model-backed requests can address a preloaded artifact
-             *     explicitly as `<owner>/<repo>:<format>[:<quantization>]`; the selector is not
-             *     part of the registry directory name. A bare model name continues to resolve the
-             *     directory's default artifact, so multiple selected variants can remain resident.
+             * @description Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
              * @example antflydb/gemma-e2b
              */
             name: string;
@@ -11904,7 +11789,7 @@ export interface components {
              * @description URL of the Antfly inference embedding/chunking service
              * @example http://localhost:8080
              */
-            api_url?: string;
+            api_url: string;
             /** @description API key used when calling an authenticated shared Antfly inference API. */
             api_key?: string;
             /**
@@ -11932,34 +11817,28 @@ export interface components {
             /** @description S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail. */
             s3_credentials?: components["schemas"]["InferenceCredentials"];
             /**
-             * @description Idle-eviction policy for loaded models (Ollama-compatible). Runtimes that
-             *     support idle eviction may unload a model after this duration of inactivity.
-             *     Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
-             *     Defaults to "5m". Set to "0" to keep loaded models resident without idle
-             *     eviction. For compatibility, some runtimes also eagerly load discovered
-             *     models in this mode. Use `preload` when startup loading must be deterministic.
+             * @description How long to keep models loaded in memory after last use (Ollama-compatible).
+             *     Models are automatically unloaded after this duration of inactivity.
+             *     Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading).
+             *     Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading
+             *     where all models are loaded at startup and never unloaded.
              * @default 5m
              * @example 5m
              */
             keep_alive?: string;
             /**
-             * @description Maximum steady-state number of resident logical model instances. Manager-cached
-             *     models and request-scoped specialized or composite pipelines share this budget.
-             *     A composite pipeline counts as one logical model even when it owns multiple backend
-             *     sessions. At capacity, one replacement may initialize while an idle cached model
-             *     remains available; successful activation evicts that model. If no idle model is
-             *     available, the request receives 503 Service Unavailable. Set to 0 for unlimited.
-             * @default 10
+             * @description Maximum total models loaded across all registry types (embedders, rerankers,
+             *     generators, chunkers, etc.). When the limit is reached, the least-recently-used
+             *     idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
+             * @default 0
              * @example 3
              */
             max_loaded_models?: number;
             /**
-             * @description Number of reusable inference execution slots per model. Some runtimes realize
-             *     each slot as a complete pipeline, increasing both possible concurrency and
-             *     per-model memory; others pool lightweight backend providers, so memory and
-             *     throughput effects are backend-dependent. Generation and backends with shared
-             *     runtime state may remain serialized even when this is greater than one. Model
-             *     residency is controlled separately by `max_loaded_models`.
+             * @description Number of concurrent inference pipelines per model. Each pipeline loads
+             *     a copy of the model, so higher values use more memory but allow more
+             *     concurrent requests. Note: pool_size multiplies per-model memory
+             *     independently of max_loaded_models.
              * @default 1
              * @example 1
              */
@@ -11967,56 +11846,97 @@ export interface components {
             /** @description Native generator prompt KV cache settings. */
             prompt_cache?: components["schemas"]["InferencePromptCacheConfig"];
             /**
-             * @description Explicit backend order for inference. Antfly tries entries in order and uses the first
-             *     backend supported by both the build and the operation. Direct model loading skips
-             *     compiled-only `pjrt` entries and continues to the next backend, while generation uses
-             *     PJRT for compiled graph partitions when it is the first available entry. An empty list
-             *     is invalid. A single entry is a strict backend requirement and causes startup to fail
-             *     when that backend is unavailable or cannot directly load a model session.
+             * @description Backend priority order for model loading with optional device specifiers.
+             *     Format: `backend` or `backend:device` where device defaults to `auto`.
              *
-             *     **Backends** (depend on build flags):
-             *     - `native` - Native CPU backend
-             *     - `onnx` - ONNX Runtime backend
-             *     - `metal` - Apple Metal backend
-             *     - `cuda` - NVIDIA CUDA backend
-             *     - `pjrt` - PJRT compiled graph backend
-             *     - `webgpu` - WebGPU backend for Wasm builds
+             *     Antfly inference tries entries in order and uses the first available backend+device
+             *     combination that supports the model.
+             *
+             *     **Examples**:
+             *     - `["native", "onnx", "xla"]` - Try backends with auto device detection
+             *     - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
+             * @default [
+             *       "native",
+             *       "onnx",
+             *       "xla"
+             *     ]
              * @example [
-             *       "pjrt",
+             *       "cuda",
+             *       "onnx:cuda",
+             *       "xla:tpu",
              *       "native"
              *     ]
              */
             backend_priority?: components["schemas"]["InferenceBackendPriorityEntry"][];
             /**
-             * @description Filesystem path to the PJRT C API plugin used for compiled generation.
-             *     This is the preferred production configuration. `PJRT_PLUGIN_PATH` is
-             *     accepted as a process-level fallback when this field is unset.
-             * @example /usr/local/lib/libtpu.so
-             */
-            pjrt_plugin_path?: string;
-            /**
-             * @description Maximum weighted inference work admitted concurrently by the Zig runtime.
-             *     Requests beyond the limit receive 503 Service Unavailable with Retry-After;
-             *     they are not held in an in-process wait queue. Set to 0 for unlimited.
-             * @default 32
+             * @description Maximum number of concurrent inference requests allowed.
+             *     Additional requests will be queued up to max_queue_size.
+             *     Set to 0 for unlimited (default).
+             * @default 0
              * @example 4
              */
             max_concurrent_requests?: number;
             /**
+             * @description Maximum number of requests to queue when max_concurrent_requests is reached.
+             *     When the queue is full, new requests receive 503 Service Unavailable with Retry-After header.
+             *     Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
+             * @default 0
+             * @example 100
+             */
+            max_queue_size?: number;
+            /**
+             * @description Maximum time to wait for a request to complete, including queue wait time.
+             *     Use Go duration format: "30s", "1m", "0" (no timeout, default).
+             *     Requests exceeding this timeout receive 504 Gateway Timeout.
+             * @default 0
+             * @example 30s
+             */
+            request_timeout?: string;
+            /**
              * @description Models to preload and warm at startup. Generators run a tiny generation
              *     request so native/Metal weights, KV setup, and kernels use the same
              *     budgeted path as request-time generation. Other model kinds use the
-             *     best available warm path for that kind. Specialized request-scoped pipelines
-             *     are capacity-bounded but may still initialize on their first request.
+             *     best available warm path for that kind.
              * @example [
              *       {
              *         "kind": "generator",
              *         "name": "antflydb/gemma-e2b",
-             *         "backend": "metal"
+             *         "backend": "metal",
+             *         "format": "gguf",
+             *         "quantization": "q4_k"
              *       }
              *     ]
              */
             preload?: components["schemas"]["InferenceModelRef"][];
+            /**
+             * @description Maximum memory (in MB) to use for loaded models.
+             *     When this limit is approached, least recently used models are unloaded.
+             *     Set to 0 for unlimited (default). This is an advisory limit - actual memory
+             *     usage depends on model sizes and may temporarily exceed this value.
+             *     Works alongside max_loaded_models for fine-grained control.
+             * @default 0
+             * @example 4096
+             */
+            max_memory_mb?: number;
+            /**
+             * @description Per-model loading strategy overrides. Maps model names to their loading strategy.
+             *     Models not in this map use the default strategy based on keep_alive:
+             *     - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle)
+             *     - If keep_alive="0": eager loading (load at startup, never unload)
+             *
+             *     When a model has strategy "eager" in this map:
+             *     - It is loaded at startup through the same startup warmup path
+             *     - It is never unloaded, even when keep_alive>0 (pinned in memory)
+             *
+             *     This allows mixing eager and lazy models in the same pool.
+             * @example {
+             *       "BAAI/bge-small-en-v1.5": "eager",
+             *       "mirth/chonky-mmbert-small-multilingual-1": "lazy"
+             *     }
+             */
+            model_strategies?: {
+                [key: string]: "eager" | "lazy" | "bounded";
+            };
             /**
              * @description Whether the dashboard should show model download commands.
              *     Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed
@@ -12052,12 +11972,12 @@ export interface components {
              * @description Whether the PJRT/XLA backend is built into this runtime
              * @example false
              */
-            pjrt?: boolean;
+            xla?: boolean;
             /**
-             * @description Whether the WebGPU backend is built into this runtime
+             * @description Whether the WASM backend is built into this runtime
              * @example false
              */
-            webgpu?: boolean;
+            wasm?: boolean;
         };
         /** @description Text content with character offsets. */
         InferenceTextContent: {
@@ -12585,17 +12505,6 @@ export interface components {
             };
             content: {
                 "application/json": components["schemas"]["Error"];
-            };
-        };
-        /** @description Writes are temporarily limited while a dense-index rebuild catches up. */
-        DenseRepairBackpressure: {
-            headers: {
-                /** @description Suggested delay in seconds before retrying. */
-                "Retry-After"?: number;
-                [name: string]: unknown;
-            };
-            content: {
-                "application/json": components["schemas"]["DenseRepairBackpressureError"];
             };
         };
         /** @description Unsupported request media or content encoding */
@@ -13797,7 +13706,6 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
-            429: components["responses"]["DenseRepairBackpressure"];
             500: components["responses"]["InternalServerError"];
         };
     };
@@ -14271,7 +14179,7 @@ export interface operations {
                     "application/json": components["schemas"]["TableRepairJob"];
                 };
             };
-            /** @description Cancellation remains in progress at a running-pass boundary or during the durable named-index pause traversal. */
+            /** @description Cancellation requested; the current running pass has not yet reached a cancellation boundary. */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -15893,17 +15801,6 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
-            503: {
-                headers: {
-                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
-                    "Retry-After"?: string;
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
         };
     };
     chunkText: {
@@ -15940,17 +15837,6 @@ export interface operations {
             /** @description Internal server error */
             500: {
                 headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Service unavailable because request capacity is exhausted. */
-            503: {
-                headers: {
-                    /** @description Recommended delay in seconds before retrying. */
-                    "Retry-After"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -16008,17 +15894,6 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
-            503: {
-                headers: {
-                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
-                    "Retry-After"?: string;
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
         };
     };
     rerankPrompts: {
@@ -16070,11 +15945,9 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
+            /** @description Reranking service unavailable (no models configured) */
             503: {
                 headers: {
-                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
-                    "Retry-After"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -16136,11 +16009,9 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
+            /** @description Generation service unavailable (no models configured) */
             503: {
                 headers: {
-                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
-                    "Retry-After"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -16189,11 +16060,9 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Service unavailable because request queue capacity is exhausted. */
+            /** @description Generation service unavailable */
             503: {
                 headers: {
-                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
-                    "Retry-After"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -16255,11 +16124,9 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
+            /** @description Generation service unavailable (no models configured) */
             503: {
                 headers: {
-                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
-                    "Retry-After"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -16317,11 +16184,9 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
+            /** @description Generation service unavailable (no models configured) */
             503: {
                 headers: {
-                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
-                    "Retry-After"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -16379,11 +16244,9 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
+            /** @description Reader service unavailable (no models configured) */
             503: {
                 headers: {
-                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
-                    "Retry-After"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -16441,11 +16304,9 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
+            /** @description Transcription service unavailable (no models configured) */
             503: {
                 headers: {
-                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
-                    "Retry-After"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -16503,11 +16364,9 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
+            /** @description Extraction service unavailable (no models configured) */
             503: {
                 headers: {
-                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
-                    "Retry-After"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -16597,17 +16456,6 @@ export interface operations {
             /** @description Internal server error */
             500: {
                 headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
-            503: {
-                headers: {
-                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
-                    "Retry-After"?: string;
                     [name: string]: unknown;
                 };
                 content: {

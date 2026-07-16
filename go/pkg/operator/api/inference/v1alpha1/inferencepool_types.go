@@ -28,34 +28,15 @@ const (
 	WorkloadTypeWriteHeavy WorkloadType = "write-heavy"
 	WorkloadTypeBurst      WorkloadType = "burst"
 	WorkloadTypeGeneral    WorkloadType = "general"
-
-	// ManagedInferenceModelsDir is the shared model path used by the operator's
-	// pull init containers, model volume, and supported inference runtime.
-	ManagedInferenceModelsDir = "/models"
 )
 
 // ModelPriority defines the priority of a model for loading/eviction
 type ModelPriority string
 
-// ModelKind identifies the inference API used to warm a model.
-// +kubebuilder:validation:Enum=generator;embedder;reranker;chunker;classifier;recognizer;rewriter;reader;transcriber;extractor
-type ModelKind string
-
 const (
 	ModelPriorityHigh   ModelPriority = "high"
 	ModelPriorityMedium ModelPriority = "medium"
 	ModelPriorityLow    ModelPriority = "low"
-
-	ModelKindGenerator   ModelKind = "generator"
-	ModelKindEmbedder    ModelKind = "embedder"
-	ModelKindReranker    ModelKind = "reranker"
-	ModelKindChunker     ModelKind = "chunker"
-	ModelKindClassifier  ModelKind = "classifier"
-	ModelKindRecognizer  ModelKind = "recognizer"
-	ModelKindRewriter    ModelKind = "rewriter"
-	ModelKindReader      ModelKind = "reader"
-	ModelKindTranscriber ModelKind = "transcriber"
-	ModelKindExtractor   ModelKind = "extractor"
 )
 
 // LoadingStrategy defines how models are loaded
@@ -76,8 +57,7 @@ type InferencePoolSpec struct {
 
 	// Config is the Inference configuration as a JSON string.
 	// This is merged with auto-generated configuration and passed to inference via --config.
-	// Supports inference config options including logging, GPU settings, keep_alive, etc.
-	// models_dir is operator-managed and, when specified, must be "/models".
+	// Supports all inference config options including logging, GPU settings, keep_alive, etc.
 	// Example: {"log": {"level": "debug", "style": "json"}, "gpu": "auto"}
 	// +optional
 	Config string `json:"config,omitempty"`
@@ -152,8 +132,7 @@ type InferencePoolSpec struct {
 
 // ModelConfig defines model loading configuration
 type ModelConfig struct {
-	// Preload lists models to provision on this pool. Eager pools warm them at
-	// startup; lazy and bounded pools pull the artifacts but load on demand.
+	// Preload lists models to preload on this pool
 	Preload []ModelSpec `json:"preload"`
 
 	// LoadingStrategy defines how models are loaded
@@ -181,9 +160,6 @@ type ModelSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
-	// Kind identifies how the model is loaded and warmed by the inference runtime.
-	Kind ModelKind `json:"kind"`
-
 	// Tasks declares the model tasks to write into the pulled model manifest.
 	// For example: ["embed"].
 	// +optional
@@ -198,6 +174,12 @@ type ModelSpec struct {
 	// +kubebuilder:validation:Enum=high;medium;low
 	// +kubebuilder:default=medium
 	Priority ModelPriority `json:"priority,omitempty"`
+
+	// Strategy overrides the pool-level loading strategy for this model.
+	// If not specified, uses the pool's loadingStrategy.
+	// +optional
+	// +kubebuilder:validation:Enum=eager;lazy;bounded
+	Strategy LoadingStrategy `json:"strategy,omitempty"`
 }
 
 // ReplicaConfig defines replica scaling bounds

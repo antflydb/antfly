@@ -319,9 +319,6 @@ pub const LoRATrainOptions = struct {
     /// DDP rank of this process. Rank 0 is responsible for eval logging and checkpoint writes.
     /// Set to 0 for single-device training (default).
     ddp_rank: u32 = 0,
-    /// Number of distributed replicas. PJRT training is disabled when greater than one
-    /// because its gradient path does not provide collective operations.
-    world_size: u32 = 1,
     /// Linear LR warmup steps. LR ramps from 0 → learning_rate over the first warmup_steps
     /// optimizer updates. 0 = no warmup.
     warmup_steps: u32 = 0,

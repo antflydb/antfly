@@ -162,10 +162,6 @@ pub const RawNode = struct {
         try self.raft.compactAppliedLogTo(index);
     }
 
-    pub fn termAt(self: *RawNode, index: types.Index) !types.Term {
-        return self.raft.log.term(index) orelse error.IndexNotFound;
-    }
-
     fn needsStorageAppend(rd: ready_mod.Ready) bool {
         return rd.entries.len > 0 or
             rd.snapshot != null or

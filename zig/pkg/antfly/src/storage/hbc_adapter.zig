@@ -2238,7 +2238,7 @@ pub const HBCIndex = struct {
 
     /// Test-only fault/cache-coherency control. Production cache policy is
     /// owned by ResourceManager.
-    pub fn setCacheEnabled(self: *HBCIndex, enabled: bool) void {
+    fn setCacheEnabled(self: *HBCIndex, enabled: bool) void {
         if (self.cache_enabled == enabled) return;
         self.cache_enabled = enabled;
         if (!enabled) {

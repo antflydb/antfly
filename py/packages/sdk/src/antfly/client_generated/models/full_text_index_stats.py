@@ -14,7 +14,6 @@ if TYPE_CHECKING:
     from ..models.full_text_index_stats_promotion import FullTextIndexStatsPromotion
     from ..models.full_text_index_stats_resolution import FullTextIndexStatsResolution
     from ..models.full_text_index_stats_text_merge import FullTextIndexStatsTextMerge
-    from ..models.index_repair_status import IndexRepairStatus
 
 
 T = TypeVar("T", bound="FullTextIndexStats")
@@ -29,8 +28,6 @@ class FullTextIndexStats:
         total_indexed (int | Unset): Number of documents in the index
         disk_usage (int | Unset): Size of the index in bytes
         rebuilding (bool | Unset): Whether the index is currently rebuilding
-        repair (IndexRepairStatus | Unset): Compact user-facing state for an automatic index repair. Detailed
-            diagnostics are available from the admin API and metrics.
         backfill_active (bool | Unset): Whether the index is actively rebuilding, replaying, or catching up.
         backfill_progress (float | Unset): Progress of ongoing rebuild as fraction [0.0, 1.0]
         backfill_items_processed (int | Unset): Number of documents indexed during current rebuild
@@ -82,7 +79,6 @@ class FullTextIndexStats:
     total_indexed: int | Unset = UNSET
     disk_usage: int | Unset = UNSET
     rebuilding: bool | Unset = UNSET
-    repair: IndexRepairStatus | Unset = UNSET
     backfill_active: bool | Unset = UNSET
     backfill_progress: float | Unset = UNSET
     backfill_items_processed: int | Unset = UNSET
@@ -134,10 +130,6 @@ class FullTextIndexStats:
         disk_usage = self.disk_usage
 
         rebuilding = self.rebuilding
-
-        repair: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.repair, Unset):
-            repair = self.repair.to_dict()
 
         backfill_active = self.backfill_active
 
@@ -240,8 +232,6 @@ class FullTextIndexStats:
             field_dict["disk_usage"] = disk_usage
         if rebuilding is not UNSET:
             field_dict["rebuilding"] = rebuilding
-        if repair is not UNSET:
-            field_dict["repair"] = repair
         if backfill_active is not UNSET:
             field_dict["backfill_active"] = backfill_active
         if backfill_progress is not UNSET:
@@ -329,7 +319,6 @@ class FullTextIndexStats:
         from ..models.full_text_index_stats_promotion import FullTextIndexStatsPromotion
         from ..models.full_text_index_stats_resolution import FullTextIndexStatsResolution
         from ..models.full_text_index_stats_text_merge import FullTextIndexStatsTextMerge
-        from ..models.index_repair_status import IndexRepairStatus
 
         d = dict(src_dict)
         index_type = FullTextIndexStatsIndexType(d.pop("index_type"))
@@ -341,13 +330,6 @@ class FullTextIndexStats:
         disk_usage = d.pop("disk_usage", UNSET)
 
         rebuilding = d.pop("rebuilding", UNSET)
-
-        _repair = d.pop("repair", UNSET)
-        repair: IndexRepairStatus | Unset
-        if isinstance(_repair, Unset):
-            repair = UNSET
-        else:
-            repair = IndexRepairStatus.from_dict(_repair)
 
         backfill_active = d.pop("backfill_active", UNSET)
 
@@ -453,7 +435,6 @@ class FullTextIndexStats:
             total_indexed=total_indexed,
             disk_usage=disk_usage,
             rebuilding=rebuilding,
-            repair=repair,
             backfill_active=backfill_active,
             backfill_progress=backfill_progress,
             backfill_items_processed=backfill_items_processed,

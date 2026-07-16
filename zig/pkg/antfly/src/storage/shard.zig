@@ -195,11 +195,9 @@ pub fn decodeSplitDeltaAlloc(alloc: Allocator, seq: u64, data: []const u8) !Spli
     const nd = std.mem.littleToNative(u32, @as(*align(1) const u32, @ptrCast(data[pos..][0..4])).*);
     pos += 4;
 
-    if (nw > (data.len - pos) / 8 or nd > (data.len - pos) / 4) return error.InvalidDelta;
     var writes = try alloc.alloc(OwnedKVPair, nw);
-    var writes_initialized: usize = 0;
     errdefer {
-        for (writes[0..writes_initialized]) |w| {
+        for (writes[0..nw]) |w| {
             alloc.free(w.key);
             alloc.free(w.value);
         }
@@ -207,48 +205,29 @@ pub fn decodeSplitDeltaAlloc(alloc: Allocator, seq: u64, data: []const u8) !Spli
     }
 
     for (0..nw) |idx| {
-        if (data.len - pos < 4) return error.InvalidDelta;
         const kl = std.mem.littleToNative(u32, @as(*align(1) const u32, @ptrCast(data[pos..][0..4])).*);
         pos += 4;
-        if (kl > data.len - pos) return error.InvalidDelta;
         const key = try alloc.dupe(u8, data[pos..][0..kl]);
         pos += kl;
-        if (data.len - pos < 4) {
-            alloc.free(key);
-            return error.InvalidDelta;
-        }
         const vl = std.mem.littleToNative(u32, @as(*align(1) const u32, @ptrCast(data[pos..][0..4])).*);
         pos += 4;
-        if (vl > data.len - pos) {
-            alloc.free(key);
-            return error.InvalidDelta;
-        }
-        const val = alloc.dupe(u8, data[pos..][0..vl]) catch |err| {
-            alloc.free(key);
-            return err;
-        };
+        const val = try alloc.dupe(u8, data[pos..][0..vl]);
         pos += vl;
         writes[idx] = .{ .key = key, .value = val };
-        writes_initialized += 1;
     }
 
     var del_list = try alloc.alloc([]u8, nd);
-    var deletes_initialized: usize = 0;
     errdefer {
-        for (del_list[0..deletes_initialized]) |d| alloc.free(d);
+        for (del_list[0..nd]) |d| alloc.free(d);
         alloc.free(del_list);
     }
 
     for (0..nd) |idx| {
-        if (data.len - pos < 4) return error.InvalidDelta;
         const kl = std.mem.littleToNative(u32, @as(*align(1) const u32, @ptrCast(data[pos..][0..4])).*);
         pos += 4;
-        if (kl > data.len - pos) return error.InvalidDelta;
         del_list[idx] = try alloc.dupe(u8, data[pos..][0..kl]);
         pos += kl;
-        deletes_initialized += 1;
     }
-    if (pos != data.len) return error.InvalidDelta;
 
     return .{
         .sequence = seq,
@@ -473,12 +452,6 @@ pub const ShardManager = struct {
         const end = try self.alloc.dupe(u8, byte_range.end);
         errdefer self.alloc.free(end);
 
-        self.replaceByteRangeOwned(start, end);
-    }
-
-    /// Replaces the in-memory range without allocation. Ownership of both
-    /// buffers transfers to the shard manager.
-    pub fn replaceByteRangeOwned(self: *ShardManager, start: []u8, end: []u8) void {
         self.alloc.free(self.owned_range_start);
         self.alloc.free(self.owned_range_end);
         self.owned_range_start = start;
