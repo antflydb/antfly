@@ -21595,6 +21595,12 @@ fn completeDocumentExtractionGeneratedText(
 ) !void {
     const active_runtime = runtime orelse return;
     const producer = active_runtime.config.asset_producer orelse return;
+    var source_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source_bytes, &source_digest, .{});
+    const source_hex = std.fmt.bytesToHex(source_digest, .lower);
+    const profile_source_id = source_hex[0..16];
+    const document_started_ns = platform_time.monotonicNs();
+    defer logLegacyDocumentOcrProfile(profile_source_id, extraction.units, document_started_ns);
     var pdf_session: ?document_extraction_mod.PdfRenderSession = if (std.mem.eql(u8, extraction.route_type, "pdf"))
         try document_extraction_mod.PdfRenderSession.init(alloc, source_bytes)
     else
@@ -21605,7 +21611,9 @@ fn completeDocumentExtractionGeneratedText(
             unit.ocr_attempted = true;
             unit.ocr_render_dpi = if (std.mem.eql(u8, extraction.route_type, "pdf")) config.ocr_render_dpi else null;
             const rendered = if (std.mem.eql(u8, extraction.route_type, "pdf")) blk: {
+                const render_started_ns = platform_time.monotonicNs();
                 const page = pdf_session.?.renderPagePngAdaptiveAlloc(alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels, config.ocr_max_rendered_dimension) catch |err| {
+                    logLegacyOcrRenderProfile(profile_source_id, unit.page_number, config.ocr_render_dpi, null, null, null, null, @errorName(err), render_started_ns);
                     if (enrichment_runtime_mod.isRetryableEnrichmentError(err)) return err;
                     try setGeneratedUnitFailureStage(alloc, unit, .ocr, "render");
                     try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, err);
@@ -21615,6 +21623,7 @@ fn completeDocumentExtractionGeneratedText(
                 unit.ocr_rendered_width = page.width;
                 unit.ocr_rendered_height = page.height;
                 unit.ocr_rendered_bytes = page.png.len;
+                logLegacyOcrRenderProfile(profile_source_id, unit.page_number, config.ocr_render_dpi, page.effective_dpi, page.width, page.height, page.png.len, null, render_started_ns);
                 break :blk page.png;
             } else null;
             defer if (rendered) |png| alloc.free(png);
@@ -21623,6 +21632,9 @@ fn completeDocumentExtractionGeneratedText(
             else
                 try documentGeneratedTextPartsJsonAlloc(alloc, extraction.route_type, source_content_type, unit.*);
             defer alloc.free(parts_json);
+            const request_bytes = parts_json.len + config.ocr_config_json.len;
+            logLegacyOcrRequestProfile(profile_source_id, unit.page_number, request_bytes);
+            const inference_started_ns = platform_time.monotonicNs();
             const produced = producer.produce(alloc, .{
                 .producer_type = .reader,
                 .config_json = config.ocr_config_json,
@@ -21630,11 +21642,13 @@ fn completeDocumentExtractionGeneratedText(
                 .source_parts_json = parts_json,
                 .content_type = "text/plain",
             }) catch |err| {
+                logLegacyOcrInferenceProfile(profile_source_id, unit.page_number, request_bytes, null, @errorName(err), inference_started_ns);
                 if (enrichment_runtime_mod.isRetryableEnrichmentError(err)) return err;
                 try setGeneratedUnitFailureStage(alloc, unit, .ocr, "inference");
                 try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, err);
                 continue;
             };
+            logLegacyOcrInferenceProfile(profile_source_id, unit.page_number, request_bytes, produced.len, null, inference_started_ns);
             errdefer alloc.free(produced);
             applyGeneratedUnitText(alloc, unit, produced, "ocr_text", "completed", .ocr, config.ocr_quality, document_extraction_mod.effectiveOcrPrompt(config)) catch |err| {
                 if (enrichment_runtime_mod.isRetryableEnrichmentError(err)) return err;
@@ -21658,6 +21672,68 @@ fn completeDocumentExtractionGeneratedText(
             try applyGeneratedUnitText(alloc, unit, produced, "transcript_text", "completed", .transcript, config.ocr_quality, "");
         }
     }
+}
+
+fn legacyDocumentReadProfileEnabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_READ_PROFILE");
+}
+
+fn legacyDocumentProfileElapsedMs(started_ns: u64) f64 {
+    const finished_ns = platform_time.monotonicNs();
+    return @as(f64, @floatFromInt(finished_ns -| started_ns)) / @as(f64, std.time.ns_per_ms);
+}
+
+fn logLegacyOcrRenderProfile(
+    source_id: []const u8,
+    page_number: ?u32,
+    requested_dpi: u16,
+    effective_dpi: ?u16,
+    width: ?u32,
+    height: ?u32,
+    encoded_bytes: ?usize,
+    failure: ?[]const u8,
+    started_ns: u64,
+) void {
+    if (!legacyDocumentReadProfileEnabled()) return;
+    std.log.info("read-profile phase=pdf_render source_sha256={s} page={?d} requested_dpi={d} effective_dpi={?d} width={?d} height={?d} encoded_bytes={?d} failure={?s} elapsed_ms={d:.3}", .{
+        source_id, page_number, requested_dpi, effective_dpi, width, height, encoded_bytes, failure, legacyDocumentProfileElapsedMs(started_ns),
+    });
+}
+
+fn logLegacyOcrRequestProfile(source_id: []const u8, page_number: ?u32, request_bytes: usize) void {
+    if (!legacyDocumentReadProfileEnabled()) return;
+    std.log.info("read-profile phase=ocr_request source_sha256={s} page={?d} batch_size=1 request_bytes={d} mode=serial serial_fallback_reason=legacy_unit_path", .{
+        source_id, page_number, request_bytes,
+    });
+}
+
+fn logLegacyOcrInferenceProfile(
+    source_id: []const u8,
+    page_number: ?u32,
+    request_bytes: usize,
+    output_bytes: ?usize,
+    failure: ?[]const u8,
+    started_ns: u64,
+) void {
+    if (!legacyDocumentReadProfileEnabled()) return;
+    std.log.info("read-profile phase=ocr_batch source_sha256={s} first_page={?d} last_page={?d} batch_size=1 request_bytes={d} mode=serial serial_fallback_reason=legacy_unit_path output_bytes={?d} failure={?s} elapsed_ms={d:.3}", .{
+        source_id, page_number, page_number, request_bytes, output_bytes, failure, legacyDocumentProfileElapsedMs(started_ns),
+    });
+}
+
+fn logLegacyDocumentOcrProfile(source_id: []const u8, units: []const document_extraction_mod.Unit, started_ns: u64) void {
+    if (!legacyDocumentReadProfileEnabled()) return;
+    var attempted: usize = 0;
+    var selected: usize = 0;
+    var failed: usize = 0;
+    for (units) |unit| {
+        if (unit.ocr_attempted) attempted += 1;
+        if (unit.ocr_used) selected += 1;
+        if (unit.ocr_failure_stage != null) failed += 1;
+    }
+    std.log.info("read-profile phase=ocr_document source_sha256={s} units={d} attempted={d} selected={d} failed={d} elapsed_ms={d:.3}", .{
+        source_id, units.len, attempted, selected, failed, legacyDocumentProfileElapsedMs(started_ns),
+    });
 }
 
 const GeneratedUnitTextKind = enum { ocr, transcript };
