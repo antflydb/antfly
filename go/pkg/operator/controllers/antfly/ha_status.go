@@ -300,8 +300,19 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		holder = strings.TrimSpace(identity.CurrentPrimaryID)
 	}
 	scope, ok := haFencingLeaseReconcileScope(cluster, holder)
+	bootstrapUnknownBoundary := false
 	if !ok {
-		return nil
+		identity := haReplicationIdentity(ha)
+		if identity == nil || cluster.Status.HAStatus.PrimaryLSN != 0 || holder != localNodeID ||
+			holder != strings.TrimSpace(identity.CurrentPrimaryID) {
+			return nil
+		}
+		// LSN zero is an unknown boundary, not a safe promotion boundary. It is
+		// accepted only to create the configured primary's first authority Lease.
+		// If the Lease already exists, its positive persisted boundary must be
+		// recovered below and can never be overwritten with zero.
+		scope = haFencingLeaseScopeForIdentity(identity, 0)
+		bootstrapUnknownBoundary = true
 	}
 
 	now := metav1.NowMicro()
@@ -361,6 +372,20 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	if currentHolder == "" || transitions <= 0 ||
 		lease.Annotations[haFencingLeaseAnnotationTopologyID] != haFencingLeaseTopologyID(cluster) {
 		return nil
+	}
+	if bootstrapUnknownBoundary {
+		persistedBoundary, parseErr := strconv.ParseUint(
+			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationPrimaryLSN]), 10, 64,
+		)
+		if parseErr != nil || persistedBoundary == 0 {
+			return nil
+		}
+		persistedScope := scope
+		persistedScope.primaryLSN = persistedBoundary
+		if !haLeaseFenceScopeMatches(lease, persistedScope) {
+			return nil
+		}
+		scope = persistedScope
 	}
 	preserveTransferredScope := false
 	if lease.Annotations[haFencingLeaseAnnotationTransferCommitted] == "true" && currentHolder != "" &&
@@ -705,7 +730,7 @@ func haCurrentFencingLeaseScope(cluster *antflyv1.AntflyCluster) (haFencingLease
 		return haFencingLeaseScope{}, false
 	}
 	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
-	if identity == nil {
+	if identity == nil || cluster.Status.HAStatus.PrimaryLSN == 0 {
 		return haFencingLeaseScope{}, false
 	}
 	return haFencingLeaseScope{

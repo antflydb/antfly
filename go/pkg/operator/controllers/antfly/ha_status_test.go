@@ -5221,6 +5221,31 @@ func TestReconcileHAFencingLeaseBootstrapsEmptyPrimaryAtLSNZero(t *testing.T) {
 	}
 }
 
+func TestReconcileHAFencingLeasePreservesPositiveBoundaryWhenPrimaryLSNIsUnknown(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Spec.HighAvailability.Identity.ShardID = 10
+	cluster.Spec.HighAvailability.Identity.TableID = 20
+	cluster.Status.HAStatus = &antflyv1.HAStatus{PrimaryLSN: 17}
+	lease := haFenceLease(cluster, time.Now().Add(-time.Second), 30, 1, "primary-a")
+	cluster.Status.HAStatus.PrimaryLSN = 0
+	reconciler := testHAReconciler(t, cluster, lease)
+
+	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("renew fencing lease with temporarily unknown primary LSN: %v", err)
+	}
+
+	observed := &coordinationv1.Lease{}
+	if err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, observed); err != nil {
+		t.Fatalf("get renewed fencing lease: %v", err)
+	}
+	if got := observed.Annotations[haFencingLeaseAnnotationPrimaryLSN]; got != "17" {
+		t.Fatalf("unknown status must not regress the persisted positive boundary, got %q", got)
+	}
+	if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.After(lease.Spec.RenewTime.Time) {
+		t.Fatalf("expected positive-boundary lease renewal to advance, old=%#v new=%#v", lease.Spec.RenewTime, observed.Spec.RenewTime)
+	}
+}
+
 func TestReconcileHAFencingLeaseSkipsWhenAdminExecutionDisabled(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 	cluster.Spec.HighAvailability.Admin.ExecutePlannedActions = false
