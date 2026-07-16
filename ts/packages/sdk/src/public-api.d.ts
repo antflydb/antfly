@@ -1255,10 +1255,14 @@ export interface paths {
         put?: never;
         /**
          * Cancel a table repair job
-         * @description Cancels a queued table repair job. If a repair pass is already running,
-         *     the response returns the current running state; cancellation is applied
-         *     only at pass boundaries so the API never reports a committed in-flight
-         *     pass as cancelled.
+         * @description Requests cancellation at a bounded repair boundary. For a named-index
+         *     job, the server also traverses the table in bounded passes, durably
+         *     pauses matching automatic repair, and asks an active owner to yield.
+         *     The job remains nonterminal until that traversal completes, so a
+         *     `cancelled` response means detached reconstruction will not restart
+         *     without an explicit resume action. If the API process restarts during
+         *     the traversal, server maintenance resumes it automatically; clients do
+         *     not need to advance or repeat the cancellation request.
          */
         post: operations["cancelTableRepairJob"];
         delete?: never;
@@ -3148,10 +3152,17 @@ export interface components {
             /** @description Opaque cursor returned by a prior repair response. */
             cursor?: string;
             /**
-             * @description Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
+             * @description Force one named-index replacement generation even when no repair debt is currently recorded. The force is dispatched once across the initial bounded group traversal; later convergence passes only observe that generation. Only applies to target=index.
              * @default false
              */
             force?: boolean;
+            /**
+             * @description Applies one control to an existing named index repair. Requires target=index and index; cannot be combined with force, kind, or cursor.
+             * @enum {string}
+             */
+            control?: "pause_automatic" | "resume_automatic" | "cancel_current_attempt";
+            /** @description Optional opaque generation fence for a repair control. A stale value is rejected instead of affecting a newer repair. */
+            repair_id?: string;
             /**
              * Format: uint32
              * @description Maximum artifact repair records to attempt. For target=index, any positive value permits one named index repair.
@@ -3216,6 +3227,11 @@ export interface components {
              * @description Number of selected indexes that were already degraded or quarantined before repair.
              */
             indexes_degraded: number;
+            /**
+             * Format: uint64
+             * @description Number of existing index repairs that accepted the requested control.
+             */
+            controls_applied: number;
             /**
              * Format: uint32
              * @description Effective repair limit.
@@ -3301,12 +3317,12 @@ export interface components {
              * @description Effective per-pass repair limit.
              */
             limit: number;
-            /** @description Whether the job forces a named index rebuild. */
+            /** @description Whether the next bounded pass still needs to dispatch the job's one forced named-index generation. */
             force: boolean;
             result: components["schemas"]["TableRepairRunResult"];
             /** @description Last stable job-level error code. */
             last_error?: string | null;
-            /** @description Whether cancellation has been requested for a running pass. Running passes finish at a bounded repair boundary before the job transitions to cancelled. */
+            /** @description Whether cancellation is pending. For a named-index job, cancellation durably pauses the matching repair in every group and becomes terminal only after that bounded traversal completes. */
             cancel_requested: boolean;
             /**
              * Format: uint64
@@ -4485,6 +4501,19 @@ export interface components {
             deleted?: number;
             /** @description Number of documents successfully transformed */
             transformed?: number;
+        };
+        /** @description A dense-index rebuild is retaining replay history and the node has reached its hard safety budget. */
+        DenseRepairBackpressureError: {
+            /** @enum {string} */
+            code: "dense_repair_backpressure";
+            message: string;
+            /** @enum {boolean} */
+            retryable: true;
+            /**
+             * Format: uint32
+             * @description Suggested delay before retrying the write.
+             */
+            retry_after_ms: number;
         };
         /**
          * @description Cross-table batch operations in a single atomic transaction.
@@ -8923,6 +8952,16 @@ export interface components {
             boost?: components["schemas"]["Boost"];
         };
         Query: components["schemas"]["TermQuery"] | components["schemas"]["MatchQuery"] | components["schemas"]["MultiMatchQuery"] | components["schemas"]["MatchPhraseQuery"] | components["schemas"]["PhraseQuery"] | components["schemas"]["MultiPhraseQuery"] | components["schemas"]["FuzzyQuery"] | components["schemas"]["PrefixQuery"] | components["schemas"]["RegexpQuery"] | components["schemas"]["WildcardQuery"] | components["schemas"]["QueryStringQuery"] | components["schemas"]["NumericRangeQuery"] | components["schemas"]["TermRangeQuery"] | components["schemas"]["DateRangeStringQuery"] | components["schemas"]["BooleanQuery"] | components["schemas"]["ConjunctionQuery"] | components["schemas"]["DisjunctionQuery"] | components["schemas"]["MatchAllQuery"] | components["schemas"]["MatchNoneQuery"] | components["schemas"]["DocIdQuery"] | components["schemas"]["BoolFieldQuery"] | components["schemas"]["IPRangeQuery"] | components["schemas"]["GeoBoundingBoxQuery"] | components["schemas"]["GeoDistanceQuery"] | components["schemas"]["GeoBoundingPolygonQuery"] | components["schemas"]["GeoShapeQuery"];
+        /** @description Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics. */
+        IndexRepairStatus: {
+            /**
+             * @description Stable repair state. Internal state-machine phases are intentionally not exposed here.
+             * @enum {string}
+             */
+            state: "rebuilding" | "waiting" | "paused" | "failed";
+            /** @description Whether an operator must resume, retry, reconfigure, or drop the affected index. */
+            action_required: boolean;
+        };
         FullTextIndexStats: {
             /**
              * @description Discriminator for the index stats variant. (enum property replaced by openapi-typescript)
@@ -8943,6 +8982,7 @@ export interface components {
             disk_usage?: number;
             /** @description Whether the index is currently rebuilding */
             rebuilding?: boolean;
+            repair?: components["schemas"]["IndexRepairStatus"];
             /** @description Whether the index is actively rebuilding, replaying, or catching up. */
             backfill_active?: boolean;
             /**
@@ -9144,6 +9184,7 @@ export interface components {
             total_terms?: number;
             /** @description Whether the index enricher is currently backfilling */
             rebuilding?: boolean;
+            repair?: components["schemas"]["IndexRepairStatus"];
             /**
              * Format: uint64
              * @description Number of documents pending enrichment in the WAL
@@ -9299,6 +9340,7 @@ export interface components {
             };
             /** @description Whether the index is currently rebuilding */
             rebuilding?: boolean;
+            repair?: components["schemas"]["IndexRepairStatus"];
             /** @description Whether the index is actively rebuilding, materializing, or catching up. */
             backfill_active?: boolean;
             /**
@@ -9445,6 +9487,7 @@ export interface components {
             disk_usage?: number;
             /** @description Whether the sidecar is currently rebuilding */
             rebuilding?: boolean;
+            repair?: components["schemas"]["IndexRepairStatus"];
             /** @description Whether the sidecar is actively rebuilding, replaying, or catching up. */
             backfill_active?: boolean;
             /**
@@ -12519,6 +12562,17 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Writes are temporarily limited while a dense-index rebuild catches up. */
+        DenseRepairBackpressure: {
+            headers: {
+                /** @description Suggested delay in seconds before retrying. */
+                "Retry-After"?: number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["DenseRepairBackpressureError"];
+            };
+        };
         /** @description Unsupported request media or content encoding */
         UnsupportedMediaType: {
             headers: {
@@ -13718,6 +13772,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["DenseRepairBackpressure"];
             500: components["responses"]["InternalServerError"];
         };
     };
@@ -14191,7 +14246,7 @@ export interface operations {
                     "application/json": components["schemas"]["TableRepairJob"];
                 };
             };
-            /** @description Cancellation requested; the current running pass has not yet reached a cancellation boundary. */
+            /** @description Cancellation remains in progress at a running-pass boundary or during the durable named-index pause traversal. */
             202: {
                 headers: {
                     [name: string]: unknown;
