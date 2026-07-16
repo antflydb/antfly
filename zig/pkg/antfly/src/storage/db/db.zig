@@ -21387,7 +21387,7 @@ fn computeDocumentExtractionAssetRequestDerived(
     ) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
-            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, @errorName(err), "remote content download failed", artifact_writes, artifact_delete_keys);
+            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, @errorName(err), "remote content download failed", "remote_content_download", artifact_writes, artifact_delete_keys);
             return;
         },
     };
@@ -21396,7 +21396,7 @@ fn computeDocumentExtractionAssetRequestDerived(
         .http_error => |http_error| {
             const message = try std.fmt.allocPrint(alloc, "{s}: HTTP {d}", .{ http_error.message, http_error.status });
             defer alloc.free(message);
-            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, "RemoteDocumentFetchFailed", message, artifact_writes, artifact_delete_keys);
+            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, "RemoteDocumentFetchFailed", message, "remote_content_http", artifact_writes, artifact_delete_keys);
             return;
         },
     };
@@ -21406,7 +21406,7 @@ fn computeDocumentExtractionAssetRequestDerived(
     var extraction = document_extraction_mod.extractDownloadedAlloc(alloc, downloaded_mut, source_url, config) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
-            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, @errorName(err), "document extraction failed", artifact_writes, artifact_delete_keys);
+            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, @errorName(err), "document extraction failed", documentExtractionFailureStage(err, "document_extraction"), artifact_writes, artifact_delete_keys);
             return;
         },
     };
@@ -23662,6 +23662,44 @@ fn documentExtractionManifestPayloadAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
+fn documentExtractionFailureStage(err: anyerror, fallback: []const u8) []const u8 {
+    return switch (err) {
+        error.InvalidFlateStream,
+        error.MalformedLzw,
+        error.MalformedPredictorData,
+        error.MalformedRunLength,
+        error.MalformedAscii85,
+        error.MalformedAsciiHex,
+        error.UnsupportedStreamFilter,
+        error.UnsupportedPredictor,
+        error.DecodedStreamTooLarge,
+        => "pdf_stream_decode",
+        error.UnsupportedPdfRendering,
+        error.RenderedPageTooLarge,
+        error.InvalidPageBox,
+        => "pdf_page_render",
+        error.InvalidType1,
+        error.TruncatedType1,
+        error.UnsupportedType1,
+        => "pdf_font_outline",
+        error.InvalidPdfHeader,
+        error.MissingPdfEof,
+        error.MissingStartXref,
+        error.MissingTrailer,
+        error.InvalidStartXref,
+        error.InvalidXref,
+        error.CyclicXref,
+        error.UnsupportedXrefFormat,
+        error.ExpectedTrailerDict,
+        error.MalformedXrefStream,
+        error.MalformedXrefTable,
+        error.InvalidObjectStream,
+        error.InvalidPageTree,
+        => "pdf_structure",
+        else => fallback,
+    };
+}
+
 fn documentExtractionFailureManifestPayloadAlloc(
     alloc: Allocator,
     doc_key: []const u8,
@@ -23671,6 +23709,7 @@ fn documentExtractionFailureManifestPayloadAlloc(
     to_generation: u64,
     error_code: []const u8,
     error_message: []const u8,
+    error_stage: []const u8,
 ) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -23705,6 +23744,7 @@ fn documentExtractionFailureManifestPayloadAlloc(
     var error_first = true;
     try appendJsonFieldString(alloc, &out, &error_first, "code", error_code);
     try appendJsonFieldString(alloc, &out, &error_first, "message", error_message);
+    try appendJsonFieldString(alloc, &out, &error_first, "stage", error_stage);
     try out.append(alloc, '}');
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
@@ -23723,6 +23763,7 @@ fn appendDocumentExtractionFailureManifest(
     to_generation: u64,
     error_code: []const u8,
     error_message: []const u8,
+    error_stage: []const u8,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
 ) !void {
@@ -23747,6 +23788,7 @@ fn appendDocumentExtractionFailureManifest(
         to_generation,
         error_code,
         error_message,
+        error_stage,
     );
     defer alloc.free(manifest);
     try artifact_writes.append(alloc, .{
@@ -28582,6 +28624,63 @@ const DerivedCoverageDocOutcome = struct {
     outcome: DerivedCoverageOutcome,
 };
 
+fn shouldReplaceDerivedCoverageOutcome(existing: ?DerivedCoverageOutcome, target: DerivedCoverageOutcome) bool {
+    if (existing == null) return true;
+    if (existing.? == target) return false;
+    // Generated index application sees a failed artifact as an empty primary
+    // write and would otherwise relabel it as skipped after the enrichment
+    // runtime has recorded the terminal producer failure. A later produced
+    // outcome still proves recovery and is allowed to replace the failure.
+    return !(existing.? == .terminal_failed and target == .skipped);
+}
+
+fn documentExtractionManifestIsTerminalFailure(alloc: Allocator, manifest_json: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const object = parsed.value.object;
+    if (object.get("last_error") != null) return true;
+    if (object.get("merge_status")) |value| {
+        if (value == .string and std.mem.eql(u8, value.string, "failed")) return true;
+    }
+    if (object.get("merge_plan")) |value| {
+        if (value == .object) if (value.object.get("status")) |status| {
+            if (status == .string and std.mem.eql(u8, status.string, "failed")) return true;
+        };
+    }
+    if (object.get("route_type")) |value| {
+        if (value == .string and std.mem.eql(u8, value.string, "error")) return true;
+    }
+    const chunk_count = jsonObjectU64(object, "chunk_count") catch 0;
+    const ocr_failed_count = jsonObjectU64(object, "ocr_failed_count") catch 0;
+    if (chunk_count == 0 and ocr_failed_count > 0) return true;
+    return false;
+}
+
+fn emptyArtifactCoverageOutcome(
+    ctx: *const AsyncContext,
+    asset_artifact_names: []const []const u8,
+    doc_key: []const u8,
+) !DerivedCoverageOutcome {
+    for (asset_artifact_names) |artifact_name| {
+        const manifest_key = try internal_keys.artifactNamedPrefixAlloc(ctx.alloc, doc_key, "asset", artifact_name);
+        defer ctx.alloc.free(manifest_key);
+        const manifest = ctx.store.get(ctx.alloc, manifest_key) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        defer ctx.alloc.free(manifest);
+        if (try documentExtractionManifestIsTerminalFailure(ctx.alloc, manifest)) return .terminal_failed;
+    }
+    return .skipped;
+}
+
+test "derived coverage keeps terminal failures over downstream skips" {
+    try std.testing.expect(!shouldReplaceDerivedCoverageOutcome(.terminal_failed, .skipped));
+    try std.testing.expect(shouldReplaceDerivedCoverageOutcome(.terminal_failed, .produced));
+    try std.testing.expect(shouldReplaceDerivedCoverageOutcome(.produced, .skipped));
+}
+
 fn setDerivedCoverageOutcomes(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
@@ -28631,7 +28730,7 @@ fn setDerivedCoverageOutcomes(
             defer alloc.free(value);
             break :blk std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome;
         } else null;
-        if (existing_outcome == null or existing_outcome.? != transition.outcome) {
+        if (shouldReplaceDerivedCoverageOutcome(existing_outcome, transition.outcome)) {
             if (existing_outcome) |previous| {
                 const previous_index = @intFromEnum(previous);
                 if (counter_counts[previous_index] == 0) return error.InvalidDerivedCoverageCounter;
@@ -28661,6 +28760,11 @@ fn accountDenseCoverage(
     writes: []const mapper.DenseEmbeddingWrite,
 ) !void {
     const external = ctx.index_manager.denseIndexUsesExternalCoverage(index_name);
+    const asset_artifact_names = try ctx.index_manager.assetArtifactsForVectorIndex(ctx.alloc, index_name);
+    defer {
+        for (asset_artifact_names) |name| ctx.alloc.free(name);
+        ctx.alloc.free(asset_artifact_names);
+    }
     var produced = std.StringHashMapUnmanaged(void).empty;
     defer produced.deinit(ctx.alloc);
     for (writes) |write| {
@@ -28673,7 +28777,7 @@ fn accountDenseCoverage(
             if (doc.action == .delete or internal_keys.isInternalUserKey(doc.key) or !ctx.index_manager.byte_range.contains(doc.key)) continue;
             try outcomes.append(ctx.alloc, .{
                 .doc_key = doc.key,
-                .outcome = if (produced.contains(doc.key)) .produced else .skipped,
+                .outcome = if (produced.contains(doc.key)) .produced else try emptyArtifactCoverageOutcome(ctx, asset_artifact_names, doc.key),
             });
         }
     } else {
@@ -28693,6 +28797,11 @@ fn accountSparseCoverage(
     writes: []const mapper.SparseEmbeddingWrite,
 ) !void {
     const external = ctx.index_manager.sparseIndexUsesExternalCoverage(index_name);
+    const asset_artifact_names = try ctx.index_manager.assetArtifactsForVectorIndex(ctx.alloc, index_name);
+    defer {
+        for (asset_artifact_names) |name| ctx.alloc.free(name);
+        ctx.alloc.free(asset_artifact_names);
+    }
     var produced = std.StringHashMapUnmanaged(void).empty;
     defer produced.deinit(ctx.alloc);
     for (writes) |write| {
@@ -28705,7 +28814,7 @@ fn accountSparseCoverage(
             if (doc.action == .delete or internal_keys.isInternalUserKey(doc.key) or !ctx.index_manager.byte_range.contains(doc.key)) continue;
             try outcomes.append(ctx.alloc, .{
                 .doc_key = doc.key,
-                .outcome = if (produced.contains(doc.key)) .produced else .skipped,
+                .outcome = if (produced.contains(doc.key)) .produced else try emptyArtifactCoverageOutcome(ctx, asset_artifact_names, doc.key),
             });
         }
     } else {

@@ -887,6 +887,172 @@ def test_artifact_backed_embedding_table_provisions_atomically(
     )
 
 
+def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
+    stateful_api, openai_embedder
+):
+    """Produced, skipped, and failed sources settle every coverage policy."""
+
+    def indexes_for_policy(policy: str) -> dict:
+        units = _document_units_index_config()
+        return {
+            "document_units": units,
+            "document_text": {
+                "type": "full_text",
+                "field": "text",
+                "artifact_name": "document_chunks_v1",
+                "enrichments": [
+                    {
+                        "name": "document_units_v1",
+                        "kind": "asset",
+                        "field": "url",
+                        "content_type": "application/json",
+                        "producer_json": json.dumps(
+                            units["artifact"]["producer_json"], separators=(",", ":")
+                        ),
+                    },
+                    {
+                        "name": "document_chunks_v1",
+                        "kind": "chunk",
+                        "field": "text",
+                        "source_artifact_name": "document_units_v1",
+                        "chunk_size": 256,
+                        "chunk_overlap": 0,
+                        "full_text_index": True,
+                    },
+                ],
+            },
+            "document_vectors": {
+                "name": "document_vectors",
+                "type": "embeddings",
+                "coverage_policy": policy,
+                "field": "embedding",
+                "dimension": 3,
+                "distance_metric": "cosine",
+                "embedding_name": "document_chunk_dense_v1",
+                "source_artifact_name": "document_chunks_v1",
+                "embedder": {
+                    "provider": "openai",
+                    "model": "text-embedding-3-small",
+                    "url": openai_embedder,
+                    "dimensions": 3,
+                },
+                "enrichments": [
+                    {
+                        "name": "document_chunk_dense_v1",
+                        "kind": "embedding",
+                        "field": "text",
+                        "source_artifact_name": "document_chunks_v1",
+                        "expected_dims": 3,
+                    }
+                ],
+            },
+        }
+
+    tables: dict[str, str] = {}
+    bad_pdf = "data:application/pdf;base64," + base64.b64encode(
+        b"%PDF-1.7\nnot a complete pdf"
+    ).decode("ascii")
+    records = {
+        "produced": {
+            "filename": "produced.txt",
+            "mime_type": "text/plain",
+            "version": "1",
+            "url": "data:text/plain;base64,cHJvZHVjZWQgY292ZXJhZ2UgZG9jdW1lbnQ=",
+        },
+        "skipped": {
+            "filename": "intentional.skip",
+            "mime_type": "application/x-antfly-intentional-skip",
+            "version": "1",
+            "url": "data:application/octet-stream;base64,c2tpcA==",
+        },
+        "failed": {
+            "filename": "failed.pdf",
+            "mime_type": "application/pdf",
+            "version": "1",
+            "url": bad_pdf,
+        },
+    }
+
+    for policy in ("strict", "partial", "best_effort"):
+        table_name = f"artifact_terminal_{policy}_{time.time_ns()}"
+        tables[policy] = table_name
+        created = stateful_api.post(
+            f"/tables/{table_name}",
+            {"num_shards": 1, "indexes": indexes_for_policy(policy)},
+        )
+        assert created.get("name") == table_name or created.get("table_name") == table_name
+        merged = stateful_api.linear_merge(
+            table_name, records=records, sync_level="full_index"
+        )
+        assert merged["upserted"] == 3
+        cleanup = stateful_api.linear_merge(
+            table_name,
+            records={},
+            last_merged_id=merged["next_cursor"],
+            sync_level="full_index",
+        )
+        assert cleanup["upserted"] == 0
+
+    def expected_status(policy: str) -> dict | None:
+        current = stateful_api.get_index(tables[policy], "document_vectors")
+        status = current.get("status", {})
+        coverage = status.get("coverage", {})
+        expected_covered = {"strict": 1, "partial": 2, "best_effort": 3}[policy]
+        expected_complete = policy == "best_effort"
+        if not (
+            coverage.get("source_total") == 3
+            and coverage.get("produced") == 1
+            and coverage.get("skipped") == 1
+            and coverage.get("terminal_failed") == 1
+            and coverage.get("covered") == expected_covered
+            and coverage.get("pending") == 3 - expected_covered
+            and coverage.get("observation_complete") is True
+            and coverage.get("complete") is expected_complete
+            and coverage.get("healthy") is False
+            and status.get("backfill_active") is False
+        ):
+            return None
+        if expected_complete:
+            if coverage.get("degraded") is not True:
+                return None
+        elif status.get("backfill_state") != "failed":
+            return None
+        return current
+
+    for policy in tables:
+        settled = wait_until(
+            lambda policy=policy: expected_status(policy),
+            timeout_s=90.0,
+            interval_s=0.5,
+        )
+        assert settled is not None, json.dumps(
+            stateful_api.get_index(tables[policy], "document_vectors"), sort_keys=True
+        )
+
+    failed_manifest = stateful_api.get(
+        f"{_document_artifact_path(tables['strict'], 'failed', DOCUMENT_UNITS_ARTIFACT)}?detail=raw"
+    )
+    assert failed_manifest["merge_status"] == "failed"
+    assert json.loads(failed_manifest["manifest_json"])["last_error"]["stage"] == "pdf_structure"
+    skipped_manifest = stateful_api.get(
+        f"{_document_artifact_path(tables['strict'], 'skipped', DOCUMENT_UNITS_ARTIFACT)}?detail=raw"
+    )
+    assert skipped_manifest["merge_status"] == "converged"
+    assert skipped_manifest["route_type"] == "unsupported"
+    assert skipped_manifest["unit_count"] == 0
+
+    stateful_api.restart_server()
+    for policy in tables:
+        settled = wait_until(
+            lambda policy=policy: expected_status(policy),
+            timeout_s=90.0,
+            interval_s=1.0,
+        )
+        assert settled is not None, json.dumps(
+            stateful_api.get_index(tables[policy], "document_vectors"), sort_keys=True
+        )
+
+
 def test_artifact_backed_chunk_embeddings_are_semantic_searchable(stateful_api, openai_embedder):
     table_name = f"artifact_backed_chunk_embeddings_{time.time_ns()}"
     created = stateful_api.create_table(table_name, num_shards=1)

@@ -2370,6 +2370,7 @@ fn processDocumentExtractionAsset(
                 from_generation,
                 window,
             );
+            try queueTerminalCoverageForRequest(runtime, window, request);
             return;
         },
     };
@@ -2395,6 +2396,7 @@ fn processDocumentExtractionAsset(
                 from_generation,
                 window,
             );
+            try queueTerminalCoverageForRequest(runtime, window, request);
             return;
         },
     };
@@ -2466,6 +2468,7 @@ fn processDocumentExtractionAsset(
             from_generation,
             window,
         );
+        try queueTerminalCoverageForRequest(runtime, window, request);
         return;
     };
 
@@ -2639,6 +2642,7 @@ fn processDocumentExtractionAsset(
             from_generation,
             window,
         );
+        try queueTerminalCoverageForRequest(runtime, window, request);
         return;
     };
     try flushRuntimeKVBatchAndClear(runtime, &writes, &deletes);
@@ -2729,7 +2733,14 @@ fn documentExtractionFailureStage(err: anyerror, fallback: []const u8) []const u
         error.UnsupportedType1,
         => "pdf_font_outline",
         error.InvalidPdfHeader,
+        error.MissingPdfEof,
+        error.MissingStartXref,
+        error.MissingTrailer,
+        error.InvalidStartXref,
         error.InvalidXref,
+        error.CyclicXref,
+        error.UnsupportedXrefFormat,
+        error.ExpectedTrailerDict,
         error.MalformedXrefStream,
         error.MalformedXrefTable,
         error.InvalidObjectStream,
@@ -7368,9 +7379,9 @@ fn materializedChunkEmptyCoverageOutcome(
     if (chunk_cfg.source_artifact_name.len == 0) return .skipped;
     const manifest_key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", chunk_cfg.source_artifact_name);
     defer runtime.alloc.free(manifest_key);
-    const manifest = storeGetAlloc(runtime, manifest_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => return .skipped,
+    const manifest = storeGetAllocWithRetry(runtime, manifest_key) catch |err| switch (err) {
+        error.NotFound => return .skipped,
+        else => return err,
     };
     defer runtime.alloc.free(manifest);
     return documentExtractionEmptyCoverageOutcome(runtime.alloc, manifest);
@@ -8633,6 +8644,19 @@ fn coverageOutcomeName(outcome: CoverageOutcome) []const u8 {
     return @tagName(outcome);
 }
 
+fn coverageOutcomePriority(outcome: CoverageOutcome) u8 {
+    return switch (outcome) {
+        .skipped => 0,
+        .produced => 1,
+        .terminal_failed => 2,
+    };
+}
+
+test "terminal coverage outcome dominates later empty-consumer outcomes" {
+    try std.testing.expect(coverageOutcomePriority(.terminal_failed) > coverageOutcomePriority(.produced));
+    try std.testing.expect(coverageOutcomePriority(.produced) > coverageOutcomePriority(.skipped));
+}
+
 fn initCoverageOutcomeTransition(runtime: *EnrichmentRuntime, index_name: []const u8, generation: u64, doc_key: []const u8, outcome: CoverageOutcome) !CoverageOutcomeTransition {
     var transition: CoverageOutcomeTransition = .{
         .index_name = try runtime.alloc.dupe(u8, index_name),
@@ -8730,7 +8754,12 @@ fn queueDerivedCoverageOutcomeForIndex(runtime: *EnrichmentRuntime, window: *Gen
     if (window.coverage_transition_keys.getKey(identity_key)) |existing_key| {
         for (window.coverage_transitions.items) |*queued| {
             if (std.mem.eql(u8, queued.marker_key, existing_key)) {
-                queued.outcome = outcome;
+                // One replay window can contain the asset producer and all of its
+                // downstream consumers. Do not let a later empty-consumer skip
+                // hide a failure already reported by the producer.
+                if (coverageOutcomePriority(outcome) > coverageOutcomePriority(queued.outcome)) {
+                    queued.outcome = outcome;
+                }
                 break;
             }
         }
@@ -8855,7 +8884,11 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
         else
             null;
 
-        if (existing_outcome == null or existing_outcome.? != target_outcome) {
+        // Producer failures are authoritative for the current source version.
+        // A later successful replay may replace one, but an empty downstream
+        // consumer must not relabel the same failure as an intentional skip.
+        const weaker_than_existing_failure = existing_outcome == .terminal_failed and target_outcome == .skipped;
+        if (!weaker_than_existing_failure and (existing_outcome == null or existing_outcome.? != target_outcome)) {
             if (existing_outcome) |previous_outcome| {
                 const previous_state_index = try counterState(runtime, &counter_states, &counter_indexes, transition, previous_outcome);
                 if (counter_states.items[previous_state_index].count == 0) return error.InvalidDerivedCoverageCounter;
@@ -8939,6 +8972,18 @@ test "derived coverage outcome transitions are exclusive and idempotent" {
     try applyCoverageOutcomeTransitionsForIndex(&runtime, &.{transition});
     try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.produced)]));
     try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.terminal_failed)]));
+
+    transition.outcome = .skipped;
+    try applyCoverageOutcomeTransitionsForIndex(&runtime, &.{transition});
+    const terminal_outcome = try storeGetAlloc(&runtime, transition.marker_key);
+    defer runtime.alloc.free(terminal_outcome);
+    try std.testing.expectEqualStrings("terminal_failed", terminal_outcome);
+    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.skipped)]));
+
+    transition.outcome = .produced;
+    try applyCoverageOutcomeTransitionsForIndex(&runtime, &.{transition});
+    try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.produced)]));
+    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.terminal_failed)]));
 }
 
 test "enrichment applied checkpoint stays degraded until runtime status clears" {
@@ -9066,6 +9111,20 @@ fn storeGetAlloc(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
     defer txn.abort();
     const raw = try txn.get(key);
     return try runtime.alloc.dupe(u8, raw);
+}
+
+fn storeGetAllocWithRetry(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        return storeGetAlloc(runtime, key) catch |err| switch (err) {
+            error.WriterLocked => {
+                if (attempt >= writer_locked_retry_count) return err;
+                backoffWriterLockRetry();
+                continue;
+            },
+            else => return err,
+        };
+    }
 }
 
 fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !void {

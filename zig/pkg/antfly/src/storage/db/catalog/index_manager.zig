@@ -5878,6 +5878,31 @@ pub const IndexManager = struct {
         return try names.toOwnedSlice(alloc);
     }
 
+    pub fn assetArtifactsForVectorIndex(self: *const IndexManager, alloc: Allocator, index_name: []const u8) ![][]u8 {
+        var names = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (names.items) |name| alloc.free(name);
+            names.deinit(alloc);
+        }
+        for (self.enrichments.items) |enrichment| {
+            if (enrichment.kind != .asset) continue;
+            const indexes = try self.vectorIndexesDependingOnArtifact(alloc, enrichment.name);
+            defer {
+                for (indexes) |name| alloc.free(name);
+                alloc.free(indexes);
+            }
+            var depends = false;
+            for (indexes) |name| {
+                if (std.mem.eql(u8, name, index_name)) {
+                    depends = true;
+                    break;
+                }
+            }
+            if (depends) try names.append(alloc, try alloc.dupe(u8, enrichment.name));
+        }
+        return try names.toOwnedSlice(alloc);
+    }
+
     pub fn coverageGenerationForIndex(self: *const IndexManager, index_name: []const u8) ?u64 {
         const cfg = self.get(index_name) orelse return null;
         if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) return null;
