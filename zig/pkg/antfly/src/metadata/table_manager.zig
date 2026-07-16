@@ -279,6 +279,9 @@ pub const RuntimeGroupStatusReport = struct {
     topology_generation: u64 = 0,
     lsm_root_generation: u64 = 0,
     status_generation: u64 = 0,
+    /// Exact primary source-document count reported by newer data nodes.
+    /// Optional so mixed-version metadata snapshots remain readable.
+    source_doc_count: ?u64 = null,
     doc_count: u64 = 0,
     disk_bytes: u64 = 0,
     created_at_millis: u64 = 0,

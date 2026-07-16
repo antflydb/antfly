@@ -725,23 +725,38 @@ def test_artifact_backed_embedding_table_provisions_atomically(
         for enrichment in table_status["indexes"][index_name]["enrichments"]
     )
 
-    doc_key = "atomic-doc"
-    batch = stateful_api.batch_write(
+    doc_key = "atomic-doc-a"
+    second_doc_key = "atomic-doc-b"
+    merged = stateful_api.linear_merge(
         table_name,
-        inserts={
+        records={
             doc_key: {
                 "filename": "atomic.txt",
                 "mime_type": "text/plain",
                 "version": "1",
                 "url": "data:text/plain;base64,YXRvbWljIHF1YWxpZmljYXRpb24gZ2FtbWE=",
-            }
+            },
+            second_doc_key: {
+                "filename": "secondary.txt",
+                "mime_type": "text/plain",
+                "version": "1",
+                "url": "data:text/plain;base64,c2Vjb25kYXJ5IGNvdmVyYWdlIGRlbHRh",
+            },
         },
         sync_level="full_index",
     )
-    assert batch["inserted"] == 1
+    assert merged["upserted"] == 2
     assert (
         wait_until(
             lambda: _manifest_ready(stateful_api, table_name, doc_key),
+            timeout_s=60.0,
+            interval_s=0.5,
+        )
+        is not None
+    )
+    assert (
+        wait_until(
+            lambda: _manifest_ready(stateful_api, table_name, second_doc_key),
             timeout_s=60.0,
             interval_s=0.5,
         )
@@ -770,6 +785,30 @@ def test_artifact_backed_embedding_table_provisions_atomically(
             interval_s=0.5,
         )
         is not None
+    )
+    coverage = wait_until(
+        lambda: (
+            status
+            if (
+                (status := stateful_api.get_index(table_name, "document_vectors"))
+                .get("status", {})
+                .get("coverage", {})
+                .get("source_total")
+                == 2
+                and status["status"]["coverage"].get("produced") == 2
+                and status["status"]["coverage"].get("covered") == 2
+                and status["status"]["coverage"].get("observation_complete")
+                is True
+                and status["status"]["coverage"].get("complete") is True
+                and status["status"]["coverage"].get("healthy") is True
+            )
+            else None
+        ),
+        timeout_s=60.0,
+        interval_s=0.5,
+    )
+    assert coverage is not None, stateful_api.get_index(
+        table_name, "document_vectors"
     )
     assert (
         wait_until(

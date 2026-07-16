@@ -10048,6 +10048,7 @@ fn runtimeStatusReportFromLocalStatus(
         .topology_generation = status.metadata.topology_generation,
         .lsm_root_generation = status.metadata.lsm_root_generation,
         .status_generation = status.metadata.status_generation,
+        .source_doc_count = status.stats.source_doc_count,
         .doc_count = status.stats.doc_count,
         .disk_bytes = status.disk_bytes,
         .created_at_millis = status.created_at_millis,

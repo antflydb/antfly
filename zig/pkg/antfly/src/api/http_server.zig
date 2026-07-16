@@ -1799,7 +1799,9 @@ pub const ApiHttpServer = struct {
 
     fn runtimeStatusNeedsDenseVisibilityRefresh(status: runtime_status.LocalTableRuntimeStatus) bool {
         if (status.stats.repair_degraded or status.stats.repair_issue_count != 0) return false;
-        const has_primary_facts = status.stats.doc_identity.live_ordinals != 0 or status.stats.doc_count != 0;
+        const has_primary_facts = status.stats.source_doc_count != 0 or
+            status.stats.doc_identity.live_ordinals != 0 or
+            status.stats.doc_count != 0;
         for (status.stats.indexes) |item| {
             if (item.kind != .dense_vector) continue;
             if (indexHasDenseVisibilityFacts(item)) continue;
@@ -2037,7 +2039,12 @@ pub const ApiHttpServer = struct {
                 .node_id = report.node_id,
             },
             .stats = .{
-                .source_doc_count = report.doc_identity.live_ordinals,
+                .source_doc_count = report.source_doc_count orelse blk: {
+                    if (report.doc_identity.scanned_primary_docs > 0) {
+                        break :blk report.doc_identity.scanned_primary_docs;
+                    }
+                    break :blk report.doc_identity.live_ordinals;
+                },
                 .doc_count = report.doc_count,
                 .index_count = report.index_count,
                 .indexes = indexes,
@@ -24432,6 +24439,7 @@ test "remote runtime status reports replay debt separately from active catch-up"
         .node_id = 30,
         .updated_at_ns = 99,
         .freshness = "fresh",
+        .source_doc_count = 41,
         .doc_count = 56_250,
         .index_count = 1,
         .async_dense_catch_up_active = false,
@@ -24481,7 +24489,7 @@ test "remote runtime status reports replay debt separately from active catch-up"
     try std.testing.expectEqual(@as(u64, 2), index.coverage_terminal_failed_count);
     try std.testing.expectEqual(@as(u64, 0x1234), index.coverage_config_hash);
     try std.testing.expect(index.coverage_summary_ready);
-    try std.testing.expectEqual(@as(u64, 40), status.stats.source_doc_count);
+    try std.testing.expectEqual(@as(u64, 41), status.stats.source_doc_count);
     try std.testing.expectEqual(@as(u64, 1), status.stats.doc_identity.namespace_table_id);
     try std.testing.expectEqual(@as(u64, 10), status.stats.doc_identity.namespace_shard_id);
     try std.testing.expectEqual(@as(u64, 1001), status.stats.doc_identity.namespace_range_id);
@@ -24491,6 +24499,18 @@ test "remote runtime status reports replay debt separately from active catch-up"
     try std.testing.expectEqual(@as(u64, 3), status.stats.doc_set_planning.ordinal_list_count);
     try std.testing.expectEqual(@as(u64, 1), status.stats.doc_set_planning.missing_ordinal_coverage_count);
     try std.testing.expectEqual(@as(u64, 2), status.stats.doc_set_planning.stale_identity_generation_rejection_count);
+
+    var legacy_report = report;
+    legacy_report.source_doc_count = null;
+    legacy_report.doc_identity.scanned_primary_docs = 39;
+    var legacy_status = try ApiHttpServer.localRuntimeStatusFromRemoteReport(alloc, legacy_report);
+    defer legacy_status.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 39), legacy_status.stats.source_doc_count);
+
+    legacy_report.doc_identity.scanned_primary_docs = 0;
+    var oldest_status = try ApiHttpServer.localRuntimeStatusFromRemoteReport(alloc, legacy_report);
+    defer oldest_status.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 40), oldest_status.stats.source_doc_count);
 }
 
 test "api index status ignores propagated runtime status from removed owner" {
