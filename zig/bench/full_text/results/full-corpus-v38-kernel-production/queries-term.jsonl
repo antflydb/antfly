@@ -1,0 +1,10 @@
+{"elapsed_ns": 69917, "engine": "antfly-zig", "operation": "top_k", "query": "V1 TERM text alpha", "query_index": 0, "repetition": 0, "schema_version": 1}
+{"elapsed_ns": 33709, "engine": "antfly-zig", "operation": "top_k", "query": "V1 TERM text gamma", "query_index": 1, "repetition": 0, "schema_version": 1}
+{"elapsed_ns": 33375, "engine": "antfly-zig", "operation": "top_k", "query": "V1 TERM text gamma", "query_index": 1, "repetition": 1, "schema_version": 1}
+{"elapsed_ns": 67791, "engine": "antfly-zig", "operation": "top_k", "query": "V1 TERM text alpha", "query_index": 0, "repetition": 1, "schema_version": 1}
+{"elapsed_ns": 38834, "engine": "antfly-zig", "operation": "top_k", "query": "V1 TERM text gamma", "query_index": 1, "repetition": 2, "schema_version": 1}
+{"elapsed_ns": 67833, "engine": "antfly-zig", "operation": "top_k", "query": "V1 TERM text alpha", "query_index": 0, "repetition": 2, "schema_version": 1}
+{"elapsed_ns": 66916, "engine": "antfly-zig", "operation": "top_k", "query": "V1 TERM text alpha", "query_index": 0, "repetition": 3, "schema_version": 1}
+{"elapsed_ns": 38125, "engine": "antfly-zig", "operation": "top_k", "query": "V1 TERM text gamma", "query_index": 1, "repetition": 3, "schema_version": 1}
+{"elapsed_ns": 68625, "engine": "antfly-zig", "operation": "top_k", "query": "V1 TERM text alpha", "query_index": 0, "repetition": 4, "schema_version": 1}
+{"elapsed_ns": 33333, "engine": "antfly-zig", "operation": "top_k", "query": "V1 TERM text gamma", "query_index": 1, "repetition": 4, "schema_version": 1}

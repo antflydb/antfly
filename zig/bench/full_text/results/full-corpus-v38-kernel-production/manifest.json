@@ -1,0 +1,381 @@
+{
+  "bm25": {
+    "b": 0.75,
+    "k1": 1.2
+  },
+  "build": {
+    "argv": [
+      "tools/run_search_kernel_benchmark.py",
+      "--corpus",
+      "/private/tmp/antfly-wiki-full-canonical.jsonl",
+      "--output",
+      "/private/tmp/antfly-wiki-full-production-v38-cross-engine-final",
+      "--index-dir",
+      "/private/tmp/antfly-wiki-full-production-v38-compact-header-index",
+      "--segment-mode",
+      "production",
+      "--reuse-index",
+      "--antfly-manifest",
+      "/private/tmp/antfly-wiki-full-production-v38-compact-header/index-manifest.json",
+      "--comparator-index-dir",
+      "/private/tmp/antfly-wiki-full-production-tantivy-v3",
+      "--comparator-manifest",
+      "/private/tmp/antfly-wiki-full-production-v32-cross-engine/comparator-index-manifest.json",
+      "--comparator-query-command",
+      "search-benchmark-game/engines/tantivy-kernel/target/release/tantivy-kernel-benchmark query {comparator_index} --bm25-k1 1.2 --bm25-b 0.75",
+      "--warmup-queries",
+      "100",
+      "--warmup-seconds",
+      "1",
+      "--repetitions",
+      "5",
+      "--resource-profile-seconds",
+      "3"
+    ],
+    "optimization": "ReleaseFast",
+    "python": "3.9.6 (default, Apr 30 2025, 02:07:17) \n[Clang 17.0.0 (clang-1700.0.13.5)]"
+  },
+  "comparator": true,
+  "comparator_index_manifest": {
+    "analysis": {
+      "filters": [
+        "ascii_lowercase"
+      ],
+      "name": "simple",
+      "stemming": false,
+      "stop_words": false,
+      "tokenizer": "unicode_words"
+    },
+    "bm25": {
+      "b": 0.75,
+      "k1": 1.2
+    },
+    "corpus": {
+      "empty_text_documents": 391079,
+      "indexed_documents": 5032105,
+      "input_documents": 5032105,
+      "normalization": "trim_ascii_whitespace_drop_blank_append_lf_json_or_plain_text",
+      "ordinal_assignment": "zero_based_normalized_input_order_u32",
+      "rejected_documents": 0,
+      "sha256": "9078d9ea4783ab764fe246046efdc8062692f07afdd7c8749a74ebfe05c51ff4",
+      "uncompressed_bytes": 8473678432
+    },
+    "engine": "tantivy-0.25",
+    "index_elapsed_ns": 550184738333,
+    "ingestion_batch_size": 5000,
+    "layout": {
+      "global_doc_count": 5032105,
+      "segment_count": 20,
+      "segments": [
+        {
+          "deleted_count": 0,
+          "doc_count": 2560000,
+          "segment_id": "02ca6631fdff4703bbb60444590ee534"
+        },
+        {
+          "deleted_count": 0,
+          "doc_count": 320000,
+          "segment_id": "b9c4e671a7fa4e13aa2de157a9aedb28"
+        },
+        {
+          "deleted_count": 0,
+          "doc_count": 320000,
+          "segment_id": "b3d45b1580614d98bc13b02dc2a105de"
+        },
+        {
+          "deleted_count": 0,
+          "doc_count": 320000,
+          "segment_id": "8b03512b38d54d14901d4f431554474d"
+        },
+        {
+          "deleted_count": 0,
+          "doc_count": 320000,
+          "segment_id": "a3d6f617c64847358ad20dbeb0e482e4"
+        },
+        {
+          "deleted_count": 0,
+          "doc_count": 320000,
+          "segment_id": "c53c7d0f8066423789aeb8380e936e51"
+        },
+        {
+          "deleted_count": 0,
+          "doc_count": 320000,
+          "segment_id": "a3370de11e794cea84cc1cdb20d308d5"
+        },
+        {
+          "deleted_count": 0,
+          "doc_count": 320000,
+          "segment_id": "c59b22653ce945baa6ee25c443c55824"
+        },
+        {
+          "deleted_count": 0,
+          "doc_count": 40000,
+          "segment_id": "5056120c2c8d412091a3c63ca9edf2fd"
+        },
+        {
+          "deleted_count": 0,
+          "doc_count": 40000,
+          "segment_id": "95192d3d14bb48c7b6ece4f791e19630"
+        },
+        {
+          "deleted_count": 0,
+          "doc_count": 40000,
+          "segment_id": "986c739e160a4ec7a48e43f97702b994"
+        },
+        {
+          "deleted_count": 0,
+          "doc_count": 40000,
+          "segment_id": "40b162d24d8e468fab45aab1b4692565"
+        },
+        {
+          "deleted_count": 0,
+          "doc_count": 40000,
+          "segment_id": "120b3d9af5e84fa0a322f5b72eebaba8"
+        },
+        {
+          "deleted_count": 0,
+          "doc_count": 5000,
+          "segment_id": "97776a8343dc4163a48c05c6e301ba1d"
+        },
+        {
+          "deleted_count": 0,
+          "doc_count": 5000,
+          "segment_id": "86bfa513eba0458c8c41626df2a6627c"
+        },
+        {
+          "deleted_count": 0,
+          "doc_count": 5000,
+          "segment_id": "0faaee16393d4420a095aec20b74f385"
+        },
+        {
+          "deleted_count": 0,
+          "doc_count": 5000,
+          "segment_id": "c25e3dd750ec4347af6a3392aef87837"
+        },
+        {
+          "deleted_count": 0,
+          "doc_count": 5000,
+          "segment_id": "43f6e167a7c5408ebe62c9b96c13ad7f"
+        },
+        {
+          "deleted_count": 0,
+          "doc_count": 5000,
+          "segment_id": "806cd0650b4943b0bd886f587d9b427d"
+        },
+        {
+          "deleted_count": 0,
+          "doc_count": 2105,
+          "segment_id": "8ba721d62f7f46a0b60157c241359833"
+        }
+      ],
+      "total_bytes": 3252077340
+    },
+    "query_grammar": "V1",
+    "result_schema_version": 1,
+    "schema_version": 1,
+    "segment_mode": "production"
+  },
+  "corpus": {
+    "nonblank_lines": 5032105,
+    "path": "/private/tmp/antfly-wiki-full-canonical.jsonl",
+    "source_bytes": 8473678432,
+    "source_sha256": "9078d9ea4783ab764fe246046efdc8062692f07afdd7c8749a74ebfe05c51ff4"
+  },
+  "engine": "antfly-zig",
+  "environment": {
+    "logical_cpus": 14,
+    "machine": "arm64",
+    "platform": "macOS-15.6.1-arm64-arm-64bit",
+    "processor": "arm"
+  },
+  "git": {
+    "commit": "7eb4beb73ac1772ccd4762d075d206481fa1922b",
+    "dirty": false
+  },
+  "index_manifest": {
+    "analysis": {
+      "filters": [
+        "ascii_lowercase"
+      ],
+      "name": "simple",
+      "stemming": false,
+      "stop_words": false,
+      "tokenizer": "unicode_words"
+    },
+    "bm25": {
+      "b": 0.75,
+      "k1": 1.2
+    },
+    "corpus": {
+      "empty_text_documents": 391079,
+      "indexed_documents": 5032105,
+      "input_documents": 5032105,
+      "max_text_bytes": null,
+      "normalization": "trim_ascii_whitespace_drop_blank_append_lf_json_or_plain_text",
+      "ordinal_assignment": "zero_based_normalized_input_order_u32",
+      "rejected_documents": 0,
+      "sha256": "9078d9ea4783ab764fe246046efdc8062692f07afdd7c8749a74ebfe05c51ff4",
+      "truncated_documents": 0,
+      "uncompressed_bytes": 8473678432
+    },
+    "index_elapsed_ns": 421345216000,
+    "indexing_scope": "production_full_text_index_only",
+    "ingestion_batch_size": 5000,
+    "inverted_wire_version": 38,
+    "layout": {
+      "global_doc_count": 5032105,
+      "merge_policy": {
+        "delete_reclaim_weight": 2,
+        "floor_segment_size": 16777216,
+        "max_merge_at_once": 10,
+        "max_segment_size": 5368709120,
+        "max_segments_per_tier": 10,
+        "size_weight": 1,
+        "skew_weight": 1
+      },
+      "merge_stats": {
+        "backpressure_events": 0,
+        "backpressure_ns": 0,
+        "completed_merges": 267,
+        "deferred_for_pressure": 0,
+        "enabled": false,
+        "failed_merges": 0,
+        "in_flight_merges": 0,
+        "in_flight_segments": 0,
+        "last_merge_elapsed_ns": 1300020000,
+        "last_merge_error": "",
+        "last_merge_input_bytes": 92412310,
+        "last_merge_input_segments": 2,
+        "last_merge_output_bytes": 91717344,
+        "last_merge_output_segments": 1,
+        "last_merge_peak_task_alloc_bytes": 0,
+        "max_pending_bytes": 0,
+        "max_pending_segments": 0,
+        "merge_elapsed_ns_total": 237151042000,
+        "merge_input_bytes_total": 17902875053,
+        "merge_input_segments_total": 1326,
+        "merge_output_bytes_total": 17263657081,
+        "merge_output_segments_total": 267,
+        "merge_peak_task_alloc_bytes": 0,
+        "pending_bytes": 0,
+        "pending_heap_bytes": 0,
+        "pending_indexes": 0,
+        "pending_mmap_bytes": 0,
+        "pending_segments": 0,
+        "quarantined_merges": 0,
+        "quarantined_segments": 0,
+        "retry_after_ns": 0,
+        "skipped_stale_merges": 0
+      },
+      "segments": [
+        {
+          "bytes": 729058597,
+          "deleted_count": 0,
+          "doc_count": 996411,
+          "file_backed": true,
+          "live_doc_count": 996411,
+          "segment_id": 724
+        },
+        {
+          "bytes": 402112400,
+          "deleted_count": 0,
+          "doc_count": 658075,
+          "file_backed": true,
+          "live_doc_count": 658075,
+          "segment_id": 801
+        },
+        {
+          "bytes": 622644128,
+          "deleted_count": 0,
+          "doc_count": 872963,
+          "file_backed": true,
+          "live_doc_count": 872963,
+          "segment_id": 911
+        },
+        {
+          "bytes": 505708633,
+          "deleted_count": 0,
+          "doc_count": 670463,
+          "file_backed": true,
+          "live_doc_count": 670463,
+          "segment_id": 1052
+        },
+        {
+          "bytes": 340505184,
+          "deleted_count": 0,
+          "doc_count": 528043,
+          "file_backed": true,
+          "live_doc_count": 528043,
+          "segment_id": 1226
+        },
+        {
+          "bytes": 440493314,
+          "deleted_count": 0,
+          "doc_count": 724045,
+          "file_backed": true,
+          "live_doc_count": 724045,
+          "segment_id": 1297
+        },
+        {
+          "bytes": 176590749,
+          "deleted_count": 0,
+          "doc_count": 300000,
+          "file_backed": true,
+          "live_doc_count": 300000,
+          "segment_id": 1298
+        },
+        {
+          "bytes": 59495840,
+          "deleted_count": 0,
+          "doc_count": 100000,
+          "file_backed": true,
+          "live_doc_count": 100000,
+          "segment_id": 1321
+        },
+        {
+          "bytes": 17490670,
+          "deleted_count": 0,
+          "doc_count": 32105,
+          "file_backed": true,
+          "live_doc_count": 32105,
+          "segment_id": 1335
+        },
+        {
+          "bytes": 91717344,
+          "deleted_count": 0,
+          "doc_count": 150000,
+          "file_backed": true,
+          "live_doc_count": 150000,
+          "segment_id": 1336
+        }
+      ],
+      "total_bytes": 3385816859
+    },
+    "merge_settlement_interval_documents": 100000,
+    "postings_chunk_size": 128,
+    "postings_layout": "fixed_posting_count_sparse_impacts_contiguous_positions_inline_single_doc_two_column_meta_constant_frequency_five_bit_impact_frequency_vertical_bp128",
+    "process_cpu_ns": 407516166000,
+    "process_peak_rss_bytes": 1924825088,
+    "query_grammar": "V1",
+    "result_schema_version": 1,
+    "schema_version": 1,
+    "segment_mode": "production",
+    "stored_source": "omitted_index_only_ordinal_sidecar"
+  },
+  "measurement": {
+    "repetitions": 5,
+    "resource_profile_seconds": 3.0,
+    "shuffle_seed": 7349,
+    "warmup_min_seconds": 1.0,
+    "warmup_queries": 2468
+  },
+  "merge_policy_override": {
+    "max_merge_at_once": null,
+    "max_segments_per_tier": null
+  },
+  "query_grammar": "V1",
+  "reopen_ns": 35188500,
+  "schema_version": 1,
+  "segment_mode": "production",
+  "unsupported_queries": 0
+}

@@ -1,0 +1,10 @@
+{"elapsed_ns": 58833, "engine": "comparator", "operation": "top_k", "query": "V1 TERM text alpha", "query_index": 0, "repetition": 0, "schema_version": 1}
+{"elapsed_ns": 40792, "engine": "comparator", "operation": "top_k", "query": "V1 TERM text gamma", "query_index": 1, "repetition": 0, "schema_version": 1}
+{"elapsed_ns": 38042, "engine": "comparator", "operation": "top_k", "query": "V1 TERM text gamma", "query_index": 1, "repetition": 1, "schema_version": 1}
+{"elapsed_ns": 47750, "engine": "comparator", "operation": "top_k", "query": "V1 TERM text alpha", "query_index": 0, "repetition": 1, "schema_version": 1}
+{"elapsed_ns": 53209, "engine": "comparator", "operation": "top_k", "query": "V1 TERM text gamma", "query_index": 1, "repetition": 2, "schema_version": 1}
+{"elapsed_ns": 57875, "engine": "comparator", "operation": "top_k", "query": "V1 TERM text alpha", "query_index": 0, "repetition": 2, "schema_version": 1}
+{"elapsed_ns": 53292, "engine": "comparator", "operation": "top_k", "query": "V1 TERM text alpha", "query_index": 0, "repetition": 3, "schema_version": 1}
+{"elapsed_ns": 33834, "engine": "comparator", "operation": "top_k", "query": "V1 TERM text gamma", "query_index": 1, "repetition": 3, "schema_version": 1}
+{"elapsed_ns": 46583, "engine": "comparator", "operation": "top_k", "query": "V1 TERM text alpha", "query_index": 0, "repetition": 4, "schema_version": 1}
+{"elapsed_ns": 35625, "engine": "comparator", "operation": "top_k", "query": "V1 TERM text gamma", "query_index": 1, "repetition": 4, "schema_version": 1}

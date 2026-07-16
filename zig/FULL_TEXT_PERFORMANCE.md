@@ -2960,6 +2960,35 @@ platform-specific tuning merely to improve one RSS sample.
 Exact evidence and source-artifact hashes are checked in as
 `bench/full_text/results/full-corpus-v38-primary-cache-memory-qualification.json`.
 
+### Final direct kernel qualification
+
+The final runner audit compared the accepted v38 Antfly index directly with the
+preserved Tantivy 0.25 production index in one persistent-process run. Both
+manifests declare the same 5,032,105-document corpus hash, V1 grammar, simple
+analyzer, and BM25 parameters. Antfly used its settled ten-segment production
+layout and Tantivy its documented twenty-segment production layout. Analyzer
+fixtures matched, all five query correctness records matched strictly (counts,
+ordinals, ordering, and scores), and unsupported queries remained zero.
+
+After at least one second and 2,468 shared warmup queries, five shuffled timing
+repetitions produced Antfly/Tantivy median-latency ratios of 1.121 for terms,
+0.793 for unions, 0.662 for intersections, and 1.070 for phrases. Independent
+three-second resource passes produced CPU-per-query ratios of 1.188, 0.796,
+0.649, and 1.216 respectively. Query-process peak RSS was 103.7 MB for Antfly
+and 21.0 MB for Tantivy. This closes the historical 1.8x term/phrase CPU gap
+without platform-specific SIMD: the residual term and phrase CPU costs are
+about 19% and 22%, while both boolean classes are faster than the comparator.
+
+The complete manifest, analyzer output, correctness records, diagnostics,
+per-repetition query samples for both engines, resource profiles, index
+manifests, layout, memory, indexing, and summary files are checked in under
+`bench/full_text/results/full-corpus-v38-kernel-production/`. Reused-index
+reporting now carries the original indexing elapsed/CPU/RSS fields instead of
+emitting null measurements. The historical Tantivy index manifest did not
+record indexing CPU or peak RSS; its accepted same-index rebuild peak-RSS result
+remains in `full-corpus-v27-production-query-resources.json`, so no redundant
+full comparator rebuild was run.
+
 ## Result Artifact
 
 Each run should produce one directory containing at least:
