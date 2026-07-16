@@ -55,6 +55,36 @@ func TestClusterRoleGrantsLeasePermissionsForHAFencing(t *testing.T) {
 	t.Fatal("ClusterRole must grant coordination.k8s.io leases permissions for HA KubernetesLease fencing")
 }
 
+func TestClusterRoleGrantsHARuntimeRBACReconciliationPermissions(t *testing.T) {
+	role := ClusterRole()
+	requiredVerbs := []string{"create", "get", "list", "update", "watch"}
+	required := map[string][]string{
+		"":                          {"serviceaccounts"},
+		"rbac.authorization.k8s.io": {"roles", "rolebindings"},
+	}
+
+	for apiGroup, resources := range required {
+		for _, resource := range resources {
+			var matchingRuleFound bool
+			for _, rule := range role.Rules {
+				if !containsString(rule.APIGroups, apiGroup) || !containsString(rule.Resources, resource) {
+					continue
+				}
+				matchingRuleFound = true
+				for _, verb := range requiredVerbs {
+					if !containsString(rule.Verbs, verb) {
+						t.Fatalf("ClusterRole %s rule missing verb %q: %#v", resource, verb, rule.Verbs)
+					}
+				}
+				break
+			}
+			if !matchingRuleFound {
+				t.Fatalf("ClusterRole must grant %s permissions needed to reconcile HA runtime RBAC", resource)
+			}
+		}
+	}
+}
+
 func TestHAAdminTokenSecretInjectionManifestsAreAligned(t *testing.T) {
 	rawDeployment, err := os.ReadFile("../config/manager/deployment.yaml")
 	if err != nil {
