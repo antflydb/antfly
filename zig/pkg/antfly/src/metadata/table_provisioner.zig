@@ -1431,7 +1431,7 @@ test "table provisioner reconciles stored algebraic metadata without public type
     const indexes_json =
         \\{"alg":{"version":1,"table":"docs","schema_version":1,"group_fields":[{"name":"product","path":"product","type":"string"}],"materializations":[]}}
     ;
-    const summary = try ensureIndexes(std.testing.allocator, &db, indexes_json);
+    const summary = try ensureIndexes(std.testing.allocator, &db, indexes_json, .synchronous);
     try std.testing.expectEqual(@as(usize, 0), summary.added);
     try std.testing.expectEqual(@as(usize, 0), summary.removed);
     try std.testing.expect(db.core.index_manager.algebraicIndex("alg") != null);

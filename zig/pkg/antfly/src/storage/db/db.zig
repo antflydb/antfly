@@ -12738,6 +12738,30 @@ pub const DB = struct {
 
         const applied = installed.applied;
         const stored_cfg = self.core.index_manager.get(cfg.name) orelse return error.IndexNotFound;
+        // An empty corpus needs no shadow generation or backfill. Prove that
+        // with a one-document range probe, then publish the freshly installed
+        // empty generation through the same completion gate as synchronous
+        // admission. Future writes are handled by the normal derived worker.
+        // This keeps initial index creation immediately usable without making
+        // non-empty schema migrations unbounded.
+        if (!try self.hasPrimaryDocuments(self.core.byteRange())) {
+            // Dense coverage accounting must exist before admission becomes
+            // visible. Otherwise the first post-create write observes a
+            // missing authoritative counter and correctly fails the index
+            // closed even though the initial zero-document build was valid.
+            try self.ensureDenseArtifactTargetCounterForAdmission(stored_cfg.*);
+            if (self.start_index_workers) {
+                try self.executor.addWorker(cfg.name, .{ .name = cfg.name, .kind = cfg.kind }, applied);
+            }
+            if (restart_enrichment) {
+                try self.restartEnrichmentAfterStructuralMutation("index creation", cfg.name);
+                enrichment_restarted = true;
+            }
+            try self.core.index_manager.completeAdmissionRebuild(self.core.store, cfg.name);
+            self.core.index_manager.clearRepairUnavailable(cfg.name);
+            index_installed = false;
+            return;
+        }
         _ = try self.createGenerationRepairIntent(
             self.alloc,
             stored_cfg.*,
@@ -16010,6 +16034,13 @@ pub const DB = struct {
     }
 
     pub fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: Allocator) !usize {
+        // Portable archives contain the materialized artifact rows consumed by
+        // indexes, but embedded/lite restores intentionally have no inference
+        // runtime. In that environment there is nothing to regenerate: index
+        // reconstruction above replays the archived artifacts directly. Keep
+        // managed admission strict through advanceAdmissionGeneratedEnrichmentReplay,
+        // which still requires a runtime before publishing a new index.
+        if (self.enrichment_runtime == null) return 0;
         return try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &.{}, true);
     }
 
@@ -17789,6 +17820,30 @@ pub const DB = struct {
         var state = CountState{ .doc_count = &doc_count };
         try self.core.store.scanWithContext(lower, if (upper) |buf| buf else "", .{}, &state, CountState.scanEntry);
         return doc_count;
+    }
+
+    fn hasPrimaryDocuments(self: *DB, byte_range: types.ByteRange) !bool {
+        const lower = try self.core.documentRangeLowerAlloc(byte_range.start);
+        defer self.core.alloc.free(lower);
+        const upper = if (byte_range.end.len > 0) try self.core.documentRangeUpperAlloc(byte_range.end) else null;
+        defer if (upper) |buf| self.core.alloc.free(buf);
+
+        var found = false;
+        const ProbeState = struct {
+            found: *bool,
+
+            fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                _ = value;
+                const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                if (!isPrimaryDocumentStoreKey(key)) return .@"continue";
+                state.found.* = true;
+                return .stop;
+            }
+        };
+
+        var state = ProbeState{ .found = &found };
+        try self.core.store.scanWithContext(lower, if (upper) |buf| buf else "", .{}, &state, ProbeState.scanEntry);
+        return found;
     }
 
     fn initializeDerivedCoverageIdentity(cfg: types.IndexConfig, item: *types.DBIndexStats) void {
@@ -40734,6 +40789,10 @@ test "late query visibility hook observes pending index admission" {
 
     // Managed provisioning can install the hook only after open-time catalog
     // reconciliation has already admitted the index.
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
     try db.addIndexAsync(.{
         .name = "ft_pending",
         .kind = .full_text,
@@ -40761,6 +40820,43 @@ test "late query visibility hook observes pending index admission" {
 
     try std.testing.expectEqual(@as(u64, 1), hook_ctx.calls);
     try std.testing.expectEqual(QueryVisibilityChange.index_repair_pending, hook_ctx.change.?);
+}
+
+test "asynchronous index admission publishes an empty corpus immediately" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    });
+    defer db.close();
+
+    try db.addIndexAsync(.{
+        .name = "ft_empty",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try std.testing.expect(!db.core.index_manager.admissionRebuilding("ft_empty"));
+    try std.testing.expect(!db.core.index_manager.repairUnavailable("ft_empty"));
+    try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+
+    try db.addIndexAsync(.{
+        .name = "dense_empty",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
+    });
+    try std.testing.expectEqual(
+        @as(?u64, 0),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "dense_empty"),
+    );
+    try std.testing.expect(!db.core.index_manager.admissionRebuilding("dense_empty"));
+    try std.testing.expect(!db.core.index_manager.repairUnavailable("dense_empty"));
+    try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
 }
 
 test "db full-text index and search survive reopen with durable lsm primary backend" {
@@ -43154,6 +43250,10 @@ test "db asynchronous index admission survives reopen and clears only after repa
     {
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
         defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
         const edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "graph_async", "mentions", "doc:b");
         defer alloc.free(edge_key);
         const edge_value = try enrichment_artifact_codec.encodePortableUnboundGraphEdgeAlloc(alloc, 0.75, 11, 12, "{\"origin\":\"go\"}");

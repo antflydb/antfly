@@ -1336,12 +1336,12 @@ pub const ProvisionedTableWriteCache = struct {
                         .open_mode = switch (open_mode) {
                             .default => .writer,
                             .default_async, .writer_no_replay => .writer_no_replay,
-                            .startup_catch_up, .restore_repair => .writer_no_replay,
+                            .startup_catch_up, .index_repair, .restore_repair => .writer_no_replay,
                             .query_readonly => .query_readonly,
                             .status_only => .status_only,
                         },
-                        .start_index_workers = if (open_mode == .startup_catch_up or open_mode == .restore_repair or open_mode == .query_readonly) false else true,
-                        .start_optional_runtimes = open_mode != .startup_catch_up and open_mode != .restore_repair and open_mode != .query_readonly,
+                        .start_index_workers = if (open_mode == .startup_catch_up or open_mode == .index_repair or open_mode == .restore_repair or open_mode == .query_readonly) false else true,
+                        .start_optional_runtimes = open_mode != .startup_catch_up and open_mode != .index_repair and open_mode != .restore_repair and open_mode != .query_readonly,
                         .index_open_parallelism = if (open_mode == .default_async or open_mode == .writer_no_replay) 1 else null,
                     });
                 errdefer db.close();
@@ -1350,7 +1350,7 @@ pub const ProvisionedTableWriteCache = struct {
                     .db = db,
                     .start_bulk_session = switch (open_mode) {
                         .default, .default_async, .writer_no_replay => true,
-                        .startup_catch_up, .restore_repair, .query_readonly, .status_only => false,
+                        .startup_catch_up, .index_repair, .restore_repair, .query_readonly, .status_only => false,
                     },
                 };
             }
@@ -1718,7 +1718,7 @@ pub const ProvisionedTableWriteCache = struct {
 
         const start_bulk_session = switch (mode) {
             .default, .default_async, .writer_no_replay => self.bulkIngestSessionActiveForTable(table_name),
-            .startup_catch_up, .restore_repair, .query_readonly, .status_only => false,
+            .startup_catch_up, .index_repair, .restore_repair, .query_readonly, .status_only => false,
         };
         if (start_bulk_session) {
             try db.beginBulkIngestSession();
@@ -1803,16 +1803,26 @@ pub const ProvisionedTableWriteCache = struct {
         try self.entries.append(self.alloc, owned_entry);
     }
 
+    fn getEntryLocked(
+        self: *ProvisionedTableWriteCache,
+        group_id: u64,
+        lsm_root_generation: u64,
+        table_name: []const u8,
+    ) ?*Entry {
+        for (self.entries.items) |entry| {
+            if (entry.group_id == group_id and entry.lsm_root_generation == lsm_root_generation and std.mem.eql(u8, entry.table_name, table_name)) return entry;
+        }
+        return null;
+    }
+
     pub fn getLocked(
         self: *ProvisionedTableWriteCache,
         group_id: u64,
         lsm_root_generation: u64,
         table_name: []const u8,
     ) ?*db_mod.DB {
-        for (self.entries.items) |entry| {
-            if (entry.group_id == group_id and entry.lsm_root_generation == lsm_root_generation and std.mem.eql(u8, entry.table_name, table_name)) return &entry.db;
-        }
-        return null;
+        const entry = self.getEntryLocked(group_id, lsm_root_generation, table_name) orelse return null;
+        return &entry.db;
     }
 
     pub fn snapshotRuntimeStatusesLocked(
@@ -6189,16 +6199,16 @@ pub const ProvisionedTableWriteSource = struct {
                 .open_mode = switch (mode) {
                     .default => .writer,
                     .default_async, .writer_no_replay => .writer_no_replay,
-                    .startup_catch_up, .restore_repair => .writer_no_replay,
+                    .startup_catch_up, .index_repair, .restore_repair => .writer_no_replay,
                     .query_readonly => .query_readonly,
                     .status_only => .status_only,
                 },
                 .index_open_parallelism = if (mode == .default_async or mode == .writer_no_replay) 1 else null,
-                .start_index_workers = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) false else true,
-                .start_optional_runtimes = mode != .startup_catch_up and mode != .restore_repair and mode != .query_readonly,
-                .ttl_cleanup = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
-                .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
-                .text_merge = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
+                .start_index_workers = if (mode == .startup_catch_up or mode == .index_repair or mode == .restore_repair or mode == .query_readonly) false else true,
+                .start_optional_runtimes = mode != .startup_catch_up and mode != .index_repair and mode != .restore_repair and mode != .query_readonly,
+                .ttl_cleanup = if (mode == .startup_catch_up or mode == .index_repair or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
+                .transaction_recovery = if (mode == .startup_catch_up or mode == .index_repair or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
+                .text_merge = if (mode == .startup_catch_up or mode == .index_repair or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
             });
         defer if (opened) |*db| db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &opened.?);
@@ -6681,7 +6691,7 @@ pub const ProvisionedTableWriteSource = struct {
                 var cached = cached_db;
                 defer cached.deinit(alloc);
                 try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, cached.db);
-                cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(table.name, group_id, cached.db));
+                cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
                 try applyLocalTableSchemaJson(alloc, cached.db, table.schema_json);
                 const index_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, table.indexes_json, .{
                     .index_admission = .managed_async,
@@ -6722,8 +6732,8 @@ pub const ProvisionedTableWriteSource = struct {
 
             try applyLocalTableSchemaJson(alloc, &opened.?, table.schema_json);
             try cache.seedCreatedDbLocked(&opened, group_id, lsm_root_generation, table.name, table.indexes_json, table.schema_json);
-            const seeded_db = cache.getLocked(group_id, lsm_root_generation, table.name) orelse unreachable;
-            seeded_db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(table.name, group_id, seeded_db));
+            const seeded_entry = cache.getEntryLocked(group_id, lsm_root_generation, table.name) orelse unreachable;
+            seeded_entry.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(seeded_entry.table_name, group_id, &seeded_entry.db));
         }
         return summary;
     }
@@ -7030,7 +7040,12 @@ pub const ProvisionedTableWriteSource = struct {
             std.log.warn("managed startup catch-up restore repair probe failed table={s} err={}", .{ table_name, err });
             return err;
         };
-        const startup_open_mode: ManagedDbOpenMode = if (restore_repair_needed) .restore_repair else .startup_catch_up;
+        const startup_open_mode: ManagedDbOpenMode = if (restore_repair_needed)
+            .restore_repair
+        else if (metadata.advance_index_repairs)
+            .index_repair
+        else
+            .startup_catch_up;
         const startup_cache = self.startup_write_cache;
         var cached_db: ?ProvisionedTableWriteCache.CachedDb = null;
         defer if (cached_db) |*cached| cached.deinit(alloc);
@@ -8400,6 +8415,21 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.local_index_repair_debt_hook) |hook| hook.on_change(hook.ptr, table_name, group_id, action);
     }
 
+    /// Transfers a metadata-provisioned index admission from the foreground
+    /// writer cache to the isolated repair owner. Callers must invoke this only
+    /// after releasing `local_db_mutex`: retiring the live writer is what lets
+    /// the repair cache acquire the single-writer root, and draining its close
+    /// while holding that mutex would deadlock cache lifecycle callbacks.
+    pub fn handOffProvisionedIndexAdmission(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+    ) void {
+        self.invalidateWriteCacheForTable(table_name);
+        self.invalidateReadCache(table_name);
+        self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue);
+    }
+
     fn indexRepairDebtAction(
         req: db_mod.types.ArtifactRepairRunRequest,
         result: db_mod.types.ArtifactRepairResult,
@@ -9341,8 +9371,8 @@ pub const ProvisionedTableWriteSource = struct {
             });
             if (seed_create_table_writer) {
                 try self.write_cache.?.seedCreatedDbLocked(&opened, group_id, lsm_root_generation, table_name, indexes_json, schema_json);
-                const seeded_db = self.write_cache.?.getLocked(group_id, lsm_root_generation, table_name) orelse unreachable;
-                seeded_db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(table_name, group_id, seeded_db));
+                const seeded_entry = self.write_cache.?.getEntryLocked(group_id, lsm_root_generation, table_name) orelse unreachable;
+                seeded_entry.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(seeded_entry.table_name, group_id, &seeded_entry.db));
             } else {
                 try drainManagedDbBeforeClose(&opened.?);
             }
@@ -11989,15 +12019,15 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .open_mode = switch (mode) {
                     .default => .writer,
                     .default_async, .writer_no_replay => .writer_no_replay,
-                    .startup_catch_up, .restore_repair => .writer_no_replay,
+                    .startup_catch_up, .index_repair, .restore_repair => .writer_no_replay,
                     .query_readonly => .query_readonly,
                     .status_only => .status_only,
                 },
-                .start_index_workers = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) false else true,
-                .start_optional_runtimes = mode != .startup_catch_up and mode != .restore_repair and mode != .query_readonly,
-                .ttl_cleanup = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
-                .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
-                .text_merge = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
+                .start_index_workers = if (mode == .startup_catch_up or mode == .index_repair or mode == .restore_repair or mode == .query_readonly) false else true,
+                .start_optional_runtimes = mode != .startup_catch_up and mode != .index_repair and mode != .restore_repair and mode != .query_readonly,
+                .ttl_cleanup = if (mode == .startup_catch_up or mode == .index_repair or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
+                .transaction_recovery = if (mode == .startup_catch_up or mode == .index_repair or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
+                .text_merge = if (mode == .startup_catch_up or mode == .index_repair or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
             });
         defer if (opened) |*db| db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &opened.?);
@@ -14593,6 +14623,10 @@ const ManagedDbOpenMode = enum {
     default_async,
     writer_no_replay,
     startup_catch_up,
+    /// Bounded durable index admission with producer runtimes initialized but
+    /// their autonomous workers disabled. The repair state machine drives the
+    /// exact enrichment pages it needs.
+    index_repair,
     restore_repair,
     query_readonly,
     status_only,
@@ -14601,7 +14635,7 @@ const ManagedDbOpenMode = enum {
 fn haMirrorForManagedDbOpenMode(mode: ManagedDbOpenMode, mirror: ?db_mod.HAAsyncEffectMirror) ?db_mod.HAAsyncEffectMirror {
     return switch (mode) {
         .default, .default_async, .writer_no_replay => mirror,
-        .startup_catch_up, .restore_repair, .query_readonly, .status_only => null,
+        .startup_catch_up, .index_repair, .restore_repair, .query_readonly, .status_only => null,
     };
 }
 
@@ -14965,7 +14999,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                     .transaction_recovery = .{ .enabled = false },
                     .text_merge = .{ .enabled = false },
                 }),
-                .restore_repair => if (enrichment_cfg != null)
+                .index_repair, .restore_repair => if (enrichment_cfg != null)
                     try db_mod.DB.open(allocator, db_path, .{
                         .lsm_cache = cache,
                         .hbc_cache = vector_cache,
@@ -32332,6 +32366,15 @@ test "replica root reconcile seeds write cache across generation bump" {
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expect(write_cache.entries.items[0].allow_generation_adoption);
     try std.testing.expect(write_cache.entries.items[0].allow_active_generation_adoption);
+    const visibility_hook = write_cache.entries.items[0].db.async_context.query_visibility_hook orelse
+        return error.TestUnexpectedResult;
+    // A cached DB outlives the metadata snapshot supplied to provisioning.
+    // Its callback must therefore retain the cache entry's owned table name,
+    // not the caller's transient slice.
+    try std.testing.expectEqual(
+        @intFromPtr(write_cache.entries.items[0].table_name.ptr),
+        @intFromPtr(visibility_hook.table_name.ptr),
+    );
     const misses_before = write_cache.miss_count.load(.monotonic);
 
     generation = 2;

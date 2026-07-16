@@ -8933,10 +8933,10 @@ pub const DataServer = struct {
                     defer activity.deinit();
 
                     var group_ids_one = [_]u64{group_id};
-                    {
+                    const provision_summary = provision: {
                         lockAtomic(refresh_write_source.localDbMutex());
                         defer refresh_write_source.localDbMutex().unlock();
-                        _ = try refresh_write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
+                        break :provision try refresh_write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
                             self.alloc,
                             head.metadata_group_id,
                             group_ids_one[0..],
@@ -8944,8 +8944,19 @@ pub const DataServer = struct {
                             snapshot.ranges,
                             backend_runtime,
                         );
-                    }
+                    };
                     try self.provisioned_storage.bumpGroupVisibleRootGenerations(group_ids_one[0..]);
+                    if (provision_summary.indexes_added != 0) {
+                        // Reconciliation opens/adopts the foreground writer in
+                        // order to persist the admission marker and intent. The
+                        // durable repair owner is deliberately isolated from a
+                        // live foreground writer, so retire that cache entry
+                        // before giving the exact group route another wakeup.
+                        // Publish the new visible generation first so the
+                        // repair ownership fence cannot capture the generation
+                        // that provisioning just superseded.
+                        refresh_write_source.handOffProvisionedIndexAdmission(table.name, group_id);
+                    }
                 }
             }
             self.provisioned_storage.read_cache.clear();
