@@ -471,6 +471,7 @@ fn runtimeStatusWorthPreserving(status: LocalTableRuntimeStatus) bool {
 }
 
 fn statusStatsHaveRuntimeFacts(stats: db_mod.types.DBStats) bool {
+    if (stats.source_doc_count > 0) return true;
     if (stats.doc_count > 0) return true;
     if (stats.repair_degraded or stats.repair_issue_count != 0) return true;
     if (docIdentityStatsHaveRuntimeFacts(stats.doc_identity)) return true;

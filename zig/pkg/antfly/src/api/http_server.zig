@@ -1814,6 +1814,17 @@ pub const ApiHttpServer = struct {
 
     fn runtimeStatusNeedsWriterRefresh(status: runtime_status.LocalTableRuntimeStatus) bool {
         if (runtimeStatusNeedsDenseVisibilityRefresh(status)) return true;
+        // A remote/cached report with derived index visibility but no primary
+        // source count is incomplete for strict coverage. Ask the live writer
+        // for exact DB stats rather than treating derived facts as sufficient.
+        if (status.stats.source_doc_count == 0 and
+            status.stats.doc_identity.scanned_primary_docs == 0 and
+            status.stats.doc_identity.live_ordinals == 0)
+        {
+            for (status.stats.indexes) |item| {
+                if (indexHasDenseVisibilityFacts(item)) return status.metadata.source != .live_writer_publish;
+            }
+        }
         if (runtime_status.statusHasRuntimeFacts(status)) return false;
         if (status.metadata.source == .live_writer_publish) return false;
         return status.stats.indexes.len != 0;
@@ -24129,6 +24140,22 @@ test "api index status refreshes synthetic configured index status from write so
         },
     }};
     try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefresh(live_statuses[0..]));
+
+    const incomplete_remote_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "vec",
+        .kind = .dense_vector,
+        .doc_count = 2,
+        .node_count = 2,
+    }};
+    const incomplete_remote = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .remote_store, .freshness = .fresh },
+        .stats = .{
+            .index_count = incomplete_remote_indexes.len,
+            .indexes = @constCast(incomplete_remote_indexes[0..]),
+        },
+    }};
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefresh(incomplete_remote[0..]));
 }
 
 test "api index status asks write source when read runtime status is absent" {
