@@ -5211,11 +5211,13 @@ pub const ProvisionedTableWriteSource = struct {
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
-                // Reconciliation publishes immutable runtime snapshots and
-                // keeps the old schema generation readable. Status inspection
-                // must remain available for the entire (possibly multi-minute)
-                // backfill; only destructive generation transitions fence it.
-                if (entry.structural_active or entry.restore_preparations > 0) {
+                // Status is served from an immutable published snapshot while
+                // structural work is active. It is observational and must not
+                // make schema metadata projection or a long index backfill an
+                // availability fence. Restore preparation is different: it
+                // may replace the complete root and has no stable snapshot
+                // contract until the lifecycle reservation completes.
+                if (entry.restore_preparations > 0) {
                     self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                     continue;
                 }
@@ -7713,13 +7715,13 @@ pub const ProvisionedTableWriteSource = struct {
         return false;
     }
 
-    fn structuralReconcileActiveBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
+    fn structuralStatusSnapshotOnlyBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, null) orelse return false;
         const entry = self.active_table_activities.items[index];
-        return entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0;
+        return entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0;
     }
 
     fn readCompatibleGroupOperationActiveBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
@@ -7969,7 +7971,7 @@ pub const ProvisionedTableWriteSource = struct {
         // the resident writer. Status is observational and already has an
         // immutable published snapshot; do not contend on live DB stats merely
         // to refresh optional counters during that interval.
-        if (!self.structuralReconcileActiveBestEffort(table_name)) {
+        if (!self.structuralStatusSnapshotOnlyBestEffort(table_name)) {
             try self.refreshRuntimeStatusesFromWriteCache(alloc, table_name, &cached);
             self.overlayManagedWriterReplayTargetsBestEffort(table_name, &cached);
         }
@@ -24830,7 +24832,7 @@ test "provisioned schema reconcile keeps reads and status available" {
     source.endReadRequest("docs");
 }
 
-test "provisioned runtime status inspection waits for structural transition" {
+test "provisioned runtime status inspection remains available during structural transition" {
     const NoCatalog = struct {
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -24849,39 +24851,11 @@ test "provisioned runtime status inspection waits for structural transition" {
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
-    const StatusWorker = struct {
-        source: *ProvisionedTableWriteSource,
-        started: std.atomic.Value(bool) = .init(false),
-        completed: std.atomic.Value(bool) = .init(false),
-
-        fn run(self: *@This()) void {
-            self.started.store(true, .release);
-            const statuses = self.source.source().localRuntimeStatuses(std.testing.allocator, "docs") catch unreachable;
-            std.debug.assert(statuses == null);
-            self.completed.store(true, .release);
-        }
-    };
-
     var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-status-transition", NoCatalog.iface());
     source.beginStructuralTableActivity("docs");
-    var structural_active = true;
-    errdefer if (structural_active) source.endStructuralTableActivity("docs");
-
-    var worker = StatusWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, StatusWorker.run, .{&worker});
-
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer io_impl.deinit();
-    while (!worker.started.load(.acquire)) {
-        io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
-    }
-    io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
-    try std.testing.expect(!worker.completed.load(.acquire));
-
+    const statuses = try source.source().localRuntimeStatuses(std.testing.allocator, "docs");
+    try std.testing.expect(statuses == null);
     source.endStructuralTableActivity("docs");
-    structural_active = false;
-    thread.join();
-    try std.testing.expect(worker.completed.load(.acquire));
 }
 
 test "provisioned read admission enters through forwarded write owner" {

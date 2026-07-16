@@ -2769,6 +2769,36 @@ completion still performs a policy-settling merge before clearing the durable
 rebuild marker and publishing the generation. The interrupted-resume and
 final-fanout tests remain the correctness gates for these changes.
 
+The corrective v3 generation completed on the preserved full corpus and is the
+first valid product-format size result. It indexed exactly 5,032,105 documents,
+promoted 10 segments, and passed the three semantic gates: 5,032,105
+`match_all` hits, 15,753 `alpha` hits, and 525 `alpha beta` phrase hits. The old
+binary took approximately 37 minutes 54 seconds from schema request to
+promotion; that timing includes the per-document ordinal reads, 1,054 observed
+one-document tail builds, and eager page-boundary merge behavior removed above,
+so it is a diagnostic baseline rather than the post-fix indexing result.
+
+The 10 v3 segment files occupy 3,599,478,976 logical bytes, of which all but 400
+bytes are attributed: 177,122,512 stored-field bytes, 3,362,929,083 inverted
+bytes, 39,297,431 typed-value bytes, 20,128,470 ordinal bytes, and 1,080 section
+index bytes. The inverted section contains 79,922,010 dictionary bytes,
+20,512,968 Bloom bytes, and 3,257,461,620 postings bytes, including
+1,847,106,891 position bytes. Removing the product-only stored and typed
+sections leaves 3,383,059,033 bytes. That is 2.76 MB smaller than the accepted
+3,385,816,859-byte v38 Antfly kernel artifact and 131,564,890 bytes (4.05%)
+larger than the 3,251,494,143-byte Tantivy kernel artifact. The honest remaining
+kernel-format gap is therefore about 132 MB, not the former 1.3--1.5 GB.
+
+The published Quickwit split inventory remains approximately 3.138 GB, but its
+archived profile stores the ordinal as a fast field and disables source storage;
+the Antfly product artifact additionally carries 216.4 MB of stored/typed
+product payload. Public reporting must show both the complete 3.599 GB product
+footprint and the 3.383 GB index-only normalization, rather than comparing one
+against a source-disabled server and calling the full difference postings
+overhead. No Quickwit rerun is needed because the archived result already
+contains the full persistent-HTTP load matrix, mixed writes, freshness, CPU,
+RSS, disk, and recovery measurements.
+
 ## Result Artifact
 
 Each run should produce one directory containing at least:

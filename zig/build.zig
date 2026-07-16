@@ -4479,7 +4479,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table restore lifecycle blocks request admission without blocking foreground structural mutation",
             "provisioned table restore lifecycle reserves forwarded owner and caller sources",
             "provisioned startup catch-up enters through forwarded write owner",
-            "provisioned runtime status inspection waits for structural transition",
+            "provisioned runtime status inspection remains available during structural transition",
             "provisioned read admission enters through forwarded write owner",
             "provisioned table write source drop table waits for active read cache lease",
             "provisioned table write source drop table closes schema-bearing cached writer once",
