@@ -3828,7 +3828,7 @@ fn materializeGraphAssetForRuntime(
             const key = try internal_keys.graphEdgeArtifactKeyAlloc(runtime.alloc, write.source, write.index_name, write.edge_type, write.target);
             var key_owned = true;
             errdefer if (key_owned) runtime.alloc.free(key);
-            const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(runtime.alloc, null, write.weight, write.created_at, write.updated_at, write.metadata_json);
+            const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(runtime.alloc, null, graph_entry.config.coverage_generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
             var payload_owned = true;
             errdefer if (payload_owned) runtime.alloc.free(payload);
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);

@@ -61,3 +61,14 @@ def test_artifact_source_validation() -> None:
             sources=[ArtifactEmbeddingSource("dense_v1")],
             embedder={},
         )
+
+
+@pytest.mark.parametrize("dimension", [True, 3.5, "384"])
+def test_embedding_dimension_requires_an_integer(dimension: object) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        artifact_embedding_index_config(
+            "vectors",
+            sources=[ArtifactEmbeddingSource("dense_v1")],
+            embedder={"provider": "antfly", "model": "antflydb/clipclap"},
+            dimension=dimension,  # type: ignore[arg-type]
+        )

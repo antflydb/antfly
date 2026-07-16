@@ -128,6 +128,20 @@ pub fn graph_index_sources(
 ) -> Result<Vec<GraphIndexSourceSpec>, IndexConfigError> {
     validate_artifact_names(sources.iter().map(|source| source.artifact.as_str()))?;
     for (source_index, source) in sources.iter().enumerate() {
+        if let Some(edge) = source.edge.as_ref() {
+            for (field_name, value) in [
+                ("type", edge.edge_type.as_ref()),
+                ("weight", edge.weight.as_ref()),
+            ] {
+                if let Some(GraphTemplateOrNumber::Number(value)) = value
+                    && !value.is_finite()
+                {
+                    return Err(IndexConfigError(format!(
+                        "sources[{source_index}].edge.{field_name} must be finite"
+                    )));
+                }
+            }
+        }
         let Some(context) = source.context.as_ref() else {
             continue;
         };
@@ -461,5 +475,32 @@ mod tests {
         assert_eq!(encoded[0]["nodes"]["source"], "{{source}}");
         assert_eq!(encoded[0]["edge"]["weight"], 1.0);
         assert_eq!(encoded[0]["context"]["doc_fields"][1], "url");
+    }
+
+    #[test]
+    fn rejects_non_finite_graph_edge_numbers() {
+        for (field, value) in [("type", f64::NAN), ("weight", f64::INFINITY)] {
+            let mut edge = GraphEdgeMappingSpec {
+                edge_type: None,
+                weight: None,
+                metadata: None,
+            };
+            if field == "type" {
+                edge.edge_type = Some(GraphTemplateOrNumber::Number(value));
+            } else {
+                edge.weight = Some(GraphTemplateOrNumber::Number(value));
+            }
+            let err = graph_index_sources(vec![GraphIndexSourceSpec {
+                artifact: "relations_v1".into(),
+                path: None,
+                format: None,
+                mention_edge_type: None,
+                nodes: None,
+                edge: Some(edge),
+                context: None,
+            }])
+            .unwrap_err();
+            assert!(err.0.contains(&format!("edge.{field} must be finite")));
+        }
     }
 }

@@ -31,7 +31,8 @@ pub const Kind = enum(u8) {
 
 pub const Flags = packed struct(u8) {
     has_source_hash: bool = false,
-    _reserved: u7 = 0,
+    has_graph_generation: bool = false,
+    _reserved: u6 = 0,
 };
 
 pub const Header = struct {
@@ -165,6 +166,7 @@ pub const SparseEmbeddingView = struct {
 };
 
 pub const GraphEdge = struct {
+    generation: u64,
     weight: f64,
     created_at: u64,
     updated_at: u64,
@@ -263,12 +265,13 @@ fn sparseEmbeddingPayload(data: []const u8) ![]const u8 {
 pub fn encodeGraphEdgeAlloc(
     alloc: Allocator,
     source_hash: ?u64,
+    generation: u64,
     weight: f64,
     created_at: u64,
     updated_at: u64,
     metadata_json: []const u8,
 ) ![]u8 {
-    const payload_len = @sizeOf(u64) + @sizeOf(u64) + @sizeOf(u64) + @sizeOf(u32) + metadata_json.len;
+    const payload_len = @sizeOf(u64) * 4 + @sizeOf(u32) + metadata_json.len;
     const total_len = header_len + payload_len;
     const out = try alloc.alloc(u8, total_len);
     errdefer alloc.free(out);
@@ -276,12 +279,17 @@ pub fn encodeGraphEdgeAlloc(
     writeHeader(out[0..header_len], .{
         .version = codec_version,
         .kind = .graph_edge,
-        .flags = .{ .has_source_hash = source_hash != null },
+        .flags = .{
+            .has_source_hash = source_hash != null,
+            .has_graph_generation = true,
+        },
         .source_hash = source_hash orelse 0,
         .payload_len = @intCast(payload_len),
     });
 
     var pos: usize = header_len;
+    std.mem.writeInt(u64, out[pos..][0..8], generation, .little);
+    pos += @sizeOf(u64);
     std.mem.writeInt(u64, out[pos..][0..8], @as(u64, @bitCast(weight)), .little);
     pos += @sizeOf(u64);
     std.mem.writeInt(u64, out[pos..][0..8], created_at, .little);
@@ -297,10 +305,13 @@ pub fn encodeGraphEdgeAlloc(
 pub fn decodeGraphEdgeAlloc(alloc: Allocator, data: []const u8) !GraphEdge {
     const header = try decodeHeader(data);
     if (header.kind != .graph_edge) return error.InvalidArtifactKind;
-    if (header.payload_len < @sizeOf(u64) * 3 + @sizeOf(u32)) return error.InvalidArtifactPayload;
+    if (!header.flags.has_graph_generation) return error.InvalidArtifactPayload;
+    if (header.payload_len < @sizeOf(u64) * 4 + @sizeOf(u32)) return error.InvalidArtifactPayload;
 
     const payload = data[header_len..][0..header.payload_len];
     var pos: usize = 0;
+    const generation = std.mem.readInt(u64, payload[pos..][0..8], .little);
+    pos += @sizeOf(u64);
     const weight = @as(f64, @bitCast(std.mem.readInt(u64, payload[pos..][0..8], .little)));
     pos += @sizeOf(u64);
     const created_at = std.mem.readInt(u64, payload[pos..][0..8], .little);
@@ -312,6 +323,7 @@ pub fn decodeGraphEdgeAlloc(alloc: Allocator, data: []const u8) !GraphEdge {
     if (payload.len != pos + metadata_len) return error.InvalidArtifactPayload;
 
     return .{
+        .generation = generation,
         .weight = weight,
         .created_at = created_at,
         .updated_at = updated_at,
@@ -500,17 +512,19 @@ test "artifact codec sparse embedding view falls back when unaligned" {
 test "artifact codec encodes graph edge with version and source hash" {
     const alloc = std.testing.allocator;
     const hash = hashSource("graph source");
-    const encoded = try encodeGraphEdgeAlloc(alloc, hash, 1.5, 10, 20, "{\"k\":1}");
+    const encoded = try encodeGraphEdgeAlloc(alloc, hash, 42, 1.5, 10, 20, "{\"k\":1}");
     defer alloc.free(encoded);
 
     const header = try decodeHeader(encoded);
     try std.testing.expectEqual(codec_version, header.version);
     try std.testing.expectEqual(Kind.graph_edge, header.kind);
     try std.testing.expect(header.flags.has_source_hash);
+    try std.testing.expect(header.flags.has_graph_generation);
     try std.testing.expectEqual(hash, header.source_hash);
 
     var decoded = try decodeGraphEdgeAlloc(alloc, encoded);
     defer decoded.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 42), decoded.generation);
     try std.testing.expectEqual(@as(f64, 1.5), decoded.weight);
     try std.testing.expectEqual(@as(u64, 10), decoded.created_at);
     try std.testing.expectEqual(@as(u64, 20), decoded.updated_at);

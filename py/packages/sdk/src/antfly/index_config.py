@@ -196,7 +196,9 @@ def artifact_embedding_index_config(
         raise ValueError("dimension must be omitted for sparse embedding indexes")
     if sparse and distance_metric is not None:
         raise ValueError("distance_metric must be omitted for sparse embedding indexes")
-    if dimension is not None and (isinstance(dimension, bool) or dimension <= 0):
+    if dimension is not None and (
+        not isinstance(dimension, int) or isinstance(dimension, bool) or dimension <= 0
+    ):
         raise ValueError("dimension must be a positive integer")
 
     embedder_config = _model_dict(embedder)

@@ -448,6 +448,13 @@ key)`, so two embeddings derived from the same document do not overwrite one
 another. Full-text and graph indexes likewise union every selected terminal
 artifact stream.
 
+Adding an artifact-backed dense index over existing streams bootstraps its
+authoritative union cardinality from a stable store snapshot. Concurrent
+artifact commits contribute signed deltas while the snapshot is counted, so
+the scan does not hold the global apply lock and cannot publish a false zero
+coverage target. The synchronous target rebuild therefore starts from the same
+authoritative union count used by later coverage checks.
+
 All sources in one index must have the same dense dimension and must inhabit a
 compatible vector space. `vector_space` is optional. When every source omits
 it, Antfly compares the durable canonical semantic producer identity stored on
@@ -578,6 +585,13 @@ mutations. Graph source state is versioned and self-contained: every manifest
 entry stores its edge payload. Older key-only manifests are rejected and the
 index must be rebuilt; falling back to the currently visible edge could restore
 the wrong source's payload.
+
+Every materialized graph-edge payload is also fenced by the owning index
+generation. Deleting and recreating an index name therefore makes its retired
+edge records inert immediately, including during replay, split reconstruction,
+and shadow repair. Physical records can be reclaimed lazily instead of making
+index deletion perform a corpus-sized scan. Manifests for artifacts no longer
+listed in `sources` are excluded from winner selection.
 
 ```json
 {
