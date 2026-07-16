@@ -2992,6 +2992,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
             .source_text = if (rendered != null) "" else source_url,
             .source_parts_json = parts_json,
             .content_type = "text/plain",
+            .correlation_id = profile_source_id,
         };
         const request_bytes = runtimeGeneratedTextRequestBytes(request);
         if (request_bytes > batch_policy.max_bytes) {

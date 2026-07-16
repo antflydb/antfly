@@ -51,6 +51,7 @@ pub const ReadTelemetry = struct {
 };
 
 var last_read_telemetry: ReadTelemetry = .{};
+threadlocal var active_read_profile_correlation_id: ?[]const u8 = null;
 
 pub fn resetLastReadTelemetry() void {
     last_read_telemetry = .{};
@@ -77,6 +78,7 @@ pub const ReadConfig = struct {
     pix2struct_patch_width: usize = 0,
     pix2struct_do_normalize: bool = false,
     prompt: ?[]const u8 = null,
+    correlation_id: ?[]const u8 = null,
 };
 
 pub const ReadResult = struct {
@@ -116,6 +118,9 @@ pub const ReadingPipeline = struct {
 
     /// Read text from an image. image_data is raw JPEG/PNG bytes.
     pub fn read(self: *ReadingPipeline, image_data: []const u8) !ReadResult {
+        const previous_correlation_id = active_read_profile_correlation_id;
+        active_read_profile_correlation_id = self.config.correlation_id;
+        defer active_read_profile_correlation_id = previous_correlation_id;
         resetLastReadTelemetry();
         const allocator = self.allocator;
         const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
@@ -152,6 +157,9 @@ pub const ReadingPipeline = struct {
     /// back to the existing serial path; native Florence uses a batched encoder
     /// and KV-decoder path where the selected backend supports it.
     pub fn readBatch(self: *ReadingPipeline, image_datas: []const []const u8) ![]ReadResult {
+        const previous_correlation_id = active_read_profile_correlation_id;
+        active_read_profile_correlation_id = self.config.correlation_id;
+        defer active_read_profile_correlation_id = previous_correlation_id;
         const allocator = self.allocator;
         if (image_datas.len == 0) return try allocator.alloc(ReadResult, 0);
         if (image_datas.len == 1) {
@@ -1324,7 +1332,13 @@ pub const ReadingPipeline = struct {
         const prefix_len: usize = if (self.config.forced_bos_token_id != null and dec_len > 1) 2 else 1;
         const text_len = if (dec_len > prefix_len) dec_len - prefix_len else 0;
         last_read_telemetry.generated_tokens = text_len;
-        if (readProfileEnabled()) std.log.info("read-profile phase=output output_tokens={d} model_max_tokens={d}", .{ text_len, self.config.max_length });
+        if (readProfileEnabled()) {
+            if (active_read_profile_correlation_id) |correlation_id| {
+                std.log.info("read-profile correlation_id={s} phase=output output_tokens={d} model_max_tokens={d}", .{ correlation_id, text_len, self.config.max_length });
+            } else {
+                std.log.info("read-profile phase=output output_tokens={d} model_max_tokens={d}", .{ text_len, self.config.max_length });
+            }
+        }
         const token_ids = try allocator.alloc(i32, text_len);
         defer allocator.free(token_ids);
         for (0..text_len) |i| token_ids[i] = @intCast(dec_ids[prefix_len + i]);
@@ -1455,19 +1469,33 @@ fn tokenTensorToU32(cb: *const ComputeBackend, allocator: std.mem.Allocator, tok
 
 fn logReadProfile(phase: []const u8, start_ns: u64) void {
     if (!readProfileEnabled()) return;
-    std.log.info("read-profile phase={s} elapsed_ms={d:.3}", .{ phase, nsToMs(nowNs() - start_ns) });
+    if (active_read_profile_correlation_id) |correlation_id| {
+        std.log.info("read-profile correlation_id={s} phase={s} elapsed_ms={d:.3}", .{ correlation_id, phase, nsToMs(nowNs() - start_ns) });
+    } else {
+        std.log.info("read-profile phase={s} elapsed_ms={d:.3}", .{ phase, nsToMs(nowNs() - start_ns) });
+    }
 }
 
 fn logReadProfileStep(phase: []const u8, step: usize, seq_len: usize, elapsed_ns: u64) void {
     if (!readProfileEnabled()) return;
-    std.log.info("read-profile phase={s} step={d} seq_len={d} elapsed_ms={d:.3}", .{ phase, step, seq_len, nsToMs(elapsed_ns) });
+    if (active_read_profile_correlation_id) |correlation_id| {
+        std.log.info("read-profile correlation_id={s} phase={s} step={d} seq_len={d} elapsed_ms={d:.3}", .{ correlation_id, phase, step, seq_len, nsToMs(elapsed_ns) });
+    } else {
+        std.log.info("read-profile phase={s} step={d} seq_len={d} elapsed_ms={d:.3}", .{ phase, step, seq_len, nsToMs(elapsed_ns) });
+    }
 }
 
 fn logReadBatchMode(mode: []const u8, image_datas: []const []const u8, fallback_reason: ?[]const u8) void {
     if (!readProfileEnabled()) return;
     var encoded_bytes: usize = 0;
     for (image_datas) |data| encoded_bytes +|= data.len;
-    if (fallback_reason) |reason| {
+    if (active_read_profile_correlation_id) |correlation_id| {
+        if (fallback_reason) |reason| {
+            std.log.info("read-profile correlation_id={s} phase=batch mode={s} count={d} encoded_bytes={d} serial_fallback_reason={s}", .{ correlation_id, mode, image_datas.len, encoded_bytes, reason });
+        } else {
+            std.log.info("read-profile correlation_id={s} phase=batch mode={s} count={d} encoded_bytes={d}", .{ correlation_id, mode, image_datas.len, encoded_bytes });
+        }
+    } else if (fallback_reason) |reason| {
         std.log.info("read-profile phase=batch mode={s} count={d} encoded_bytes={d} serial_fallback_reason={s}", .{ mode, image_datas.len, encoded_bytes, reason });
     } else {
         std.log.info("read-profile phase=batch mode={s} count={d} encoded_bytes={d}", .{ mode, image_datas.len, encoded_bytes });

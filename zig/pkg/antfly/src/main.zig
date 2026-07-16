@@ -22,6 +22,7 @@ const antfly_client = @import("antfly-client");
 const platform = @import("antfly_platform");
 
 const antfly_cloud_binary = "antfly-cloud";
+const recommended_server_fd_limit: std.posix.rlim_t = 4096;
 
 pub const std_options: std.Options = .{
     .logFn = structlog.logFn,
@@ -47,6 +48,8 @@ pub fn main(init: std.process.Init) !void {
         printVersion();
         return;
     }
+
+    if (isServerSubcommand(subcommand)) ensureServerFileDescriptorLimit();
 
     // Server-side subcommands
     if (std.mem.eql(u8, subcommand, "data")) return try cmd.data.runFromIterator(runtimeInit(init), argv0, &args);
@@ -85,6 +88,51 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("unknown subcommand: {s}\n", .{subcommand});
     printUsage(argv0);
     return error.InvalidArguments;
+}
+
+fn isServerSubcommand(subcommand: []const u8) bool {
+    return std.mem.eql(u8, subcommand, "data") or
+        std.mem.eql(u8, subcommand, "metadata") or
+        std.mem.eql(u8, subcommand, "standalone") or
+        std.mem.eql(u8, subcommand, "inference") or
+        std.mem.eql(u8, subcommand, "serverless");
+}
+
+fn desiredServerFileDescriptorLimit(current: std.posix.rlim_t, hard: std.posix.rlim_t) std.posix.rlim_t {
+    return @max(current, @min(hard, recommended_server_fd_limit));
+}
+
+fn ensureServerFileDescriptorLimit() void {
+    if (comptime std.posix.rlimit_resource == void) {
+        std.log.warn("server file-descriptor limit unavailable platform={s} recommended={d}", .{ @tagName(builtin.os.tag), recommended_server_fd_limit });
+        return;
+    }
+    const initial = std.posix.getrlimit(.NOFILE) catch |err| {
+        std.log.warn("server file-descriptor limit query failed error={s} recommended={d}", .{ @errorName(err), recommended_server_fd_limit });
+        return;
+    };
+    const desired = desiredServerFileDescriptorLimit(initial.cur, initial.max);
+    if (desired > initial.cur) {
+        var raised = initial;
+        raised.cur = desired;
+        std.posix.setrlimit(.NOFILE, raised) catch |err| {
+            std.log.warn("server file-descriptor limit raise failed soft={d} hard={d} requested={d} error={s}", .{ initial.cur, initial.max, desired, @errorName(err) });
+        };
+    }
+    const final = std.posix.getrlimit(.NOFILE) catch initial;
+    if (final.cur < recommended_server_fd_limit) {
+        std.log.warn("LOW SERVER FILE-DESCRIPTOR LIMIT soft={d} hard={d} recommended={d} index creation may fail with ProcessFdQuotaExceeded", .{ final.cur, final.max, recommended_server_fd_limit });
+    } else if (final.cur != initial.cur) {
+        std.log.info("raised server file-descriptor limit initial_soft={d} soft={d} hard={d} recommended={d}", .{ initial.cur, final.cur, final.max, recommended_server_fd_limit });
+    } else {
+        std.log.info("server file-descriptor limit soft={d} hard={d} recommended={d}", .{ final.cur, final.max, recommended_server_fd_limit });
+    }
+}
+
+test "server file descriptor target is bounded by hard limit" {
+    try std.testing.expectEqual(@as(std.posix.rlim_t, 4096), desiredServerFileDescriptorLimit(256, 8192));
+    try std.testing.expectEqual(@as(std.posix.rlim_t, 1024), desiredServerFileDescriptorLimit(256, 1024));
+    try std.testing.expectEqual(@as(std.posix.rlim_t, 8192), desiredServerFileDescriptorLimit(8192, 8192));
 }
 
 fn cliHelpRequested(args: *std.process.Args.Iterator) bool {

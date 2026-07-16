@@ -74,6 +74,8 @@ pub const Request = struct {
     source_text: []const u8,
     source_parts_json: ?[]const u8 = null,
     content_type: []const u8 = "",
+    /// Internal-only correlation for opt-in producer/inference profiling.
+    correlation_id: ?[]const u8 = null,
 };
 
 pub const Producer = struct {

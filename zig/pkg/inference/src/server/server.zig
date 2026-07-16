@@ -1213,6 +1213,7 @@ pub const Node = struct {
         const results = try reader.readBatch(image_datas, .{
             .prompt = request.prompt,
             .max_tokens = max_tokens,
+            .correlation_id = request.correlation_id,
         });
         defer {
             for (results) |result| {
