@@ -97,6 +97,10 @@ runtime contract is `/antfly inference pull <model-ref> --models-dir /models`,
 with `--tasks` and `--capabilities` added when the model preload spec declares
 them.
 
+`models_dir` is part of that managed pod contract. If it is present in an
+InferencePool `spec.config`, it must be `/models`; the admission webhook rejects
+other values so model pulls cannot be disconnected from the runtime volume.
+
 TPU InferencePools configure `pjrt_plugin_path` as
 `/usr/local/lib/libtpu.so`, the operator's inference image contract. A custom
 inference image that installs the PJRT plugin elsewhere must override

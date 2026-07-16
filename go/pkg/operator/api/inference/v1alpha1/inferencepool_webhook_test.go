@@ -43,6 +43,34 @@ func TestValidateInferencePool_Valid(t *testing.T) {
 	}
 }
 
+func TestValidateInferencePool_ManagedModelsDir(t *testing.T) {
+	t.Run("accepts the managed path", func(t *testing.T) {
+		pool := validPool()
+		pool.Spec.Config = `{"models_dir":"/models"}`
+		if err := pool.ValidateInferencePool(); err != nil {
+			t.Fatalf("expected managed models_dir to be accepted, got: %v", err)
+		}
+	})
+
+	for name, config := range map[string]string{
+		"different path": `{"models_dir":"/custom/models"}`,
+		"null path":      `{"models_dir":null}`,
+		"non-object":     `null`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			pool := validPool()
+			pool.Spec.Config = config
+			err := pool.ValidateInferencePool()
+			if err == nil {
+				t.Fatal("expected invalid managed models_dir configuration to be rejected")
+			}
+			if !strings.Contains(err.Error(), "spec.config") {
+				t.Fatalf("expected spec.config validation error, got: %v", err)
+			}
+		})
+	}
+}
+
 func TestValidateInferencePool_ValidAutoscaling(t *testing.T) {
 	pool := validPool()
 	pool.Spec.Autoscaling = &AutoscalingConfig{

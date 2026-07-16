@@ -28,6 +28,10 @@ const (
 	WorkloadTypeWriteHeavy WorkloadType = "write-heavy"
 	WorkloadTypeBurst      WorkloadType = "burst"
 	WorkloadTypeGeneral    WorkloadType = "general"
+
+	// ManagedInferenceModelsDir is the shared model path used by the operator's
+	// pull init containers, model volume, and supported inference runtime.
+	ManagedInferenceModelsDir = "/models"
 )
 
 // ModelPriority defines the priority of a model for loading/eviction
@@ -72,7 +76,8 @@ type InferencePoolSpec struct {
 
 	// Config is the Inference configuration as a JSON string.
 	// This is merged with auto-generated configuration and passed to inference via --config.
-	// Supports all inference config options including logging, GPU settings, keep_alive, etc.
+	// Supports inference config options including logging, GPU settings, keep_alive, etc.
+	// models_dir is operator-managed and, when specified, must be "/models".
 	// Example: {"log": {"level": "debug", "style": "json"}, "gpu": "auto"}
 	// +optional
 	Config string `json:"config,omitempty"`

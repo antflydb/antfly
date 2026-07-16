@@ -464,8 +464,23 @@ var _ = Describe("InferencePool Controller", func() {
 			config, ok := completeConfig["inference"].(map[string]any)
 			Expect(ok).To(BeTrue())
 			Expect(config).NotTo(HaveKey("preload"))
+			Expect(config["models_dir"]).To(Equal(antflyaiv1alpha1.ManagedInferenceModelsDir))
 			Expect(config["keep_alive"]).To(Equal("5m"))
 			Expect(config["allow_downloads"]).To(BeFalse())
+		})
+
+		It("Should reject a models directory disconnected from the managed volume", func() {
+			reconciler := &InferencePoolReconciler{}
+			pool := &antflyaiv1alpha1.InferencePool{
+				Spec: antflyaiv1alpha1.InferencePoolSpec{
+					Config: `{"models_dir":"/custom/models"}`,
+					Models: antflyaiv1alpha1.ModelConfig{
+						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyBounded,
+					},
+				},
+			}
+			_, err := reconciler.generateCompleteConfig(pool)
+			Expect(err).To(MatchError(ContainSubstring("models_dir is operator-managed")))
 		})
 
 		It("Should preserve an explicit download policy", func() {

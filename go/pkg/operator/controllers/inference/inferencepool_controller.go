@@ -305,6 +305,18 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 			return "", fmt.Errorf("failed to parse spec.config: %w", err)
 		}
 	}
+	if inferenceConfig == nil {
+		return "", fmt.Errorf("spec.config must be a JSON object")
+	}
+	if configuredModelsDir, exists := inferenceConfig["models_dir"]; exists {
+		modelsDir, ok := configuredModelsDir.(string)
+		if !ok || modelsDir != antflyaiv1alpha1.ManagedInferenceModelsDir {
+			return "", fmt.Errorf(
+				"spec.config.models_dir is operator-managed and must be %q",
+				antflyaiv1alpha1.ManagedInferenceModelsDir,
+			)
+		}
+	}
 
 	loadingStrategy := pool.Spec.Models.LoadingStrategy
 	if loadingStrategy == "" {
@@ -341,9 +353,9 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 		inferenceConfig["max_loaded_models"] = len(preload)
 	}
 
-	if _, exists := inferenceConfig["models_dir"]; !exists {
-		inferenceConfig["models_dir"] = "/models"
-	}
+	// This path is a pod-layout invariant shared by the pull init containers,
+	// volume mount, and runtime. Validation rejects conflicting user overrides.
+	inferenceConfig["models_dir"] = antflyaiv1alpha1.ManagedInferenceModelsDir
 	if _, exists := inferenceConfig["allow_downloads"]; !exists {
 		inferenceConfig["allow_downloads"] = false
 	}
@@ -462,7 +474,7 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 
 	initContainers := make([]corev1.Container, 0, len(preloadModels))
 	for i, model := range preloadModels {
-		args := []string{"inference", "pull", model.Name, "--models-dir", "/models"}
+		args := []string{"inference", "pull", model.Name, "--models-dir", antflyaiv1alpha1.ManagedInferenceModelsDir}
 		if len(model.Tasks) > 0 {
 			args = append(args, "--tasks", strings.Join(model.Tasks, ","))
 		}
@@ -475,7 +487,7 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 			Command: []string{"/antfly"},
 			Args:    args,
 			VolumeMounts: []corev1.VolumeMount{
-				{Name: "models", MountPath: "/models"},
+				{Name: "models", MountPath: antflyaiv1alpha1.ManagedInferenceModelsDir},
 			},
 			EnvFrom: []corev1.EnvFromSource{
 				{ConfigMapRef: &corev1.ConfigMapEnvSource{
@@ -518,7 +530,7 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 								{Name: "http", ContainerPort: InferenceAPIPort, Protocol: corev1.ProtocolTCP},
 							},
 							VolumeMounts: []corev1.VolumeMount{
-								{Name: "models", MountPath: "/models"},
+								{Name: "models", MountPath: antflyaiv1alpha1.ManagedInferenceModelsDir},
 								{Name: "config", MountPath: "/config", ReadOnly: true},
 							},
 							EnvFrom: []corev1.EnvFromSource{

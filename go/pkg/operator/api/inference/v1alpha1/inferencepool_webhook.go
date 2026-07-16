@@ -15,6 +15,7 @@
 package v1alpha1
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -81,11 +82,42 @@ func (r *InferencePool) ValidateInferencePool() error {
 		allErrors = append(allErrors, err.Error())
 	}
 
+	if err := r.validateInferenceConfig(); err != nil {
+		allErrors = append(allErrors, err.Error())
+	}
+
 	if len(allErrors) > 0 {
 		return fmt.Errorf("InferencePool validation failed:\n  - %s",
 			strings.Join(allErrors, "\n  - "))
 	}
 
+	return nil
+}
+
+// validateInferenceConfig protects fields that are coupled to the managed pod
+// layout. Allowing the runtime to read from a different model directory would
+// disconnect it from the init containers and shared model volume.
+func (r *InferencePool) validateInferenceConfig() error {
+	if strings.TrimSpace(r.Spec.Config) == "" {
+		return nil
+	}
+
+	var config map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(r.Spec.Config), &config); err != nil {
+		return fmt.Errorf("spec.config must be a JSON object: %w", err)
+	}
+	if config == nil {
+		return errors.New("spec.config must be a JSON object")
+	}
+
+	rawModelsDir, exists := config["models_dir"]
+	if !exists {
+		return nil
+	}
+	var modelsDir string
+	if err := json.Unmarshal(rawModelsDir, &modelsDir); err != nil || modelsDir != ManagedInferenceModelsDir {
+		return fmt.Errorf("spec.config.models_dir is operator-managed and must be %q", ManagedInferenceModelsDir)
+	}
 	return nil
 }
 
