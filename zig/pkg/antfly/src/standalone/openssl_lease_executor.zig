@@ -171,6 +171,7 @@ const optional_client_auth_server =
     \\import socket
     \\import ssl
     \\import sys
+    \\import time
     \\cert, key, port_file = sys.argv[1:4]
     \\listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     \\listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -194,6 +195,7 @@ const optional_client_auth_server =
     \\        body = b'{"ok":true}' if authorized else b'{"ok":false}'
     \\        status = b'200 OK' if authorized else b'401 Unauthorized'
     \\        tls_conn.sendall(b'HTTP/1.1 ' + status + b'\r\nContent-Type: application/json\r\nContent-Length: ' + str(len(body)).encode() + b'\r\nConnection: close\r\n\r\n' + body)
+    \\        time.sleep(5)
     \\listener.close()
 ;
 

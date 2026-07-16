@@ -195,6 +195,84 @@ static int parse_hex_size(const unsigned char *text, size_t len, size_t *value) 
     return 1;
 }
 
+static int response_body_complete(
+    const unsigned char *response,
+    size_t response_len,
+    size_t max_body,
+    int *out_complete
+) {
+    *out_complete = 0;
+    const unsigned char *first_line_end = find_bytes(response, response_len, "\r\n", 2);
+    const unsigned char *headers_end = find_bytes(response, response_len, "\r\n\r\n", 4);
+    if (headers_end == NULL) return response_len > HEADER_CAP ? ANTFLY_OPENSSL_INVALID_RESPONSE : ANTFLY_OPENSSL_OK;
+    if (first_line_end == NULL || first_line_end >= headers_end) return ANTFLY_OPENSSL_INVALID_RESPONSE;
+
+    int chunked = 0;
+    int has_content_length = 0;
+    size_t content_length = 0;
+    const unsigned char *line = first_line_end + 2;
+    while (line < headers_end) {
+        const unsigned char *line_end = find_bytes(line, (size_t)(headers_end + 2 - line), "\r\n", 2);
+        if (line_end == NULL) return ANTFLY_OPENSSL_INVALID_RESPONSE;
+        const unsigned char *colon = memchr(line, ':', (size_t)(line_end - line));
+        if (colon == NULL) return ANTFLY_OPENSSL_INVALID_RESPONSE;
+        const unsigned char *value = colon + 1;
+        while (value < line_end && (*value == ' ' || *value == '\t')) value++;
+        const unsigned char *value_end = line_end;
+        while (value_end > value && (value_end[-1] == ' ' || value_end[-1] == '\t')) value_end--;
+        if (ascii_equal_ignore_case(line, (size_t)(colon - line), "transfer-encoding")) {
+            chunked = value_contains_chunked(value, (size_t)(value_end - value));
+        } else if (ascii_equal_ignore_case(line, (size_t)(colon - line), "content-length")) {
+            size_t parsed = 0;
+            if (value == value_end) return ANTFLY_OPENSSL_INVALID_RESPONSE;
+            for (const unsigned char *it = value; it < value_end; it++) {
+                if (*it < '0' || *it > '9') return ANTFLY_OPENSSL_INVALID_RESPONSE;
+                unsigned digit = *it - '0';
+                if (parsed > (SIZE_MAX - digit) / 10) return ANTFLY_OPENSSL_INVALID_RESPONSE;
+                parsed = parsed * 10 + digit;
+            }
+            content_length = parsed;
+            has_content_length = 1;
+        }
+        line = line_end + 2;
+    }
+
+    const unsigned char *body = headers_end + 4;
+    size_t body_available = response_len - (size_t)(body - response);
+    if (chunked) {
+        const unsigned char *cursor = body;
+        const unsigned char *response_end = response + response_len;
+        size_t decoded_len = 0;
+        for (;;) {
+            const unsigned char *size_end = find_bytes(cursor, (size_t)(response_end - cursor), "\r\n", 2);
+            if (size_end == NULL) return ANTFLY_OPENSSL_OK;
+            size_t chunk_size = 0;
+            if (!parse_hex_size(cursor, (size_t)(size_end - cursor), &chunk_size)) return ANTFLY_OPENSSL_INVALID_RESPONSE;
+            cursor = size_end + 2;
+            if (chunk_size == 0) {
+                size_t trailer_available = (size_t)(response_end - cursor);
+                if (trailer_available >= 2 && cursor[0] == '\r' && cursor[1] == '\n') {
+                    *out_complete = 1;
+                } else if (find_bytes(cursor, trailer_available, "\r\n\r\n", 4) != NULL) {
+                    *out_complete = 1;
+                }
+                return ANTFLY_OPENSSL_OK;
+            }
+            if (chunk_size > max_body - decoded_len) return ANTFLY_OPENSSL_RESPONSE_TOO_LARGE;
+            if ((size_t)(response_end - cursor) < chunk_size + 2) return ANTFLY_OPENSSL_OK;
+            decoded_len += chunk_size;
+            cursor += chunk_size;
+            if (cursor[0] != '\r' || cursor[1] != '\n') return ANTFLY_OPENSSL_INVALID_RESPONSE;
+            cursor += 2;
+        }
+    }
+    if (has_content_length) {
+        if (content_length > max_body) return ANTFLY_OPENSSL_RESPONSE_TOO_LARGE;
+        *out_complete = body_available >= content_length;
+    }
+    return ANTFLY_OPENSSL_OK;
+}
+
 static int decode_response(
     unsigned char *response,
     size_t response_len,
@@ -388,10 +466,10 @@ int antfly_openssl_lease_get(
         size_t got = 0;
         int rc = SSL_read_ex(ssl, response + response_len, response_cap - 1 - response_len, &got);
         response_len += got;
-        if (find_bytes(response, response_len, "\r\n\r\n", 4) == NULL && response_len > HEADER_CAP) {
-            result = ANTFLY_OPENSSL_INVALID_RESPONSE;
-            goto done;
-        }
+        int complete = 0;
+        result = response_body_complete(response, response_len, max_body, &complete);
+        if (result != ANTFLY_OPENSSL_OK) goto done;
+        if (complete) break;
         if (rc == 1) continue;
         int ssl_error = SSL_get_error(ssl, rc);
         if (ssl_error == SSL_ERROR_ZERO_RETURN || (ssl_error == SSL_ERROR_SYSCALL && got == 0 && errno == 0)) break;
