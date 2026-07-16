@@ -7834,8 +7834,16 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn runtimeStatusNeedsColdVisibilityRefresh(status: runtime_status.LocalTableRuntimeStatus) bool {
         if (status.stats.repair_degraded or status.stats.repair_issue_count != 0) return false;
-        const has_primary_facts = status.stats.doc_identity.live_ordinals != 0 or status.stats.doc_count != 0;
+        const has_exact_primary_facts = status.stats.source_doc_count != 0 or
+            status.stats.doc_identity.scanned_primary_docs != 0 or
+            status.stats.doc_identity.live_ordinals != 0;
+        const has_primary_facts = has_exact_primary_facts or status.stats.doc_count != 0;
         for (status.stats.indexes) |item| {
+            // Status-only recovery can load persisted derived-index counts
+            // without scanning the primary namespace. Upgrade that snapshot
+            // to query-readonly once so strict coverage has an exact source
+            // denominator after restart.
+            if (!has_exact_primary_facts and indexHasVisibilityFactsForStatus(item)) return true;
             if (item.kind != .dense_vector) continue;
             if (indexHasVisibilityFactsForStatus(item)) continue;
             if (item.replay_applied_sequence != 0 or item.replay_target_sequence != 0) continue;
@@ -9776,12 +9784,20 @@ pub const ProvisionedTableWriteSource = struct {
             defer cached.deinit(alloc);
             try applyGroupBatchWithSchemaJson(alloc, cached.db, cached.schema_json, group, req);
             cache.publishCachedLeaseGeneration(&cached, target_generation);
+            if (syncLevelRequiresConsistentRuntimeStatus(req.sync_level)) {
+                try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group.group_id, cached.db);
+            }
         } else {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group.group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group.group_id, &db);
             try applyGroupBatch(alloc, self.catalog, &db, table_name, group, req);
-            self.finishTransientManagedDbWriteBeforeClose(table_name, group.group_id, &db);
+            if (syncLevelRequiresConsistentRuntimeStatus(req.sync_level)) {
+                try drainManagedDbBeforeClose(&db);
+                try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group.group_id, &db);
+            } else {
+                self.finishTransientManagedDbWriteBeforeClose(table_name, group.group_id, &db);
+            }
         }
     }
 
@@ -10387,7 +10403,11 @@ pub const ProvisionedTableWriteSource = struct {
                 defer self.local_db_mutex.unlock();
                 self.markWriteCacheDirty(table_name);
             }
-            self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+            if (syncLevelRequiresConsistentRuntimeStatus(apply_req.sync_level)) {
+                try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db);
+            } else {
+                self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+            }
             self.notifyLocalChange(table_name, .data);
         } else {
             var db = try openManagedDbForReplicatedApply(
@@ -10422,7 +10442,12 @@ pub const ProvisionedTableWriteSource = struct {
                     .destination_group_id = checkpoint.destination_group_id,
                 });
             }
-            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+            if (syncLevelRequiresConsistentRuntimeStatus(apply_req.sync_level)) {
+                try drainManagedDbBeforeClose(&db);
+                try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, &db);
+            } else {
+                self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+            }
             lockAtomic(&self.local_db_mutex);
             self.markWriteCacheDirty(table_name);
             self.local_db_mutex.unlock();
@@ -10504,13 +10529,22 @@ pub const ProvisionedTableWriteSource = struct {
             );
             defer cached.deinit(alloc);
             try cached.db.waitForCurrentSyncLevel(sync_level);
-            self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+            if (syncLevelRequiresConsistentRuntimeStatus(sync_level)) {
+                try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db);
+            } else {
+                self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+            }
         } else {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try db.waitForCurrentSyncLevel(sync_level);
-            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+            if (syncLevelRequiresConsistentRuntimeStatus(sync_level)) {
+                try drainManagedDbBeforeClose(&db);
+                try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, &db);
+            } else {
+                self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+            }
         }
         self.notifyLocalChange(table_name, .data);
     }
@@ -11755,6 +11789,28 @@ pub const HostedProvisionedTableWriteSource = struct {
         return self.foreground_derived_progress or shouldDrainCachedManagedDbAfterBatch(sync_level);
     }
 
+    fn publishSynchronizedRuntimeStatus(
+        self: *const HostedProvisionedTableWriteSource,
+        cache: *HostedManagedDbCache,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        group_id: u64,
+        sync_level: db_mod.types.SyncLevel,
+        db: *db_mod.DB,
+    ) !void {
+        if (!syncLevelRequiresConsistentRuntimeStatus(sync_level)) return;
+        try publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
+            &cache.runtime_status_cache,
+            alloc,
+            table_name,
+            group_id,
+            self.visibleRootGeneration(group_id),
+            .idle,
+            .consistent,
+            db,
+        );
+    }
+
     fn visibleRootGeneration(self: *const HostedProvisionedTableWriteSource, group_id: u64) u64 {
         return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else table_reads.backend_current_root_generation;
     }
@@ -12199,6 +12255,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                             .sync_level = req.sync_level,
                         }, dispatch_ctx.dispatcher());
                         if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
+                        try self.publishSynchronizedRuntimeStatus(hosted_cache, alloc, table_name, group.group_id, req.sync_level, cached.db);
                     },
                     .remote => |remote| {
                         var client = http_client.ApiHttpClient.init(alloc, self.executor);
@@ -12245,6 +12302,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                     .sync_level = req.sync_level,
                 }, dispatch_ctx.dispatcher());
                 if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
+                try self.publishSynchronizedRuntimeStatus(hosted_cache, alloc, table_name, group.group_id, req.sync_level, cached.db);
             }
         }
     }
@@ -12348,6 +12406,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, req.writes, req.deletes, req.transforms);
         try cached.db.batchReplicatedApply(req);
         if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
+        try self.publishSynchronizedRuntimeStatus(hosted_cache, alloc, table_name, group_id, req.sync_level, cached.db);
     }
 
     fn txnBeginGroupLocal(
@@ -15253,6 +15312,21 @@ fn drainManagedDbBeforeClose(db: *db_mod.DB) !void {
     // must drain before the DB is closed or semantic indexes can stay empty.
     try db.runUntilIdle();
     try db.core.index_manager.syncAll(true);
+}
+
+fn syncLevelRequiresConsistentRuntimeStatus(sync_level: db_mod.types.SyncLevel) bool {
+    return switch (sync_level) {
+        .full_text, .full_index => true,
+        .propose, .write, .enrichments => false,
+    };
+}
+
+test "synchronized write levels require a consistent runtime status" {
+    try std.testing.expect(!syncLevelRequiresConsistentRuntimeStatus(.propose));
+    try std.testing.expect(!syncLevelRequiresConsistentRuntimeStatus(.write));
+    try std.testing.expect(!syncLevelRequiresConsistentRuntimeStatus(.enrichments));
+    try std.testing.expect(syncLevelRequiresConsistentRuntimeStatus(.full_text));
+    try std.testing.expect(syncLevelRequiresConsistentRuntimeStatus(.full_index));
 }
 
 fn publishRuntimeStatusSnapshot(

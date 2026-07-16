@@ -811,8 +811,8 @@ def test_artifact_backed_embedding_table_provisions_atomically(
         timeout_s=60.0,
         interval_s=0.5,
     )
-    assert coverage is not None, stateful_api.get_index(
-        table_name, "document_vectors"
+    assert coverage is not None, json.dumps(
+        stateful_api.get_index(table_name, "document_vectors"), sort_keys=True
     )
     assert (
         wait_until(
@@ -861,8 +861,8 @@ def test_artifact_backed_embedding_table_provisions_atomically(
         timeout_s=90.0,
         interval_s=1.0,
     )
-    assert coverage_after_restart is not None, stateful_api.get_index(
-        table_name, "document_vectors"
+    assert coverage_after_restart is not None, json.dumps(
+        stateful_api.get_index(table_name, "document_vectors"), sort_keys=True
     )
 
 
