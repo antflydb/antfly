@@ -20,9 +20,16 @@ pub const capacity_supported = builtin.link_libc and switch (builtin.os.tag) {
     else => false,
 };
 
-const c = if (capacity_supported) @cImport({
-    @cInclude("sys/statvfs.h");
-}) else struct {};
+const c = if (!capacity_supported)
+    struct {}
+else if (builtin.os.tag == .linux)
+    @cImport({
+        @cInclude("sys/statfs.h");
+    })
+else
+    @cImport({
+        @cInclude("sys/statvfs.h");
+    });
 
 pub const Capacity = struct {
     total_bytes: u64,
@@ -33,16 +40,25 @@ pub const Capacity = struct {
 /// contains `path`. Saturating overflow handling keeps the observation safe on
 /// unusual filesystems that report sentinel block counts.
 pub fn capacity(path: []const u8) !Capacity {
-    if (!capacity_supported) return error.UnsupportedPlatform;
+    if (comptime !capacity_supported) return error.UnsupportedPlatform;
     if (path.len > std.fs.max_path_bytes) return error.NameTooLong;
 
     var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
     @memcpy(path_buf[0..path.len], path);
     path_buf[path.len] = 0;
 
+    if (comptime builtin.os.tag == .linux) {
+        var stat: c.struct_statfs = undefined;
+        if (c.statfs(@ptrCast(&path_buf), &stat) != 0) return error.CapacityProbeFailed;
+        return capacityFromStat(stat);
+    }
+
     var stat: c.struct_statvfs = undefined;
     if (c.statvfs(@ptrCast(&path_buf), &stat) != 0) return error.CapacityProbeFailed;
+    return capacityFromStat(stat);
+}
 
+fn capacityFromStat(stat: anytype) Capacity {
     const fragment_bytes: u64 = @intCast(if (stat.f_frsize != 0) stat.f_frsize else stat.f_bsize);
     const blocks: u64 = @intCast(stat.f_blocks);
     const available_blocks: u64 = @intCast(stat.f_bavail);
