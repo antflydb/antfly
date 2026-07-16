@@ -3858,19 +3858,27 @@ pub const DataServer = struct {
             for (records) |*record| record.deinit(alloc);
             alloc.free(records);
         }
-        if (records.len == 0) return error.HASeedSnapshotEmptyCatalog;
-        std.mem.sort(antfly.raft.ReplicaRecord, records, {}, struct {
-            fn lessThan(_: void, left: antfly.raft.ReplicaRecord, right: antfly.raft.ReplicaRecord) bool {
-                return left.group_id < right.group_id;
-            }
-        }.lessThan);
 
         var metadata_snapshot = try self.write_source.catalog.adminSnapshot();
         defer self.write_source.catalog.freeAdminSnapshot(&metadata_snapshot);
+        if (records.len == 0 and !self.api_server_cfg.deployment_mode.isStandalone())
+            return error.HASeedSnapshotEmptyCatalog;
+        const group_ids = try alloc.alloc(
+            u64,
+            if (records.len > 0) records.len else metadata_snapshot.ranges.len,
+        );
+        defer alloc.free(group_ids);
+        if (records.len > 0) {
+            for (records, 0..) |record, index| group_ids[index] = record.group_id;
+        } else {
+            for (metadata_snapshot.ranges, 0..) |range, index| group_ids[index] = range.group_id;
+        }
+        std.mem.sort(u64, group_ids, {}, std.sort.asc(u64));
+
         if (metadata_snapshot.status.metadata_epoch == 0 or
             metadata_snapshot.tables.len == 0 or
             metadata_snapshot.ranges.len == 0 or
-            records.len != metadata_snapshot.ranges.len)
+            group_ids.len != metadata_snapshot.ranges.len)
             return error.HASeedSnapshotIncompleteTopology;
         std.mem.sort(antfly.metadata.TableRecord, metadata_snapshot.tables, {}, struct {
             fn lessThan(_: void, left: antfly.metadata.TableRecord, right: antfly.metadata.TableRecord) bool {
@@ -3899,23 +3907,23 @@ pub const DataServer = struct {
             topology_replicas.deinit(alloc);
         }
 
-        for (records, 0..) |record, index| {
-            if (index > 0 and records[index - 1].group_id == record.group_id)
+        for (group_ids, 0..) |group_id, index| {
+            if (index > 0 and group_ids[index - 1] == group_id)
                 return error.HASeedSnapshotDuplicateReplica;
-            const range = findHASeedRange(metadata_snapshot.ranges, record.group_id) orelse
+            const range = findHASeedRange(metadata_snapshot.ranges, group_id) orelse
                 return error.HASeedSnapshotReplicaMissingFromTopology;
             const table = findHASeedTable(metadata_snapshot.tables, range.table_id) orelse
                 return error.HASeedSnapshotTableMissingFromTopology;
-            const snapshot_path = try std.fmt.allocPrint(alloc, "replicas/group-{d}", .{record.group_id});
+            const snapshot_path = try std.fmt.allocPrint(alloc, "replicas/group-{d}", .{group_id});
             errdefer alloc.free(snapshot_path);
             const destination_root = try std.fs.path.join(alloc, &.{ building_root, snapshot_path });
             defer alloc.free(destination_root);
-            const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-g{d}", .{ request.generation, record.group_id });
+            const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-g{d}", .{ request.generation, group_id });
             defer alloc.free(snapshot_token);
             try self.write_source.captureHASeedReplicaSnapshot(
                 alloc,
                 table.name,
-                record.group_id,
+                group_id,
                 snapshot_token,
                 destination_root,
             );
@@ -3924,7 +3932,7 @@ pub const DataServer = struct {
             const digest = try haSeedSnapshotFileSha256HexAlloc(alloc, io, store_path);
             errdefer alloc.free(digest);
             try topology_replicas.append(alloc, .{
-                .group_id = record.group_id,
+                .group_id = group_id,
                 .table_id = range.table_id,
                 .table_name = table.name,
                 .snapshot_path = snapshot_path,
@@ -19249,6 +19257,144 @@ const TestHASeedSnapshotProvider = struct {
         return .{ .root = prepared_root };
     }
 };
+
+test "storage.ha data runtime default seed snapshot derives standalone groups from metadata only" {
+    const alloc = std.testing.allocator;
+
+    const FakeMetadata = struct {
+        fn catalogSource() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn statusSource() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metadata_epoch = 7, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metadata_epoch = 7, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 77,
+                    .range_id = 77,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                    .doc_identity_shard_id = 77,
+                    .doc_identity_range_id = 77,
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const fixture_root = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/data-runtime-ha-standalone-seed",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(fixture_root);
+    const replica_root = try std.fs.path.join(alloc, &.{ fixture_root, "replicas" });
+    defer alloc.free(replica_root);
+    const replica_catalog_path = try std.fs.path.join(alloc, &.{ fixture_root, "catalog.txt" });
+    defer alloc.free(replica_catalog_path);
+    const capture_root = try std.fs.path.join(alloc, &.{ fixture_root, "seed-captures" });
+    defer alloc.free(capture_root);
+    const replica_db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root, 77);
+    defer alloc.free(replica_db_path);
+
+    {
+        var replica_catalog = try antfly.raft.FileReplicaCatalog.init(alloc, replica_catalog_path);
+        replica_catalog.deinit();
+    }
+    {
+        var db = try antfly.db.DB.open(alloc, replica_db_path, .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:seed", .value = "{\"title\":\"standalone seed\"}" }},
+            .sync_level = .full_index,
+        });
+    }
+
+    var standalone = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = replica_root,
+        .replica_catalog_path = replica_catalog_path,
+        .api_server_cfg = .{ .deployment_mode = .standalone },
+    }, FakeMetadata.catalogSource(), FakeMetadata.statusSource());
+    defer standalone.deinit();
+
+    var prepared = try standalone.prepareDefaultHASeedSnapshot(alloc, .{
+        .capture_root = capture_root,
+        .generation = "standalone-empty-catalog",
+    });
+    defer prepared.deinit(alloc);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const topology_path = try std.fs.path.join(alloc, &.{ prepared.root, ha_seed_snapshot_topology_name });
+    defer alloc.free(topology_path);
+    const topology_json = try std.Io.Dir.cwd().readFileAlloc(
+        io_impl.io(),
+        topology_path,
+        alloc,
+        .limited(1024 * 1024),
+    );
+    defer alloc.free(topology_json);
+    var topology = try std.json.parseFromSlice(
+        HASeedSnapshotTopology,
+        alloc,
+        topology_json,
+        .{ .ignore_unknown_fields = false },
+    );
+    defer topology.deinit();
+    try std.testing.expectEqual(@as(usize, 1), topology.value.replicas.len);
+    try std.testing.expectEqual(@as(u64, 77), topology.value.replicas[0].group_id);
+    try std.testing.expectEqualStrings("docs", topology.value.replicas[0].table_name);
+
+    var distributed = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = replica_root,
+        .replica_catalog_path = replica_catalog_path,
+        .api_server_cfg = .{ .deployment_mode = .distributed },
+    }, FakeMetadata.catalogSource(), FakeMetadata.statusSource());
+    defer distributed.deinit();
+    try std.testing.expectError(error.HASeedSnapshotEmptyCatalog, distributed.prepareDefaultHASeedSnapshot(alloc, .{
+        .capture_root = capture_root,
+        .generation = "distributed-empty-catalog",
+    }));
+}
 
 test "data server wires configured HA executors into API server" {
     const alloc = std.testing.allocator;
