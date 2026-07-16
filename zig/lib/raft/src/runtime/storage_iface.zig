@@ -114,10 +114,12 @@ pub const GroupStorage = struct {
             ready: core.Ready,
             diagnostics: *ReadyPersistenceDiagnostics,
         ) anyerror!void = null,
-        /// Releases process-owned state for a replica that has left local
-        /// placement. Durable files may be retained for generation-aware GC,
-        /// but a later replica incarnation must not reuse the open owner.
-        retire_group: ?*const fn (ptr: *anyopaque, group_id: core.types.GroupId) anyerror!void = null,
+        /// Infallibly releases process-owned state for a replica that has left
+        /// local placement. Durable files may be retained for generation-aware
+        /// GC, but a later replica incarnation must not reuse the open owner.
+        /// Implementations must report optional shutdown/flush failures through
+        /// diagnostics rather than leaving local retirement partially applied.
+        retire_group: ?*const fn (ptr: *anyopaque, group_id: core.types.GroupId) void = null,
     };
 
     pub fn persistReady(self: GroupStorage, group_id: core.types.GroupId, ready: core.Ready) !void {
@@ -163,8 +165,8 @@ pub const GroupStorage = struct {
         return try self.persistReady(group_id, ready);
     }
 
-    pub fn retireGroup(self: GroupStorage, group_id: core.types.GroupId) !void {
-        if (self.vtable.retire_group) |retire_group| try retire_group(self.ptr, group_id);
+    pub fn retireGroup(self: GroupStorage, group_id: core.types.GroupId) void {
+        if (self.vtable.retire_group) |retire_group| retire_group(self.ptr, group_id);
     }
 };
 

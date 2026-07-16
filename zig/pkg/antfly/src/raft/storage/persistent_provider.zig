@@ -140,7 +140,7 @@ pub const PersistentReplicaProvider = struct {
         try state.setAppliedIndex(index);
     }
 
-    fn retireGroup(ptr: *anyopaque, group_id: u64) !void {
+    fn retireGroup(ptr: *anyopaque, group_id: u64) void {
         const self: *PersistentReplicaProvider = @ptrCast(@alignCast(ptr));
         const removed = self.states.fetchRemove(group_id) orelse {
             return;

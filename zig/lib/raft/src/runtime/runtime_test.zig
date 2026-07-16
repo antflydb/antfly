@@ -86,10 +86,39 @@ const StorageRecorder = struct {
         self.compact_successes += 1;
     }
 
-    fn retireGroup(ptr: *anyopaque, group_id: core.types.GroupId) !void {
+    fn retireGroup(ptr: *anyopaque, group_id: core.types.GroupId) void {
         const self: *StorageRecorder = @ptrCast(@alignCast(ptr));
         self.retired_groups += 1;
         _ = self.stores.remove(group_id);
+    }
+};
+
+const FailingRemovalCatalog = struct {
+    fail_remove: bool = true,
+    remove_calls: usize = 0,
+
+    fn iface(self: *@This()) runtime.replica_catalog_iface.ReplicaCatalog {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .upsert_replica = upsertReplica,
+                .remove_replica = removeReplica,
+                .list_replicas = listReplicas,
+            },
+        };
+    }
+
+    fn upsertReplica(_: *anyopaque, _: runtime.ReplicaRecord) !void {}
+
+    fn removeReplica(ptr: *anyopaque, _: core.types.GroupId) !bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.remove_calls += 1;
+        if (self.fail_remove) return error.InjectedCatalogRemovalFailure;
+        return true;
+    }
+
+    fn listReplicas(_: *anyopaque, alloc: std.mem.Allocator) ![]runtime.ReplicaRecord {
+        return try alloc.alloc(runtime.ReplicaRecord, 0);
     }
 };
 
@@ -939,7 +968,7 @@ test "multi raft applies an incoming snapshot before stale compaction maintenanc
     try std.testing.expectEqualStrings("incoming-state", store.snapshot_state.data);
 }
 
-test "multi raft drops a completed snapshot from a retired group incarnation" {
+test "multi raft cancels and drops a snapshot from a retired group incarnation" {
     var old_store = core.MemoryStorage.init(std.testing.allocator);
     defer old_store.deinit();
     var replacement_store = core.MemoryStorage.init(std.testing.allocator);
@@ -975,10 +1004,10 @@ test "multi raft drops a completed snapshot from a retired group incarnation" {
     }
     try std.testing.expect(apply_recorder.snapshot_materialization_started.load(.acquire));
     try std.testing.expect(host.removeGroup(64));
+    try std.testing.expect(apply_recorder.release_snapshot_materialization.load(.acquire));
     try storage_recorder.registerStore(64, &replacement_store);
     try addSingleNodeGroup(&host, 64, &replacement_store, false);
 
-    apply_recorder.release_snapshot_materialization.store(true, .release);
     const stale_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
     while (host.metricsSnapshot().snapshot_compaction_stale_drops == 0 and clock.monotonicNs() < stale_deadline) {
         _ = try host.drainReady(0);
@@ -1998,6 +2027,33 @@ test "multi raft removal drops pending applies and retires replica storage" {
     try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_apply_tasks);
     try std.testing.expectEqual(@as(usize, 0), apply_recorder.applied_entries);
     try std.testing.expectEqual(@as(usize, 1), storage_recorder.retired_groups);
+}
+
+test "multi raft catalog failure leaves replica hosted for reconciliation retry" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    var storage_recorder = StorageRecorder{ .alloc = std.testing.allocator };
+    defer storage_recorder.deinit();
+    try storage_recorder.registerStore(158, &store);
+    var replica_catalog = FailingRemovalCatalog{};
+
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{
+        .group_storage = storage_recorder.iface(),
+        .replica_catalog = replica_catalog.iface(),
+    });
+    defer host.deinit();
+    try addSingleNodeGroup(&host, 158, &store, false);
+
+    try std.testing.expectError(error.InjectedCatalogRemovalFailure, host.removeReplica(158));
+    try std.testing.expect(host.group(158) != null);
+    try std.testing.expectEqual(@as(usize, 0), storage_recorder.retired_groups);
+
+    replica_catalog.fail_remove = false;
+    try host.removeReplica(158);
+    try std.testing.expect(host.group(158) == null);
+    try std.testing.expectEqual(@as(usize, 1), storage_recorder.retired_groups);
+    try std.testing.expectEqual(@as(usize, 2), replica_catalog.remove_calls);
 }
 
 test "in-memory disk batcher and queued apply worker integrate with host" {

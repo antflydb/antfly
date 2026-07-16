@@ -212,6 +212,13 @@ const SnapshotBuildResult = union(enum) {
         }
         self.* = undefined;
     }
+
+    fn belongsTo(self: @This(), group_id: core.types.GroupId, incarnation: u64) bool {
+        return switch (self) {
+            .success => |result| result.group_id == group_id and result.incarnation == incarnation,
+            .failure => |result| result.group_id == group_id and result.incarnation == incarnation,
+        };
+    }
 };
 
 const SnapshotBuildWorker = struct {
@@ -223,6 +230,8 @@ const SnapshotBuildWorker = struct {
     running: bool = false,
     pending: ?SnapshotBuildRequest = null,
     running_source: ?storage_iface.SnapshotSource = null,
+    running_group_id: ?core.types.GroupId = null,
+    running_incarnation: u64 = 0,
     result: ?SnapshotBuildResult = null,
 
     fn start(self: *@This()) !void {
@@ -269,6 +278,36 @@ const SnapshotBuildWorker = struct {
         return result;
     }
 
+    fn retireGroup(self: *@This(), group_id: core.types.GroupId, incarnation: u64) void {
+        const io = self.io_impl.io();
+        var pending: ?SnapshotBuildRequest = null;
+        var result: ?SnapshotBuildResult = null;
+
+        self.mutex.lockUncancelable(io);
+        if (self.pending) |request| {
+            if (request.group_id == group_id and request.incarnation == incarnation) {
+                pending = request;
+                self.pending = null;
+            }
+        }
+        if (self.running_group_id == group_id and self.running_incarnation == incarnation) {
+            if (self.running_source) |source| source.cancel();
+        }
+        if (self.result) |completed| {
+            if (completed.belongsTo(group_id, incarnation)) {
+                result = completed;
+                self.result = null;
+            }
+        }
+        self.mutex.unlock(io);
+
+        if (pending) |*request| {
+            request.source.cancel();
+            request.deinit();
+        }
+        if (result) |*completed| completed.deinit();
+    }
+
     fn run(self: *@This()) void {
         const io = self.io_impl.io();
         while (true) {
@@ -282,6 +321,8 @@ const SnapshotBuildWorker = struct {
             self.pending = null;
             self.running = true;
             self.running_source = request.source;
+            self.running_group_id = request.group_id;
+            self.running_incarnation = request.incarnation;
             self.mutex.unlock(io);
 
             const started_ns = clock.monotonicNs();
@@ -290,6 +331,8 @@ const SnapshotBuildWorker = struct {
 
             self.mutex.lockUncancelable(io);
             self.running_source = null;
+            self.running_group_id = null;
+            self.running_incarnation = 0;
             self.mutex.unlock(io);
             request.source.deinit();
             request.source = undefined;
@@ -450,9 +493,13 @@ pub const MultiRaft = struct {
     }
 
     pub fn removeReplica(self: *MultiRaft, group_id: core.types.GroupId) !void {
-        if (!self.removeGroup(group_id)) return error.UnknownGroup;
-        if (self.hooks.group_storage) |group_storage| try group_storage.retireGroup(group_id);
+        if (!self.groups.contains(group_id)) return error.UnknownGroup;
+        // The catalog is the durable admission record. Remove it before local
+        // teardown so a catalog I/O failure leaves the hosted replica intact and
+        // visible to the next reconciliation pass.
         if (self.hooks.replica_catalog) |catalog| _ = try catalog.removeReplica(group_id);
+        std.debug.assert(self.removeGroup(group_id));
+        if (self.hooks.group_storage) |group_storage| group_storage.retireGroup(group_id);
     }
 
     pub fn restoreReplicasFromCatalog(self: *MultiRaft, alloc: std.mem.Allocator) !usize {
@@ -477,9 +524,19 @@ pub const MultiRaft = struct {
     }
 
     pub fn removeGroup(self: *MultiRaft, group_id: core.types.GroupId) bool {
+        const incarnation = self.group_incarnations.get(group_id) orelse return false;
         const removed = self.groups.fetchRemove(group_id) orelse return false;
         _ = self.group_incarnations.remove(group_id);
         _ = self.snapshot_candidates.remove(group_id);
+        if (self.snapshot_worker) |worker| worker.retireGroup(group_id, incarnation);
+        if (self.snapshot_publish) |*result| {
+            if (result.belongsTo(group_id, incarnation)) {
+                result.deinit();
+                self.snapshot_publish = null;
+                self.snapshot_publish_retry_attempt = 0;
+                self.snapshot_publish_retry_after_ns = 0;
+            }
+        }
         self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
         self.removePendingAppliesForGroup(group_id);
         var grp = removed.value;

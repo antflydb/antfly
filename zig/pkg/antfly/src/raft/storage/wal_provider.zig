@@ -182,19 +182,17 @@ pub const WalReplicaProvider = struct {
         try state.setAppliedIndex(index);
     }
 
-    fn retireGroup(ptr: *anyopaque, group_id: u64) !void {
+    fn retireGroup(ptr: *anyopaque, group_id: u64) void {
         const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
         const state = self.states.get(group_id) orelse {
             return;
         };
-        var flush_error: ?anyerror = null;
         if (self.cfg.flush_on_deinit) state.flushForShutdown() catch |err| {
-            flush_error = err;
+            std.log.err("raft WAL replica retirement flush failed group_id={d} error={s}", .{ group_id, @errorName(err) });
         };
         const removed = self.states.fetchRemove(group_id) orelse unreachable;
         removed.value.deinit();
         self.alloc.destroy(removed.value);
-        if (flush_error) |err| return err;
     }
 
     fn ensureState(self: *WalReplicaProvider, record: catalog.ReplicaRecord) !*wal_replica_state.WalReplicaState {
