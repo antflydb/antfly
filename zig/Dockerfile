@@ -61,6 +61,8 @@ LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
 LABEL org.opencontainers.image.description="AntflyDB Zig runtime image"
 LABEL org.opencontainers.image.licenses=Elastic-2.0
 
+RUN apk add --no-cache libssl3 libcrypto3
+
 RUN addgroup -S -g 10001 antfly && adduser -S -u 10001 -G antfly -h /home/antfly antfly
 
 WORKDIR /
