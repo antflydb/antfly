@@ -25,7 +25,7 @@ T = TypeVar("T", bound="InferenceConfig")
 class InferenceConfig:
     """
     Attributes:
-        api_url (str): URL of the Antfly inference embedding/chunking service Example: http://localhost:8080.
+        api_url (str | Unset): URL of the Antfly inference embedding/chunking service Example: http://localhost:8080.
         api_key (str | Unset): API key used when calling an authenticated shared Antfly inference API.
         models_dir (str | Unset): Base directory containing model subdirectories. Antfly inference auto-discovers models
             from:
@@ -126,7 +126,7 @@ class InferenceConfig:
         log (InferenceschemasConfig | Unset): Logging configuration for inference services
     """
 
-    api_url: str
+    api_url: str | Unset = UNSET
     api_key: str | Unset = UNSET
     models_dir: str | Unset = UNSET
     ml_dir: str | Unset = UNSET
@@ -208,11 +208,9 @@ class InferenceConfig:
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update(
-            {
-                "api_url": api_url,
-            }
-        )
+        field_dict.update({})
+        if api_url is not UNSET:
+            field_dict["api_url"] = api_url
         if api_key is not UNSET:
             field_dict["api_key"] = api_key
         if models_dir is not UNSET:
@@ -262,7 +260,7 @@ class InferenceConfig:
         from ..models.inferenceschemas_config import InferenceschemasConfig
 
         d = dict(src_dict)
-        api_url = d.pop("api_url")
+        api_url = d.pop("api_url", UNSET)
 
         api_key = d.pop("api_key", UNSET)
 

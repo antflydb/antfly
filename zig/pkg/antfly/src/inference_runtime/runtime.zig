@@ -144,8 +144,6 @@ fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
         .kind = parsePreloadModelKind(kind_name) orelse return error.InvalidArguments,
         .name = model_name,
         .backend = backend,
-        .format = null,
-        .quantization = null,
     };
 }
 
@@ -228,6 +226,12 @@ pub fn runFromIterator(
     }
 }
 
+fn rejectUnsupportedInferenceFields(source: std.json.ObjectMap) !void {
+    inline for (.{ "model_strategies", "embedder_models_dir", "chunker_models_dir", "reranker_models_dir" }) |key| {
+        if (source.contains(key)) return error.InvalidConfig;
+    }
+}
+
 fn parseInferenceFileConfig(alloc: std.mem.Allocator, raw: []const u8) !common_config.Config {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .allocate = .alloc_always });
     defer parsed.deinit();
@@ -235,9 +239,19 @@ fn parseInferenceFileConfig(alloc: std.mem.Allocator, raw: []const u8) !common_c
         .object => |object| object,
         else => return error.InvalidConfig,
     };
-    inline for (.{ "model_strategies", "embedder_models_dir", "chunker_models_dir", "reranker_models_dir" }) |key| {
-        if (source.contains(key)) return error.InvalidConfig;
+
+    // `antfly inference run` accepts both the inference-only document exposed
+    // by the inference schema and the common Antfly config shape emitted by
+    // the operator. Detect the latter instead of wrapping it a second time.
+    if (source.get("inference")) |inference_value| {
+        const inference_object = switch (inference_value) {
+            .object => |object| object,
+            else => return error.InvalidConfig,
+        };
+        try rejectUnsupportedInferenceFields(inference_object);
+        return common_config.Config.parseFromSlice(alloc, raw);
     }
+    try rejectUnsupportedInferenceFields(source);
 
     var inference_object = std.json.ObjectMap.empty;
     defer inference_object.deinit(alloc);
@@ -260,13 +274,10 @@ fn appendConfiguredPreloads(
 ) !void {
     try destination.ensureUnusedCapacity(alloc, configured.len);
     for (configured) |model| {
-        if (model.format != null or model.quantization != null) return error.InvalidConfig;
         destination.appendAssumeCapacity(.{
             .kind = parsePreloadModelKind(model.kind) orelse return error.InvalidConfig,
             .name = model.name,
             .backend = parseOptionalBackendType(model.backend) catch return error.InvalidConfig,
-            .format = model.format,
-            .quantization = model.quantization,
         });
     }
 }
@@ -351,6 +362,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         node_config.max_loaded_models = config.inference.max_loaded_models;
         node_config.max_concurrent_requests = config.inference.max_concurrent_requests;
         node_config.pool_size = config.inference.pool_size;
+        node_config.allow_downloads = config.inference.allow_downloads;
         node_config.prompt_cache = .{
             .enabled = config.inference.prompt_cache.enabled,
             .mode = switch (config.inference.prompt_cache.mode) {
@@ -756,18 +768,28 @@ test "inference run parses operator config" {
     try std.testing.expectEqual(inference.backends.BackendType.metal, preload.items[0].backend.?);
 }
 
-test "inference run rejects unsupported preload selectors" {
+test "inference run parses common config shape emitted by operator" {
     const raw =
-        \\{"preload":[{"kind":"generator","name":"antflydb/gemma-e2b","format":"gguf"}]}
+        \\{
+        \\  "log": {"level":"debug"},
+        \\  "inference": {
+        \\    "models_dir": "/models",
+        \\    "keep_alive": "0",
+        \\    "backend_priority": ["cuda"],
+        \\    "preload": [{"kind":"embedder","name":"antflydb/clipclap"}]
+        \\  }
+        \\}
     ;
     var config = try parseInferenceFileConfig(std.testing.allocator, raw);
     defer config.deinit();
-    var preload = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
-    defer preload.deinit(std.testing.allocator);
-    try std.testing.expectError(
-        error.InvalidConfig,
-        appendConfiguredPreloads(std.testing.allocator, &preload, config.inference.preload),
-    );
+
+    try std.testing.expectEqualStrings("/models", config.inference.models_dir.?);
+    try std.testing.expectEqual(@as(u64, 0), config.inference.keep_alive_ms);
+    try std.testing.expectEqual(@as(usize, 1), config.inference.backend_priority.?.len);
+    try std.testing.expectEqualStrings("cuda", config.inference.backend_priority.?[0]);
+    try std.testing.expectEqual(@as(usize, 1), config.inference.preload.len);
+    try std.testing.expectEqualStrings("embedder", config.inference.preload[0].kind);
+    try std.testing.expect(config.log != null);
 }
 
 test "inference run rejects unsupported config fields" {

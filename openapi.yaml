@@ -21352,21 +21352,6 @@ components:
         - cuda
         - pjrt
         - webgpu
-    InferenceModelFormat:
-      type: string
-      description: Optional artifact format preference for loading a model.
-      enum:
-        - gguf
-        - onnx
-        - safetensors
-        - hybrid
-    InferenceModelQuantization:
-      type: string
-      description: Optional quantization preference for loading a model.
-      enum:
-        - q4_k
-        - q8
-        - fp16
     InferenceBackendPriorityEntry:
       type: string
       description: >
@@ -21411,10 +21396,6 @@ components:
           example: antflydb/gemma-e2b
         backend:
           $ref: '#/components/schemas/InferenceModelBackend'
-        format:
-          $ref: '#/components/schemas/InferenceModelFormat'
-        quantization:
-          $ref: '#/components/schemas/InferenceModelQuantization'
     InferencePromptCacheConfig:
       type: object
       description: Native generator prompt KV cache configuration.
@@ -21461,8 +21442,6 @@ components:
           default: 300000
     InferenceConfig:
       type: object
-      required:
-        - api_url
       properties:
         api_url:
           type: string
@@ -21730,9 +21709,9 @@ components:
           type: boolean
           description: Whether the PJRT/XLA backend is built into this runtime
           example: false
-        wasm:
+        webgpu:
           type: boolean
-          description: Whether the WASM backend is built into this runtime
+          description: Whether the WebGPU backend is built into this runtime
           example: false
     InferenceTextContent:
       type: object

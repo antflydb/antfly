@@ -1304,6 +1304,7 @@ pub fn runFromIterator(
         antfly_node_cfg.max_loaded_models = cfg.inference.max_loaded_models;
         antfly_node_cfg.max_concurrent_requests = cfg.inference.max_concurrent_requests;
         antfly_node_cfg.pool_size = cfg.inference.pool_size;
+        antfly_node_cfg.allow_downloads = cfg.inference.allow_downloads;
         antfly_node_cfg.prompt_cache = .{
             .enabled = cfg.inference.prompt_cache.enabled,
             .mode = switch (cfg.inference.prompt_cache.mode) {
@@ -2747,8 +2748,6 @@ fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
         .kind = parsePreloadModelKind(kind_name) orelse return error.InvalidArguments,
         .name = model_name,
         .backend = backend,
-        .format = null,
-        .quantization = null,
     };
 }
 
@@ -3565,13 +3564,10 @@ fn resolveInferenceWarmModels(
     const out = try alloc.alloc(inference.server.WarmModel, loaded.inference.preload.len);
     errdefer alloc.free(out);
     for (loaded.inference.preload, 0..) |model, i| {
-        if (model.format != null or model.quantization != null) return error.InvalidConfig;
         out[i] = .{
             .kind = parsePreloadModelKind(model.kind) orelse return error.InvalidConfig,
             .name = model.name,
             .backend = antfly.inference_runtime.parseOptionalBackendType(model.backend) catch return error.InvalidConfig,
-            .format = model.format,
-            .quantization = model.quantization,
         };
     }
     return .{ .items = out, .owned = true };
@@ -5020,8 +5016,6 @@ test "inference config falls back to common config" {
     try std.testing.expectEqual(inference.server.WarmModelKind.generator, warm_models.items[0].kind);
     try std.testing.expectEqualStrings("antflydb/gemma-e2b", warm_models.items[0].name);
     try std.testing.expectEqual(inference.backends.BackendType.metal, warm_models.items[0].backend.?);
-    try std.testing.expect(warm_models.items[0].format == null);
-    try std.testing.expect(warm_models.items[0].quantization == null);
 }
 
 test "standalone runtime resolves paths from common storage base dir" {

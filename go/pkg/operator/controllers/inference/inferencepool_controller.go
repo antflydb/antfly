@@ -334,6 +334,9 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 	if _, exists := inferenceConfig["models_dir"]; !exists {
 		inferenceConfig["models_dir"] = "/models"
 	}
+	if _, exists := inferenceConfig["allow_downloads"]; !exists {
+		inferenceConfig["allow_downloads"] = false
+	}
 
 	// Set loading strategy config
 	// Note: Inference defaults to lazy loading (5m keep_alive) like Ollama.

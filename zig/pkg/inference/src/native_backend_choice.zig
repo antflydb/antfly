@@ -41,10 +41,13 @@ pub fn parse(value: []const u8) ?Choice {
 
 pub fn validate(choice: Choice) !void {
     switch (choice) {
+        .onnx => if (!build_options.enable_onnx) return error.BackendUnavailable,
+        .native => if (!backends.BackendType.native.available()) return error.BackendUnavailable,
+        .metal => if (!build_options.enable_metal) return error.BackendUnavailable,
         .cuda => if (!build_options.enable_cuda) return error.BackendUnavailable,
         .pjrt => if (!build_options.enable_pjrt) return error.BackendUnavailable,
         .webgpu => if (!(build_options.enable_wasm and build_options.enable_webgpu)) return error.BackendUnavailable,
-        .auto, .onnx, .native, .metal => {},
+        .auto => {},
     }
 }
 
@@ -58,19 +61,10 @@ pub fn configureSessionPreference(session_manager: *backends.SessionManager, cho
             &.{ backends.BackendType.metal, backends.BackendType.native }
         else
             &.{backends.BackendType.native},
-        .onnx => if (build_options.enable_native)
-            &.{ backends.BackendType.onnx, backends.BackendType.native }
-        else if (build_options.enable_wasm and build_options.enable_webgpu)
-            &.{ backends.BackendType.onnx, backends.BackendType.webgpu, backends.BackendType.native }
-        else if (build_options.enable_wasm)
-            &.{ backends.BackendType.onnx, backends.BackendType.native }
-        else if (build_options.enable_metal)
-            &.{ backends.BackendType.onnx, backends.BackendType.metal }
-        else
-            &.{backends.BackendType.onnx},
+        .onnx => &.{backends.BackendType.onnx},
         .native => &.{backends.BackendType.native},
-        .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
-        .cuda => if (build_options.enable_cuda) &.{backends.BackendType.cuda} else &.{backends.BackendType.native},
+        .metal => &.{backends.BackendType.metal},
+        .cuda => &.{backends.BackendType.cuda},
         .webgpu => if (build_options.enable_wasm and build_options.enable_webgpu)
             &.{backends.BackendType.webgpu}
         else
@@ -118,6 +112,29 @@ test "parse accepts explicit compiled backends" {
     try std.testing.expectEqual(Choice.onnx, parse("onnx").?);
     try std.testing.expectEqual(Choice.pjrt, parse("pjrt").?);
     try std.testing.expectEqual(Choice.webgpu, parse("webgpu").?);
+}
+
+test "explicit backend validation never silently substitutes a runtime" {
+    if (build_options.enable_onnx) {
+        try validate(.onnx);
+    } else {
+        try std.testing.expectError(error.BackendUnavailable, validate(.onnx));
+    }
+    if (build_options.enable_metal) {
+        try validate(.metal);
+    } else {
+        try std.testing.expectError(error.BackendUnavailable, validate(.metal));
+    }
+    try std.testing.expectEqualSlices(backends.BackendType, &.{.onnx}, blk: {
+        var manager = backends.SessionManager.init(std.testing.allocator);
+        configureSessionPreference(&manager, .onnx);
+        break :blk manager.preferred_backends;
+    });
+    try std.testing.expectEqualSlices(backends.BackendType, &.{.metal}, blk: {
+        var manager = backends.SessionManager.init(std.testing.allocator);
+        configureSessionPreference(&manager, .metal);
+        break :blk manager.preferred_backends;
+    });
 }
 
 test "compiledPartitionBackend maps explicit compiled backends" {

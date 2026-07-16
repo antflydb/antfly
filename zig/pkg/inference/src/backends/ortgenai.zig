@@ -665,21 +665,46 @@ fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 }
 
 fn isExecutionProviderFailure(message: []const u8) bool {
+    // OGA exposes only a textual error here. Match provider-specific failure
+    // phrases rather than bare backend names: model paths and artifact names
+    // commonly contain strings such as "cuda", and treating those as provider
+    // failures would incorrectly mask corrupt artifacts behind fallback.
     const provider_markers = [_][]const u8{
-        "execution provider",
-        "provider library",
-        "loadlibrary",
-        "dlopen",
-        "cuda",
-        "cudnn",
-        "tensorrt",
-        "directml",
-        "coreml",
+        "execution provider is not available",
+        "failed to load execution provider",
+        "failed to initialize execution provider",
+        "provider library could not be loaded",
+        "loadlibrary failed",
+        "dlopen(",
+        "libonnxruntime_providers_cuda",
+        "libonnxruntime_providers_tensorrt",
+        "cuda driver version is insufficient",
+        "cuda initialization failure",
+        "cuda failure",
+        "cuda error",
+        "no cuda-capable device",
+        "cudnn error",
+        "cublas error",
+        "tensorrt execution provider",
+        "directml execution provider",
+        "coreml execution provider",
     };
     for (provider_markers) |marker| {
         if (containsAsciiIgnoreCase(message, marker)) return true;
     }
     return false;
+}
+
+test "execution provider classification does not inspect artifact names" {
+    try std.testing.expect(!isExecutionProviderFailure(
+        "failed to parse /models/acme-cuda-model/genai_config.json",
+    ));
+    try std.testing.expect(isExecutionProviderFailure(
+        "LoadLibrary failed while loading libonnxruntime_providers_cuda.so",
+    ));
+    try std.testing.expect(isExecutionProviderFailure(
+        "CUDA driver version is insufficient for CUDA runtime version",
+    ));
 }
 
 /// Model construction can fail because the selected execution provider is not

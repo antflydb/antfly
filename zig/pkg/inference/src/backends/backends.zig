@@ -503,6 +503,8 @@ test {
     _ = activations;
     _ = session_factory;
     _ = imported_onnx_session;
+    _ = onnx;
+    _ = ortgenai;
 }
 
 test "shouldPreferBlasBeforeGpuForBytes prefers native only above eager dense threshold" {

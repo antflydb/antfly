@@ -4199,8 +4199,8 @@ pub const InferenceBackendRuntimes = struct {
     cuda: ?bool = null,
     /// Whether the PJRT/XLA backend is built into this runtime
     pjrt: ?bool = null,
-    /// Whether the WASM backend is built into this runtime
-    wasm: ?bool = null,
+    /// Whether the WebGPU backend is built into this runtime
+    webgpu: ?bool = null,
 };
 
 /// Binary media content with format-specific metadata.
@@ -4357,7 +4357,7 @@ pub const InferenceChunkResponse = struct {
 
 pub const InferenceConfig = struct {
     /// URL of the Antfly inference embedding/chunking service
-    api_url: []const u8,
+    api_url: ?[]const u8 = null,
     /// API key used when calling an authenticated shared Antfly inference API.
     api_key: ?[]const u8 = null,
     /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/recognizers/` - Recognition models (ONNX) - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
@@ -4844,38 +4844,6 @@ pub const InferenceModelBackend = enum {
     }
 };
 
-/// Optional artifact format preference for loading a model.
-pub const InferenceModelFormat = enum {
-    gguf,
-    onnx,
-    safetensors,
-    hybrid,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .gguf => "gguf",
-            .onnx => "onnx",
-            .safetensors => "safetensors",
-            .hybrid => "hybrid",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "gguf", .gguf },
-            .{ "onnx", .onnx },
-            .{ "safetensors", .safetensors },
-            .{ "hybrid", .hybrid },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
 /// Information about a model including its capabilities
 pub const InferenceModelInfo = struct {
     /// List of capabilities this model supports (omitted when empty). For rerankers, `late_interaction` or `colbert` selects native MaxSim token scoring.
@@ -4934,43 +4902,12 @@ pub const InferenceModelKind = enum {
     }
 };
 
-/// Optional quantization preference for loading a model.
-pub const InferenceModelQuantization = enum {
-    q4_k,
-    q8,
-    fp16,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .q4_k => "q4_k",
-            .q8 => "q8",
-            .fp16 => "fp16",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "q4_k", .q4_k },
-            .{ "q8", .q8 },
-            .{ "fp16", .fp16 },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
 /// Model reference used by startup preload and model-loading configuration.
 pub const InferenceModelRef = struct {
     kind: InferenceModelKind,
     /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
     name: []const u8,
     backend: ?InferenceModelBackend = null,
-    format: ?InferenceModelFormat = null,
-    quantization: ?InferenceModelQuantization = null,
 };
 
 pub const InferenceModelsResponse = struct {

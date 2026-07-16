@@ -184,15 +184,11 @@ pub const Config = struct {
             kind: []u8,
             name: []u8,
             backend: ?[]u8 = null,
-            format: ?[]u8 = null,
-            quantization: ?[]u8 = null,
 
             fn deinit(self: *WarmModelConfig, alloc: std.mem.Allocator) void {
                 alloc.free(self.kind);
                 alloc.free(self.name);
                 if (self.backend) |value| alloc.free(value);
-                if (self.format) |value| alloc.free(value);
-                if (self.quantization) |value| alloc.free(value);
                 self.* = undefined;
             }
         };
@@ -211,6 +207,7 @@ pub const Config = struct {
         max_loaded_models: usize = 10,
         max_concurrent_requests: usize = 32,
         pool_size: usize = 1,
+        allow_downloads: bool = true,
 
         fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
             if (self.api_url) |value| alloc.free(value);
@@ -645,7 +642,10 @@ pub const Config = struct {
             .storage = storage_config,
             .transaction_sessions = try transactionSessionConfigFromOpenApi(validated.value.transaction_sessions),
             .inference = if (validated.value.inference) |inference| .{
-                .api_url = if (inference.api_url.len > 0) try alloc.dupe(u8, inference.api_url) else null,
+                .api_url = if (inference.api_url) |value|
+                    if (value.len > 0) try alloc.dupe(u8, value) else null
+                else
+                    null,
                 .api_key = try rawOptionalStringField(alloc, raw_root.get("inference"), "api_key"),
                 .models_dir = if (inference.models_dir) |value| try alloc.dupe(u8, value) else null,
                 .ml_dir = if (inference.ml_dir) |value| try alloc.dupe(u8, value) else null,
@@ -659,6 +659,7 @@ pub const Config = struct {
                 .max_loaded_models = inference_max_loaded_models,
                 .max_concurrent_requests = inference_max_concurrent_requests,
                 .pool_size = inference_pool_size,
+                .allow_downloads = inference.allow_downloads orelse true,
             } else .{},
             .remote_content = if (raw_root.get("remote_content")) |remote_content|
                 try parseRemoteContentConfig(alloc, remote_content)
@@ -1987,12 +1988,11 @@ fn parseInferencePreloadModels(
             .object => |entry| entry,
             else => return error.InvalidConfig,
         };
+        if (model_object.contains("format") or model_object.contains("quantization")) return error.InvalidConfig;
         out[i] = .{
             .kind = try requiredStringFieldDup(alloc, model_object, "kind"),
             .name = try requiredStringFieldDup(alloc, model_object, "name"),
             .backend = try optionalStringFieldDup(alloc, model_object, "backend"),
-            .format = try optionalStringFieldDup(alloc, model_object, "format"),
-            .quantization = try optionalStringFieldDup(alloc, model_object, "quantization"),
         };
         filled = i + 1;
     }
@@ -2223,7 +2223,7 @@ test "common config extracts antfly settings" {
         \\      "max_inflight": 77
         \\    },
         \\    "preload": [
-        \\      { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal", "format": "gguf", "quantization": "q4_k" }
+        \\      { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal" }
         \\    ],
         \\    "content_security": {
         \\      "allowed_hosts": ["models.example.com"],
@@ -2264,8 +2264,6 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqualStrings("generator", cfg.inference.preload[0].kind);
     try std.testing.expectEqualStrings("antflydb/gemma-e2b", cfg.inference.preload[0].name);
     try std.testing.expectEqualStrings("metal", cfg.inference.preload[0].backend.?);
-    try std.testing.expectEqualStrings("gguf", cfg.inference.preload[0].format.?);
-    try std.testing.expectEqualStrings("q4_k", cfg.inference.preload[0].quantization.?);
     try std.testing.expectEqualStrings("models.example.com", cfg.inference.content_security.?.allowed_hosts.?[0]);
     try std.testing.expectEqual(@as(?bool, true), cfg.inference.content_security.?.block_private_ips);
     try std.testing.expectEqualStrings("s3.amazonaws.com", cfg.inference.s3_credentials.?.endpoint.?);
@@ -2290,8 +2288,8 @@ test "common config parses inference preload" {
         \\  "inference": {
         \\    "api_url": "http://127.0.0.1:8090",
         \\    "preload": [
-        \\      { "kind": "generator", "name": "antflydb/gemma-e2b", "format": "gguf", "quantization": "q8" },
-        \\      { "kind": "reranker", "name": "BAAI/bge-reranker", "backend": "native", "format": "onnx" }
+        \\      { "kind": "generator", "name": "antflydb/gemma-e2b" },
+        \\      { "kind": "reranker", "name": "BAAI/bge-reranker", "backend": "native" }
         \\    ]
         \\  }
         \\}
@@ -2302,12 +2300,21 @@ test "common config parses inference preload" {
     try std.testing.expectEqual(@as(usize, 2), cfg.inference.preload.len);
     try std.testing.expectEqualStrings("generator", cfg.inference.preload[0].kind);
     try std.testing.expectEqualStrings("antflydb/gemma-e2b", cfg.inference.preload[0].name);
-    try std.testing.expectEqualStrings("gguf", cfg.inference.preload[0].format.?);
-    try std.testing.expectEqualStrings("q8", cfg.inference.preload[0].quantization.?);
     try std.testing.expectEqualStrings("reranker", cfg.inference.preload[1].kind);
     try std.testing.expectEqualStrings("BAAI/bge-reranker", cfg.inference.preload[1].name);
     try std.testing.expectEqualStrings("native", cfg.inference.preload[1].backend.?);
-    try std.testing.expectEqualStrings("onnx", cfg.inference.preload[1].format.?);
+}
+
+test "common config rejects unsupported preload artifact selectors" {
+    inline for (.{ "format", "quantization" }) |field| {
+        const raw = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"inference\":{{\"preload\":[{{\"kind\":\"generator\",\"name\":\"model\",\"{s}\":\"value\"}}]}}}}",
+            .{field},
+        );
+        defer std.testing.allocator.free(raw);
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, raw));
+    }
 }
 
 test "common config rejects out of range query embedding cache policy" {

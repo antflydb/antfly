@@ -11709,16 +11709,6 @@ export interface components {
          */
         InferenceModelBackend: "auto" | "native" | "onnx" | "metal" | "cuda" | "pjrt" | "webgpu";
         /**
-         * @description Optional artifact format preference for loading a model.
-         * @enum {string}
-         */
-        InferenceModelFormat: "gguf" | "onnx" | "safetensors" | "hybrid";
-        /**
-         * @description Optional quantization preference for loading a model.
-         * @enum {string}
-         */
-        InferenceModelQuantization: "q4_k" | "q8" | "fp16";
-        /**
          * @description Backend priority entry for inference. Device policy is expressed by the
          *     backend name itself, so device suffixes are not accepted.
          *
@@ -11741,8 +11731,6 @@ export interface components {
              */
             name: string;
             backend?: components["schemas"]["InferenceModelBackend"];
-            format?: components["schemas"]["InferenceModelFormat"];
-            quantization?: components["schemas"]["InferenceModelQuantization"];
         };
         /** @description Native generator prompt KV cache configuration. */
         InferencePromptCacheConfig: {
@@ -11786,7 +11774,7 @@ export interface components {
              * @description URL of the Antfly inference embedding/chunking service
              * @example http://localhost:8080
              */
-            api_url: string;
+            api_url?: string;
             /** @description API key used when calling an authenticated shared Antfly inference API. */
             api_key?: string;
             /**
@@ -11978,10 +11966,10 @@ export interface components {
              */
             pjrt?: boolean;
             /**
-             * @description Whether the WASM backend is built into this runtime
+             * @description Whether the WebGPU backend is built into this runtime
              * @example false
              */
-            wasm?: boolean;
+            webgpu?: boolean;
         };
         /** @description Text content with character offsets. */
         InferenceTextContent: {

@@ -21,7 +21,7 @@ class InferenceBackendRuntimes:
         metal (bool | Unset): Whether the Metal backend is built into this runtime Example: True.
         cuda (bool | Unset): Whether the CUDA backend is built into this runtime
         pjrt (bool | Unset): Whether the PJRT/XLA backend is built into this runtime
-        wasm (bool | Unset): Whether the WASM backend is built into this runtime
+        webgpu (bool | Unset): Whether the WebGPU backend is built into this runtime
     """
 
     native: bool | Unset = UNSET
@@ -29,7 +29,7 @@ class InferenceBackendRuntimes:
     metal: bool | Unset = UNSET
     cuda: bool | Unset = UNSET
     pjrt: bool | Unset = UNSET
-    wasm: bool | Unset = UNSET
+    webgpu: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -43,7 +43,7 @@ class InferenceBackendRuntimes:
 
         pjrt = self.pjrt
 
-        wasm = self.wasm
+        webgpu = self.webgpu
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -58,8 +58,8 @@ class InferenceBackendRuntimes:
             field_dict["cuda"] = cuda
         if pjrt is not UNSET:
             field_dict["pjrt"] = pjrt
-        if wasm is not UNSET:
-            field_dict["wasm"] = wasm
+        if webgpu is not UNSET:
+            field_dict["webgpu"] = webgpu
 
         return field_dict
 
@@ -76,7 +76,7 @@ class InferenceBackendRuntimes:
 
         pjrt = d.pop("pjrt", UNSET)
 
-        wasm = d.pop("wasm", UNSET)
+        webgpu = d.pop("webgpu", UNSET)
 
         inference_backend_runtimes = cls(
             native=native,
@@ -84,7 +84,7 @@ class InferenceBackendRuntimes:
             metal=metal,
             cuda=cuda,
             pjrt=pjrt,
-            wasm=wasm,
+            webgpu=webgpu,
         )
 
         inference_backend_runtimes.additional_properties = d

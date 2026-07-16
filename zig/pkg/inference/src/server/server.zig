@@ -241,6 +241,7 @@ pub const NodeConfig = struct {
     max_loaded_models: usize = 10,
     max_concurrent_requests: usize = 32,
     pool_size: usize = 1,
+    allow_downloads: bool = true,
     backend_priority: ?[]const backends_mod.BackendType = null,
     generation_budget_overrides: BudgetOverrides = .{},
     prompt_cache: PromptCacheConfig = .{},
@@ -327,8 +328,6 @@ pub const WarmModel = struct {
     kind: WarmModelKind = .generator,
     name: []const u8,
     backend: ?backends_mod.BackendType = null,
-    format: ?[]const u8 = null,
-    quantization: ?[]const u8 = null,
 };
 
 pub const ai_api_prefix = "/ai/v1";
@@ -2813,7 +2812,13 @@ pub const Node = struct {
         ort_genai_generation: {
             if (allow_onnx and build_options.enable_onnx) {
                 const ortgenai = backends_mod.ortgenai;
-                const ort_model_dir = ortgenai.prepareGenerativeModelPackage(ctx.allocator, model_path) catch null;
+                // Package discovery may return null when this is not an Ort
+                // GenAI model. Actual preparation failures describe the model
+                // artifact or local filesystem and must remain terminal; they
+                // are not evidence that the configured ONNX provider is
+                // unavailable.
+                const ort_model_dir = ortgenai.prepareGenerativeModelPackage(ctx.allocator, model_path) catch |err|
+                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
                 defer if (ort_model_dir) |prepared| ctx.allocator.free(prepared);
                 if (ort_model_dir) |prepared_model_dir| {
                     if (config.grammar != null) {
@@ -6000,7 +6005,22 @@ pub const Node = struct {
         }
         try buf.appendSlice(a, "{\"object\":\"list\",\"data\":[");
         try buf.appendSlice(a, openai_data.items);
-        try buf.appendSlice(a, "],");
+        try buf.appendSlice(a, "],\"allow_downloads\":");
+        try buf.appendSlice(a, if (self.config.allow_downloads) "true" else "false");
+        try buf.appendSlice(a, ",\"backends\":{");
+        try buf.appendSlice(a, "\"native\":");
+        try buf.appendSlice(a, if (backends_mod.BackendType.native.available()) "true" else "false");
+        try buf.appendSlice(a, ",\"onnx\":");
+        try buf.appendSlice(a, if (build_options.enable_onnx) "true" else "false");
+        try buf.appendSlice(a, ",\"metal\":");
+        try buf.appendSlice(a, if (build_options.enable_metal) "true" else "false");
+        try buf.appendSlice(a, ",\"cuda\":");
+        try buf.appendSlice(a, if (build_options.enable_cuda) "true" else "false");
+        try buf.appendSlice(a, ",\"pjrt\":");
+        try buf.appendSlice(a, if (build_options.enable_pjrt) "true" else "false");
+        try buf.appendSlice(a, ",\"webgpu\":");
+        try buf.appendSlice(a, if (build_options.enable_wasm and build_options.enable_webgpu) "true" else "false");
+        try buf.appendSlice(a, "},");
         try buf.appendSlice(a, body.items);
         try buf.append(a, '}');
 
@@ -6060,19 +6080,21 @@ pub const Node = struct {
         _ = tabular_mod.discovery.discover(ctx.io, ctx.allocator, &self.tabular_registry, self.config.ml_dir) catch {};
     }
 
-    pub fn getVersion(_: *Node, ctx: *httpx.Context) !httpx.Response {
+    pub fn getVersion(self: *Node, ctx: *httpx.Context) !httpx.Response {
         return ctx.json(.{
             .version = build_options.inference_version,
             .git_commit = build_options.git_commit,
             .build_time = build_options.build_time,
             .go_version = build_options.go_version,
-            .allow_downloads = build_options.allow_downloads,
+            .allow_downloads = self.config.allow_downloads,
             .runtime = "antfly-inference",
             .backends = .{
-                .native = build_options.enable_native,
-                .onnx = true,
-                .onnx_runtime = build_options.enable_onnx,
-                .wasm = build_options.enable_wasm,
+                .native = backends_mod.BackendType.native.available(),
+                .onnx = build_options.enable_onnx,
+                .metal = build_options.enable_metal,
+                .cuda = build_options.enable_cuda,
+                .pjrt = build_options.enable_pjrt,
+                .webgpu = build_options.enable_wasm and build_options.enable_webgpu,
             },
         });
     }
@@ -7237,6 +7259,10 @@ test "node config accepts shared scraping config" {
     try std.testing.expectEqualStrings("s3.amazonaws.com", cfg.s3_credentials.?.endpoint.?);
 }
 
+test {
+    _ = native_backend_choice;
+}
+
 test "generate batch preflight rejects image content without parsing media" {
     const request_json =
         \\{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.invalid/image.png"}}]}]}
@@ -7326,6 +7352,27 @@ test "registerRoutesOn prefixes embed aliases and metrics route" {
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/metrics"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/healthz"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/readyz"));
+}
+
+test "model listing satisfies generated backend capability contract" {
+    var node = try Node.init(std.testing.allocator, .{
+        .models_dir = "./does-not-exist-model-listing-contract",
+    });
+    defer node.deinit();
+
+    const raw = try node.listModelsJsonAlloc(std.testing.allocator, std.testing.io);
+    defer std.testing.allocator.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expect(root.get("allow_downloads") != null);
+    const backend_value = root.get("backends") orelse return error.MissingBackends;
+    const backend_object = backend_value.object;
+    inline for (.{ "native", "onnx", "metal", "cuda", "pjrt", "webgpu" }) |name| {
+        try std.testing.expect(backend_object.get(name) != null);
+    }
+    try std.testing.expect(backend_object.get("wasm") == null);
 }
 
 test "configured warmup attaches io before loading models" {

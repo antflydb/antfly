@@ -111,6 +111,7 @@ var _ = Describe("InferencePool Controller", func() {
 			Expect(ok).To(BeTrue())
 			Expect(runtimeConfig["backend_priority"]).To(HaveExactElements("pjrt", "native"))
 			Expect(runtimeConfig["preload"]).To(HaveLen(1))
+			Expect(runtimeConfig["allow_downloads"]).To(BeFalse())
 
 			// Verify the StatefulSet was created
 			stsLookupKey := types.NamespacedName{Name: poolName, Namespace: poolNamespace}
@@ -365,6 +366,23 @@ var _ = Describe("InferencePool Controller", func() {
 			Expect(ok).To(BeTrue())
 			Expect(config).NotTo(HaveKey("preload"))
 			Expect(config["keep_alive"]).To(Equal("5m"))
+			Expect(config["allow_downloads"]).To(BeFalse())
+		})
+
+		It("Should preserve an explicit download policy", func() {
+			reconciler := &InferencePoolReconciler{}
+			pool := &antflyaiv1alpha1.InferencePool{
+				Spec: antflyaiv1alpha1.InferencePoolSpec{
+					Config: `{"allow_downloads":true}`,
+				},
+			}
+			configJSON, err := reconciler.generateCompleteConfig(pool)
+			Expect(err).NotTo(HaveOccurred())
+			var completeConfig map[string]any
+			Expect(json.Unmarshal([]byte(configJSON), &completeConfig)).To(Succeed())
+			config, ok := completeConfig["inference"].(map[string]any)
+			Expect(ok).To(BeTrue())
+			Expect(config["allow_downloads"]).To(BeTrue())
 		})
 	})
 

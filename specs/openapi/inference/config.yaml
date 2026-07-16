@@ -961,9 +961,9 @@ components:
           type: boolean
           description: Whether the PJRT/XLA backend is built into this runtime
           example: false
-        wasm:
+        webgpu:
           type: boolean
-          description: Whether the WASM backend is built into this runtime
+          description: Whether the WebGPU backend is built into this runtime
           example: false
 
     # Tool Calling Types (OpenAI-compatible)
@@ -1424,16 +1424,6 @@ components:
         `webgpu` selects the Wasm/WebGPU backend in Wasm builds.
       enum: [auto, native, onnx, metal, cuda, pjrt, webgpu]
 
-    ModelFormat:
-      type: string
-      description: Optional artifact format preference for loading a model.
-      enum: [gguf, onnx, safetensors, hybrid]
-
-    ModelQuantization:
-      type: string
-      description: Optional quantization preference for loading a model.
-      enum: [q4_k, q8, fp16]
-
     ModelRef:
       type: object
       description: Model reference used by startup preload and model-loading configuration.
@@ -1447,11 +1437,6 @@ components:
           example: antflydb/gemma-e2b
         backend:
           $ref: "#/components/schemas/ModelBackend"
-        format:
-          $ref: "#/components/schemas/ModelFormat"
-        quantization:
-          $ref: "#/components/schemas/ModelQuantization"
-
     PromptCacheConfig:
       type: object
       description: Native generator prompt KV cache configuration.
@@ -1521,8 +1506,6 @@ components:
 
     Config:
       type: object
-      required:
-        - api_url
       properties:
         api_url:
           type: string
