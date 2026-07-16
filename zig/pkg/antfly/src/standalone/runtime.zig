@@ -48,6 +48,8 @@ const ha_lease_poll_interval_ns: u64 = 2 * std.time.ns_per_s;
 const ha_lease_request_timeout_ms: u32 = 1_000;
 const ha_lease_timing_jitter_ns: u64 = std.time.ns_per_s;
 const ha_lease_min_grace_ms: u64 = 10_000;
+const ha_lease_api_host_env = "ANTFLY_HA_LEASE_API_HOST";
+const ha_lease_default_api_host = "kubernetes.default.svc";
 const ha_lease_http_executor_config: antfly.common.http.StdHttpExecutorConfig = .{
     .max_response_bytes = 256 * 1024,
     // Use the client carrying the projected Kubernetes CA, but force every
@@ -57,6 +59,18 @@ const ha_lease_http_executor_config: antfly.common.http.StdHttpExecutorConfig = 
 };
 
 var termination_requested: std.atomic.Value(bool) = .init(false);
+
+const HALeaseAPIEndpoint = struct {
+    host: []const u8,
+    port: []const u8,
+};
+
+fn haLeaseAPIEndpoint(env: *const std.process.Environ.Map) !HALeaseAPIEndpoint {
+    return .{
+        .host = env.get(ha_lease_api_host_env) orelse ha_lease_default_api_host,
+        .port = env.get("KUBERNETES_SERVICE_PORT_HTTPS") orelse env.get("KUBERNETES_SERVICE_PORT") orelse return error.HALeaseAPIPortMissing,
+    };
+}
 
 fn terminationSignalHandler(_: std.posix.SIG) callconv(.c) void {
     // Atomic publication is async-signal-safe. Listener and storage teardown
@@ -207,8 +221,7 @@ const RuntimeLeaseWatchdog = struct {
     ) !?RuntimeLeaseWatchdog {
         const lease_name = env.get("ANTFLY_HA_LEASE_NAME") orelse return null;
         const namespace = env.get("ANTFLY_HA_LEASE_NAMESPACE") orelse return error.HALeaseNamespaceMissing;
-        const host = env.get("KUBERNETES_SERVICE_HOST") orelse return error.HALeaseAPIHostMissing;
-        const port = env.get("KUBERNETES_SERVICE_PORT_HTTPS") orelse env.get("KUBERNETES_SERVICE_PORT") orelse return error.HALeaseAPIPortMissing;
+        const api_endpoint = try haLeaseAPIEndpoint(env);
         const grace_raw = env.get("ANTFLY_HA_LEASE_GRACE_MS") orelse return error.HALeaseGraceMissing;
         const sentinel_path = env.get("ANTFLY_HA_LEASE_SENTINEL_PATH") orelse return error.HALeaseSentinelMissing;
         const topology_id = env.get("ANTFLY_HA_LEASE_TOPOLOGY_ID") orelse return error.HALeaseTopologyIDMissing;
@@ -256,7 +269,7 @@ const RuntimeLeaseWatchdog = struct {
                 .sentinel_path = sentinel_path,
             }, sentinel_generation, repaired_generation),
             .executor = executor,
-            .uri = try antfly.ha.kubernetes_lease_watchdog.leaseURLAlloc(alloc, host, port, namespace, lease_name),
+            .uri = try antfly.ha.kubernetes_lease_watchdog.leaseURLAlloc(alloc, api_endpoint.host, api_endpoint.port, namespace, lease_name),
             .token_path = env.get("ANTFLY_HA_LEASE_TOKEN_PATH") orelse antfly.ha.kubernetes_lease_watchdog.service_account_token_path,
             .lease_name = lease_name,
             .lease_namespace = namespace,
@@ -5959,4 +5972,20 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
 test "runtime lease watchdog uses configured client without reusing connections" {
     try std.testing.expect(ha_lease_http_executor_config.keep_alive);
     try std.testing.expectEqual(@as(u32, 1), ha_lease_http_executor_config.max_requests_per_connection);
+}
+
+test "runtime lease watchdog prefers a DNS-verified Kubernetes API host and retains the injected port" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("KUBERNETES_SERVICE_HOST", "10.96.0.1");
+    try env.put("KUBERNETES_SERVICE_PORT_HTTPS", "443");
+
+    const default_endpoint = try haLeaseAPIEndpoint(&env);
+    try std.testing.expectEqualStrings(ha_lease_default_api_host, default_endpoint.host);
+    try std.testing.expectEqualStrings("443", default_endpoint.port);
+
+    try env.put(ha_lease_api_host_env, "kubernetes.default.svc.cluster.local");
+    const overridden_endpoint = try haLeaseAPIEndpoint(&env);
+    try std.testing.expectEqualStrings("kubernetes.default.svc.cluster.local", overridden_endpoint.host);
+    try std.testing.expectEqualStrings("443", overridden_endpoint.port);
 }

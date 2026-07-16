@@ -5269,6 +5269,7 @@ pub fn build(b: *std.Build) void {
             "standalone unified server lifecycle propagates startup failure",
             "runtime lease watchdog fetch and validation failures publish no bootstrap capability",
             "runtime lease watchdog uses configured client without reusing connections",
+            "runtime lease watchdog prefers a DNS-verified Kubernetes API host and retains the injected port",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
