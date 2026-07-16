@@ -1798,6 +1798,7 @@ test "strict terminal coverage stops backfill as failed" {
         .coverage_skipped_count = @as(u64, 1),
         .coverage_terminal_failed_count = @as(u64, 0),
         .coverage_summary_ready = true,
+        .coverage_identity_ready = true,
         .coverage_config_mismatch_count = @as(u64, 0),
         .coverage_generation = @as(u64, 7),
         .coverage_config_hash = @as(u64, 11),
@@ -2031,6 +2032,7 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         .replay_applied_sequence = item.replay_applied_sequence,
         .replay_target_sequence = item.replay_target_sequence,
         .replay_catch_up_required = item.replay_catch_up_required,
+        .coverage_policy_failed = false,
     };
     const produced_count = if (@hasField(@TypeOf(item), "coverage_produced_count")) item.coverage_produced_count else 0;
     const skipped_count = if (@hasField(@TypeOf(item), "coverage_skipped_count")) item.coverage_skipped_count else 0;
@@ -2107,6 +2109,8 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
     // the rejected outcomes pending in coverage while stopping the backfill
     // spinner once replay and enrichment have both settled.
     if (coverage_policy != .external and
+        !coverage_incomplete and
+        replay_current and
         terminal_coverage.all_sources_terminal and
         !terminal_coverage.complete and
         !enrichment_pending)
