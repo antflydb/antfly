@@ -97,6 +97,11 @@ runtime contract is `/antfly inference pull <model-ref> --models-dir /models`,
 with `--tasks` and `--capabilities` added when the model preload spec declares
 them.
 
+TPU InferencePools configure `pjrt_plugin_path` as
+`/usr/local/lib/libtpu.so`, the omni image contract. A custom inference image
+that installs the PJRT plugin elsewhere must override `pjrt_plugin_path` in the
+InferencePool `spec.config` JSON.
+
 ## Storage Resize
 
 Antfly storage changes are grow-only.

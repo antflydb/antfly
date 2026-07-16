@@ -400,6 +400,46 @@ fn nativeGenerationDirectPriority(
     return scratch[0..len];
 }
 
+/// Batch generation currently supports direct GPT sessions only. Resolve the
+/// operation-specific order by skipping compiled providers rather than treating
+/// them as boundaries, while preserving an explicit request override exactly.
+fn batchGenerationDirectPriority(
+    scratch: *[backend_priority_capacity]backends_mod.BackendType,
+    configured: []const backends_mod.BackendType,
+    selection: GenerateBackendSelection,
+) []const backends_mod.BackendType {
+    if (selection.strict_backend) {
+        const selected = generationSelectionBackendType(selection) orelse return &.{};
+        if (compiledGenerationBackendKind(selected) != null) return &.{};
+        scratch[0] = selected;
+        return scratch[0..1];
+    }
+
+    var len: usize = 0;
+    if (selection.override_model_loading) {
+        if (generationSelectionBackendType(selection)) |selected| {
+            if (compiledGenerationBackendKind(selected) == null) {
+                scratch[len] = selected;
+                len += 1;
+            }
+        }
+    }
+    for (configured) |backend| {
+        if (compiledGenerationBackendKind(backend) != null) continue;
+        var duplicate = false;
+        for (scratch[0..len]) |existing| {
+            if (existing == backend) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        scratch[len] = backend;
+        len += 1;
+    }
+    return scratch[0..len];
+}
+
 fn isRetryableGenerationBaseLoadError(
     direct_backends: []const backends_mod.BackendType,
     err: anyerror,
@@ -1629,15 +1669,16 @@ pub const Node = struct {
         switch (backend) {
             .onnx => try self.warmOnnxGenerator(allocator, model_path, messages, artifact_selection, request_id),
             .pjrt => {
-                var manager = backends_mod.SessionManager.init(allocator);
-                native_backend_choice.configureSessionPreference(&manager, .pjrt);
-                if (manager.preferred_backends.len == 0) return error.NoNativeGenerationBackend;
+                var direct_scratch: [backend_priority_capacity]backends_mod.BackendType = undefined;
+                const configured = self.config.backend_priority orelse self.session_manager.preferred_backends;
+                const direct_backends = nativeGenerationBaseLoadPriority(&direct_scratch, configured, .pjrt);
+                if (direct_backends.len == 0) return error.NoNativeGenerationBackend;
                 const text = try self.generateMessagesDirectMaxTokens(
                     allocator,
                     model_name,
                     messages,
                     1,
-                    manager.preferred_backends,
+                    direct_backends,
                     .pjrt,
                     artifact_selection,
                     timing,
@@ -3354,204 +3395,85 @@ pub const Node = struct {
         var pjrt_plugin_path: ?[:0]u8 = null;
         defer if (pjrt_plugin_path) |path| ctx.allocator.free(path);
 
-        // Probe an initially selected PJRT provider before the ONNX stage. If
-        // it is unavailable, the next configured backend must still get its
-        // native operation-specific implementation rather than being entered
-        // later as a compiled partition backend.
-        if (backend_selection.compiled_partition_backend == .pjrt) {
-            if (self.initializeConfiguredPjrtClient(ctx.allocator, &pjrt_plugin_path)) |client| {
-                pjrt_client = client;
-            } else |err| {
-                if (backend_selection.strict_backend) {
-                    return ctx.status(if (err == error.MissingPjrtPluginPath) 400 else 500).json(.{
-                        .@"error" = if (err == error.MissingPjrtPluginPath) "INVALID_REQUEST" else "BACKEND_ERROR",
-                        .message = if (err == error.MissingPjrtPluginPath)
-                            "pjrt backend requires inference.pjrt_plugin_path or PJRT_PLUGIN_PATH"
-                        else
-                            @errorName(err),
-                    });
-                }
-                std.log.warn("configured PJRT backend unavailable ({s}); advancing backend priority", .{@errorName(err)});
-                backend_selection = self.fallbackConfiguredGenerationSelection(body, &failed_generation_backends, .pjrt) catch
-                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "failed to resolve generation backend fallback" });
+        // Provider selection remains mutable until a model implementation has
+        // been loaded. Keep every provider-specific loader inside this bounded
+        // loop so a fallback selected by a later direct-session failure still
+        // enters ONNX/PJRT through its operation-specific implementation.
+        var provider_attempts: usize = 0;
+        const model = provider_attempt: while (true) {
+            provider_attempts += 1;
+            if (provider_attempts > backend_priority_capacity) {
+                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "generation backend fallback exhausted" });
             }
-        }
 
-        // The direct ONNX generator implementations do not support grammar or
-        // speculative decoding. A configured ONNX preference falls through to
-        // graph-backed native generation for those requests; an ordinary ONNX
-        // model session is never passed to the native generation pipeline.
-        var allow_onnx = config.grammar == null and
-            effective_draft_model_name == null and
-            !backend_selection.graph_mode_requested and
-            (backend_selection.native_choice == .auto or backend_selection.native_choice == .onnx) and
-            (artifact_selection.format == null or artifactFormatIs(artifact_selection, "onnx") or artifactFormatIs(artifact_selection, "hybrid"));
+            if (backend_selection.compiled_partition_backend == .pjrt and pjrt_client == null) {
+                if (self.initializeConfiguredPjrtClient(ctx.allocator, &pjrt_plugin_path)) |client| {
+                    pjrt_client = client;
+                } else |err| {
+                    if (backend_selection.strict_backend) {
+                        return ctx.status(if (err == error.MissingPjrtPluginPath) 400 else 500).json(.{
+                            .@"error" = if (err == error.MissingPjrtPluginPath) "INVALID_REQUEST" else "BACKEND_ERROR",
+                            .message = if (err == error.MissingPjrtPluginPath)
+                                "pjrt backend requires inference.pjrt_plugin_path or PJRT_PLUGIN_PATH"
+                            else
+                                @errorName(err),
+                        });
+                    }
+                    std.log.warn("configured PJRT backend unavailable ({s}); advancing backend priority", .{@errorName(err)});
+                    backend_selection = self.fallbackConfiguredGenerationSelection(body, &failed_generation_backends, .pjrt) catch
+                        return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "failed to resolve generation backend fallback" });
+                    continue :provider_attempt;
+                }
+            }
 
-        // Try plain HF ONNX decoder-only VLM packages before Ort GenAI overlays.
-        plain_onnx_generation: {
-            if (allow_onnx and artifact_selection.quantization == null and build_options.enable_onnx and
-                !c_file.fileExistsInDir(ctx.allocator, model_path, "genai_config.json") and
-                onnx_decoder_only_vlm.isSupportedModelDir(ctx.allocator, model_path))
+            // The direct ONNX generator implementations do not support grammar
+            // or speculative decoding. Those requests use graph-backed native
+            // generation instead; an ordinary ONNX model session is never
+            // passed to the native generation pipeline.
+            const allow_onnx = config.grammar == null and
+                effective_draft_model_name == null and
+                !backend_selection.graph_mode_requested and
+                (backend_selection.native_choice == .auto or backend_selection.native_choice == .onnx) and
+                (artifact_selection.format == null or artifactFormatIs(artifact_selection, "onnx") or artifactFormatIs(artifact_selection, "hybrid"));
+
+            // Try plain HF ONNX decoder-only VLM packages before Ort GenAI overlays.
             {
-                var transient_lease = self.model_manager.beginTransientModelLoadForRequest(request_id) catch |err|
-                    return modelLoadFailure(ctx, err);
-                defer transient_lease.deinit();
-
-                var prompt_override: ?[]u8 = null;
-                defer if (prompt_override) |prompt| ctx.allocator.free(prompt);
-                if (tool_parser) |*parser| {
-                    if (std.mem.eql(u8, parser.name(), "functiongemma")) {
-                        prompt_override = try buildFunctionGemmaPrompt(
-                            ctx.allocator,
-                            "",
-                            messages.items,
-                        );
-                    }
-                }
-
-                var pipeline = onnx_decoder_only_vlm.Pipeline.load(ctx.allocator, model_path) catch |err| {
-                    if (!backend_selection.strict_backend and isConfiguredOnnxGenerationFallbackError(err)) {
-                        backend_selection = self.fallbackConfiguredGenerationSelection(body, &failed_generation_backends, .onnx) catch {
-                            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
-                        };
-                        allow_onnx = false;
-                        std.log.warn(
-                            "configured ONNX generator initialization failed ({s}); continuing with backend priority fallback",
-                            .{@errorName(err)},
-                        );
-                        break :plain_onnx_generation;
-                    }
-                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
-                };
-                defer pipeline.deinit();
-                transient_lease.activate() catch |err| return modelLoadFailure(ctx, err);
-                pipeline.prompt_override = if (prompt_override) |prompt| prompt else null;
-
-                if (want_stream) {
-                    return self.streamGenerate(ctx, body.model, &pipeline, messages.items, config, if (tool_parser) |*parser| parser else null);
-                }
-
-                var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
-                defer result.deinit();
-
-                var response_text = result.text;
-                var tool_response_text: ?[]u8 = null;
-                defer if (tool_response_text) |text| ctx.allocator.free(text);
-                const parsed_tool_calls = if (tool_parser) |*parser| blk: {
-                    parser.reset();
-                    _ = parser.feed(result.text) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
-                    tool_response_text = parser.finishText(ctx.allocator) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
-                    response_text = tool_response_text.?;
-                    if (response_text.len == 0) response_text = result.text;
-                    const calls = parser.toolCalls();
-                    break :blk if (calls.len > 0) calls else null;
-                } else null;
-
-                if (parsed_tool_calls == null and tool_parser != null and response_text.len == 0) {
-                    response_text = "No tool call was emitted.";
-                }
-
-                var formatted_response_text: ?[]u8 = null;
-                defer if (formatted_response_text) |text| ctx.allocator.free(text);
-                if (parsed_tool_calls == null) {
-                    formatted_response_text = try coerceGenerateResponseFormat(ctx.allocator, body.response_format, response_text);
-                    if (formatted_response_text) |text| response_text = text;
-                }
-
-                return self.buildGenerateResponse(
-                    ctx,
-                    body.model,
-                    response_text,
-                    if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
-                    result.prompt_tokens,
-                    result.tokens_used,
-                    0,
-                    parsed_tool_calls,
-                );
-            }
-        }
-
-        // Try ortgenai first (models with genai_config.json)
-        ort_genai_generation: {
-            if (allow_onnx and build_options.enable_onnx) {
-                const ortgenai = backends_mod.ortgenai;
-                // Package discovery may return null when this is not an Ort
-                // GenAI model. Actual preparation failures describe the model
-                // artifact or local filesystem and must remain terminal; they
-                // are not evidence that the configured ONNX provider is
-                // unavailable.
-                var ort_package = prepareOnnxGeneratorModelDir(ctx.allocator, model_path, artifact_selection) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
-                defer if (ort_package) |*package| package.deinit();
-                if (ort_package) |*package| {
-                    const prepared_model_dir = package.path;
+                if (allow_onnx and artifact_selection.quantization == null and build_options.enable_onnx and
+                    !c_file.fileExistsInDir(ctx.allocator, model_path, "genai_config.json") and
+                    onnx_decoder_only_vlm.isSupportedModelDir(ctx.allocator, model_path))
+                {
                     var transient_lease = self.model_manager.beginTransientModelLoadForRequest(request_id) catch |err|
                         return modelLoadFailure(ctx, err);
                     defer transient_lease.deinit();
 
-                    var ort_manifest = manifest_mod.loadFromDir(ctx.allocator, prepared_model_dir) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
-                    defer ort_manifest.deinit();
-
-                    const use_functiongemma_prompt_override = if (tool_parser) |*parser|
-                        std.mem.eql(u8, parser.name(), "functiongemma")
-                    else
-                        false;
-
-                    var ort_chat_template_storage: ?generation.ChatTemplate = null;
-                    defer if (ort_chat_template_storage) |*ct| ct.deinit();
-                    if (!use_functiongemma_prompt_override) {
-                        if (ort_manifest.chat_template) |ct_source| {
-                            ort_chat_template_storage = generation.ChatTemplate.init(
+                    var prompt_override: ?[]u8 = null;
+                    defer if (prompt_override) |prompt| ctx.allocator.free(prompt);
+                    if (tool_parser) |*parser| {
+                        if (std.mem.eql(u8, parser.name(), "functiongemma")) {
+                            prompt_override = try buildFunctionGemmaPrompt(
                                 ctx.allocator,
-                                ct_source,
-                                ort_manifest.bos_token,
-                                ort_manifest.eos_token,
-                                ort_manifest.unk_token,
-                                ort_manifest.pad_token,
-                            ) catch |err| blk: {
-                                std.log.warn("chat template init failed for {s}: {s}", .{ model_path, @errorName(err) });
-                                break :blk null;
-                            };
+                                "",
+                                messages.items,
+                            );
                         }
                     }
 
-                    var prompt_override: ?[]u8 = null;
-                    defer if (prompt_override) |prompt| ctx.allocator.free(prompt);
-                    if (use_functiongemma_prompt_override) {
-                        prompt_override = try buildFunctionGemmaPrompt(
-                            ctx.allocator,
-                            ort_manifest.bos_token,
-                            messages.items,
-                        );
-                    }
-
-                    var gen_model = ortgenai.GenAiModel.load(ctx.allocator, prepared_model_dir) catch |err| {
+                    var pipeline = onnx_decoder_only_vlm.Pipeline.load(ctx.allocator, model_path) catch |err| {
                         if (!backend_selection.strict_backend and isConfiguredOnnxGenerationFallbackError(err)) {
                             backend_selection = self.fallbackConfiguredGenerationSelection(body, &failed_generation_backends, .onnx) catch {
                                 return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
                             };
-                            allow_onnx = false;
                             std.log.warn(
-                                "configured Ort GenAI initialization failed ({s}); continuing with backend priority fallback",
+                                "configured ONNX generator initialization failed ({s}); continuing with backend priority fallback",
                                 .{@errorName(err)},
                             );
-                            break :ort_genai_generation;
+                            continue :provider_attempt;
                         }
                         return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
                     };
-                    defer gen_model.deinit();
+                    defer pipeline.deinit();
                     transient_lease.activate() catch |err| return modelLoadFailure(ctx, err);
-
-                    var pipeline = generation.GenerationPipeline{
-                        .allocator = ctx.allocator,
-                        .model = &gen_model,
-                        .chat_template = if (ort_chat_template_storage) |*ct| ct else null,
-                        .prompt_override = if (prompt_override) |prompt| prompt else null,
-                    };
+                    pipeline.prompt_override = if (prompt_override) |prompt| prompt else null;
 
                     if (want_stream) {
                         return self.streamGenerate(ctx, body.model, &pipeline, messages.items, config, if (tool_parser) |*parser| parser else null);
@@ -3599,16 +3521,135 @@ pub const Node = struct {
                     );
                 }
             }
-        }
 
-        // Fall back to native generation (CPU/GPU GPT arch forward pass).
-        // Provider selection is still mutable here: no model or generation
-        // state has been committed, so infrastructure-only load failures may
-        // advance to the next bounded priority segment.
-        var model: *model_manager_mod.LoadedModel = undefined;
-        var base_load_attempts: usize = 0;
-        while (true) {
-            model = self.loadNativeGenerationModelForRequest(
+            // Try ortgenai first (models with genai_config.json)
+            {
+                if (allow_onnx and build_options.enable_onnx) {
+                    const ortgenai = backends_mod.ortgenai;
+                    // Package discovery may return null when this is not an Ort
+                    // GenAI model. Actual preparation failures describe the model
+                    // artifact or local filesystem and must remain terminal; they
+                    // are not evidence that the configured ONNX provider is
+                    // unavailable.
+                    var ort_package = prepareOnnxGeneratorModelDir(ctx.allocator, model_path, artifact_selection) catch |err|
+                        return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                    defer if (ort_package) |*package| package.deinit();
+                    if (ort_package) |*package| {
+                        const prepared_model_dir = package.path;
+                        var transient_lease = self.model_manager.beginTransientModelLoadForRequest(request_id) catch |err|
+                            return modelLoadFailure(ctx, err);
+                        defer transient_lease.deinit();
+
+                        var ort_manifest = manifest_mod.loadFromDir(ctx.allocator, prepared_model_dir) catch |err|
+                            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                        defer ort_manifest.deinit();
+
+                        const use_functiongemma_prompt_override = if (tool_parser) |*parser|
+                            std.mem.eql(u8, parser.name(), "functiongemma")
+                        else
+                            false;
+
+                        var ort_chat_template_storage: ?generation.ChatTemplate = null;
+                        defer if (ort_chat_template_storage) |*ct| ct.deinit();
+                        if (!use_functiongemma_prompt_override) {
+                            if (ort_manifest.chat_template) |ct_source| {
+                                ort_chat_template_storage = generation.ChatTemplate.init(
+                                    ctx.allocator,
+                                    ct_source,
+                                    ort_manifest.bos_token,
+                                    ort_manifest.eos_token,
+                                    ort_manifest.unk_token,
+                                    ort_manifest.pad_token,
+                                ) catch |err| blk: {
+                                    std.log.warn("chat template init failed for {s}: {s}", .{ model_path, @errorName(err) });
+                                    break :blk null;
+                                };
+                            }
+                        }
+
+                        var prompt_override: ?[]u8 = null;
+                        defer if (prompt_override) |prompt| ctx.allocator.free(prompt);
+                        if (use_functiongemma_prompt_override) {
+                            prompt_override = try buildFunctionGemmaPrompt(
+                                ctx.allocator,
+                                ort_manifest.bos_token,
+                                messages.items,
+                            );
+                        }
+
+                        var gen_model = ortgenai.GenAiModel.load(ctx.allocator, prepared_model_dir) catch |err| {
+                            if (!backend_selection.strict_backend and isConfiguredOnnxGenerationFallbackError(err)) {
+                                backend_selection = self.fallbackConfiguredGenerationSelection(body, &failed_generation_backends, .onnx) catch {
+                                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                                };
+                                std.log.warn(
+                                    "configured Ort GenAI initialization failed ({s}); continuing with backend priority fallback",
+                                    .{@errorName(err)},
+                                );
+                                continue :provider_attempt;
+                            }
+                            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                        };
+                        defer gen_model.deinit();
+                        transient_lease.activate() catch |err| return modelLoadFailure(ctx, err);
+
+                        var pipeline = generation.GenerationPipeline{
+                            .allocator = ctx.allocator,
+                            .model = &gen_model,
+                            .chat_template = if (ort_chat_template_storage) |*ct| ct else null,
+                            .prompt_override = if (prompt_override) |prompt| prompt else null,
+                        };
+
+                        if (want_stream) {
+                            return self.streamGenerate(ctx, body.model, &pipeline, messages.items, config, if (tool_parser) |*parser| parser else null);
+                        }
+
+                        var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
+                            return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                        defer result.deinit();
+
+                        var response_text = result.text;
+                        var tool_response_text: ?[]u8 = null;
+                        defer if (tool_response_text) |text| ctx.allocator.free(text);
+                        const parsed_tool_calls = if (tool_parser) |*parser| blk: {
+                            parser.reset();
+                            _ = parser.feed(result.text) catch |err|
+                                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                            tool_response_text = parser.finishText(ctx.allocator) catch |err|
+                                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                            response_text = tool_response_text.?;
+                            if (response_text.len == 0) response_text = result.text;
+                            const calls = parser.toolCalls();
+                            break :blk if (calls.len > 0) calls else null;
+                        } else null;
+
+                        if (parsed_tool_calls == null and tool_parser != null and response_text.len == 0) {
+                            response_text = "No tool call was emitted.";
+                        }
+
+                        var formatted_response_text: ?[]u8 = null;
+                        defer if (formatted_response_text) |text| ctx.allocator.free(text);
+                        if (parsed_tool_calls == null) {
+                            formatted_response_text = try coerceGenerateResponseFormat(ctx.allocator, body.response_format, response_text);
+                            if (formatted_response_text) |text| response_text = text;
+                        }
+
+                        return self.buildGenerateResponse(
+                            ctx,
+                            body.model,
+                            response_text,
+                            if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
+                            result.prompt_tokens,
+                            result.tokens_used,
+                            0,
+                            parsed_tool_calls,
+                        );
+                    }
+                }
+            }
+
+            // Fall back to native generation (CPU/GPU GPT arch forward pass).
+            const loaded_model = self.loadNativeGenerationModelForRequest(
                 request_id,
                 model_path,
                 backend_selection,
@@ -3639,16 +3680,14 @@ pub const Node = struct {
                     &failed_generation_backends,
                     failed_backend,
                 ) catch return modelLoadFailure(ctx, err);
-                base_load_attempts += 1;
-                if (base_load_attempts >= backend_priority_capacity) return modelLoadFailure(ctx, err);
                 std.log.warn(
                     "generation base model load failed ({s}); advancing to backend={s}",
                     .{ @errorName(err), @tagName(backend_selection.native_choice) },
                 );
-                continue;
+                continue :provider_attempt;
             };
-            break;
-        }
+            break :provider_attempt loaded_model;
+        };
         model.lockNativeGenerationWithIo(ctx.io);
         defer model.unlockNativeGenerationWithIo(ctx.io);
         const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
@@ -3716,25 +3755,6 @@ pub const Node = struct {
         var draft_cb: ?ops.ComputeBackend = null;
         defer if (draft_cb) |*cb_value| cb_value.deinit();
         var draft_gpt_config: ?@import("../models/gpt.zig").Config = null;
-        if (backend_selection.compiled_partition_backend == .pjrt and pjrt_client == null) {
-            if (self.initializeConfiguredPjrtClient(ctx.allocator, &pjrt_plugin_path)) |client| {
-                pjrt_client = client;
-            } else |err| {
-                if (backend_selection.strict_backend) {
-                    return ctx.status(if (err == error.MissingPjrtPluginPath) 400 else 500).json(.{
-                        .@"error" = if (err == error.MissingPjrtPluginPath) "INVALID_REQUEST" else "BACKEND_ERROR",
-                        .message = if (err == error.MissingPjrtPluginPath)
-                            "pjrt backend requires inference.pjrt_plugin_path or PJRT_PLUGIN_PATH"
-                        else
-                            @errorName(err),
-                    });
-                }
-                std.log.warn("configured PJRT backend unavailable ({s}); advancing backend priority", .{@errorName(err)});
-                backend_selection = self.fallbackConfiguredGenerationSelection(body, &failed_generation_backends, .pjrt) catch
-                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "failed to resolve generation backend fallback" });
-            }
-        }
-
         var compiled_fallback_storage: [backend_priority_capacity]ops.BackendKind = undefined;
         const effective_backend_priority = self.config.backend_priority orelse self.session_manager.preferred_backends;
         var compiled_fallback_backends = if (backend_selection.strict_backend)
@@ -4503,17 +4523,44 @@ pub const Node = struct {
                 try group_indices.append(ctx.allocator, idx);
             }
 
-            const model = self.loadNativeGenerationModelForRequest(
-                group_request_id,
-                model_path,
-                selection,
-                artifact_selection,
-            ) catch |err| {
+            const model = batch_model_load: {
+                var direct_scratch: [backend_priority_capacity]backends_mod.BackendType = undefined;
+                const configured_priority = self.config.backend_priority orelse self.session_manager.preferred_backends;
+                const direct_backends = batchGenerationDirectPriority(&direct_scratch, configured_priority, selection);
+                var last_load_error: ?anyerror = null;
+                var last_load_backend: ?backends_mod.BackendType = null;
+                for (direct_backends) |backend| {
+                    var attempt_selection = selection;
+                    attempt_selection.native_choice = backendTypeToGenerationChoice(backend);
+                    attempt_selection.compiled_partition_backend = null;
+                    attempt_selection.override_model_loading = true;
+                    attempt_selection.strict_backend = true;
+                    const loaded = self.loadNativeGenerationModelForRequest(
+                        group_request_id,
+                        model_path,
+                        attempt_selection,
+                        artifact_selection,
+                    ) catch |err| {
+                        last_load_error = err;
+                        last_load_backend = backend;
+                        if (!isRetryableGenerationBaseLoadError(&.{backend}, err)) break;
+                        std.log.warn(
+                            "batch generation base model load failed backend={s} ({s}); advancing operation-compatible priority",
+                            .{ @tagName(backend), @errorName(err) },
+                        );
+                        continue;
+                    };
+                    break :batch_model_load loaded;
+                }
+
+                const err = last_load_error orelse error.NoNativeGenerationBackend;
+                const retryable = err == error.ModelCapacityReached or
+                    (last_load_backend != null and isRetryableGenerationBaseLoadError(&.{last_load_backend.?}, err));
                 for (group_indices.items) |idx| {
                     results[idx].@"error" = .{
                         .code = if (err == error.ModelCapacityReached) "MODEL_CAPACITY_REACHED" else "MODEL_LOAD_FAILED",
                         .message = @errorName(err),
-                        .retryable = true,
+                        .retryable = retryable,
                     };
                     pending[idx] = false;
                 }
@@ -8478,6 +8525,31 @@ test "generation base load preserves compiled provider boundaries" {
         configured_cuda,
     );
     try std.testing.expectEqualSlices(backends_mod.BackendType, &.{.cuda}, bounded_direct);
+}
+
+test "batch generation skips unsupported compiled providers while preserving direct order" {
+    var scratch: [backend_priority_capacity]backends_mod.BackendType = undefined;
+    const configured = GenerateBackendSelection{ .native_choice = .cuda };
+    const direct = batchGenerationDirectPriority(
+        &scratch,
+        &.{ .cuda, .pjrt, .onnx, .native, .webgpu, .metal },
+        configured,
+    );
+    try std.testing.expectEqualSlices(backends_mod.BackendType, &.{ .cuda, .native, .metal }, direct);
+
+    const strict = GenerateBackendSelection{
+        .native_choice = .metal,
+        .strict_backend = true,
+    };
+    const strict_direct = batchGenerationDirectPriority(&scratch, &.{ .native, .metal }, strict);
+    try std.testing.expectEqualSlices(backends_mod.BackendType, &.{.metal}, strict_direct);
+
+    const model_policy = GenerateBackendSelection{
+        .native_choice = .metal,
+        .override_model_loading = true,
+    };
+    const policy_direct = batchGenerationDirectPriority(&scratch, &.{ .cuda, .native }, model_policy);
+    try std.testing.expectEqualSlices(backends_mod.BackendType, &.{ .metal, .cuda, .native }, policy_direct);
 }
 
 test "generation base failure advances beyond every provider sharing the base" {

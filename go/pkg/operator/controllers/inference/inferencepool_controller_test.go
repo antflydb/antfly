@@ -112,6 +112,7 @@ var _ = Describe("InferencePool Controller", func() {
 			runtimeConfig, ok := completeConfig["inference"].(map[string]any)
 			Expect(ok).To(BeTrue())
 			Expect(runtimeConfig["backend_priority"]).To(HaveExactElements("pjrt", "native"))
+			Expect(runtimeConfig["pjrt_plugin_path"]).To(Equal(defaultTPUPJRTPluginPath))
 			Expect(runtimeConfig["preload"]).To(HaveLen(1))
 			Expect(runtimeConfig["allow_downloads"]).To(BeFalse())
 
@@ -165,6 +166,24 @@ var _ = Describe("InferencePool Controller", func() {
 	})
 
 	Context("When selecting accelerator backends", func() {
+		It("preserves an explicit PJRT plugin path for custom TPU images", func() {
+			pool := &antflyaiv1alpha1.InferencePool{
+				Spec: antflyaiv1alpha1.InferencePoolSpec{
+					Models:   antflyaiv1alpha1.ModelConfig{LoadingStrategy: antflyaiv1alpha1.LoadingStrategyLazy},
+					Hardware: antflyaiv1alpha1.HardwareConfig{Accelerator: "tpu-v5-lite-podslice"},
+					Config:   `{"pjrt_plugin_path":"/opt/custom/libtpu.so"}`,
+				},
+			}
+			reconciler := &InferencePoolReconciler{}
+			configJSON, err := reconciler.generateCompleteConfig(pool)
+			Expect(err).NotTo(HaveOccurred())
+			var config map[string]any
+			Expect(json.Unmarshal([]byte(configJSON), &config)).To(Succeed())
+			inferenceConfig := config["inference"].(map[string]any)
+			Expect(inferenceConfig["backend_priority"]).To(HaveExactElements("pjrt", "native"))
+			Expect(inferenceConfig["pjrt_plugin_path"]).To(Equal("/opt/custom/libtpu.so"))
+		})
+
 		It("derives CUDA from NVIDIA resources without adding TPU resources", func() {
 			pool := &antflyaiv1alpha1.InferencePool{
 				Spec: antflyaiv1alpha1.InferencePoolSpec{

@@ -519,7 +519,7 @@ fn executeModelForwardViaDefinition(
 
     var output = switch (request) {
         .decode => |decode_request| runtime.decode(allocator, decode_request) catch |err| switch (err) {
-            error.UnsupportedDecode, error.UnsupportedShape, error.MissingPastKeyValue, error.MissingValue => {
+            error.UnsupportedDecode, error.UnsupportedShape => {
                 logPjrtRuntimeDecline("runtime", err, request);
                 return null;
             },
@@ -528,11 +528,7 @@ fn executeModelForwardViaDefinition(
         .prefill => |prefill_request| blk: {
             try runtime.reset();
             break :blk runtime.prefill(allocator, prefill_request) catch |err| switch (err) {
-                error.ArtifactShapeMismatch,
-                error.UnsupportedArtifactInputs,
                 error.UnsupportedShape,
-                error.UnsupportedTensorType,
-                error.MissingValue,
                 => {
                     logPjrtRuntimeDecline("runtime", err, request);
                     return null;
@@ -624,7 +620,7 @@ fn findMatchingPjrtArtifactFromPackage(
         defer allocator.free(package_path);
 
         var parsed = compiled_artifact.readPackageManifest(allocator, io, package_path) catch |err| switch (err) {
-            error.FileNotFound, error.InvalidCharacter, error.SyntaxError, error.UnexpectedToken, error.UnknownField => continue,
+            error.FileNotFound => continue,
             else => return err,
         };
         defer parsed.deinit();
@@ -669,7 +665,7 @@ fn findMatchingPjrtWholeModelPackageManifest(
         defer allocator.free(package_path);
 
         var parsed = compiled_artifact.readPackageManifest(allocator, io, package_path) catch |err| switch (err) {
-            error.FileNotFound, error.InvalidCharacter, error.SyntaxError, error.UnexpectedToken, error.UnknownField => continue,
+            error.FileNotFound => continue,
             else => return err,
         };
         defer parsed.deinit();
@@ -759,7 +755,7 @@ fn findMatchingPjrtDecodeArtifactsFromPackage(
     defer allocator.free(package_path);
 
     var parsed = compiled_artifact.readPackageManifest(allocator, io, package_path) catch |err| switch (err) {
-        error.FileNotFound, error.InvalidCharacter, error.SyntaxError, error.UnexpectedToken, error.UnknownField => return null,
+        error.FileNotFound => return null,
         else => return err,
     };
     defer parsed.deinit();
@@ -1266,6 +1262,41 @@ test "PJRT whole-model artifact lookup can resolve prefill from package index" {
     defer allocator.free(found.manifest_path);
     defer allocator.free(found.artifact_path);
     try std.testing.expectEqualStrings("/tmp/model.prefill.exec", found.artifact_path);
+}
+
+test "PJRT model-specific package corruption is terminal" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(base_dir);
+    const package_path = try compiled_artifact.packageManifestPath(
+        allocator,
+        base_dir,
+        "xla",
+        "/tmp/model",
+        "pjrt_executable",
+        compiled_artifact.pjrt_parameter_mode_embedded,
+    );
+    defer allocator.free(package_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = package_path, .data = "[1]" });
+
+    try std.testing.expectError(
+        error.UnexpectedToken,
+        findMatchingPjrtWholeModelArtifact(
+            allocator,
+            base_dir,
+            "/tmp/model",
+            .{ .prefill = .{
+                .input_ids = &.{1},
+                .seq_len = 1,
+                .query_seq_len = 1,
+                .attention_mode = .paged_prefill,
+            } },
+        ),
+    );
 }
 
 test "PJRT whole-model coverage reports unsupported stateful attention blockers" {

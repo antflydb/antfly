@@ -57,6 +57,9 @@ const (
 	// InferenceAPIPort is the port the Inference API server listens on.
 	// This must match ANTFLY_INFERENCE_URL in the container image (default: http://0.0.0.0:8080).
 	InferenceAPIPort = 8080
+	// defaultTPUPJRTPluginPath is part of the omni inference image contract.
+	// Custom images may override it through spec.config.pjrt_plugin_path.
+	defaultTPUPJRTPluginPath = "/usr/local/lib/libtpu.so"
 )
 
 var (
@@ -393,6 +396,11 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 			inferenceConfig["backend_priority"] = []string{"cuda"}
 		}
 	}
+	if isTPUInferencePool(pool) {
+		if _, exists := inferenceConfig["pjrt_plugin_path"]; !exists {
+			inferenceConfig["pjrt_plugin_path"] = defaultTPUPJRTPluginPath
+		}
+	}
 
 	config := map[string]any{"inference": inferenceConfig}
 	// The CLI constructs its logger before starting the inference runtime. Mirror
@@ -415,10 +423,7 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 // inferenceArtifactSelection recognizes only runtime artifact-family suffixes.
 // Other registry variants such as :i8 remain opaque pull references.
 func inferenceArtifactSelection(modelRef string) (format, quantization string, ok bool) {
-	ref := modelRef
-	if strings.HasPrefix(ref, "hf:") {
-		ref = ref[len("hf:"):]
-	}
+	ref := strings.TrimPrefix(modelRef, "hf:")
 	separator := strings.IndexByte(ref, ':')
 	if separator < 0 {
 		return "", "", false
