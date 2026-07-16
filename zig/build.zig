@@ -2999,6 +2999,7 @@ pub fn build(b: *std.Build) void {
         "metadata.table status does not promote mismatched index sort runtime capability",
         "metadata.table status does not advertise changed index sort direction before rebuild",
         "metadata.table status merges observed capabilities conservatively",
+        "metadata.table status encoder preserves enrichment summaries without producer configuration",
         "metadata.table debug encoder emits runtime schemas and index bindings",
         "api query builder preflight describes missing physical sort coverage with public sortable wording",
         "api query builder prompt exposes native sort capabilities",

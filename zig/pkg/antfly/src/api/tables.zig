@@ -1838,16 +1838,39 @@ fn buildCanonicalIndexConfigValue(
 }
 
 fn projectInlineEnrichmentConfigsInTableStatusJson(alloc: std.mem.Allocator, encoded: []const u8) ![]u8 {
-    return try alloc.dupe(u8, encoded);
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena, encoded, .{});
+    redactInlineEnrichmentProducerConfigs(&parsed.value);
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
 }
 
 fn projectSingleTableStatusJson(alloc: std.mem.Allocator, encoded: []const u8, indexes_json: []const u8) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
-    defer parsed.deinit();
-    var owned = try cloneJsonValueAlloc(alloc, parsed.value);
-    defer deinitJsonValue(alloc, &owned);
-    try attachArtifactEnrichmentsToTableStatus(alloc, &owned, indexes_json);
-    return try std.json.Stringify.valueAlloc(alloc, owned, .{ .emit_null_optional_fields = false });
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena, encoded, .{});
+    try attachArtifactEnrichmentsToTableStatus(arena, &parsed.value, indexes_json);
+    redactInlineEnrichmentProducerConfigs(&parsed.value);
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
+}
+
+/// Producer configuration is accepted on writes but is deliberately omitted
+/// from table-status responses. Besides provider credentials, producer_json
+/// can contain arbitrary nested reader configuration supplied by a client.
+fn redactInlineEnrichmentProducerConfigs(value: *std.json.Value) void {
+    switch (value.*) {
+        .array => |*array| {
+            for (array.items) |*item| redactInlineEnrichmentProducerConfigs(item);
+        },
+        .object => |*object| {
+            _ = object.swapRemove("producer_json");
+            var it = object.iterator();
+            while (it.next()) |entry| redactInlineEnrichmentProducerConfigs(entry.value_ptr);
+        },
+        else => {},
+    }
 }
 
 fn attachArtifactEnrichmentsToTableStatus(alloc: std.mem.Allocator, value: *std.json.Value, indexes_json: []const u8) !void {
@@ -3501,14 +3524,14 @@ test "metadata.table status merges observed capabilities conservatively" {
     try std.testing.expectEqualStrings("observed_dynamic", price.object.get("provenance").?.string);
 }
 
-test "metadata.table status encoder preserves inline enrichment configs" {
+test "metadata.table status encoder preserves enrichment summaries without producer configuration" {
     const indexes_json =
         \\{
         \\  "document_text":{
         \\    "type":"full_text",
         \\    "artifact_name":"document_chunks_v1",
         \\    "enrichments":[
-        \\      {"name":"document_units_v1","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\"}"},
+        \\      {"name":"document_units_v1","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"ocr\":{\"config\":{\"provider\":\"remote\",\"api_key\":\"do-not-return\"}}}"},
         \\      {"name":"document_chunks_v1","kind":"chunk","source_artifact_name":"document_units_v1","field":"text"}
         \\    ]
         \\  },
@@ -3538,6 +3561,8 @@ test "metadata.table status encoder preserves inline enrichment configs" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"enrichments\":[{\"name\":\"document_units_v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "{\"name\":\"document_chunks_v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"enrichments\":[{\"name\":\"document_chunk_dense_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "producer_json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "do-not-return") == null);
 }
 
 test "metadata.table debug encoder emits runtime schemas and index bindings" {
