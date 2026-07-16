@@ -3156,7 +3156,7 @@ pub const DataServer = struct {
             apply_sm.write_source.setLocalIndexRepairDebtHook(self.localIndexRepairDebtHook());
             _ = self.write_source.withLocalWriteOwner(&apply_sm.write_source);
         }
-        self.read_source.primary_lookup_db = self.localPrimaryLookupDbSource();
+        self.read_source.resident_db = self.localResidentDbSource();
         self.write_source.setLocalChangeHook(self.localChangeHook());
         self.write_source.setLocalIndexRepairDebtHook(self.localIndexRepairDebtHook());
         _ = self.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
@@ -4281,28 +4281,28 @@ pub const DataServer = struct {
         };
     }
 
-    fn localPrimaryLookupDbSource(self: *DataServer) antfly.public_api.table_reads.PrimaryLookupDbSource {
+    fn localResidentDbSource(self: *DataServer) antfly.public_api.table_reads.ResidentDbSource {
         return .{
             .ptr = self,
-            .lease_group = localPrimaryLookupDbLeaseGroup,
+            .lease_group = localResidentDbLeaseGroup,
         };
     }
 
-    fn localPrimaryLookupDbLeaseGroup(
+    fn localResidentDbLeaseGroup(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
         group_id: u64,
         lsm_root_generation: u64,
-    ) !?antfly.public_api.table_reads.PrimaryLookupDbLease {
+    ) !?antfly.public_api.table_reads.ResidentDbLease {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.data_raft_apply) |apply_sm| {
-            const apply_source = apply_sm.write_source.primaryLookupDbSource();
+            const apply_source = apply_sm.write_source.residentDbSource();
             if (try apply_source.leaseGroup(alloc, table_name, group_id, lsm_root_generation)) |lease| {
                 return lease;
             }
         }
-        const write_source = self.write_source.primaryLookupDbSource();
+        const write_source = self.write_source.residentDbSource();
         return try write_source.leaseGroup(alloc, table_name, group_id, lsm_root_generation);
     }
 

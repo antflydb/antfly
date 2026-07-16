@@ -58493,6 +58493,9 @@ test "db dense repair durably yields and resumes a reopenable building candidate
     var yield_token: u8 = 0;
     const options = types.ArtifactRepairRunOptions{
         .yield_check = .{ .ptr = &yield_token, .is_requested = Yield.requested },
+        // This test covers durable yield/resume checkpoints, not the default
+        // activation pause SLA. Leave enough headroom for contended CI hosts.
+        .max_activation_pause_ms = 5_000,
     };
     var repair_id: u128 = 0;
     var candidate_path: []u8 = undefined;

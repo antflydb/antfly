@@ -4466,7 +4466,7 @@ pub fn build(b: *std.Build) void {
             "write cache local mutation preempts stale startup writer",
             "hosted runtime status prefers live writer over stale hosted snapshot",
             "runtime status collection leaves active stale write lease live",
-            "primary lookup adopts seeded write cache across visible generation bump",
+            "resident DB lease adopts seeded write cache across visible generation bump",
             "provisioned write cache close detaches promotion leadership callback before stats",
             "provisioned table write source coalesces same-group waiters",
             "provisioned table write source preserves same-key delete then write across coalesced waiters",
@@ -4520,6 +4520,7 @@ pub fn build(b: *std.Build) void {
             "parseRemoteSearchResult preserves fused index scores",
             "table read distributed sorted merge uses catalog runtime schema and rejects incomplete shard windows",
             "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
+            "provisioned local query reuses resident generation without readonly open",
             "catalog backed router skips non-serving relocation placements",
         },
         .test_runner = .{

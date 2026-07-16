@@ -261,7 +261,7 @@ pub const ProvisionedGroupStorage = struct {
         read_source.runtime_status_cache = &self.runtime_status_cache;
         read_source.prepare_for_read = write_source.readPreparation();
         _ = read_source.withGroupVisibleRootGeneration(self.groupVisibleRootGenerationSource());
-        read_source.primary_lookup_db = write_source.primaryLookupDbSource();
+        read_source.resident_db = write_source.residentDbSource();
         write_source.read_cache = &self.read_cache;
         write_source.bindWriteCaches(&self.write_cache, &self.startup_write_cache);
         write_source.runtime_status_cache = &self.runtime_status_cache;

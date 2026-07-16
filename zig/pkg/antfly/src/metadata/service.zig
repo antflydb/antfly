@@ -1512,7 +1512,12 @@ pub const MetadataService = struct {
 
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForLifecycleRound();
         if (shouldRefreshLocalStoreStatusForLifecycleRound(self, backfill_markers)) {
-            self.refreshLocalStoreStatusWithBackfillMarkers(backfill_markers, false) catch |err| switch (err) {
+            // Lifecycle rounds run while schema provisioning can own the
+            // shard DB for minutes. Use the registered data-runtime provider
+            // here too: bypassing it cold-opened the complete DB once per
+            // lifecycle tick, including every full-text segment, while the
+            // authoritative writer was already rebuilding the next schema.
+            self.refreshLocalStoreStatusWithBackfillMarkers(backfill_markers, true) catch |err| switch (err) {
                 error.UnknownGroup, error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
                 else => return err,
             };
@@ -2891,7 +2896,10 @@ pub const MetadataHttpService = struct {
 
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForLifecycleRound();
         if (shouldRefreshLocalStoreStatusForLifecycleRound(self, backfill_markers)) {
-            self.refreshLocalStoreStatusWithBackfillMarkers(backfill_markers, false) catch |err| switch (err) {
+            // Keep lifecycle status observational. The provider returns its
+            // published/runtime cache immediately and refreshes cold state in
+            // the background; it must not be bypassed during long migrations.
+            self.refreshLocalStoreStatusWithBackfillMarkers(backfill_markers, true) catch |err| switch (err) {
                 error.UnknownGroup, error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
                 else => return err,
             };
@@ -4786,7 +4794,11 @@ fn collectLocalGroupStatusReport(
     _ = stores;
     _ = merged_group_statuses;
     var db = try db_mod.DB.open(alloc, db_path, .{
-        .open_mode = .query_readonly,
+        // This path is only a fallback when no local data-runtime provider is
+        // installed. Group status needs primary identity count and filesystem
+        // size, never query execution. Catalog-only mode avoids mmap/open of
+        // every derived segment and cannot race a live index generation.
+        .open_mode = .status_only,
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .transaction_recovery = .{ .enabled = false },
@@ -8303,6 +8315,28 @@ test "metadata service lifecycle round uses cached backfill markers" {
         }
     };
 
+    const ProviderCapture = struct {
+        calls: usize = 0,
+
+        fn collect(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            _: []const u8,
+            _: []const metadata_table_manager.TableRecord,
+            _: []const metadata_table_manager.RangeRecord,
+            _: []const metadata_table_manager.StoreRecord,
+            _: []const metadata_reconciler.MergedGroupStatus,
+            _: []const transition_state.SplitTransitionRecord,
+            _: []const transition_state.MergeTransitionRecord,
+            _: []const transition_state.SplitObservationRecord,
+            _: []const transition_state.MergeObservationRecord,
+        ) ![]metadata_table_manager.GroupStatusReport {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return try alloc.alloc(metadata_table_manager.GroupStatusReport, 0);
+        }
+    };
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
@@ -8331,6 +8365,11 @@ test "metadata service lifecycle round uses cached backfill markers" {
         },
     }, .{});
     defer svc.deinit();
+    var provider_capture = ProviderCapture{};
+    svc.setLocalGroupStatusProvider(.{
+        .ptr = &provider_capture,
+        .vtable = &.{ .collect = ProviderCapture.collect },
+    });
 
     _ = try svc.ensureMetadataReplica(.{
         .group_id = 1978,
@@ -8383,6 +8422,7 @@ test "metadata service lifecycle round uses cached backfill markers" {
     try std.Io.Dir.cwd().deleteFile(io_impl.io(), state_path);
 
     try svc.runLifecycleRound();
+    try std.testing.expectEqual(@as(usize, 1), provider_capture.calls);
     try std.testing.expectEqual(@as(usize, 1), svc.store_status_backfill_marker_cache.markers.len);
     try std.testing.expect(svc.store_status_backfill_marker_cache.rescan_requested);
     try std.testing.expectEqual(@as(usize, 39), svc.store_status_ticks);

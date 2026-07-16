@@ -14,8 +14,18 @@ request templates are relative to that normal public API prefix.
 The loader preserves the kernel benchmark's zero-based corpus ordinal. Normal
 batches use `sync_level=write`, matching the declared process-durable profile;
 the final batch uses `sync_level=full_index` so timed loading does not return
-until the corpus is searchable. Search requests ask for no stored fields and
-therefore return only result identity/scoring metadata.
+until the corpus is searchable. Search requests select only the reserved
+`_id` field. Responses therefore contain IDs and scores (plus the API's empty
+`_source` object), never stored document bodies.
+
+`schema-v2.json` is the immutable migration fixture for a corpus that was
+already created with schema version 1. It has identical validation and runtime
+indexing semantics; its `required` array is reordered because the public API
+derives versions from a document-schema change and ignores a caller-supplied
+version by design. Apply it with `PUT
+/db/v1/tables/antfly-benchmark/schema`; the server must retain the prior read
+generation until `full_text_index_v2` is complete. This fixture exists to test
+real production migration and must not be used to rewrite version 1 in place.
 
 The process-durable server command is structurally:
 

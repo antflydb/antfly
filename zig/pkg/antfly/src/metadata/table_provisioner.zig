@@ -1001,19 +1001,37 @@ fn localRangeHasSchemaVersionIndex(
     const path = try groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
     defer alloc.free(path);
 
+    var target_name_buf: [64]u8 = undefined;
+    const target_name = if (schema_version == 0)
+        @import("../api/tables.zig").default_full_text_index_name
+    else
+        try std.fmt.bufPrint(&target_name_buf, "full_text_index_v{d}", .{schema_version});
+
+    // A rebuild marker is the durable, authoritative statement that this
+    // schema index is not ready. Check it before opening the DB: schema
+    // progress is polled by the metadata lifecycle while the resident writer
+    // can spend minutes backfilling a large corpus. Reopening the same DB in
+    // query mode on every poll maps the complete retained read index and scans
+    // primary LSM metadata even though the answer is already on disk here.
+    const rebuild_state_root = try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ path, target_name });
+    defer alloc.free(rebuild_state_root);
+    const rebuild_state = db_mod.backfill_state.RebuildState.init(rebuild_state_root);
+    if (try rebuild_state.check(alloc)) |resume_key| {
+        alloc.free(resume_key);
+        return false;
+    }
+
     var open_options = provisioningDbOpenOptions();
-    open_options.open_mode = .query_readonly;
+    // Marker disappearance is followed by one catalog-only verification.
+    // Status probes do not execute queries and must not load/mmap full-text
+    // segment data merely to inspect persisted readiness metadata.
+    open_options.open_mode = .status_only;
     open_options.backend_runtime = options.backend_runtime;
     var db = try db_mod.DB.open(alloc, path, open_options);
     defer db.close();
     const stats = try db.stats(alloc);
     defer db_mod.types.freeDBStats(alloc, stats);
 
-    var target_name_buf: [64]u8 = undefined;
-    const target_name = if (schema_version == 0)
-        @import("../api/tables.zig").default_full_text_index_name
-    else
-        try std.fmt.bufPrint(&target_name_buf, "full_text_index_v{d}", .{schema_version});
     const target_index = findDbIndexStats(stats.indexes, target_name) orelse return false;
     if (!indexStatsReady(target_index)) return false;
     if (schema_version == read_schema_version) return true;
@@ -2725,6 +2743,35 @@ test "table provisioner schema progress probes do not take a writer lease" {
 
     try std.testing.expectEqual(@as(usize, 1), progress.len);
     try std.testing.expectEqual(@as(u64, 9), progress[0].table_id);
+}
+
+test "table provisioner schema progress returns not ready from rebuild marker without opening DB" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-metadata-table-provisioner-progress-rebuild-marker";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2007);
+    defer alloc.free(db_path);
+    const index_root = try std.fmt.allocPrint(alloc, "{s}/indexes/full_text_index_v2", .{db_path});
+    defer alloc.free(index_root);
+    const rebuild_state = db_mod.backfill_state.RebuildState.init(index_root);
+    try rebuild_state.update("doc:m");
+
+    // There is deliberately no DB at db_path. If the progress probe attempts
+    // DB.open instead of trusting the durable marker, this call fails rather
+    // than returning the expected in-progress result.
+    try std.testing.expect(!try localRangeHasSchemaVersionIndex(
+        alloc,
+        path,
+        "docs",
+        2007,
+        2,
+        1,
+        .{},
+    ));
 }
 
 test "table provisioner withholds schema progress when any local shard is missing the target full-text index" {

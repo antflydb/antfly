@@ -21556,7 +21556,10 @@ test "force compact accounts text merge buffers via resource manager" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
-        .hard_limit_bytes = 1024 * 1024,
+        // File-backed merges reserve an 8 MiB baseline plus measured segment
+        // working set. Keep the hard limit above that baseline so this test
+        // exercises accounting and release rather than admission rejection.
+        .hard_limit_bytes = 64 * 1024 * 1024,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
     policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{

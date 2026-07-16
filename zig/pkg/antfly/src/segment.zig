@@ -2133,7 +2133,7 @@ fn mergeTypedDocValuesSections(
     var writer: ?typed_dv.TypedDocValuesWriter = null;
     defer if (writer) |*w| w.deinit();
 
-    var merged_doc_id: u32 = 0;
+    var merged_doc_base: u32 = 0;
     for (inputs) |input| {
         const reader = input.reader;
         var dv_reader: ?typed_dv.TypedDocValuesReader = null;
@@ -2151,34 +2151,28 @@ fn mergeTypedDocValuesSections(
             }
         }
 
-        for (0..reader.doc_count) |doc_id_usize| {
-            const doc_id: u32 = @intCast(doc_id_usize);
-            if (input.isDeleted(doc_id)) continue;
-            if (dv_reader) |dv| {
-                switch (dv.value_type) {
-                    .u64_val => if (try dv.getU64(doc_id)) |value| {
-                        try writer.?.add(merged_doc_id, .{ .u64_val = value });
-                    },
-                    .i64_val => if (try dv.getI64(doc_id)) |value| {
-                        try writer.?.add(merged_doc_id, .{ .i64_val = value });
-                    },
-                    .f64_val => if (try dv.getF64(doc_id)) |value| {
-                        try writer.?.add(merged_doc_id, .{ .f64_val = value });
-                    },
-                    .geo_point => if (try dv.getGeoPoint(doc_id)) |value| {
-                        try writer.?.add(merged_doc_id, .{ .geo_point = value });
-                    },
-                    .bool_val => if (try dv.getBool(doc_id)) |value| {
-                        try writer.?.add(merged_doc_id, .{ .bool_val = value });
-                    },
-                    .bytes_val => if (try dv.getBytesAlloc(doc_id)) |value| {
-                        defer alloc.free(value);
-                        try writer.?.add(merged_doc_id, .{ .bytes_val = value });
-                    },
+        if (dv_reader) |*dv| {
+            for (0..dv.num_chunks) |chunk_idx| {
+                var chunk = try dv.decodeChunk(@intCast(chunk_idx));
+                defer chunk.deinit();
+                var it = chunk.iterator();
+                while (try it.next()) |entry| {
+                    if (entry.doc_id >= reader.doc_count) return error.InvalidSegment;
+                    if (input.isDeleted(entry.doc_id)) continue;
+                    const deleted_before: u32 = if (input.deleted) |deleted|
+                        @intCast(deleted.rank(entry.doc_id))
+                    else
+                        0;
+                    try writer.?.add(merged_doc_base + entry.doc_id - deleted_before, entry.value);
                 }
             }
-            merged_doc_id += 1;
         }
+
+        const deleted_live_range: u32 = if (input.deleted) |deleted|
+            @intCast(deleted.rank(reader.doc_count))
+        else
+            0;
+        merged_doc_base += reader.doc_count - deleted_live_range;
     }
 
     if (writer) |*w| {
@@ -2828,6 +2822,78 @@ test "segment append merge preserves bytes typed doc values" {
 
     try std.testing.expectEqualStrings("acme", tenant0);
     try std.testing.expectEqualStrings("beta", tenant1_value);
+}
+
+test "segment append merge remaps sparse multi-chunk typed doc values around deletions" {
+    const alloc = std.testing.allocator;
+
+    var first_values = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 2);
+    defer first_values.deinit();
+    try first_values.add(0, .{ .u64_val = 10 });
+    try first_values.add(2, .{ .u64_val = 20 });
+    try first_values.add(4, .{ .u64_val = 40 });
+    const first_values_data = try first_values.build();
+    defer alloc.free(first_values_data);
+
+    var sw1 = SegmentWriter.init(alloc);
+    defer sw1.deinit();
+    const first_field = try sw1.addField("ordinal");
+    try sw1.addSection(first_field, .typed_doc_values, first_values_data);
+    for (0..5) |doc_id| {
+        var id_buf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "first:{d}", .{doc_id});
+        try sw1.addStoredDoc(id, "{}");
+    }
+    const first_segment = try sw1.build();
+    defer alloc.free(first_segment);
+
+    var second_values = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 1);
+    defer second_values.deinit();
+    try second_values.add(0, .{ .u64_val = 50 });
+    try second_values.add(2, .{ .u64_val = 70 });
+    const second_values_data = try second_values.build();
+    defer alloc.free(second_values_data);
+
+    var sw2 = SegmentWriter.init(alloc);
+    defer sw2.deinit();
+    const second_field = try sw2.addField("ordinal");
+    try sw2.addSection(second_field, .typed_doc_values, second_values_data);
+    for (0..3) |doc_id| {
+        var id_buf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "second:{d}", .{doc_id});
+        try sw2.addStoredDoc(id, "{}");
+    }
+    const second_segment = try sw2.build();
+    defer alloc.free(second_segment);
+
+    var first_reader = try SegmentReader.init(alloc, first_segment);
+    defer first_reader.deinit();
+    var second_reader = try SegmentReader.init(alloc, second_segment);
+    defer second_reader.deinit();
+
+    var first_deleted = roaring.RoaringBitmap.init(alloc);
+    defer first_deleted.deinit();
+    try first_deleted.add(1);
+    try first_deleted.add(4);
+    var second_deleted = roaring.RoaringBitmap.init(alloc);
+    defer second_deleted.deinit();
+    try second_deleted.add(1);
+
+    const merged = try mergeSegmentInputs(alloc, &.{
+        .{ .reader = &first_reader, .deleted = first_deleted },
+        .{ .reader = &second_reader, .deleted = second_deleted },
+    });
+    defer alloc.free(merged);
+
+    var merged_reader = try SegmentReader.init(alloc, merged);
+    defer merged_reader.deinit();
+    try std.testing.expectEqual(@as(u32, 5), merged_reader.doc_count);
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, merged_reader.getSection("ordinal", .typed_doc_values) orelse return error.TestExpectedEqual);
+    try std.testing.expectEqual(@as(?u64, 10), try values.getU64(0));
+    try std.testing.expectEqual(@as(?u64, 20), try values.getU64(1));
+    try std.testing.expectEqual(@as(?u64, null), try values.getU64(2));
+    try std.testing.expectEqual(@as(?u64, 50), try values.getU64(3));
+    try std.testing.expectEqual(@as(?u64, 70), try values.getU64(4));
 }
 
 test "index-only stored fields preserve ordinals key ranges and merges" {

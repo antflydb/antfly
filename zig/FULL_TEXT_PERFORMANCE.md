@@ -2491,7 +2491,13 @@ the health and public endpoints responded. Earlier loopback refusals came from
 the command sandbox, while request delay came from the synchronous structural
 schema/rebuild path and the pathological status scans above. Treat availability
 of the listener, table-generation admission, and migration completion as three
-separate signals in future server runs.
+separate signals in future server runs. The optimized v2 rebuild reconfirmed
+this explicitly: a live process sample showed one OS thread blocked in the
+health server's `accept` and a separate thread blocked in
+`httpx.Server.listen`'s `accept`, while a sandboxed curl reported connection
+refused. The same curl from the host network namespace immediately returned
+`{"status":"ok"}`. A per-command sandbox reachability failure is not evidence
+that either event loop or listener has exited.
 
 A later thread sample isolated an additional public-status stall: `GET /tables`
 and `GET /tables/:name` called a field named
@@ -2519,16 +2525,66 @@ runtime report with `startup_catch_up/opening` means the live shard owner has
 been observed but is not ready yet; it does not mean runtime status is
 unavailable. Both metadata service variants previously treated an empty set of
 *ready* schema-progress records as absence of any runtime observation and fell
-back to opening the shard DB from the filesystem. During the preserved v1
-backfill this reopened the 6.65 GB primary state and the old full-text
-generation once per second, consuming roughly 265-295 ms per poll. Metadata
-reconciliation now checks coverage separately from readiness: if every locally
-hosted migrating group has an explicit runtime observation, including an
-opening/catching-up report, it does not perform the query-readonly DB fallback.
-The fallback remains enabled when even one hosted migrating group lacks a
-runtime observation, so the optimization cannot hide a genuinely missing
-owner/status report. This removes redundant CPU, allocation, mmap, and I/O
-pressure; it is independent of HTTP listener availability.
+back to opening the shard DB from the filesystem. Runtime coverage is now
+checked separately from readiness where projected observations exist. A later
+sample proved that this was necessary but not sufficient: standalone's
+synchronous provisioner does not publish a projected runtime observation while
+it is inside the backfill. Its lifecycle still entered
+`collectLocalSchemaProgressWithOptions` once per second, reopened the 6.65 GB
+primary state and retained v1 full-text generation, and spent about 250-285 ms
+per poll. The stack was metadata lifecycle -> local schema progress ->
+`DB.open(query_readonly)`; no HTTP listener or event-loop work was involved.
+
+Schema progress now consults the target generation's durable `rebuild.state`
+before any DB open. Presence is an authoritative not-ready result, so the
+normal multi-minute migration performs only a tiny marker read per lifecycle
+round. Once the marker is atomically removed, reconciliation performs one
+`status_only` catalog verification rather than loading or mapping query
+segments. A regression creates only the v2 marker with no DB beneath it and
+requires the probe to return not-ready; any attempted DB open therefore fails
+the test. The lifecycle store-status paths also use the registered local data
+runtime provider, and their provider-less fallback is catalog-only. Together
+these rules remove recurring CPU, allocation, mmap, and I/O pressure without
+conflating schema progress with HTTP availability.
+
+The completed v1 migration was logically correct (`5,032,105` documents and
+`15,818` exact `alpha` matches), but its 10 segment files occupied exactly
+`6,054,355,534` bytes and are not benchmark-valid. Segment footer inspection
+proved that v1 contains `body.keyword` and `_all` in addition to `body`,
+`corpus_ordinal`, and the native ordinal sidecar. The metadata provisioner had
+opened the configured target generation synchronously and only applied the
+table schema after `DB.open` returned. An interrupted generation therefore
+resumed and completed under the old schema-less mapper before the authoritative
+schema could be installed.
+
+Provisioned DB opens now accept an owned-for-the-call
+`schema_before_index_load` option. `DB.open` persists that schema after core
+initialization but before configured indexes are loaded or resumed, and the
+metadata provisioner parses and supplies the authoritative target schema before
+calling it. A regression creates an incomplete schema-less full-text generation,
+reopens it through the provisioning option, writes a document, and proves that
+`body` has one posting while `body.keyword` and `_all` have none. The focused DB
+test passes 11/11 and the metadata test target compiles and passes 10/10. Because
+schema versions are immutable in production, the invalid v1 files are retained
+as the read generation while the corrected fixture creates
+`full_text_index_v2`; no branch-only format or schema is rewritten in place.
+The migration API derives versions by comparing `document_schemas` and ignores
+a caller-supplied version. The v2 fixture therefore reverses the order of the
+two names in the JSON Schema `required` set, a validation- and indexing-neutral
+change that legitimately creates the next immutable generation.
+
+After a clean restart, the first exact-count query exposed a second ownership
+problem: it filled the query-readonly cache instead of establishing the normal
+data runtime as the group owner. Opening v1 took 1.995 seconds and the complete
+DB open took 2.275 seconds; the immediately repeated request then completed in
+7.1 ms. Full search now uses the same lifetime-pinned resident DB lease as
+primary lookups. The lease is matched by group, table, identity namespace, and
+visible LSM root generation, and holds read activity so structural maintenance
+cannot retire the DB during the query. On a cold normal data runtime, the lease
+coalesces the open into the writer cache and then searches that DB. Only an
+explicit query-only source with no writer cache falls back to a query-readonly
+open. This avoids duplicate multi-gigabyte mappings and cold-start memory/I/O
+amplification on data servers while retaining query-only availability.
 
 The preserved corpus also reports 6.655 GB across 30 active primary LSM runs.
 This is not retained-generation or WAL amplification in this run: the manifest
@@ -2585,6 +2641,35 @@ already fallen from a 6.09 GB peak to 1.28 GB, below its 2 GiB hard limit, and
 the segment mmap eviction path issues clean-page discard advice. Report RSS,
 physical footprint, malloc live bytes, mmap logical bytes, and ResourceManager
 residency together rather than treating any one of them as heap usage.
+
+The corrected v2 rebuild then exposed a separate CPU degeneracy at roughly 66%
+of the corpus. Physical footprint remained near 1 GiB, but a four-minute sample
+placed about 92% of worker samples in Snappy decode under
+`mergeTypedDocValuesSections`. The append merge iterated every source document
+and used the point-lookup accessor for its typed doc value. That accessor starts
+at chunk zero, so document `n` repeatedly decompressed and scanned all preceding
+chunks. Merge work was therefore quadratic in chunk count even for the dense
+corpus-ordinal column.
+
+Append merges now use an owning decoded-chunk handle and a validated sequential
+iterator. Each compressed chunk is decoded exactly once, sparse values retain
+their source document IDs, deletions are skipped, and output IDs are remapped by
+the deletion rank before the next segment's live-document base is applied. Byte
+values are borrowed only for the duration of the decoded chunk; the existing
+writer takes its own copy. Focused tests cover sparse numeric values spanning
+multiple chunks, borrowed byte values, byte-column append merge, and
+multi-segment deletion remapping. The durable rebuild checkpoint was preserved
+so the replacement binary can resume at the same point and directly measure the
+removed stall. The ReleaseFast replacement crossed that checkpoint and emitted
+58 segment batches in 87 seconds instead of going silent for more than four
+minutes. A three-second post-fix sample found only 26 top-of-stack samples in
+generic Snappy decode and no `mergeTypedDocValuesSections` entry in the
+top-of-stack table; the pre-fix sample placed roughly 92% of worker samples in
+Snappy decode below that merge. During the confirmation interval physical
+footprint was 0.88--0.91 GiB with a 1.00 GiB peak. The diagnostic process was
+then restarted with memory attribution every 64 batches rather than every batch
+so repeatedly walking the multi-gigabyte v1 layout does not dominate the
+remaining rebuild wall time.
 
 ## Result Artifact
 

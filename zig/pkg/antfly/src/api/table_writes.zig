@@ -8147,10 +8147,10 @@ pub const ProvisionedTableWriteSource = struct {
         };
     }
 
-    pub fn primaryLookupDbSource(self: *ProvisionedTableWriteSource) table_reads.PrimaryLookupDbSource {
+    pub fn residentDbSource(self: *ProvisionedTableWriteSource) table_reads.ResidentDbSource {
         return .{
             .ptr = self,
-            .lease_group = leasePrimaryLookupDb,
+            .lease_group = leaseResidentDb,
         };
     }
 
@@ -8191,16 +8191,16 @@ pub const ProvisionedTableWriteSource = struct {
         self.endReadRequest(table_name);
     }
 
-    fn leasePrimaryLookupDb(
+    fn leaseResidentDb(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
         group_id: u64,
         lsm_root_generation: u64,
-    ) !?table_reads.PrimaryLookupDbLease {
+    ) !?table_reads.ResidentDbLease {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.local_write_owner) |owner| {
-            return try leasePrimaryLookupDb(owner, alloc, table_name, group_id, lsm_root_generation);
+            return try leaseResidentDb(owner, alloc, table_name, group_id, lsm_root_generation);
         }
         self.beginReadRequest(table_name);
         var read_request_active = true;
@@ -8208,15 +8208,70 @@ pub const ProvisionedTableWriteSource = struct {
 
         lockAtomic(&self.local_db_mutex);
         var cached: ?ProvisionedTableWriteCache.CachedDb = null;
+        var mismatched_generation_resident = false;
         if (self.write_cache) |cache| {
             cached = cache.snapshotLeaseOrAdoptSeededLocked(group_id, lsm_root_generation, table_name);
+            if (cached == null) {
+                for (cache.entries.items) |entry| {
+                    if (entry.group_id == group_id and
+                        std.mem.eql(u8, entry.table_name, table_name) and
+                        entry.lsm_root_generation != lsm_root_generation)
+                    {
+                        mismatched_generation_resident = true;
+                        break;
+                    }
+                }
+            }
         }
         if (cached == null) {
             if (self.startup_write_cache) |cache| {
                 cached = cache.snapshotLeaseOrAdoptSeededLocked(group_id, lsm_root_generation, table_name);
+                if (cached == null) {
+                    for (cache.entries.items) |entry| {
+                        if (entry.group_id == group_id and
+                            std.mem.eql(u8, entry.table_name, table_name) and
+                            entry.lsm_root_generation != lsm_root_generation)
+                        {
+                            mismatched_generation_resident = true;
+                            break;
+                        }
+                    }
+                }
             }
         }
         self.local_db_mutex.unlock();
+
+        if (cached == null and mismatched_generation_resident) return error.ReadUnavailable;
+
+        // A normal data runtime owns a write cache even when this group has not
+        // been touched since process start. Make that cache the single cold-open
+        // owner instead of allowing the read path to construct a duplicate
+        // query_readonly DB. Query-only runtimes have no write cache and retain
+        // the explicit readonly fallback.
+        if (cached == null) {
+            const cache = self.write_cache orelse self.startup_write_cache orelse {
+                self.endReadRequest(table_name);
+                read_request_active = false;
+                return null;
+            };
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
+            cached = self.getOrOpenCachedDbModeAtGeneration(
+                alloc,
+                cache,
+                path,
+                group_id,
+                lsm_root_generation,
+                table_name,
+                .default_async,
+                null,
+                null,
+                null,
+            ) catch |err| {
+                if (isTransientWriterOpenConflict(err)) return error.ReadUnavailable;
+                return err;
+            };
+        }
 
         var cached_value = cached orelse {
             self.endReadRequest(table_name);
@@ -8230,7 +8285,7 @@ pub const ProvisionedTableWriteSource = struct {
             return err;
         };
         errdefer alloc.free(owned_table_name);
-        const lease_ctx = alloc.create(PrimaryLookupLeaseContext) catch |err| {
+        const lease_ctx = alloc.create(ResidentLeaseContext) catch |err| {
             cached_value.deinit(alloc);
             self.endReadRequest(table_name);
             read_request_active = false;
@@ -8245,18 +8300,18 @@ pub const ProvisionedTableWriteSource = struct {
         return .{
             .ptr = lease_ctx,
             .db = lease_ctx.cached.db,
-            .release_fn = releasePrimaryLookupDb,
+            .release_fn = releaseResidentDb,
         };
     }
 
-    const PrimaryLookupLeaseContext = struct {
+    const ResidentLeaseContext = struct {
         source: *ProvisionedTableWriteSource,
         table_name: []u8,
         cached: ProvisionedTableWriteCache.CachedDb,
     };
 
-    fn releasePrimaryLookupDb(ptr: *anyopaque, alloc: std.mem.Allocator) void {
-        const lease_ctx: *PrimaryLookupLeaseContext = @ptrCast(@alignCast(ptr));
+    fn releaseResidentDb(ptr: *anyopaque, alloc: std.mem.Allocator) void {
+        const lease_ctx: *ResidentLeaseContext = @ptrCast(@alignCast(ptr));
         lease_ctx.cached.deinit(alloc);
         lease_ctx.source.endReadRequest(lease_ctx.table_name);
         alloc.free(lease_ctx.table_name);
@@ -32084,16 +32139,14 @@ test "runtime status collection leaves active stale write lease live" {
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
 }
 
-test "primary lookup adopts seeded write cache across visible generation bump" {
+test "resident DB lease adopts seeded write cache across visible generation bump" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/primary-lookup-write-cache-generation", .{tmp.sub_path});
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/resident-db-write-cache-generation", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
-    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
-    defer alloc.free(path);
 
     const Catalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -32138,21 +32191,22 @@ test "primary lookup adopts seeded write cache across visible generation bump" {
     source.write_cache = &write_cache;
     _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
 
-    var seeded = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, generation, "docs");
+    const resident = source.residentDbSource();
+    var seeded = (try resident.leaseGroup(alloc, "docs", 7001, generation)).?;
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try seeded.db.batch(.{
         .writes = &.{.{ .key = "doc:gold", .value = "{\"title\":\"gold doc\"}" }},
         .sync_level = .write,
     });
-    seeded.deinit(alloc);
+    seeded.release(alloc);
 
-    const primary_lookup = source.primaryLookupDbSource();
     generation = 2;
-    try std.testing.expect((try primary_lookup.leaseGroup(alloc, "docs", 7001, generation)) == null);
+    try std.testing.expectError(error.ReadUnavailable, resident.leaseGroup(alloc, "docs", 7001, generation));
 
     write_cache.entries.items[0].allow_generation_adoption = true;
     const misses_before = write_cache.miss_count.load(.monotonic);
 
-    var lease = (try primary_lookup.leaseGroup(alloc, "docs", 7001, generation)).?;
+    var lease = (try resident.leaseGroup(alloc, "docs", 7001, generation)).?;
     defer lease.release(alloc);
 
     try std.testing.expectEqual(@as(u64, 2), write_cache.entries.items[0].lsm_root_generation);
