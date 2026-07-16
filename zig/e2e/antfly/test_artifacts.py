@@ -731,7 +731,7 @@ def test_artifact_backed_embedding_table_provisions_atomically(
 
     doc_key = "atomic-doc-a"
     second_doc_key = "atomic-doc-b"
-    merged = stateful_api.linear_merge(
+    first_merged = stateful_api.linear_merge(
         table_name,
         records={
             doc_key: {
@@ -739,7 +739,14 @@ def test_artifact_backed_embedding_table_provisions_atomically(
                 "mime_type": "text/plain",
                 "version": "1",
                 "url": "data:text/plain;base64,YXRvbWljIHF1YWxpZmljYXRpb24gZ2FtbWE=",
-            },
+            }
+        },
+        sync_level="full_index",
+    )
+    assert first_merged["upserted"] == 1
+    merged = stateful_api.linear_merge(
+        table_name,
+        records={
             second_doc_key: {
                 "filename": "secondary.txt",
                 "mime_type": "text/plain",
@@ -747,9 +754,10 @@ def test_artifact_backed_embedding_table_provisions_atomically(
                 "url": "data:text/plain;base64,c2Vjb25kYXJ5IGNvdmVyYWdlIGRlbHRh",
             },
         },
+        last_merged_id=first_merged["next_cursor"],
         sync_level="full_index",
     )
-    assert merged["upserted"] == 2
+    assert merged["upserted"] == 1
     assert (
         wait_until(
             lambda: _manifest_ready(stateful_api, table_name, doc_key),
@@ -814,6 +822,19 @@ def test_artifact_backed_embedding_table_provisions_atomically(
     assert coverage is not None, json.dumps(
         stateful_api.get_index(table_name, "document_vectors"), sort_keys=True
     )
+
+    # Match paged public /merge clients: close the final key range with an
+    # empty full-index merge before the process restart. This used to leave a
+    # persisted live-writer report whose derived counts survived restart while
+    # its primary source denominator collapsed to zero.
+    cleanup = stateful_api.linear_merge(
+        table_name,
+        records={},
+        last_merged_id=merged["next_cursor"],
+        sync_level="full_index",
+    )
+    assert cleanup["upserted"] == 0
+    assert cleanup["deleted"] == 0
     assert (
         wait_until(
             lambda: (

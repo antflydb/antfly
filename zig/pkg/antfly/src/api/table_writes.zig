@@ -7832,13 +7832,21 @@ pub const ProvisionedTableWriteSource = struct {
             item.repair_degraded or item.repair_issue_count != 0;
     }
 
+    fn indexHasDerivedDocumentFactsForStatus(item: db_mod.types.DBIndexStats) bool {
+        return item.doc_count != 0 or
+            item.coverage_produced_count != 0 or
+            item.coverage_skipped_count != 0 or
+            item.coverage_terminal_failed_count != 0;
+    }
+
     fn runtimeStatusNeedsColdVisibilityRefresh(status: runtime_status.LocalTableRuntimeStatus) bool {
         if (status.stats.repair_degraded or status.stats.repair_issue_count != 0) return false;
-        const live_source_has_exact_primary_facts = switch (status.metadata.source) {
-            .live_writer_publish, .background_refresh, .startup_catch_up => true,
-            else => false,
-        };
-        const has_exact_primary_facts = live_source_has_exact_primary_facts or status.stats.source_doc_count != 0 or
+        // The status source describes where the snapshot came from, not
+        // whether an absent source-document count is an exact zero. In
+        // particular, a live-writer snapshot can survive into the restart
+        // cache with derived visibility while its primary denominator is
+        // missing. Only concrete primary counters make that snapshot exact.
+        const has_exact_primary_facts = status.stats.source_doc_count != 0 or
             status.stats.doc_identity.scanned_primary_docs != 0 or
             status.stats.doc_identity.live_ordinals != 0;
         const has_primary_facts = has_exact_primary_facts or status.stats.doc_count != 0;
@@ -7847,13 +7855,17 @@ pub const ProvisionedTableWriteSource = struct {
             // without scanning the primary namespace. Upgrade that snapshot
             // to query-readonly once so strict coverage has an exact source
             // denominator after restart.
-            if (!has_exact_primary_facts and indexHasVisibilityFactsForStatus(item)) return true;
+            if (!has_exact_primary_facts and indexHasDerivedDocumentFactsForStatus(item)) return true;
             if (item.kind != .dense_vector) continue;
             if (indexHasVisibilityFactsForStatus(item)) continue;
             if (item.replay_applied_sequence != 0 or item.replay_target_sequence != 0) continue;
             if (has_primary_facts) return true;
             if (status.metadata.source == .synthetic_config) return true;
-            return status.metadata.source == .live_writer_publish;
+            // A freshly published empty live writer has exact zero primary
+            // documents and legitimately no dense visibility. There is
+            // nothing to recover unless the snapshot is synthetic or some
+            // primary/derived evidence above proves the zero is ambiguous.
+            return false;
         }
         return false;
     }
@@ -7873,6 +7885,42 @@ pub const ProvisionedTableWriteSource = struct {
             item.metadata.source = .cached_snapshot;
             item.metadata.freshness = .fresh;
         }
+    }
+
+    const ColdManagedWriterRefresh = enum {
+        resolved,
+        absent,
+        busy,
+    };
+
+    fn refreshColdRuntimeStatusesFromManagedWriters(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        statuses: *runtime_status.LocalTableRuntimeStatuses,
+    ) !ColdManagedWriterRefresh {
+        var saw_absent = false;
+        for (statuses.items) |*status| {
+            if (!runtimeStatusNeedsColdVisibilityRefresh(status.*)) continue;
+            switch (self.probeManagedWriterGroupBestEffort(table_name, status.group_id)) {
+                .unknown => return .busy,
+                .absent => saw_absent = true,
+                .leased => |cached| {
+                    var lease = cached;
+                    const release_alloc = if (lease.cache) |cache| cache.alloc else std.heap.page_allocator;
+                    defer lease.deinit(release_alloc);
+                    const exact_stats = (try lease.db.runtimeStatusStatsConsistentIfAvailable(alloc)) orelse return .busy;
+                    db_mod.types.freeDBStats(alloc, status.stats);
+                    status.stats = exact_stats;
+                    self.markManagedWriterRuntimeStatus(status);
+                    status.lsm_storage_stats = lsmStorageStatsFromDb(lease.db);
+                    if (status.created_at_millis == 0) {
+                        status.created_at_millis = (lease.db.getGroupCreatedAtMillis(alloc, status.group_id) catch null) orelse 0;
+                    }
+                },
+            }
+        }
+        return if (saw_absent) .absent else .resolved;
     }
 
     fn recoverRuntimeStatusesFromStorage(
@@ -7908,12 +7956,21 @@ pub const ProvisionedTableWriteSource = struct {
         errdefer cached.deinit(alloc);
         const needs_cold_refresh = runtimeStatusesNeedColdVisibilityRefresh(&cached);
         if (needs_cold_refresh) {
-            cached.deinit(alloc);
-            // The recovery call can fail. Leave the errdefer with an empty,
-            // valid value instead of letting it deinitialize the freed cache
-            // snapshot a second time while propagating that error.
-            cached = .{};
-            return try self.recoverRuntimeStatusesFromStorage(alloc, table_name);
+            switch (try self.refreshColdRuntimeStatusesFromManagedWriters(alloc, table_name, &cached)) {
+                .resolved => {},
+                .busy => {
+                    self.overlayManagedWriterReplayTargetsBestEffort(table_name, &cached);
+                    return cached;
+                },
+                .absent => {
+                    cached.deinit(alloc);
+                    // The recovery call can fail. Leave the errdefer with an
+                    // empty, valid value instead of deinitializing the freed
+                    // cache snapshot again while propagating that error.
+                    cached = .{};
+                    return try self.recoverRuntimeStatusesFromStorage(alloc, table_name);
+                },
+            }
         }
 
         // Cached snapshots are the steady-state status plane, but an active
@@ -23508,7 +23565,7 @@ test "provisioned table write source cached runtime status does not fetch catalo
     var cached_status = runtime_status.LocalTableRuntimeStatus{
         .group_id = 7001,
         .metadata = .{
-            .source = .cached_snapshot,
+            .source = .live_writer_publish,
             .freshness = .fresh,
         },
         .stats = .{
@@ -23575,7 +23632,9 @@ test "provisioned table write source cold runtime refresh failure does not doubl
     var cached_status = runtime_status.LocalTableRuntimeStatus{
         .group_id = 7001,
         .metadata = .{
-            .source = .cached_snapshot,
+            // A live-writer label can be persisted across process restart;
+            // it must not make a missing primary denominator authoritative.
+            .source = .live_writer_publish,
             .freshness = .fresh,
         },
         .stats = .{
@@ -23617,6 +23676,7 @@ test "provisioned table write source runtime status recovers empty cache from st
     defer alloc.free(replica_root_dir);
     const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
     defer alloc.free(path);
+    const identity_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
 
     const Catalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -23652,16 +23712,41 @@ test "provisioned table write source runtime status recovers empty cache from st
     };
 
     {
-        var db = try openManagedDbWithIndexesJson(
+        var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
             alloc,
             path,
             "{\"semantic_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
+            null,
+            null,
+            table_reads.backend_current_root_generation,
+            null,
+            .default,
+            null,
+            identity_namespace,
         );
         defer db.close();
-        _ = try db.batch(.{
-            .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"semantic_idx\":[1,2]}}" }},
-            .sync_level = .write,
-        });
+        try doc_identity.writeNamespaceToStore(db.core.store, identity_namespace);
+        const store_key = try db_mod.internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(store_key);
+        try db.core.store.put(store_key, "{\"title\":\"alpha\"}");
+        try std.testing.expectEqual(@as(u64, 1), try db.primaryDocCount(alloc));
+    }
+
+    {
+        var reopened = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
+            alloc,
+            path,
+            "{\"semantic_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
+            null,
+            null,
+            table_reads.backend_current_root_generation,
+            null,
+            .default,
+            null,
+            identity_namespace,
+        );
+        defer reopened.close();
+        try std.testing.expectEqual(@as(u64, 1), try reopened.primaryDocCount(alloc));
     }
 
     var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
@@ -23707,6 +23792,30 @@ test "provisioned table write source runtime status recovers empty cache from st
     try std.testing.expectEqual(runtime_status.RuntimeStatusSource.cached_snapshot, recovered_from_synthetic.items[0].metadata.source);
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, recovered_from_synthetic.items[0].metadata.freshness);
     try std.testing.expectEqualStrings("semantic_idx", recovered_from_synthetic.items[0].stats.indexes[0].name);
+
+    snapshot_cache.invalidateTable("docs");
+    var persisted_live = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7001,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 1,
+            .index_count = 1,
+            .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
+        },
+    };
+    defer persisted_live.deinit(alloc);
+    persisted_live.stats.indexes[0] = .{
+        .name = try alloc.dupe(u8, "semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 1,
+    };
+    try snapshot_cache.upsertGroupStatusPreservingMetadata("docs", persisted_live);
+
+    var recovered_from_persisted_live = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    defer recovered_from_persisted_live.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), recovered_from_persisted_live.items.len);
+    try std.testing.expectEqual(@as(u64, 1), recovered_from_persisted_live.items[0].stats.source_doc_count);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.cached_snapshot, recovered_from_persisted_live.items[0].metadata.source);
 }
 
 test "provisioned table write source runtime status serves cached snapshot during active same-table work" {
@@ -23738,6 +23847,7 @@ test "provisioned table write source runtime status serves cached snapshot durin
         .group_id = 7001,
         .stats = .{
             .doc_count = 9,
+            .source_doc_count = 9,
             .index_count = 1,
             .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
         },
@@ -23797,6 +23907,7 @@ test "provisioned table write source runtime status serves cached snapshot while
         .group_id = 7001,
         .stats = .{
             .doc_count = 9,
+            .source_doc_count = 9,
             .index_count = 1,
             .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
         },
@@ -23856,6 +23967,7 @@ test "provisioned table write source runtime status still serves sibling groups 
         .group_id = 7001,
         .stats = .{
             .doc_count = 9,
+            .source_doc_count = 9,
             .index_count = 1,
             .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
         },
@@ -23869,6 +23981,7 @@ test "provisioned table write source runtime status still serves sibling groups 
         .group_id = 7002,
         .stats = .{
             .doc_count = 3,
+            .source_doc_count = 3,
             .index_count = 1,
             .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
         },

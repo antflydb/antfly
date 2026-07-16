@@ -1822,7 +1822,11 @@ pub const ApiHttpServer = struct {
             status.stats.doc_identity.live_ordinals == 0)
         {
             for (status.stats.indexes) |item| {
-                if (indexHasDenseVisibilityFacts(item)) return status.metadata.source != .live_writer_publish;
+                // A report labelled live_writer_publish may have been
+                // persisted before restart. The source label alone cannot
+                // prove that a missing primary denominator means exact zero;
+                // ask the writer/status-recovery path to resolve it.
+                if (indexHasDenseVisibilityFacts(item)) return true;
             }
         }
         if (runtime_status.statusHasRuntimeFacts(status)) return false;
@@ -24160,6 +24164,16 @@ test "api index status refreshes synthetic configured index status from write so
         },
     }};
     try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefresh(incomplete_remote[0..]));
+
+    const persisted_live = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{
+            .index_count = incomplete_remote_indexes.len,
+            .indexes = @constCast(incomplete_remote_indexes[0..]),
+        },
+    }};
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefresh(persisted_live[0..]));
 }
 
 test "api index status asks write source when read runtime status is absent" {
