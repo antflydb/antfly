@@ -8099,7 +8099,8 @@ fn countSortedSegmentVisibleCandidatesAlloc(
 ) !usize {
     if (sortedSegmentConstraintsAreKnownEmpty(constraints)) return 0;
 
-    const snapshot = text_entry.persistent.snapshot();
+    const snapshot = text_entry.persistent.acquireSnapshot();
+    defer snapshot.release();
     const cursor = activeSortCursor(req);
     if (cursor.len == 0 and
         membership == null and
@@ -8210,7 +8211,8 @@ fn sortAndPageMatchAllSortedSegmentsAlloc(
     try validateSortExecutionPlanForRuntime(effective_req, plan, native_loader);
     try checkSearchRequestDeadline(effective_req);
 
-    const snapshot = text_entry.persistent.snapshot();
+    const snapshot = text_entry.persistent.acquireSnapshot();
+    defer snapshot.release();
     const bench_query_profile = shouldLogBenchQueryProfile();
     const collect_sort_profile = bench_query_profile or effective_req.profile;
     if (effective_req.limit == 0) {
@@ -8524,7 +8526,8 @@ fn collectSearchQueryResolvedDocSetAlloc(
     var execute_ns: u64 = 0;
     var ordinal_ns: u64 = 0;
     const snapshot_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    const snapshot = text_entry.persistent.snapshot();
+    const snapshot = text_entry.persistent.acquireSnapshot();
+    defer snapshot.release();
     if (bench_profile) snapshot_ns = platform_time.monotonicNs() - snapshot_start_ns;
     const capability_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     if (!(try searchQueryCanUseSnapshot(
@@ -8600,7 +8603,8 @@ fn collectStructuredFilterTextDocNumsAlloc(
     if (patternFilterValueHasRole(parsed.value)) return null;
     const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
-    const snapshot = text_entry.persistent.snapshot();
+    const snapshot = text_entry.persistent.acquireSnapshot();
+    defer snapshot.release();
     if (!(try searchQueryCanUseSnapshot(
         snapshot,
         search_query,
@@ -8689,7 +8693,8 @@ fn collectStructuredFilterDocIdsAlloc(
     const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch return null;
     const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
-    const snapshot = text_entry.persistent.snapshot();
+    const snapshot = text_entry.persistent.acquireSnapshot();
+    defer snapshot.release();
     if (!(try searchQueryCanUseSnapshot(
         snapshot,
         search_query,
@@ -10820,7 +10825,12 @@ pub fn searchTextQuery(
     defer arena.deinit();
     const arena_alloc = arena.allocator();
     const base_search_query = try textQueryToSearchQuery(arena_alloc, text_query, text_entry.text_analysis, text_entry.runtime_schema);
-    const snapshot = text_index.snapshot();
+    // Full-text projection publishes replacement snapshots independently of
+    // query execution. Pin this generation for the entire request: a borrowed
+    // snapshot can otherwise reach refcount zero while a concurrent write is
+    // still scoring it (observed as allocator corruption in termDocFreq()).
+    const snapshot = text_index.acquireSnapshot();
+    defer snapshot.release();
     const can_apply_live_all_docs = !chunk_backed or snapshot.hasDocOrdinalCoverage();
     const constraints_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var constraint_req = effective_req;
@@ -11497,7 +11507,8 @@ pub fn collectExplicitTextStats(
 
     for (requests, 0..) |request, i| {
         const text_entry = (try executor.text_index_entry(executor.ctx, request.index_name)) orelse return error.IndexNotFound;
-        const snapshot = text_entry.persistent.snapshot();
+        const snapshot = text_entry.persistent.acquireSnapshot();
+        defer snapshot.release();
         if (request.resolved_doc_filter) |filter| {
             out[i] = try collectFilteredExplicitTextStats(alloc, snapshot, request, filter, executor);
             initialized += 1;
@@ -11684,7 +11695,8 @@ pub fn collectExplicitBackgroundTextStats(
 
     for (requests, 0..) |request, i| {
         const text_entry = (try executor.text_index_entry(executor.ctx, request.index_name)) orelse return error.IndexNotFound;
-        const snapshot = text_entry.persistent.snapshot();
+        const snapshot = text_entry.persistent.acquireSnapshot();
+        defer snapshot.release();
         var background_result = try executeBackgroundQuery(alloc, snapshot, request.background_query);
         defer background_result.deinit();
 
