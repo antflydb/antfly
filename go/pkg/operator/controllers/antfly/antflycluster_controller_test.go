@@ -5557,6 +5557,53 @@ func TestExecuteCaptureSeedArtifactUsesRuntimeOwnedTypedEndpoint(t *testing.T) {
 	g.Expect(action.AdminResult).To(BeNil())
 }
 
+func TestHAActivateSeededSlotWaitsForCompletedActivationArtifact(t *testing.T) {
+	g := NewWithT(t)
+	digest := strings.Repeat("a", 64)
+	actions := []antflyv1.HAPlannedActionStatus{{
+		Kind:                     string(haActionActivateSeedArtifact),
+		Executor:                 string(haActionExecutorCLIJob),
+		SlotName:                 "standby-a",
+		TargetLSN:                1,
+		SeedArtifactGeneration:   "initial-standby-a-1",
+		SeedCaptureReceiptSHA256: digest,
+		TargetLocalNodeID:        1,
+		TargetReplicaID:          1,
+	}, {
+		Kind:                   string(haActionActivateSeededSlot),
+		Executor:               string(haActionExecutorAdminAPI),
+		DependsOn:              string(haActionActivateSeedArtifact),
+		SlotName:               "standby-a",
+		TargetLSN:              1,
+		SeedArtifactGeneration: "initial-standby-a-1",
+	}}
+
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeFalse())
+
+	actions[0].AdminJobPhase = haAdminJobPhaseSucceeded
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeFalse())
+
+	actions[0].SeedArtifactReceipt = &antflyv1.HASeedArtifactReceiptStatus{
+		FormatVersion:               2,
+		Generation:                  "initial-standby-a-1",
+		SlotName:                    "standby-a",
+		ManifestID:                  "initial-standby-a-1",
+		BackupLSN:                   1,
+		CheckpointLSN:               1,
+		SeedReceiptSHA256:           digest,
+		CaptureReceiptSHA256:        digest,
+		ManifestSHA256:              digest,
+		AggregateSHA256:             digest,
+		MaterializedReceiptSHA256:   digest,
+		MaterializedAggregateSHA256: digest,
+		TargetLocalNodeID:           1,
+		TargetReplicaID:             1,
+		GenerationPath:              "live-generations/initial-standby-a-1",
+		RawGenerationPath:           "generations/initial-standby-a-1",
+	}
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeTrue())
+}
+
 func TestHAPlannedActionDependenciesPreferExplicitDependsOn(t *testing.T) {
 	g := NewWithT(t)
 

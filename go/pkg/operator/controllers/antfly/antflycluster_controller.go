@@ -9659,9 +9659,6 @@ func haPlannedActionDependenciesSucceeded(actions []antflyv1.HAPlannedActionStat
 			}
 			return dependency.AdminJobPhase == haAdminJobPhaseSucceeded
 		}
-		if dependency.AdminJobName != haAdminDirectAPIName && !haPlannedActionRequiresAdminTarget(dependency) {
-			return true
-		}
 		return haAdminActionSucceededWithEvidence(dependency)
 	}
 	return false
