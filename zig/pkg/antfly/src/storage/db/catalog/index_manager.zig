@@ -83,6 +83,12 @@ const text_field_analyzers_prefix = "\x00\x00__metadata__:text_field_analyzers:"
 const active_index_root_pointer_file = ".antfly-active-index-root";
 const active_index_root_pointer_magic = "antfly-active-index-root-v1\n";
 
+fn optionalBytesEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+const index_generation_manifest = @import("../derived/index_generation_manifest.zig");
+
 fn checkRepairCancelled(cancel_check: ?types.RepairCancelCheck) !void {
     if (cancel_check) |check| {
         if (check.requested()) return error.Canceled;
@@ -784,9 +790,13 @@ pub const IndexManager = struct {
     hbc_cache: ?*hbc_mod.Cache,
     lsm_root_generation: u64,
     resource_manager: ?*resource_manager_mod.ResourceManager,
+    owned_resource_manager: ?*resource_manager_mod.ResourceManager,
+    bind_cache_resource_manager: bool,
     primary_store: ?*docstore_mod.DocStore,
     applied_sequence_checkpoint_path: ?[]const u8,
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
+    /// 0 = idle, 1 = queued/running, 2 = rerun requested while active.
+    repair_cleanup_state: std.atomic.Value(u8) = .init(0),
     load_parallelism: ?usize = null,
     full_text_pending_bytes_accounted: u64 = 0,
     text_indexes: std.ArrayListUnmanaged(TextIndex),
@@ -806,6 +816,11 @@ pub const IndexManager = struct {
     // and retry/backoff state for self-healing (retryFailedIndexLoads).
     // Keys are duped index names; err_name values are static @errorName memory.
     failed_index_loads: std.StringHashMapUnmanaged(FailedIndexLoad) = .empty,
+    // Durable repair intents gate service independently of load failures. A
+    // replacement may load successfully after pointer activation while its
+    // intent is still in activating/validating; queries must remain closed
+    // until DB validation publishes a clean checkpoint.
+    repair_unavailable_indexes: std.StringHashMapUnmanaged(void) = .empty,
     index_load_states: std.StringHashMapUnmanaged(IndexLoadState) = .empty,
 
     pub const FailedIndexLoad = struct {
@@ -932,7 +947,6 @@ pub const IndexManager = struct {
     const DenseVectorLoadContext = struct {
         manager: *IndexManager,
         index_name: []u8,
-        max_cached_vectors: usize,
 
         fn deinit(self: *DenseVectorLoadContext, alloc: Allocator) void {
             alloc.free(self.index_name);
@@ -1169,8 +1183,7 @@ pub const IndexManager = struct {
 
         fn cacheVector(self: *@This(), vector_id: u64, vector: []const f32) !void {
             if (self.vector_cache.contains(vector_id)) return;
-            const max_cached_vectors = self.maxCachedVectors();
-            if (max_cached_vectors == 0 or self.vector_cache.count() >= max_cached_vectors) return;
+            if (!self.cache_vectors) return;
             const byte_len: u64 = @intCast(vector.len * @sizeOf(f32));
             const next_bytes = std.math.add(u64, self.vector_cache_bytes, byte_len) catch return;
             const next_working_bytes = next_bytes +| self.raw_cache_key_bytes +| self.raw_read_value_bytes;
@@ -1181,11 +1194,6 @@ pub const IndexManager = struct {
             errdefer self.context.manager.alloc.free(owned);
             try self.vector_cache.put(self.context.manager.alloc, vector_id, owned);
             self.vector_cache_bytes = next_bytes;
-        }
-
-        fn maxCachedVectors(self: *const @This()) usize {
-            if (!self.cache_vectors) return 0;
-            return self.context.max_cached_vectors;
         }
     };
 
@@ -1289,6 +1297,11 @@ pub const IndexManager = struct {
         }
     };
 
+    /// Ownership token for an opened index generation detached from an index
+    /// manager. It can be transferred between managers without closing and
+    /// reopening the underlying storage runtime.
+    pub const DetachedIndex = OpenedIndex;
+
     const OpenResult = struct {
         opened: ?OpenedIndex = null,
         err: ?anyerror = null,
@@ -1315,6 +1328,61 @@ pub const IndexManager = struct {
     };
 
     pub fn initWithOptions(alloc: Allocator, base_path: []const u8, opts: db_config.IndexBackendOptions) !IndexManager {
+        var owned_resource_manager: ?*resource_manager_mod.ResourceManager = null;
+        const resource_manager = opts.resource_manager orelse blk: {
+            const manager = try alloc.create(resource_manager_mod.ResourceManager);
+            errdefer alloc.destroy(manager);
+            manager.* = resource_manager_mod.ResourceManager.init(.{});
+            owned_resource_manager = manager;
+            break :blk manager;
+        };
+        errdefer if (owned_resource_manager) |manager| {
+            manager.deinit(alloc);
+            alloc.destroy(manager);
+        };
+        const bind_cache_resource_manager = opts.bind_cache_resource_manager and owned_resource_manager == null;
+
+        const text_main_lsm_options = db_config.mergedIndexLsmOptions(
+            opts.text_lsm_storage,
+            opts.lsm_cache,
+            opts.lsm_root_generation,
+            resource_manager,
+            bind_cache_resource_manager,
+            opts.text_main_lsm_options,
+        );
+        const text_wal_lsm_options = db_config.mergedIndexLsmOptions(
+            opts.text_lsm_storage,
+            opts.lsm_cache,
+            opts.lsm_root_generation,
+            resource_manager,
+            bind_cache_resource_manager,
+            opts.text_wal_lsm_options,
+        );
+        const dense_lsm_options = db_config.mergedIndexLsmOptions(
+            opts.dense_lsm_storage,
+            opts.lsm_cache,
+            opts.lsm_root_generation,
+            resource_manager,
+            bind_cache_resource_manager,
+            opts.dense_lsm_options,
+        );
+        const sparse_lsm_options = db_config.mergedIndexLsmOptions(
+            opts.sparse_lsm_storage,
+            opts.lsm_cache,
+            opts.lsm_root_generation,
+            resource_manager,
+            bind_cache_resource_manager,
+            opts.sparse_lsm_options,
+        );
+        const graph_reverse_lsm_options = db_config.mergedIndexLsmOptions(
+            opts.graph_lsm_storage,
+            opts.lsm_cache,
+            opts.lsm_root_generation,
+            resource_manager,
+            bind_cache_resource_manager,
+            opts.graph_reverse_lsm_options,
+        );
+
         return .{
             .alloc = alloc,
             .base_path = try alloc.dupe(u8, base_path),
@@ -1322,21 +1390,23 @@ pub const IndexManager = struct {
             .relaxed_split_durability = false,
             .text_main_backend = opts.text_main_backend,
             .text_lsm_storage = opts.text_lsm_storage,
-            .text_main_lsm_options = opts.text_main_lsm_options,
-            .text_wal_lsm_options = opts.text_wal_lsm_options,
+            .text_main_lsm_options = text_main_lsm_options,
+            .text_wal_lsm_options = text_wal_lsm_options,
             .dense_storage_backend = opts.dense_storage_backend,
             .dense_lsm_storage = opts.dense_lsm_storage,
-            .dense_lsm_options = opts.dense_lsm_options,
+            .dense_lsm_options = dense_lsm_options,
             .sparse_backend = opts.sparse_backend,
             .sparse_lsm_storage = opts.sparse_lsm_storage,
-            .sparse_lsm_options = opts.sparse_lsm_options,
+            .sparse_lsm_options = sparse_lsm_options,
             .graph_reverse_backend = opts.graph_reverse_backend,
             .graph_lsm_storage = opts.graph_lsm_storage,
-            .graph_reverse_lsm_options = opts.graph_reverse_lsm_options,
+            .graph_reverse_lsm_options = graph_reverse_lsm_options,
             .lsm_cache = opts.lsm_cache,
             .hbc_cache = opts.hbc_cache,
             .lsm_root_generation = opts.lsm_root_generation,
-            .resource_manager = opts.resource_manager,
+            .resource_manager = resource_manager,
+            .owned_resource_manager = owned_resource_manager,
+            .bind_cache_resource_manager = bind_cache_resource_manager,
             .primary_store = null,
             .applied_sequence_checkpoint_path = null,
             .load_parallelism = null,
@@ -1527,6 +1597,7 @@ pub const IndexManager = struct {
 
         const dense_cfg = try parseDenseConfig(self.alloc, entry.config.config_json);
         defer dense_cfg.deinit(self.alloc);
+        const cache_limits = self.resource_manager.?.hbcCacheLimits(dense_cfg.dims, self.hbc_cache != null);
 
         var index = try hbc_mod.HBCIndex.openWithLsmOptions(self.alloc, zpath, .{
             .storage_backend = self.dense_storage_backend,
@@ -1544,9 +1615,9 @@ pub const IndexManager = struct {
             .rerank_policy = dense_cfg.rerank_policy,
             .quantizer_seed = dense_cfg.quantizer_seed,
             .use_random_ortho_trans = dense_cfg.use_random_ortho_trans,
-            .max_cached_nodes = dense_cfg.max_cached_nodes,
-            .max_cached_vectors = dense_cfg.max_cached_vectors,
-            .max_cached_metadata = dense_cfg.max_cached_metadata,
+            .max_cached_nodes = cache_limits.max_cached_nodes,
+            .max_cached_vectors = cache_limits.max_cached_vectors,
+            .max_cached_metadata = cache_limits.max_cached_metadata,
             .lazy_posting_maintenance = dense_cfg.lazy_posting_maintenance,
             .auto_posting_maintenance_max_postings = dense_cfg.auto_posting_maintenance_max_postings,
             .centroid_directory_mode = dense_cfg.centroid_directory_mode,
@@ -1563,14 +1634,15 @@ pub const IndexManager = struct {
         errdefer index.close();
 
         if (self.hbc_cache) |cache| index.attachSharedCache(cache);
-        if (self.resource_manager) |manager| index.attachResourceManager(manager);
+        if (self.resource_manager) |manager| {
+            index.attachResourceManagerWithSharedCacheBinding(manager, self.bind_cache_resource_manager);
+        }
 
         const vector_loader_context = try self.alloc.create(DenseVectorLoadContext);
         errdefer self.alloc.destroy(vector_loader_context);
         vector_loader_context.* = .{
             .manager = self,
             .index_name = try self.alloc.dupe(u8, entry.config.name),
-            .max_cached_vectors = dense_cfg.max_cached_vectors,
         };
         errdefer {
             self.alloc.free(vector_loader_context.index_name);
@@ -1699,6 +1771,7 @@ pub const IndexManager = struct {
         read_txn: *docstore_mod.DocStore.Txn,
         index_name: []const u8,
         cancel_check: ?types.RepairCancelCheck,
+        capacity_check: ?types.RepairCapacityCheck,
     ) !u64 {
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
         const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
@@ -1706,7 +1779,7 @@ pub const IndexManager = struct {
         try checkRepairCancelled(cancel_check);
         try entry.persistent.resetAllForRebuild();
         try rebuild_state.update("");
-        try self.backfillTextIndexFromReadTxn(store, read_txn, entry, null, cancel_check);
+        try self.backfillTextIndexFromReadTxn(store, read_txn, entry, null, cancel_check, capacity_check);
         try checkRepairCancelled(cancel_check);
         try entry.persistent.sync(true);
 
@@ -1761,6 +1834,8 @@ pub const IndexManager = struct {
         self.clearStatusOnlyIndexConfigs();
         self.clearFailedIndexLoads();
         self.failed_index_loads.deinit(self.alloc);
+        self.clearRepairUnavailableIndexes();
+        self.repair_unavailable_indexes.deinit(self.alloc);
         self.clearIndexLoadStates();
         self.index_load_states.deinit(self.alloc);
         for (self.enrichments.items) |*entry| entry.deinit(self.alloc);
@@ -1773,6 +1848,10 @@ pub const IndexManager = struct {
         self.enrichments.deinit(self.alloc);
         self.resolvers.deinit(self.alloc);
         self.alloc.free(self.base_path);
+        if (self.owned_resource_manager) |manager| {
+            manager.deinit(self.alloc);
+            self.alloc.destroy(manager);
+        }
         self.* = undefined;
     }
 
@@ -1788,8 +1867,59 @@ pub const IndexManager = struct {
         return (self.failed_index_loads.get(name) orelse return null).err_name;
     }
 
+    pub const IndexLoadRecoveryAction = enum {
+        retry_open,
+        rebuild_from_artifacts,
+        manual_intervention,
+    };
+
+    /// Classifies policy, not corruption severity. Keep the destructive
+    /// automatic-rebuild allowlist deliberately narrow: an unknown load error
+    /// must never become permission to delete or replace an index root.
+    pub fn loadFailureRecoveryAction(err_name: []const u8) IndexLoadRecoveryAction {
+        if (std.mem.eql(u8, err_name, "IncompleteBulkPublish")) {
+            return .rebuild_from_artifacts;
+        }
+        if (std.mem.eql(u8, err_name, "TableReadChurn")) {
+            return .retry_open;
+        }
+        return .manual_intervention;
+    }
+
+    pub fn recoveryActionForIndex(self: *const IndexManager, name: []const u8) ?IndexLoadRecoveryAction {
+        const err_name = self.loadFailure(name) orelse return null;
+        return loadFailureRecoveryAction(err_name);
+    }
+
     pub fn hasLoadFailures(self: *const IndexManager) bool {
         return self.failed_index_loads.count() > 0;
+    }
+
+    pub fn markRepairUnavailable(self: *IndexManager, name: []const u8) !void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        if (self.repair_unavailable_indexes.contains(name)) return;
+        const owned = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(owned);
+        try self.repair_unavailable_indexes.put(self.alloc, owned, {});
+    }
+
+    pub fn clearRepairUnavailable(self: *IndexManager, name: []const u8) void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        if (self.repair_unavailable_indexes.fetchRemove(name)) |entry| self.alloc.free(entry.key);
+    }
+
+    pub fn repairUnavailable(self: *IndexManager, name: []const u8) bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        return self.repair_unavailable_indexes.contains(name);
+    }
+
+    fn clearRepairUnavailableIndexes(self: *IndexManager) void {
+        var it = self.repair_unavailable_indexes.keyIterator();
+        while (it.next()) |key| self.alloc.free(key.*);
+        self.repair_unavailable_indexes.clearRetainingCapacity();
     }
 
     fn clearFailedIndexLoads(self: *IndexManager) void {
@@ -3504,56 +3634,168 @@ pub const IndexManager = struct {
         return error.IndexNotFound;
     }
 
-    pub fn installBuiltReplacementIndex(
+    pub fn detachReplacementIndex(self: *IndexManager, name: []const u8) !DetachedIndex {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        return self.detachInMemoryNoLock(name) orelse error.IndexNotFound;
+    }
+
+    pub fn destroyDetachedReplacementIndex(self: *IndexManager, entry: *DetachedIndex) void {
+        entry.deinit(self);
+    }
+
+    /// Publishes any already-open replacement generation without a
+    /// size-dependent close/reopen tail. All allocations and validation happen
+    /// before the durable pointer commit; the detached predecessor is returned
+    /// to the caller for retirement after service fences are released.
+    pub fn installAdoptedReplacementIndex(
         self: *IndexManager,
         store: anytype,
         cfg: types.IndexConfig,
         replacement_index_path: []const u8,
-    ) !void {
+        expected_previous_pointer: ?[]const u8,
+        replacement: *DetachedIndex,
+    ) !?DetachedIndex {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         self.bindPrimaryStore(store);
 
+        if (std.meta.activeTag(replacement.*) != cfg.kind or
+            types.indexConfigHash(detachedIndexConfig(replacement).*) != types.indexConfigHash(cfg))
+        {
+            return error.IndexReplacementConfigurationMismatch;
+        }
         const target_path = try self.indexPath(cfg.name);
         defer self.alloc.free(target_path);
-        const previous_active_path = try self.activeIndexPath(cfg.name);
-        defer self.alloc.free(previous_active_path);
         const previous_pointer = try self.readActiveIndexRootPointer(target_path, cfg.name);
         defer if (previous_pointer) |value| self.alloc.free(value);
+        if (!optionalBytesEqual(previous_pointer, expected_previous_pointer)) return error.IndexRootPointerChanged;
         const replacement_relative_path = try self.relativeRepairIndexRootForActivePath(cfg.name, replacement_index_path);
         defer self.alloc.free(replacement_relative_path);
+        _ = try index_generation_manifest.validateReady(
+            self.alloc,
+            replacement_index_path,
+            null,
+            cfg.name,
+            types.indexConfigHash(cfg),
+        );
 
-        self.removeInMemory(cfg.name);
-
-        self.writeActiveIndexRootPointer(target_path, replacement_relative_path) catch |err| {
-            self.recordFailedIndexLoad(cfg, err) catch {};
-            return err;
-        };
-
-        self.openConfiguredIndex(store, cfg, false, false) catch |err| {
-            self.removeInMemory(cfg.name);
-            if (previous_pointer) |value| {
-                self.writeActiveIndexRootPointer(target_path, value) catch {};
-            } else {
-                self.clearActiveIndexRootPointer(target_path) catch {};
+        var status_only_index: ?usize = null;
+        for (self.status_only_index_configs, 0..) |status_cfg, i| {
+            if (std.mem.eql(u8, status_cfg.name, cfg.name)) {
+                status_only_index = i;
+                break;
             }
-            self.openConfiguredIndex(store, cfg, false, false) catch {};
-            self.recordFailedIndexLoad(cfg, err) catch {};
-            return err;
-        };
-        self.dropFailedIndexLoad(cfg.name);
-        if (std.mem.eql(u8, previous_active_path, target_path)) {
-            pruneCanonicalIndexRootAfterPointerInstall(target_path) catch |err| {
-                std.log.warn("failed to prune previous canonical index root name={s} err={s}", .{ cfg.name, @errorName(err) });
-            };
-        } else if (!std.mem.eql(u8, previous_active_path, replacement_index_path)) {
-            deleteIndexDirIfPresent(previous_active_path);
         }
-        try self.refreshGeneratedEnrichmentTargetCache();
+        const status_replacement: ?[]types.IndexConfig = if (status_only_index) |remove_i| blk: {
+            const next: []types.IndexConfig = if (self.status_only_index_configs.len > 1)
+                try self.alloc.alloc(types.IndexConfig, self.status_only_index_configs.len - 1)
+            else
+                &.{};
+            var out: usize = 0;
+            for (self.status_only_index_configs, 0..) |status_cfg, i| {
+                if (i == remove_i) continue;
+                next[out] = status_cfg;
+                out += 1;
+            }
+            break :blk next;
+        } else null;
+        var status_replacement_committed = false;
+        defer if (!status_replacement_committed) if (status_replacement) |next| {
+            if (next.len > 0) self.alloc.free(next);
+        };
+
+        try self.ensureDetachedIndexCapacity(replacement.*);
+        const replacement_generates = try self.configRequiresEnrichmentReplay(detachedIndexConfig(replacement).*);
+        const generated_targets = replacement_generates or
+            try self.computeGeneratedEnrichmentTargetCacheExcluding(cfg.name, null);
+
+        try self.writeActiveIndexRootPointer(target_path, replacement_relative_path);
+        const retired = self.detachInMemoryNoLock(cfg.name);
+        self.appendDetachedIndexAssumeCapacity(replacement);
+        if (status_only_index) |remove_i| {
+            var removed = self.status_only_index_configs[remove_i];
+            if (self.status_only_index_configs.len > 0) self.alloc.free(self.status_only_index_configs);
+            self.status_only_index_configs = status_replacement.?;
+            status_replacement_committed = true;
+            removed.deinit(self.alloc);
+        }
+        self.dropFailedIndexLoad(cfg.name);
+        self.storeGeneratedEnrichmentTargetCache(generated_targets);
+        return retired;
+    }
+
+    /// Captures the durable pointer selected immediately before activation.
+    /// Null denotes the canonical root and is distinct from an uncaptured
+    /// rollback anchor in the durable repair intent.
+    pub fn captureActiveIndexRootPointer(self: *const IndexManager, name: []const u8) !?[]u8 {
+        const target_path = try self.indexPath(name);
+        defer self.alloc.free(target_path);
+        return try self.readActiveIndexRootPointer(target_path, name);
+    }
+
+    /// Restores the exact generation captured before replacement activation.
+    /// The candidate is retained for postmortem/retry cleanup; this method
+    /// changes only the durable pointer and in-memory runtime selection.
+    pub fn restoreActiveIndexRootPointer(
+        self: *IndexManager,
+        name: []const u8,
+        expected_candidate_relative_path: []const u8,
+        previous_pointer: ?[]const u8,
+    ) !void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const target_path = try self.indexPath(name);
+        defer self.alloc.free(target_path);
+        const current_pointer = try self.readActiveIndexRootPointer(target_path, name);
+        defer if (current_pointer) |value| self.alloc.free(value);
+        if (!optionalBytesEqual(current_pointer, expected_candidate_relative_path)) {
+            return error.IndexRootPointerChanged;
+        }
+        self.removeInMemory(name);
+        if (previous_pointer) |value| {
+            try self.writeActiveIndexRootPointer(target_path, value);
+        } else {
+            try self.clearActiveIndexRootPointer(target_path);
+        }
+    }
+
+    /// Returns whether the durable active-root pointer for `name` selects the
+    /// exact repair candidate recorded by a replica-local repair intent.  This
+    /// is used during restart reconciliation to distinguish a crash before
+    /// pointer activation from a crash after activation but before validation
+    /// and intent cleanup.
+    pub fn isRepairCandidateActive(
+        self: *const IndexManager,
+        name: []const u8,
+        candidate_relative_path: []const u8,
+    ) !bool {
+        const active_path = try self.activeIndexPath(name);
+        defer self.alloc.free(active_path);
+        const candidate_path = try std.fmt.allocPrint(
+            self.alloc,
+            "{s}/{s}",
+            .{ self.base_path, candidate_relative_path },
+        );
+        defer self.alloc.free(candidate_path);
+        return std.mem.eql(u8, active_path, candidate_path);
     }
 
     pub fn cleanupInactiveRepairShadowRoots(self: *IndexManager) void {
         if (builtin.os.tag == .freestanding) return;
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+
+        // Once no durable repair intent protects rollback, canonical roots
+        // selected through a pointer contain only stale generation data plus
+        // the pointer file. Prune that stale data before collecting orphaned
+        // shadow roots.
+        for (self.text_indexes.items) |entry| self.cleanupCanonicalRootAfterPointer(entry.config.name);
+        for (self.dense_indexes.items) |entry| self.cleanupCanonicalRootAfterPointer(entry.config.name);
+        for (self.sparse_indexes.items) |entry| self.cleanupCanonicalRootAfterPointer(entry.config.name);
+        for (self.graph_indexes.items) |entry| self.cleanupCanonicalRootAfterPointer(entry.config.name);
+        for (self.algebraic_indexes.items) |entry| self.cleanupCanonicalRootAfterPointer(entry.config.name);
+        for (self.status_only_index_configs) |cfg| self.cleanupCanonicalRootAfterPointer(cfg.name);
 
         var active_roots = std.StringHashMapUnmanaged(void).empty;
         defer {
@@ -3578,6 +3820,18 @@ pub const IndexManager = struct {
             defer self.alloc.free(path);
             if (repairShadowRootInProgress(path)) continue;
             deleteIndexDirIfPresent(path);
+        }
+    }
+
+    fn cleanupCanonicalRootAfterPointer(self: *const IndexManager, name: []const u8) void {
+        const target_path = self.indexPath(name) catch return;
+        defer self.alloc.free(target_path);
+        const pointer = self.readActiveIndexRootPointer(target_path, name) catch return;
+        if (pointer) |value| {
+            self.alloc.free(value);
+            pruneCanonicalIndexRootAfterPointerInstall(target_path) catch |err| {
+                std.log.warn("failed to prune previous canonical index root name={s} err={s}", .{ name, @errorName(err) });
+            };
         }
     }
 
@@ -5171,6 +5425,25 @@ pub const IndexManager = struct {
     pub fn denseWriteProfileByName(self: *IndexManager, name: []const u8) ?hbc_mod.WriteProfile {
         const entry = self.denseIndex(name) orelse return null;
         return entry.index.getWriteProfile();
+    }
+
+    pub fn beginDenseStreamingReplaySessionByName(self: *IndexManager, name: []const u8) !void {
+        const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        try entry.index.beginStreamingReplaySession();
+    }
+
+    pub fn finishDenseStreamingReplaySessionByNameWithOptions(
+        self: *IndexManager,
+        name: []const u8,
+        options: backend_types.BulkIngestFinishOptions,
+    ) !void {
+        const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        try entry.index.finishStreamingReplaySessionWithOptions(options);
+    }
+
+    pub fn abortDenseStreamingReplaySessionByName(self: *IndexManager, name: []const u8) void {
+        const entry = self.denseIndex(name) orelse return;
+        entry.index.abortStreamingReplaySession();
     }
 
     pub fn sparseWriteProfileByName(self: *IndexManager, name: []const u8) ?sparse_mod.WriteProfile {
@@ -6824,6 +7097,7 @@ pub const IndexManager = struct {
         entry: *TextIndex,
         resume_from: ?[]const u8,
         cancel_check: ?types.RepairCancelCheck,
+        capacity_check: ?types.RepairCapacityCheck,
     ) !void {
         const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
 
@@ -6856,8 +7130,10 @@ pub const IndexManager = struct {
                 last_doc_key: []const u8,
                 flush_count: *usize,
                 check: ?types.RepairCancelCheck,
+                capacity: ?types.RepairCapacityCheck,
             ) !void {
                 try checkRepairCancelled(check);
+                if (capacity) |admission| try admission.boundary();
                 var built = try mapper.buildTextSegmentsFromDocumentsWithMetadata(manager.alloc, docs_buf.items, text_entry.text_analysis, text_entry.runtime_schema, .{
                     .target_segment_bytes = default_text_segment_build_target_bytes,
                 });
@@ -6979,7 +7255,17 @@ pub const IndexManager = struct {
             }
 
             if (mapped_docs.items.len > 0) {
-                try flush_batch(self, store, entry, rebuild_state, &mapped_docs, batch_last_doc_key.?, &flushed_batches, cancel_check);
+                try flush_batch(
+                    self,
+                    store,
+                    entry,
+                    rebuild_state,
+                    &mapped_docs,
+                    batch_last_doc_key.?,
+                    &flushed_batches,
+                    cancel_check,
+                    capacity_check,
+                );
                 if (batch_last_doc_key) |old| self.alloc.free(old);
                 batch_last_doc_key = null;
             }
@@ -7086,6 +7372,53 @@ pub const IndexManager = struct {
             return active_path;
         }
         return canonical_path;
+    }
+
+    /// Storage-sized estimate for rebuilding one index. This intentionally
+    /// measures the selected index generation rather than the entire table DB;
+    /// node admission adds separate replay and cleanup headroom.
+    pub fn activeIndexStorageBytes(self: *const IndexManager, name: []const u8) !u64 {
+        const path = try self.activeIndexPath(name);
+        defer self.alloc.free(path);
+        if (builtin.os.tag == .freestanding) return 0;
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return 0,
+            else => return err,
+        };
+        defer dir.close(io);
+        var walker = try dir.walk(self.alloc);
+        defer walker.deinit();
+        var total: u64 = 0;
+        while (try walker.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            const stat = try dir.statFile(io, entry.path, .{});
+            total +|= stat.size;
+        }
+        return total;
+    }
+
+    /// A pointer-selected generation is publication state, not an empty index
+    /// location. Validate its durable ready manifest before any backend open
+    /// can create missing files or accept a stale/corrupt candidate.
+    fn activeIndexPathForConfig(self: *const IndexManager, cfg: types.IndexConfig) ![]u8 {
+        const canonical_path = try self.indexPath(cfg.name);
+        errdefer self.alloc.free(canonical_path);
+        const relative_active_path = (try self.readActiveIndexRootPointer(canonical_path, cfg.name)) orelse return canonical_path;
+        defer self.alloc.free(relative_active_path);
+        const active_path = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.base_path, relative_active_path });
+        errdefer self.alloc.free(active_path);
+        _ = try index_generation_manifest.validateReady(
+            self.alloc,
+            active_path,
+            null,
+            cfg.name,
+            types.indexConfigHash(cfg),
+        );
+        self.alloc.free(canonical_path);
+        return active_path;
     }
 
     fn relativeRepairIndexRootForActivePath(self: *const IndexManager, name: []const u8, active_path: []const u8) ![]u8 {
@@ -7335,7 +7668,7 @@ pub const IndexManager = struct {
                 const text_cfg = try parseTextConfig(self.alloc, cfg.config_json);
                 defer text_cfg.deinit(self.alloc);
 
-                const path = try self.activeIndexPath(cfg.name);
+                const path = try self.activeIndexPathForConfig(cfg);
                 defer self.alloc.free(path);
 
                 const zpath = try self.alloc.dupeZ(u8, path);
@@ -7472,6 +7805,7 @@ pub const IndexManager = struct {
                 var backfill_ns: u64 = 0;
                 const dense_cfg = try parseDenseConfig(self.alloc, cfg.config_json);
                 defer dense_cfg.deinit(self.alloc);
+                const cache_limits = self.resource_manager.?.hbcCacheLimits(dense_cfg.dims, self.hbc_cache != null);
                 const dense_generator = try parseDenseGeneratorConfig(self.alloc, cfg.config_json);
                 defer if (dense_generator) |generator| generator.deinit(self.alloc);
                 const referenced_embedding = if (dense_generator == null and dense_cfg.embedding_name != null and !dense_cfg.external)
@@ -7487,7 +7821,7 @@ pub const IndexManager = struct {
                     }
                 }
 
-                const path = try self.activeIndexPath(cfg.name);
+                const path = try self.activeIndexPathForConfig(cfg);
                 defer self.alloc.free(path);
 
                 const zpath = try self.alloc.dupeZ(u8, path);
@@ -7509,9 +7843,9 @@ pub const IndexManager = struct {
                     .rerank_policy = dense_cfg.rerank_policy,
                     .quantizer_seed = dense_cfg.quantizer_seed,
                     .use_random_ortho_trans = dense_cfg.use_random_ortho_trans,
-                    .max_cached_nodes = dense_cfg.max_cached_nodes,
-                    .max_cached_vectors = dense_cfg.max_cached_vectors,
-                    .max_cached_metadata = dense_cfg.max_cached_metadata,
+                    .max_cached_nodes = cache_limits.max_cached_nodes,
+                    .max_cached_vectors = cache_limits.max_cached_vectors,
+                    .max_cached_metadata = cache_limits.max_cached_metadata,
                     .lazy_posting_maintenance = dense_cfg.lazy_posting_maintenance,
                     .auto_posting_maintenance_max_postings = dense_cfg.auto_posting_maintenance_max_postings,
                     .centroid_directory_mode = dense_cfg.centroid_directory_mode,
@@ -7526,7 +7860,9 @@ pub const IndexManager = struct {
                     .root_generation = self.lsm_root_generation,
                 });
                 if (self.hbc_cache) |cache| index.attachSharedCache(cache);
-                if (self.resource_manager) |manager| index.attachResourceManager(manager);
+                if (self.resource_manager) |manager| {
+                    index.attachResourceManagerWithSharedCacheBinding(manager, self.bind_cache_resource_manager);
+                }
                 var index_moved = false;
                 errdefer if (!index_moved) index.close();
                 const vector_loader_context = try self.alloc.create(DenseVectorLoadContext);
@@ -7541,7 +7877,6 @@ pub const IndexManager = struct {
                 vector_loader_context.* = .{
                     .manager = self,
                     .index_name = try self.alloc.dupe(u8, cfg.name),
-                    .max_cached_vectors = dense_cfg.max_cached_vectors,
                 };
                 vector_loader_context_initialized = true;
                 index.setExternalVectorLoader(vector_loader_context, loadDenseVectorForHbc);
@@ -7608,7 +7943,7 @@ pub const IndexManager = struct {
                 else
                     null;
 
-                const path = try self.activeIndexPath(cfg.name);
+                const path = try self.activeIndexPathForConfig(cfg);
                 defer self.alloc.free(path);
 
                 const zpath = try self.alloc.dupeZ(u8, path);
@@ -7695,7 +8030,7 @@ pub const IndexManager = struct {
                     graph_cfg.shorthand_asset = null;
                 }
 
-                const path = try self.activeIndexPath(cfg.name);
+                const path = try self.activeIndexPathForConfig(cfg);
                 defer self.alloc.free(path);
 
                 const forward_path = try std.fmt.allocPrint(self.alloc, "{s}/forward", .{path});
@@ -8541,6 +8876,84 @@ pub const IndexManager = struct {
                 return;
             }
         }
+    }
+
+    fn detachedIndexConfig(entry: *const DetachedIndex) *const types.IndexConfig {
+        return switch (entry.*) {
+            inline else => |*index| &index.config,
+        };
+    }
+
+    fn ensureDetachedIndexCapacity(self: *IndexManager, entry: DetachedIndex) !void {
+        switch (entry) {
+            .full_text => try self.text_indexes.ensureUnusedCapacity(self.alloc, 1),
+            .dense_vector => try self.dense_indexes.ensureUnusedCapacity(self.alloc, 1),
+            .sparse_vector => try self.sparse_indexes.ensureUnusedCapacity(self.alloc, 1),
+            .graph => try self.graph_indexes.ensureUnusedCapacity(self.alloc, 1),
+            .algebraic => try self.algebraic_indexes.ensureUnusedCapacity(self.alloc, 1),
+        }
+    }
+
+    fn appendDetachedIndexAssumeCapacity(self: *IndexManager, entry: *DetachedIndex) void {
+        switch (entry.*) {
+            .full_text => |index| {
+                self.text_indexes.appendAssumeCapacity(index);
+                if (index.compaction_pending) TextMergeScheduler.schedule(&self.text_indexes.items[self.text_indexes.items.len - 1]);
+            },
+            .dense_vector => |index_value| {
+                const index = index_value;
+                if (index.vector_loader_context) |ctx| ctx.manager = self;
+                self.dense_indexes.appendAssumeCapacity(index);
+            },
+            .sparse_vector => |index| self.sparse_indexes.appendAssumeCapacity(index),
+            .graph => |index| self.graph_indexes.appendAssumeCapacity(index),
+            .algebraic => |index| self.algebraic_indexes.appendAssumeCapacity(index),
+        }
+        entry.* = undefined;
+    }
+
+    fn detachInMemoryNoLock(self: *IndexManager, name: []const u8) ?DetachedIndex {
+        for (self.text_indexes.items, 0..) |entry, i| {
+            if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            const detached = self.text_indexes.orderedRemove(i);
+            self.dropIndexLoadStateNoLock(name);
+            return .{ .full_text = detached };
+        }
+        for (self.dense_indexes.items, 0..) |entry, i| {
+            if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            const detached = self.dense_indexes.orderedRemove(i);
+            self.dropIndexLoadStateNoLock(name);
+            return .{ .dense_vector = detached };
+        }
+        for (self.sparse_indexes.items, 0..) |entry, i| {
+            if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            const detached = self.sparse_indexes.orderedRemove(i);
+            self.dropIndexLoadStateNoLock(name);
+            return .{ .sparse_vector = detached };
+        }
+        for (self.graph_indexes.items, 0..) |entry, i| {
+            if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            const detached = self.graph_indexes.orderedRemove(i);
+            self.dropIndexLoadStateNoLock(name);
+            return .{ .graph = detached };
+        }
+        for (self.algebraic_indexes.items, 0..) |entry, i| {
+            if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            const detached = self.algebraic_indexes.orderedRemove(i);
+            self.dropIndexLoadStateNoLock(name);
+            return .{ .algebraic = detached };
+        }
+        return null;
+    }
+
+    fn detachDenseInMemoryNoLock(self: *IndexManager, name: []const u8) ?DenseIndex {
+        for (self.dense_indexes.items, 0..) |entry, i| {
+            if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            const detached = self.dense_indexes.orderedRemove(i);
+            self.dropIndexLoadStateNoLock(name);
+            return detached;
+        }
+        return null;
     }
 
     fn truncateEnrichments(self: *IndexManager, len: usize) void {
@@ -13440,9 +13853,6 @@ const DenseConfig = struct {
     rerank_policy: hbc_mod.HBCConfig.RerankPolicy = .boundary,
     quantizer_seed: u64 = 42,
     use_random_ortho_trans: bool = false,
-    max_cached_nodes: usize = 100_000,
-    max_cached_vectors: usize = 100_000,
-    max_cached_metadata: usize = 100_000,
     lazy_posting_maintenance: bool = false,
     auto_posting_maintenance_max_postings: usize = 0,
     centroid_directory_mode: hbc_mod.HBCConfig.CentroidDirectoryMode = .hbc,
@@ -13454,6 +13864,35 @@ const DenseConfig = struct {
         if (self.embedding_name) |embedding_name| alloc.free(embedding_name);
     }
 };
+
+/// Returns whether rebuilding this dense projection depends on durable
+/// embedding artifacts and their authoritative coverage counter. Kept here so
+/// repair preflight and normal index open interpret the same config grammar.
+pub fn denseConfigRequiresArtifactCoverage(alloc: Allocator, cfg: types.IndexConfig) !bool {
+    if (cfg.kind != .dense_vector) return false;
+    const dense_cfg = try parseDenseConfig(alloc, cfg.config_json);
+    defer dense_cfg.deinit(alloc);
+    const generator = try parseDenseGeneratorConfig(alloc, cfg.config_json);
+    defer if (generator) |value| value.deinit(alloc);
+    return dense_cfg.external or dense_cfg.embedding_name != null or generator != null;
+}
+
+pub fn denseConfigDimensions(alloc: Allocator, cfg: types.IndexConfig) !u32 {
+    if (cfg.kind != .dense_vector) return error.InvalidIndexConfiguration;
+    const dense_cfg = try parseDenseConfig(alloc, cfg.config_json);
+    defer dense_cfg.deinit(alloc);
+    return dense_cfg.dims;
+}
+
+pub fn denseConfigArtifactNameAlloc(alloc: Allocator, cfg: types.IndexConfig) ![]u8 {
+    if (cfg.kind != .dense_vector) return error.InvalidIndexConfiguration;
+    const dense_cfg = try parseDenseConfig(alloc, cfg.config_json);
+    defer dense_cfg.deinit(alloc);
+    const generator = try parseDenseGeneratorConfig(alloc, cfg.config_json);
+    defer if (generator) |value| value.deinit(alloc);
+    if (generator) |value| return try alloc.dupe(u8, value.embedding_name orelse cfg.name);
+    return try alloc.dupe(u8, dense_cfg.embedding_name orelse cfg.name);
+}
 
 const TextConfig = struct {
     source_artifact_name: ?[]u8 = null,
@@ -13793,18 +14232,6 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
             value.bool
         else
             false,
-        .max_cached_nodes = if (root.object.get("max_cached_nodes")) |value|
-            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
-        else
-            100_000,
-        .max_cached_vectors = if (root.object.get("max_cached_vectors")) |value|
-            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
-        else
-            100_000,
-        .max_cached_metadata = if (root.object.get("max_cached_metadata")) |value|
-            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
-        else
-            100_000,
         .lazy_posting_maintenance = if (root.object.get("lazy_posting_maintenance")) |value|
             value.bool
         else
@@ -16606,7 +17033,7 @@ test "index manager modeled crash fixtures stay green" {
     try runModeledIndexManagerCrashFixtures(std.testing.allocator);
 }
 
-test "parseDenseConfig accepts HBC tuning knobs" {
+test "parseDenseConfig accepts HBC algorithm tuning" {
     const alloc = std.testing.allocator;
     const raw =
         \\{
@@ -16625,9 +17052,6 @@ test "parseDenseConfig accepts HBC tuning knobs" {
         \\  "rerank_policy": "never",
         \\  "quantizer_seed": 99,
         \\  "use_random_ortho_trans": true,
-        \\  "max_cached_nodes": 4096,
-        \\  "max_cached_vectors": 2048,
-        \\  "max_cached_metadata": 8192,
         \\  "lazy_posting_maintenance": true,
         \\  "auto_posting_maintenance_max_postings": 17,
         \\  "centroid_directory_mode": "flat_rabitq",
@@ -16654,14 +17078,55 @@ test "parseDenseConfig accepts HBC tuning knobs" {
     try std.testing.expectEqual(hbc_mod.HBCConfig.RerankPolicy.never, cfg.rerank_policy);
     try std.testing.expectEqual(@as(u64, 99), cfg.quantizer_seed);
     try std.testing.expectEqual(true, cfg.use_random_ortho_trans);
-    try std.testing.expectEqual(@as(usize, 4096), cfg.max_cached_nodes);
-    try std.testing.expectEqual(@as(usize, 2048), cfg.max_cached_vectors);
-    try std.testing.expectEqual(@as(usize, 8192), cfg.max_cached_metadata);
     try std.testing.expectEqual(true, cfg.lazy_posting_maintenance);
     try std.testing.expectEqual(@as(usize, 17), cfg.auto_posting_maintenance_max_postings);
     try std.testing.expectEqual(hbc_mod.HBCConfig.CentroidDirectoryMode.flat_rabitq, cfg.centroid_directory_mode);
     try std.testing.expectEqual(@as(usize, 1024), cfg.flat_centroid_block_size);
     try std.testing.expectEqual(@as(usize, 33), cfg.flat_centroid_probe_count);
+}
+
+test "dense cache policy comes from resource manager instead of index config" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "dense-resource-cache-policy");
+    defer cleanupIndexManagerDir(path);
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+        .soft_limit_bytes = 2048,
+        .hard_limit_bytes = 4096,
+    };
+    var resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try IndexManager.initWithOptions(alloc, std.mem.span(path), .{
+        .resource_manager = &resources,
+    });
+    defer manager.deinit();
+
+    // Legacy raw JSON may still contain these keys in a persisted catalog,
+    // but they are deliberately ignored and cannot override node policy.
+    try manager.add(&store, .{
+        .name = "dense_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true,\"max_cached_nodes\":999999,\"max_cached_vectors\":999999,\"max_cached_metadata\":999999}",
+    });
+
+    const entry = manager.denseIndex("dense_v1") orelse return error.TestUnexpectedResult;
+    const expected = resources.hbcCacheLimits(2, false);
+    try std.testing.expectEqual(expected.max_cached_nodes, entry.index.config.max_cached_nodes);
+    try std.testing.expectEqual(expected.max_cached_vectors, entry.index.config.max_cached_vectors);
+    try std.testing.expectEqual(expected.max_cached_metadata, entry.index.config.max_cached_metadata);
+    try std.testing.expect((try manager.activeIndexStorageBytes("dense_v1")) > 0);
+}
+
+test "standalone index manager installs an internal resource manager" {
+    var manager = try IndexManager.init(std.testing.allocator, ".");
+    defer manager.deinit();
+
+    try std.testing.expect(manager.resource_manager != null);
+    try std.testing.expect(manager.owned_resource_manager != null);
+    try std.testing.expectEqual(manager.owned_resource_manager.?, manager.resource_manager.?);
 }
 
 test "parseDenseConfig accepts external embedding indexes" {
@@ -18302,6 +18767,25 @@ test "configured index loading only parallelizes read-only construction" {
     );
 }
 
+test "index load recovery classification only auto rebuilds incomplete publication" {
+    try std.testing.expectEqual(
+        IndexManager.IndexLoadRecoveryAction.rebuild_from_artifacts,
+        IndexManager.loadFailureRecoveryAction("IncompleteBulkPublish"),
+    );
+    try std.testing.expectEqual(
+        IndexManager.IndexLoadRecoveryAction.retry_open,
+        IndexManager.loadFailureRecoveryAction("TableReadChurn"),
+    );
+    try std.testing.expectEqual(
+        IndexManager.IndexLoadRecoveryAction.manual_intervention,
+        IndexManager.loadFailureRecoveryAction("UnsupportedVersion"),
+    );
+    try std.testing.expectEqual(
+        IndexManager.IndexLoadRecoveryAction.manual_intervention,
+        IndexManager.loadFailureRecoveryAction("CorruptMetadata"),
+    );
+}
+
 test "loadConfiguredIndexesParallel quarantines worker errors without double-joining threads" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -18575,8 +19059,7 @@ test "dense artifact-only replay apply remains searchable after incremental catc
     try std.testing.expectEqual(before_replay_profile.bulk_build_tree_ns, after_second_replay_profile.bulk_build_tree_ns);
 
     try std.testing.expectEqual(@as(u64, 3), entry.index.stats().active_count);
-    entry.index.setCacheEnabled(false);
-    entry.index.setCacheEnabled(true);
+    entry.index.clearAllCaches();
 
     var results = try entry.index.searchWithRequest(.{
         .query = &[_]f32{ 1.0, 0.0, 0.0 },
@@ -18603,7 +19086,6 @@ test "dense vector load session caches decoded vectors and tracks bytes" {
     context.* = .{
         .manager = &manager,
         .index_name = try alloc.dupe(u8, "dv_v1"),
-        .max_cached_vectors = 100_000,
     };
 
     var session: IndexManager.DenseVectorLoadSession = .{
@@ -18621,7 +19103,7 @@ test "dense vector load session caches decoded vectors and tracks bytes" {
     try std.testing.expectEqual(@as(u64, 0), session.vector_cache_misses);
 }
 
-test "dense vector load session bounds cache by vector cap and apply working-set budget" {
+test "dense vector load session is bounded by the shared apply working-set budget" {
     const alloc = std.testing.allocator;
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
@@ -18631,32 +19113,16 @@ test "dense vector load session bounds cache by vector cap and apply working-set
     };
     var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
 
-    var manager = try IndexManager.init(alloc, ".");
+    var manager = try IndexManager.initWithOptions(alloc, ".", .{
+        .resource_manager = &resource_manager,
+    });
     defer manager.deinit();
-    manager.resource_manager = &resource_manager;
-
-    const capped_context = try alloc.create(IndexManager.DenseVectorLoadContext);
-    defer capped_context.deinit(alloc);
-    capped_context.* = .{
-        .manager = &manager,
-        .index_name = try alloc.dupe(u8, "dv_v1"),
-        .max_cached_vectors = 1,
-    };
-
-    var capped_session: IndexManager.DenseVectorLoadSession = .{
-        .context = capped_context,
-    };
-    try capped_session.cacheVector(1, &[_]f32{ 1.0, 2.0 });
-    try capped_session.cacheVector(2, &[_]f32{ 3.0, 4.0 });
-    try std.testing.expectEqual(@as(usize, 1), capped_session.vector_cache.count());
-    capped_session.deinit();
 
     const budget_context = try alloc.create(IndexManager.DenseVectorLoadContext);
     defer budget_context.deinit(alloc);
     budget_context.* = .{
         .manager = &manager,
         .index_name = try alloc.dupe(u8, "dv_v1"),
-        .max_cached_vectors = 100,
     };
 
     var budget_session: IndexManager.DenseVectorLoadSession = .{
@@ -19050,7 +19516,6 @@ test "dense artifact preload session reuses cached raw values across calls" {
     context.* = .{
         .manager = &manager,
         .index_name = try alloc.dupe(u8, "dv_v1"),
-        .max_cached_vectors = 100_000,
     };
 
     const artifact_key = try alloc.dupe(u8, "artifact:a");

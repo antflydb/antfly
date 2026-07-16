@@ -259,10 +259,10 @@ pub const DerivedRuntime = struct {
         return try self.backlog.track(self.alloc, sequence, bytes);
     }
 
-    pub fn shouldThrottleBacklog(self: *DerivedRuntime) bool {
+    pub fn backlogThrottleTargetSequence(self: *DerivedRuntime) ?u64 {
         lock(self);
         defer self.mutex.unlock();
-        return self.backlog.shouldThrottleWrites();
+        return self.backlog.throttleTargetSequence();
     }
 
     pub fn releaseBacklogThrough(self: *DerivedRuntime, sequence: u64) void {
