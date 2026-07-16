@@ -79,27 +79,6 @@ pub fn configureSessionPreference(session_manager: *backends.SessionManager, cho
     };
 }
 
-/// Graph execution providers still require a direct session that owns model
-/// architecture metadata, weights, and fallback kernels. Keep that base
-/// session choice independent from the strict compiled provider requested by
-/// the caller. In Wasm builds `.native` is the Wasm CPU implementation.
-pub fn configureGenerationBaseSessionPreference(session_manager: *backends.SessionManager, choice: Choice) void {
-    switch (choice) {
-        .onnx, .pjrt, .webgpu => {
-            session_manager.preserve_backend_order = true;
-            session_manager.preferred_backends = if (build_options.enable_native)
-                &.{backends.BackendType.native}
-            else if (build_options.enable_metal)
-                &.{backends.BackendType.metal}
-            else if (build_options.enable_cuda)
-                &.{backends.BackendType.cuda}
-            else
-                &.{};
-        },
-        else => configureSessionPreference(session_manager, choice),
-    }
-}
-
 pub fn compiledPartitionBackend(choice: Choice) ?ops.BackendKind {
     return switch (choice) {
         .onnx => .onnx,
@@ -183,19 +162,4 @@ test "compiledPartitionBackend maps explicit compiled backends" {
     try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackendForMode(.metal, false));
     try std.testing.expectEqual(@as(?ops.BackendKind, .webgpu), compiledPartitionBackendForMode(.webgpu, true));
     try std.testing.expectEqual(@as(?ops.BackendKind, .webgpu), compiledPartitionBackendForMode(.webgpu, false));
-}
-
-test "compiled generation providers use a direct base session" {
-    var manager = backends.SessionManager.init(std.testing.allocator);
-    configureGenerationBaseSessionPreference(&manager, .webgpu);
-    const expected: []const backends.BackendType = if (build_options.enable_native)
-        &.{.native}
-    else if (build_options.enable_metal)
-        &.{.metal}
-    else if (build_options.enable_cuda)
-        &.{.cuda}
-    else
-        &.{};
-    try std.testing.expectEqualSlices(backends.BackendType, expected, manager.preferred_backends);
-    try std.testing.expect(manager.preserve_backend_order);
 }

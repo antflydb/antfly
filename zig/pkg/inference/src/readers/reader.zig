@@ -117,6 +117,7 @@ const VlmLoadedReader = struct {
     pub fn loadFromDir(
         allocator: std.mem.Allocator,
         model_path: []const u8,
+        artifact_selection: manifest_mod.ArtifactSelection,
     ) !VlmLoadedReader {
         const parser_kind = try detectParserKind(allocator, model_path);
         if (parser_kind != .moondream) return error.InvalidModelForReading;
@@ -124,7 +125,7 @@ const VlmLoadedReader = struct {
         return .{
             .allocator = allocator,
             .parser_kind = parser_kind,
-            .pipeline = try onnx_decoder_only_vlm.Pipeline.load(allocator, model_path),
+            .pipeline = try onnx_decoder_only_vlm.Pipeline.loadWithArtifactSelection(allocator, model_path, artifact_selection),
         };
     }
 
@@ -163,13 +164,28 @@ const GenAiLoadedReader = struct {
     pub fn loadFromDir(
         allocator: std.mem.Allocator,
         model_path: []const u8,
+        artifact_selection: manifest_mod.ArtifactSelection,
     ) !GenAiLoadedReader {
         if (!build_options.enable_onnx) return error.OnnxNotEnabled;
 
         const parser_kind = try detectParserKind(allocator, model_path);
         if (parser_kind != .moondream) return error.InvalidModelForReading;
 
-        var prepared_package = (try ortgenai.prepareGenerativeModelPackage(allocator, model_path)) orelse
+        var prepared_package = if (!artifact_selection.isEmpty()) blk: {
+            var selected_manifest = try manifest_mod.loadFromDirWithArtifactSelection(
+                allocator,
+                model_path,
+                artifact_selection,
+            );
+            defer selected_manifest.deinit();
+            const selected_onnx_path = selected_manifest.onnx_path orelse
+                return error.UnsupportedReaderArtifactSelection;
+            break :blk try ortgenai.prepareGenerativeModelPackageForArtifact(
+                allocator,
+                model_path,
+                selected_onnx_path,
+            );
+        } else (try ortgenai.prepareGenerativeModelPackage(allocator, model_path)) orelse
             return error.InvalidModelForReading;
         errdefer prepared_package.deinit();
 
@@ -240,6 +256,19 @@ pub const LoadedReader = struct {
         artifact_selection: manifest_mod.ArtifactSelection,
     ) !LoadedReader {
         if (multistage_metadata.isMultiStageModelDir(allocator, model_path)) {
+            if (!artifact_selection.isEmpty()) {
+                const format = artifact_selection.format orelse return error.UnsupportedReaderArtifactSelection;
+                if (!std.ascii.eqlIgnoreCase(format, "hybrid")) return error.UnsupportedReaderArtifactSelection;
+                // Composite readers select their stage files as one atomic
+                // hybrid package. Loading the selected manifest validates
+                // uniqueness and rejects quantization before any stage opens.
+                var selected_manifest = try manifest_mod.loadFromDirWithArtifactSelection(
+                    allocator,
+                    model_path,
+                    artifact_selection,
+                );
+                selected_manifest.deinit();
+            }
             var lease = try beginTransientLease(model_manager, request_id);
             errdefer deinitTransientLease(&lease);
             var reader = try multistage_reader_mod.LoadedMultiStageReader.loadFromDir(allocator, model_path, session_manager);
@@ -253,14 +282,14 @@ pub const LoadedReader = struct {
             if (onnx_decoder_only_vlm.isSupportedModelDir(allocator, model_path)) {
                 var lease = try beginTransientLease(model_manager, request_id);
                 errdefer deinitTransientLease(&lease);
-                var reader = try VlmLoadedReader.loadFromDir(allocator, model_path);
+                var reader = try VlmLoadedReader.loadFromDir(allocator, model_path, artifact_selection);
                 errdefer reader.deinit();
                 try activateTransientLease(&lease);
                 return .{ .impl = .{ .vlm = reader }, .transient_lease = lease };
             }
             if (build_options.enable_onnx) {
                 var lease = try beginTransientLease(model_manager, request_id);
-                if (GenAiLoadedReader.loadFromDir(allocator, model_path)) |loaded| {
+                if (GenAiLoadedReader.loadFromDir(allocator, model_path, artifact_selection)) |loaded| {
                     errdefer deinitTransientLease(&lease);
                     var reader = loaded;
                     errdefer reader.deinit();
@@ -268,6 +297,10 @@ pub const LoadedReader = struct {
                     return .{ .impl = .{ .genai = reader }, .transient_lease = lease };
                 } else |err| {
                     deinitTransientLease(&lease);
+                    // An exact artifact reference is authoritative. Do not
+                    // hide selection, manifest, or package failures by
+                    // silently switching to a different reader family.
+                    if (!artifact_selection.isEmpty()) return err;
                     std.log.warn("ortgenai moondream reader load failed for {s}: {s}", .{ model_path, @errorName(err) });
                 }
             }

@@ -2134,6 +2134,15 @@ pub const NativeGenerationPipeline = struct {
     /// partitions the single-device graph and compiles eligible subgraphs
     /// for the requested backend while the host backend handles fallbacks.
     compiled_partition_backend: ?ops.BackendKind = null,
+    /// Remaining configured compiled providers before the first direct
+    /// generation backend. The slice is request-owned and allocation-free.
+    compiled_partition_fallback_backends: []const ops.BackendKind = &.{},
+    /// Explicit request overrides are strict: an unavailable or incompatible
+    /// compiled provider must be reported instead of silently using the base.
+    compiled_partition_strict: bool = false,
+    /// Once a provider has produced request-visible model state, switching
+    /// implementations is unsafe because backend-owned KV may have advanced.
+    compiled_provider_committed: bool = false,
     /// Whether the compiled backend should attach bounded partitions or
     /// only proceed when it can own the whole traced graph shape.
     compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = .partitioned,
@@ -4596,7 +4605,7 @@ pub const NativeGenerationPipeline = struct {
         const cache = self.graph_cache orelse return null;
         if (self.compiled_partition_backend == null or self.compiled_attachment_target != .whole_model) return null;
 
-        const token_id = (try graph_mod.execution.graphForwardCompiledModelGreedyToken(
+        const token_id = (graph_mod.execution.graphForwardCompiledModelGreedyToken(
             self,
             cache,
             input_ids,
@@ -4604,7 +4613,14 @@ pub const NativeGenerationPipeline = struct {
             seq_len,
             decode_context,
             self.gpt_config.vocab_size,
-        )) orelse return null;
+        ) catch |err| {
+            if (!self.advanceCompiledWholeModelProvider(cache, err)) return err;
+            return null;
+        }) orelse {
+            if (!self.compiled_partition_strict) _ = self.advanceCompiledWholeModelProvider(cache, null);
+            return null;
+        };
+        self.compiled_provider_committed = true;
         if (token_id < 0) return error.InvalidModelOutput;
         return @intCast(token_id);
     }
@@ -4616,7 +4632,42 @@ pub const NativeGenerationPipeline = struct {
         const cache = self.graph_cache orelse return false;
         try self.rejectUnsupportedDeepSeekV4GraphMode();
         if (self.compiled_partition_backend == null or self.compiled_attachment_target != .whole_model) return false;
-        return graph_mod.execution.prepareCompiledModelRuntime(self, cache, kv_tokens_hint);
+        while (self.compiled_partition_backend != null) {
+            const prepared = graph_mod.execution.prepareCompiledModelRuntime(self, cache, kv_tokens_hint) catch |err| {
+                if (!self.advanceCompiledWholeModelProvider(cache, err)) return err;
+                continue;
+            };
+            if (prepared) return true;
+            if (!self.advanceCompiledWholeModelProvider(cache, null)) return false;
+        }
+        return false;
+    }
+
+    fn advanceCompiledWholeModelProvider(
+        self: *NativeGenerationPipeline,
+        cache: *graph_mod.cache.GraphCache,
+        failure: ?anyerror,
+    ) bool {
+        const failed = self.compiled_partition_backend orelse return false;
+        if (self.compiled_partition_strict or self.compiled_provider_committed) return false;
+        if (failure) |err| {
+            if (!graph_mod.execution.isRetryableCompiledProviderError(failed, err)) return false;
+            std.log.warn("compiled whole-model generation provider {s} failed ({s}); advancing configured priority", .{
+                @tagName(failed),
+                @errorName(err),
+            });
+        } else {
+            std.log.warn("compiled whole-model generation provider {s} is incompatible; advancing configured priority", .{@tagName(failed)});
+        }
+        cache.resetSessionCompiledModelRuntime();
+        if (self.compiled_partition_fallback_backends.len > 0) {
+            self.compiled_partition_backend = self.compiled_partition_fallback_backends[0];
+            self.compiled_partition_fallback_backends = self.compiled_partition_fallback_backends[1..];
+        } else {
+            self.compiled_partition_backend = null;
+            self.compiled_attachment_target = .partitioned;
+        }
+        return true;
     }
 
     fn forwardAllLogits(
@@ -5284,11 +5335,23 @@ pub const NativeGenerationPipeline = struct {
         decode_context: *const gpt_arch.DecodeContext,
     ) ![]f32 {
         const allocator = self.allocator;
-        if (try graph_mod.execution.graphForwardCompiledModelLast(self, cache, input_ids, batch, seq_len, decode_context)) |last_logits| {
-            return last_logits;
-        }
-        if (self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model) {
-            return error.MissingCompiledModelRuntime;
+        while (self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model) {
+            const maybe_logits = graph_mod.execution.graphForwardCompiledModelLast(
+                self,
+                cache,
+                input_ids,
+                batch,
+                seq_len,
+                decode_context,
+            ) catch |err| {
+                if (!self.advanceCompiledWholeModelProvider(cache, err)) return err;
+                continue;
+            };
+            if (maybe_logits) |last_logits| {
+                self.compiled_provider_committed = true;
+                return last_logits;
+            }
+            if (!self.advanceCompiledWholeModelProvider(cache, null)) return error.MissingCompiledModelRuntime;
         }
 
         const logits = try graph_mod.execution.graphForwardAll(self, cache, input_ids, batch, seq_len, decode_context);

@@ -316,6 +316,88 @@ fn nativeGenerationLoadPriority(
     return scratch[0..len];
 }
 
+fn nativeGenerationBaseLoadPriority(
+    scratch: *[backend_priority_capacity]backends_mod.BackendType,
+    configured: []const backends_mod.BackendType,
+    primary: ops.BackendKind,
+) []const backends_mod.BackendType {
+    const primary_type = compiledGenerationBackendType(primary) orelse return &.{};
+    var start: usize = 0;
+    for (configured, 0..) |backend, index| {
+        if (backend == primary_type) {
+            start = index + 1;
+            break;
+        }
+    }
+
+    var len: usize = 0;
+    var direct_run_started = false;
+    for (configured[start..]) |backend| {
+        if (compiledGenerationBackendKind(backend) != null) {
+            if (direct_run_started) break;
+            continue;
+        }
+        direct_run_started = true;
+        scratch[len] = backend;
+        len += 1;
+    }
+    return scratch[0..len];
+}
+
+fn compiledGenerationBackendKind(backend: backends_mod.BackendType) ?ops.BackendKind {
+    return switch (backend) {
+        .onnx => .onnx,
+        .pjrt => .pjrt,
+        .webgpu => .webgpu,
+        .native, .metal, .cuda => null,
+    };
+}
+
+fn compiledGenerationBackendType(backend: ops.BackendKind) ?backends_mod.BackendType {
+    return switch (backend) {
+        .onnx => .onnx,
+        .pjrt => .pjrt,
+        .webgpu => .webgpu,
+        .native, .metal, .cuda, .wasm, .graph => null,
+    };
+}
+
+/// Return configured compiled providers after `primary`, stopping at the first
+/// direct generation backend. Once a direct backend is reached, later entries
+/// cannot participate in fallback because priority has already selected that
+/// direct implementation.
+fn compiledGenerationFallbackPriority(
+    scratch: *[backend_priority_capacity]ops.BackendKind,
+    configured: ?[]const backends_mod.BackendType,
+    failed: std.EnumSet(backends_mod.BackendType),
+    primary: ?ops.BackendKind,
+) []const ops.BackendKind {
+    const priority = configured orelse return &.{};
+    const primary_type = if (primary) |kind| compiledGenerationBackendType(kind) else null;
+    var start: usize = 0;
+    if (primary_type) |needle| {
+        for (priority, 0..) |backend, index| {
+            if (backend == needle) {
+                start = index + 1;
+                break;
+            }
+        }
+    }
+
+    var len: usize = 0;
+    for (priority[start..]) |backend| {
+        if (failed.contains(backend) or !backend.available()) continue;
+        if (compiledGenerationBackendKind(backend)) |kind| {
+            if (primary != null and kind == primary.?) continue;
+            scratch[len] = kind;
+            len += 1;
+            continue;
+        }
+        break;
+    }
+    return scratch[0..len];
+}
+
 fn generationPriorityNeedsSessionFiltering(configured: []const backends_mod.BackendType) bool {
     for (configured) |backend| switch (backend) {
         .onnx, .webgpu => return true,
@@ -506,13 +588,6 @@ fn isConfiguredOnnxGenerationFallbackError(err: anyerror) bool {
         => true,
         else => false,
     };
-}
-
-fn configureGenerateBaseSessionPreference(
-    session_manager: *backends_mod.SessionManager,
-    selection: GenerateBackendSelection,
-) void {
-    native_backend_choice.configureGenerationBaseSessionPreference(session_manager, selection.native_choice);
 }
 
 fn singleBackendPreference(backend: backends_mod.BackendType) []const backends_mod.BackendType {
@@ -2714,8 +2789,13 @@ pub const Node = struct {
         artifact_selection: manifest_mod.ArtifactSelection,
     ) !*model_manager_mod.LoadedModel {
         var request_session_manager = backends_mod.SessionManager.init(allocator);
-        const configured = if (selection.override_model_loading or selection.compiled_partition_backend != null) blk: {
-            configureGenerateBaseSessionPreference(&request_session_manager, selection);
+        const configured = if (selection.compiled_partition_backend != null)
+            // A compiled provider is an accelerator layered over the direct
+            // session. Its base must come from the same configured priority,
+            // never from an implicit native-first list.
+            self.session_manager.preferred_backends
+        else if (selection.override_model_loading) blk: {
+            native_backend_choice.configureSessionPreference(&request_session_manager, selection.native_choice);
             break :blk request_session_manager.preferred_backends;
         } else self.session_manager.preferred_backends;
 
@@ -2732,7 +2812,10 @@ pub const Node = struct {
         }
 
         var scratch: [backend_priority_capacity]backends_mod.BackendType = undefined;
-        const direct_backends = nativeGenerationLoadPriority(&scratch, configured);
+        const direct_backends = if (selection.compiled_partition_backend) |primary|
+            nativeGenerationBaseLoadPriority(&scratch, configured, primary)
+        else
+            nativeGenerationLoadPriority(&scratch, configured);
         if (direct_backends.len == 0) return error.NoNativeGenerationBackend;
 
         if (!artifact_selection.isEmpty()) {
@@ -2769,12 +2852,17 @@ pub const Node = struct {
         if (self.config.backend_priority != null and fallback_choice == .auto) {
             return error.NoConfiguredGenerationBackendFallback;
         }
-        return parseGenerateBackendSelectionWithDefault(
+        var selection = try parseGenerateBackendSelectionWithDefault(
             null,
             body.mode,
             body.compiled_target,
             fallback_choice,
         );
+        // The fallback resolver has already selected one exact operation
+        // backend. Keep model loading on that point in the priority chain
+        // instead of restarting the shared list from its beginning.
+        selection.override_model_loading = true;
+        return selection;
     }
 
     fn initializeConfiguredPjrtClient(
@@ -3519,6 +3607,35 @@ pub const Node = struct {
             }
         }
 
+        var compiled_fallback_storage: [backend_priority_capacity]ops.BackendKind = undefined;
+        var compiled_fallback_backends = if (backend_selection.strict_backend)
+            @as([]const ops.BackendKind, &.{})
+        else
+            compiledGenerationFallbackPriority(
+                &compiled_fallback_storage,
+                self.config.backend_priority,
+                failed_generation_backends,
+                backend_selection.compiled_partition_backend,
+            );
+
+        // A later PJRT candidate needs the same bounded, request-owned client
+        // as a primary PJRT provider. Probe it before generation so runtime
+        // failover never performs plugin discovery on the token hot path.
+        if (pjrt_client == null and std.mem.indexOfScalar(ops.BackendKind, compiled_fallback_backends, .pjrt) != null) {
+            if (self.initializeConfiguredPjrtClient(ctx.allocator, &pjrt_plugin_path)) |client| {
+                pjrt_client = client;
+            } else |err| {
+                failed_generation_backends.insert(.pjrt);
+                std.log.warn("configured PJRT fallback unavailable ({s}); advancing backend priority", .{@errorName(err)});
+                compiled_fallback_backends = compiledGenerationFallbackPriority(
+                    &compiled_fallback_storage,
+                    self.config.backend_priority,
+                    failed_generation_backends,
+                    backend_selection.compiled_partition_backend,
+                );
+            }
+        }
+
         if (effective_draft_model_name) |draft_model_name| {
             const draft_model_path = self.resolveModelPath(ctx.io, draft_model_name, "generators") catch
                 return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "draft model not found" });
@@ -3803,6 +3920,8 @@ pub const Node = struct {
             .prompt_cache = prompt_cache,
             .graph_cache = graph_cache,
             .compiled_partition_backend = effective_compiled_partition_backend,
+            .compiled_partition_fallback_backends = if (auto_metal_whole_model) &.{} else compiled_fallback_backends,
+            .compiled_partition_strict = backend_selection.strict_backend,
             .compiled_attachment_target = effective_compiled_attachment_target,
             .pjrt_client = if (pjrt_client) |*client| client else null,
         };
@@ -5973,6 +6092,15 @@ pub const Node = struct {
             error.MultiStageReaderNotYetSupported => return ctx.status(400).json(.{
                 .@"error" = "INVALID_MODEL",
                 .message = "multi-stage OCR model uses unsupported stages or configuration",
+            }),
+            error.UnsupportedReaderArtifactSelection,
+            error.InvalidModelArtifactFormat,
+            error.InvalidModelQuantization,
+            error.ModelArtifactVariantNotFound,
+            error.AmbiguousModelArtifactVariant,
+            => return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "the selected reader artifact is unavailable or incompatible with this reader pipeline",
             }),
             else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) }),
         };
@@ -8183,6 +8311,36 @@ test "native generation load priority excludes compiled and incompatible session
     try std.testing.expectEqualSlices(backends_mod.BackendType, &.{ .cuda, .native }, direct);
     try std.testing.expect(generationPriorityNeedsSessionFiltering(&.{ .pjrt, .onnx, .native }));
     try std.testing.expect(!generationPriorityNeedsSessionFiltering(&.{ .pjrt, .cuda, .native }));
+
+    const bounded = nativeGenerationBaseLoadPriority(
+        &scratch,
+        &.{ .onnx, .cuda, .native, .pjrt, .metal },
+        .onnx,
+    );
+    try std.testing.expectEqualSlices(backends_mod.BackendType, &.{ .cuda, .native }, bounded);
+}
+
+test "compiled generation fallback preserves configured ordering boundary" {
+    var scratch: [backend_priority_capacity]ops.BackendKind = undefined;
+    const failed = std.EnumSet(backends_mod.BackendType).initEmpty();
+    const fallbacks = compiledGenerationFallbackPriority(
+        &scratch,
+        &.{ .onnx, .pjrt, .cuda, .webgpu, .native },
+        failed,
+        .onnx,
+    );
+    const expected: []const ops.BackendKind = if (build_options.enable_pjrt) &.{.pjrt} else &.{};
+    try std.testing.expectEqualSlices(ops.BackendKind, expected, fallbacks);
+
+    var pjrt_failed = failed;
+    pjrt_failed.insert(.pjrt);
+    const without_pjrt = compiledGenerationFallbackPriority(
+        &scratch,
+        &.{ .onnx, .pjrt, .cuda, .webgpu },
+        pjrt_failed,
+        .onnx,
+    );
+    try std.testing.expectEqual(@as(usize, 0), without_pjrt.len);
 }
 
 test "singleBackendPreference is strict" {
