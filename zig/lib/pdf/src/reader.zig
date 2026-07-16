@@ -19,6 +19,7 @@ const image_lib = @import("antfly_image");
 const font_lib = @import("antfly_font");
 
 const Allocator = std.mem.Allocator;
+const max_trailing_pdf_bytes: usize = 4096;
 
 pub const XrefEntry = struct {
     ptr: syntax.ObjRef,
@@ -1287,15 +1288,25 @@ pub const Reader = struct {
 
     pub fn init(alloc: Allocator, bytes: []const u8) !Reader {
         if (bytes.len < 10) return error.InvalidPdfHeader;
-        if (!std.mem.startsWith(u8, bytes, "%PDF-1.")) return error.InvalidPdfHeader;
+        // ISO 32000 permits the header to appear anywhere in the first 1024
+        // bytes. In practice scanners and download gateways sometimes prefix
+        // a short binary marker before it, while preserving xref offsets
+        // relative to the original byte stream.
+        const header_search = bytes[0..@min(bytes.len, 1024)];
+        const header_offset = std.mem.indexOf(u8, header_search, "%PDF-1.") orelse return error.InvalidPdfHeader;
+        if (header_offset + 8 >= bytes.len) return error.InvalidPdfHeader;
 
-        const minor = bytes[7];
+        const minor = bytes[header_offset + 7];
         if (minor < '0' or minor > '9') return error.InvalidPdfHeader;
-        const newline = bytes[8];
-        if (newline != '\r' and newline != '\n') return error.InvalidPdfHeader;
+        const header_suffix = header_search[header_offset + 8 ..];
+        if (std.mem.indexOfAny(u8, header_suffix, "\r\n") == null) return error.InvalidPdfHeader;
 
-        const trailer_slice = trimPdfTrailer(bytes);
-        if (!std.mem.endsWith(u8, trailer_slice, "%%EOF")) return error.MissingPdfEof;
+        // Use the final EOF marker rather than requiring it to be the final
+        // non-whitespace bytes. A number of otherwise valid scanned PDFs have
+        // a bounded proxy/scanner diagnostic appended after the PDF body.
+        const eof_offset = std.mem.lastIndexOf(u8, bytes, "%%EOF") orelse return error.MissingPdfEof;
+        if (bytes.len - (eof_offset + "%%EOF".len) > max_trailing_pdf_bytes) return error.TrailingPdfDataTooLarge;
+        const trailer_slice = bytes[0 .. eof_offset + "%%EOF".len];
 
         const startxref_pos = findLastLine(trailer_slice, "startxref") orelse return error.MissingStartXref;
         const startxref_offset = try parseStartXref(trailer_slice[startxref_pos..]);
@@ -1538,6 +1549,10 @@ pub const Reader = struct {
     pub fn pageCount(self: *const Reader) !usize {
         try self.ensurePageIndex();
         return self.page_index.?.len;
+    }
+
+    pub fn sourceBytes(self: *const Reader) []const u8 {
+        return self.bytes;
     }
 
     pub fn readPageObject(self: *const Reader, page_num: usize) !syntax.Object {
@@ -2017,7 +2032,10 @@ pub const Reader = struct {
         defer out.deinit(self.alloc);
 
         for (1..count + 1) |page_num| {
-            const text = try self.extractPageTextAlloc(page_num);
+            const text = self.extractPageTextAlloc(page_num) catch |err| switch (err) {
+                std.mem.Allocator.Error.OutOfMemory => return err,
+                else => continue,
+            };
             defer self.alloc.free(text);
             try out.appendSlice(self.alloc, text);
         }
@@ -3356,6 +3374,17 @@ pub const Reader = struct {
                     rgba[dst + 3] = 0xff;
                 }
             },
+            4 => {
+                var i: usize = 0;
+                while (i < pixel_count) : (i += 1) {
+                    const src = i * 4;
+                    const dst = i * 4;
+                    rgba[dst + 0] = decoded.pixels[src + 0];
+                    rgba[dst + 1] = decoded.pixels[src + 1];
+                    rgba[dst + 2] = decoded.pixels[src + 2];
+                    rgba[dst + 3] = decoded.pixels[src + 3];
+                }
+            },
             else => return error.UnsupportedPdfRendering,
         }
         return rgba;
@@ -4253,10 +4282,6 @@ pub const Reader = struct {
         return try entries.toOwnedSlice(self.alloc);
     }
 };
-
-fn trimPdfTrailer(bytes: []const u8) []const u8 {
-    return std.mem.trimEnd(u8, bytes, "\r\n\t ");
-}
 
 fn findLastLine(bytes: []const u8, needle: []const u8) ?usize {
     var i = bytes.len;
@@ -9094,9 +9119,38 @@ test "reader init parses basic header and startxref" {
     try std.testing.expect(reader.trailerGet("Root") != null);
 }
 
+test "reader init accepts bounded bytes before header and after final eof" {
+    const alloc = std.testing.allocator;
+    const header = "\xbe\xad%PDF-1.7\r\n";
+    const object_offset = header.len;
+    const body = header ++ "1 0 obj\r\n<< /Type /Catalog >>\r\nendobj\r\n";
+    const xref_offset = body.len;
+    const sample = try std.fmt.allocPrint(
+        alloc,
+        "{s}xref\r\n0 2\r\n0000000000 65535 f \r\n{d:0>10} 00000 n \r\ntrailer\r\n<< /Size 2 /Root 1 0 R >>\r\nstartxref\r\n{d}\r\n%%EOF\r\nError 500: null\r\n",
+        .{ body, object_offset, xref_offset },
+    );
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(u8, 7), reader.version_minor);
+    try std.testing.expectEqual(xref_offset, reader.startxref_offset);
+}
+
 test "reader init rejects missing eof" {
     const sample = "%PDF-1.7\nstartxref\n123\n";
     try std.testing.expectError(error.MissingPdfEof, Reader.init(std.testing.allocator, sample));
+}
+
+test "reader init rejects unbounded bytes after eof" {
+    const alloc = std.testing.allocator;
+    const trailer = try alloc.alloc(u8, max_trailing_pdf_bytes + 1);
+    defer alloc.free(trailer);
+    @memset(trailer, 'x');
+    const sample = try std.mem.concat(alloc, u8, &.{ "%PDF-1.7\nstartxref\n0\n%%EOF", trailer });
+    defer alloc.free(sample);
+    try std.testing.expectError(error.TrailingPdfDataTooLarge, Reader.init(alloc, sample));
 }
 
 test "reader init rejects missing startxref" {

@@ -13,6 +13,8 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const darwin_render = if (builtin.os.tag == .macos) @import("darwin_render.zig") else struct {};
 
 pub const text_encoding = @import("text_encoding.zig");
 pub const reader = @import("reader.zig");
@@ -20,6 +22,8 @@ pub const syntax = @import("syntax.zig");
 pub const render = @import("render.zig");
 
 const Allocator = std.mem.Allocator;
+const minimum_direct_render_dpi: u16 = 48;
+const minimum_requested_render_dpi: u16 = 72;
 
 pub const RenderedPagePng = struct {
     png: []u8,
@@ -84,8 +88,29 @@ pub fn renderPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_number: 
 }
 
 pub fn renderParsedPagePngAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
+    if (dpi < minimum_requested_render_dpi or dpi > 600) return error.InvalidRenderDpi;
+    return try renderParsedPagePngEffectiveAlloc(alloc, parsed, page_number, dpi, max_pixels);
+}
+
+fn renderParsedPagePngEffectiveAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
+    return renderParsedPagePngNativeAlloc(alloc, parsed, page_number, dpi, max_pixels) catch |err| switch (err) {
+        error.UnsupportedStreamFilter,
+        error.UnsupportedNativeDecode,
+        error.UnsupportedPdfRendering,
+        error.InvalidFlateStream,
+        error.MissingEndStream,
+        error.UnexpectedEof,
+        => if (builtin.os.tag == .macos)
+            try darwin_render.renderPagePngAlloc(alloc, parsed.sourceBytes(), page_number, dpi, max_pixels)
+        else
+            return err,
+        else => return err,
+    };
+}
+
+fn renderParsedPagePngNativeAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
     if (page_number == 0) return error.InvalidPageNumber;
-    if (dpi < 72 or dpi > 600) return error.InvalidRenderDpi;
+    if (dpi < minimum_direct_render_dpi or dpi > 600) return error.InvalidRenderDpi;
     const page_count = try parsed.pageCount();
     if (page_number > page_count) return error.InvalidPageNumber;
     // Reject oversized pages before decoding page images and font resources.
@@ -216,8 +241,9 @@ pub fn renderParsedPagePngAlloc(alloc: Allocator, parsed: *reader.Reader, page_n
 }
 
 /// Renders at the requested DPI when safe, reducing it only enough to satisfy
-/// both the dimension and pixel guards. OCR below 72 DPI is intentionally
-/// refused because it is unlikely to produce useful text.
+/// both the dimension and pixel guards. Direct requests remain at least 72
+/// DPI, but exceptionally large scanned pages may adapt as low as 48 DPI so a
+/// useful 4K raster is preferred over dropping the page entirely.
 pub fn renderParsedPagePngAdaptiveAlloc(
     alloc: Allocator,
     parsed: *reader.Reader,
@@ -250,12 +276,12 @@ pub fn renderParsedPagePngAdaptiveAlloc(
             const pixels = @as(u64, width) * @as(u64, height);
             if (width <= max_dimension and height <= max_dimension and pixels <= max_pixels) break;
         }
-        if (effective_dpi == 72) return error.RenderedPageTooLarge;
+        if (effective_dpi == minimum_direct_render_dpi) return error.RenderedPageTooLarge;
         effective_dpi -= 1;
     }
 
     return .{
-        .png = try renderParsedPagePngAlloc(alloc, parsed, page_number, effective_dpi, max_pixels),
+        .png = try renderParsedPagePngEffectiveAlloc(alloc, parsed, page_number, effective_dpi, max_pixels),
         .requested_dpi = requested_dpi,
         .effective_dpi = effective_dpi,
         .width = width,
@@ -2532,8 +2558,15 @@ test "adaptive OCR rendering records effective DPI and enforces safety caps" {
     try std.testing.expectEqual(adaptive.width, decoded.width);
     try std.testing.expectEqual(adaptive.height, decoded.height);
 
-    try std.testing.expectError(error.RenderedPageTooLarge, renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 700));
+    var low_dpi = try renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 700);
+    defer low_dpi.deinit(alloc);
+    try std.testing.expect(low_dpi.effective_dpi >= minimum_direct_render_dpi);
+    try std.testing.expect(low_dpi.effective_dpi < minimum_requested_render_dpi);
+    try std.testing.expect(low_dpi.width <= 700);
+    try std.testing.expect(low_dpi.height <= 700);
+    try std.testing.expectError(error.RenderedPageTooLarge, renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 400));
     try std.testing.expectError(error.RenderedPageTooLarge, renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 10, 4096));
+    try std.testing.expectError(error.InvalidRenderDpi, renderParsedPagePngAlloc(alloc, &parsed, 1, 48, 40_000_000));
 }
 
 test "OCR DPI scaling maps tiling patterns exactly once" {

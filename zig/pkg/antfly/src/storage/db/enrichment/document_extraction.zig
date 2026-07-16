@@ -71,7 +71,10 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
                 runs: []TextRun,
                 outline_fallback: bool = false,
 
-                pub fn deinit(_: *PageTextAnalysis, _: Allocator) void {}
+                pub fn deinit(self: *PageTextAnalysis, alloc: Allocator) void {
+                    alloc.free(self.text);
+                    alloc.free(self.runs);
+                }
             };
         };
 
@@ -1268,6 +1271,33 @@ fn sha256HexAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
     return out;
 }
 
+const PdfPageTextCandidate = struct {
+    analysis: pdf.reader.PageTextAnalysis,
+    warning: ?[]u8 = null,
+};
+
+fn extractPdfPageTextBestEffort(alloc: Allocator, parsed: *pdf.reader.Reader, page_num: usize) !PdfPageTextCandidate {
+    var analysis = parsed.extractPageTextAnalysisAlloc(page_num) catch |err| {
+        var empty_analysis = pdf.reader.PageTextAnalysis{
+            .text = try alloc.dupe(u8, ""),
+            .runs = try alloc.alloc(pdf.reader.TextRun, 0),
+        };
+        errdefer empty_analysis.deinit(alloc);
+        return .{
+            .analysis = empty_analysis,
+            .warning = try std.fmt.allocPrint(alloc, "pdf_text_decode_failed:{s}", .{@errorName(err)}),
+        };
+    };
+    errdefer analysis.deinit(alloc);
+    return .{
+        .analysis = analysis,
+        .warning = if (analysis.outline_fallback)
+            try alloc.dupe(u8, "embedded_font_outline_unsupported")
+        else
+            null,
+    };
+}
+
 fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig) !Result {
     var parsed = try pdf.reader.Reader.init(alloc, bytes);
     defer parsed.deinit();
@@ -1286,7 +1316,8 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
         const force_ocr = ocr_mode == .always;
         // `.always` forces the OCR attempt, but the merger still needs the
         // embedded candidate in order to retain whichever text is better.
-        const analysis = try parsed.extractPageTextAnalysisAlloc(page_num);
+        const candidate = try extractPdfPageTextBestEffort(alloc, &parsed, page_num);
+        const analysis = candidate.analysis;
         defer {
             for (analysis.runs) |*run| run.deinit(alloc);
             if (analysis.runs.len > 0) alloc.free(analysis.runs);
@@ -1295,10 +1326,7 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
         errdefer alloc.free(text);
         const text_regions: []TextRegion = try extractPdfTextRegionsFromRunsAlloc(alloc, analysis.runs, text);
         errdefer if (text_regions.len > 0) alloc.free(text_regions);
-        const extraction_warning: ?[]u8 = if (analysis.outline_fallback)
-            try alloc.dupe(u8, "embedded_font_outline_unsupported")
-        else
-            null;
+        const extraction_warning: ?[]u8 = candidate.warning;
         errdefer if (extraction_warning) |value| alloc.free(value);
         const page_box = parsed.extractPageBox(page_num) catch null;
         const page_rotation = parsed.extractPageRotation(page_num) catch null;
@@ -1363,7 +1391,8 @@ fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []cons
         const force_ocr = ocr_mode == .always;
         // Keep embedded text even in forced mode so OCR is not a blind
         // replacement for usable born-digital content.
-        const analysis = try parsed.extractPageTextAnalysisAlloc(page_num);
+        const candidate = try extractPdfPageTextBestEffort(alloc, &parsed, page_num);
+        const analysis = candidate.analysis;
         defer {
             for (analysis.runs) |*run| run.deinit(alloc);
             if (analysis.runs.len > 0) alloc.free(analysis.runs);
@@ -1372,10 +1401,7 @@ fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []cons
         errdefer alloc.free(text);
         var text_regions: []TextRegion = try extractPdfTextRegionsFromRunsAlloc(alloc, analysis.runs, text);
         errdefer if (text_regions.len > 0) alloc.free(text_regions);
-        var extraction_warning: ?[]u8 = if (analysis.outline_fallback)
-            try alloc.dupe(u8, "embedded_font_outline_unsupported")
-        else
-            null;
+        var extraction_warning: ?[]u8 = candidate.warning;
         errdefer if (extraction_warning) |value| alloc.free(value);
         const page_text_len = text.len;
         const page_box = parsed.extractPageBox(page_num) catch null;

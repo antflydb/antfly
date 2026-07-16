@@ -1475,6 +1475,11 @@ pub fn build(b: *std.Build) void {
     });
     pdf_mod.addImport("antfly_image", image_mod);
     pdf_mod.addImport("antfly_font", font_mod);
+    if (target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, pdf_mod, target);
+        pdf_mod.linkFramework("CoreFoundation", .{});
+        pdf_mod.linkFramework("CoreGraphics", .{});
+    }
     const wasm_image_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/src/mod.zig"),
         .target = wasm_target,
@@ -2551,6 +2556,11 @@ pub fn build(b: *std.Build) void {
     });
     pdf_test_mod.addImport("antfly_image", image_mod);
     pdf_test_mod.addImport("antfly_font", font_mod);
+    if (target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, pdf_test_mod, target);
+        pdf_test_mod.linkFramework("CoreFoundation", .{});
+        pdf_test_mod.linkFramework("CoreGraphics", .{});
+    }
     const lib_pdf_tests = b.addTest(.{
         .root_module = pdf_test_mod,
     });
@@ -2614,6 +2624,11 @@ pub fn build(b: *std.Build) void {
     });
     pdf_bench_pdf_mod.addImport("antfly_image", pdf_bench_image_mod);
     pdf_bench_pdf_mod.addImport("antfly_font", pdf_bench_font_mod);
+    if (target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, pdf_bench_pdf_mod, target);
+        pdf_bench_pdf_mod.linkFramework("CoreFoundation", .{});
+        pdf_bench_pdf_mod.linkFramework("CoreGraphics", .{});
+    }
     const pdf_bench_mod = b.createModule(.{
         .root_source_file = b.path("lib/pdf/src/pdf_bench.zig"),
         .target = target,
@@ -4206,6 +4221,7 @@ pub fn build(b: *std.Build) void {
             "single embeddings index encoder scopes isolated enrichment failure to one index",
             "empty embeddings index status is ready without dense artifact visibility",
             "derived coverage evaluation is policy exact and observation gated",
+            "strict terminal coverage stops backfill as failed",
             "partial coverage embeddings readiness counts skipped source units",
             "partial coverage embeddings readiness does not mask pending enrichment",
             "index encoders report missing and stale topology groups without probing databases",
@@ -4609,6 +4625,7 @@ pub fn build(b: *std.Build) void {
             "public index config encoders redact coverage incarnation",
             "identical index mutation retries preserve coverage incarnation",
             "derived coverage evaluation is policy exact and observation gated",
+            "strict terminal coverage stops backfill as failed",
             "derived coverage aggregation rejects mixed config observations",
             "index status exposes compact repair state without internal diagnostics",
             "index repair aggregation exposes a waiting shard over rebuilding shards",
