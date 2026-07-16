@@ -13,7 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const builtin = @import("builtin");
+const platform = @import("antfly_platform");
 const ml = @import("ml");
 const build_options = @import("build_options");
 const ops = @import("ops.zig");
@@ -65,6 +65,11 @@ fn metalPagedAttentionKvFormatSupported(format: u32) bool {
     return format <= 4;
 }
 
+fn persistentEmbeddingCacheFits(limit_bytes: usize, current_bytes: usize, table_bytes: usize) bool {
+    if (limit_bytes == 0) return true;
+    return table_bytes <= limit_bytes and current_bytes <= limit_bytes - table_bytes;
+}
+
 test "metal_compute: upload boundary accepts only concrete matching shapes" {
     try std.testing.expect(shouldUploadFloat32ShapeToMetal(6, &.{ 2, 3 }));
     try std.testing.expect(!shouldUploadFloat32ShapeToMetal(5, &.{ 2, 3 }));
@@ -81,6 +86,13 @@ test "metal_compute paged slot attention accepts kernel supported kv formats" {
         try std.testing.expect(metalPagedAttentionKvFormatSupported(format));
     }
     try std.testing.expect(!metalPagedAttentionKvFormatSupported(5));
+}
+
+test "metal_compute persistent embedding cache admission respects backend budget" {
+    try std.testing.expect(persistentEmbeddingCacheFits(0, std.math.maxInt(usize), std.math.maxInt(usize)));
+    try std.testing.expect(persistentEmbeddingCacheFits(100, 60, 40));
+    try std.testing.expect(!persistentEmbeddingCacheFits(100, 61, 40));
+    try std.testing.expect(!persistentEmbeddingCacheFits(100, 0, 101));
 }
 
 fn getenvBool(comptime name: [*:0]const u8) bool {
@@ -294,6 +306,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     const CachedDenseWeight = struct {
         data: []f32,
+        data_owned: bool,
         logical_shape: []i64,
         lazy_entry: ?*gpu_hosted_store_mod.LazyWeightEntry = null,
         runtime_quantized_storage: ?*const QuantizedStorage = null,
@@ -303,7 +316,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         native_dense_mmap_source_bytes: ?[]const u8 = null,
 
         fn deinit(self: *CachedDenseWeight, allocator: std.mem.Allocator) void {
-            if (self.data.len != 0) allocator.free(self.data);
+            if (self.data_owned and self.data.len != 0) allocator.free(self.data);
             allocator.free(self.logical_shape);
             if (self.native_dense_bytes_owned) {
                 if (self.native_dense_bytes) |bytes| allocator.free(bytes);
@@ -497,7 +510,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     allocator: std.mem.Allocator,
     data: *WeightStore,
     provider_impl: *ProviderImpl,
-    owned_native_provider: bool = false,
+    provider_pool_slot: usize,
+    self_owned: bool = false,
+    run_budget: ?*runtime_root.tier.memory.RunBudget = null,
+    embedding_cache_budget_denial_noted: bool = false,
     backend_kv_cache: std.AutoHashMapUnmanaged(BackendKvCacheKey, BackendKvCacheEntry) = .empty,
     deepseek_v4_device_cache: std.AutoHashMapUnmanaged(DeepSeekV4CacheKey, DeepSeekV4DeviceLayerCache) = .empty,
     backend_kv_write_serial: u64 = 0,
@@ -537,36 +553,76 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         run_budget: ?*@import("../runtime/root.zig").tier.memory.RunBudget,
         io: ?std.Io,
     ) !MetalCompute {
-        _ = run_budget;
-        if (io == null and !builtin.is_test) {
-            const provider_impl = try std.heap.c_allocator.create(MetalNativeProvider);
-            errdefer std.heap.c_allocator.destroy(provider_impl);
-            provider_impl.* = try MetalNativeProvider.create();
-            return .{
-                .allocator = allocator,
-                .data = data,
-                .provider_impl = provider_impl,
-                .owned_native_provider = true,
-                .io = io,
-            };
+        const lock_io = try lockMetalNativeProviderPool(data, io);
+        defer data.metal_native_provider_pool_lock.unlock(lock_io);
+
+        var allocated_slots = false;
+        errdefer if (allocated_slots and data.metal_native_provider_active_leases.load(.monotonic) == 0) {
+            data.allocator.free(data.metal_native_provider_slots);
+            data.metal_native_provider_slots = &.{};
+        };
+
+        while (true) {
+            // A no-Io owner may tear an idle pool down while an Io waiter is
+            // asleep. Recreate it after wakeup before scanning for a lease.
+            if (data.metal_native_provider_slots.len == 0) {
+                const slots = try data.allocator.alloc(
+                    gpu_hosted_store_mod.MetalNativeProviderSlot,
+                    @max(data.metal_native_provider_pool_size, 1),
+                );
+                @memset(slots, .{});
+                data.metal_native_provider_slots = slots;
+                allocated_slots = true;
+            }
+            for (data.metal_native_provider_slots, 0..) |*slot, slot_index| {
+                if (slot.in_use) continue;
+                const provider_impl = slot.provider orelse blk: {
+                    const created = try std.heap.c_allocator.create(MetalNativeProvider);
+                    errdefer std.heap.c_allocator.destroy(created);
+                    created.* = try MetalNativeProvider.create();
+                    slot.provider = created;
+                    break :blk created;
+                };
+                slot.in_use = true;
+                const active = data.metal_native_provider_active_leases.fetchAdd(1, .monotonic) + 1;
+                _ = data.metal_native_provider_peak_leases.fetchMax(active, .monotonic);
+                return .{
+                    .allocator = allocator,
+                    .data = data,
+                    .provider_impl = provider_impl,
+                    .provider_pool_slot = slot_index,
+                    .run_budget = run_budget,
+                    .io = io,
+                };
+            }
+
+            const wait_io = io orelse return error.MetalProviderPoolExhausted;
+            _ = data.metal_native_provider_waits.fetchAdd(1, .monotonic);
+            gpu_hosted_store_mod.noteMetalNativeProviderWait();
+            try data.metal_native_provider_available.wait(wait_io, &data.metal_native_provider_pool_lock);
         }
-        const lock_io = metalComputeLockIo(io);
-        data.shared_metal_native_provider_lock.lockUncancelable(lock_io);
-        defer data.shared_metal_native_provider_lock.unlock(lock_io);
-        const provider_impl = data.shared_metal_native_provider orelse blk: {
-            const created = try std.heap.c_allocator.create(MetalNativeProvider);
-            errdefer std.heap.c_allocator.destroy(created);
-            created.* = try MetalNativeProvider.create();
-            data.shared_metal_native_provider = created;
-            break :blk created;
-        };
-        return .{
-            .allocator = allocator,
-            .data = data,
-            .provider_impl = provider_impl,
-            .owned_native_provider = false,
-            .io = io,
-        };
+    }
+
+    fn lockMetalNativeProviderPool(data: *WeightStore, io: ?std.Io) !std.Io {
+        if (io) |lock_io| {
+            data.metal_native_provider_pool_lock.lockUncancelable(lock_io);
+            return lock_io;
+        }
+        // Direct library callers intentionally have no long-lived Io attached.
+        // Spin only for this tiny metadata critical section; pool exhaustion is
+        // checked after the lock is held. The global Io is used solely to make
+        // unlock wake an Io-backed waiter in a mixed direct/server workload.
+        while (!data.metal_native_provider_pool_lock.tryLock()) platform.time.yieldBriefly();
+        return std.Io.Threaded.global_single_threaded.io();
+    }
+
+    fn lockMetalNativeProviderPoolForRelease(data: *WeightStore, io: ?std.Io) std.Io {
+        if (io) |lock_io| {
+            data.metal_native_provider_pool_lock.lockUncancelable(lock_io);
+            return lock_io;
+        }
+        while (!data.metal_native_provider_pool_lock.tryLock()) platform.time.yieldBriefly();
+        return std.Io.Threaded.global_single_threaded.io();
     }
 
     pub fn initWithIo(
@@ -1491,6 +1547,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return buf.data[wrapRepeatedBufferIndex(flat, buf.data.len)];
     }
 
+    const HostF32Weight = struct {
+        data: []f32,
+        owned: bool,
+    };
+
+    fn borrowOrConvertTensorToF32(allocator: std.mem.Allocator, tensor: *const tensor_mod.Tensor) !HostF32Weight {
+        // Host-loaded model weights are immutable. Keep aligned f32 storage in
+        // place and pin its LazyWeightEntry through the cache/buffer lifetime.
+        if (tensor.dtype == .f32) {
+            if (tensor.asFloat32IfAligned()) |aligned| {
+                return .{ .data = @constCast(aligned), .owned = false };
+            }
+        }
+        return .{
+            .data = try convertTensorToOwnedF32(allocator, tensor),
+            .owned = true,
+        };
+    }
+
     fn convertTensorToOwnedF32(allocator: std.mem.Allocator, tensor: *const tensor_mod.Tensor) ![]f32 {
         const count = tensor.elementCount();
         const out = try allocator.alloc(f32, count);
@@ -1927,6 +2002,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self: *MetalCompute,
         full_name: []const u8,
         data: []f32,
+        data_owned: bool,
         logical_shape: []i64,
         lazy_entry: ?*gpu_hosted_store_mod.LazyWeightEntry,
         runtime_quantized_storage: ?*const QuantizedStorage,
@@ -1939,6 +2015,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             errdefer self.allocator.free(gop.key_ptr.*);
             gop.value_ptr.* = .{
                 .data = data,
+                .data_owned = data_owned,
                 .logical_shape = logical_shape,
                 .lazy_entry = lazy_entry,
                 .runtime_quantized_storage = runtime_quantized_storage,
@@ -1948,7 +2025,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .native_dense_mmap_source_bytes = if (native_dense) |native_info| native_info.mmap_source_bytes else null,
             };
         } else {
-            if (data.len != 0) self.allocator.free(data);
+            if (data_owned and data.len != 0) self.allocator.free(data);
             self.allocator.free(logical_shape);
             if (native_dense) |native_info| {
                 if (native_info.owned) self.allocator.free(native_info.bytes);
@@ -2697,10 +2774,42 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.dynamic_linear_slots.deinit(self.allocator);
         self.dynamic_layer_norm_slots.deinit(self.allocator);
         self.dynamic_rms_norm_slots.deinit(self.allocator);
-        if (self.owned_native_provider) {
-            self.provider_impl.deinitOwned();
-            std.heap.c_allocator.destroy(self.provider_impl);
+        const lock_io = lockMetalNativeProviderPoolForRelease(self.data, self.io);
+        const slot = &self.data.metal_native_provider_slots[self.provider_pool_slot];
+        std.debug.assert(slot.in_use and slot.provider == self.provider_impl);
+        const memory = metal_runtime.runtimeMemorySnapshot(self.provider_impl.raw_decode_runtime);
+        if (memory.embedding_bytes >= slot.embedding_cache_bytes) {
+            _ = self.data.metal_native_provider_embedding_cache_bytes.fetchAdd(memory.embedding_bytes - slot.embedding_cache_bytes, .monotonic);
+        } else {
+            _ = self.data.metal_native_provider_embedding_cache_bytes.fetchSub(slot.embedding_cache_bytes - memory.embedding_bytes, .monotonic);
         }
+        if (memory.embedding_logical_bytes >= slot.embedding_cache_logical_bytes) {
+            _ = self.data.metal_native_provider_embedding_cache_logical_bytes.fetchAdd(memory.embedding_logical_bytes - slot.embedding_cache_logical_bytes, .monotonic);
+        } else {
+            _ = self.data.metal_native_provider_embedding_cache_logical_bytes.fetchSub(slot.embedding_cache_logical_bytes - memory.embedding_logical_bytes, .monotonic);
+        }
+        slot.embedding_cache_bytes = memory.embedding_bytes;
+        slot.embedding_cache_logical_bytes = memory.embedding_logical_bytes;
+        slot.in_use = false;
+        const previous_active = self.data.metal_native_provider_active_leases.fetchSub(1, .monotonic);
+        std.debug.assert(previous_active > 0);
+        if (self.io == null and previous_active == 1) {
+            // No-Io callers predate shared provider reuse and often own only a
+            // stack WeightStore. Tear the idle pool down with the last lease.
+            for (self.data.metal_native_provider_slots) |*idle_slot| {
+                if (idle_slot.provider) |provider| {
+                    provider.deinitOwned();
+                    std.heap.c_allocator.destroy(provider);
+                    idle_slot.provider = null;
+                }
+            }
+            self.data.allocator.free(self.data.metal_native_provider_slots);
+            self.data.metal_native_provider_slots = &.{};
+            self.data.metal_native_provider_embedding_cache_bytes.store(0, .monotonic);
+            self.data.metal_native_provider_embedding_cache_logical_bytes.store(0, .monotonic);
+        }
+        self.data.metal_native_provider_available.signal(lock_io);
+        self.data.metal_native_provider_pool_lock.unlock(lock_io);
     }
 
     fn clearActivePrefillFramePlan(self: *MetalCompute) void {
@@ -2799,7 +2908,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn deinitBackendOp(ctx: *anyopaque) void {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const allocator = self.allocator;
+        const self_owned = self.self_owned;
         self.deinit();
+        if (self_owned) allocator.destroy(self);
     }
 
     fn getIoOp(ctx: *anyopaque) ?std.Io {
@@ -3335,9 +3447,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn freeOp(ctx: *anyopaque, tensor: CT) void {
         _ = ctx;
         const buf = toBuf(tensor);
-        if (buf.lazy_entry) |entry| {
-            if (entry.pin_count > 0) entry.pin_count -= 1;
-        }
         releaseOwnedHostData(buf);
         if (buf.logical_shape) |shape| buf.allocator.free(shape);
         if (buf.view_strides) |strides| buf.allocator.free(strides);
@@ -7374,6 +7483,45 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return denseBuf(self.allocator, output, true, &shape);
     }
 
+    fn persistentEmbeddingCacheKey(self: *MetalCompute, weight_buf: *const Buf, rows: usize, dim: usize) ?usize {
+        const entry = weight_buf.lazy_entry orelse return null;
+        // Only one provider per model may retain embedding tables. This keeps
+        // concurrent pool slots from each admitting a full copy against their
+        // own request-local budget. Session.run has no request budget, so the
+        // primary provider falls back to its immutable model cache budget.
+        if (self.provider_pool_slot != 0) return null;
+        const table_bytes = std.math.mul(usize, rows, dim) catch return null;
+        const table_f32_bytes = std.math.mul(usize, table_bytes, @sizeOf(f32)) catch return null;
+        const cache_key = @intFromPtr(entry);
+        if (metal_runtime.decoderRuntimeEmbeddingCacheContains(
+            self.provider_impl,
+            cache_key,
+            rows,
+            dim,
+            table_f32_bytes,
+        )) return cache_key;
+
+        const limit_bytes = if (self.run_budget) |budget|
+            budget.limits.backend_limit_bytes
+        else if (self.data.tier_cache) |tier_cache|
+            tier_cache.budget.backend_limit_bytes
+        else
+            return null;
+        if (limit_bytes == 0) return cache_key;
+        const snapshot = metal_runtime.runtimeMemorySnapshot(self.provider_impl.raw_decode_runtime);
+        const current_bytes = std.math.cast(usize, snapshot.total_bytes) orelse limit_bytes;
+        if (persistentEmbeddingCacheFits(limit_bytes, current_bytes, table_f32_bytes)) return cache_key;
+
+        if (!self.embedding_cache_budget_denial_noted) {
+            if (self.run_budget) |budget| {
+                const reported_current = @min(current_bytes, std.math.maxInt(usize) - table_f32_bytes);
+                budget.noteSharedCacheDenial(.backend, table_f32_bytes, reported_current, limit_bytes);
+            }
+            self.embedding_cache_budget_denial_noted = true;
+        }
+        return null;
+    }
+
     fn embeddingLookupOp(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const weight_buf = toBuf(weight);
@@ -7395,6 +7543,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .ids = ids,
                 .total = total,
                 .dim = dim,
+                .cache_key = self.persistentEmbeddingCacheKey(weight_buf, rows, dim),
             })) |tensor| {
                 return self.ctFromOwnedMetalTensor(tensor);
             }
@@ -14799,8 +14948,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
             if (preferHostLoadedWeightsDebug()) {
                 if (entry.host_loaded) |*loaded| {
-                    const host = try convertTensorToOwnedF32(self.allocator, &loaded.tensor);
-                    errdefer self.allocator.free(host);
+                    const host = try borrowOrConvertTensorToF32(self.allocator, &loaded.tensor);
+                    errdefer if (host.owned) self.allocator.free(host.data);
                     const shape = try self.logicalShapeFromTensor(&loaded.tensor);
                     errdefer self.allocator.free(shape);
                     const runtime_storage = if (entry.quantized_storage) |*storage| storage else null;
@@ -14809,7 +14958,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         if (native_info.owned) self.allocator.free(native_info.bytes);
                     };
                     const native_dense_dtype = if (native_dense) |native_info| native_info.dtype else null;
-                    const cached = try self.getOrInsertCachedDenseWeight(full_name, host, shape, entry, runtime_storage, native_dense, native_dense_dtype);
+                    const cached = try self.getOrInsertCachedDenseWeight(full_name, host.data, host.owned, shape, entry, runtime_storage, native_dense, native_dense_dtype);
                     return self.cachedDenseWeightBuf(cached);
                 }
             }
@@ -14826,7 +14975,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         );
                         return error.UnsupportedQuantFormatForMetalOnly;
                     }
-                    entry.pin_count += 1;
                     const shape = try self.allocator.dupe(i64, storage.shape);
                     errdefer self.allocator.free(shape);
                     return self.makeWeightBuf(&.{}, false, shape, entry, storage, null);
@@ -14842,12 +14990,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     if (native_info.owned) self.allocator.free(native_info.bytes);
                 };
                 const native_dense_dtype = if (native_dense) |native_info| native_info.dtype else null;
-                const host = if (native_dense != null)
-                    @as([]f32, &.{})
+                const host: HostF32Weight = if (native_dense != null)
+                    .{ .data = @as([]f32, &.{}), .owned = false }
                 else
-                    try convertTensorToOwnedF32(self.allocator, &loaded.tensor);
-                errdefer if (native_dense == null) self.allocator.free(host);
-                const cached = try self.getOrInsertCachedDenseWeight(full_name, host, shape, entry, runtime_storage, native_dense, native_dense_dtype);
+                    try borrowOrConvertTensorToF32(self.allocator, &loaded.tensor);
+                errdefer if (host.owned) self.allocator.free(host.data);
+                const cached = try self.getOrInsertCachedDenseWeight(full_name, host.data, host.owned, shape, entry, runtime_storage, native_dense, native_dense_dtype);
                 return self.cachedDenseWeightBuf(cached);
             }
         }
@@ -15025,11 +15173,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         var weight_mt = try self.ownedMetalTensorFromCt(weight);
         defer weight_mt.deinit();
+        if (weight_mt.ndim() != 2 or weight_mt.dim(0) <= 0 or
+            @as(usize, @intCast(weight_mt.dim(1))) != dim)
+        {
+            return error.InvalidTensorShape;
+        }
+        const rows: usize = @intCast(weight_mt.dim(0));
         var embedding = (try metal_runtime.decoderRuntimeEmbeddingLookup(self.provider_impl, .{
             .weight = weight_mt,
             .ids = token_ids,
             .total = token_ids.len,
             .dim = dim,
+            .cache_key = self.persistentEmbeddingCacheKey(weight_buf, rows, dim),
         })) orelse return null;
         errdefer embedding.deinit();
         return scaleDecodeTensor(self, embedding, scale);
@@ -19930,21 +20085,27 @@ pub fn deinitPackedExpertViews(data: *WeightStore, allocator: std.mem.Allocator)
     gpu_hosted_store_mod.deinitPackedExpertViews(data, allocator);
 }
 
-fn metalComputeLockIo(io: ?std.Io) std.Io {
-    return io orelse if (builtin.is_test) std.testing.io else unreachable;
-}
-
 pub fn deinitSharedNativeProvider(data: *WeightStore) void {
     if (comptime !build_options.enable_metal) return;
-    if (!data.shared_metal_native_provider_lock.tryLock()) {
+    if (!data.metal_native_provider_pool_lock.tryLock()) {
         std.debug.assert(false);
         return;
     }
-    defer data.shared_metal_native_provider_lock.unlock(std.Io.failing);
-    const provider = data.shared_metal_native_provider orelse return;
-    provider.deinitOwned();
-    std.heap.c_allocator.destroy(provider);
-    data.shared_metal_native_provider = null;
+    defer data.metal_native_provider_pool_lock.unlock(std.Io.Threaded.global_single_threaded.io());
+    for (data.metal_native_provider_slots) |*slot| {
+        std.debug.assert(!slot.in_use);
+        if (slot.provider) |provider| {
+            provider.deinitOwned();
+            std.heap.c_allocator.destroy(provider);
+        }
+    }
+    if (data.metal_native_provider_slots.len != 0) {
+        data.allocator.free(data.metal_native_provider_slots);
+        data.metal_native_provider_slots = &.{};
+    }
+    data.metal_native_provider_active_leases.store(0, .monotonic);
+    data.metal_native_provider_embedding_cache_bytes.store(0, .monotonic);
+    data.metal_native_provider_embedding_cache_logical_bytes.store(0, .monotonic);
 }
 
 fn testMetalWeightStoreInit(allocator: std.mem.Allocator) WeightStore {
@@ -19955,23 +20116,163 @@ fn testMetalWeightStoreInit(allocator: std.mem.Allocator) WeightStore {
     };
 }
 
-test "metal_compute: native provider is shared across backend lifetimes" {
+test "metal_compute: aligned f32 model weights are borrowed without copying" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const shape = [_]i64{ 2, 2 };
+    const values = [_]f32{ 1, 2, 3, 4 };
+    var tensor = try tensor_mod.Tensor.initFloat32(allocator, "weight", &shape, &values);
+    defer tensor.deinit();
+
+    const host = try MetalCompute.borrowOrConvertTensorToF32(allocator, &tensor);
+    defer if (host.owned) allocator.free(host.data);
+    try std.testing.expect(!host.owned);
+    try std.testing.expectEqual(@intFromPtr(tensor.asFloat32().ptr), @intFromPtr(host.data.ptr));
+}
+
+test "metal_compute: warm provider is reused without sharing overlapping backends" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var metal_ws = testMetalWeightStoreInit(allocator);
+    gpu_hosted_store_mod.setMetalNativeProviderPoolSize(&metal_ws, 2);
+    defer {
+        deinitSharedNativeProvider(&metal_ws);
+        metal_ws.lazy_weights.deinit(allocator);
+    }
+
+    var first = try MetalCompute.initWithIo(allocator, &metal_ws, null, std.testing.io);
+    var first_live = true;
+    defer if (first_live) first.deinit();
+    const first_provider = @intFromPtr(first.provider_impl);
+
+    var overlapping = try MetalCompute.initWithIo(allocator, &metal_ws, null, std.testing.io);
+    defer overlapping.deinit();
+    try std.testing.expect(first.provider_impl != overlapping.provider_impl);
+    var stats = gpu_hosted_store_mod.metalNativeProviderPoolStats(&metal_ws);
+    try std.testing.expectEqual(@as(usize, 2), stats.capacity);
+    try std.testing.expectEqual(@as(usize, 2), stats.active_leases);
+    try std.testing.expectEqual(@as(usize, 2), stats.peak_leases);
+    try std.testing.expectEqual(@as(usize, 0), stats.waits_total);
+
+    first.deinit();
+    first_live = false;
+
+    var reused = try MetalCompute.initWithIo(allocator, &metal_ws, null, std.testing.io);
+    defer reused.deinit();
+    try std.testing.expectEqual(first_provider, @intFromPtr(reused.provider_impl));
+    stats = gpu_hosted_store_mod.metalNativeProviderPoolStats(&metal_ws);
+    try std.testing.expectEqual(@as(usize, 2), stats.active_leases);
+    try std.testing.expectEqual(@as(usize, 2), stats.peak_leases);
+}
+
+test "metal_compute: no-Io provider pool fails closed when full" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    gpu_hosted_store_mod.setMetalNativeProviderPoolSize(&metal_ws, 1);
     defer {
         deinitSharedNativeProvider(&metal_ws);
         metal_ws.lazy_weights.deinit(allocator);
     }
 
     var first = try MetalCompute.init(allocator, &metal_ws, null);
-    const first_provider = first.provider_impl;
-    try std.testing.expect(metal_ws.shared_metal_native_provider != null);
-    first.deinit();
+    defer first.deinit();
+    try std.testing.expectError(error.MetalProviderPoolExhausted, MetalCompute.init(allocator, &metal_ws, null));
+}
 
-    var second = try MetalCompute.init(allocator, &metal_ws, null);
+test "metal_compute: f32 embedding cache uses loaded weight identity without run budget" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const metal_runtime_mod = @import("../backends/metal_runtime.zig");
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    metal_ws.tier_cache = runtime_root.tier.cache.SharedCache.init(.{
+        .backend_limit_bytes = std.math.maxInt(usize),
+    });
+    defer {
+        deinitSharedNativeProvider(&metal_ws);
+        metal_ws.lazy_weights.deinit(allocator);
+    }
+
+    const weight_data = [_]f32{
+        1.0, 2.0,  3.0,  4.0,
+        5.0, 6.0,  7.0,  8.0,
+        9.0, 10.0, 11.0, 12.0,
+    };
+    const shape = [_]i32{ 3, 4 };
+    const ids = [_]i64{ 2, 0 };
+    const expected = [_]f32{
+        9.0, 10.0, 11.0, 12.0,
+        1.0, 2.0,  3.0,  4.0,
+    };
+    var cache_identity: gpu_hosted_store_mod.LazyWeightEntry = .{
+        .tensor_ref = .{ .name = "test.embedding.weight" },
+    };
+    const first_data = try allocator.dupe(f32, &weight_data);
+    defer allocator.free(first_data);
+    var first_provider: usize = 0;
+    var first_snapshot: metal_runtime_mod.RawRuntimeMemoryStats = undefined;
+    {
+        // Session.run, including the production embed and warm paths, creates
+        // its Metal backend without a request-local RunBudget.
+        var first = try MetalCompute.initWithIo(allocator, &metal_ws, null, std.testing.io);
+        defer first.deinit();
+        first_provider = @intFromPtr(first.provider_impl);
+
+        const first_weight = try MetalCompute.denseBuf(allocator, first_data, false, &shape);
+        MetalCompute.toBuf(first_weight).lazy_entry = &cache_identity;
+        var first_cb = first.computeBackend();
+        defer first_cb.free(first_weight);
+        const first_output = try first_cb.embeddingLookup(first_weight, &ids, ids.len, 4);
+        defer first_cb.free(first_output);
+        const first_values = try first_cb.toFloat32(first_output, allocator);
+        defer allocator.free(first_values);
+        try std.testing.expectEqualSlices(f32, &expected, first_values);
+
+        const runtime = first.provider_impl.raw_decode_runtime orelse return error.SkipZigTest;
+        first_snapshot = metal_runtime_mod.runtimeMemorySnapshot(runtime);
+    }
+    try std.testing.expect(first_snapshot.embedding_bytes > 0);
+
+    var run_budget = runtime_root.tier.memory.RunBudget.init(.{});
+    run_budget.limits.backend_limit_bytes = 1;
+    var second = try MetalCompute.initWithIo(allocator, &metal_ws, &run_budget, std.testing.io);
     defer second.deinit();
-    try std.testing.expectEqual(first_provider, second.provider_impl);
+    try std.testing.expectEqual(first_provider, @intFromPtr(second.provider_impl));
+    const second_data = try allocator.dupe(f32, &weight_data);
+    const second_weight = try MetalCompute.denseBuf(allocator, second_data, true, &shape);
+    MetalCompute.toBuf(second_weight).lazy_entry = &cache_identity;
+    var second_cb = second.computeBackend();
+    defer second_cb.free(second_weight);
+    try std.testing.expect(@intFromPtr(first_data.ptr) != @intFromPtr(second_data.ptr));
+    const second_output = try second_cb.embeddingLookup(second_weight, &ids, ids.len, 4);
+    defer second_cb.free(second_output);
+    const second_values = try second_cb.toFloat32(second_output, allocator);
+    defer allocator.free(second_values);
+    try std.testing.expectEqualSlices(f32, &expected, second_values);
+
+    const runtime = second.provider_impl.raw_decode_runtime orelse return error.SkipZigTest;
+    const second_snapshot = metal_runtime_mod.runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(first_snapshot.embedding_bytes, second_snapshot.embedding_bytes);
+    try std.testing.expectEqual(first_snapshot.embedding_logical_bytes, second_snapshot.embedding_logical_bytes);
+    try std.testing.expectEqual(first_snapshot.embedding_cache_hits + 1, second_snapshot.embedding_cache_hits);
+
+    // A different decode table must take the non-persistent path under the
+    // tight budget above.
+    var denied_identity: gpu_hosted_store_mod.LazyWeightEntry = .{
+        .tensor_ref = .{ .name = "test.embedding.denied.weight" },
+    };
+    const denied_data = try allocator.dupe(f32, &weight_data);
+    const denied_weight = try MetalCompute.denseBuf(allocator, denied_data, true, &shape);
+    MetalCompute.toBuf(denied_weight).lazy_entry = &denied_identity;
+    defer second_cb.free(denied_weight);
+    var denied_output = (try second.lookupDecodeEmbeddingTensor(denied_weight, &ids, 4, 1.0)) orelse
+        return error.UnsupportedTensorType;
+    defer denied_output.deinit();
+    const denied_snapshot = metal_runtime_mod.runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(second_snapshot.embedding_bytes, denied_snapshot.embedding_bytes);
+    try std.testing.expectEqual(second_snapshot.embedding_logical_bytes, denied_snapshot.embedding_logical_bytes);
 }
 
 test "metal_compute: paged decode attention matches native on f32 cache" {

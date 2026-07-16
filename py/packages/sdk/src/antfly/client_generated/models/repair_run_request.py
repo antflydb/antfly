@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.artifact_repair_kind import ArtifactRepairKind
+from ..models.repair_run_request_control import RepairRunRequestControl
 from ..models.repair_target import RepairTarget
 from ..types import UNSET, Unset
 
@@ -22,8 +23,13 @@ class RepairRunRequest:
         kind (ArtifactRepairKind | Unset): Kind of stored artifact tracked by the repair queue.
         index (str | Unset): Restrict repair attempts to one index name.
         cursor (str | Unset): Opaque cursor returned by a prior repair response.
-        force (bool | Unset): Force a named index rebuild even when no repair debt is currently recorded. Only applies
-            to target=index. Default: False.
+        force (bool | Unset): Force one named-index replacement generation even when no repair debt is currently
+            recorded. The force is dispatched once across the initial bounded group traversal; later convergence passes only
+            observe that generation. Only applies to target=index. Default: False.
+        control (RepairRunRequestControl | Unset): Applies one control to an existing named index repair. Requires
+            target=index and index; cannot be combined with force, kind, or cursor.
+        repair_id (str | Unset): Optional opaque generation fence for a repair control. A stale value is rejected
+            instead of affecting a newer repair.
         limit (int | Unset): Maximum artifact repair records to attempt. For target=index, any positive value permits
             one named index repair. Default: 100.
     """
@@ -33,6 +39,8 @@ class RepairRunRequest:
     index: str | Unset = UNSET
     cursor: str | Unset = UNSET
     force: bool | Unset = False
+    control: RepairRunRequestControl | Unset = UNSET
+    repair_id: str | Unset = UNSET
     limit: int | Unset = 100
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -51,6 +59,12 @@ class RepairRunRequest:
 
         force = self.force
 
+        control: str | Unset = UNSET
+        if not isinstance(self.control, Unset):
+            control = self.control.value
+
+        repair_id = self.repair_id
+
         limit = self.limit
 
         field_dict: dict[str, Any] = {}
@@ -66,6 +80,10 @@ class RepairRunRequest:
             field_dict["cursor"] = cursor
         if force is not UNSET:
             field_dict["force"] = force
+        if control is not UNSET:
+            field_dict["control"] = control
+        if repair_id is not UNSET:
+            field_dict["repair_id"] = repair_id
         if limit is not UNSET:
             field_dict["limit"] = limit
 
@@ -94,6 +112,15 @@ class RepairRunRequest:
 
         force = d.pop("force", UNSET)
 
+        _control = d.pop("control", UNSET)
+        control: RepairRunRequestControl | Unset
+        if isinstance(_control, Unset):
+            control = UNSET
+        else:
+            control = RepairRunRequestControl(_control)
+
+        repair_id = d.pop("repair_id", UNSET)
+
         limit = d.pop("limit", UNSET)
 
         repair_run_request = cls(
@@ -102,6 +129,8 @@ class RepairRunRequest:
             index=index,
             cursor=cursor,
             force=force,
+            control=control,
+            repair_id=repair_id,
             limit=limit,
         )
 

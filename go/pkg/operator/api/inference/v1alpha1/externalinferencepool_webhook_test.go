@@ -32,7 +32,7 @@ func TestExternalInferencePoolValidationAcceptsExternalServices(t *testing.T) {
 					HealthPort:       DefaultInferenceHealthPort,
 				},
 			},
-			Models: []ModelSpec{{Name: "gemma"}},
+			Models: []ModelSpec{{Name: "gemma", Kind: ModelKindGenerator}},
 		},
 	}
 

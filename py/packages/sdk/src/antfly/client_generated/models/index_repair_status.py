@@ -6,55 +6,56 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..types import UNSET, Unset
+from ..models.index_repair_status_state import IndexRepairStatusState
 
-T = TypeVar("T", bound="InferenceError")
+T = TypeVar("T", bound="IndexRepairStatus")
 
 
 @_attrs_define
-class InferenceError:
-    """
-    Attributes:
-        error (str): Stable machine-readable error code when available; legacy responses may contain a human-readable
-            error string.
-        message (str | Unset): Optional human-readable detail for the error.
+class IndexRepairStatus:
+    """Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and
+    metrics.
+
+        Attributes:
+            state (IndexRepairStatusState): Stable repair state. Internal state-machine phases are intentionally not exposed
+                here.
+            action_required (bool): Whether an operator must resume, retry, reconfigure, or drop the affected index.
     """
 
-    error: str
-    message: str | Unset = UNSET
+    state: IndexRepairStatusState
+    action_required: bool
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        error = self.error
+        state = self.state.value
 
-        message = self.message
+        action_required = self.action_required
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
-                "error": error,
+                "state": state,
+                "action_required": action_required,
             }
         )
-        if message is not UNSET:
-            field_dict["message"] = message
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        error = d.pop("error")
+        state = IndexRepairStatusState(d.pop("state"))
 
-        message = d.pop("message", UNSET)
+        action_required = d.pop("action_required")
 
-        inference_error = cls(
-            error=error,
-            message=message,
+        index_repair_status = cls(
+            state=state,
+            action_required=action_required,
         )
 
-        inference_error.additional_properties = d
-        return inference_error
+        index_repair_status.additional_properties = d
+        return index_repair_status
 
     @property
     def additional_keys(self) -> list[str]:
