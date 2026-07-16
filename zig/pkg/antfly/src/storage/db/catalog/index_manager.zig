@@ -1910,16 +1910,24 @@ pub const IndexManager = struct {
     pub fn markRepairUnavailable(self: *IndexManager, name: []const u8) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
+        try self.markRepairUnavailableNoLock(name);
+    }
+
+    fn markRepairUnavailableNoLock(self: *IndexManager, name: []const u8) !void {
         if (self.repair_unavailable_indexes.contains(name)) return;
         const owned = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(owned);
         try self.repair_unavailable_indexes.put(self.alloc, owned, {});
     }
 
+    fn clearRepairUnavailableNoLock(self: *IndexManager, name: []const u8) void {
+        if (self.repair_unavailable_indexes.fetchRemove(name)) |entry| self.alloc.free(entry.key);
+    }
+
     pub fn clearRepairUnavailable(self: *IndexManager, name: []const u8) void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        if (self.repair_unavailable_indexes.fetchRemove(name)) |entry| self.alloc.free(entry.key);
+        self.clearRepairUnavailableNoLock(name);
     }
 
     pub fn repairUnavailable(self: *IndexManager, name: []const u8) bool {
@@ -3161,10 +3169,25 @@ pub const IndexManager = struct {
     }
 
     pub fn add(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
+        return try self.addWithReadiness(store, cfg, false);
+    }
+
+    /// Publishes a new index behind the same availability barrier used by
+    /// shadow repair. The barrier is installed while the catalog write lock is
+    /// held, so no query can observe the index between publication and the
+    /// caller beginning its bootstrap/replay work.
+    pub fn addRebuilding(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
+        return try self.addWithReadiness(store, cfg, true);
+    }
+
+    fn addWithReadiness(self: *IndexManager, store: anytype, cfg: types.IndexConfig, rebuilding: bool) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         self.bindPrimaryStore(store);
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
+
+        if (rebuilding) try self.markRepairUnavailableNoLock(cfg.name);
+        errdefer if (rebuilding) self.clearRepairUnavailableNoLock(cfg.name);
 
         var stored_cfg = try indexConfigWithCoverageGeneration(self.alloc, cfg);
         defer stored_cfg.deinit(self.alloc);
@@ -3498,6 +3521,7 @@ pub const IndexManager = struct {
             // subsequent recreate starts clean.
             self.dropFailedIndexLoad(name);
             self.dropIndexLoadStateNoLock(name);
+            self.clearRepairUnavailableNoLock(name);
             return true;
         }
         for (self.text_indexes.items, 0..) |*entry, i| {
@@ -3512,6 +3536,7 @@ pub const IndexManager = struct {
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 self.deleteIndexRootForName(name, index_path);
+                self.clearRepairUnavailableNoLock(name);
                 return true;
             }
         }
@@ -3539,6 +3564,7 @@ pub const IndexManager = struct {
                 try self.deleteDenseIndexMetadata(store, name);
                 try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
                 self.deleteIndexRootForName(name, index_path);
+                self.clearRepairUnavailableNoLock(name);
                 return true;
             }
         }
@@ -3565,6 +3591,7 @@ pub const IndexManager = struct {
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
                 self.deleteIndexRootForName(name, index_path);
+                self.clearRepairUnavailableNoLock(name);
                 return true;
             }
         }
@@ -3580,6 +3607,7 @@ pub const IndexManager = struct {
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 self.deleteIndexRootForName(name, index_path);
+                self.clearRepairUnavailableNoLock(name);
                 return true;
             }
         }
@@ -3595,6 +3623,7 @@ pub const IndexManager = struct {
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 self.deleteIndexRootForName(name, index_path);
+                self.clearRepairUnavailableNoLock(name);
                 return true;
             }
         }

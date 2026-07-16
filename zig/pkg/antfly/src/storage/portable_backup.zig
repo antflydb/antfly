@@ -1531,14 +1531,30 @@ fn graphArtifactValueFromPortableEdgeValueAlloc(alloc: Allocator, value: []const
         if (header.kind == .graph_edge) return try alloc.dupe(u8, value);
     } else |_| {}
 
-    if (value.len >= 24) {
-        const weight = @as(f64, @bitCast(std.mem.readInt(u64, value[0..][0..8], .little)));
-        const created_at = std.mem.readInt(u64, value[8..][0..8], .little);
-        const updated_at = std.mem.readInt(u64, value[16..][0..8], .little);
-        return try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 0, weight, created_at, updated_at, value[24..]);
-    }
+    // A raw graph-index value has no owning coverage generation. Guessing one
+    // (historically zero) makes the restore appear successful while replay
+    // silently discards the edge as stale. This backup version intentionally
+    // has no legacy graph-value compatibility: fail closed and require a fresh
+    // backup produced from generation-bearing graph artifacts.
+    return error.UnsupportedPortableGraphEdgeValue;
+}
 
-    return try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 0, 1.0, 0, 0, value);
+test "portable graph edge values require a coverage generation" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.UnsupportedPortableGraphEdgeValue,
+        graphArtifactValueFromPortableEdgeValueAlloc(alloc, "legacy raw edge"),
+    );
+
+    const encoded = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 73, 0.75, 11, 12, "{\"source\":\"test\"}");
+    defer alloc.free(encoded);
+    const restored = try graphArtifactValueFromPortableEdgeValueAlloc(alloc, encoded);
+    defer alloc.free(restored);
+    var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, restored);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 73), decoded.generation);
+    try std.testing.expectEqual(@as(f64, 0.75), decoded.weight);
+    try std.testing.expectEqualStrings("{\"source\":\"test\"}", decoded.metadata_json);
 }
 
 /// Decode an edge batch payload (mirrors backup_codec.encodeEdgeBatch).

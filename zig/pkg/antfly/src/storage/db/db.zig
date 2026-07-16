@@ -800,6 +800,7 @@ const artifact_repair_summary_dirty_marker = "dirty";
 const dense_catch_up_startup_max_records_default: usize = 32;
 const dense_catch_up_startup_max_chunk_bytes_default: u64 = 512 * 1024;
 const graph_repair_rebuild_batch_size: usize = 2048;
+const graph_generation_cleanup_batch_size: usize = 1024;
 var test_graph_repair_stream_flushes: std.atomic.Value(u64) = .init(0);
 var test_dense_repair_rebuild_batch_size: ?usize = null;
 var test_index_repair_catch_up_max_records_per_window: ?usize = null;
@@ -2990,6 +2991,14 @@ pub const DB = struct {
     index_repair_replay_pinned: std.atomic.Value(bool) = .init(false),
     index_repair_state_corrupt: std.atomic.Value(bool) = .init(false),
     published_dense_searches: std.atomic.Value(u32) = .init(0),
+    // Serializes catalog mutations whose lifecycle extends beyond the apply
+    // lock (runtime quiescing, corpus bootstrap, replay, and deferred cleanup).
+    // The apply lock remains short-lived; unrelated document writes can
+    // continue while one structural operation owns this mutex.
+    index_structure_mutex: std.atomic.Mutex = .unlocked,
+    graph_generation_cleanup_mutex: std.atomic.Mutex = .unlocked,
+    graph_generation_cleanup_state: std.atomic.Value(u8) = .init(0),
+    pending_graph_generation_cleanup: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(u64)) = .empty,
     index_repair_mutex: std.atomic.Mutex = .unlocked,
     active_index_repairs: std.StringHashMapUnmanaged(bool) = .{},
     shadow_index_repair_hook: ?@This().ShadowIndexRepairHook = null,
@@ -3603,6 +3612,8 @@ pub const DB = struct {
 
     pub fn reconfigureEnrichmentRuntime(self: *DB, cfg: enrichment_runtime_mod.Config) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockAtomic(&self.index_structure_mutex);
+        defer self.index_structure_mutex.unlock();
 
         var owned_cfg = cfg;
         var cfg_owned = true;
@@ -4001,6 +4012,7 @@ pub const DB = struct {
         }
         self.backend_runtime.durable_jobs.closeOwner(self.repair_cleanup_owner_id);
         self.backend_runtime.durable_jobs.drainOwner(self.repair_cleanup_owner_id);
+        self.deinitPendingGraphGenerationCleanup();
         self.core.deinit();
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         self.async_context.deinit(self.runtime_alloc);
@@ -5752,6 +5764,315 @@ pub const DB = struct {
         var it = self.active_index_repairs.keyIterator();
         while (it.next()) |key_ptr| self.alloc.free(@constCast(key_ptr.*));
         self.active_index_repairs.clearRetainingCapacity();
+    }
+
+    const RetiredGraphGeneration = struct {
+        index_name: []u8,
+        generation: u64,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            alloc.free(self.index_name);
+            self.* = undefined;
+        }
+    };
+
+    fn snapshotPendingGraphGenerationCleanup(self: *DB, alloc: Allocator) ![]RetiredGraphGeneration {
+        lockAtomic(&self.graph_generation_cleanup_mutex);
+        defer self.graph_generation_cleanup_mutex.unlock();
+
+        var count: usize = 0;
+        var values = self.pending_graph_generation_cleanup.valueIterator();
+        while (values.next()) |generations| count += generations.items.len;
+        const pending = try alloc.alloc(RetiredGraphGeneration, count);
+        var initialized: usize = 0;
+        errdefer {
+            for (pending[0..initialized]) |*entry| entry.deinit(alloc);
+            alloc.free(pending);
+        }
+        var it = self.pending_graph_generation_cleanup.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items) |generation| {
+                pending[initialized] = .{
+                    .index_name = try alloc.dupe(u8, entry.key_ptr.*),
+                    .generation = generation,
+                };
+                initialized += 1;
+            }
+        }
+        std.mem.sort(RetiredGraphGeneration, pending, {}, struct {
+            fn lessThan(_: void, a: RetiredGraphGeneration, b: RetiredGraphGeneration) bool {
+                return switch (std.mem.order(u8, a.index_name, b.index_name)) {
+                    .lt => true,
+                    .gt => false,
+                    .eq => a.generation < b.generation,
+                };
+            }
+        }.lessThan);
+        return pending;
+    }
+
+    fn removeCompletedGraphGenerationCleanup(self: *DB, completed: []const RetiredGraphGeneration) void {
+        lockAtomic(&self.graph_generation_cleanup_mutex);
+        defer self.graph_generation_cleanup_mutex.unlock();
+
+        for (completed) |item| {
+            const generations = self.pending_graph_generation_cleanup.getPtr(item.index_name) orelse continue;
+            for (generations.items, 0..) |generation, i| {
+                if (generation != item.generation) continue;
+                _ = generations.orderedRemove(i);
+                break;
+            }
+            if (generations.items.len == 0) {
+                if (self.pending_graph_generation_cleanup.fetchRemove(item.index_name)) |removed| {
+                    var values = removed.value;
+                    values.deinit(self.alloc);
+                    self.alloc.free(@constCast(removed.key));
+                }
+            }
+        }
+    }
+
+    fn hasPendingGraphGenerationCleanup(self: *DB) bool {
+        lockAtomic(&self.graph_generation_cleanup_mutex);
+        defer self.graph_generation_cleanup_mutex.unlock();
+        return self.pending_graph_generation_cleanup.count() != 0;
+    }
+
+    fn deinitPendingGraphGenerationCleanup(self: *DB) void {
+        lockAtomic(&self.graph_generation_cleanup_mutex);
+        defer self.graph_generation_cleanup_mutex.unlock();
+        var it = self.pending_graph_generation_cleanup.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(self.alloc);
+            self.alloc.free(@constCast(entry.key_ptr.*));
+        }
+        self.pending_graph_generation_cleanup.deinit(self.alloc);
+    }
+
+    fn graphGenerationIsRetired(retired: []const RetiredGraphGeneration, index_name: []const u8, generation: u64) bool {
+        var lower: usize = 0;
+        var upper: usize = retired.len;
+        while (lower < upper) {
+            const middle = lower + (upper - lower) / 2;
+            const item = retired[middle];
+            switch (std.mem.order(u8, item.index_name, index_name)) {
+                .lt => lower = middle + 1,
+                .gt => upper = middle,
+                .eq => {
+                    if (item.generation < generation) {
+                        lower = middle + 1;
+                    } else if (item.generation > generation) {
+                        upper = middle;
+                    } else {
+                        return true;
+                    }
+                },
+            }
+        }
+        return false;
+    }
+
+    fn graphAssetStateIndexNameAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
+        if (!internal_keys.isInternalUserKey(key)) return null;
+        const doc_term = internal_keys.findComponentTerminator(key, 1) orelse return null;
+        var pos = doc_term + 2;
+        if (pos >= key.len or key[pos] != internal_keys.graph_asset_state_kind) return null;
+        pos += 1;
+        const index_term = internal_keys.findComponentTerminator(key, pos) orelse return null;
+        return try internal_keys.decodeBodyAlloc(alloc, key[pos..index_term]);
+    }
+
+    fn storedGraphRecordIsRetired(
+        alloc: Allocator,
+        retired: []const RetiredGraphGeneration,
+        key: []const u8,
+        value: []const u8,
+    ) !bool {
+        if (internal_keys.isGraphEdgeArtifactKey(key)) {
+            const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(alloc, key)) orelse return false;
+            defer {
+                alloc.free(parsed.doc_key);
+                alloc.free(parsed.index_name);
+                alloc.free(parsed.edge_type);
+                alloc.free(parsed.target_doc_key);
+            }
+            var decoded = enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, value) catch return false;
+            defer decoded.deinit(alloc);
+            return graphGenerationIsRetired(retired, parsed.index_name, decoded.generation);
+        }
+
+        const index_name = (try graphAssetStateIndexNameAlloc(alloc, key)) orelse return false;
+        defer alloc.free(index_name);
+        const generation = graph_asset_state.coverageGeneration(value) catch return false;
+        return graphGenerationIsRetired(retired, index_name, generation);
+    }
+
+    fn reclaimRetiredGraphGenerations(self: *DB, retired: []const RetiredGraphGeneration) !usize {
+        if (retired.len == 0) return 0;
+        const alloc = std.heap.page_allocator;
+        var lower = try documentRangeLowerAlloc(alloc, "");
+        defer alloc.free(lower);
+        var lower_exclusive = false;
+        var reclaimed: usize = 0;
+
+        while (true) {
+            const ScanState = struct {
+                alloc: Allocator,
+                retired: []const RetiredGraphGeneration,
+                delete_keys: std.ArrayListUnmanaged([]u8) = .empty,
+                resume_key: ?[]u8 = null,
+                stopped: bool = false,
+
+                fn deinit(state: *@This()) void {
+                    for (state.delete_keys.items) |key| state.alloc.free(key);
+                    state.delete_keys.deinit(state.alloc);
+                    if (state.resume_key) |key| state.alloc.free(key);
+                }
+
+                fn appendDelete(state: *@This(), key: []const u8) !docstore_mod.DocStore.ScanAction {
+                    try state.delete_keys.append(state.alloc, try state.alloc.dupe(u8, key));
+                    if (state.delete_keys.items.len < graph_generation_cleanup_batch_size) return .@"continue";
+                    state.resume_key = try state.alloc.dupe(u8, key);
+                    state.stopped = true;
+                    return .stop;
+                }
+
+                fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                    const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
+                    if (!try DB.storedGraphRecordIsRetired(state.alloc, state.retired, key, value)) return .@"continue";
+                    return try state.appendDelete(key);
+                }
+            };
+
+            var state = ScanState{ .alloc = alloc, .retired = retired };
+            defer state.deinit();
+            try self.core.store.scanWithContext(lower, "", .{ .lower_exclusive = lower_exclusive }, &state, ScanState.scanEntry);
+            if (state.delete_keys.items.len > 0) {
+                // The unlocked scan keeps corpus traversal off the write path.
+                // Revalidate the bounded candidate batch while holding the
+                // apply lock so a recreated generation cannot overwrite a key
+                // between generation inspection and physical deletion.
+                lockApply(self);
+                defer self.core.unlockApply();
+                var verified = std.ArrayListUnmanaged([]const u8).empty;
+                defer verified.deinit(alloc);
+                for (state.delete_keys.items) |key| {
+                    const current = self.core.store.get(alloc, key) catch |err| switch (err) {
+                        error.NotFound => continue,
+                        else => return err,
+                    };
+                    defer alloc.free(current);
+                    if (try storedGraphRecordIsRetired(alloc, retired, key, current)) try verified.append(alloc, key);
+                }
+                if (verified.items.len > 0) {
+                    try self.core.store.putBatch(&.{}, verified.items);
+                    reclaimed += verified.items.len;
+                }
+            }
+            if (!state.stopped) break;
+            alloc.free(lower);
+            lower = state.resume_key.?;
+            state.resume_key = null;
+            lower_exclusive = true;
+        }
+        return reclaimed;
+    }
+
+    const GraphGenerationCleanupWork = struct {
+        db: *DB,
+
+        fn run(ptr: *anyopaque) anyerror!void {
+            const work: *@This() = @ptrCast(@alignCast(ptr));
+            const alloc = std.heap.page_allocator;
+            while (true) {
+                const pending = try work.db.snapshotPendingGraphGenerationCleanup(alloc);
+                defer {
+                    for (pending) |*entry| entry.deinit(alloc);
+                    alloc.free(pending);
+                }
+                if (pending.len > 0) {
+                    _ = work.db.reclaimRetiredGraphGenerations(pending) catch |err| {
+                        work.db.graph_generation_cleanup_state.store(0, .release);
+                        return err;
+                    };
+                    work.db.removeCompletedGraphGenerationCleanup(pending);
+                }
+
+                if (work.db.hasPendingGraphGenerationCleanup()) {
+                    work.db.graph_generation_cleanup_state.store(1, .release);
+                    continue;
+                }
+                if (work.db.graph_generation_cleanup_state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
+                if (work.db.graph_generation_cleanup_state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) continue;
+            }
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const work: *@This() = @ptrCast(@alignCast(ptr));
+            std.heap.page_allocator.destroy(work);
+        }
+    };
+
+    fn scheduleRetiredGraphGenerationCleanup(self: *DB, index_name: []const u8, generation: u64) void {
+        lockAtomic(&self.graph_generation_cleanup_mutex);
+        var entry = self.pending_graph_generation_cleanup.getOrPut(self.alloc, index_name) catch {
+            self.graph_generation_cleanup_mutex.unlock();
+            std.log.warn("failed to retain retired graph generation cleanup index={s} generation={}", .{ index_name, generation });
+            return;
+        };
+        const inserted = !entry.found_existing;
+        if (!entry.found_existing) {
+            entry.key_ptr.* = self.alloc.dupe(u8, index_name) catch {
+                _ = self.pending_graph_generation_cleanup.remove(index_name);
+                self.graph_generation_cleanup_mutex.unlock();
+                std.log.warn("failed to retain retired graph generation cleanup index={s} generation={}", .{ index_name, generation });
+                return;
+            };
+            entry.value_ptr.* = .empty;
+        }
+        var already_pending = false;
+        for (entry.value_ptr.items) |existing| {
+            if (existing == generation) {
+                already_pending = true;
+                break;
+            }
+        }
+        if (!already_pending) {
+            entry.value_ptr.append(self.alloc, generation) catch {
+                if (inserted) {
+                    if (self.pending_graph_generation_cleanup.fetchRemove(index_name)) |removed| {
+                        var values = removed.value;
+                        values.deinit(self.alloc);
+                        self.alloc.free(@constCast(removed.key));
+                    }
+                }
+                self.graph_generation_cleanup_mutex.unlock();
+                std.log.warn("failed to retain retired graph generation cleanup index={s} generation={}", .{ index_name, generation });
+                return;
+            };
+        }
+        self.graph_generation_cleanup_mutex.unlock();
+
+        if (self.graph_generation_cleanup_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
+            _ = self.graph_generation_cleanup_state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
+            return;
+        }
+        const work = std.heap.page_allocator.create(GraphGenerationCleanupWork) catch {
+            self.graph_generation_cleanup_state.store(0, .release);
+            return;
+        };
+        work.* = .{ .db = self };
+        self.backend_runtime.durable_jobs.submit(.{
+            .owner_id = self.repair_cleanup_owner_id,
+            .class = .cleanup,
+            .ptr = work,
+            .run = GraphGenerationCleanupWork.run,
+            .deinit = GraphGenerationCleanupWork.deinit,
+        }) catch |err| {
+            std.heap.page_allocator.destroy(work);
+            self.graph_generation_cleanup_state.store(0, .release);
+            std.log.warn("retired graph generation cleanup was not scheduled index={s} generation={} err={s}", .{ index_name, generation, @errorName(err) });
+        };
     }
 
     const RepairShadowCleanupWork = struct {
@@ -11775,6 +12096,7 @@ pub const DB = struct {
         edge_type: []const u8,
         direction: graph_mod.EdgeDirection,
     ) ![]graph_mod.Edge {
+        try self.failIfIndexQuarantined(index_name);
         if (key.len == 0) return try alloc.alloc(graph_mod.Edge, 0);
         return try self.core.graphGetEdges(alloc, index_name, key, edge_type, direction);
     }
@@ -11786,6 +12108,7 @@ pub const DB = struct {
         start_key: []const u8,
         rules: traversal_mod.TraversalRules,
     ) ![]traversal_mod.TraversalResult {
+        try self.failIfIndexQuarantined(index_name);
         if (start_key.len == 0) return try alloc.alloc(traversal_mod.TraversalResult, 0);
         return try self.core.graphTraverseEdges(alloc, index_name, start_key, rules);
     }
@@ -11823,6 +12146,7 @@ pub const DB = struct {
         min_weight: f64,
         max_weight: f64,
     ) !?paths_mod.Path {
+        try self.failIfIndexQuarantined(index_name);
         if (source.len == 0 or target.len == 0) return null;
         if (try self.findAlgebraicShortestPath(alloc, index_name, source, target, edge_types, direction, weight_mode, max_depth, min_weight, max_weight)) |path| {
             return path;
@@ -11855,6 +12179,7 @@ pub const DB = struct {
         min_weight: f64,
         max_weight: f64,
     ) ![]paths_mod.Path {
+        try self.failIfIndexQuarantined(index_name);
         if (source.len == 0 or target.len == 0 or k == 0) return try alloc.alloc(paths_mod.Path, 0);
         if (k == 1) {
             if (try self.findShortestPath(alloc, index_name, source, target, edge_types, direction, weight_mode, max_depth, min_weight, max_weight)) |path| {
@@ -11978,6 +12303,7 @@ pub const DB = struct {
         max_results: u32,
         return_aliases: []const []const u8,
     ) ![]graph_pattern_mod.PatternMatch {
+        try self.failIfIndexQuarantined(index_name);
         if (start_keys.len == 0) return try alloc.alloc(graph_pattern_mod.PatternMatch, 0);
         return try self.core.graphMatchPattern(alloc, index_name, start_keys, pattern, .{
             .max_results = max_results,
@@ -12075,7 +12401,7 @@ pub const DB = struct {
     fn installIndexWhileEnrichmentQuiesced(self: *DB, cfg: types.IndexConfig) !InstalledIndex {
         lockApply(self);
         defer self.core.unlockApply();
-        const applied = try self.core.addIndex(cfg);
+        const applied = try self.core.addIndexRebuilding(cfg);
         var install_committed = false;
         errdefer if (!install_committed) {
             _ = self.core.deleteIndex(cfg.name) catch |rollback_err| {
@@ -12104,6 +12430,8 @@ pub const DB = struct {
 
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockAtomic(&self.index_structure_mutex);
+        defer self.index_structure_mutex.unlock();
         const restart_enrichment = if (self.enrichment_runtime) |runtime| runtime.isStarted() else false;
         if (restart_enrichment) self.enrichment_runtime.?.stop();
         var enrichment_restarted = false;
@@ -12115,9 +12443,13 @@ pub const DB = struct {
         const installed = try self.installIndexWhileEnrichmentQuiesced(cfg);
         var index_installed = true;
         errdefer if (index_installed) {
-            _ = self.deleteIndexWhileEnrichmentQuiesced(cfg.name) catch |rollback_err| {
+            const deleted: ?DeletedIndex = self.deleteIndexWhileEnrichmentQuiesced(cfg.name) catch |rollback_err| blk: {
                 std.log.err("failed to roll back incomplete index creation index={s} err={s}", .{ cfg.name, @errorName(rollback_err) });
+                break :blk null;
             };
+            if (deleted) |result| {
+                if (result.retired_graph_generation) |generation| self.scheduleRetiredGraphGenerationCleanup(cfg.name, generation);
+            }
         };
 
         // Establish the target count from an authoritative store snapshot
@@ -12133,18 +12465,42 @@ pub const DB = struct {
         const applied = installed.applied;
         var worker_applied = applied;
         if (needs_enrichment_replay) {
-            // A newly admitted managed index owns a fresh coverage generation.
-            // Journal entries at or before the current head may belong to a
-            // retired incarnation with the same public name, so establish the
-            // new worker's baseline at that head after rebuilding current
-            // materialized artifacts. Fresh enrichment replay is appended below
-            // and therefore remains visible to the worker.
+            // Couple a stable artifact snapshot to its replay floor. Writes
+            // committed after this snapshot are necessarily above the floor and
+            // are caught up by the target worker; writes at or below it are
+            // represented by the synchronous rebuild. This avoids the classic
+            // scan-then-read-head gap where a concurrent mutation can be missed
+            // by the scan and then skipped by replay.
+            var rebuild_snapshot = try self.core.store.beginReadTxn();
+            defer rebuild_snapshot.abort();
+            const generation_baseline = try self.core.store.lastReplaySequenceFromTxn(&rebuild_snapshot, 0);
+            var rebuild_ctx = AsyncContext{
+                .alloc = self.runtime_alloc,
+                .io = self.backend_runtime.io(),
+                .store = self.core.store,
+                .snapshot_read_txn = &rebuild_snapshot,
+                .applied_sequence_checkpoint_path = self.async_context.applied_sequence_checkpoint_path,
+                .index_repair_checkpoint_path = self.async_context.index_repair_checkpoint_path,
+                .index_manager = self.core.index_manager,
+                .apply_mutex = self.async_context.apply_mutex,
+                .dense_bulk_session_scope = .external,
+                .resolution_runtime = self.resolution_runtime,
+                .promotion_runtime = self.promotion_runtime,
+            };
+            defer rebuild_ctx.deinit(self.runtime_alloc);
             const rebuilt = switch (cfg.kind) {
-                .dense_vector => try rebuildDenseIndexForTargetCoverageContext(self.async_context, cfg.name, 2048),
-                .sparse_vector => try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(self.async_context, cfg.name, 2048),
+                .dense_vector => try rebuildDenseIndexForTargetCoverageContext(&rebuild_ctx, cfg.name, 2048),
+                .sparse_vector => try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(&rebuild_ctx, cfg.name, 2048),
+                .graph => try applySplitGraphArtifactsForIndexStreamingContext(&rebuild_ctx, cfg.name, graph_repair_rebuild_batch_size),
+                .full_text => @as(usize, @intCast(try self.core.index_manager.resetFullTextIndexForArtifactRebuildFromReadTxn(
+                    self.core.store,
+                    &rebuild_snapshot,
+                    cfg.name,
+                    null,
+                    null,
+                ))),
                 else => 0,
             };
-            const generation_baseline = self.core.nextDerivedSequence();
             if (rebuilt > 0 or generation_baseline > worker_applied) {
                 worker_applied = generation_baseline;
                 try self.core.saveAppliedSequence(cfg.name, worker_applied);
@@ -12182,13 +12538,20 @@ pub const DB = struct {
         }
         if (self.start_index_workers) {
             const current_target = self.core.nextDerivedSequence();
-            if (current_target > worker_applied) self.executor.notifyIndexes(current_target, &.{cfg.name});
+            if (current_target > worker_applied) {
+                try self.runDerivedUntilTargets(current_target, &.{cfg.name});
+            }
         }
+        // Publish readiness only after the snapshot rebuild and the exact
+        // post-snapshot replay interval have both completed.
+        self.core.index_manager.clearRepairUnavailable(cfg.name);
         index_installed = false;
     }
 
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockAtomic(&self.index_structure_mutex);
+        defer self.index_structure_mutex.unlock();
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.addEnrichment(cfg);
@@ -12196,6 +12559,8 @@ pub const DB = struct {
 
     pub fn upsertEnrichment(self: *DB, cfg: types.EnrichmentConfig) !index_manager_mod.IndexManager.EnrichmentUpsertResult {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockAtomic(&self.index_structure_mutex);
+        defer self.index_structure_mutex.unlock();
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.upsertEnrichment(cfg);
@@ -13194,29 +13559,44 @@ pub const DB = struct {
         };
     }
 
-    fn deleteIndexWhileEnrichmentQuiesced(self: *DB, name: []const u8) !bool {
+    const DeletedIndex = struct {
+        removed: bool,
+        retired_graph_generation: ?u64 = null,
+    };
+
+    fn deleteIndexWhileEnrichmentQuiesced(self: *DB, name: []const u8) !DeletedIndex {
         self.executor.removeWorker(name);
         lockApply(self);
         defer self.core.unlockApply();
+        const retired_graph_generation = if (self.core.index_manager.graphIndex(name)) |entry|
+            entry.config.coverage_generation
+        else
+            null;
         try self.abandonIndexRepairForDeletion(self.alloc, name);
         const removed = try self.core.deleteIndex(name);
         if (removed) {
             try self.deleteDerivedCoverageForIndex(name);
             try self.deleteDenseArtifactCounterMetadata(name);
         }
-        return removed;
+        return .{
+            .removed = removed,
+            .retired_graph_generation = if (removed) retired_graph_generation else null,
+        };
     }
 
     pub fn deleteIndex(self: *DB, name: []const u8) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockAtomic(&self.index_structure_mutex);
+        defer self.index_structure_mutex.unlock();
         const restart_enrichment = if (self.enrichment_runtime) |runtime| runtime.isStarted() else false;
         if (restart_enrichment) self.enrichment_runtime.?.stop();
-        const removed = self.deleteIndexWhileEnrichmentQuiesced(name) catch |delete_err| {
+        const deleted = self.deleteIndexWhileEnrichmentQuiesced(name) catch |delete_err| {
             if (restart_enrichment) try self.restartEnrichmentAfterStructuralMutation("failed index deletion", name);
             return delete_err;
         };
         if (restart_enrichment) try self.restartEnrichmentAfterStructuralMutation("index deletion", name);
-        return removed;
+        if (deleted.retired_graph_generation) |generation| self.scheduleRetiredGraphGenerationCleanup(name, generation);
+        return deleted.removed;
     }
 
     fn refreshManagedIndexWorkersLocked(self: *DB) !void {
@@ -13294,6 +13674,8 @@ pub const DB = struct {
 
     pub fn deleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockAtomic(&self.index_structure_mutex);
+        defer self.index_structure_mutex.unlock();
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.deleteEnrichment(kind, name);
@@ -23579,8 +23961,8 @@ fn graphAssetStateKeyAlloc(alloc: Allocator, doc_key: []const u8, index_name: []
     return try list.toOwnedSlice(alloc);
 }
 
-fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, writes: []const docstore_mod.KVPair) ![]u8 {
-    return try graph_asset_state.encodeAlloc(alloc, writes);
+fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, generation: u64, writes: []const docstore_mod.KVPair) ![]u8 {
+    return try graph_asset_state.encodeAlloc(alloc, generation, writes);
 }
 
 fn loadGraphAssetStateKeysAlloc(alloc: Allocator, store: *docstore_mod.DocStore, state_key: []const u8) !?[][]const u8 {
@@ -25707,7 +26089,7 @@ fn preparePrecomputedGraphSourceArtifactMutation(
             try group_positions.put(scratch, group_key, position);
             break :blk position;
         };
-        const state_value = try encodeGraphAssetStateKeysAlloc(scratch, graph_store_writes.items);
+        const state_value = try encodeGraphAssetStateKeysAlloc(scratch, graph_entry.config.coverage_generation, graph_store_writes.items);
         try groups.items[group_position].updates.append(scratch, .{
             .state_key = state_key,
             .state_value = state_value,
@@ -30969,7 +31351,7 @@ fn materializeGraphSourceArtifactsForIndex(
         }
 
         const graph_write_count = writes.items.len;
-        const state_value = try encodeGraphAssetStateKeysAlloc(alloc, writes.items[0..graph_write_count]);
+        const state_value = try encodeGraphAssetStateKeysAlloc(alloc, generation, writes.items[0..graph_write_count]);
         var state_value_owned = true;
         defer if (state_value_owned) alloc.free(state_value);
         var winners = try loadGraphEdgeWinners(alloc, store, artifact_ref.document_id, index_name, state_key, state_value, &.{}, sources);
@@ -31103,7 +31485,7 @@ fn materializeMentionEdgesForResolutionKey(
     const previous_keys = try loadGraphAssetStateKeysAlloc(alloc, store, state_key);
     defer if (previous_keys) |keys| freeOwnedConstKeySlice(alloc, keys);
     const graph_write_count = writes.items.len;
-    const state_value = try encodeGraphAssetStateKeysAlloc(alloc, writes.items[0..graph_write_count]);
+    const state_value = try encodeGraphAssetStateKeysAlloc(alloc, generation, writes.items[0..graph_write_count]);
     var state_value_owned = true;
     defer if (state_value_owned) alloc.free(state_value);
     var winners = try loadGraphEdgeWinners(alloc, store, parsed_key.doc_key, index_name, state_key, state_value, &.{}, index_manager.graphArtifactSources(index_name));
@@ -31143,7 +31525,7 @@ fn materializeMentionEdgesForResolutionKey(
         }
     }
 
-    const mention_state_value = try encodeGraphAssetStateKeysAlloc(alloc, mention_writes.items);
+    const mention_state_value = try encodeGraphAssetStateKeysAlloc(alloc, generation, mention_writes.items);
     var mention_state_value_owned = true;
     defer if (mention_state_value_owned) alloc.free(mention_state_value);
     try mention_writes.append(alloc, .{
@@ -42315,6 +42697,8 @@ test "db graph delete and recreate fences stale materialized edges" {
 
     const stale_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
     defer alloc.free(stale_key);
+    const stale_state_key = try graphAssetStateKeyAlloc(alloc, "doc:a", "relations_graph", "relations_v1");
+    defer alloc.free(stale_state_key);
     {
         const raw = try db.core.store.get(alloc, stale_key);
         defer alloc.free(raw);
@@ -42324,6 +42708,9 @@ test "db graph delete and recreate fences stale materialized edges" {
     }
 
     try std.testing.expect(try db.deleteIndex("relations_graph"));
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_state_key));
     try db.addIndex(.{
         .name = "relations_graph",
         .kind = .graph,
@@ -42334,13 +42721,53 @@ test "db graph delete and recreate fences stale materialized edges" {
     const current_generation = db.core.index_manager.graphIndex("relations_graph").?.config.coverage_generation;
     try std.testing.expect(current_generation != retired_generation);
 
-    // The durable record may remain for lazy compaction, but both live replay
-    // and full shadow/split reconstruction must treat it as a delete for this
-    // incarnation rather than resurrecting the retired source's edge.
+    // Replay and full shadow/split reconstruction still treat an explicitly
+    // supplied retired key as a delete, even after bounded background
+    // reclamation has removed the physical record.
     _ = try applySplitGraphArtifactsForIndex(db.core.store, db.core.index_manager, &.{stale_key}, "relations_graph");
     const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 0), edges.len);
+
+    // Cleanup is exact-generation scoped. A delayed/retried retirement pass
+    // must not delete an edge written by the recreated incarnation.
+    const current_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "current", "doc:c");
+    defer alloc.free(current_key);
+    const current_value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, current_generation, 1.0, 0, 0, "");
+    defer alloc.free(current_value);
+    try db.core.store.putBatch(&.{.{ .key = current_key, .value = current_value }}, &.{});
+    db.scheduleRetiredGraphGenerationCleanup("relations_graph", retired_generation);
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    const preserved = try db.core.store.get(alloc, current_key);
+    defer alloc.free(preserved);
+    var preserved_edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, preserved);
+    defer preserved_edge.deinit(alloc);
+    try std.testing.expectEqual(current_generation, preserved_edge.generation);
+}
+
+test "db graph direct APIs reject indexes behind the readiness barrier" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.core.index_manager.addRebuilding(db.core.store, .{
+        .name = "graph_building",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+    try std.testing.expect(db.core.index_manager.repairUnavailable("graph_building"));
+
+    try std.testing.expectError(error.IndexRebuilding, db.getEdges(alloc, "graph_building", "doc:a", "", .out));
+    try std.testing.expectError(error.IndexRebuilding, db.traverseEdges(alloc, "graph_building", "doc:a", .{}));
+    try std.testing.expectError(error.IndexRebuilding, db.findShortestPath(alloc, "graph_building", "doc:a", "doc:b", &.{}, .out, .min_hops, 4, 0, std.math.inf(f64)));
+    try std.testing.expectError(error.IndexRebuilding, db.findKShortestPaths(alloc, "graph_building", "doc:a", "doc:b", 2, &.{}, .out, .min_hops, 4, 0, std.math.inf(f64)));
+    try std.testing.expectError(error.IndexRebuilding, db.matchPattern(alloc, "graph_building", &.{"doc:a"}, &.{}, 1, &.{}));
+
+    db.core.index_manager.clearRepairUnavailable("graph_building");
+    try std.testing.expect(!db.core.index_manager.repairUnavailable("graph_building"));
 }
 
 test "db resolver catalog persists across reopen" {

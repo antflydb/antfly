@@ -455,6 +455,14 @@ the scan does not hold the global apply lock and cannot publish a false zero
 coverage target. The synchronous target rebuild therefore starts from the same
 authoritative union count used by later coverage checks.
 
+Index admission is published behind an `IndexRebuilding` availability barrier.
+The rebuild reads a stable artifact snapshot paired with its exact replay
+sequence floor, then catches the target index up through every post-snapshot
+mutation before clearing the barrier. Catalog mutations are structurally
+serialized without holding the global apply lock for the corpus scan, so a
+delete/recreate cannot overlap an admission while unrelated document writes
+continue normally.
+
 All sources in one index must have the same dense dimension and must inhabit a
 compatible vector space. `vector_space` is optional. When every source omits
 it, Antfly compares the durable canonical semantic producer identity stored on
@@ -589,9 +597,12 @@ the wrong source's payload.
 Every materialized graph-edge payload is also fenced by the owning index
 generation. Deleting and recreating an index name therefore makes its retired
 edge records inert immediately, including during replay, split reconstruction,
-and shadow repair. Physical records can be reclaimed lazily instead of making
-index deletion perform a corpus-sized scan. Manifests for artifacts no longer
-listed in `sources` are excluded from winner selection.
+and shadow repair. Exact retired `(index, generation)` pairs are reclaimed by a
+coalesced background sweep in bounded delete batches; the cleanup never infers
+staleness from the current catalog and therefore cannot delete a concurrently
+recreated generation. Index deletion stays independent of corpus size.
+Manifests for artifacts no longer listed in `sources` are excluded from winner
+selection.
 
 ```json
 {

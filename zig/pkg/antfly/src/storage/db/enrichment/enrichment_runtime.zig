@@ -3863,7 +3863,7 @@ fn materializeGraphAssetForRuntime(
         }
 
         const graph_write_count = writes.items.len;
-        const state_value = try encodeGraphAssetStateKeysAlloc(runtime.alloc, writes.items);
+        const state_value = try encodeGraphAssetStateKeysAlloc(runtime.alloc, graph_entry.config.coverage_generation, writes.items);
         var state_owned = true;
         defer if (state_owned) runtime.alloc.free(state_value);
 
@@ -3932,7 +3932,7 @@ fn materializeGraphAssetDeleteForRuntime(
             }
         }
 
-        const state_value = try encodeGraphAssetStateKeysAlloc(runtime.alloc, &.{});
+        const state_value = try encodeGraphAssetStateKeysAlloc(runtime.alloc, graph_entry.config.coverage_generation, &.{});
         defer runtime.alloc.free(state_value);
         var winners = try runtimeLoadGraphEdgeWinners(runtime, request.doc_key, graph_entry.config.name, state_key, state_value);
         defer winners.deinit(runtime.alloc);
@@ -7522,8 +7522,8 @@ fn runtimeResolutionMentionStateKeysForGraphSourceAlloc(
     return try protected.toOwnedSlice(runtime.alloc);
 }
 
-fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, writes: []const KVPair) ![]u8 {
-    return try graph_asset_state.encodeAlloc(alloc, writes);
+fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, generation: u64, writes: []const KVPair) ![]u8 {
+    return try graph_asset_state.encodeAlloc(alloc, generation, writes);
 }
 
 fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const u8) !?[][]const u8 {

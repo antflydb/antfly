@@ -553,7 +553,19 @@ pub const DBCore = struct {
     }
 
     pub fn addIndex(self: *DBCore, cfg: types.IndexConfig) !u64 {
-        try self.index_manager.add(self.store, cfg);
+        return try self.addIndexWithReadiness(cfg, false);
+    }
+
+    pub fn addIndexRebuilding(self: *DBCore, cfg: types.IndexConfig) !u64 {
+        return try self.addIndexWithReadiness(cfg, true);
+    }
+
+    fn addIndexWithReadiness(self: *DBCore, cfg: types.IndexConfig, rebuilding: bool) !u64 {
+        if (rebuilding) {
+            try self.index_manager.addRebuilding(self.store, cfg);
+        } else {
+            try self.index_manager.add(self.store, cfg);
+        }
         const applied = if (try self.index_manager.requiresEnrichmentReplay(cfg.name))
             0
         else
