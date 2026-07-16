@@ -7834,7 +7834,11 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn runtimeStatusNeedsColdVisibilityRefresh(status: runtime_status.LocalTableRuntimeStatus) bool {
         if (status.stats.repair_degraded or status.stats.repair_issue_count != 0) return false;
-        const has_exact_primary_facts = status.stats.source_doc_count != 0 or
+        const live_source_has_exact_primary_facts = switch (status.metadata.source) {
+            .live_writer_publish, .background_refresh, .startup_catch_up => true,
+            else => false,
+        };
+        const has_exact_primary_facts = live_source_has_exact_primary_facts or status.stats.source_doc_count != 0 or
             status.stats.doc_identity.scanned_primary_docs != 0 or
             status.stats.doc_identity.live_ordinals != 0;
         const has_primary_facts = has_exact_primary_facts or status.stats.doc_count != 0;
@@ -7905,6 +7909,10 @@ pub const ProvisionedTableWriteSource = struct {
         const needs_cold_refresh = runtimeStatusesNeedColdVisibilityRefresh(&cached);
         if (needs_cold_refresh) {
             cached.deinit(alloc);
+            // The recovery call can fail. Leave the errdefer with an empty,
+            // valid value instead of letting it deinitialize the freed cache
+            // snapshot a second time while propagating that error.
+            cached = .{};
             return try self.recoverRuntimeStatusesFromStorage(alloc, table_name);
         }
 
@@ -23499,8 +23507,13 @@ test "provisioned table write source cached runtime status does not fetch catalo
 
     var cached_status = runtime_status.LocalTableRuntimeStatus{
         .group_id = 7001,
+        .metadata = .{
+            .source = .cached_snapshot,
+            .freshness = .fresh,
+        },
         .stats = .{
             .doc_count = 25_000,
+            .source_doc_count = 25_000,
             .index_count = 1,
             .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
         },
@@ -23529,6 +23542,69 @@ test "provisioned table write source cached runtime status does not fetch catalo
     try std.testing.expectEqual(@as(u64, 25_000), statuses.items[0].stats.doc_count);
     try std.testing.expectEqualStrings("dense_idx", statuses.items[0].stats.indexes[0].name);
     try std.testing.expect(statuses.items[0].stats.indexes[0].replay_catch_up_required);
+}
+
+test "provisioned table write source cold runtime refresh failure does not double free cached status" {
+    const alloc = std.testing.allocator;
+
+    const FailingCatalog = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.ExpectedCatalogFailure;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+
+    var cached_status = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7001,
+        .metadata = .{
+            .source = .cached_snapshot,
+            .freshness = .fresh,
+        },
+        .stats = .{
+            .doc_count = 25_000,
+            .index_count = 1,
+            .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
+        },
+    };
+    defer cached_status.deinit(alloc);
+    cached_status.stats.indexes[0] = .{
+        .name = try alloc.dupe(u8, "dense_idx"),
+        .kind = .dense_vector,
+        .doc_count = 25_000,
+        .replay_applied_sequence = 100,
+        .replay_target_sequence = 101,
+        .replay_catch_up_required = true,
+        .backfill_active = true,
+    };
+    try snapshot_cache.upsertGroupStatus("docs", cached_status);
+
+    var catalog = FailingCatalog{};
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-runtime-status-failed-refresh", catalog.iface());
+    source.runtime_status_cache = &snapshot_cache;
+
+    try std.testing.expectError(
+        error.ExpectedCatalogFailure,
+        source.source().localRuntimeStatuses(alloc, "docs"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), catalog.calls);
 }
 
 test "provisioned table write source runtime status recovers empty cache from storage" {
@@ -31661,6 +31737,14 @@ test "hosted runtime status prefers live writer over stale hosted snapshot" {
     var opened = try source.getOrOpenCachedDbMode(hosted_cache, path, 7001, "docs", .default_async);
     opened.deinit(hosted_cache.write_cache.alloc);
 
+    _ = try source.source().batchGroupLocal(alloc, 7001, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .full_index,
+    });
+
+    // Install the stale snapshot after the write, since full-index writes can
+    // publish a fresh runtime snapshot themselves. This keeps the regression
+    // focused on the status read preferring the already-open writer.
     try hosted_cache.runtime_status_cache.upsertGroupStatusPreservingMetadata("docs", .{
         .group_id = 7001,
         .metadata = .{
@@ -31669,11 +31753,6 @@ test "hosted runtime status prefers live writer over stale hosted snapshot" {
             .updated_at_ns = 1,
         },
         .stats = .{ .doc_count = 99 },
-    });
-
-    _ = try source.source().batchGroupLocal(alloc, 7001, "docs", .{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
-        .sync_level = .full_index,
     });
 
     var cached_only = (try hosted_cache.runtime_status_cache.snapshot(alloc, "docs")).?;
