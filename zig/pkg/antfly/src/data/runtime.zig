@@ -2746,8 +2746,10 @@ pub const DataServer = struct {
     provisioned_startup_catch_up_not_before_ms: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_mutex: std.atomic.Mutex = .unlocked,
     provisioned_index_repair_owner_id: u64 = 0,
+    provisioned_index_repair_ready: std.atomic.Value(bool) = .init(false),
     provisioned_index_repair_shutdown: std.atomic.Value(bool) = .init(false),
     provisioned_index_repair_active: std.atomic.Value(bool) = .init(false),
+    provisioned_index_repair_resubmit_requested: std.atomic.Value(bool) = .init(false),
     provisioned_index_repair_dirty: std.atomic.Value(bool) = .init(false),
     provisioned_index_repair_last_run_at_ms: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_discovery_interval_ms: u64 = default_provisioned_index_repair_discovery_interval_ms,
@@ -3189,6 +3191,9 @@ pub const DataServer = struct {
             self.write_source.source(),
         );
         self.http_server.?.antfly_provider = self.read_source.antfly_provider;
+        // Publish scheduler readiness only after every write-source pointer and
+        // hook target the worker may dereference has been initialized.
+        self.provisioned_index_repair_ready.store(true, .release);
     }
 
     pub fn applyHAReplicationRecord(self: *DataServer, record: antfly.ha.replication_record.RecordView) !void {
@@ -4695,10 +4700,30 @@ pub const DataServer = struct {
     ) void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         switch (action) {
-            .enqueue => self.enqueueProvisionedIndexRepairForTable(table_name, group_id) catch |err| {
-                _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
-                self.provisioned_index_repair_dirty.store(true, .release);
-                std.log.warn("provisioned index repair debt enqueue failed group={} err={s}", .{ group_id, @errorName(err) });
+            .enqueue => {
+                self.enqueueProvisionedIndexRepairForTable(table_name, group_id) catch |err| {
+                    _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
+                    self.provisioned_index_repair_dirty.store(true, .release);
+                    std.log.warn("provisioned index repair debt enqueue failed group={} err={s}", .{ group_id, @errorName(err) });
+                    return;
+                };
+                // Exact durable-debt notifications are the primary wakeup;
+                // the periodic scan is only lost-wakeup recovery. Submission
+                // is bounded and the repair job still performs authoritative
+                // leadership, root-generation, capacity, and activation
+                // fencing before it can mutate an index generation.
+                if (!self.provisioned_index_repair_ready.load(.acquire)) return;
+                self.requestProvisionedIndexRepair() catch |err| switch (err) {
+                    error.BackgroundOwnerClosing => {},
+                    else => {
+                        _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
+                        self.recordProvisionedIndexRepairSchedulerFailure(@intCast(@divTrunc(
+                            platform_time.monotonicNs(),
+                            std.time.ns_per_ms,
+                        )));
+                        std.log.warn("provisioned index repair debt wake failed group={} err={s}", .{ group_id, @errorName(err) });
+                    },
+                };
             },
             .remove => {
                 self.removeProvisionedIndexRepair(group_id);
@@ -6797,14 +6822,21 @@ pub const DataServer = struct {
         // repair state machine observes this at bounded snapshot, catch-up,
         // capacity, and activation boundaries and leaves its durable candidate
         // resumable for the next owner.
+        self.provisioned_index_repair_ready.store(false, .release);
         self.provisioned_index_repair_shutdown.store(true, .release);
         lockAtomic(&self.provisioned_index_repair_mutex);
         const owner_id = self.provisioned_index_repair_owner_id;
         const runtime = self.backend_runtime;
         self.provisioned_index_repair_mutex.unlock();
         if (owner_id != 0) {
-            if (runtime) |active_runtime| active_runtime.durable_jobs.closeOwner(owner_id);
+            if (runtime) |active_runtime| {
+                active_runtime.durable_jobs.closeOwner(owner_id);
+                // The job captures `self`; draining is required even when the
+                // BackendRuntime is borrowed and outlives this DataServer.
+                active_runtime.durable_jobs.drainOwner(owner_id);
+            }
         }
+        self.provisioned_index_repair_resubmit_requested.store(false, .release);
         self.provisioned_index_repair_active.store(false, .release);
     }
 
@@ -7426,7 +7458,14 @@ pub const DataServer = struct {
             self.provisioned_index_repair_last_duration_ns.store(platform_time.monotonicNs() -| started_ns, .monotonic);
         }
 
-        const registration = self.store_registration orelse return;
+        // Standalone/local deployments legitimately have no metadata store
+        // registration but still own provisioned table groups. Domain zero is
+        // the node-local ResourceManager domain; distributed stores continue
+        // to use their stable registered id.
+        const capacity_domain_id: u128 = if (self.store_registration) |registration|
+            registration.store_id
+        else
+            0;
 
         var found_pending = false;
         var attempted = false;
@@ -7674,7 +7713,7 @@ pub const DataServer = struct {
                     // The DB measures the selected index generation. Group disk
                     // bytes above are only a fair-scheduling proxy.
                     .estimated_candidate_bytes = candidate.estimated_bytes,
-                    .capacity_domain_id = registration.store_id,
+                    .capacity_domain_id = capacity_domain_id,
                     .owner_epoch = ownership_fence.owner_epoch,
                     .max_activation_gap_sequences = self.provisioned_index_repair_max_activation_gap_sequences,
                     .max_convergence_rounds = self.provisioned_index_repair_max_convergence_rounds,
@@ -7702,12 +7741,24 @@ pub const DataServer = struct {
                 );
                 continue;
             };
-            found_pending = found_pending or result.index_repair_pending;
+            // A cooperative busy result is not evidence that durable debt was
+            // cleared: the group may have been unavailable before the DB could
+            // inspect its repair checkpoint. Retain the exact route with a
+            // bounded retry instead of turning ordinary writer contention into
+            // a lost wakeup and a later fleet-discovery scan.
+            const repair_pending = result.index_repair_pending or result.busy;
+            found_pending = found_pending or repair_pending;
             if (result.index_repair_disk_wait) {
                 _ = self.provisioned_index_repair_disk_waits.fetchAdd(1, .monotonic);
             }
-            if (result.index_repair_pending) {
-                self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, result.index_repair_retry_at_ms) catch |err| {
+            if (repair_pending) {
+                const retry_at_ms = if (result.index_repair_retry_at_ms != 0)
+                    result.index_repair_retry_at_ms
+                else if (result.busy)
+                    now_ms +| provisioned_index_repair_interval_ms
+                else
+                    0;
+                self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, retry_at_ms) catch |err| {
                     _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
                     self.recordProvisionedIndexRepairSchedulerFailure(now_ms);
                     if (!candidate.queued) {
@@ -8043,6 +8094,7 @@ pub const DataServer = struct {
     }
 
     fn maybeRequestProvisionedIndexRepair(self: *DataServer) !void {
+        if (!self.provisioned_index_repair_ready.load(.acquire)) return;
         if (self.provisioned_index_repair_shutdown.load(.acquire)) return;
         const dirty = self.provisioned_index_repair_dirty.load(.acquire);
         if (self.provisioned_index_repair_active.load(.acquire)) return;
@@ -8059,12 +8111,15 @@ pub const DataServer = struct {
     }
 
     fn requestProvisionedIndexRepair(self: *DataServer) !void {
+        if (!self.provisioned_index_repair_ready.load(.acquire)) return;
         const runtime = try self.ensureBackendRuntime();
-        if (self.provisioned_index_repair_active.load(.acquire)) return;
         lockAtomic(&self.provisioned_index_repair_mutex);
         defer self.provisioned_index_repair_mutex.unlock();
         if (self.provisioned_index_repair_shutdown.load(.acquire)) return error.BackgroundOwnerClosing;
-        if (self.provisioned_index_repair_active.load(.acquire)) return;
+        if (self.provisioned_index_repair_active.load(.acquire)) {
+            self.provisioned_index_repair_resubmit_requested.store(true, .release);
+            return;
+        }
         if (self.provisioned_index_repair_owner_id == 0) {
             self.provisioned_index_repair_owner_id = runtime.allocOwnerId();
         }
@@ -8081,8 +8136,28 @@ pub const DataServer = struct {
 
     fn runProvisionedIndexRepairJob(ptr: *anyopaque) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        defer self.provisioned_index_repair_active.store(false, .release);
+        defer self.finishProvisionedIndexRepairJob();
         self.runProvisionedIndexRepair();
+    }
+
+    fn finishProvisionedIndexRepairJob(self: *DataServer) void {
+        // Serialize the active-to-idle transition with request registration.
+        // An atomic-only fast path can lose a wake when a requester observes
+        // `active`, stalls, and sets the latch after this worker consumes it.
+        lockAtomic(&self.provisioned_index_repair_mutex);
+        self.provisioned_index_repair_active.store(false, .release);
+        const resubmit = self.provisioned_index_repair_resubmit_requested.swap(false, .acq_rel) and
+            !self.provisioned_index_repair_shutdown.load(.acquire);
+        self.provisioned_index_repair_mutex.unlock();
+        if (!resubmit) return;
+        self.requestProvisionedIndexRepair() catch |err| switch (err) {
+            error.BackgroundOwnerClosing => {},
+            else => {
+                _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
+                self.provisioned_index_repair_dirty.store(true, .release);
+                std.log.warn("provisioned index repair resubmit failed err={s}", .{@errorName(err)});
+            },
+        };
     }
 
     fn deinitProvisionedIndexRepairJob(_: *anyopaque) void {}
@@ -8858,10 +8933,10 @@ pub const DataServer = struct {
                     defer activity.deinit();
 
                     var group_ids_one = [_]u64{group_id};
-                    {
+                    const provision_summary = provision: {
                         lockAtomic(refresh_write_source.localDbMutex());
                         defer refresh_write_source.localDbMutex().unlock();
-                        _ = try refresh_write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
+                        break :provision try refresh_write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
                             self.alloc,
                             head.metadata_group_id,
                             group_ids_one[0..],
@@ -8869,8 +8944,19 @@ pub const DataServer = struct {
                             snapshot.ranges,
                             backend_runtime,
                         );
-                    }
+                    };
                     try self.provisioned_storage.bumpGroupVisibleRootGenerations(group_ids_one[0..]);
+                    if (provision_summary.indexes_added != 0) {
+                        // Reconciliation opens/adopts the foreground writer in
+                        // order to persist the admission marker and intent. The
+                        // durable repair owner is deliberately isolated from a
+                        // live foreground writer, so retire that cache entry
+                        // before giving the exact group route another wakeup.
+                        // Publish the new visible generation first so the
+                        // repair ownership fence cannot capture the generation
+                        // that provisioning just superseded.
+                        refresh_write_source.handOffProvisionedIndexAdmission(table.name, group_id);
+                    }
                 }
             }
             self.provisioned_storage.read_cache.clear();
@@ -16570,6 +16656,8 @@ test "data runtime repair debt hook targets the affected group queue" {
     try std.testing.expect(server.provisioned_index_repair_group_ages.contains(7001));
     try std.testing.expectEqualStrings("docs", server.provisioned_index_repair_group_ages.get(7001).?.table_name.?);
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_index_repair_queue_depth.load(.monotonic));
+    try std.testing.expect(server.backend_runtime == null);
+    try std.testing.expect(!server.provisioned_index_repair_active.load(.acquire));
 
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .cancel);
     try std.testing.expect(server.provisionedIndexRepairCancellationRequested(7001));

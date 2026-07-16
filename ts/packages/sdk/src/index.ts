@@ -78,6 +78,13 @@ export type {
   TranscribeResponse,
 } from "./inference-types.js";
 export { logLevels, logStyles } from "./inference-types.js";
+export {
+  artifactEmbeddingIndexConfig,
+  artifactIndexSources,
+  graphIndexSources,
+  type ArtifactEmbeddingIndexOptions,
+  type ArtifactEmbeddingSourceConfig,
+} from "./index-config.js";
 // Re-export the generated types for advanced users
 export type { components, operations, paths } from "./public-api.js";
 export type { components as query_components } from "./query.js";
@@ -118,6 +125,7 @@ export type {
   AggregationResult,
   // Search and aggregation types
   AggregationType,
+  AlgebraicIndexConfig,
   // Authentication
   AntflyAuth,
   // Configuration
@@ -125,6 +133,7 @@ export type {
   // Error type
   AntflyError,
   AntflyType,
+  ArtifactIndexSource,
   // Backup/Restore types
   BackupRequest,
   BatchRequest, // Now using our custom type
@@ -177,6 +186,8 @@ export type {
   EmbedderProvider,
   // Embedding types
   Embedding,
+  EmbeddingsIndexConfig,
+  EnrichmentConfig,
   // Eval types
   EvalConfig,
   EvalResult,
@@ -188,10 +199,12 @@ export type {
   ExternalIoProtocol,
   FetchConfig,
   FilterSpec,
+  FullTextIndexConfig,
   GenerationConfidence,
   GeneratorConfig,
   GeneratorProvider,
   GraphIndexConfig,
+  GraphIndexSource,
   GraphNodeSelector,
   GraphQuery,
   GraphQueryParams,

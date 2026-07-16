@@ -52,6 +52,8 @@ type (
 
 	// Index config types
 	EmbeddingsIndexConfig = oapi.EmbeddingsIndexConfig
+	ArtifactIndexSource   = oapi.ArtifactIndexSource
+	AlgebraicIndexConfig  = oapi.AlgebraicIndexConfig
 	DistanceMetric        = oapi.DistanceMetric
 	EmbeddingsIndexStats  = oapi.EmbeddingsIndexStats
 	EnrichmentConfig      = oapi.EnrichmentConfig
@@ -235,13 +237,21 @@ type (
 	ReplicationRoute       = oapi.ReplicationRoute
 
 	// Graph index types
-	GraphIndexConfig       = oapi.GraphIndexConfig
-	GraphIndexStats        = oapi.GraphIndexStats
-	EdgeTypeConfig         = oapi.EdgeTypeConfig
-	EdgeTypeConfigTopology = oapi.EdgeTypeConfigTopology
-	EdgeDirection          = oapi.EdgeDirection
-	Edge                   = oapi.Edge
-	EdgesResponse          = oapi.EdgesResponse
+	GraphIndexConfig           = oapi.GraphIndexConfig
+	GraphIndexSource           = oapi.GraphIndexSource
+	GraphIndexSourceContext    = oapi.GraphIndexSourceContext
+	GraphIndexSourceEdge       = oapi.GraphIndexSourceEdge
+	GraphIndexSourceEdgeType   = oapi.GraphIndexSourceEdge_Type
+	GraphIndexSourceEdgeWeight = oapi.GraphIndexSourceEdge_Weight
+	GraphIndexSourceFormat     = oapi.GraphIndexSourceFormat
+	GraphIndexSourceNodes      = oapi.GraphIndexSourceNodes
+	GraphIndexSourceNodesModel = oapi.GraphIndexSourceNodesModel
+	GraphIndexStats            = oapi.GraphIndexStats
+	EdgeTypeConfig             = oapi.EdgeTypeConfig
+	EdgeTypeConfigTopology     = oapi.EdgeTypeConfigTopology
+	EdgeDirection              = oapi.EdgeDirection
+	Edge                       = oapi.Edge
+	EdgesResponse              = oapi.EdgesResponse
 
 	// Graph query types
 	GraphQuery        = oapi.GraphQuery
@@ -341,6 +351,12 @@ const (
 	IndexTypeEmbeddings = oapi.IndexTypeEmbeddings
 	IndexTypeFullText   = oapi.IndexTypeFullText
 	IndexTypeGraph      = oapi.IndexTypeGraph
+	IndexTypeAlgebraic  = oapi.IndexTypeAlgebraic
+
+	GraphIndexSourceFormatExtractionRelation = oapi.GraphIndexSourceFormatExtractionRelation
+	GraphIndexSourceFormatExtractionGraph    = oapi.GraphIndexSourceFormatExtractionGraph
+	GraphIndexSourceNodesModelDocument       = oapi.GraphIndexSourceNodesModelDocument
+	GraphIndexSourceNodesModelExternal       = oapi.GraphIndexSourceNodesModelExternal
 
 	// EnrichmentKind values
 	EnrichmentKindAsset     = oapi.EnrichmentKindAsset

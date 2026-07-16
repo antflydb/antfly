@@ -11,6 +11,7 @@ from ..models.distance_metric import DistanceMetric
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.artifact_index_source import ArtifactIndexSource
     from ..models.chunker_config import ChunkerConfig
     from ..models.embedder_config import EmbedderConfig
     from ..models.generator_config import GeneratorConfig
@@ -35,11 +36,11 @@ class EmbeddingsIndexConfig:
                 dense (HNSW) vector index. Default: False.
             dimension (int | Unset): Vector dimension for dense indexes. Required for external dense indexes. Can be omitted
                 for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
-            field (str | Unset): Field to extract embeddings from (managed indexes only; not allowed when external=true)
-            embedding_name (str | Unset): Generated embedding artifact name consumed by this vector index. Use with a
-                matching embedding enrichment for artifact-backed managed embeddings.
-            source_artifact_name (str | Unset): Artifact stream consumed by the embedding enrichment backing this vector
-                index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+            field (str | Unset): Field to extract embeddings from for direct managed indexes. Omit when sources is set.
+            sources (list[ArtifactIndexSource] | Unset): Embedding artifact streams indexed together. Each artifact record
+                is an independent vector member identified by the artifact name and its source key. All sources must use the
+                same dense vector space or the same sparse token space. Not allowed for external or direct field/template
+                indexes.
             template (str | Unset): Handlebars template for generating prompts (managed indexes only; not allowed when
                 external=true). See https://handlebarsjs.com/guide/ for more information. Example: Hello, {{#if (eq Name
                 "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old..
@@ -237,8 +238,7 @@ class EmbeddingsIndexConfig:
     sparse: bool | Unset = False
     dimension: int | Unset = UNSET
     field: str | Unset = UNSET
-    embedding_name: str | Unset = UNSET
-    source_artifact_name: str | Unset = UNSET
+    sources: list[ArtifactIndexSource] | Unset = UNSET
     template: str | Unset = UNSET
     distance_metric: DistanceMetric | Unset = UNSET
     mem_only: bool | Unset = UNSET
@@ -264,9 +264,12 @@ class EmbeddingsIndexConfig:
 
         field = self.field
 
-        embedding_name = self.embedding_name
-
-        source_artifact_name = self.source_artifact_name
+        sources: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.sources, Unset):
+            sources = []
+            for sources_item_data in self.sources:
+                sources_item = sources_item_data.to_dict()
+                sources.append(sources_item)
 
         template = self.template
 
@@ -311,10 +314,8 @@ class EmbeddingsIndexConfig:
             field_dict["dimension"] = dimension
         if field is not UNSET:
             field_dict["field"] = field
-        if embedding_name is not UNSET:
-            field_dict["embedding_name"] = embedding_name
-        if source_artifact_name is not UNSET:
-            field_dict["source_artifact_name"] = source_artifact_name
+        if sources is not UNSET:
+            field_dict["sources"] = sources
         if template is not UNSET:
             field_dict["template"] = template
         if distance_metric is not UNSET:
@@ -340,6 +341,7 @@ class EmbeddingsIndexConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.artifact_index_source import ArtifactIndexSource
         from ..models.chunker_config import ChunkerConfig
         from ..models.embedder_config import EmbedderConfig
         from ..models.generator_config import GeneratorConfig
@@ -361,9 +363,14 @@ class EmbeddingsIndexConfig:
 
         field = d.pop("field", UNSET)
 
-        embedding_name = d.pop("embedding_name", UNSET)
+        _sources = d.pop("sources", UNSET)
+        sources: list[ArtifactIndexSource] | Unset = UNSET
+        if _sources is not UNSET:
+            sources = []
+            for sources_item_data in _sources:
+                sources_item = ArtifactIndexSource.from_dict(sources_item_data)
 
-        source_artifact_name = d.pop("source_artifact_name", UNSET)
+                sources.append(sources_item)
 
         template = d.pop("template", UNSET)
 
@@ -416,8 +423,7 @@ class EmbeddingsIndexConfig:
             sparse=sparse,
             dimension=dimension,
             field=field,
-            embedding_name=embedding_name,
-            source_artifact_name=source_artifact_name,
+            sources=sources,
             template=template,
             distance_metric=distance_metric,
             mem_only=mem_only,
