@@ -99,7 +99,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             return error.SparseEmbeddingRequiresTextInput;
         }
 
-        try model.ensureEmbeddingAssets(opts.texts.items.len > 0, false, false);
+        try model.ensureEmbeddingAssetsWithIo(io, opts.texts.items.len > 0, false, false);
         const ensured_assets_at = std.Io.Timestamp.now(io, .awake);
         var sparse_pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
             .allocator = allocator,
@@ -133,7 +133,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return;
     }
 
-    try model.ensureEmbeddingAssets(
+    try model.ensureEmbeddingAssetsWithIo(
+        io,
         opts.texts.items.len > 0,
         opts.image_paths.items.len > 0,
         opts.audio_paths.items.len > 0,

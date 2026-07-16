@@ -2508,6 +2508,8 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "export and import documents round trip",
             "file import rejects oversized portable blocks before allocation",
+            "portable graph edge values accept Go semantic encoding without guessing a generation",
+            "import accepts Go portable AFB edge batch encoding end to end",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

@@ -1522,12 +1522,19 @@ pub fn compileGradientGraph(
     if (needs_max_reducer) try aux_list.append(allocator, max_reducer_comp);
     const module = hlo.Module.initWithAux("gradient", comp, aux_list.items);
     const hlo_bytes = try module.serialize(allocator);
+    errdefer allocator.free(hlo_bytes);
+    const input_shapes = try buildInputShapesForBindings(allocator, graph, input_bindings);
+    errdefer freeShapeSlices(allocator, input_shapes);
+    const output_shapes = try cloneHloShapesForOutputNodeIds(allocator, &b, node_map, output_node_ids);
+    errdefer freeShapeSlices(allocator, output_shapes);
 
     return .{
         .hlo_bytes = hlo_bytes,
         .input_bindings = input_bindings,
         .input_node_ids = input_node_ids_copy,
         .output_node_ids = output_node_ids,
+        .input_shapes = input_shapes,
+        .output_shapes = output_shapes,
         .allocator = allocator,
     };
 }

@@ -78,10 +78,14 @@ def sync_detailed(
 ) -> Response[Error | TableRepairJob]:
     """Cancel a table repair job
 
-     Cancels a queued table repair job. If a repair pass is already running,
-    the response returns the current running state; cancellation is applied
-    only at pass boundaries so the API never reports a committed in-flight
-    pass as cancelled.
+     Requests cancellation at a bounded repair boundary. For a named-index
+    job, the server also traverses the table in bounded passes, durably
+    pauses matching automatic repair, and asks an active owner to yield.
+    The job remains nonterminal until that traversal completes, so a
+    `cancelled` response means detached reconstruction will not restart
+    without an explicit resume action. If the API process restarts during
+    the traversal, server maintenance resumes it automatically; clients do
+    not need to advance or repeat the cancellation request.
 
     Args:
         table_name (str):
@@ -115,10 +119,14 @@ def sync(
 ) -> Error | TableRepairJob | None:
     """Cancel a table repair job
 
-     Cancels a queued table repair job. If a repair pass is already running,
-    the response returns the current running state; cancellation is applied
-    only at pass boundaries so the API never reports a committed in-flight
-    pass as cancelled.
+     Requests cancellation at a bounded repair boundary. For a named-index
+    job, the server also traverses the table in bounded passes, durably
+    pauses matching automatic repair, and asks an active owner to yield.
+    The job remains nonterminal until that traversal completes, so a
+    `cancelled` response means detached reconstruction will not restart
+    without an explicit resume action. If the API process restarts during
+    the traversal, server maintenance resumes it automatically; clients do
+    not need to advance or repeat the cancellation request.
 
     Args:
         table_name (str):
@@ -147,10 +155,14 @@ async def asyncio_detailed(
 ) -> Response[Error | TableRepairJob]:
     """Cancel a table repair job
 
-     Cancels a queued table repair job. If a repair pass is already running,
-    the response returns the current running state; cancellation is applied
-    only at pass boundaries so the API never reports a committed in-flight
-    pass as cancelled.
+     Requests cancellation at a bounded repair boundary. For a named-index
+    job, the server also traverses the table in bounded passes, durably
+    pauses matching automatic repair, and asks an active owner to yield.
+    The job remains nonterminal until that traversal completes, so a
+    `cancelled` response means detached reconstruction will not restart
+    without an explicit resume action. If the API process restarts during
+    the traversal, server maintenance resumes it automatically; clients do
+    not need to advance or repeat the cancellation request.
 
     Args:
         table_name (str):
@@ -182,10 +194,14 @@ async def asyncio(
 ) -> Error | TableRepairJob | None:
     """Cancel a table repair job
 
-     Cancels a queued table repair job. If a repair pass is already running,
-    the response returns the current running state; cancellation is applied
-    only at pass boundaries so the API never reports a committed in-flight
-    pass as cancelled.
+     Requests cancellation at a bounded repair boundary. For a named-index
+    job, the server also traverses the table in bounded passes, durably
+    pauses matching automatic repair, and asks an active owner to yield.
+    The job remains nonterminal until that traversal completes, so a
+    `cancelled` response means detached reconstruction will not restart
+    without an explicit resume action. If the API process restarts during
+    the traversal, server maintenance resumes it automatically; clients do
+    not need to advance or repeat the cancellation request.
 
     Args:
         table_name (str):

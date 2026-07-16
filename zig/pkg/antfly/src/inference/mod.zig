@@ -90,6 +90,14 @@ test "managed embedder artifact backed embedding translation" {
     try managed_embedder.testArtifactBackedEmbeddingTranslation();
 }
 
+test "managed embedder multi-source embedding translation" {
+    try managed_embedder.testMultiSourceEmbeddingTranslation();
+    try managed_embedder.testMultiSourceSparseEmbeddingTranslation();
+    try managed_embedder.testInvalidMultiSourceEmbeddingConfigs();
+    try managed_embedder.testVectorSpaceCompatibility();
+    try managed_embedder.testEmbeddingSemanticProducerIdentity();
+}
+
 test "query embedding cache owns results and coalesces misses" {
     try query_embedding_cache.testOwnedValuesAndHits();
     try query_embedding_cache.testConcurrentCoalescing();

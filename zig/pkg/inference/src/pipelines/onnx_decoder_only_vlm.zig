@@ -260,9 +260,17 @@ pub const Pipeline = struct {
     prompt_override: ?[]const u8 = null,
 
     pub fn load(allocator: std.mem.Allocator, model_dir: []const u8) !Pipeline {
+        return loadWithArtifactSelection(allocator, model_dir, .{});
+    }
+
+    pub fn loadWithArtifactSelection(
+        allocator: std.mem.Allocator,
+        model_dir: []const u8,
+        artifact_selection: manifest_mod.ArtifactSelection,
+    ) !Pipeline {
         if (!build_options.enable_onnx) return error.OnnxNotEnabled;
 
-        var manifest = try manifest_mod.loadFromDir(allocator, model_dir);
+        var manifest = try manifest_mod.loadFromDirWithArtifactSelection(allocator, model_dir, artifact_selection);
         errdefer manifest.deinit();
 
         const tok_bytes = try c_file.readFileFromDir(allocator, model_dir, "tokenizer.json");
@@ -277,7 +285,10 @@ pub const Pipeline = struct {
         const eos_token_ids = try loadEosTokenIds(allocator, model_dir, &manifest, gpt_config);
         errdefer allocator.free(eos_token_ids);
 
-        const decoder_path = (try findOnnxFile(allocator, model_dir, &decoder_candidates)) orelse return error.DecoderModelNotFound;
+        const decoder_path = if (!artifact_selection.isEmpty()) blk: {
+            const selected = manifest.onnx_path orelse return error.UnsupportedReaderArtifactSelection;
+            break :blk try allocator.dupe(u8, selected);
+        } else (try findOnnxFile(allocator, model_dir, &decoder_candidates)) orelse return error.DecoderModelNotFound;
         defer allocator.free(decoder_path);
         const embed_path = (try findOnnxFile(allocator, model_dir, &embed_candidates)) orelse return error.EmbedTokensModelNotFound;
         defer allocator.free(embed_path);

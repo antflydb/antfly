@@ -36,6 +36,24 @@ const ExpertCoord = moe_residency.ExpertCoord;
 const ResidencyTier = tier_planner.ResidencyTier;
 const PlacementPlan = tier_planner.PlacementPlan;
 
+var metal_native_provider_process_waits: std.atomic.Value(usize) = .init(0);
+
+pub const MetalNativeProviderSlot = if (supports_native_metal_provider) struct {
+    provider: ?*metal_native_provider_mod.MetalNativeProvider = null,
+    in_use: bool = false,
+    embedding_cache_bytes: u64 = 0,
+    embedding_cache_logical_bytes: u64 = 0,
+} else void;
+
+pub const MetalNativeProviderPoolStats = struct {
+    capacity: usize,
+    active_leases: usize,
+    peak_leases: usize,
+    waits_total: usize,
+    embedding_cache_bytes: u64,
+    embedding_cache_logical_bytes: u64,
+};
+
 pub const QuantExecutionMode = enum {
     prefer_backend_dense,
     wrapper_direct_quant,
@@ -216,12 +234,55 @@ pub const WeightStore = struct {
     access_epoch: u64 = 1,
     packed_expert_views: std.StringHashMapUnmanaged(PackedExpertViewEntry) = .empty,
     packed_expert_view_bytes: usize = 0,
-    shared_metal_native_provider: if (supports_native_metal_provider) ?*metal_native_provider_mod.MetalNativeProvider else void =
-        if (supports_native_metal_provider) null else {},
-    shared_metal_native_provider_lock: if (supports_native_metal_provider) std.Io.Mutex else void =
+    metal_native_provider_pool_size: usize = 1,
+    metal_native_provider_slots: if (supports_native_metal_provider) []MetalNativeProviderSlot else void =
+        if (supports_native_metal_provider) &.{} else {},
+    metal_native_provider_pool_lock: if (supports_native_metal_provider) std.Io.Mutex else void =
         if (supports_native_metal_provider) .init else {},
+    metal_native_provider_available: if (supports_native_metal_provider) std.Io.Condition else void =
+        if (supports_native_metal_provider) .init else {},
+    metal_native_provider_active_leases: std.atomic.Value(usize) = .init(0),
+    metal_native_provider_peak_leases: std.atomic.Value(usize) = .init(0),
+    metal_native_provider_waits: std.atomic.Value(usize) = .init(0),
+    metal_native_provider_embedding_cache_bytes: std.atomic.Value(u64) = .init(0),
+    metal_native_provider_embedding_cache_logical_bytes: std.atomic.Value(u64) = .init(0),
     jina_lora_adapter: ?*JinaLoraAdapter = null,
 };
+
+pub fn setMetalNativeProviderPoolSize(data: *WeightStore, pool_size: usize) void {
+    const normalized = @max(pool_size, 1);
+    if (comptime supports_native_metal_provider) {
+        // SessionManager configures this immediately after model load, before
+        // the first backend lease. A live pool cannot be resized safely.
+        if (data.metal_native_provider_slots.len != 0) {
+            std.debug.assert(data.metal_native_provider_pool_size == normalized);
+            return;
+        }
+    }
+    data.metal_native_provider_pool_size = normalized;
+}
+
+pub fn metalNativeProviderPoolStats(data: *const WeightStore) MetalNativeProviderPoolStats {
+    // The configured capacity is immutable once the session is attached. Do
+    // not inspect the lazily allocated slot slice without its pool mutex.
+    const capacity = if (comptime supports_native_metal_provider) data.metal_native_provider_pool_size else 0;
+    return .{
+        .capacity = capacity,
+        .active_leases = data.metal_native_provider_active_leases.load(.monotonic),
+        .peak_leases = data.metal_native_provider_peak_leases.load(.monotonic),
+        .waits_total = data.metal_native_provider_waits.load(.monotonic),
+        .embedding_cache_bytes = data.metal_native_provider_embedding_cache_bytes.load(.monotonic),
+        .embedding_cache_logical_bytes = data.metal_native_provider_embedding_cache_logical_bytes.load(.monotonic),
+    };
+}
+
+pub fn metalNativeProviderProcessWaitsTotal() usize {
+    return metal_native_provider_process_waits.load(.monotonic);
+}
+
+pub fn noteMetalNativeProviderWait() void {
+    _ = metal_native_provider_process_waits.fetchAdd(1, .monotonic);
+}
 
 pub fn touchLazyWeight(data: *WeightStore, entry: *LazyWeightEntry) void {
     entry.last_access_epoch = data.access_epoch;
