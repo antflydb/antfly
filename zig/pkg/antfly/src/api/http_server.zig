@@ -4853,6 +4853,7 @@ pub const ApiHttpServer = struct {
                     else => return err,
                 };
                 if (self.table_writes) |table_writes_source| {
+                    var background_reconcile_scheduled = false;
                     if (!local_schema_applied) {
                         const scheduled = table_writes_source.requestTableStructuralReconcile(self.alloc, table_name) catch |write_err| {
                             std.log.err("public schema update structural reconcile enqueue failed table={s} err={s}", .{ table_name, @errorName(write_err) });
@@ -4865,9 +4866,14 @@ pub const ApiHttpServer = struct {
                                 error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                                 else => return write_err,
                             };
+                        } else {
+                            background_reconcile_scheduled = true;
                         }
                     }
-                    if (try self.source.runRound()) {
+                    // A provisioned owner has its own structural worker. Do not
+                    // turn an enqueue-only HTTP contract back into synchronous
+                    // work by driving metadata/reconciliation rounds here.
+                    if (!background_reconcile_scheduled and try self.source.runRound()) {
                         _ = try self.source.runRound();
                         _ = try self.source.runRound();
                     }

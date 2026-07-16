@@ -2799,6 +2799,24 @@ overhead. No Quickwit rerun is needed because the archived result already
 contains the full persistent-HTTP load matrix, mixed writes, freshness, CPU,
 RSS, disk, and recovery measurements.
 
+The reusable `tools/verify_antfly_schema_availability.py` gate drives a schema
+PUT concurrently with health, table-status, and exact term queries until the
+target generation is solely published. On a 50,000-document fixture, the first
+run exposed one five-second status timeout during the metadata structural
+handoff even though all 973 search polls succeeded. Status admission therefore
+now serves the immutable snapshot during both metadata structural activity and
+background reconciliation; only restore preparation retains its status fence.
+The corrected v1-to-v2 run observed migration and promotion with zero health,
+status, or query errors. All three status samples stayed below 0.9 ms. The
+schema response and first cold query both took approximately 2.01 seconds,
+which identified one final synchronous coupling: the HTTP handler drove up to
+three metadata rounds after successfully enqueueing reconciliation. A
+provisioned background owner now skips those rounds and returns after enqueue;
+embedded/direct sources retain their synchronous update and round-driving
+contract. The final availability acceptance reruns the same v2-to-v3 fixture
+with the rebuilt handler and requires a bounded PUT response plus zero polling
+failures.
+
 ## Result Artifact
 
 Each run should produce one directory containing at least:
