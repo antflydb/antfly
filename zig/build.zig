@@ -574,7 +574,12 @@ fn addOpenSslLeaseTransport(b: *std.Build, mod: *std.Build.Module, target: std.B
     });
     mod.linkSystemLibrary("ssl", .{});
     mod.linkSystemLibrary("crypto", .{});
-    if (target.result.os.tag == .macos) {
+    if (target.result.os.tag == .linux) {
+        // Container builds pass an explicit *-linux-musl target, so Zig does
+        // not implicitly search the native Alpine sysroot.
+        mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+        mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+    } else if (target.result.os.tag == .macos) {
         const prefixes = [_][]const u8{
             "/opt/homebrew/opt/openssl@3",
             "/usr/local/opt/openssl@3",
