@@ -1057,7 +1057,12 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 			continue
 		}
 		plan.DesiredStandbyCount++
-		if !ok {
+		// Standby-local observation errors create a configured status entry even
+		// before the primary owns a replication slot. Runtime-owned portable
+		// seeding activates that slot only at the end of the seed chain, so entry
+		// presence alone must not turn initial bootstrap into ResumeSlot. A typed
+		// primary slot observation carries its required nonzero timeline.
+		if !ok || (haStandbyUsesRuntimeOwnedSeedCapture(standby) && observed.TimelineID == 0) {
 			plan.UnhealthyStandbyCount++
 			seedTargetLSN := initialStandbyLSN(standby, status.PrimaryLSN)
 			if seedTargetLSN == 0 {

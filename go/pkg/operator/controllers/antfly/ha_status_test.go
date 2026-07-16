@@ -1420,10 +1420,6 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 		SeedManifestPath:       "/antflydb/ha/seed-captures/generations/base-standby-a-10/manifest.afha",
 		SeedAlreadyCaptured:    false,
 	}
-	// Keep the synthetic planner fixture in the missing-standby state across the
-	// second reconcile; mergeConfiguredStandbys otherwise creates a placeholder
-	// observation that correctly plans ResumeSlot instead.
-	cluster.Status.HAStatus.Standbys = nil
 	(&AntflyClusterReconciler{}).updateHAStatusAndConditions(cluster)
 	publish := cluster.Status.HAStatus.PlannedActions[1]
 	if publish.SeedManifestPath != "/antflydb/ha/seed-captures/generations/base-standby-a-10/manifest.afha" ||
@@ -1462,6 +1458,82 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 		!strings.Contains(strings.Join(sourceGC.AdminCommand, " "), "artifact gc-source") {
 		t.Fatalf("CAPTURE_ROOT_NOT_GC_BOUND: source GC must use the exact durable capture root, got %#v", sourceGC)
 	}
+}
+
+func TestPlanHAInitialPortableSeedIgnoresSyntheticStandbyStatusUntilPrimarySlotObserved(t *testing.T) {
+	initial := uint64(5)
+	newCluster := func(timelineID uint64) *antflyv1.AntflyCluster {
+		cluster := haCluster()
+		cluster.Spec.Mode = antflyv1.ClusterModeStandalone
+		cluster.Spec.Standalone = &antflyv1.StandaloneSpec{Replicas: 1, NodeID: 7}
+		cluster.Status.HAStatus = &antflyv1.HAStatus{
+			PrimaryLSN: 9,
+			Standbys: []antflyv1.HAStandbyStatus{{
+				Name:       "standby-a",
+				SlotName:   "standby-a",
+				TimelineID: timelineID,
+				Status:     "unreachable",
+				LastError:  "standby Service does not exist yet",
+			}},
+		}
+		cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
+		cluster.Spec.HighAvailability.Identity = &antflyv1.HAReplicationIdentitySpec{
+			ClusterID: 100, TimelineID: 4, Epoch: 6, CurrentPrimaryID: "primary-a",
+		}
+		cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{{
+			Name:       "standby-a",
+			InitialLSN: &initial,
+			AdminURL:   "http://standby-a-ha.default.svc:8081",
+			SeedArtifact: &antflyv1.HASeedArtifactSpec{
+				Location:           "s3://ha-seeds/cluster-a",
+				Generation:         "initial-standby-a-1",
+				StagingRoot:        "/target/.antfly-ha/staging/initial-standby-a-1",
+				TopologyID:         "topology-a",
+				TopologyGeneration: 1,
+				NodeID:             "standby-a",
+				TargetPVCUID:       "pvc-uid-1",
+				SourcePVC: &antflyv1.HASeedArtifactPVCSpec{
+					ClaimName: "primary-a-data",
+					MountPath: "/antflydb",
+				},
+				TargetPVC: &antflyv1.HASeedArtifactPVCSpec{
+					ClaimName: "standby-a-data",
+					MountPath: "/target",
+				},
+			},
+		}}
+		return cluster
+	}
+
+	t.Run("synthetic standby error without primary slot evidence keeps initial seed chain", func(t *testing.T) {
+		cluster := newCluster(0)
+		plan := planHA(cluster)
+		wantKinds := []haActionKind{
+			haActionCaptureSeedArtifact,
+			haActionPublishSeedArtifact,
+			haActionGCSourceSeedGenerations,
+			haActionRestoreSeedArtifact,
+			haActionActivateSeedArtifact,
+			haActionActivateSeededSlot,
+			haActionGCTargetSeedGenerations,
+			haActionPruneSeedArtifacts,
+		}
+		gotKinds := make([]haActionKind, len(plan.Actions))
+		for i := range plan.Actions {
+			gotKinds[i] = plan.Actions[i].Kind
+		}
+		if !reflect.DeepEqual(gotKinds, wantKinds) {
+			t.Fatalf("PREMATURE_RESUME_SLOT: initial portable seed requires %v before a primary slot exists, got %v (%#v)", wantKinds, gotKinds, plan.Actions)
+		}
+	})
+
+	t.Run("primary observed inactive slot still resumes", func(t *testing.T) {
+		cluster := newCluster(4)
+		plan := planHA(cluster)
+		if len(plan.Actions) != 1 || plan.Actions[0].Kind != haActionResumeSlot {
+			t.Fatalf("expected a genuine primary-observed inactive slot to resume, got %#v", plan.Actions)
+		}
+	})
 }
 
 func TestPlanHAUsesExplicitExactSeedArtifactGenerationAcrossChangingLSN(t *testing.T) {
