@@ -23100,12 +23100,12 @@ test "provisioned table write cache retires stale db when index metadata changes
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), write_cache.table_metadata.items.len);
     try std.testing.expect(first.db.core.index_manager.textIndex("first_idx") != null);
+    const initial_cache_stats = write_cache.cacheStats();
 
     Catalog.indexes_json_buf = "{\"second_idx\":{\"type\":\"full_text\",\"field\":\"body\"}}";
 
     try std.testing.expectError(error.LsmRootWriterAlreadyOpen, write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs"));
 
-    const first_entry = first.entry.?;
     first.deinit(alloc);
     first_released = true;
     write_cache.drainPendingClosesForGroupTable(7001, "docs");
@@ -23115,7 +23115,9 @@ test "provisioned table write cache retires stale db when index metadata changes
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), write_cache.table_metadata.items.len);
-    try std.testing.expect(second.entry.? != first_entry);
+    const refreshed_cache_stats = write_cache.cacheStats();
+    try std.testing.expectEqual(initial_cache_stats.hit_count, refreshed_cache_stats.hit_count);
+    try std.testing.expectEqual(initial_cache_stats.miss_count + 1, refreshed_cache_stats.miss_count);
     try std.testing.expect(second.db.core.index_manager.textIndex("second_idx") != null);
     try std.testing.expect(second.db.core.index_manager.textIndex("first_idx") == null);
 }

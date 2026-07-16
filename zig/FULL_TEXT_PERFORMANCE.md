@@ -2813,9 +2813,28 @@ which identified one final synchronous coupling: the HTTP handler drove up to
 three metadata rounds after successfully enqueueing reconciliation. A
 provisioned background owner now skips those rounds and returns after enqueue;
 embedded/direct sources retain their synchronous update and round-driving
-contract. The final availability acceptance reruns the same v2-to-v3 fixture
-with the rebuilt handler and requires a bounded PUT response plus zero polling
-failures.
+contract. The final v2-to-v3 availability acceptance also completed with zero
+health, status, or query failures. Health peaked at 6.1 ms, table status at
+0.93 ms, the schema PUT at 3.78 seconds, and the first cold query at 3.80
+seconds. Removing the explicit post-enqueue rounds did not reduce the local
+schema response, locating the remaining delay in committed metadata projection
+and the cold owner handoff rather than the listener or event loop. Returning a
+subsecond asynchronous schema job would be a separate API-contract change;
+the current PUT continues to guarantee metadata projection before success.
+
+The first full-corpus persistent-HTTP concurrency run then exposed a separate
+native lifetime bug. Concurrency 1, 2, and 4 completed without errors, but the
+process crashed 3.5 seconds into the 8-client/200-RPS mixed read/write point.
+The macOS crash report recorded `EXC_BAD_ACCESS` at address `0x15` while
+`IndexSnapshot.termDocFreq` grew its hash-map cache. The public accept loop was
+normally blocked in `accept`; a worker's SIGSEGV terminated the whole process.
+Full-text projection can publish a replacement snapshot independently of a
+query, but the query executor had borrowed the old pointer without retaining
+it. Production text searches, structured-filter executions, and distributed
+term-stat collection now acquire and release a ref-counted snapshot for their
+complete operation. The failed run is diagnostic only; the server comparison
+is accepted only after the same mixed-load point and then the complete matrix,
+freshness, and recovery gates pass with the rebuilt binary.
 
 ## Result Artifact
 
