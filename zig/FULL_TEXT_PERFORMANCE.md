@@ -686,7 +686,7 @@ correctness, index-size, RSS, and query-class regression gates.
 - [x] Add searchable-freshness markers.
 - [x] Define and implement durability-profile manifests.
 - [x] Add graceful/crash restart and recovery measurements.
-- [ ] Compare Antfly with a normal server comparator such as Quickwit.
+- [x] Compare Antfly with a normal server comparator such as Quickwit.
 
 Exit gate: the public report clearly separates kernel results from product
 results and includes throughput, tail latency, freshness, durability, memory,
@@ -2835,6 +2835,46 @@ term-stat collection now acquire and release a ref-counted snapshot for their
 complete operation. The failed run is diagnostic only; the server comparison
 is accepted only after the same mixed-load point and then the complete matrix,
 freshness, and recovery gates pass with the rebuilt binary.
+
+The rebuilt ReleaseFast server passed that acceptance gate on the preserved
+5,032,105-document corpus. The exact former crash point delivered all 6,000
+requests at 200 RPS with zero search or write errors; p50/p95/p99 end-to-end
+latency was 1.82/2.15/2.70 ms and mean server CPU was 31.9%. The subsequent
+seven-point run also had zero errors at every level and sustained the complete
+25, 50, 100, 200, 400, 800, and 1,200 RPS schedule. At 1,200 RPS Antfly
+delivered 1,199.7 RPS with 0.81/3.05/20.74 ms p50/p95/p99 and 152.8% mean
+server CPU. The archived Quickwit run delivered 1,198.5 RPS at the same point
+with 9.90/53.79/92.33 ms and 900.1% CPU. At the 25-RPS endpoint Antfly used
+4.5% CPU with 5.88/6.13/6.49 ms latency versus Quickwit's 25.4% and
+13.92/18.53/20.67 ms. These are product/server results, not replacements for
+the kernel query-class comparison.
+
+Five Antfly searchable-freshness probes completed in 36.9--89.2 ms with a
+68.0 ms median, versus Quickwit's archived 60.2-second median. Graceful restart
+through first successful search took 0.99 seconds and crash restart took 0.48
+seconds, versus 2.33 and 1.31 seconds respectively for Quickwit. Antfly's full
+data directory remained approximately 10.14 GB because it includes the 6.54 GB
+primary product LSM in addition to the 3.60 GB full-text artifact; Quickwit's
+6.54 GB directory is approximately equal published-split and rebuildable-cache
+copies with source storage disabled. These totals have different product
+boundaries and are reported with their component inventories rather than
+compared as equivalent index sizes.
+
+Memory is the remaining server-level loss. Antfly peak RSS ranged from 2.22 to
+2.25 GiB across the sweep, versus Quickwit's 305--598 MiB. On macOS Antfly's
+current physical footprint at the RSS samples was only 602--622 MiB and its
+lifetime peak footprint was 972 MiB: RSS includes reclaimable clean pages from
+the 3.60 GB file-backed segment mapping. Even so, allocator-zone samples
+reported roughly 721 MiB reserved and 926--990 MiB summed live bytes (zone
+enumeration can overlap), so the gap cannot be dismissed as mmap accounting
+alone. ResourceManager currently charges every touched segment's entire
+mapping to `full_text.segment_residency`; a term query touches all ten segments,
+keeps each conservatively recent, and therefore leaves the slice at 3.60 GB
+against a 1.50/2.00 GiB soft/hard budget even though physical footprint is much
+lower. Follow-up memory work must measure per-section/page residency or use
+bounded post-query clean-page eviction, and separately attribute allocator
+zones, while preserving the accepted latency/CPU curve. Whole-segment eviction
+on every query is not accepted without page-in, CPU, and tail-latency evidence.
 
 ## Result Artifact
 

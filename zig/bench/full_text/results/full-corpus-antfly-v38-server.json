@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "status": "accepted_full_corpus_server_run",
+  "engine": "antfly-v38-final-installed",
+  "boundary": "persistent_http_server_process_durable_mixed_workload",
+  "source_artifact": {
+    "path": "/private/tmp/antfly-v38-final-installed-server-benchmark",
+    "manifest_sha256": "3f7cc3debc115d83e77337ad7fd1fa0864d71151bc5dee6276dc49430bc9a0dc",
+    "summary_sha256": "62dac898419cc09874f54fec075f7618a55810f62ce177744058e0aaa206adc0",
+    "loads_sha256": "9883d4ee83e8f1d4cda9b1b0102200d53f04194d354a1f5853782be70b5cc74c",
+    "freshness_sha256": "f912c2d41526743a4ec0863eebfefb3c289f84208fcf66a68997c3d9424033ba",
+    "recovery_sha256": "ce6efdc67f8d3ce8e2b772238da6fc9dc29fbddffcdc44f47653e7bf9151ce67"
+  },
+  "corpus": {
+    "documents": 5032105,
+    "full_text_segment_bytes": 3599478976,
+    "full_text_segments": 10,
+    "semantic_counts": {
+      "match_all": 5032105,
+      "alpha": 15753,
+      "alpha_beta_phrase": 525
+    }
+  },
+  "configuration": {
+    "durability_profile": "process-durable",
+    "write_fraction": 0.01,
+    "duration_seconds_per_level": 30,
+    "persistent_http": true,
+    "load_model": "open_loop_scheduled_end_to_end_latency",
+    "response": "ids_only_count_false"
+  },
+  "disk_bytes": {
+    "full_data_directory_before_workload": 10142328927,
+    "full_data_directory_after_workload": 10142625320,
+    "full_text_segments": 3599478976,
+    "primary_lsm_runs_before_workload": 6542536480,
+    "note": "The full directory includes the primary product LSM and full-text index; compare the full-text component separately with source-disabled servers."
+  },
+  "mixed_loads": [
+    {"concurrency":1,"offered_rps":25,"achieved_rps":25,"errors":0,"p50_ns":5884042,"p95_ns":6130375,"p99_ns":6490000,"server_cpu_mean_percent":4.5224,"peak_rss_bytes":2326822912},
+    {"concurrency":2,"offered_rps":50,"achieved_rps":50,"errors":0,"p50_ns":4815291,"p95_ns":5728458,"p99_ns":5997666,"server_cpu_mean_percent":8.0483,"peak_rss_bytes":2328018944},
+    {"concurrency":4,"offered_rps":100,"achieved_rps":100,"errors":0,"p50_ns":2769666,"p95_ns":3250083,"p99_ns":3534083,"server_cpu_mean_percent":15.9220,"peak_rss_bytes":2327740416},
+    {"concurrency":8,"offered_rps":200,"achieved_rps":200,"errors":0,"p50_ns":1711333,"p95_ns":2001333,"p99_ns":2442375,"server_cpu_mean_percent":30.1414,"peak_rss_bytes":2336407552},
+    {"concurrency":16,"offered_rps":400,"achieved_rps":400,"errors":0,"p50_ns":1153375,"p95_ns":1390459,"p99_ns":1934250,"server_cpu_mean_percent":57.4746,"peak_rss_bytes":2340913152},
+    {"concurrency":32,"offered_rps":800,"achieved_rps":799.988176,"errors":0,"p50_ns":907875,"p95_ns":1732708,"p99_ns":21859375,"server_cpu_mean_percent":124.6695,"peak_rss_bytes":2346352640},
+    {"concurrency":64,"offered_rps":1200,"achieved_rps":1199.687978,"errors":0,"p50_ns":812084,"p95_ns":3051834,"p99_ns":20743459,"server_cpu_mean_percent":152.8051,"peak_rss_bytes":2358804480}
+  ],
+  "memory": {
+    "rss_peak_range_bytes": [2326822912, 2358804480],
+    "physical_footprint_at_rss_sample_range_bytes": [631360968, 652497048],
+    "lifetime_peak_physical_footprint_bytes": 1019578984,
+    "mapped_full_text_segment_bytes": 3599479008,
+    "resource_manager_full_text_residency_soft_limit_bytes": 1610612736,
+    "resource_manager_full_text_residency_hard_limit_bytes": 2147483648,
+    "note": "RSS includes reclaimable clean file-backed pages; physical footprint and allocator-zone attribution must be reported alongside it."
+  },
+  "freshness_ns": {
+    "samples": 5,
+    "values": [36850875, 67957250, 89186334, 66547916, 79338791],
+    "p50": 67957250,
+    "max": 89186334
+  },
+  "recovery": {
+    "graceful_seconds_through_first_search": 0.991986958,
+    "crash_seconds_through_first_search": 0.476437125,
+    "graceful_first_search_ns": 387088417,
+    "crash_first_search_ns": 335977208
+  },
+  "comparison": {
+    "quickwit_artifact": "bench/full_text/results/full-corpus-quickwit-0.8.2-server-v2.json",
+    "result": "Antfly wins latency, CPU, searchable freshness, and recovery at this boundary; Quickwit wins RSS. Index and full-directory sizes require the documented component normalization."
+  }
+}
