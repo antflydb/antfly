@@ -8787,6 +8787,9 @@ pub const IndexManager = struct {
                     self.text_merge_scheduler.deferred_for_pressure += 1;
                     return null;
                 },
+                // Replay owns this index right now. Keep its pending bit set
+                // and give another index a chance in this scheduler pass.
+                error.IndexApplyBusy => continue,
                 else => return err,
             };
             if (maybe_task) |task| return task;
@@ -8809,7 +8812,12 @@ pub const IndexManager = struct {
             )
         else
             PhaseTrackingAllocator.init(alloc, &alloc_stats);
-        if (task.persistent.prepareMergedSegmentToFileWithAllocator(tracking.allocator(), task.snapshot, task.merge_indices)) |prepared| {
+        const task_alloc = tracking.allocator();
+        const deleted_docs = try task_alloc.alloc(?roaring.RoaringBitmap, task.source.len);
+        defer task_alloc.free(deleted_docs);
+        for (task.source, 0..) |source, i| deleted_docs[i] = source.deleted;
+
+        if (task.persistent.prepareMergedSegmentToFileWithAllocatorAndDeletes(task_alloc, task.snapshot, task.merge_indices, deleted_docs)) |prepared| {
             var output_bytes: u64 = 0;
             for (prepared) |*segment| output_bytes +|= @intCast(segment.data.bytes().len);
             logTextMergeTaskMemory("after_build", task, output_bytes);
@@ -8838,6 +8846,7 @@ pub const IndexManager = struct {
 
         const merged = merger_mod.mergeSegmentsBounded(tracking.allocator(), task.snapshot, task.merge_indices, .{
             .target_segment_bytes = @intCast(activeTextMergePolicy().max_segment_size),
+            .deleted_docs = deleted_docs,
         }) catch |err| {
             if (tracking.limit_exceeded) return error.ResourceBudgetExceeded;
             if (err == error.EmptySegment) return .{
@@ -8893,14 +8902,24 @@ pub const IndexManager = struct {
             }
             return false;
         }
+
+        const old_ids = try textMergeSourceIds(self.alloc, task.source);
+        defer self.alloc.free(old_ids);
+
+        // Replay mutates SegmentShared.deleted while holding this same
+        // per-index mutex. Reacquire it only for validation and publication;
+        // executeTextMergeTask uses the task-owned clones and runs unlocked.
+        lockAtomicWithBackoff(entry.apply_mutex);
+        var index_apply_locked = true;
+        defer if (index_apply_locked) entry.apply_mutex.unlock();
         if (!try self.textMergeSourceStillCurrent(entry, task)) {
+            entry.apply_mutex.unlock();
+            index_apply_locked = false;
             self.text_merge_scheduler.skipped_stale_merges += 1;
             TextMergeScheduler.schedule(entry);
             return false;
         }
 
-        const old_ids = try textMergeSourceIds(self.alloc, task.source);
-        defer self.alloc.free(old_ids);
         const input_bytes = textMergeTaskInputBytes(task);
         const output_stats = textMergeResultOutputStats(result);
         const applied = if (result.prepared_segments.len == 0 and result.segments.len == 0) blk: {
@@ -8931,6 +8950,8 @@ pub const IndexManager = struct {
                 },
             };
         };
+        entry.apply_mutex.unlock();
+        index_apply_locked = false;
 
         if (applied and !try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy())) {
             TextMergeScheduler.noteComplete(entry);
@@ -8968,6 +8989,17 @@ pub const IndexManager = struct {
     }
 
     fn beginTextMergeTaskForEntry(self: *IndexManager, entry: *TextIndex) !?TextMergeTask {
+        // Full-text replay holds this mutex while changing the shared deletion
+        // bitmap. Keep planning and cloning in one short critical section so a
+        // task can never observe RoaringBitmap.add() between its key and
+        // container insertions. The returned task owns the clones, so the
+        // expensive merge itself does not retain the mutex.
+        // The background runtime reaches this point while holding the DB apply
+        // lock. Do not wait there behind an active replay batch: leave the
+        // index scheduled and let replay's completion notification retry it.
+        if (!entry.apply_mutex.tryLock()) return error.IndexApplyBusy;
+        defer entry.apply_mutex.unlock();
+
         const snap = entry.persistent.acquireSnapshot();
         defer snap.release();
         if (snap.segments.len < 2) return null;
@@ -20983,6 +21015,13 @@ test "text merge task skips stale source after concurrent delete" {
     try std.testing.expect(pending_stats.pending_segments >= 12);
     try std.testing.expect(pending_stats.pending_bytes > 0);
 
+    const text_entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
+    try std.testing.expect(text_entry.apply_mutex.tryLock());
+    const busy_task = try manager.beginTextMergeTask();
+    text_entry.apply_mutex.unlock();
+    try std.testing.expect(busy_task == null);
+    try std.testing.expect(text_entry.compaction_pending);
+
     var task = (try manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
     defer task.deinit(alloc);
     const in_flight_stats = manager.textMergeStats();
@@ -20991,10 +21030,29 @@ test "text merge task skips stale source after concurrent delete" {
 
     const stale_segment = &task.snapshot.segments[task.merge_indices[0]];
     const stale_doc = stale_segment.reader.storedDoc(0) orelse return error.TestUnexpectedResult;
+    var frozen_live_docs: u32 = 0;
+    for (task.source, task.merge_indices) |source, seg_idx| {
+        const deleted_count: u32 = if (source.deleted) |deleted| @intCast(deleted.cardinality()) else 0;
+        frozen_live_docs += task.snapshot.segments[seg_idx].reader.doc_count - deleted_count;
+    }
     try manager.deleteTextBatchByNameWithOptions("ft_v1", &.{stale_doc.id}, opts);
 
     var result = try IndexManager.executeTextMergeTask(alloc, &task);
     defer result.deinit(alloc);
+    var merged_docs: u32 = 0;
+    for (result.prepared_segments) |*prepared| {
+        var reader = try segment_mod.SegmentReader.init(alloc, prepared.data.bytes());
+        defer reader.deinit();
+        merged_docs += reader.doc_count;
+    }
+    for (result.segments) |segment_bytes| {
+        var reader = try segment_mod.SegmentReader.init(alloc, segment_bytes);
+        defer reader.deinit();
+        merged_docs += reader.doc_count;
+    }
+    // The build ran after the live bitmap changed, but it consumed the frozen
+    // task view. Publication must reject that now-stale view below.
+    try std.testing.expectEqual(frozen_live_docs, merged_docs);
     const applied = try manager.finishTextMergeTask(&task, &result);
     try std.testing.expect(!applied);
     const stale_stats = manager.textMergeStats();
@@ -21002,9 +21060,8 @@ test "text merge task skips stale source after concurrent delete" {
     try std.testing.expectEqual(@as(u64, 0), stale_stats.in_flight_segments);
     try std.testing.expectEqual(@as(u64, 1), stale_stats.skipped_stale_merges);
 
-    const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
-    try std.testing.expect(entry.compaction_pending);
-    try std.testing.expect(entry.persistent.snapshot().segments.len >= 12);
+    try std.testing.expect(text_entry.compaction_pending);
+    try std.testing.expect(text_entry.persistent.snapshot().segments.len >= 12);
 }
 
 test "text merge task retires all-deleted file-backed inputs" {

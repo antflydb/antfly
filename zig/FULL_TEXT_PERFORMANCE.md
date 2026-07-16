@@ -2960,6 +2960,33 @@ platform-specific tuning merely to improve one RSS sample.
 Exact evidence and source-artifact hashes are checked in as
 `bench/full_text/results/full-corpus-v38-primary-cache-memory-qualification.json`.
 
+### Full-text deletion snapshot synchronization
+
+A concurrent counter workload exposed a pre-existing lock mismatch made more
+observable by the new background compaction schedule. Full-text replay mutates
+each segment's shared Roaring deletion bitmap while holding the per-index apply
+mutex. Merge-task creation previously held only the DB apply lock while cloning
+that bitmap. Because `RoaringBitmap.add()` publishes its key and container in
+separate steps, the clone could observe unequal arrays and panic. A defensive
+length check in the bitmap codec would merely hide the race and could construct
+an incorrect deletion view.
+
+Background task creation now tries the same per-index apply mutex before reading
+deletion cardinalities or cloning deletion metadata. If replay is active, the
+scheduler leaves the index pending and tries another index rather than waiting
+while holding the DB-wide lock. The mutex is released before any segment merge
+work. Execution consumes the task-owned bitmap clones instead of rereading the
+mutable shared bitmaps; this is necessary for logical consistency as well as
+memory safety. Publication reacquires the per-index mutex, validates the frozen
+source view, atomically replaces the active segments only if it is still
+current, and releases the mutex before scheduler accounting.
+
+The stale-source regression now proves all three properties: a busy per-index
+mutex defers task creation without losing merge debt, a deletion applied after
+task creation does not change the already-running merge's frozen input, and the
+result is rejected at publication as stale. The expensive merge remains fully
+concurrent with indexing.
+
 ### Final direct kernel qualification
 
 The final runner audit compared the accepted v38 Antfly index directly with the

@@ -1881,7 +1881,23 @@ pub const PersistentIndex = struct {
         snap: *const index_mod.IndexSnapshot,
         segment_indices: []const usize,
     ) ![]PreparedMergeSegment {
+        return try self.prepareMergedSegmentToFileWithAllocatorAndDeletes(work_alloc, snap, segment_indices, null);
+    }
+
+    /// Prepare a file-backed merge against an immutable, task-owned deletion
+    /// view. The optional slice is aligned with `segment_indices`; callers may
+    /// therefore release their mutation lock while segment bytes are merged.
+    pub fn prepareMergedSegmentToFileWithAllocatorAndDeletes(
+        self: *PersistentIndex,
+        work_alloc: Allocator,
+        snap: *const index_mod.IndexSnapshot,
+        segment_indices: []const usize,
+        deleted_docs: ?[]const ?roaring.RoaringBitmap,
+    ) ![]PreparedMergeSegment {
         if (segment_indices.len == 0) return error.NoSegments;
+        if (deleted_docs) |frozen| {
+            if (frozen.len != segment_indices.len) return error.InvalidDeletionSnapshot;
+        }
         const store = &(self.segment_files orelse return error.Unsupported);
         if (store.storage_owner == null) return error.Unsupported;
 
@@ -1894,7 +1910,7 @@ pub const PersistentIndex = struct {
             const seg = &snap.segments[seg_idx];
             inputs[i] = .{
                 .reader = &seg.reader,
-                .deleted = seg.shared.deleted,
+                .deleted = if (deleted_docs) |frozen| frozen[i] else seg.shared.deleted,
             };
         }
         const index_sort = try segment_mod.commonIndexSortForMergeInputsAlloc(work_alloc, inputs);
