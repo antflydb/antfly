@@ -24301,6 +24301,34 @@ fn graphAssetStateKeyAlloc(alloc: Allocator, doc_key: []const u8, index_name: []
     return try list.toOwnedSlice(alloc);
 }
 
+const graph_state_name_magic = "GSN1";
+
+fn appendGraphStateNameComponent(list: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: []const u8) !void {
+    if (value.len > std.math.maxInt(u32)) return error.GraphStateNameComponentTooLarge;
+    var len_bytes: [@sizeOf(u32)]u8 = undefined;
+    std.mem.writeInt(u32, &len_bytes, @intCast(value.len), .big);
+    try list.appendSlice(alloc, &len_bytes);
+    try list.appendSlice(alloc, value);
+}
+
+fn initGraphStateName(alloc: Allocator, source_artifact: []const u8) !std.ArrayListUnmanaged(u8) {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    errdefer list.deinit(alloc);
+    try list.appendSlice(alloc, graph_state_name_magic);
+    try appendGraphStateNameComponent(&list, alloc, source_artifact);
+    return list;
+}
+
+fn graphStateNameSourceArtifact(state_name: []const u8) !?[]const u8 {
+    if (!std.mem.startsWith(u8, state_name, graph_state_name_magic)) return null;
+    var pos: usize = graph_state_name_magic.len;
+    if (state_name.len - pos < @sizeOf(u32)) return error.InvalidGraphStateName;
+    const name_len = std.mem.readInt(u32, state_name[pos..][0..@sizeOf(u32)], .big);
+    pos += @sizeOf(u32);
+    if (name_len > state_name.len - pos) return error.InvalidGraphStateName;
+    return state_name[pos..][0..name_len];
+}
+
 fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, generation: u64, writes: []const docstore_mod.KVPair) ![]u8 {
     return try graph_asset_state.encodeAlloc(alloc, generation, writes);
 }
@@ -24398,11 +24426,73 @@ fn graphStateSourcePriorityAlloc(
     const terminator = internal_keys.findComponentTerminator(state_key, state_prefix.len) orelse return null;
     const state_name = try internal_keys.decodeBodyAlloc(alloc, state_key[state_prefix.len..terminator]);
     defer alloc.free(state_name);
-    const artifact_name = if (std.mem.indexOfScalar(u8, state_name, '\x1f')) |end| state_name[0..end] else state_name;
-    for (sources, 0..) |source, i| {
-        if (std.mem.eql(u8, source.artifact_name, artifact_name)) return i;
+
+    if (try graphStateNameSourceArtifact(state_name)) |artifact_name| {
+        for (sources, 0..) |source, i| {
+            if (std.mem.eql(u8, source.artifact_name, artifact_name)) return i;
+        }
+        return null;
     }
-    return null;
+
+    // Read pre-versioned branch-local state defensively. New state names use a
+    // length-prefixed tuple above and therefore cannot be ambiguous. Longest
+    // matching here avoids truncating names containing the historical US
+    // separator while old state is naturally replaced by replay.
+    var best: ?usize = null;
+    var best_len: usize = 0;
+    for (sources, 0..) |source, i| {
+        if (source.artifact_name.len < best_len or !std.mem.startsWith(u8, state_name, source.artifact_name)) continue;
+        const boundary_matches = source.artifact_name.len == state_name.len or
+            (source.artifact_name.len < state_name.len and state_name[source.artifact_name.len] == '\x1f');
+        if (!boundary_matches) continue;
+        if (best == null or source.artifact_name.len > best_len) {
+            best = i;
+            best_len = source.artifact_name.len;
+        }
+    }
+    return best;
+}
+
+test "graph state source priority preserves embedded separators and prefix names" {
+    const alloc = std.testing.allocator;
+    const sources = [_]index_manager_mod.GraphArtifactSource{
+        .{ .artifact_name = @constCast("relations") },
+        .{ .artifact_name = @constCast("relations\x1fregional") },
+    };
+    const prefix = try internal_keys.graphAssetStateIndexPrefixAlloc(alloc, "doc:a", "relations_graph");
+    defer alloc.free(prefix);
+
+    var exact_ref = types.ArtifactRef{
+        .document_id = @constCast("doc:a"),
+        .name = @constCast("relations\x1fregional"),
+        .kind = .asset,
+    };
+    const exact_name = try graphArtifactStateNameAlloc(alloc, exact_ref);
+    defer alloc.free(exact_name);
+    const exact_key = try graphAssetStateKeyAlloc(alloc, "doc:a", "relations_graph", exact_name);
+    defer alloc.free(exact_key);
+    try std.testing.expectEqual(@as(?usize, 1), try graphStateSourcePriorityAlloc(alloc, exact_key, prefix, &sources));
+
+    exact_ref.unit_id = @constCast("unit-a");
+    const derived_name = try graphArtifactStateNameAlloc(alloc, exact_ref);
+    defer alloc.free(derived_name);
+    const derived_key = try graphAssetStateKeyAlloc(alloc, "doc:a", "relations_graph", derived_name);
+    defer alloc.free(derived_key);
+    try std.testing.expectEqual(@as(?usize, 1), try graphStateSourcePriorityAlloc(alloc, derived_key, prefix, &sources));
+
+    const mention_name = try mentionGraphStateNameAlloc(alloc, "relations\x1fregional", "entity_resolution_v1");
+    defer alloc.free(mention_name);
+    const mention_key = try graphAssetStateKeyAlloc(alloc, "doc:a", "relations_graph", mention_name);
+    defer alloc.free(mention_key);
+    try std.testing.expectEqual(@as(?usize, 1), try graphStateSourcePriorityAlloc(alloc, mention_key, prefix, &sources));
+
+    const mention_artifact_name = try mentionArtifactStateNameAlloc(alloc, "relations\x1fregional", "entity_resolution_v1");
+    defer alloc.free(mention_artifact_name);
+    const mention_artifact_key = try graphAssetStateKeyAlloc(alloc, "doc:a", "relations_graph", mention_artifact_name);
+    defer alloc.free(mention_artifact_key);
+    try std.testing.expectEqual(@as(?usize, 1), try graphStateSourcePriorityAlloc(alloc, mention_artifact_key, prefix, &sources));
+
+    try std.testing.expect(!std.mem.eql(u8, exact_name, "relations\x1fregional"));
 }
 
 fn loadGraphEdgeWinners(
@@ -26655,22 +26745,19 @@ fn graphArtifactRefUsesDocumentWideFallback(artifact_ref: types.ArtifactRef) boo
 }
 
 fn graphArtifactStateNameAlloc(alloc: Allocator, artifact_ref: types.ArtifactRef) ![]u8 {
-    if (graphArtifactRefUsesDocumentWideFallback(artifact_ref)) return try alloc.dupe(u8, artifact_ref.name);
-    var list = std.ArrayListUnmanaged(u8).empty;
+    var list = try initGraphStateName(alloc, artifact_ref.name);
     errdefer list.deinit(alloc);
-    try list.appendSlice(alloc, artifact_ref.name);
-    try list.append(alloc, '\x1f');
-    try list.appendSlice(alloc, @tagName(artifact_ref.kind));
+    try appendGraphStateNameComponent(&list, alloc, "artifact");
+    try appendGraphStateNameComponent(&list, alloc, @tagName(artifact_ref.kind));
     if (artifact_ref.unit_id) |unit_id| {
-        try list.append(alloc, '\x1f');
-        try list.appendSlice(alloc, "unit:");
-        try list.appendSlice(alloc, unit_id);
+        try appendGraphStateNameComponent(&list, alloc, "unit");
+        try appendGraphStateNameComponent(&list, alloc, unit_id);
     }
     if (artifact_ref.chunk_id) |chunk_id| {
-        const chunk_part = try std.fmt.allocPrint(alloc, "chunk:{d}", .{chunk_id});
-        defer alloc.free(chunk_part);
-        try list.append(alloc, '\x1f');
-        try list.appendSlice(alloc, chunk_part);
+        var chunk_bytes: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &chunk_bytes, chunk_id, .big);
+        try appendGraphStateNameComponent(&list, alloc, "chunk");
+        try appendGraphStateNameComponent(&list, alloc, &chunk_bytes);
     }
     if (artifact_ref.source) |source| {
         const source_key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, .{
@@ -26681,9 +26768,8 @@ fn graphArtifactStateNameAlloc(alloc: Allocator, artifact_ref: types.ArtifactRef
             .unit_id = source.unit_id,
         });
         defer alloc.free(source_key);
-        try list.append(alloc, '\x1f');
-        try list.appendSlice(alloc, "source:");
-        try list.appendSlice(alloc, source_key);
+        try appendGraphStateNameComponent(&list, alloc, "source");
+        try appendGraphStateNameComponent(&list, alloc, source_key);
     }
     return try list.toOwnedSlice(alloc);
 }
@@ -31924,11 +32010,19 @@ fn resolverConfigForResolutionArtifact(
 }
 
 fn mentionGraphStateNameAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}\x1fresolution_mentions\x1f{s}", .{ source_artifact, resolution_artifact });
+    var list = try initGraphStateName(alloc, source_artifact);
+    errdefer list.deinit(alloc);
+    try appendGraphStateNameComponent(&list, alloc, "resolution_mentions");
+    try appendGraphStateNameComponent(&list, alloc, resolution_artifact);
+    return try list.toOwnedSlice(alloc);
 }
 
 fn mentionArtifactStateNameAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}\x1fresolution_mention_artifacts\x1f{s}", .{ source_artifact, resolution_artifact });
+    var list = try initGraphStateName(alloc, source_artifact);
+    errdefer list.deinit(alloc);
+    try appendGraphStateNameComponent(&list, alloc, "resolution_mention_artifacts");
+    try appendGraphStateNameComponent(&list, alloc, resolution_artifact);
+    return try list.toOwnedSlice(alloc);
 }
 
 fn resolutionMentionArtifactNameAlloc(
@@ -43128,7 +43222,13 @@ test "db graph delete and recreate fences stale materialized edges" {
 
     const stale_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
     defer alloc.free(stale_key);
-    const stale_state_key = try graphAssetStateKeyAlloc(alloc, "doc:a", "relations_graph", "relations_v1");
+    const stale_state_name = try graphArtifactStateNameAlloc(alloc, .{
+        .document_id = @constCast("doc:a"),
+        .name = @constCast("relations_v1"),
+        .kind = .asset,
+    });
+    defer alloc.free(stale_state_name);
+    const stale_state_key = try graphAssetStateKeyAlloc(alloc, "doc:a", "relations_graph", stale_state_name);
     defer alloc.free(stale_state_key);
     {
         const raw = try db.core.store.get(alloc, stale_key);
@@ -43761,7 +43861,13 @@ test "db async asset producer mention edges come from resolution artifacts" {
     defer graph_mod.GraphIndex.freeEdges(alloc, deterministic_edges);
     try std.testing.expectEqual(@as(usize, 0), deterministic_edges.len);
 
-    const relation_state_key = try graphAssetStateKeyAlloc(alloc, "doc:a", "prov_graph", "relations_v1");
+    const relation_state_name = try graphArtifactStateNameAlloc(alloc, .{
+        .document_id = @constCast("doc:a"),
+        .name = @constCast("relations_v1"),
+        .kind = .asset,
+    });
+    defer alloc.free(relation_state_name);
+    const relation_state_key = try graphAssetStateKeyAlloc(alloc, "doc:a", "prov_graph", relation_state_name);
     defer alloc.free(relation_state_key);
     try db.core.store.delete(relation_state_key);
 
@@ -47387,6 +47493,117 @@ test "db target coverage rebuild restores every embedding source member" {
     try std.testing.expectEqual(@as(u64, 2), db.core.index_manager.denseIndex("document_vectors").?.index.stats().active_count);
     try std.testing.expectEqual(@as(usize, 2), try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(db.async_context, "document_sparse", 16));
     try std.testing.expectEqual(@as(u64, 2), db.core.index_manager.sparseIndex("document_sparse").?.index.stats().doc_count);
+}
+
+test "db vector indexes support mixed direct and chunk-backed artifact sources" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "body_chunks_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunk_size = 64,
+    });
+    for ([_]types.EnrichmentConfig{
+        .{ .name = "title_dense_v1", .kind = .embedding, .field = "title", .expected_dims = 2, .vector_space = "test:mixed-dense-v1" },
+        .{ .name = "body_dense_v1", .kind = .embedding, .field = "text", .source_artifact_name = "body_chunks_v1", .expected_dims = 2, .vector_space = "test:mixed-dense-v1" },
+        .{ .name = "title_sparse_v1", .kind = .embedding, .field = "title", .vector_space = "test:mixed-sparse-v1" },
+        .{ .name = "body_sparse_v1", .kind = .embedding, .field = "text", .source_artifact_name = "body_chunks_v1", .vector_space = "test:mixed-sparse-v1" },
+    }) |cfg| try db.addEnrichment(cfg);
+
+    try db.addIndex(.{
+        .name = "mixed_dense",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"sources\":[{\"artifact\":\"title_dense_v1\"},{\"artifact\":\"body_dense_v1\"}]}",
+    });
+    try db.addIndex(.{
+        .name = "mixed_sparse",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"embedding\",\"sources\":[{\"artifact\":\"title_sparse_v1\"},{\"artifact\":\"body_sparse_v1\"}]}",
+    });
+
+    // Primary writes establish the normal document identity mapping. The
+    // artifact rows are installed explicitly below so this test exercises the
+    // heterogeneous index consumer independently of inference workers.
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:direct", .value = "{\"title\":\"direct\",\"body\":\"unused\"}" },
+            .{ .key = "doc:chunk", .value = "{\"title\":\"unused\",\"body\":\"chunk\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:chunk", "body_chunks_v1", 0);
+    defer alloc.free(chunk_key);
+    try db.core.store.put(chunk_key, "{\"_parent_doc_key\":\"doc:chunk\",\"text\":\"chunk\"}");
+
+    const direct_dense = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:direct", "title_dense_v1");
+    defer alloc.free(direct_dense);
+    const chunk_dense = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "body_dense_v1");
+    defer alloc.free(chunk_dense);
+    try putDenseEmbeddingArtifactForTest(&db, alloc, direct_dense, null, &.{ 0.0, 0.0 });
+    try putDenseEmbeddingArtifactForTest(&db, alloc, chunk_dense, null, &.{ 0.25, 0.0 });
+
+    const direct_sparse = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:direct", "title_sparse_v1");
+    defer alloc.free(direct_sparse);
+    const chunk_sparse = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "body_sparse_v1");
+    defer alloc.free(chunk_sparse);
+    try putSparseEmbeddingArtifactForTest(&db, alloc, direct_sparse, null, &.{1}, &.{1.0});
+    try putSparseEmbeddingArtifactForTest(&db, alloc, chunk_sparse, null, &.{1}, &.{0.75});
+
+    try std.testing.expectEqual(@as(usize, 2), try rebuildDenseIndexFromStoredEmbeddingArtifactsContext(db.async_context, "mixed_dense", 16));
+    try std.testing.expectEqual(@as(usize, 2), try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(db.async_context, "mixed_sparse", 16));
+
+    var dense = try db.search(alloc, .{
+        .index_name = "mixed_dense",
+        .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 2 } },
+        .limit = 2,
+        .search_effort = 1.0,
+    });
+    defer dense.deinit();
+    try std.testing.expectEqual(@as(usize, 2), dense.hits.len);
+    var dense_has_direct = false;
+    var dense_has_chunk = false;
+    for (dense.hits) |hit| {
+        dense_has_direct = dense_has_direct or std.mem.eql(u8, hit.id, "doc:direct");
+        dense_has_chunk = dense_has_chunk or std.mem.eql(u8, hit.id, "doc:chunk");
+    }
+    try std.testing.expect(dense_has_direct and dense_has_chunk);
+
+    var sparse = try db.search(alloc, .{
+        .index_name = "mixed_sparse",
+        .query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1.0}, .k = 2 } },
+        .limit = 2,
+        .search_effort = 1.0,
+    });
+    defer sparse.deinit();
+    try std.testing.expectEqual(@as(usize, 2), sparse.hits.len);
+    var sparse_has_direct = false;
+    var sparse_has_chunk = false;
+    for (sparse.hits) |hit| {
+        sparse_has_direct = sparse_has_direct or std.mem.eql(u8, hit.id, "doc:direct");
+        sparse_has_chunk = sparse_has_chunk or std.mem.eql(u8, hit.id, "doc:chunk");
+    }
+    try std.testing.expect(sparse_has_direct and sparse_has_chunk);
+
+    const direct_ordinal = blk: {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        break :blk (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:direct")) orelse return error.TestUnexpectedResult;
+    };
+    for (sparse.hits) |hit| {
+        if (std.mem.eql(u8, hit.id, "doc:direct")) try std.testing.expectEqual(@as(?doc_set.DocOrdinal, direct_ordinal), hit.doc_ordinal);
+    }
 }
 
 test "db index repair rebuilds full text index from stored documents" {

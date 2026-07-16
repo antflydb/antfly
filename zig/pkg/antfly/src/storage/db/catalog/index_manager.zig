@@ -8191,7 +8191,6 @@ pub const IndexManager = struct {
                     }
                 }
                 var first_multi_source_embedding: ?*const enrichment_catalog.EnrichmentConfig = null;
-                var multi_source_chunk_backing: ?bool = null;
                 var multi_source_vector_space: ?[]const u8 = null;
                 var multi_source_has_implicit_vector_space = false;
                 var multi_source_implicit_producer: ?[]const u8 = null;
@@ -8214,12 +8213,6 @@ pub const IndexManager = struct {
                                 multi_source_vector_space = embedding_cfg.vector_space;
                             }
                         }
-                    }
-                    const chunk_backed = embedding_cfg.source_artifact_name.len > 0;
-                    if (multi_source_chunk_backing) |expected| {
-                        if (expected != chunk_backed) return error.InvalidIndexConfig;
-                    } else {
-                        multi_source_chunk_backing = chunk_backed;
                     }
                     if (first_multi_source_embedding == null and embedding_cfg.source_artifact_name.len > 0) {
                         first_multi_source_embedding = embedding_cfg;
@@ -8356,7 +8349,6 @@ pub const IndexManager = struct {
                 else
                     null;
                 var first_multi_source_embedding: ?*const enrichment_catalog.EnrichmentConfig = null;
-                var multi_source_chunk_backing: ?bool = null;
                 var multi_source_vector_space: ?[]const u8 = null;
                 var multi_source_has_implicit_vector_space = false;
                 var multi_source_implicit_producer: ?[]const u8 = null;
@@ -8379,12 +8371,6 @@ pub const IndexManager = struct {
                                 multi_source_vector_space = embedding_cfg.vector_space;
                             }
                         }
-                    }
-                    const chunk_backed = embedding_cfg.source_artifact_name.len > 0;
-                    if (multi_source_chunk_backing) |expected| {
-                        if (expected != chunk_backed) return error.InvalidIndexConfig;
-                    } else {
-                        multi_source_chunk_backing = chunk_backed;
                     }
                     if (first_multi_source_embedding == null and embedding_cfg.source_artifact_name.len > 0) {
                         first_multi_source_embedding = embedding_cfg;

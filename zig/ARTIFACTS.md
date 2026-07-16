@@ -509,6 +509,11 @@ for both dense and sparse indexes. Dense sources share dimensions, metric, and
 vector space. Sparse sources share one tokenizer/model token space. Artifact-
 backed indexes have one configuration path in the API and SDKs: `sources`.
 Removed singular aliases are rejected rather than silently normalized.
+Sources in one vector index may mix embeddings produced directly from primary
+documents with embeddings produced from chunk artifacts. Query result shaping
+uses each member's artifact identity, so document return modes collapse chunk
+members to their parent while retaining direct document members in the same
+score-ordered result.
 
 Embedder batching belongs on each matching embedding enrichment. When an index
 declares multiple sources, each producer may use its own `execution` policy;

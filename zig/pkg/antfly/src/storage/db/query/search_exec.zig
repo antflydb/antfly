@@ -12972,7 +12972,12 @@ pub fn searchSparse(
         errdefer alloc.free(hit_id);
         hits[i] = .{
             .id = hit_id,
-            .doc_ordinal = if (chunk_backed or (entry.embedding_names.len > 0 and internal_keys.isChunkArtifactRecordKey(hit_id)))
+            .doc_ordinal = if (entry.embedding_names.len > 0)
+                if (internal_keys.isChunkArtifactRecordKey(hit_id))
+                    try sparseHitParentOrdinal(alloc, executor, hit_id, req.identity_read_generation)
+                else
+                    try sparseHitOrdinal(alloc, executor, hit_id, req.identity_read_generation)
+            else if (chunk_backed)
                 try sparseHitParentOrdinal(alloc, executor, hit_id, req.identity_read_generation)
             else if (sparse_doc_nums_are_ordinals and hit.doc_num != null)
                 hit.doc_num.?
