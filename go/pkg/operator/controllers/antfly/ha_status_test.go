@@ -1527,6 +1527,32 @@ func TestPlanHAInitialPortableSeedIgnoresSyntheticStandbyStatusUntilPrimarySlotO
 		}
 	})
 
+	t.Run("reachable empty primary starts seed at the backup control record", func(t *testing.T) {
+		cluster := newCluster(0)
+		cluster.Spec.HighAvailability.Standbys[0].InitialLSN = nil
+		cluster.Status.HAStatus.PrimaryLSN = 0
+		cluster.Status.HAStatus.PrimaryAdminReachable = true
+		plan := planHA(cluster)
+		if len(plan.Actions) != 8 {
+			t.Fatalf("ZERO_LSN_INITIAL_SEED_DEADLOCK: reachable empty primary must plan the portable seed chain, got %#v", plan.Actions)
+		}
+		for _, action := range plan.Actions {
+			if action.TargetLSN != 1 {
+				t.Fatalf("reachable empty primary must bind %s to backup_start LSN 1, got %#v", action.Kind, action)
+			}
+		}
+	})
+
+	t.Run("unobserved zero primary still waits", func(t *testing.T) {
+		cluster := newCluster(0)
+		cluster.Spec.HighAvailability.Standbys[0].InitialLSN = nil
+		cluster.Status.HAStatus.PrimaryLSN = 0
+		cluster.Status.HAStatus.PrimaryAdminReachable = false
+		if plan := planHA(cluster); len(plan.Actions) != 0 {
+			t.Fatalf("unobserved zero primary must not fabricate an initial seed boundary, got %#v", plan.Actions)
+		}
+	})
+
 	t.Run("primary observed inactive slot still resumes", func(t *testing.T) {
 		cluster := newCluster(4)
 		plan := planHA(cluster)

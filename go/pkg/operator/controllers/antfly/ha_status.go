@@ -1065,6 +1065,9 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		if !ok || (haStandbyUsesRuntimeOwnedSeedCapture(standby) && observed.TimelineID == 0) {
 			plan.UnhealthyStandbyCount++
 			seedTargetLSN := initialStandbyLSN(standby, status.PrimaryLSN)
+			if haStandbyUsesRuntimeOwnedSeedCapture(standby) {
+				seedTargetLSN = haRuntimeOwnedInitialSeedTargetLSN(status)
+			}
 			if seedTargetLSN == 0 {
 				continue
 			}
@@ -1072,7 +1075,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				plan.Actions = append(plan.Actions, haSeedCompletionActions(
 					standby,
 					slotName,
-					haSeedBeginTargetLSN(status.PrimaryLSN),
+					seedTargetLSN,
 					"StandbyNeedsBaseBackup",
 					"",
 				)...)
@@ -1336,6 +1339,22 @@ func haSeedBeginTargetLSN(primaryLSN uint64) uint64 {
 		return 0
 	}
 	return primaryLSN + 1
+}
+
+func haRuntimeOwnedInitialSeedTargetLSN(status *antflyv1.HAStatus) uint64 {
+	if status == nil {
+		return 0
+	}
+	if targetLSN := haSeedBeginTargetLSN(status.PrimaryLSN); targetLSN != 0 {
+		return targetLSN
+	}
+	// A successful authenticated primary observation distinguishes a valid
+	// empty HA log from an unknown boundary. Runtime-owned capture appends the
+	// backup_start control record atomically, making LSN 1 the seed checkpoint.
+	if status.PrimaryLSN == 0 && status.PrimaryAdminReachable {
+		return 1
+	}
+	return 0
 }
 
 func haStandbyMatchesFormerPrimary(status *antflyv1.HAStatus, standbyName string, slotName string) bool {
