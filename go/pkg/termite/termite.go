@@ -181,7 +181,7 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 		cleanups []func() error
 	)
 
-	// Parse backend priority (supports "backend" or "backend:device" format)
+	// Parse the shared public backend priority vocabulary.
 	var backendPriority []backends.BackendSpec
 	if len(config.BackendPriority) > 0 {
 		var err error
@@ -199,6 +199,9 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 			globalPriority = append(globalPriority, spec.Backend)
 		}
 		backends.ConfigurePriorityDevices(backendPriority)
+		if err := backends.ValidateStrictBackendPriority(backendPriority); err != nil {
+			zl.Fatal("Required inference backend is unavailable", zap.Error(err))
+		}
 		backends.SetPriority(globalPriority)
 		zl.Info("Backend priority configured", zap.Any("priority", config.BackendPriority))
 	}
@@ -322,7 +325,7 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 				zap.Strings("models", eagerModels))
 			for _, modelName := range eagerModels {
 				if err := embedderRegistry.Pin(modelName); err != nil {
-					zl.Warn("Failed to pin model",
+					zl.Fatal("Failed to pin eager model",
 						zap.String("model", modelName),
 						zap.Error(err))
 				}
@@ -335,7 +338,7 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 	if len(config.Preload) > 0 {
 		preloadModels := embedderPreloadNames(config.Preload, zl)
 		if err := embedderRegistry.Preload(preloadModels); err != nil {
-			zl.Warn("Some models failed to preload", zap.Error(err))
+			zl.Fatal("Failed to preload configured embedder models", zap.Error(err))
 		}
 	}
 
@@ -361,7 +364,7 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 	// If eager loading is requested, preload all models
 	if keepAlive == 0 {
 		if err := rerankerRegistry.PreloadAll(); err != nil {
-			zl.Warn("Failed to preload some reranker models", zap.Error(err))
+			zl.Fatal("Failed to preload eager reranker models", zap.Error(err))
 		}
 	}
 
@@ -387,7 +390,7 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 		// If eager loading is requested, preload all models
 		if keepAlive == 0 {
 			if err := generatorRegistry.PreloadAll(); err != nil {
-				zl.Warn("Failed to preload some generator models", zap.Error(err))
+				zl.Fatal("Failed to preload eager generator models", zap.Error(err))
 			}
 		}
 	}
@@ -419,7 +422,7 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 		// If eager loading is requested, preload all models
 		if keepAlive == 0 {
 			if err := nerRegistry.PreloadAll(); err != nil {
-				zl.Warn("Failed to preload some NER models", zap.Error(err))
+				zl.Fatal("Failed to preload eager NER models", zap.Error(err))
 			}
 		}
 	}
@@ -450,7 +453,7 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 		// If eager loading is requested, preload all models
 		if keepAlive == 0 {
 			if err := seq2seqRegistry.PreloadAll(); err != nil {
-				zl.Warn("Failed to preload some Seq2Seq models", zap.Error(err))
+				zl.Fatal("Failed to preload eager Seq2Seq models", zap.Error(err))
 			}
 		}
 	}
@@ -482,7 +485,7 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 		// If eager loading is requested, preload all models
 		if keepAlive == 0 {
 			if err := classifierRegistry.Preload(classifierRegistry.List()); err != nil {
-				zl.Warn("Failed to preload some classifier models", zap.Error(err))
+				zl.Fatal("Failed to preload eager classifier models", zap.Error(err))
 			}
 		}
 	}
@@ -510,7 +513,7 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 		// If eager loading is requested, preload all models
 		if keepAlive == 0 {
 			if err := readerRegistry.PreloadAll(); err != nil {
-				zl.Warn("Failed to preload some reader models", zap.Error(err))
+				zl.Fatal("Failed to preload eager reader models", zap.Error(err))
 			}
 		}
 	}
@@ -538,7 +541,7 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 		// If eager loading is requested, preload all models
 		if keepAlive == 0 {
 			if err := transcriberRegistry.PreloadAll(); err != nil {
-				zl.Warn("Failed to preload some transcriber models", zap.Error(err))
+				zl.Fatal("Failed to preload eager transcriber models", zap.Error(err))
 			}
 		}
 	}

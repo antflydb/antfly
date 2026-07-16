@@ -62,6 +62,9 @@ const runtime = @import("../runtime/root.zig");
 const tabular_mod = @import("../tabular/root.zig");
 const c_file = @import("../util/c_file.zig");
 const native_backend_choice = @import("../native_backend_choice.zig");
+const cuda_context = if (build_options.enable_cuda) @import("../ops/cuda/context.zig") else struct {};
+const metal_runtime = if (build_options.enable_metal) @import("../backends/metal_runtime.zig") else struct {};
+const wasm_extern = if (build_options.enable_wasm and build_options.enable_webgpu) @import("../ops/wasm_extern.zig") else struct {};
 const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
     pub const pjrt = struct {
         pub const Client = struct {
@@ -74,6 +77,36 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
 };
 pub const metrics_mod = @import("metrics.zig");
 const request_queue_mod = @import("request_queue.zig");
+
+/// A one-entry priority is a deployment requirement, not a preference. Probe
+/// the real provider before binding the server so readiness reflects driver and
+/// runtime usability for lazy and bounded model-loading strategies as well as
+/// eager ones.
+fn validateStrictBackendRuntime(priority: []const backends_mod.BackendType) !void {
+    if (priority.len != 1) return;
+    switch (priority[0]) {
+        .native => {},
+        .onnx => {
+            if (comptime !build_options.enable_onnx) return error.ConfiguredBackendUnavailable;
+            try backends_mod.onnx.probeRuntime();
+        },
+        .metal => {
+            if (comptime !build_options.enable_metal) return error.ConfiguredBackendUnavailable;
+            if (!metal_runtime.metalDeviceAvailable()) return error.MetalDeviceUnavailable;
+        },
+        .cuda => {
+            if (comptime !build_options.enable_cuda) return error.ConfiguredBackendUnavailable;
+            _ = try cuda_context.probeDefault();
+        },
+        // PJRT is a compiled graph provider rather than a direct model-session
+        // backend. validateBackendPriority rejects it as a sole entry.
+        .pjrt => return error.ConfiguredBackendUnavailable,
+        .webgpu => {
+            if (comptime !(build_options.enable_wasm and build_options.enable_webgpu)) return error.ConfiguredBackendUnavailable;
+            if (!wasm_extern.isAvailable()) return error.WebGpuUnavailable;
+        },
+    }
+}
 
 fn shouldSkipAutoMtpDraftLoad(config: generation.GenerationConfig, draft_cfg: gpt_model_mod.Config) bool {
     if (config.speculation_policy != .auto) return false;
@@ -392,6 +425,17 @@ fn modelBackendToNativeChoice(value: api.ModelBackend) native_backend_choice.Cho
         .cuda => .cuda,
         .pjrt => .pjrt,
         .webgpu => .webgpu,
+    };
+}
+
+fn isConfiguredOnnxGenerationFallbackError(err: anyerror) bool {
+    return switch (err) {
+        error.OrtEnvCreationFailed,
+        error.OrtSessionOptionsFailed,
+        error.OnnxSessionInitializationFailed,
+        error.OrtGenAiBackendUnavailable,
+        => true,
+        else => false,
     };
 }
 
@@ -759,7 +803,10 @@ pub const Node = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: NodeConfig) !Node {
         if (config.pool_size == 0) return error.InvalidPoolSize;
-        if (config.backend_priority) |priority| try backends_mod.validateBackendPriority(priority);
+        if (config.backend_priority) |priority| {
+            try backends_mod.validateBackendPriority(priority);
+            try validateStrictBackendRuntime(priority);
+        }
         var node: Node = .{
             .config = config,
             .allocator = allocator,
@@ -2328,11 +2375,18 @@ pub const Node = struct {
         body: api.GenerateRequest,
         excluded: backends_mod.BackendType,
     ) !GenerateBackendSelection {
+        const fallback_choice = generationBackendFromPriorityExcluding(self.config.backend_priority, excluded);
+        // A configured list must never escape to the implicit auto/default
+        // order. In particular, a one-entry list is strict even when the
+        // request did not include an explicit backend override.
+        if (self.config.backend_priority != null and fallback_choice == .auto) {
+            return error.NoConfiguredGenerationBackendFallback;
+        }
         return parseGenerateBackendSelectionWithDefault(
             null,
             body.mode,
             body.compiled_target,
-            generationBackendFromPriorityExcluding(self.config.backend_priority, excluded),
+            fallback_choice,
         );
     }
 
@@ -2656,97 +2710,17 @@ pub const Node = struct {
         // speculative decoding. A configured ONNX preference falls through to
         // graph-backed native generation for those requests; an ordinary ONNX
         // model session is never passed to the native generation pipeline.
-        const allow_onnx = config.grammar == null and
+        var allow_onnx = config.grammar == null and
             effective_draft_model_name == null and
             !backend_selection.graph_mode_requested and
             (backend_selection.native_choice == .auto or backend_selection.native_choice == .onnx);
 
         // Try plain HF ONNX decoder-only VLM packages before Ort GenAI overlays.
-        if (allow_onnx and build_options.enable_onnx and
-            !c_file.fileExistsInDir(ctx.allocator, model_path, "genai_config.json") and
-            onnx_decoder_only_vlm.isSupportedModelDir(ctx.allocator, model_path))
-        {
-            if (config.grammar != null) {
-                return ctx.status(400).json(.{
-                    .@"error" = "INVALID_REQUEST",
-                    .message = "grammar-constrained decoding is native-backend only; ONNX generation remains unconstrained-only",
-                });
-            }
-
-            var transient_lease = self.model_manager.beginTransientModelLoadForRequest(request_id) catch |err|
-                return modelLoadFailure(ctx, err);
-            defer transient_lease.deinit();
-
-            var prompt_override: ?[]u8 = null;
-            defer if (prompt_override) |prompt| ctx.allocator.free(prompt);
-            if (tool_parser) |*parser| {
-                if (std.mem.eql(u8, parser.name(), "functiongemma")) {
-                    prompt_override = try buildFunctionGemmaPrompt(
-                        ctx.allocator,
-                        "",
-                        messages.items,
-                    );
-                }
-            }
-
-            var pipeline = onnx_decoder_only_vlm.Pipeline.load(ctx.allocator, model_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
-            defer pipeline.deinit();
-            transient_lease.activate() catch |err| return modelLoadFailure(ctx, err);
-            pipeline.prompt_override = if (prompt_override) |prompt| prompt else null;
-
-            if (want_stream) {
-                return self.streamGenerate(ctx, body.model, &pipeline, messages.items, config, if (tool_parser) |*parser| parser else null);
-            }
-
-            var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
-            defer result.deinit();
-
-            var response_text = result.text;
-            var tool_response_text: ?[]u8 = null;
-            defer if (tool_response_text) |text| ctx.allocator.free(text);
-            const parsed_tool_calls = if (tool_parser) |*parser| blk: {
-                parser.reset();
-                _ = parser.feed(result.text) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
-                tool_response_text = parser.finishText(ctx.allocator) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
-                response_text = tool_response_text.?;
-                if (response_text.len == 0) response_text = result.text;
-                const calls = parser.toolCalls();
-                break :blk if (calls.len > 0) calls else null;
-            } else null;
-
-            if (parsed_tool_calls == null and tool_parser != null and response_text.len == 0) {
-                response_text = "No tool call was emitted.";
-            }
-
-            var formatted_response_text: ?[]u8 = null;
-            defer if (formatted_response_text) |text| ctx.allocator.free(text);
-            if (parsed_tool_calls == null) {
-                formatted_response_text = try coerceGenerateResponseFormat(ctx.allocator, body.response_format, response_text);
-                if (formatted_response_text) |text| response_text = text;
-            }
-
-            return self.buildGenerateResponse(
-                ctx,
-                body.model,
-                response_text,
-                if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
-                result.prompt_tokens,
-                result.tokens_used,
-                0,
-                parsed_tool_calls,
-            );
-        }
-
-        // Try ortgenai first (models with genai_config.json)
-        if (allow_onnx and build_options.enable_onnx) {
-            const ortgenai = backends_mod.ortgenai;
-            const ort_model_dir = ortgenai.prepareGenerativeModelPackage(ctx.allocator, model_path) catch null;
-            defer if (ort_model_dir) |prepared| ctx.allocator.free(prepared);
-            if (ort_model_dir) |prepared_model_dir| {
+        plain_onnx_generation: {
+            if (allow_onnx and build_options.enable_onnx and
+                !c_file.fileExistsInDir(ctx.allocator, model_path, "genai_config.json") and
+                onnx_decoder_only_vlm.isSupportedModelDir(ctx.allocator, model_path))
+            {
                 if (config.grammar != null) {
                     return ctx.status(400).json(.{
                         .@"error" = "INVALID_REQUEST",
@@ -2758,54 +2732,35 @@ pub const Node = struct {
                     return modelLoadFailure(ctx, err);
                 defer transient_lease.deinit();
 
-                var ort_manifest = manifest_mod.loadFromDir(ctx.allocator, prepared_model_dir) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
-                defer ort_manifest.deinit();
-
-                const use_functiongemma_prompt_override = if (tool_parser) |*parser|
-                    std.mem.eql(u8, parser.name(), "functiongemma")
-                else
-                    false;
-
-                var ort_chat_template_storage: ?generation.ChatTemplate = null;
-                defer if (ort_chat_template_storage) |*ct| ct.deinit();
-                if (!use_functiongemma_prompt_override) {
-                    if (ort_manifest.chat_template) |ct_source| {
-                        ort_chat_template_storage = generation.ChatTemplate.init(
+                var prompt_override: ?[]u8 = null;
+                defer if (prompt_override) |prompt| ctx.allocator.free(prompt);
+                if (tool_parser) |*parser| {
+                    if (std.mem.eql(u8, parser.name(), "functiongemma")) {
+                        prompt_override = try buildFunctionGemmaPrompt(
                             ctx.allocator,
-                            ct_source,
-                            ort_manifest.bos_token,
-                            ort_manifest.eos_token,
-                            ort_manifest.unk_token,
-                            ort_manifest.pad_token,
-                        ) catch |err| blk: {
-                            std.log.warn("chat template init failed for {s}: {s}", .{ model_path, @errorName(err) });
-                            break :blk null;
-                        };
+                            "",
+                            messages.items,
+                        );
                     }
                 }
 
-                var prompt_override: ?[]u8 = null;
-                defer if (prompt_override) |prompt| ctx.allocator.free(prompt);
-                if (use_functiongemma_prompt_override) {
-                    prompt_override = try buildFunctionGemmaPrompt(
-                        ctx.allocator,
-                        ort_manifest.bos_token,
-                        messages.items,
-                    );
-                }
-
-                var gen_model = ortgenai.GenAiModel.load(ctx.allocator, prepared_model_dir) catch |err|
+                var pipeline = onnx_decoder_only_vlm.Pipeline.load(ctx.allocator, model_path) catch |err| {
+                    if (!backend_selection.override_model_loading and isConfiguredOnnxGenerationFallbackError(err)) {
+                        backend_selection = self.fallbackConfiguredGenerationSelection(body, .onnx) catch {
+                            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                        };
+                        allow_onnx = false;
+                        std.log.warn(
+                            "configured ONNX generator initialization failed ({s}); continuing with backend priority fallback",
+                            .{@errorName(err)},
+                        );
+                        break :plain_onnx_generation;
+                    }
                     return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
-                defer gen_model.deinit();
-                transient_lease.activate() catch |err| return modelLoadFailure(ctx, err);
-
-                var pipeline = generation.GenerationPipeline{
-                    .allocator = ctx.allocator,
-                    .model = &gen_model,
-                    .chat_template = if (ort_chat_template_storage) |*ct| ct else null,
-                    .prompt_override = if (prompt_override) |prompt| prompt else null,
                 };
+                defer pipeline.deinit();
+                transient_lease.activate() catch |err| return modelLoadFailure(ctx, err);
+                pipeline.prompt_override = if (prompt_override) |prompt| prompt else null;
 
                 if (want_stream) {
                     return self.streamGenerate(ctx, body.model, &pipeline, messages.items, config, if (tool_parser) |*parser| parser else null);
@@ -2851,6 +2806,133 @@ pub const Node = struct {
                     0,
                     parsed_tool_calls,
                 );
+            }
+        }
+
+        // Try ortgenai first (models with genai_config.json)
+        ort_genai_generation: {
+            if (allow_onnx and build_options.enable_onnx) {
+                const ortgenai = backends_mod.ortgenai;
+                const ort_model_dir = ortgenai.prepareGenerativeModelPackage(ctx.allocator, model_path) catch null;
+                defer if (ort_model_dir) |prepared| ctx.allocator.free(prepared);
+                if (ort_model_dir) |prepared_model_dir| {
+                    if (config.grammar != null) {
+                        return ctx.status(400).json(.{
+                            .@"error" = "INVALID_REQUEST",
+                            .message = "grammar-constrained decoding is native-backend only; ONNX generation remains unconstrained-only",
+                        });
+                    }
+
+                    var transient_lease = self.model_manager.beginTransientModelLoadForRequest(request_id) catch |err|
+                        return modelLoadFailure(ctx, err);
+                    defer transient_lease.deinit();
+
+                    var ort_manifest = manifest_mod.loadFromDir(ctx.allocator, prepared_model_dir) catch |err|
+                        return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                    defer ort_manifest.deinit();
+
+                    const use_functiongemma_prompt_override = if (tool_parser) |*parser|
+                        std.mem.eql(u8, parser.name(), "functiongemma")
+                    else
+                        false;
+
+                    var ort_chat_template_storage: ?generation.ChatTemplate = null;
+                    defer if (ort_chat_template_storage) |*ct| ct.deinit();
+                    if (!use_functiongemma_prompt_override) {
+                        if (ort_manifest.chat_template) |ct_source| {
+                            ort_chat_template_storage = generation.ChatTemplate.init(
+                                ctx.allocator,
+                                ct_source,
+                                ort_manifest.bos_token,
+                                ort_manifest.eos_token,
+                                ort_manifest.unk_token,
+                                ort_manifest.pad_token,
+                            ) catch |err| blk: {
+                                std.log.warn("chat template init failed for {s}: {s}", .{ model_path, @errorName(err) });
+                                break :blk null;
+                            };
+                        }
+                    }
+
+                    var prompt_override: ?[]u8 = null;
+                    defer if (prompt_override) |prompt| ctx.allocator.free(prompt);
+                    if (use_functiongemma_prompt_override) {
+                        prompt_override = try buildFunctionGemmaPrompt(
+                            ctx.allocator,
+                            ort_manifest.bos_token,
+                            messages.items,
+                        );
+                    }
+
+                    var gen_model = ortgenai.GenAiModel.load(ctx.allocator, prepared_model_dir) catch |err| {
+                        if (!backend_selection.override_model_loading and isConfiguredOnnxGenerationFallbackError(err)) {
+                            backend_selection = self.fallbackConfiguredGenerationSelection(body, .onnx) catch {
+                                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                            };
+                            allow_onnx = false;
+                            std.log.warn(
+                                "configured Ort GenAI initialization failed ({s}); continuing with backend priority fallback",
+                                .{@errorName(err)},
+                            );
+                            break :ort_genai_generation;
+                        }
+                        return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                    };
+                    defer gen_model.deinit();
+                    transient_lease.activate() catch |err| return modelLoadFailure(ctx, err);
+
+                    var pipeline = generation.GenerationPipeline{
+                        .allocator = ctx.allocator,
+                        .model = &gen_model,
+                        .chat_template = if (ort_chat_template_storage) |*ct| ct else null,
+                        .prompt_override = if (prompt_override) |prompt| prompt else null,
+                    };
+
+                    if (want_stream) {
+                        return self.streamGenerate(ctx, body.model, &pipeline, messages.items, config, if (tool_parser) |*parser| parser else null);
+                    }
+
+                    var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
+                        return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                    defer result.deinit();
+
+                    var response_text = result.text;
+                    var tool_response_text: ?[]u8 = null;
+                    defer if (tool_response_text) |text| ctx.allocator.free(text);
+                    const parsed_tool_calls = if (tool_parser) |*parser| blk: {
+                        parser.reset();
+                        _ = parser.feed(result.text) catch |err|
+                            return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                        tool_response_text = parser.finishText(ctx.allocator) catch |err|
+                            return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                        response_text = tool_response_text.?;
+                        if (response_text.len == 0) response_text = result.text;
+                        const calls = parser.toolCalls();
+                        break :blk if (calls.len > 0) calls else null;
+                    } else null;
+
+                    if (parsed_tool_calls == null and tool_parser != null and response_text.len == 0) {
+                        response_text = "No tool call was emitted.";
+                    }
+
+                    var formatted_response_text: ?[]u8 = null;
+                    defer if (formatted_response_text) |text| ctx.allocator.free(text);
+                    if (parsed_tool_calls == null) {
+                        formatted_response_text = try coerceGenerateResponseFormat(ctx.allocator, body.response_format, response_text);
+                        if (formatted_response_text) |text| response_text = text;
+                    }
+
+                    return self.buildGenerateResponse(
+                        ctx,
+                        body.model,
+                        response_text,
+                        if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
+                        result.prompt_tokens,
+                        result.tokens_used,
+                        0,
+                        parsed_tool_calls,
+                    );
+                }
             }
         }
 
@@ -7368,6 +7450,20 @@ test "modelKindAcceptsInput infers text and image modalities" {
     try std.testing.expect(model_caps.modelKindAcceptsInput("transcriber", "", &.{}, false, false, "audio"));
     try std.testing.expect(model_caps.modelKindAcceptsInput("recognizer", "", &.{"image"}, false, false, "image"));
     try std.testing.expect(!model_caps.modelKindAcceptsInput("recognizer", "", &.{"image"}, false, false, "text"));
+}
+
+test "configured ONNX fallback excludes artifact failures" {
+    try std.testing.expect(isConfiguredOnnxGenerationFallbackError(error.OrtEnvCreationFailed));
+    try std.testing.expect(isConfiguredOnnxGenerationFallbackError(error.OnnxSessionInitializationFailed));
+    try std.testing.expect(isConfiguredOnnxGenerationFallbackError(error.OrtGenAiBackendUnavailable));
+    try std.testing.expect(!isConfiguredOnnxGenerationFallbackError(error.InvalidOnnxModel));
+    try std.testing.expect(!isConfiguredOnnxGenerationFallbackError(error.OrtGenAiFailed));
+}
+
+test "generation backend exclusion advances configured priority" {
+    const priority = [_]backends_mod.BackendType{ .onnx, .pjrt, .native };
+    const expected: GenerationBackend = if (build_options.enable_pjrt) .pjrt else .native;
+    try std.testing.expectEqual(expected, generationBackendFromPriorityExcluding(&priority, .onnx));
 }
 
 test "generate backend selection keeps compiled mode explicit" {

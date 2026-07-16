@@ -114,7 +114,7 @@ fn absolutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd_z = c_file.c.getcwd(&buf, buf.len) orelse return error.GetCwdFailed;
-    const cwd = std.mem.span(cwd_z);
+    const cwd = std.mem.sliceTo(cwd_z, 0);
     return std.fs.path.join(allocator, &.{ cwd, path });
 }
 
@@ -655,6 +655,50 @@ fn check(result: ?*c.OgaResult) !void {
     }
 }
 
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    for (0..haystack.len - needle.len + 1) |offset| {
+        if (std.ascii.eqlIgnoreCase(haystack[offset .. offset + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn isExecutionProviderFailure(message: []const u8) bool {
+    const provider_markers = [_][]const u8{
+        "execution provider",
+        "provider library",
+        "loadlibrary",
+        "dlopen",
+        "cuda",
+        "cudnn",
+        "tensorrt",
+        "directml",
+        "coreml",
+    };
+    for (provider_markers) |marker| {
+        if (containsAsciiIgnoreCase(message, marker)) return true;
+    }
+    return false;
+}
+
+/// Model construction can fail because the selected execution provider is not
+/// usable or because the artifact/configuration is invalid. Only the former is
+/// eligible for configured-priority fallback.
+fn checkModelCreate(result: ?*c.OgaResult) !void {
+    if (result) |r| {
+        var provider_failure = false;
+        if (c.OgaResultGetError(r)) |msg| {
+            const message = std.mem.span(msg);
+            std.log.err("ortgenai: {s}", .{message});
+            provider_failure = isExecutionProviderFailure(message);
+        }
+        defer c.OgaDestroyResult(r);
+        if (provider_failure) return error.OrtGenAiBackendUnavailable;
+        return error.OrtGenAiFailed;
+    }
+}
+
 /// A loaded generative model (wraps OgaModel + OgaTokenizer).
 pub const GenAiModel = struct {
     model: *c.OgaModel,
@@ -666,7 +710,7 @@ pub const GenAiModel = struct {
         defer allocator.free(path_z);
 
         var model: ?*c.OgaModel = null;
-        try check(c.OgaCreateModel(path_z.ptr, &model));
+        try checkModelCreate(c.OgaCreateModel(path_z.ptr, &model));
         errdefer c.OgaDestroyModel(model.?);
 
         var tokenizer: ?*c.OgaTokenizer = null;

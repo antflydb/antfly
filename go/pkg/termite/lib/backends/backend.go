@@ -133,6 +133,14 @@ type gpuModeConfigurableBackend interface {
 	SetGPUMode(GPUMode)
 }
 
+// runtimeProber validates that a configured backend can initialize its runtime
+// and requested execution provider without requiring a model artifact. Backends
+// whose Available method already performs an equivalent probe do not need to
+// implement this interface.
+type runtimeProber interface {
+	ProbeRuntime(DeviceType) error
+}
+
 // ConfigurePriorityDevices applies the first device requirement for each
 // concrete backend before any model sessions are created. SessionManager keeps
 // device metadata for selection and diagnostics, while backends such as ONNX
@@ -154,6 +162,32 @@ func ConfigurePriorityDevices(priority []BackendSpec) {
 		}
 		configurable.SetGPUMode(spec.Device.ToGPUMode())
 	}
+}
+
+// ValidateStrictBackendPriority enforces the startup contract for a single
+// configured backend. Multi-entry priorities are allowed to defer provider
+// failures to selection time because they have an explicit fallback. A strict
+// entry must be registered, runtime-available, and able to initialize its
+// requested execution provider before the server advertises readiness.
+func ValidateStrictBackendPriority(priority []BackendSpec) error {
+	if len(priority) != 1 {
+		return nil
+	}
+
+	spec := priority[0]
+	backend, ok := GetBackend(spec.Backend)
+	if !ok {
+		return fmt.Errorf("required backend %q is not registered", spec)
+	}
+	if !backend.Available() {
+		return fmt.Errorf("required backend %q is unavailable", spec)
+	}
+	if prober, ok := backend.(runtimeProber); ok {
+		if err := prober.ProbeRuntime(spec.Device); err != nil {
+			return fmt.Errorf("required backend %q failed runtime probe: %w", spec, err)
+		}
+	}
+	return nil
 }
 
 // GetPriority returns the current backend priority order.
@@ -262,11 +296,15 @@ func ParseDeviceType(s string) (DeviceType, error) {
 	}
 }
 
-// ParseBackendSpec parses a public "backend" or "backend:device" string and
-// translates it to the Go runtime's internal backend/device pair.
+// ParseBackendSpec parses a public backend name and translates it to the Go
+// runtime's internal backend/device pair. Device policy is part of the public
+// backend identity (for example, "cuda" means ONNX with a required CUDA EP),
+// so accepting a second device syntax would create two conflicting contracts.
 func ParseBackendSpec(s string) (BackendSpec, error) {
-	parts := strings.SplitN(s, ":", 2)
-	publicBackend := strings.ToLower(strings.TrimSpace(parts[0]))
+	publicBackend := strings.ToLower(strings.TrimSpace(s))
+	if strings.Contains(publicBackend, ":") {
+		return BackendSpec{}, fmt.Errorf("backend %q must use a public backend name without a device suffix", s)
+	}
 
 	backend, err := ParseBackendType(publicBackend)
 	if err != nil {
@@ -284,21 +322,12 @@ func ParseBackendSpec(s string) (BackendSpec, error) {
 	}
 	spec := BackendSpec{Backend: backend, Device: defaultDevice}
 
-	if len(parts) == 2 {
-		device, err := ParseDeviceType(parts[1])
-		if err != nil {
-			return BackendSpec{}, err
-		}
-		spec.Device = device
-	}
-
 	return spec, nil
 }
 
-// ParseBackendPriority parses a list of backend:device strings into BackendSpecs.
-// Each element can be a single spec ("onnx", "pjrt:tpu") or comma-separated
-// ("onnx,pjrt,native") to handle environment variables where viper returns the
-// entire value as a single string slice element.
+// ParseBackendPriority parses public backend names into BackendSpecs. Comma
+// splitting is retained because Viper represents a string-slice environment
+// value as one element; individual entries still use only the public names.
 func ParseBackendPriority(priority []string) ([]BackendSpec, error) {
 	specs := make([]BackendSpec, 0, len(priority))
 	for _, s := range priority {

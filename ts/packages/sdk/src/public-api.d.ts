@@ -11719,24 +11719,19 @@ export interface components {
          */
         InferenceModelQuantization: "q4_k" | "q8" | "fp16";
         /**
-         * @description Backend priority entry for model loading. Use `backend` or `backend:device`,
-         *     where device defaults to `auto`.
+         * @description Backend priority entry for inference. Device policy is expressed by the
+         *     backend name itself, so device suffixes are not accepted.
          *
-         *     Backends:
+         *     Backends (depend on build flags):
          *     - `native` - Native CPU backend
          *     - `onnx` - ONNX Runtime backend
          *     - `metal` - Apple Metal backend
          *     - `cuda` - NVIDIA CUDA backend
-         *     - `pjrt` - PJRT compiled backend
-         *     - `webgpu` - WebGPU backend in Wasm builds
-         *
-         *     Devices:
-         *     - `auto` - Auto-detect best available (default)
-         *     - `cuda` - NVIDIA CUDA GPU
-         *     - `tpu` - Google TPU (used by XLA)
-         *     - `cpu` - Force CPU only
+         *     - `pjrt` - PJRT compiled graph backend
+         *     - `webgpu` - WebGPU backend for Wasm builds
+         * @enum {string}
          */
-        InferenceBackendPriorityEntry: string;
+        InferenceBackendPriorityEntry: "native" | "onnx" | "metal" | "cuda" | "pjrt" | "webgpu";
         /** @description Model reference used by startup preload and model-loading configuration. */
         InferenceModelRef: {
             kind: components["schemas"]["InferenceModelKind"];
@@ -11854,24 +11849,22 @@ export interface components {
             /** @description Native generator prompt KV cache settings. */
             prompt_cache?: components["schemas"]["InferencePromptCacheConfig"];
             /**
-             * @description Backend priority order for model loading with optional device specifiers.
-             *     Format: `backend` or `backend:device` where device defaults to `auto`.
+             * @description Explicit backend order for inference. Antfly tries entries in order and uses the first
+             *     backend supported by both the build and the operation. Direct model loading skips
+             *     compiled-only `pjrt` entries and continues to the next backend, while generation uses
+             *     PJRT for compiled graph partitions when it is the first available entry. An empty list
+             *     is invalid. A single entry is a strict backend requirement and causes startup to fail
+             *     when that backend is unavailable or cannot directly load a model session.
              *
-             *     Antfly inference tries entries in order and uses the first available backend+device
-             *     combination that supports the model.
-             *
-             *     **Examples**:
-             *     - `["native", "onnx", "pjrt"]` - Try backends with auto device detection
-             *     - `["cuda", "onnx:cuda", "pjrt:tpu", "native"]` - Prefer GPU, fall back to CPU
-             * @default [
-             *       "native",
-             *       "onnx",
-             *       "pjrt"
-             *     ]
+             *     **Backends** (depend on build flags):
+             *     - `native` - Native CPU backend
+             *     - `onnx` - ONNX Runtime backend
+             *     - `metal` - Apple Metal backend
+             *     - `cuda` - NVIDIA CUDA backend
+             *     - `pjrt` - PJRT compiled graph backend
+             *     - `webgpu` - WebGPU backend for Wasm builds
              * @example [
-             *       "cuda",
-             *       "onnx:cuda",
-             *       "pjrt:tpu",
+             *       "pjrt",
              *       "native"
              *     ]
              */

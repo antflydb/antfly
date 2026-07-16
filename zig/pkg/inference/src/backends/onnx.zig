@@ -51,6 +51,13 @@ fn initEnv() !void {
     }
 }
 
+/// Initialize the linked ONNX Runtime without loading a model. Strict backend
+/// configurations use this before opening the listener so a missing or broken
+/// runtime cannot produce a falsely-ready server.
+pub fn probeRuntime() !void {
+    try initEnv();
+}
+
 /// Check an ORT status and return an error if non-null.
 fn checkStatus(api: *const OrtApi, status: ?*c.OrtStatus) !void {
     if (status) |s| {
@@ -62,6 +69,31 @@ fn checkStatus(api: *const OrtApi, status: ?*c.OrtStatus) !void {
         }
         defer api.ReleaseStatus.?(s);
         return error.OrtApiFailed;
+    }
+}
+
+/// Session creation is where ONNX Runtime reports both provider failures and
+/// malformed model artifacts. Preserve that distinction so configured backend
+/// priorities may fall back for infrastructure failures without hiding a bad
+/// model behind another backend.
+fn checkSessionCreateStatus(api: *const OrtApi, status: ?*c.OrtStatus) !void {
+    if (status) |s| {
+        const code = api.GetErrorCode.?(s);
+        if (api.GetErrorMessage) |get_error_message| {
+            if (get_error_message(s)) |msg_ptr| {
+                std.debug.print("onnxruntime: {s}\n", .{std.mem.span(msg_ptr)});
+            }
+        }
+        defer api.ReleaseStatus.?(s);
+        return switch (code) {
+            c.ORT_INVALID_ARGUMENT,
+            c.ORT_NO_SUCHFILE,
+            c.ORT_NO_MODEL,
+            c.ORT_INVALID_PROTOBUF,
+            c.ORT_INVALID_GRAPH,
+            => error.InvalidOnnxModel,
+            else => error.OnnxSessionInitializationFailed,
+        };
     }
 }
 
@@ -347,7 +379,7 @@ pub fn createSessionWithOptions(
 
     // Create session from model file
     var ort_session: ?*c.OrtSession = null;
-    try checkStatus(api, api.CreateSession.?(global_env.?, path_z.ptr, session_options.?, &ort_session));
+    try checkSessionCreateStatus(api, api.CreateSession.?(global_env.?, path_z.ptr, session_options.?, &ort_session));
 
     const impl = try allocator.create(OnnxSession);
     impl.* = .{

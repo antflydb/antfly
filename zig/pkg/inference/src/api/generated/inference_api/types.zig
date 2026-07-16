@@ -7,8 +7,43 @@ const antfly_generating_openapi = @import("antfly_generating_openapi");
 
 pub const AudioChunkConfig = antfly_chunking_api_openapi.InferenceAudioChunkConfig;
 
-/// Backend priority entry for model loading. Use `backend` or `backend:device`, where device defaults to `auto`. Backends: - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `pjrt` - PJRT compiled backend - `webgpu` - WebGPU backend in Wasm builds Devices: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only
-pub const BackendPriorityEntry = []const u8;
+/// Backend priority entry for inference. Device policy is expressed by the backend name itself, so device suffixes are not accepted. Backends (depend on build flags): - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `pjrt` - PJRT compiled graph backend - `webgpu` - WebGPU backend for Wasm builds
+pub const BackendPriorityEntry = enum {
+    native,
+    onnx,
+    metal,
+    cuda,
+    pjrt,
+    webgpu,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .native => "native",
+            .onnx => "onnx",
+            .metal => "metal",
+            .cuda => "cuda",
+            .pjrt => "pjrt",
+            .webgpu => "webgpu",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "native", .native },
+            .{ "onnx", .onnx },
+            .{ "metal", .metal },
+            .{ "cuda", .cuda },
+            .{ "pjrt", .pjrt },
+            .{ "webgpu", .webgpu },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
 
 /// Runtime backends compiled into this inference server.
 pub const BackendRuntimes = struct {
@@ -178,7 +213,7 @@ pub const Config = struct {
     pool_size: ?i64 = null,
     /// Native generator prompt KV cache settings.
     prompt_cache: ?PromptCacheConfig = null,
-    /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Antfly inference tries entries in order and uses the first available backend+device combination that supports the model. **Examples**: - `["native", "onnx", "pjrt"]` - Try backends with auto device detection - `["cuda", "onnx:cuda", "pjrt:tpu", "native"]` - Prefer GPU, fall back to CPU
+    /// Explicit backend order for inference. Antfly tries entries in order and uses the first backend supported by both the build and the operation. Direct model loading skips compiled-only `pjrt` entries and continues to the next backend, while generation uses PJRT for compiled graph partitions when it is the first available entry. An empty list is invalid. A single entry is a strict backend requirement and causes startup to fail when that backend is unavailable or cannot directly load a model session. **Backends** (depend on build flags): - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `pjrt` - PJRT compiled graph backend - `webgpu` - WebGPU backend for Wasm builds
     backend_priority: ?[]const BackendPriorityEntry = null,
     /// Maximum weighted inference work admitted concurrently by the Zig runtime. Requests beyond the limit receive 503 Service Unavailable with Retry-After; they are not held in an in-process wait queue. Set to 0 for unlimited.
     max_concurrent_requests: ?i64 = null,

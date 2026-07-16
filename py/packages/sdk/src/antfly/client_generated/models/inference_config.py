@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.inference_backend_priority_entry import InferenceBackendPriorityEntry
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -65,16 +66,22 @@ class InferenceConfig:
             residency is controlled separately by `max_loaded_models`.
              Default: 1. Example: 1.
         prompt_cache (InferencePromptCacheConfig | Unset): Native generator prompt KV cache configuration.
-        backend_priority (list[str] | Unset): Backend priority order for model loading with optional device specifiers.
-            Format: `backend` or `backend:device` where device defaults to `auto`.
+        backend_priority (list[InferenceBackendPriorityEntry] | Unset): Explicit backend order for inference. Antfly
+            tries entries in order and uses the first
+            backend supported by both the build and the operation. Direct model loading skips
+            compiled-only `pjrt` entries and continues to the next backend, while generation uses
+            PJRT for compiled graph partitions when it is the first available entry. An empty list
+            is invalid. A single entry is a strict backend requirement and causes startup to fail
+            when that backend is unavailable or cannot directly load a model session.
 
-            Antfly inference tries entries in order and uses the first available backend+device
-            combination that supports the model.
-
-            **Examples**:
-            - `["native", "onnx", "pjrt"]` - Try backends with auto device detection
-            - `["cuda", "onnx:cuda", "pjrt:tpu", "native"]` - Prefer GPU, fall back to CPU
-             Example: ['cuda', 'onnx:cuda', 'pjrt:tpu', 'native'].
+            **Backends** (depend on build flags):
+            - `native` - Native CPU backend
+            - `onnx` - ONNX Runtime backend
+            - `metal` - Apple Metal backend
+            - `cuda` - NVIDIA CUDA backend
+            - `pjrt` - PJRT compiled graph backend
+            - `webgpu` - WebGPU backend for Wasm builds
+             Example: ['pjrt', 'native'].
         max_concurrent_requests (int | Unset): Maximum weighted inference work admitted concurrently by the Zig runtime.
             Requests beyond the limit receive 503 Service Unavailable with Retry-After;
             they are not held in an in-process wait queue. Set to 0 for unlimited.
@@ -129,7 +136,7 @@ class InferenceConfig:
     max_loaded_models: int | Unset = 10
     pool_size: int | Unset = 1
     prompt_cache: InferencePromptCacheConfig | Unset = UNSET
-    backend_priority: list[str] | Unset = UNSET
+    backend_priority: list[InferenceBackendPriorityEntry] | Unset = UNSET
     max_concurrent_requests: int | Unset = 32
     max_queue_size: int | Unset = 0
     request_timeout: str | Unset = "0"
@@ -169,7 +176,10 @@ class InferenceConfig:
 
         backend_priority: list[str] | Unset = UNSET
         if not isinstance(self.backend_priority, Unset):
-            backend_priority = self.backend_priority
+            backend_priority = []
+            for backend_priority_item_data in self.backend_priority:
+                backend_priority_item = backend_priority_item_data.value
+                backend_priority.append(backend_priority_item)
 
         max_concurrent_requests = self.max_concurrent_requests
 
@@ -287,7 +297,14 @@ class InferenceConfig:
         else:
             prompt_cache = InferencePromptCacheConfig.from_dict(_prompt_cache)
 
-        backend_priority = cast(list[str], d.pop("backend_priority", UNSET))
+        _backend_priority = d.pop("backend_priority", UNSET)
+        backend_priority: list[InferenceBackendPriorityEntry] | Unset = UNSET
+        if _backend_priority is not UNSET:
+            backend_priority = []
+            for backend_priority_item_data in _backend_priority:
+                backend_priority_item = InferenceBackendPriorityEntry(backend_priority_item_data)
+
+                backend_priority.append(backend_priority_item)
 
         max_concurrent_requests = d.pop("max_concurrent_requests", UNSET)
 

@@ -21370,12 +21370,12 @@ components:
     InferenceBackendPriorityEntry:
       type: string
       description: >
-        Backend priority entry for model loading. Use `backend` or `backend:device`,
+        Backend priority entry for inference. Device policy is expressed by the
 
-        where device defaults to `auto`.
+        backend name itself, so device suffixes are not accepted.
 
 
-        Backends:
+        Backends (depend on build flags):
 
         - `native` - Native CPU backend
 
@@ -21385,21 +21385,16 @@ components:
 
         - `cuda` - NVIDIA CUDA backend
 
-        - `pjrt` - PJRT compiled backend
+        - `pjrt` - PJRT compiled graph backend
 
-        - `webgpu` - WebGPU backend in Wasm builds
-
-
-        Devices:
-
-        - `auto` - Auto-detect best available (default)
-
-        - `cuda` - NVIDIA CUDA GPU
-
-        - `tpu` - Google TPU (used by XLA)
-
-        - `cpu` - Force CPU only
-      pattern: ^(native|onnx|metal|cuda|pjrt|webgpu)(:(auto|cuda|tpu|cpu))?$
+        - `webgpu` - WebGPU backend for Wasm builds
+      enum:
+        - native
+        - onnx
+        - metal
+        - cuda
+        - pjrt
+        - webgpu
     InferenceModelRef:
       type: object
       description: Model reference used by startup preload and model-loading configuration.
@@ -21572,29 +21567,34 @@ components:
           items:
             $ref: '#/components/schemas/InferenceBackendPriorityEntry'
           description: >
-            Backend priority order for model loading with optional device specifiers.
+            Explicit backend order for inference. Antfly tries entries in order and uses the first
 
-            Format: `backend` or `backend:device` where device defaults to `auto`.
+            backend supported by both the build and the operation. Direct model loading skips
+
+            compiled-only `pjrt` entries and continues to the next backend, while generation uses
+
+            PJRT for compiled graph partitions when it is the first available entry. An empty list
+
+            is invalid. A single entry is a strict backend requirement and causes startup to fail
+
+            when that backend is unavailable or cannot directly load a model session.
 
 
-            Antfly inference tries entries in order and uses the first available backend+device
+            **Backends** (depend on build flags):
 
-            combination that supports the model.
+            - `native` - Native CPU backend
 
+            - `onnx` - ONNX Runtime backend
 
-            **Examples**:
+            - `metal` - Apple Metal backend
 
-            - `["native", "onnx", "pjrt"]` - Try backends with auto device detection
+            - `cuda` - NVIDIA CUDA backend
 
-            - `["cuda", "onnx:cuda", "pjrt:tpu", "native"]` - Prefer GPU, fall back to CPU
-          default:
-            - native
-            - onnx
-            - pjrt
+            - `pjrt` - PJRT compiled graph backend
+
+            - `webgpu` - WebGPU backend for Wasm builds
           example:
-            - cuda
-            - onnx:cuda
-            - pjrt:tpu
+            - pjrt
             - native
         max_concurrent_requests:
           type: integer

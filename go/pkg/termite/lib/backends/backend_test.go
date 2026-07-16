@@ -14,7 +14,25 @@
 
 package backends
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
+
+type failingRuntimeProbeBackend struct{}
+
+var errProviderInitializationFailed = errors.New("provider initialization failed")
+
+func (failingRuntimeProbeBackend) Type() BackendType { return "runtime-probe-test" }
+func (failingRuntimeProbeBackend) Name() string      { return "runtime probe test" }
+func (failingRuntimeProbeBackend) Available() bool   { return true }
+func (failingRuntimeProbeBackend) Priority() int     { return 0 }
+func (failingRuntimeProbeBackend) Loader() ModelLoader {
+	return nil
+}
+func (failingRuntimeProbeBackend) ProbeRuntime(DeviceType) error {
+	return errProviderInitializationFailed
+}
 
 func TestParsePublicBackendPriority(t *testing.T) {
 	t.Parallel()
@@ -29,7 +47,6 @@ func TestParsePublicBackendPriority(t *testing.T) {
 		{name: "metal", in: "metal", want: BackendSpec{Backend: BackendCoreML, Device: DeviceCoreML}},
 		{name: "cuda", in: "cuda", want: BackendSpec{Backend: BackendONNX, Device: DeviceCUDA}},
 		{name: "pjrt", in: "pjrt", want: BackendSpec{Backend: BackendXLA, Device: DeviceAuto}},
-		{name: "pjrt tpu", in: "pjrt:tpu", want: BackendSpec{Backend: BackendXLA, Device: DeviceTPU}},
 	}
 
 	for _, tt := range tests {
@@ -43,6 +60,27 @@ func TestParsePublicBackendPriority(t *testing.T) {
 				t.Fatalf("ParseBackendSpec(%q) = %+v, want %+v", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestParsePublicBackendPriorityRejectsDeviceSuffix(t *testing.T) {
+	t.Parallel()
+
+	if _, err := ParseBackendSpec("pjrt:tpu"); err == nil {
+		t.Fatal("ParseBackendSpec(pjrt:tpu) unexpectedly succeeded")
+	}
+}
+
+func TestValidateStrictBackendPriorityRunsProviderProbe(t *testing.T) {
+	backend := failingRuntimeProbeBackend{}
+	RegisterBackend(backend)
+
+	err := ValidateStrictBackendPriority([]BackendSpec{{Backend: backend.Type(), Device: DeviceCUDA}})
+	if err == nil {
+		t.Fatal("ValidateStrictBackendPriority unexpectedly accepted a failed provider probe")
+	}
+	if !errors.Is(err, errProviderInitializationFailed) {
+		t.Fatalf("ValidateStrictBackendPriority error = %v", err)
 	}
 }
 

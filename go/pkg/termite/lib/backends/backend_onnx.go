@@ -85,6 +85,35 @@ func (b *onnxBackend) Available() bool {
 	return true
 }
 
+// ProbeRuntime initializes ONNX Runtime and, for a strict CUDA selection,
+// verifies that the CUDA execution provider can actually be attached. This is
+// deliberately model-free so lazy and bounded servers fail before readiness
+// when their required provider is missing.
+func (b *onnxBackend) ProbeRuntime(device DeviceType) error {
+	if err := b.initONNX(); err != nil {
+		return fmt.Errorf("initializing ONNX Runtime: %w", err)
+	}
+	if device != DeviceCUDA {
+		return nil
+	}
+
+	sessionOpts, err := ort.NewSessionOptions()
+	if err != nil {
+		return fmt.Errorf("creating CUDA probe session options: %w", err)
+	}
+	defer sessionOpts.Destroy()
+
+	cudaOpts, err := ort.NewCUDAProviderOptions()
+	if err != nil {
+		return fmt.Errorf("creating CUDA provider options: %w", err)
+	}
+	defer cudaOpts.Destroy()
+	if err := sessionOpts.AppendExecutionProviderCUDA(cudaOpts); err != nil {
+		return fmt.Errorf("attaching CUDA execution provider: %w", err)
+	}
+	return nil
+}
+
 func (b *onnxBackend) Priority() int {
 	// Highest priority when available
 	return 10

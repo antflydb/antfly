@@ -284,6 +284,7 @@ from .index_status import IndexStatus
 from .index_status_shard_status import IndexStatusShardStatus
 from .index_type import IndexType
 from .inference_audio_chunk_config import InferenceAudioChunkConfig
+from .inference_backend_priority_entry import InferenceBackendPriorityEntry
 from .inference_backend_runtimes import InferenceBackendRuntimes
 from .inference_binary_content import InferenceBinaryContent
 from .inference_chat_message import InferenceChatMessage
@@ -949,6 +950,7 @@ __all__ = (
     "IndexStatusShardStatus",
     "IndexType",
     "InferenceAudioChunkConfig",
+    "InferenceBackendPriorityEntry",
     "InferenceBackendRuntimes",
     "InferenceBinaryContent",
     "InferenceChatMessage",
