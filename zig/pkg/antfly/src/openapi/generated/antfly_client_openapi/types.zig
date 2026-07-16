@@ -403,6 +403,7 @@ pub const AlgebraicIndexStats = struct {
     disk_usage: ?i64 = null,
     /// Whether the sidecar is currently rebuilding
     rebuilding: ?bool = null,
+    repair: ?IndexRepairStatus = null,
     /// Whether the sidecar is actively rebuilding, replaying, or catching up.
     backfill_active: ?bool = null,
     /// Backfill progress as a ratio from 0.0 to 1.0
@@ -1869,6 +1870,15 @@ pub const DateRangeStringQuery = struct {
     datetime_parser: ?[]const u8 = null,
 };
 
+/// A dense-index rebuild is retaining replay history and the node has reached its hard safety budget.
+pub const DenseRepairBackpressureError = struct {
+    code: []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// Suggested delay before retrying the write.
+    retry_after_ms: i64,
+};
+
 /// A structured reason why the coverage projection cannot be treated as globally complete.
 pub const DerivedCoverageObservationIncompleteReason = enum {
     runtime_unavailable,
@@ -2582,6 +2592,7 @@ pub const EmbeddingsIndexStats = struct {
     total_terms: ?i64 = null,
     /// Whether the index enricher is currently backfilling
     rebuilding: ?bool = null,
+    repair: ?IndexRepairStatus = null,
     /// Number of documents pending enrichment in the WAL
     wal_backlog: ?i64 = null,
     /// Whether the index is actively rebuilding, replaying, enriching, or catching up.
@@ -3373,6 +3384,7 @@ pub const FullTextIndexStats = struct {
     disk_usage: ?i64 = null,
     /// Whether the index is currently rebuilding
     rebuilding: ?bool = null,
+    repair: ?IndexRepairStatus = null,
     /// Whether the index is actively rebuilding, replaying, or catching up.
     backfill_active: ?bool = null,
     /// Progress of ongoing rebuild as fraction [0.0, 1.0]
@@ -3681,6 +3693,7 @@ pub const GraphIndexStats = struct {
     edge_types: ?std.json.ArrayHashMap(i64) = null,
     /// Whether the index is currently rebuilding
     rebuilding: ?bool = null,
+    repair: ?IndexRepairStatus = null,
     /// Whether the index is actively rebuilding, materializing, or catching up.
     backfill_active: ?bool = null,
     /// Rebuild progress as a ratio from 0.0 to 1.0
@@ -4068,6 +4081,14 @@ pub const IndexExecutionConfig = struct {
     chunking: ?ExecutionPolicy = null,
     /// Embedding producer batching for shorthand-created embedding enrichments.
     embedding: ?ExecutionPolicy = null,
+};
+
+/// Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics.
+pub const IndexRepairStatus = struct {
+    /// Stable repair state. Internal state-machine phases are intentionally not exposed here.
+    state: []const u8,
+    /// Whether an operator must resume, retry, reconfigure, or drop the affected index.
+    action_required: bool,
 };
 
 /// Statistics for an index
@@ -6721,8 +6742,12 @@ pub const RepairRunRequest = struct {
     index: ?[]const u8 = null,
     /// Opaque cursor returned by a prior repair response.
     cursor: ?[]const u8 = null,
-    /// Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
+    /// Force one named-index replacement generation even when no repair debt is currently recorded. The force is dispatched once across the initial bounded group traversal; later convergence passes only observe that generation. Only applies to target=index.
     force: ?bool = null,
+    /// Applies one control to an existing named index repair. Requires target=index and index; cannot be combined with force, kind, or cursor.
+    control: ?[]const u8 = null,
+    /// Optional opaque generation fence for a repair control. A stale value is rejected instead of affecting a newer repair.
+    repair_id: ?[]const u8 = null,
     /// Maximum artifact repair records to attempt. For target=index, any positive value permits one named index repair.
     limit: ?i64 = null,
 };
@@ -7771,12 +7796,12 @@ pub const TableRepairJob = struct {
     cursor: ?[]const u8 = null,
     /// Effective per-pass repair limit.
     limit: i64,
-    /// Whether the job forces a named index rebuild.
+    /// Whether the next bounded pass still needs to dispatch the job's one forced named-index generation.
     force: bool,
     result: TableRepairRunResult,
     /// Last stable job-level error code.
     last_error: ?[]const u8 = null,
-    /// Whether cancellation has been requested for a running pass. Running passes finish at a bounded repair boundary before the job transitions to cancelled.
+    /// Whether cancellation is pending. For a named-index job, cancellation durably pauses the matching repair in every group and becomes terminal only after that bounded traversal completes.
     cancel_requested: bool,
     /// Unix epoch milliseconds when the job was created.
     created_at_millis: i64,
@@ -7836,6 +7861,8 @@ pub const TableRepairRunResult = struct {
     indexes_rebuilt: i64,
     /// Number of selected indexes that were already degraded or quarantined before repair.
     indexes_degraded: i64,
+    /// Number of existing index repairs that accepted the requested control.
+    controls_applied: i64,
     /// Effective repair limit.
     limit: i64,
     /// Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor.

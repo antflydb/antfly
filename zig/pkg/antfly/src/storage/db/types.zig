@@ -25,6 +25,7 @@ const shard_mod = @import("../shard.zig");
 const transactions_mod = @import("../transactions.zig");
 const reranking_mod = @import("antfly_reranking");
 const doc_identity_mod = @import("doc_identity.zig");
+const resource_manager_mod = @import("../resource_manager.zig");
 
 pub const GeoPoint = struct {
     lon: f64,
@@ -1930,6 +1931,12 @@ pub const RepairTarget = enum {
     index,
 };
 
+pub const IndexRepairControl = enum {
+    pause_automatic,
+    resume_automatic,
+    cancel_current_attempt,
+};
+
 pub const ArtifactRepairReason = enum {
     missing_artifact,
     corrupt_artifact,
@@ -2004,8 +2011,13 @@ pub const ArtifactRepairRunRequest = struct {
     limit: u32 = 100,
     cursor: ?[]const u8 = null,
     force: bool = false,
+    control: ?IndexRepairControl = null,
+    /// Optional compare-and-set fence for operator controls. When supplied,
+    /// the control applies only to the currently durable repair generation.
+    repair_id: ?u128 = null,
     repair_job_id: ?u64 = null,
     repair_attempt_id: ?u64 = null,
+    repair_job_created_at_ms: ?u64 = null,
     repair_cancel_base_uri: ?[]const u8 = null,
 };
 
@@ -2018,8 +2030,98 @@ pub const RepairCancelCheck = struct {
     }
 };
 
+/// Cooperative scheduler preemption checked only at durable reconstruction
+/// boundaries. Unlike cancellation, yielding is a successful partial pass: the
+/// candidate remains reopenable and its scan cursor is persisted before the
+/// BackendRuntime owner releases the node repair slot.
+pub const RepairYieldCheck = struct {
+    ptr: *anyopaque,
+    is_requested: *const fn (ptr: *anyopaque) bool,
+
+    pub fn requested(self: @This()) bool {
+        return self.is_requested(self.ptr);
+    }
+};
+
+pub const RepairActivationCheck = struct {
+    ptr: *anyopaque,
+    is_current_owner: *const fn (ptr: *anyopaque) anyerror!bool,
+
+    pub fn current(self: RepairActivationCheck) !bool {
+        return try self.is_current_owner(self.ptr);
+    }
+};
+
+pub const RepairCapacityObservation = resource_manager_mod.CapacityObservation;
+
+/// Storage-owned capacity probe. Implementations identify the actual
+/// volume/quota domain and synchronously refresh its capacity observation.
+/// The callback must be cheap enough to run at repair window boundaries.
+pub const RepairCapacitySource = resource_manager_mod.CapacitySource;
+
+pub const RepairCapacityCheck = struct {
+    ptr: *anyopaque,
+    reconcile: *const fn (ptr: *anyopaque, candidate_bytes: u64) anyerror!void,
+    revalidate: *const fn (ptr: *anyopaque) anyerror!void,
+    bind_candidate_root: ?*const fn (ptr: *anyopaque, candidate_root: []const u8) anyerror!void = null,
+
+    pub fn current(self: @This(), candidate_bytes: u64) !void {
+        return try self.reconcile(self.ptr, candidate_bytes);
+    }
+
+    /// Re-check the live capacity domain before another bounded build batch.
+    /// Implementations keep the successful path O(1), but may reconcile exact
+    /// candidate usage before returning an otherwise-conservative denial.
+    pub fn boundary(self: @This()) !void {
+        return try self.revalidate(self.ptr);
+    }
+
+    /// Binds the exact shadow-generation root whose materialized bytes consume
+    /// this reservation. The path is borrowed for the synchronous repair run.
+    pub fn bindCandidateRoot(self: @This(), candidate_root: []const u8) !void {
+        if (self.bind_candidate_root) |bind| try bind(self.ptr, candidate_root);
+    }
+};
+
 pub const ArtifactRepairRunOptions = struct {
     cancel_check: ?RepairCancelCheck = null,
+    /// Internal BackendRuntime scheduling policy. This is deliberately not an
+    /// API/index setting and is observed only after a bounded candidate batch
+    /// can be made durable and restart-reopenable.
+    yield_check: ?RepairYieldCheck = null,
+    /// Revalidated immediately before a replacement pointer is activated.
+    /// Long-running reconstruction may outlive leadership or placement.
+    activation_check: ?RepairActivationCheck = null,
+    /// Durable ownership claim captured by the node scheduler. Zero means the
+    /// caller has no stronger epoch than the DB's replica/root identity (the
+    /// standalone and operator-driven case). Managed repair passes the current
+    /// Raft term, or the visible root generation when no term source exists.
+    owner_epoch: u64 = 0,
+    /// Internal bounded-activation policy. These are node scheduling values,
+    /// not index configuration or public API controls.
+    max_activation_gap_sequences: u64 = 200,
+    max_convergence_rounds: u32 = 32,
+    max_activation_pause_ms: u64 = 250,
+    /// Internal node scheduler estimate persisted into the durable repair
+    /// intent before candidate construction. These fields are not API data.
+    estimated_candidate_bytes: u64 = 0,
+    planned_disk_bytes: u64 = 0,
+    /// ResourceManager capacity domain and observation source. These are
+    /// backend/runtime integration data, never public index configuration.
+    /// The direct observation is a fallback for callers without a live probe.
+    capacity_domain_id: u128 = 0,
+    capacity_observation: RepairCapacityObservation = .{},
+    capacity_source: ?RepairCapacitySource = null,
+    /// Installed by the durable owner after admission. Shadow construction
+    /// invokes it only at bounded publication/window boundaries.
+    capacity_check: ?RepairCapacityCheck = null,
+    /// Internal recursion fence: the durable owner has already admitted and
+    /// claimed this intent and is invoking the lower-level rebuild engine.
+    executing_durable_index_repair: bool = false,
+    /// Managed operator requests persist/enqueue intent work and return
+    /// immediately. Standalone callers leave this false and advance through
+    /// the same state machine synchronously.
+    defer_durable_index_repair_execution: bool = false,
 
     pub fn cancelled(self: ArtifactRepairRunOptions) bool {
         if (self.cancel_check) |check| return check.requested();
@@ -2039,6 +2141,7 @@ pub const ArtifactRepairResult = struct {
     in_progress: u64 = 0,
     indexes_rebuilt: u64 = 0,
     indexes_degraded: u64 = 0,
+    controls_applied: u64 = 0,
     limit: u32 = 0,
     next_cursor: ?[]u8 = null,
     has_more: bool = false,
@@ -2195,6 +2298,19 @@ pub const DBIndexStats = struct {
     repair_summary_ready: bool = true,
     repair_issue_count_estimated: bool = false,
     repair_scan_issue_count: u64 = 0,
+    index_repair_id: ?u128 = null,
+    index_repair_trigger: []const u8 = "none",
+    index_repair_phase: []const u8 = "none",
+    index_repair_automation: []const u8 = "none",
+    index_repair_attempts: u32 = 0,
+    index_repair_started_at_ms: u64 = 0,
+    index_repair_updated_at_ms: u64 = 0,
+    index_repair_build_floor_sequence: u64 = 0,
+    index_repair_applied_sequence: u64 = 0,
+    index_repair_target_sequence: u64 = 0,
+    index_repair_next_retry_at_ms: u64 = 0,
+    index_repair_last_error: ?[]const u8 = null,
+    index_repair_wait_reason: []const u8 = "none",
     projection_checkpoint_status: []const u8 = "clean",
     projection_checkpoint_applied_sequence: u64 = 0,
     projection_checkpoint_generation: u64 = 0,
@@ -2693,6 +2809,7 @@ pub fn freeDBStats(alloc: Allocator, stats: DBStats) void {
     for (stats.indexes) |item| {
         alloc.free(item.name);
         if (item.load_error) |value| alloc.free(value);
+        if (item.index_repair_last_error) |value| alloc.free(value);
         if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
         if (item.algebraic_last_error_reason) |value| alloc.free(value);
         if (item.algebraic_capability_fingerprint) |value| alloc.free(value);

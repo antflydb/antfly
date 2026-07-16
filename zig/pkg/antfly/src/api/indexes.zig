@@ -1165,9 +1165,42 @@ fn appendMinimalIndexRuntimeStatus(
     try out.append(alloc, '}');
 }
 
+/// Collapse the durable repair state machine into the small vocabulary that is
+/// useful to an application or an operator scanning ordinary index status.
+/// Detailed phases, identities, retry deadlines, and sequence counters remain
+/// available through internal diagnostics.
+fn publicIndexRepairState(item: anytype) ?[]const u8 {
+    const T = @TypeOf(item);
+    if (@hasField(T, "repair_state")) return item.repair_state;
+    if (!@hasField(T, "index_repair_id")) return null;
+    // Corrupt durable repair state intentionally has no trustworthy repair ID,
+    // but it is still a terminal, operator-actionable condition.
+    if (std.mem.eql(u8, item.index_repair_automation, "paused")) return "paused";
+    if (std.mem.eql(u8, item.index_repair_phase, "terminal")) return "failed";
+    if (item.index_repair_id == null) return null;
+    if (!std.mem.eql(u8, item.index_repair_wait_reason, "none")) return "waiting";
+    return "rebuilding";
+}
+
+fn repairStateRank(state: []const u8) u8 {
+    // Aggregate toward the least-progressing shard so a partially stalled
+    // distributed index is not presented as uniformly rebuilding.
+    if (std.mem.eql(u8, state, "failed")) return 5;
+    if (std.mem.eql(u8, state, "paused")) return 4;
+    if (std.mem.eql(u8, state, "waiting")) return 3;
+    if (std.mem.eql(u8, state, "rebuilding")) return 1;
+    return 0;
+}
+
+test "index repair aggregation exposes a waiting shard over rebuilding shards" {
+    try std.testing.expect(repairStateRank("waiting") > repairStateRank("rebuilding"));
+    try std.testing.expect(repairStateRank("failed") > repairStateRank("waiting"));
+}
+
 const AggregatedIndexStatus = struct {
     kind: ?db_mod.types.IndexKind = null,
     load_error: ?[]const u8 = null,
+    repair_state: ?[]const u8 = null,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
     enrichment_failed: bool = false,
@@ -1312,6 +1345,11 @@ fn aggregateIndexStatusIndexed(
         found = true;
         if (aggregate.kind == null) aggregate.kind = item.kind;
         if (item.load_error != null and aggregate.load_error == null) aggregate.load_error = item.load_error;
+        if (publicIndexRepairState(item)) |state| {
+            if (aggregate.repair_state == null or repairStateRank(state) > repairStateRank(aggregate.repair_state.?)) {
+                aggregate.repair_state = state;
+            }
+        }
         const runtime_present = runtime_status.statusHasRuntimeFacts(runtime);
         if (!runtime_present) continue;
         runtime_count += 1;
@@ -1748,6 +1786,7 @@ test "derived coverage aggregation rejects mixed config observations" {
     var indexes_a = [_]db_mod.types.DBIndexStats{.{
         .name = "visual",
         .kind = .dense_vector,
+        .load_error = "IncompleteBulkPublish",
         .coverage_produced_count = 1,
         .coverage_config_hash = 41,
     }};
@@ -1796,6 +1835,65 @@ test "derived coverage aggregation rejects mixed config observations" {
     );
     try std.testing.expect(std.mem.indexOf(u8, missing_status.items, "\"observation_incomplete_reasons\":[\"runtime_unavailable\",\"missing_group\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, missing_status.items, "\"pending\":null") != null);
+}
+
+test "index status exposes compact repair state without internal diagnostics" {
+    const item = db_mod.types.DBIndexStats{
+        .name = "visual",
+        .kind = .dense_vector,
+        .index_repair_id = 1,
+        .index_repair_phase = "building",
+        .index_repair_automation = "enabled",
+        .index_repair_wait_reason = "none",
+        .index_repair_attempts = 7,
+        .index_repair_applied_sequence = 41,
+        .index_repair_target_sequence = 99,
+    };
+    try std.testing.expectEqualStrings("rebuilding", publicIndexRepairState(item).?);
+
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .embeddings,
+        item,
+        0,
+        .external,
+        false,
+        0,
+        0,
+        null,
+        .{},
+        null,
+        null,
+        null,
+        .{},
+        null,
+        true,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"repair\":{\"state\":\"rebuilding\",\"action_required\":false}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"rebuilding\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"backfill_state\":\"running\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "load failed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "index_repair_id") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "index_repair_phase") == null);
+
+    var paused = item;
+    paused.index_repair_automation = "paused";
+    try std.testing.expectEqualStrings("paused", publicIndexRepairState(paused).?);
+
+    var failed = item;
+    failed.index_repair_phase = "terminal";
+    try std.testing.expectEqualStrings("failed", publicIndexRepairState(failed).?);
+
+    var corrupt = failed;
+    corrupt.index_repair_id = null;
+    try std.testing.expectEqualStrings("failed", publicIndexRepairState(corrupt).?);
+
+    var waiting = item;
+    waiting.index_repair_wait_reason = "backoff";
+    try std.testing.expectEqualStrings("waiting", publicIndexRepairState(waiting).?);
 }
 
 test "derived coverage aggregation rejects stale index incarnations" {
@@ -2248,15 +2346,20 @@ fn appendSingleIndexRuntimeStatus(
     }
     if (catch_up_active and catch_up_phase == .idle and replay_catch_up_required) catch_up_phase = .replay;
 
-    // An index whose persisted artifacts failed to load is broken, not
-    // rebuilding/warming: report the load error and suppress activity flags
-    // so clients classify it as needing a drop+recreate.
-    const load_error: ?[]const u8 = if (@hasField(@TypeOf(item), "load_error")) item.load_error else null;
+    const repair_state = publicIndexRepairState(item);
+    // A load failure with no durable automatic repair remains a terminal
+    // operator-visible error. Once a repair intent exists, the compact repair
+    // state is authoritative; exposing the quarantined root's raw load error
+    // at the same time would incorrectly tell clients to drop/recreate.
+    const raw_load_error: ?[]const u8 = if (@hasField(@TypeOf(item), "load_error")) item.load_error else null;
+    const load_error: ?[]const u8 = if (repair_state == null) raw_load_error else null;
     if (load_error != null) {
         backfill_active = false;
         catch_up_active = false;
         replay_catch_up_required = false;
         catch_up_phase = .idle;
+    } else if (repair_state) |state| {
+        backfill_active = std.mem.eql(u8, state, "rebuilding") or std.mem.eql(u8, state, "waiting");
     }
 
     try out.append(alloc, '{');
@@ -2292,8 +2395,12 @@ fn appendSingleIndexRuntimeStatus(
     defer alloc.free(progress);
     try out.appendSlice(alloc, progress);
     try out.appendSlice(alloc, ",\"backfill_state\":");
-    if (load_error != null) {
+    if (load_error != null or (repair_state != null and
+        (std.mem.eql(u8, repair_state.?, "paused") or std.mem.eql(u8, repair_state.?, "failed"))))
+    {
         try appendJsonString(alloc, out, "failed");
+    } else if (repair_state != null and std.mem.eql(u8, repair_state.?, "waiting")) {
+        try appendJsonString(alloc, out, "retrying");
     } else {
         try appendJsonString(alloc, out, backfillState(index_type, backfill_active, item.enrichment_failed, replay_applied_sequence, replay_target_sequence, enrichment));
     }
@@ -2302,6 +2409,13 @@ fn appendSingleIndexRuntimeStatus(
         defer alloc.free(msg);
         try out.appendSlice(alloc, ",\"error\":");
         try appendJsonString(alloc, out, msg);
+    }
+    if (repair_state) |state| {
+        try out.appendSlice(alloc, ",\"repair\":{\"state\":");
+        try appendJsonString(alloc, out, state);
+        try out.appendSlice(alloc, ",\"action_required\":");
+        try out.appendSlice(alloc, if (std.mem.eql(u8, state, "paused") or std.mem.eql(u8, state, "failed")) "true" else "false");
+        try out.append(alloc, '}');
     }
     try out.appendSlice(alloc, ",\"doc_count\":");
     try appendIntValue(alloc, out, item.doc_count);

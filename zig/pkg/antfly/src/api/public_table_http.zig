@@ -61,6 +61,7 @@ pub const TableApi = struct {
         NotFound,
         MethodNotAllowed,
         Backpressured,
+        DenseRepairBackpressure,
         Unavailable,
         WriteUnavailable,
         DocIdentityUnavailable,
@@ -76,6 +77,7 @@ pub const TableApi = struct {
         DocIdentityUnavailable,
         ReadRequiresPrimary,
         ReadUnavailable,
+        IndexRebuilding,
         ModelNotFound,
         UnsupportedExactSort,
         QueryCandidateBudgetExceeded,
@@ -487,6 +489,8 @@ pub const testing = if (builtin.is_test) struct {
 pub const OwnedResponse = struct {
     status: u16,
     body: []u8,
+    json: bool = false,
+    retry_after_seconds: ?u32 = null,
 
     pub fn deinit(self: *OwnedResponse, alloc: std.mem.Allocator) void {
         alloc.free(self.body);
@@ -557,6 +561,12 @@ pub fn handleTableBatch(
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.Backpressured => return .{ .status = 429, .body = try alloc.dupe(u8, "table backpressured") },
+        error.DenseRepairBackpressure => return .{
+            .status = 429,
+            .body = try alloc.dupe(u8, "{\"code\":\"dense_repair_backpressure\",\"message\":\"writes are temporarily limited while a dense index rebuild catches up\",\"retryable\":true,\"retry_after_ms\":1000}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
         error.Unavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "maintenance routes unavailable on query-only runtime") },
         error.WriteUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "write unavailable") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
@@ -616,6 +626,14 @@ pub fn handleTableQueryRequest(
             error.ReadUnavailable => {
                 std.log.warn("public table query standby unavailable table={s} err={}", .{ table_name, err });
                 return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") };
+            },
+            error.IndexRebuilding => {
+                std.log.info("public table query index rebuilding table={s}", .{table_name});
+                return .{
+                    .status = 503,
+                    .body = try alloc.dupe(u8, "{\"code\":\"index_rebuilding\",\"message\":\"required index is rebuilding\",\"retryable\":true}"),
+                    .json = true,
+                };
             },
             error.ModelNotFound => {
                 std.log.warn("public table query model not found table={s} err={}", .{ table_name, err });
@@ -1517,6 +1535,55 @@ test "public table batch handler maps backend errors" {
     try std.testing.expectEqualStrings("table backpressured", resp.body);
 }
 
+test "public table batch handler returns concise dense repair backpressure" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = executeTableBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBatch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) TableApi.ExecuteBatchError!void {
+            return error.DenseRepairBackpressure;
+        }
+    };
+
+    var resp = try handleTableBatch(std.testing.allocator, "docs",
+        \\{"inserts":{"doc-a":{"title":"alpha"}}}
+    , Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 429), resp.status);
+    try std.testing.expect(resp.json);
+    try std.testing.expectEqual(@as(?u32, 1), resp.retry_after_seconds);
+    var parsed = try std.json.parseFromSlice(struct {
+        code: []const u8,
+        message: []const u8,
+        retryable: bool,
+        retry_after_ms: u32,
+    }, std.testing.allocator, resp.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("dense_repair_backpressure", parsed.value.code);
+    try std.testing.expect(parsed.value.message.len != 0);
+    try std.testing.expect(parsed.value.retryable);
+    try std.testing.expectEqual(@as(u32, 1000), parsed.value.retry_after_ms);
+}
+
 test "public table batch handler maps unavailable errors" {
     const Backend = struct {
         fn iface() TableApi {
@@ -1724,7 +1791,7 @@ test "public table query handler maps doc identity unavailable errors" {
     try std.testing.expectEqualStrings("doc identity unavailable", resp.body);
 }
 
-test "public table query handler preserves embedding failure status" {
+test "public table query handler preserves retryable failure status" {
     const Backend = struct {
         err: TableApi.ExecuteQueryError,
 
@@ -1760,6 +1827,7 @@ test "public table query handler preserves embedding failure status" {
         err: TableApi.ExecuteQueryError,
         status: u16,
         body: []const u8,
+        json: bool = false,
     };
     const cases = [_]Case{
         .{ .err = error.QueryEmbeddingInputTooLarge, .status = 413, .body = "query embedding input too large" },
@@ -1767,6 +1835,7 @@ test "public table query handler preserves embedding failure status" {
         .{ .err = error.EmbedRateLimited, .status = 429, .body = "query embedding rate limited" },
         .{ .err = error.EmbedTransientFailure, .status = 503, .body = "query embedding temporarily unavailable" },
         .{ .err = error.EmbedUpstreamFailure, .status = 502, .body = "query embedding provider failed" },
+        .{ .err = error.IndexRebuilding, .status = 503, .body = "{\"code\":\"index_rebuilding\",\"message\":\"required index is rebuilding\",\"retryable\":true}", .json = true },
     };
 
     for (cases) |tc| {
@@ -1777,6 +1846,7 @@ test "public table query handler preserves embedding failure status" {
         defer resp.deinit(std.testing.allocator);
         try std.testing.expectEqual(tc.status, resp.status);
         try std.testing.expectEqualStrings(tc.body, resp.body);
+        try std.testing.expectEqual(tc.json, resp.json);
     }
 }
 

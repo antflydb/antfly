@@ -969,6 +969,15 @@ pub const CreateTableRequest = struct {
     replication_sources: ?[]const ReplicationSource = null,
 };
 
+/// A dense-index rebuild is retaining replay history and the node has reached its hard safety budget.
+pub const DenseRepairBackpressureError = struct {
+    code: []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// Suggested delay before retrying the write.
+    retry_after_ms: i64,
+};
+
 pub const DistanceRange = struct {
     /// Name of the distance range bucket
     name: []const u8,
@@ -2051,8 +2060,12 @@ pub const RepairRunRequest = struct {
     index: ?[]const u8 = null,
     /// Opaque cursor returned by a prior repair response.
     cursor: ?[]const u8 = null,
-    /// Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
+    /// Force one named-index replacement generation even when no repair debt is currently recorded. The force is dispatched once across the initial bounded group traversal; later convergence passes only observe that generation. Only applies to target=index.
     force: ?bool = null,
+    /// Applies one control to an existing named index repair. Requires target=index and index; cannot be combined with force, kind, or cursor.
+    control: ?[]const u8 = null,
+    /// Optional opaque generation fence for a repair control. A stale value is rejected instead of affecting a newer repair.
+    repair_id: ?[]const u8 = null,
     /// Maximum artifact repair records to attempt. For target=index, any positive value permits one named index repair.
     limit: ?i64 = null,
 };
@@ -2885,12 +2898,12 @@ pub const TableRepairJob = struct {
     cursor: ?[]const u8 = null,
     /// Effective per-pass repair limit.
     limit: i64,
-    /// Whether the job forces a named index rebuild.
+    /// Whether the next bounded pass still needs to dispatch the job's one forced named-index generation.
     force: bool,
     result: TableRepairRunResult,
     /// Last stable job-level error code.
     last_error: ?[]const u8 = null,
-    /// Whether cancellation has been requested for a running pass. Running passes finish at a bounded repair boundary before the job transitions to cancelled.
+    /// Whether cancellation is pending. For a named-index job, cancellation durably pauses the matching repair in every group and becomes terminal only after that bounded traversal completes.
     cancel_requested: bool,
     /// Unix epoch milliseconds when the job was created.
     created_at_millis: i64,
@@ -2950,6 +2963,8 @@ pub const TableRepairRunResult = struct {
     indexes_rebuilt: i64,
     /// Number of selected indexes that were already degraded or quarantined before repair.
     indexes_degraded: i64,
+    /// Number of existing index repairs that accepted the requested control.
+    controls_applied: i64,
     /// Effective repair limit.
     limit: i64,
     /// Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor.
