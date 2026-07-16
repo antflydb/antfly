@@ -344,6 +344,107 @@ fn nativeGenerationBaseLoadPriority(
     return scratch[0..len];
 }
 
+fn generationSelectionBackendType(selection: GenerateBackendSelection) ?backends_mod.BackendType {
+    return switch (selection.native_choice) {
+        .auto => null,
+        .native => .native,
+        .onnx => .onnx,
+        .metal => .metal,
+        .cuda => .cuda,
+        .pjrt => .pjrt,
+        .webgpu => .webgpu,
+    };
+}
+
+/// Return only the direct-session segment belonging to the selected
+/// operation backend. A later compiled provider is a hard priority boundary:
+/// direct backends after it must not be pulled forward merely because every
+/// compiled provider needs a direct base session.
+fn nativeGenerationDirectPriority(
+    scratch: *[backend_priority_capacity]backends_mod.BackendType,
+    configured: []const backends_mod.BackendType,
+    selection: GenerateBackendSelection,
+) []const backends_mod.BackendType {
+    if (selection.compiled_partition_backend) |primary| {
+        return nativeGenerationBaseLoadPriority(scratch, configured, primary);
+    }
+
+    const selected = generationSelectionBackendType(selection) orelse
+        return nativeGenerationLoadPriority(scratch, configured);
+
+    // Explicit request overrides and model-local policies that do not occur in
+    // the node priority are exact. Configured selections may consume the
+    // contiguous direct run beginning at that point in one model load.
+    if (selection.strict_backend) {
+        scratch[0] = selected;
+        return scratch[0..1];
+    }
+    var start: ?usize = null;
+    for (configured, 0..) |backend, index| {
+        if (backend == selected) {
+            start = index;
+            break;
+        }
+    }
+    if (start == null) {
+        scratch[0] = selected;
+        return scratch[0..1];
+    }
+
+    var len: usize = 0;
+    for (configured[start.?..]) |backend| {
+        if (compiledGenerationBackendKind(backend) != null) break;
+        scratch[len] = backend;
+        len += 1;
+    }
+    return scratch[0..len];
+}
+
+fn isRetryableGenerationBaseLoadError(
+    direct_backends: []const backends_mod.BackendType,
+    err: anyerror,
+) bool {
+    if (err == error.NoNativeGenerationBackend or err == error.NoBackendAvailable) return true;
+    for (direct_backends) |backend| {
+        if (backends_mod.isRetryableBackendLoadError(backend, err)) return true;
+    }
+    return false;
+}
+
+/// A failed direct base makes every compiled provider sharing that base
+/// unusable. Mark the complete bounded segment before choosing the next
+/// operation backend, otherwise fallback can loop back into the same failed
+/// base under another compiled provider.
+fn markFailedGenerationBaseSegment(
+    failed: *std.EnumSet(backends_mod.BackendType),
+    configured: []const backends_mod.BackendType,
+    selection: GenerateBackendSelection,
+    direct_backends: []const backends_mod.BackendType,
+) void {
+    const selected = generationSelectionBackendType(selection);
+    if (selected) |backend| failed.insert(backend);
+    for (direct_backends) |backend| failed.insert(backend);
+
+    const primary = selection.compiled_partition_backend orelse return;
+    const primary_type = compiledGenerationBackendType(primary) orelse return;
+    var start: usize = 0;
+    for (configured, 0..) |backend, index| {
+        if (backend == primary_type) {
+            start = index;
+            break;
+        }
+    }
+    var direct_run_started = false;
+    for (configured[start..]) |backend| {
+        if (compiledGenerationBackendKind(backend) != null) {
+            if (direct_run_started) break;
+        } else {
+            direct_run_started = true;
+        }
+        failed.insert(backend);
+    }
+}
+
 fn compiledGenerationBackendKind(backend: backends_mod.BackendType) ?ops.BackendKind {
     return switch (backend) {
         .onnx => .onnx,
@@ -400,8 +501,8 @@ fn compiledGenerationFallbackPriority(
 
 fn generationPriorityNeedsSessionFiltering(configured: []const backends_mod.BackendType) bool {
     for (configured) |backend| switch (backend) {
-        .onnx, .webgpu => return true,
-        .native, .metal, .cuda, .pjrt => {},
+        .onnx, .pjrt, .webgpu => return true,
+        .native, .metal, .cuda => {},
     };
     return false;
 }
@@ -2782,26 +2883,16 @@ pub const Node = struct {
 
     fn loadNativeGenerationModelForRequest(
         self: *Node,
-        allocator: std.mem.Allocator,
         request_id: u64,
         model_path: []const u8,
         selection: GenerateBackendSelection,
         artifact_selection: manifest_mod.ArtifactSelection,
     ) !*model_manager_mod.LoadedModel {
-        var request_session_manager = backends_mod.SessionManager.init(allocator);
-        const configured = if (selection.compiled_partition_backend != null)
-            // A compiled provider is an accelerator layered over the direct
-            // session. Its base must come from the same configured priority,
-            // never from an implicit native-first list.
-            self.session_manager.preferred_backends
-        else if (selection.override_model_loading) blk: {
-            native_backend_choice.configureSessionPreference(&request_session_manager, selection.native_choice);
-            break :blk request_session_manager.preferred_backends;
-        } else self.session_manager.preferred_backends;
+        const configured = self.session_manager.preferred_backends;
 
         // Preserve the alias-based, allocation-light hot path when the shared
-        // priority can only produce generation-compatible sessions. PJRT is
-        // safe here because direct session loading already skips it.
+        // priority can only produce generation-compatible sessions and has no
+        // compiled-provider boundary for a direct load to cross.
         if (artifact_selection.isEmpty() and
             !selection.override_model_loading and
             selection.compiled_partition_backend == null and
@@ -2812,10 +2903,7 @@ pub const Node = struct {
         }
 
         var scratch: [backend_priority_capacity]backends_mod.BackendType = undefined;
-        const direct_backends = if (selection.compiled_partition_backend) |primary|
-            nativeGenerationBaseLoadPriority(&scratch, configured, primary)
-        else
-            nativeGenerationLoadPriority(&scratch, configured);
+        const direct_backends = nativeGenerationDirectPriority(&scratch, configured, selection);
         if (direct_backends.len == 0) return error.NoNativeGenerationBackend;
 
         if (!artifact_selection.isEmpty()) {
@@ -2845,11 +2933,12 @@ pub const Node = struct {
         failed: backends_mod.BackendType,
     ) !GenerateBackendSelection {
         failed_backends.insert(failed);
-        const fallback_choice = generationBackendFromPrioritySkipping(self.config.backend_priority, failed_backends.*);
+        const effective_priority = self.config.backend_priority orelse self.session_manager.preferred_backends;
+        const fallback_choice = generationBackendFromPrioritySkipping(effective_priority, failed_backends.*);
         // A configured list must never escape to the implicit auto/default
         // order. In particular, a one-entry list is strict even when the
         // request did not include an explicit backend override.
-        if (self.config.backend_priority != null and fallback_choice == .auto) {
+        if (fallback_choice == .auto) {
             return error.NoConfiguredGenerationBackendFallback;
         }
         var selection = try parseGenerateBackendSelectionWithDefault(
@@ -3513,14 +3602,53 @@ pub const Node = struct {
         }
 
         // Fall back to native generation (CPU/GPU GPT arch forward pass).
-        const model = self.loadNativeGenerationModelForRequest(
-            ctx.allocator,
-            request_id,
-            model_path,
-            backend_selection,
-            artifact_selection,
-        ) catch |err|
-            return modelLoadFailure(ctx, err);
+        // Provider selection is still mutable here: no model or generation
+        // state has been committed, so infrastructure-only load failures may
+        // advance to the next bounded priority segment.
+        var model: *model_manager_mod.LoadedModel = undefined;
+        var base_load_attempts: usize = 0;
+        while (true) {
+            model = self.loadNativeGenerationModelForRequest(
+                request_id,
+                model_path,
+                backend_selection,
+                artifact_selection,
+            ) catch |err| {
+                var direct_scratch: [backend_priority_capacity]backends_mod.BackendType = undefined;
+                const direct_backends = nativeGenerationDirectPriority(
+                    &direct_scratch,
+                    self.session_manager.preferred_backends,
+                    backend_selection,
+                );
+                if (backend_selection.strict_backend or
+                    !isRetryableGenerationBaseLoadError(direct_backends, err))
+                {
+                    return modelLoadFailure(ctx, err);
+                }
+
+                markFailedGenerationBaseSegment(
+                    &failed_generation_backends,
+                    self.session_manager.preferred_backends,
+                    backend_selection,
+                    direct_backends,
+                );
+                const failed_backend = generationSelectionBackendType(backend_selection) orelse
+                    if (direct_backends.len > 0) direct_backends[0] else return modelLoadFailure(ctx, err);
+                backend_selection = self.fallbackConfiguredGenerationSelection(
+                    body,
+                    &failed_generation_backends,
+                    failed_backend,
+                ) catch return modelLoadFailure(ctx, err);
+                base_load_attempts += 1;
+                if (base_load_attempts >= backend_priority_capacity) return modelLoadFailure(ctx, err);
+                std.log.warn(
+                    "generation base model load failed ({s}); advancing to backend={s}",
+                    .{ @errorName(err), @tagName(backend_selection.native_choice) },
+                );
+                continue;
+            };
+            break;
+        }
         model.lockNativeGenerationWithIo(ctx.io);
         defer model.unlockNativeGenerationWithIo(ctx.io);
         const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
@@ -3608,12 +3736,13 @@ pub const Node = struct {
         }
 
         var compiled_fallback_storage: [backend_priority_capacity]ops.BackendKind = undefined;
+        const effective_backend_priority = self.config.backend_priority orelse self.session_manager.preferred_backends;
         var compiled_fallback_backends = if (backend_selection.strict_backend)
             @as([]const ops.BackendKind, &.{})
         else
             compiledGenerationFallbackPriority(
                 &compiled_fallback_storage,
-                self.config.backend_priority,
+                effective_backend_priority,
                 failed_generation_backends,
                 backend_selection.compiled_partition_backend,
             );
@@ -3629,7 +3758,7 @@ pub const Node = struct {
                 std.log.warn("configured PJRT fallback unavailable ({s}); advancing backend priority", .{@errorName(err)});
                 compiled_fallback_backends = compiledGenerationFallbackPriority(
                     &compiled_fallback_storage,
-                    self.config.backend_priority,
+                    effective_backend_priority,
                     failed_generation_backends,
                     backend_selection.compiled_partition_backend,
                 );
@@ -3655,7 +3784,6 @@ pub const Node = struct {
                 }
                 if (load_draft_backend) {
                     const draft_model = self.loadNativeGenerationModelForRequest(
-                        ctx.allocator,
                         request_id,
                         draft_model_path,
                         backend_selection,
@@ -4376,7 +4504,6 @@ pub const Node = struct {
             }
 
             const model = self.loadNativeGenerationModelForRequest(
-                ctx.allocator,
                 group_request_id,
                 model_path,
                 selection,
@@ -8310,7 +8437,8 @@ test "native generation load priority excludes compiled and incompatible session
     );
     try std.testing.expectEqualSlices(backends_mod.BackendType, &.{ .cuda, .native }, direct);
     try std.testing.expect(generationPriorityNeedsSessionFiltering(&.{ .pjrt, .onnx, .native }));
-    try std.testing.expect(!generationPriorityNeedsSessionFiltering(&.{ .pjrt, .cuda, .native }));
+    try std.testing.expect(generationPriorityNeedsSessionFiltering(&.{ .pjrt, .cuda, .native }));
+    try std.testing.expect(!generationPriorityNeedsSessionFiltering(&.{ .cuda, .native }));
 
     const bounded = nativeGenerationBaseLoadPriority(
         &scratch,
@@ -8318,6 +8446,59 @@ test "native generation load priority excludes compiled and incompatible session
         .onnx,
     );
     try std.testing.expectEqualSlices(backends_mod.BackendType, &.{ .cuda, .native }, bounded);
+}
+
+test "generation base load preserves compiled provider boundaries" {
+    var scratch: [backend_priority_capacity]backends_mod.BackendType = undefined;
+    const onnx_selection = GenerateBackendSelection{
+        .native_choice = .onnx,
+        .compiled_partition_backend = .onnx,
+    };
+    const bounded_compiled = nativeGenerationDirectPriority(
+        &scratch,
+        &.{ .onnx, .cuda, .pjrt, .native },
+        onnx_selection,
+    );
+    try std.testing.expectEqualSlices(backends_mod.BackendType, &.{.cuda}, bounded_compiled);
+
+    const bounded_contiguous = nativeGenerationDirectPriority(
+        &scratch,
+        &.{ .onnx, .cuda, .native, .pjrt },
+        onnx_selection,
+    );
+    try std.testing.expectEqualSlices(backends_mod.BackendType, &.{ .cuda, .native }, bounded_contiguous);
+
+    const configured_cuda = GenerateBackendSelection{
+        .native_choice = .cuda,
+        .override_model_loading = true,
+    };
+    const bounded_direct = nativeGenerationDirectPriority(
+        &scratch,
+        &.{ .cuda, .pjrt, .native },
+        configured_cuda,
+    );
+    try std.testing.expectEqualSlices(backends_mod.BackendType, &.{.cuda}, bounded_direct);
+}
+
+test "generation base failure advances beyond every provider sharing the base" {
+    var scratch: [backend_priority_capacity]backends_mod.BackendType = undefined;
+    const priority = [_]backends_mod.BackendType{ .onnx, .pjrt, .cuda, .native, .webgpu };
+    const selection = GenerateBackendSelection{
+        .native_choice = .onnx,
+        .compiled_partition_backend = .onnx,
+    };
+    const direct = nativeGenerationDirectPriority(&scratch, &priority, selection);
+    var failed = std.EnumSet(backends_mod.BackendType).initEmpty();
+    markFailedGenerationBaseSegment(&failed, &priority, selection, direct);
+    try std.testing.expect(failed.contains(.onnx));
+    try std.testing.expect(failed.contains(.pjrt));
+    try std.testing.expect(failed.contains(.cuda));
+    try std.testing.expect(failed.contains(.native));
+    try std.testing.expect(!failed.contains(.webgpu));
+
+    try std.testing.expect(isRetryableGenerationBaseLoadError(direct, error.NoBackendAvailable));
+    try std.testing.expect(!isRetryableGenerationBaseLoadError(direct, error.MissingRequiredWeights));
+    try std.testing.expect(!isRetryableGenerationBaseLoadError(direct, error.InvalidArtifact));
 }
 
 test "compiled generation fallback preserves configured ordering boundary" {

@@ -422,20 +422,11 @@ fn executeModelForwardViaDefinition(
         },
         .prefill => |prefill_request| blk: {
             try runtime.reset();
-            break :blk runtime.prefill(allocator, prefill_request) catch |err| switch (err) {
-                error.ArtifactShapeMismatch,
-                error.UnsupportedArtifactInputs,
-                error.UnsupportedShape,
-                error.UnsupportedTensorType,
-                => {
-                    std.log.warn(
-                        "ONNX whole-model prefill artifact rejected request: err={s} seq_len={d} query_seq_len={d} attention_mode={s}",
-                        .{ @errorName(err), prefill_request.seq_len, prefill_request.query_seq_len, @tagName(prefill_request.attention_mode) },
-                    );
-                    return null;
-                },
-                else => return err,
-            };
+            // Artifact discovery has already selected an exact shape bucket.
+            // Structural failures from that artifact are corruption/package
+            // errors and must remain terminal rather than being disguised as
+            // provider unavailability.
+            break :blk try runtime.prefill(allocator, prefill_request);
         },
     };
     return try output.takeHostLogits(allocator);

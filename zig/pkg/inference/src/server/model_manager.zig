@@ -2426,9 +2426,11 @@ fn loadSessionForPreferredBackends(
         man,
         source_session_manager.preserve_backend_order,
     );
+    var attempted_backend = false;
     for (effective_backends) |backend| {
         if (!backend.supportsDirectSessionLoad()) continue;
         const candidate_path = preferredModelPathForBackend(model_dir, man, backend) orelse continue;
+        attempted_backend = true;
         var single_backend = [_]backends.BackendType{backend};
         var backend_session_manager = sessionManagerForPreferredBackends(
             allocator,
@@ -2453,7 +2455,13 @@ fn loadSessionForPreferredBackends(
         man.visual_projection_path,
         man.audio_projection_path,
     });
-    return error.NoModelFileFound;
+    // Preserve the distinction between an invalid/incomplete model package
+    // and a set of otherwise compatible providers that could not initialize.
+    // Callers use NoBackendAvailable to advance an operation-specific
+    // priority chain; flattening both cases into NoModelFileFound masks that
+    // safe fallback signal and also risks treating package corruption as
+    // retryable.
+    return if (attempted_backend) error.NoBackendAvailable else error.NoModelFileFound;
 }
 
 test "shouldPreferNativeSession prefers native GLiNER weights" {

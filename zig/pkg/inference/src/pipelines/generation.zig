@@ -4633,6 +4633,9 @@ pub const NativeGenerationPipeline = struct {
         try self.rejectUnsupportedDeepSeekV4GraphMode();
         if (self.compiled_partition_backend == null or self.compiled_attachment_target != .whole_model) return false;
         while (self.compiled_partition_backend != null) {
+            if (!graph_mod.execution.compiledBackendSupportsRuntimePreparation(self.compiled_partition_backend.?)) {
+                return false;
+            }
             const prepared = graph_mod.execution.prepareCompiledModelRuntime(self, cache, kv_tokens_hint) catch |err| {
                 if (!self.advanceCompiledWholeModelProvider(cache, err)) return err;
                 continue;

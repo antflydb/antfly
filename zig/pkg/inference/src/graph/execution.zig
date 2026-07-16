@@ -216,9 +216,10 @@ fn advanceCompiledPartitionProvider(pipeline: anytype) void {
     }
 }
 
-/// Only provider availability and compile/shape incompatibility are safe to
-/// retry. Artifact metadata, weight, binding and output errors are terminal by
-/// default so a corrupt package is never hidden by a lower-priority backend.
+/// Only provider availability and explicit capability incompatibility are safe
+/// to retry. Artifact metadata, weight, shape, binding and output errors are
+/// terminal by default so a corrupt package is never hidden by a lower-priority
+/// backend.
 pub fn isRetryableCompiledProviderError(backend: contracts.BackendKind, err: anyerror) bool {
     switch (err) {
         error.BackendUnavailable,
@@ -228,14 +229,6 @@ pub fn isRetryableCompiledProviderError(backend: contracts.BackendKind, err: any
         error.UnsupportedCompiledGraphRuntime,
         error.UnsupportedOnnxGraphBackend,
         error.UnsupportedResidentInputBackend,
-        error.UnsupportedDType,
-        error.UnsupportedTensorDType,
-        error.UnsupportedTensorType,
-        error.UnsupportedShape,
-        error.UnsupportedOp,
-        error.UnsupportedPrimitiveOp,
-        error.MissingPartitionExecutionContext,
-        error.DeviceNotFound,
         => return true,
         else => {},
     }
@@ -245,9 +238,6 @@ pub fn isRetryableCompiledProviderError(backend: contracts.BackendKind, err: any
             error.OrtEnvCreationFailed,
             error.OrtSessionOptionsFailed,
             error.OnnxSessionInitializationFailed,
-            error.OnnxInputArityMismatch,
-            error.OnnxOutputArityMismatch,
-            error.UnsupportedOnnxOutputDType,
             => true,
             else => false,
         },
@@ -263,6 +253,14 @@ pub fn isRetryableCompiledProviderError(backend: contracts.BackendKind, err: any
         .webgpu => err == error.WebGpuUnavailable,
         else => false,
     };
+}
+
+/// Runtime preparation is an optional fast path, not a prerequisite for lazy
+/// whole-model attachment. Providers without this hook must remain selected so
+/// their normal forward path can initialize the runtime on first use.
+pub fn compiledBackendSupportsRuntimePreparation(backend: contracts.BackendKind) bool {
+    const backend_def = compiledBackendDefinition(backend) orelse return false;
+    return backend_def.prepare_model_runtime_direct != null;
 }
 
 fn executeSingleDeviceGraphExecutor(
@@ -879,12 +877,21 @@ test "shouldUsePartitionedGraphExecution requires explicit sharding config" {
 
 test "compiled provider fallback excludes artifact corruption" {
     try std.testing.expect(isRetryableCompiledProviderError(.onnx, error.OnnxSessionInitializationFailed));
-    try std.testing.expect(isRetryableCompiledProviderError(.onnx, error.UnsupportedShape));
     try std.testing.expect(isRetryableCompiledProviderError(.pjrt, error.MissingPjrtClient));
     try std.testing.expect(!isRetryableCompiledProviderError(.onnx, error.InvalidOnnxModel));
     try std.testing.expect(!isRetryableCompiledProviderError(.onnx, error.ArtifactShapeMismatch));
     try std.testing.expect(!isRetryableCompiledProviderError(.pjrt, error.InvalidArtifact));
     try std.testing.expect(!isRetryableCompiledProviderError(.pjrt, error.MissingArtifactMetadata));
+    try std.testing.expect(!isRetryableCompiledProviderError(.onnx, error.UnsupportedShape));
+    try std.testing.expect(!isRetryableCompiledProviderError(.onnx, error.OnnxInputArityMismatch));
+    try std.testing.expect(!isRetryableCompiledProviderError(.onnx, error.UnsupportedOnnxOutputDType));
+    try std.testing.expect(!isRetryableCompiledProviderError(.pjrt, error.UnsupportedTensorType));
+}
+
+test "runtime preparation remains optional for lazy compiled providers" {
+    try std.testing.expect(!compiledBackendSupportsRuntimePreparation(.onnx));
+    try std.testing.expect(!compiledBackendSupportsRuntimePreparation(.pjrt));
+    try std.testing.expectEqual(build_options.enable_metal, compiledBackendSupportsRuntimePreparation(.metal));
 }
 
 test "shouldUsePartitionedGraphExecution requires multiple mesh devices" {
