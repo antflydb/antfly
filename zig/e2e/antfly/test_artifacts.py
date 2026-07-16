@@ -257,6 +257,7 @@ def test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e(
         "mode": "always",
         "render_dpi": 150,
         "max_rendered_pixels": 4_000_000,
+        "max_rendered_dimension": 2048,
         "config": {
             "provider": "antfly",
             "model": "antflydb/Florence-2-base",
@@ -284,6 +285,7 @@ def test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e(
         )
         is not None
     )
+
     assert (
         stateful_api.put(
             f"{_table_artifact_path(table_name, 'document_chunks_v1')}/enrichment",
@@ -308,6 +310,7 @@ def test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e(
         )
         is not None
     )
+
     zig_root = Path(__file__).resolve().parents[2]
     pdf_bytes = (zig_root / "lib/pdf/testdata/two_page_text_fixture.pdf").read_bytes()
     scanned_table_pdf = (
@@ -507,6 +510,7 @@ def test_pdf_auto_ocr_only_renders_pages_without_usable_embedded_text_e2e(
         "mode": "auto",
         "render_dpi": 150,
         "max_rendered_pixels": 4_000_000,
+        "max_rendered_dimension": 2048,
         "config": {
             "provider": "antfly",
             "model": "antflydb/Florence-2-base",
@@ -831,6 +835,34 @@ def test_artifact_backed_embedding_table_provisions_atomically(
             interval_s=1.0,
         )
         is not None
+    )
+
+    # Runtime-group coverage is propagated through persisted status reports;
+    # restarting must not collapse the exact primary-document count to zero.
+    stateful_api.restart_server()
+    coverage_after_restart = wait_until(
+        lambda: (
+            status
+            if (
+                (status := stateful_api.get_index(table_name, "document_vectors"))
+                .get("status", {})
+                .get("coverage", {})
+                .get("source_total")
+                == 2
+                and status["status"]["coverage"].get("produced") == 2
+                and status["status"]["coverage"].get("covered") == 2
+                and status["status"]["coverage"].get("observation_complete")
+                is True
+                and status["status"]["coverage"].get("complete") is True
+                and status["status"]["coverage"].get("healthy") is True
+            )
+            else None
+        ),
+        timeout_s=90.0,
+        interval_s=1.0,
+    )
+    assert coverage_after_restart is not None, stateful_api.get_index(
+        table_name, "document_vectors"
     )
 
 
