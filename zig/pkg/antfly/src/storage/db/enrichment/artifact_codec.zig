@@ -32,7 +32,11 @@ pub const Kind = enum(u8) {
 pub const Flags = packed struct(u8) {
     has_source_hash: bool = false,
     has_graph_generation: bool = false,
-    _reserved: u6 = 0,
+    // Portable Go backups contain semantic edges but no Zig coverage
+    // incarnation. This bit makes that state explicit; generation zero alone
+    // is never treated as portable or serviceable.
+    portable_unbound_graph_generation: bool = false,
+    _reserved: u5 = 0,
 };
 
 pub const Header = struct {
@@ -300,6 +304,27 @@ pub fn encodeGraphEdgeAlloc(
     pos += @sizeOf(u32);
     @memcpy(out[pos .. pos + metadata_json.len], metadata_json);
     return out;
+}
+
+pub fn encodePortableUnboundGraphEdgeAlloc(
+    alloc: Allocator,
+    weight: f64,
+    created_at: u64,
+    updated_at: u64,
+    metadata_json: []const u8,
+) ![]u8 {
+    const out = try encodeGraphEdgeAlloc(alloc, null, 0, weight, created_at, updated_at, metadata_json);
+    var header = try decodeHeader(out);
+    header.flags.portable_unbound_graph_generation = true;
+    writeHeader(out[0..header_len], header);
+    return out;
+}
+
+pub fn isPortableUnboundGraphEdge(data: []const u8) bool {
+    const header = decodeHeader(data) catch return false;
+    if (header.kind != .graph_edge or !header.flags.portable_unbound_graph_generation) return false;
+    if (header.payload_len < @sizeOf(u64) or data.len < header_len + header.payload_len) return false;
+    return std.mem.readInt(u64, data[header_len..][0..8], .little) == 0;
 }
 
 pub fn decodeGraphEdgeAlloc(alloc: Allocator, data: []const u8) !GraphEdge {

@@ -1915,8 +1915,9 @@ fn processPendingDocumentGroup(
     window: *GeneratedReplayWindow,
     processed_request_count: *u64,
 ) !void {
-    const planned = try getOrCreatePlannedRequests(runtime, pending.doc_key, request_plan_cache);
+    const planned = try getOrCreatePlannedRequests(runtime, pending, request_plan_cache);
     for (planned) |request| {
+        if (!pending.all_targets and !requestMatchesAnyGeneratedRef(request, pending.generated_enrichment_refs)) continue;
         // Publish completed generated writes before the next external embedder call can enter retry backoff.
         if (window.hasDerivedItems()) try flushGeneratedReplayWindow(runtime, window);
         processed_request_count.* += 1;
@@ -5390,9 +5391,10 @@ fn processChunkedDenseWindow(
 
 fn getOrCreatePlannedRequests(
     runtime: *EnrichmentRuntime,
-    doc_key: []const u8,
+    pending: enrichment_worker.PendingDocumentGroup,
     request_plan_cache: *std.ArrayListUnmanaged(RequestPlanCacheEntry),
 ) ![]const enrichment_types.GeneratedEnrichmentRequest {
+    const doc_key = pending.doc_key;
     for (request_plan_cache.items) |entry| {
         if (std.mem.eql(u8, entry.doc_key, doc_key)) return entry.requests;
     }
@@ -5417,18 +5419,50 @@ fn getOrCreatePlannedRequests(
 
     const explicit_dense: []const mapper.DenseEmbeddingWrite = &.{};
     const explicit_sparse: []const mapper.SparseEmbeddingWrite = &.{};
+    var target_artifact_names = std.ArrayListUnmanaged([]const u8).empty;
+    defer target_artifact_names.deinit(runtime.alloc);
+    if (!pending.all_targets) {
+        for (pending.generated_enrichment_refs) |ref| {
+            try appendUniqueBorrowedName(runtime.alloc, &target_artifact_names, enrichment_types.refArtifactName(ref));
+            try appendUniqueBorrowedName(runtime.alloc, &target_artifact_names, enrichment_types.refEmbeddingName(ref));
+            try appendUniqueBorrowedName(runtime.alloc, &target_artifact_names, ref.index_name);
+        }
+    }
     const planned = try runtime.index_manager.planGeneratedEnrichments(
         runtime.alloc,
         doc_key,
         raw,
         explicit_dense,
         explicit_sparse,
+        target_artifact_names.items,
     );
     try request_plan_cache.append(runtime.alloc, .{
         .doc_key = owned_doc_key,
         .requests = planned,
     });
     return request_plan_cache.items[request_plan_cache.items.len - 1].requests;
+}
+
+fn appendUniqueBorrowedName(
+    alloc: Allocator,
+    names: *std.ArrayListUnmanaged([]const u8),
+    name: []const u8,
+) !void {
+    if (name.len == 0) return;
+    for (names.items) |existing| {
+        if (std.mem.eql(u8, existing, name)) return;
+    }
+    try names.append(alloc, name);
+}
+
+fn requestMatchesAnyGeneratedRef(
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    refs: []const enrichment_types.GeneratedEnrichmentRef,
+) bool {
+    for (refs) |ref| {
+        if (enrichment_types.requestMatchesRef(request, ref)) return true;
+    }
+    return false;
 }
 
 fn flushGeneratedReplayWindowIfNeeded(

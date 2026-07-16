@@ -4214,6 +4214,9 @@ pub const BoundTableWriteSource = struct {
             alloc.free(cfg.name);
             alloc.free(cfg.config_json);
         }
+        // A bound source owns a direct embedded DB and has no managed-table
+        // repair scheduler. Preserve the synchronous completion contract here;
+        // only provisioned sources admit through addIndexAsync.
         try db.addIndex(cfg);
     }
 
@@ -6678,8 +6681,10 @@ pub const ProvisionedTableWriteSource = struct {
                 var cached = cached_db;
                 defer cached.deinit(alloc);
                 try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, cached.db);
+                cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(table.name, group_id, cached.db));
                 try applyLocalTableSchemaJson(alloc, cached.db, table.schema_json);
                 const index_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, table.indexes_json, .{
+                    .index_admission = .managed_async,
                     .embedding_options = .{
                         .antfly_provider = self.antfly_provider,
                         .inference_api_url = self.inference_api_url,
@@ -6717,6 +6722,8 @@ pub const ProvisionedTableWriteSource = struct {
 
             try applyLocalTableSchemaJson(alloc, &opened.?, table.schema_json);
             try cache.seedCreatedDbLocked(&opened, group_id, lsm_root_generation, table.name, table.indexes_json, table.schema_json);
+            const seeded_db = cache.getLocked(group_id, lsm_root_generation, table.name) orelse unreachable;
+            seeded_db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(table.name, group_id, seeded_db));
         }
         return summary;
     }
@@ -7136,7 +7143,23 @@ pub const ProvisionedTableWriteSource = struct {
             metadata.advance_index_repairs,
             metadata.index_repair_options,
         );
-        try publishRuntimeStatusSnapshotWithStartupPhase(self, alloc, table_name, group_id, .idle, db);
+        if (result.index_repair_attempted or result.index_repair_repaired or result.terminal_degraded) {
+            // Repair completion changes durable lifecycle fields that the
+            // bounded best-effort overlay intentionally does not reload. Take
+            // one authoritative snapshot at that boundary so a removed repair
+            // intent cannot remain operator-visible in the cached status.
+            try publishRuntimeStatusSnapshotWithStartupPhaseMode(
+                self,
+                alloc,
+                table_name,
+                group_id,
+                .idle,
+                .consistent,
+                db,
+            );
+        } else {
+            try publishRuntimeStatusSnapshotWithStartupPhase(self, alloc, table_name, group_id, .idle, db);
+        }
         self.updateStartupCatchUpBackoff(group_id, startupCatchUpMonotonicMs(), backoff_epoch, &result);
         preserve_startup_cache = result.had_debt and !result.cleared_debt and
             !result.terminal_degraded and !result.busy and !result.made_progress;
@@ -8866,6 +8889,22 @@ pub const ProvisionedTableWriteSource = struct {
                     any_busy = true;
                     continue;
                 }
+                // Structural reconciliation publishes its consistent runtime
+                // snapshot before returning, so its foreground writer no
+                // longer owns useful work. Retire it before waking repair:
+                // startup/repair ownership deliberately refuses to overlap a
+                // live foreground cache entry, and leaving this entry resident
+                // would permanently fence the durable admission intent.
+                self.invalidateWriteCacheForTable(table_name);
+                // The group operation and its cached writer lease have been
+                // released when the group reconcile returns. Wake the exact
+                // repair route here so it cannot lose its only useful attempt
+                // by racing the structural operation that created the durable
+                // admission intent. The worker authoritatively removes this
+                // inexpensive hint when the group has no runnable debt.
+                if (metadata.indexes_json != null) {
+                    self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue);
+                }
             }
             if (!any_busy) {
                 self.notifyLocalChange(table_name, .structural);
@@ -8933,6 +8972,7 @@ pub const ProvisionedTableWriteSource = struct {
             if (metadata.indexes_json) |indexes_json| {
                 _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
                     .drain_resolver_backfill = false,
+                    .index_admission = .managed_async,
                     .embedding_options = .{
                         .antfly_provider = self.antfly_provider,
                         .inference_api_url = self.inference_api_url,
@@ -9035,6 +9075,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (metadata.indexes_json) |indexes_json| {
             _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
                 .drain_resolver_backfill = false,
+                .index_admission = .managed_async,
                 .embedding_options = .{
                     .antfly_provider = self.antfly_provider,
                     .inference_api_url = self.inference_api_url,
@@ -9278,6 +9319,11 @@ pub const ProvisionedTableWriteSource = struct {
                 .{
                     .inference_api_url = self.inference_api_url,
                     .drain_resolver_backfill = false,
+                    // The shard path was deleted immediately above, so this
+                    // is a provably empty initial generation. Completing
+                    // admission inline is bounded and avoids manufacturing
+                    // repair debt before distributed repair ownership exists.
+                    .index_admission = .synchronous,
                     .ha_write_gate = self.ha_write_gate,
                     .ha_async_effect_mirror = effective_ha_mirror,
                     .ha_async_batch_mirror = effective_ha_mirror,
@@ -9295,6 +9341,8 @@ pub const ProvisionedTableWriteSource = struct {
             });
             if (seed_create_table_writer) {
                 try self.write_cache.?.seedCreatedDbLocked(&opened, group_id, lsm_root_generation, table_name, indexes_json, schema_json);
+                const seeded_db = self.write_cache.?.getLocked(group_id, lsm_root_generation, table_name) orelse unreachable;
+                seeded_db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(table_name, group_id, seeded_db));
             } else {
                 try drainManagedDbBeforeClose(&opened.?);
             }
@@ -9353,6 +9401,7 @@ pub const ProvisionedTableWriteSource = struct {
                 try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
                 if (indexes_json) |value| {
                     _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, value, .{
+                        .index_admission = .managed_async,
                         .embedding_options = .{
                             .antfly_provider = self.antfly_provider,
                             .inference_api_url = self.inference_api_url,
@@ -13656,7 +13705,7 @@ fn applyIndexCreateToCachedDb(
         .antfly_provider = antfly_provider,
         .inference_api_url = inference_api_url,
     });
-    db.addIndex(.{
+    db.addIndexAsync(.{
         .name = owned_name,
         .kind = kind,
         .config_json = config_json,
@@ -14699,6 +14748,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
 
 const ManagedDbOpenOptions = struct {
     drain_resolver_backfill: bool = true,
+    index_admission: metadata_table_provisioner.IndexAdmission = .managed_async,
     inference_api_url: ?[]const u8 = null,
     ha_write_gate: ?db_mod.HAWriteGate = null,
     ha_async_effect_mirror: ?db_mod.HAAsyncEffectMirror = null,
@@ -15048,6 +15098,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
 
     const summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
         .drain_resolver_backfill = options.drain_resolver_backfill,
+        .index_admission = options.index_admission,
         .embedding_options = .{
             .antfly_provider = antfly_provider,
             .inference_api_url = options.inference_api_url,

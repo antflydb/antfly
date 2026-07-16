@@ -650,6 +650,10 @@ pub const DBCore = struct {
         return try self.index_manager.remove(self.store, name);
     }
 
+    pub fn deleteIndexWithGraphRetirement(self: *DBCore, name: []const u8, generation: ?u64) !bool {
+        return try self.index_manager.removeWithGraphRetirement(self.store, name, generation);
+    }
+
     pub fn deleteEnrichment(self: *DBCore, kind: types.EnrichmentKind, name: []const u8) !bool {
         return try self.index_manager.removeEnrichment(self.store, kind, name);
     }
@@ -665,6 +669,7 @@ pub const DBCore = struct {
         cleaned: []const u8,
         dense_embeddings: []const types.EnrichmentDenseEmbeddingWrite,
         sparse_embeddings: []const types.EnrichmentSparseEmbeddingWrite,
+        target_artifact_names: []const []const u8,
     ) ![]enrichment_types.GeneratedEnrichmentRequest {
         var explicit_dense = try alloc.alloc(mapper.DenseEmbeddingWrite, dense_embeddings.len);
         defer alloc.free(explicit_dense);
@@ -694,6 +699,7 @@ pub const DBCore = struct {
             cleaned,
             explicit_dense,
             explicit_sparse,
+            target_artifact_names,
         );
     }
 

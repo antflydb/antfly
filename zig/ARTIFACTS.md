@@ -452,16 +452,26 @@ Adding an artifact-backed dense index over existing streams bootstraps its
 authoritative union cardinality from a stable store snapshot. Concurrent
 artifact commits contribute signed deltas while the snapshot is counted, so
 the scan does not hold the global apply lock and cannot publish a false zero
-coverage target. The synchronous target rebuild therefore starts from the same
-authoritative union count used by later coverage checks.
+coverage target. Bootstrap and target construction run as bounded, resumable
+background repair work rather than extending the index-creation request.
 
-Index admission is published behind an `IndexRebuilding` availability barrier.
-The rebuild reads a stable artifact snapshot paired with its exact replay
-sequence floor, then catches the target index up through every post-snapshot
-mutation before clearing the barrier. Catalog mutations are structurally
-serialized without holding the global apply lock for the corpus scan, so a
-delete/recreate cannot overlap an admission while unrelated document writes
-continue normally.
+Index admission is published behind a durable `IndexRebuilding` availability
+barrier in the same primary-store transaction as the catalog entry. The repair
+engine reads a stable artifact snapshot paired with its exact replay sequence
+floor, builds in bounded resumable slices, then catches the target index up
+through every post-snapshot mutation, publishes a clean checkpoint, and only
+then clears the durable readiness gates. Startup recreates missing repair
+intent state from the admission marker, so a
+process stop at any boundary remains fail-closed and self-healing. Catalog
+mutations are structurally serialized without holding the global apply lock for
+the corpus scan, so a delete/recreate cannot overlap an admission while
+unrelated document writes continue normally.
+
+When a newly admitted full-text, vector, or graph index needs generated source
+artifacts for existing documents, admission replays and drains one bounded
+document page at a time. Its durable store-key cursor advances only after that
+page is serviceable, so scheduler preemption and restart resume without an
+ever-growing prefix rescan.
 
 All sources in one index must have the same dense dimension and must inhabit a
 compatible vector space. `vector_space` is optional. When every source omits
@@ -604,6 +614,15 @@ recreated generation. Index deletion stays independent of corpus size.
 Manifests for artifacts no longer listed in `sources` are excluded from winner
 selection.
 
+Portable AFB backups produced by the Go engine store graph edges as semantic
+`weight`, timestamp, and metadata values without a Zig coverage generation.
+Zig imports those values with an explicit portable-unbound marker; generation
+zero is never considered serviceable. The normal graph admission/rebuild path
+binds each imported edge to the configured index generation before queries can
+observe it. Native Zig envelopes are structurally validated, while untagged Go
+values remain distinguishable even if their weight bytes happen to equal the
+Zig artifact magic.
+
 ```json
 {
   "type": "graph",
@@ -630,7 +649,7 @@ artifact producer policy under graph root `execution`:
 ```json
 {
   "type": "graph",
-  "artifact": {
+  "enrichments": [{
     "name": "relations_v1",
     "kind": "asset",
     "field": "body",
@@ -647,7 +666,7 @@ artifact producer policy under graph root `execution`:
       "batch_items": 8,
       "batch_bytes": 262144
     }
-  },
+  }],
   "sources": [{
     "artifact": "relations_v1",
     "path": "$.relations[*]",

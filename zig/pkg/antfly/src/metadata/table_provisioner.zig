@@ -183,6 +183,7 @@ pub fn reconcileReplicaRootWithOptions(
         try applyTableSchemaJson(alloc, &db, table.schema_json);
         const index_summary = try reconcileDbIndexesWithOptions(alloc, &db, table.indexes_json, .{
             .embedding_options = options.embedding_options,
+            .index_admission = .managed_async,
         });
         summary.indexes_removed += index_summary.indexes_removed;
         summary.indexes_added += index_summary.indexes_added;
@@ -213,9 +214,12 @@ pub fn reconcileDbIndexes(
     return try reconcileDbIndexesWithOptions(alloc, db, indexes_json, .{});
 }
 
+pub const IndexAdmission = enum { synchronous, managed_async };
+
 pub const ReconcileDbIndexOptions = struct {
     drain_resolver_backfill: bool = true,
     embedding_options: managed_embedder.InitOptions = .{},
+    index_admission: IndexAdmission = .synchronous,
 };
 
 fn dbIndexReconciliationCanMutate(db: *const db_mod.DB) bool {
@@ -248,7 +252,7 @@ pub fn reconcileDbIndexesWithOptions(
         .drain_backfill = options.drain_resolver_backfill,
     });
     const missing_indexes_removed = try removeMissingIndexes(alloc, db, indexes_json);
-    const index_summary = try ensureIndexes(alloc, db, indexes_json);
+    const index_summary = try ensureIndexes(alloc, db, indexes_json, options.index_admission);
     const enrichments_removed = try removeMissingEnrichments(alloc, db, desired_enrichments.items);
     const indexes_removed = missing_indexes_removed + index_summary.removed;
     if (index_summary.added > 0 or indexes_removed > 0 or enrichment_summary.changed() or enrichments_removed > 0 or resolver_summary.changed()) {
@@ -529,7 +533,12 @@ const IndexEnsureSummary = struct {
     removed: usize = 0,
 };
 
-fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !IndexEnsureSummary {
+fn ensureIndexes(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    indexes_json: []const u8,
+    admission: IndexAdmission,
+) !IndexEnsureSummary {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer parsed.deinit();
     const object = switch (parsed.value) {
@@ -550,7 +559,7 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
             const name = try indexDefinitionName(item);
             const kind = try parseIndexKind(item);
             const config_value = indexDefinitionConfigValue(item);
-            try ensureIndexDefinition(alloc, db, current, &summary, name, kind, config_value, true);
+            try ensureIndexDefinition(alloc, db, current, &summary, name, kind, config_value, true, admission);
         }
         return summary;
     }
@@ -562,7 +571,7 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
         if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or
             std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
         const kind = try parseIndexKind(entry.value_ptr.*);
-        try ensureIndexDefinition(alloc, db, current, &summary, entry.key_ptr.*, kind, entry.value_ptr.*, false);
+        try ensureIndexDefinition(alloc, db, current, &summary, entry.key_ptr.*, kind, entry.value_ptr.*, false, admission);
     }
     return summary;
 }
@@ -576,6 +585,7 @@ fn ensureIndexDefinition(
     kind: db_mod.types.IndexKind,
     config_value: std.json.Value,
     storage_config: bool,
+    admission: IndexAdmission,
 ) !void {
     const config_json = if (storage_config)
         try extractStoredIndexConfigJson(alloc, config_value)
@@ -600,12 +610,16 @@ fn ensureIndexDefinition(
         if (try indexConfigsEqual(alloc, existing_cfg, desired)) return;
         if (try db.deleteIndex(desired.name)) summary.removed += 1;
     }
-    try db.addIndex(.{
+    const cfg = db_mod.types.IndexConfig{
         .name = desired.name,
         .kind = desired.kind,
         .config_json = desired.config_json,
         .coverage_generation = desired.coverage_generation,
-    });
+    };
+    switch (admission) {
+        .synchronous => try db.addIndex(cfg),
+        .managed_async => try db.addIndexAsync(cfg),
+    }
     summary.added += 1;
 }
 

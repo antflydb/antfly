@@ -2996,9 +2996,7 @@ pub const DB = struct {
     // The apply lock remains short-lived; unrelated document writes can
     // continue while one structural operation owns this mutex.
     index_structure_mutex: std.atomic.Mutex = .unlocked,
-    graph_generation_cleanup_mutex: std.atomic.Mutex = .unlocked,
-    graph_generation_cleanup_state: std.atomic.Value(u8) = .init(0),
-    pending_graph_generation_cleanup: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(u64)) = .empty,
+    graph_generation_cleanup: ?*GraphGenerationCleanupContext = null,
     index_repair_mutex: std.atomic.Mutex = .unlocked,
     active_index_repairs: std.StringHashMapUnmanaged(bool) = .{},
     shadow_index_repair_hook: ?@This().ShadowIndexRepairHook = null,
@@ -3300,6 +3298,15 @@ pub const DB = struct {
             owned_executor = null;
             generation_read_lease = null;
             errdefer db.deinitWrapperState(executor_ready);
+            const graph_generation_cleanup = try alloc.create(GraphGenerationCleanupContext);
+            graph_generation_cleanup.* = .{
+                .alloc = alloc,
+                .store = db.core.store,
+                .apply_mutex = db.core.apply_mutex,
+                .durable_jobs = db.backend_runtime.durable_jobs,
+                .owner_id = db.repair_cleanup_owner_id,
+            };
+            db.graph_generation_cleanup = graph_generation_cleanup;
             db.core.setIndexOpenParallelism(opts.index_open_parallelism);
             const init_async_started_ns = monotonicTimeNs();
             try db.initAsyncInfrastructure(effective_executor, opts.resource_manager);
@@ -3344,8 +3351,12 @@ pub const DB = struct {
                     db.index_repair_replay_pinned.store(state.minimumRetainAfterSequence() != null, .release);
                     state.deinit(alloc);
                 }
+                try db.ensureAdmissionRepairIntents(alloc);
             }
             try db.refreshIndexRepairAvailabilityGate(alloc);
+            if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
+                try db.restoreRetiredGraphGenerationCleanup();
+            }
             if (opts.open_mode != .status_only) {
                 db.hydrateAlgebraicObservationStatusBestEffort();
             }
@@ -3481,6 +3492,8 @@ pub const DB = struct {
 
     pub fn setQueryVisibilityHook(self: *DB, hook: ?QueryVisibilityHook) void {
         lockAtomic(&self.async_context.query_visibility_hook_mutex);
+        const previous = self.async_context.query_visibility_hook;
+        const subscription_changed = queryVisibilitySubscriptionChanged(previous, hook);
         self.async_context.query_visibility_hook = hook;
         self.async_context.query_visibility_hook_mutex.unlock();
         if (self.enrichment_runtime) |runtime| {
@@ -3489,6 +3502,25 @@ pub const DB = struct {
                 .on_change = notifyAsyncContextVisibilityHook,
             });
         }
+        // Hook installation is a state subscription, not merely an edge
+        // subscription. Managed DB provisioning can admit indexes while the
+        // DB is being opened, before its owning table source has installed the
+        // callback. Replay pending visibility here so that durable admission
+        // work cannot remain queued forever after that missed edge.
+        if (subscription_changed and hook != null and self.core.index_manager.hasRepairUnavailableIndexes()) {
+            notifyQueryVisibilityHook(self.async_context, .index_repair_pending);
+        }
+    }
+
+    fn queryVisibilitySubscriptionChanged(previous: ?QueryVisibilityHook, next: ?QueryVisibilityHook) bool {
+        if (previous == null or next == null) return previous != null or next != null;
+        const a = previous.?;
+        const b = next.?;
+        return a.ptr != b.ptr or
+            a.group_id != b.group_id or
+            a.db != b.db or
+            a.on_change != b.on_change or
+            !std.mem.eql(u8, a.table_name, b.table_name);
     }
 
     fn notifyAsyncContextVisibilityHook(ptr: *anyopaque) void {
@@ -4010,9 +4042,11 @@ pub const DB = struct {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
         }
-        self.backend_runtime.durable_jobs.closeOwner(self.repair_cleanup_owner_id);
-        self.backend_runtime.durable_jobs.drainOwner(self.repair_cleanup_owner_id);
-        self.deinitPendingGraphGenerationCleanup();
+        if (self.graph_generation_cleanup) |cleanup| {
+            cleanup.deinit();
+            self.alloc.destroy(cleanup);
+            self.graph_generation_cleanup = null;
+        }
         self.core.deinit();
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         self.async_context.deinit(self.runtime_alloc);
@@ -5776,25 +5810,65 @@ pub const DB = struct {
         }
     };
 
-    fn snapshotPendingGraphGenerationCleanup(self: *DB, alloc: Allocator) ![]RetiredGraphGeneration {
-        lockAtomic(&self.graph_generation_cleanup_mutex);
-        defer self.graph_generation_cleanup_mutex.unlock();
+    /// Heap-stable because DB is returned and commonly moved by value. Any
+    /// durable job submitted during open must never retain a pointer to the
+    /// temporary DB stack slot used by `DB.open`.
+    const GraphGenerationCleanupContext = struct {
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+        durable_jobs: background_runtime_mod.DurableJobLane,
+        owner_id: u64,
+        mutex: std.atomic.Mutex = .unlocked,
+        state: std.atomic.Value(u8) = .init(0),
+        shutdown: std.atomic.Value(bool) = .init(false),
+        pending: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(u64, void)) = .empty,
+
+        fn deinit(self: *@This()) void {
+            self.shutdown.store(true, .release);
+            self.durable_jobs.closeOwner(self.owner_id);
+            self.durable_jobs.drainOwner(self.owner_id);
+            lockAtomic(&self.mutex);
+            defer self.mutex.unlock();
+            var it = self.pending.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.deinit(self.alloc);
+                self.alloc.free(@constCast(entry.key_ptr.*));
+            }
+            self.pending.deinit(self.alloc);
+        }
+    };
+
+    fn restoreRetiredGraphGenerationCleanup(self: *DB) !void {
+        const cleanup = self.graph_generation_cleanup orelse return;
+        const rows = try self.core.store.scanPrefix(self.alloc, index_manager_mod.retired_graph_generation_prefix);
+        defer docstore_mod.DocStore.freeResults(self.alloc, rows);
+        for (rows) |row| {
+            const decoded = try index_manager_mod.IndexManager.decodeRetiredGraphGenerationKey(row.key);
+            scheduleRetiredGraphGenerationCleanupContext(cleanup, decoded.index_name, decoded.generation);
+        }
+    }
+
+    fn snapshotPendingGraphGenerationCleanup(self: *GraphGenerationCleanupContext, alloc: Allocator) ![]RetiredGraphGeneration {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
 
         var count: usize = 0;
-        var values = self.pending_graph_generation_cleanup.valueIterator();
-        while (values.next()) |generations| count += generations.items.len;
+        var values = self.pending.valueIterator();
+        while (values.next()) |generations| count += generations.count();
         const pending = try alloc.alloc(RetiredGraphGeneration, count);
         var initialized: usize = 0;
         errdefer {
             for (pending[0..initialized]) |*entry| entry.deinit(alloc);
             alloc.free(pending);
         }
-        var it = self.pending_graph_generation_cleanup.iterator();
+        var it = self.pending.iterator();
         while (it.next()) |entry| {
-            for (entry.value_ptr.items) |generation| {
+            var generations = entry.value_ptr.keyIterator();
+            while (generations.next()) |generation| {
                 pending[initialized] = .{
                     .index_name = try alloc.dupe(u8, entry.key_ptr.*),
-                    .generation = generation,
+                    .generation = generation.*,
                 };
                 initialized += 1;
             }
@@ -5811,19 +5885,34 @@ pub const DB = struct {
         return pending;
     }
 
-    fn removeCompletedGraphGenerationCleanup(self: *DB, completed: []const RetiredGraphGeneration) void {
-        lockAtomic(&self.graph_generation_cleanup_mutex);
-        defer self.graph_generation_cleanup_mutex.unlock();
+    fn removeCompletedGraphGenerationCleanup(self: *GraphGenerationCleanupContext, completed: []const RetiredGraphGeneration) !void {
+        var marker_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (marker_keys.items) |key| self.alloc.free(key);
+            marker_keys.deinit(self.alloc);
+        }
+        for (completed) |item| {
+            try marker_keys.append(self.alloc, try index_manager_mod.IndexManager.retiredGraphGenerationKeyAlloc(
+                self.alloc,
+                item.index_name,
+                item.generation,
+            ));
+        }
+        if (marker_keys.items.len > 0) {
+            var deletes = try self.alloc.alloc([]const u8, marker_keys.items.len);
+            defer self.alloc.free(deletes);
+            for (marker_keys.items, 0..) |key, i| deletes[i] = key;
+            try self.store.putBatch(&.{}, deletes);
+        }
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
 
         for (completed) |item| {
-            const generations = self.pending_graph_generation_cleanup.getPtr(item.index_name) orelse continue;
-            for (generations.items, 0..) |generation, i| {
-                if (generation != item.generation) continue;
-                _ = generations.orderedRemove(i);
-                break;
-            }
-            if (generations.items.len == 0) {
-                if (self.pending_graph_generation_cleanup.fetchRemove(item.index_name)) |removed| {
+            const generations = self.pending.getPtr(item.index_name) orelse continue;
+            _ = generations.remove(item.generation);
+            if (generations.count() == 0) {
+                if (self.pending.fetchRemove(item.index_name)) |removed| {
                     var values = removed.value;
                     values.deinit(self.alloc);
                     self.alloc.free(@constCast(removed.key));
@@ -5832,21 +5921,10 @@ pub const DB = struct {
         }
     }
 
-    fn hasPendingGraphGenerationCleanup(self: *DB) bool {
-        lockAtomic(&self.graph_generation_cleanup_mutex);
-        defer self.graph_generation_cleanup_mutex.unlock();
-        return self.pending_graph_generation_cleanup.count() != 0;
-    }
-
-    fn deinitPendingGraphGenerationCleanup(self: *DB) void {
-        lockAtomic(&self.graph_generation_cleanup_mutex);
-        defer self.graph_generation_cleanup_mutex.unlock();
-        var it = self.pending_graph_generation_cleanup.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.deinit(self.alloc);
-            self.alloc.free(@constCast(entry.key_ptr.*));
-        }
-        self.pending_graph_generation_cleanup.deinit(self.alloc);
+    fn hasPendingGraphGenerationCleanup(self: *GraphGenerationCleanupContext) bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return self.pending.count() != 0;
     }
 
     fn graphGenerationIsRetired(retired: []const RetiredGraphGeneration, index_name: []const u8, generation: u64) bool {
@@ -5907,7 +5985,7 @@ pub const DB = struct {
         return graphGenerationIsRetired(retired, index_name, generation);
     }
 
-    fn reclaimRetiredGraphGenerations(self: *DB, retired: []const RetiredGraphGeneration) !usize {
+    fn reclaimRetiredGraphGenerations(self: *GraphGenerationCleanupContext, retired: []const RetiredGraphGeneration) !usize {
         if (retired.len == 0) return 0;
         const alloc = std.heap.page_allocator;
         var lower = try documentRangeLowerAlloc(alloc, "");
@@ -5946,18 +6024,18 @@ pub const DB = struct {
 
             var state = ScanState{ .alloc = alloc, .retired = retired };
             defer state.deinit();
-            try self.core.store.scanWithContext(lower, "", .{ .lower_exclusive = lower_exclusive }, &state, ScanState.scanEntry);
+            try self.store.scanWithContext(lower, "", .{ .lower_exclusive = lower_exclusive }, &state, ScanState.scanEntry);
             if (state.delete_keys.items.len > 0) {
                 // The unlocked scan keeps corpus traversal off the write path.
                 // Revalidate the bounded candidate batch while holding the
                 // apply lock so a recreated generation cannot overwrite a key
                 // between generation inspection and physical deletion.
-                lockApply(self);
-                defer self.core.unlockApply();
+                self.apply_mutex.lockExclusive();
+                defer self.apply_mutex.unlockExclusive();
                 var verified = std.ArrayListUnmanaged([]const u8).empty;
                 defer verified.deinit(alloc);
                 for (state.delete_keys.items) |key| {
-                    const current = self.core.store.get(alloc, key) catch |err| switch (err) {
+                    const current = self.store.get(alloc, key) catch |err| switch (err) {
                         error.NotFound => continue,
                         else => return err,
                     };
@@ -5965,7 +6043,7 @@ pub const DB = struct {
                     if (try storedGraphRecordIsRetired(alloc, retired, key, current)) try verified.append(alloc, key);
                 }
                 if (verified.items.len > 0) {
-                    try self.core.store.putBatch(&.{}, verified.items);
+                    try self.store.putBatch(&.{}, verified.items);
                     reclaimed += verified.items.len;
                 }
             }
@@ -5979,31 +6057,59 @@ pub const DB = struct {
     }
 
     const GraphGenerationCleanupWork = struct {
-        db: *DB,
+        cleanup: *GraphGenerationCleanupContext,
+
+        fn waitForRetry(work: *@This(), delay_ns: u64) void {
+            var remaining = delay_ns;
+            while (remaining > 0 and !work.cleanup.shutdown.load(.acquire)) {
+                const slice = @min(remaining, 100 * std.time.ns_per_ms);
+                sleepNs(slice);
+                remaining -= slice;
+            }
+        }
 
         fn run(ptr: *anyopaque) anyerror!void {
             const work: *@This() = @ptrCast(@alignCast(ptr));
             const alloc = std.heap.page_allocator;
+            var retry_delay_ns: u64 = 100 * std.time.ns_per_ms;
             while (true) {
-                const pending = try work.db.snapshotPendingGraphGenerationCleanup(alloc);
+                if (work.cleanup.shutdown.load(.acquire)) return;
+                const pending = snapshotPendingGraphGenerationCleanup(work.cleanup, alloc) catch |err| {
+                    std.log.warn("retired graph generation pending snapshot retry err={s}", .{@errorName(err)});
+                    work.waitForRetry(retry_delay_ns);
+                    retry_delay_ns = @min(retry_delay_ns *| 2, 5 * std.time.ns_per_s);
+                    continue;
+                };
                 defer {
                     for (pending) |*entry| entry.deinit(alloc);
                     alloc.free(pending);
                 }
                 if (pending.len > 0) {
-                    _ = work.db.reclaimRetiredGraphGenerations(pending) catch |err| {
-                        work.db.graph_generation_cleanup_state.store(0, .release);
-                        return err;
+                    const cleanup_succeeded = cleanup: {
+                        _ = reclaimRetiredGraphGenerations(work.cleanup, pending) catch |err| {
+                            std.log.warn("retired graph generation cleanup retry err={s}", .{@errorName(err)});
+                            break :cleanup false;
+                        };
+                        removeCompletedGraphGenerationCleanup(work.cleanup, pending) catch |err| {
+                            std.log.warn("retired graph generation marker cleanup retry err={s}", .{@errorName(err)});
+                            break :cleanup false;
+                        };
+                        break :cleanup true;
                     };
-                    work.db.removeCompletedGraphGenerationCleanup(pending);
+                    if (!cleanup_succeeded) {
+                        work.waitForRetry(retry_delay_ns);
+                        retry_delay_ns = @min(retry_delay_ns *| 2, 5 * std.time.ns_per_s);
+                        continue;
+                    }
+                    retry_delay_ns = 100 * std.time.ns_per_ms;
                 }
 
-                if (work.db.hasPendingGraphGenerationCleanup()) {
-                    work.db.graph_generation_cleanup_state.store(1, .release);
+                if (hasPendingGraphGenerationCleanup(work.cleanup)) {
+                    work.cleanup.state.store(1, .release);
                     continue;
                 }
-                if (work.db.graph_generation_cleanup_state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
-                if (work.db.graph_generation_cleanup_state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) continue;
+                if (work.cleanup.state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
+                if (work.cleanup.state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) continue;
             }
         }
 
@@ -6014,63 +6120,61 @@ pub const DB = struct {
     };
 
     fn scheduleRetiredGraphGenerationCleanup(self: *DB, index_name: []const u8, generation: u64) void {
-        lockAtomic(&self.graph_generation_cleanup_mutex);
-        var entry = self.pending_graph_generation_cleanup.getOrPut(self.alloc, index_name) catch {
-            self.graph_generation_cleanup_mutex.unlock();
+        const cleanup = self.graph_generation_cleanup orelse return;
+        scheduleRetiredGraphGenerationCleanupContext(cleanup, index_name, generation);
+    }
+
+    fn scheduleRetiredGraphGenerationCleanupContext(self: *GraphGenerationCleanupContext, index_name: []const u8, generation: u64) void {
+        lockAtomic(&self.mutex);
+        var entry = self.pending.getOrPut(self.alloc, index_name) catch {
+            self.mutex.unlock();
             std.log.warn("failed to retain retired graph generation cleanup index={s} generation={}", .{ index_name, generation });
             return;
         };
         const inserted = !entry.found_existing;
         if (!entry.found_existing) {
             entry.key_ptr.* = self.alloc.dupe(u8, index_name) catch {
-                _ = self.pending_graph_generation_cleanup.remove(index_name);
-                self.graph_generation_cleanup_mutex.unlock();
+                _ = self.pending.remove(index_name);
+                self.mutex.unlock();
                 std.log.warn("failed to retain retired graph generation cleanup index={s} generation={}", .{ index_name, generation });
                 return;
             };
             entry.value_ptr.* = .empty;
         }
-        var already_pending = false;
-        for (entry.value_ptr.items) |existing| {
-            if (existing == generation) {
-                already_pending = true;
-                break;
-            }
-        }
-        if (!already_pending) {
-            entry.value_ptr.append(self.alloc, generation) catch {
+        if (!entry.value_ptr.contains(generation)) {
+            entry.value_ptr.put(self.alloc, generation, {}) catch {
                 if (inserted) {
-                    if (self.pending_graph_generation_cleanup.fetchRemove(index_name)) |removed| {
+                    if (self.pending.fetchRemove(index_name)) |removed| {
                         var values = removed.value;
                         values.deinit(self.alloc);
                         self.alloc.free(@constCast(removed.key));
                     }
                 }
-                self.graph_generation_cleanup_mutex.unlock();
+                self.mutex.unlock();
                 std.log.warn("failed to retain retired graph generation cleanup index={s} generation={}", .{ index_name, generation });
                 return;
             };
         }
-        self.graph_generation_cleanup_mutex.unlock();
+        self.mutex.unlock();
 
-        if (self.graph_generation_cleanup_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
-            _ = self.graph_generation_cleanup_state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
+        if (self.state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
+            _ = self.state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
             return;
         }
         const work = std.heap.page_allocator.create(GraphGenerationCleanupWork) catch {
-            self.graph_generation_cleanup_state.store(0, .release);
+            self.state.store(0, .release);
             return;
         };
-        work.* = .{ .db = self };
-        self.backend_runtime.durable_jobs.submit(.{
-            .owner_id = self.repair_cleanup_owner_id,
+        work.* = .{ .cleanup = self };
+        self.durable_jobs.submit(.{
+            .owner_id = self.owner_id,
             .class = .cleanup,
             .ptr = work,
             .run = GraphGenerationCleanupWork.run,
             .deinit = GraphGenerationCleanupWork.deinit,
         }) catch |err| {
             std.heap.page_allocator.destroy(work);
-            self.graph_generation_cleanup_state.store(0, .release);
+            self.state.store(0, .release);
             std.log.warn("retired graph generation cleanup was not scheduled index={s} generation={} err={s}", .{ index_name, generation, @errorName(err) });
         };
     }
@@ -8659,6 +8763,26 @@ pub const DB = struct {
         return repair_id;
     }
 
+    fn ensureAdmissionRepairIntents(self: *DB, alloc: Allocator) !void {
+        const names = try self.core.index_manager.admissionRebuildingIndexesAlloc(alloc);
+        defer {
+            for (names) |name| alloc.free(name);
+            alloc.free(names);
+        }
+        for (names) |name| {
+            if (try self.indexRepairIdForIndex(alloc, name) != null) continue;
+            const cfg = self.core.index_manager.get(name) orelse continue;
+            _ = try self.createGenerationRepairIntent(
+                alloc,
+                cfg.*,
+                .incomplete_bulk_publish,
+                0,
+                0,
+                "index_admission_rebuild_pending",
+            );
+        }
+    }
+
     fn createOperatorGenerationRepairIntent(
         self: *DB,
         alloc: Allocator,
@@ -9049,7 +9173,12 @@ pub const DB = struct {
             }
             return error.IndexRepairIntentNotFound;
         };
-        if (entry.intent.phase == .cleanup) try self.persistOperatorRepairCompletion(alloc, entry.intent);
+        if (entry.intent.phase == .cleanup) {
+            try self.persistOperatorRepairCompletion(alloc, entry.intent);
+            if (entry.intent.trigger == .incomplete_bulk_publish) {
+                try self.core.index_manager.completeAdmissionRebuild(self.core.store, entry.intent.index_name);
+            }
+        }
         var remaining_replay_pin = false;
         for (state.entries.items) |candidate| {
             if (candidate.intent.repair_id != repair_id and candidate.pin != null) {
@@ -9545,6 +9674,56 @@ pub const DB = struct {
             try self.recordIndexRepairAttemptFailure(alloc, repair_id, "index_configuration_changed", true);
             result.terminal = true;
             return result;
+        }
+
+        // Managed shorthand may need to materialize its source artifacts before
+        // the first index snapshot. Advance one durable corpus page per attempt;
+        // the repair cursor makes this work bounded and restart-resumable while
+        // the admission marker keeps queries fail-closed.
+        if (entry.intent.trigger == .incomplete_bulk_publish and
+            entry.intent.phase == .detected and
+            try self.core.indexRequiresEnrichmentReplay(entry.intent.index_name))
+        {
+            if (options.cancelled()) {
+                result.deferred = true;
+                return result;
+            }
+            const replay = self.advanceAdmissionGeneratedEnrichmentReplay(
+                alloc,
+                entry.intent.index_name,
+                entry.intent.build_resume_key,
+            ) catch |err| {
+                try self.recordIndexRepairAttemptFailure(alloc, repair_id, @errorName(err), false);
+                result.attempted = true;
+                result.deferred = true;
+                var updated = try self.loadIndexRepairEntryById(alloc, repair_id);
+                defer updated.deinit(alloc);
+                result.next_retry_at_ms = updated.intent.next_retry_at_ms;
+                return result;
+            };
+            defer if (replay.next_resume_key) |key| alloc.free(key);
+            if (replay.complete) {
+                try self.updateIndexRepairIntent(alloc, repair_id, .{
+                    .phase = .preflight,
+                    .replace_build_resume_key = true,
+                    .failure_streak = 0,
+                    .next_retry_at_ms = 0,
+                    .replace_last_error = true,
+                });
+                entry.intent.phase = .preflight;
+            } else {
+                try self.updateIndexRepairIntent(alloc, repair_id, .{
+                    .build_resume_key = replay.next_resume_key,
+                    .replace_build_resume_key = true,
+                    .failure_streak = 0,
+                    .next_retry_at_ms = 0,
+                    .replace_last_error = true,
+                });
+                result.attempted = true;
+                result.busy = true;
+                result.documents_reprocessed = replay.documents_reprocessed;
+                return result;
+            }
         }
 
         // Missing-counter projections bootstrap coverage from a stable primary
@@ -10425,6 +10604,7 @@ pub const DB = struct {
             self.index_backends,
         );
         shadow_manager.setAppliedSequenceCheckpointPath(shadow_checkpoint_path);
+        try shadow_manager.inheritEnrichmentCatalog(self.core.index_manager);
         shadow_manager.registerReplacementIndex(self.core.store, cfg) catch |err| {
             shadow_manager.deinit();
             if (resume_candidate) {
@@ -12428,6 +12608,8 @@ pub const DB = struct {
         };
     }
 
+    /// Embedded/direct admission retains the historical completion contract:
+    /// successful return means the index is immediately searchable.
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockAtomic(&self.index_structure_mutex);
@@ -12447,30 +12629,15 @@ pub const DB = struct {
                 std.log.err("failed to roll back incomplete index creation index={s} err={s}", .{ cfg.name, @errorName(rollback_err) });
                 break :blk null;
             };
-            if (deleted) |result| {
-                if (result.retired_graph_generation) |generation| self.scheduleRetiredGraphGenerationCleanup(cfg.name, generation);
-            }
+            if (deleted) |result| if (result.retired_graph_generation) |generation|
+                self.scheduleRetiredGraphGenerationCleanup(cfg.name, generation);
         };
 
-        // Establish the target count from an authoritative store snapshot
-        // before rebuilding the new dense generation. The snapshot is counted
-        // without the global apply lock; concurrent artifact commits publish a
-        // signed delta to the bootstrap marker in the same atomic store batch.
-        // This avoids both a corpus-sized lock hold and the false zero target
-        // that would otherwise make pre-existing multi-source artifacts look
-        // like surplus coverage immediately after admission.
         try self.ensureDenseArtifactTargetCounterForAdmission(cfg);
-
         const needs_enrichment_replay = installed.needs_enrichment_replay;
         const applied = installed.applied;
         var worker_applied = applied;
         if (needs_enrichment_replay) {
-            // Couple a stable artifact snapshot to its replay floor. Writes
-            // committed after this snapshot are necessarily above the floor and
-            // are caught up by the target worker; writes at or below it are
-            // represented by the synchronous rebuild. This avoids the classic
-            // scan-then-read-head gap where a concurrent mutation can be missed
-            // by the scan and then skipped by replay.
             var rebuild_snapshot = try self.core.store.beginReadTxn();
             defer rebuild_snapshot.abort();
             const generation_baseline = try self.core.store.lastReplaySequenceFromTxn(&rebuild_snapshot, 0);
@@ -12510,41 +12677,91 @@ pub const DB = struct {
                 }});
             }
         }
-        if (needs_enrichment_replay) {
-            if (self.enrichment_runtime != null) {
-                const refs = try self.replayGeneratedEnrichmentsFromStoredDocs(self.alloc);
-                if (refs == 0) {
-                    const target_sequence = self.core.nextDerivedSequence();
-                    try self.core.saveAppliedSequence(cfg.name, target_sequence);
-                    try self.markEnrichmentAppliedIfNoPendingThrough(target_sequence);
-                }
+        if (needs_enrichment_replay and self.enrichment_runtime != null) {
+            const targets = try self.core.index_manager.generatedEnrichmentTargetsForIndexAlloc(self.alloc, cfg.name);
+            defer {
+                for (targets) |target| self.alloc.free(target);
+                if (targets.len > 0) self.alloc.free(targets);
+            }
+            if (targets.len == 0) return error.InvalidIndexConfig;
+            const refs = try self.appendGeneratedEnrichmentsFromStoredDocs(self.alloc, targets, true);
+            if (refs == 0) {
+                const target_sequence = self.core.nextDerivedSequence();
+                try self.core.saveAppliedSequence(cfg.name, target_sequence);
+                try self.markEnrichmentAppliedIfNoPendingThrough(target_sequence);
             }
         }
-        // Admit the new index incarnation only after its synchronous rebuild and
-        // generated-enrichment replay plan are complete. Otherwise the worker can
-        // open an HBC bulk session while addIndex is still mutating the same index.
         if (self.start_index_workers) {
             try self.executor.addWorker(cfg.name, .{ .name = cfg.name, .kind = cfg.kind }, worker_applied);
         }
-        // Keep enrichment stopped until the new generation's target-specific
-        // bulk rebuild and replay plan have closed. Otherwise a generated
-        // artifact callback can enter a streaming replay session while the
-        // same HBC index still owns a bulk-publication session. The corpus
-        // scan does not hold the global apply lock, so unrelated writes remain
-        // available throughout this structural operation.
         if (restart_enrichment) {
             try self.restartEnrichmentAfterStructuralMutation("index creation", cfg.name);
             enrichment_restarted = true;
         }
         if (self.start_index_workers) {
             const current_target = self.core.nextDerivedSequence();
-            if (current_target > worker_applied) {
-                try self.runDerivedUntilTargets(current_target, &.{cfg.name});
-            }
+            if (current_target > worker_applied) try self.runDerivedUntilTargets(current_target, &.{cfg.name});
         }
-        // Publish readiness only after the snapshot rebuild and the exact
-        // post-snapshot replay interval have both completed.
+        try self.core.index_manager.completeAdmissionRebuild(self.core.store, cfg.name);
         self.core.index_manager.clearRepairUnavailable(cfg.name);
+        index_installed = false;
+    }
+
+    /// Managed/server admission: publish the catalog and durable readiness gate,
+    /// then let the bounded repair executor construct the initial generation.
+    pub fn addIndexAsync(self: *DB, cfg: types.IndexConfig) !void {
+        // Algebraic sidecars are engine-owned and have no artifact shadow-build
+        // implementation; their admission is already bounded.
+        if (cfg.kind == .algebraic) return try self.addIndex(cfg);
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockAtomic(&self.index_structure_mutex);
+        defer self.index_structure_mutex.unlock();
+        const restart_enrichment = if (self.enrichment_runtime) |runtime| runtime.isStarted() else false;
+        if (restart_enrichment) self.enrichment_runtime.?.stop();
+        var enrichment_restarted = false;
+        errdefer if (restart_enrichment and !enrichment_restarted) {
+            self.restartEnrichmentAfterStructuralMutation("failed index creation", cfg.name) catch |restart_err| {
+                std.log.err("failed to restore enrichment runtime after index creation error index={s} err={s}", .{ cfg.name, @errorName(restart_err) });
+            };
+        };
+        const installed = try self.installIndexWhileEnrichmentQuiesced(cfg);
+        var index_installed = true;
+        errdefer if (index_installed) {
+            const deleted: ?DeletedIndex = self.deleteIndexWhileEnrichmentQuiesced(cfg.name) catch |rollback_err| blk: {
+                std.log.err("failed to roll back incomplete index creation index={s} err={s}", .{ cfg.name, @errorName(rollback_err) });
+                break :blk null;
+            };
+            if (deleted) |result| {
+                if (result.retired_graph_generation) |generation| self.scheduleRetiredGraphGenerationCleanup(cfg.name, generation);
+            }
+        };
+
+        const applied = installed.applied;
+        const stored_cfg = self.core.index_manager.get(cfg.name) orelse return error.IndexNotFound;
+        _ = try self.createGenerationRepairIntent(
+            self.alloc,
+            stored_cfg.*,
+            .incomplete_bulk_publish,
+            0,
+            0,
+            "index_admission_rebuild_pending",
+        );
+        // The active generation stays query-gated while the durable repair
+        // engine materializes any shorthand artifacts, then builds and
+        // validates a shadow generation in bounded, resumable slices.
+        if (self.start_index_workers) {
+            try self.executor.addWorker(cfg.name, .{ .name = cfg.name, .kind = cfg.kind }, applied);
+        }
+        // Restart enrichment only after catalog publication and durable intent
+        // creation. The repair attempt performs the corpus replay and drain.
+        if (restart_enrichment) {
+            try self.restartEnrichmentAfterStructuralMutation("index creation", cfg.name);
+            enrichment_restarted = true;
+        }
+        // Query visibility notification enqueues managed-table repair. Startup
+        // also reconstructs any missing intent from the atomic admission marker,
+        // so a stop at every boundary is recoverable without request replay.
+        notifyQueryVisibilityHook(self.async_context, .index_repair_pending);
         index_installed = false;
     }
 
@@ -13526,6 +13743,7 @@ pub const DB = struct {
                 cleaned,
                 explicit_dense.items,
                 explicit_sparse.items,
+                &.{},
             );
             defer enrichment_types.deinitGeneratedRequests(alloc, generated);
 
@@ -13568,12 +13786,12 @@ pub const DB = struct {
         self.executor.removeWorker(name);
         lockApply(self);
         defer self.core.unlockApply();
-        const retired_graph_generation = if (self.core.index_manager.graphIndex(name)) |entry|
-            entry.config.coverage_generation
+        const retired_graph_generation = if (self.core.index_manager.get(name)) |cfg|
+            if (cfg.kind == .graph) cfg.coverage_generation else null
         else
             null;
         try self.abandonIndexRepairForDeletion(self.alloc, name);
-        const removed = try self.core.deleteIndex(name);
+        const removed = try self.core.deleteIndexWithGraphRetirement(name, retired_graph_generation);
         if (removed) {
             try self.deleteDerivedCoverageForIndex(name);
             try self.deleteDenseArtifactCounterMetadata(name);
@@ -15682,11 +15900,15 @@ pub const DB = struct {
         force_generated_artifact_names: []const []const u8,
         skip_terminally_covered: bool,
     ) !usize {
-        if (self.enrichment_runtime == null) return 0;
-
         const chunk_size: usize = 128;
         const initial_lower = try self.core.documentRangeLowerAlloc("");
         defer self.core.alloc.free(initial_lower);
+        if (self.enrichment_runtime == null) {
+            var probe = try self.collectStoredGeneratedReplayBatch(alloc, initial_lower, false, 1);
+            defer probe.deinit(alloc);
+            if (probe.writes.len == 0) return 0;
+            return error.GeneratedEnrichmentRuntimeRequired;
+        }
         var lower = try alloc.dupe(u8, initial_lower);
         defer alloc.free(lower);
         var lower_exclusive = false;
@@ -15722,6 +15944,69 @@ pub const DB = struct {
             self.notifyResolverReplayRuntimes(latest_sequence);
         }
         return generated_ref_count;
+    }
+
+    const AdmissionGeneratedReplayAdvance = struct {
+        complete: bool,
+        next_resume_key: ?[]u8 = null,
+        documents_reprocessed: u64 = 0,
+    };
+
+    /// Materializes and drains one bounded page before publishing its durable
+    /// cursor. Replaying a page after a stop is safe because terminal artifact
+    /// coverage suppresses duplicate generated references.
+    fn advanceAdmissionGeneratedEnrichmentReplay(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        resume_key: ?[]const u8,
+    ) !AdmissionGeneratedReplayAdvance {
+        const chunk_size: usize = 128;
+        const initial_lower = if (resume_key == null) try self.core.documentRangeLowerAlloc("") else null;
+        defer if (initial_lower) |key| self.core.alloc.free(key);
+        var replay_batch = try self.collectStoredGeneratedReplayBatch(
+            alloc,
+            resume_key orelse initial_lower.?,
+            resume_key != null,
+            chunk_size,
+        );
+        defer replay_batch.deinit(alloc);
+        if (replay_batch.writes.len == 0) return .{ .complete = true };
+        if (self.enrichment_runtime == null) return error.GeneratedEnrichmentRuntimeRequired;
+        const targets = try self.core.index_manager.generatedEnrichmentTargetsForIndexAlloc(alloc, index_name);
+        defer {
+            for (targets) |target| alloc.free(target);
+            if (targets.len > 0) alloc.free(targets);
+        }
+        if (targets.len == 0) return error.InvalidIndexConfig;
+
+        var pending_batch = derived_types.DerivedBatch{};
+        defer derived_types.deinitDerivedBatch(self.alloc, &pending_batch);
+        try appendGeneratedEnrichments(self, &pending_batch, .{
+            .writes = replay_batch.writes,
+            .sync_level = .write,
+        }, replay_batch.extracted, targets, true);
+        if (pending_batch.generated_enrichment_refs.len != 0) {
+            const sequence = try appendDerivedBatchRecord(self, pending_batch);
+            self.executor.notifySequence(sequence);
+            self.enrichment_runtime.?.notifySequence(sequence);
+            self.notifyResolverReplayRuntimes(sequence);
+        }
+        const enrichment_target = self.core.nextEnrichmentSequence();
+        if (enrichment_target > 0) try self.runEnrichmentUntil(enrichment_target);
+
+        const complete = replay_batch.writes.len < chunk_size;
+        const next_resume_key = if (complete)
+            null
+        else blk: {
+            const key = replay_batch.next_lower orelse return error.InvalidGeneratedEnrichmentReplayCursor;
+            break :blk try alloc.dupe(u8, key);
+        };
+        return .{
+            .complete = complete,
+            .next_resume_key = next_resume_key,
+            .documents_reprocessed = replay_batch.writes.len,
+        };
     }
 
     pub fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: Allocator) !usize {
@@ -25407,6 +25692,7 @@ fn prepareGeneratedEnrichments(
             cleaned,
             explicit_dense.items,
             explicit_sparse.items,
+            force_generated_artifact_names,
         );
         defer enrichment_types.deinitGeneratedRequests(self.alloc, generated);
 
@@ -27111,6 +27397,7 @@ fn appendGeneratedEnrichments(
             cleaned,
             explicit_dense.items,
             explicit_sparse.items,
+            force_generated_artifact_names,
         );
         defer enrichment_types.deinitGeneratedRequests(self.alloc, generated);
         for (generated) |request| {
@@ -32440,7 +32727,9 @@ fn collectGraphMutationsForArtifacts(
                     return err;
                 },
             };
-            if (decoded.generation != options.expected_generation) {
+            if (decoded.generation != options.expected_generation and
+                !enrichment_artifact_codec.isPortableUnboundGraphEdge(value))
+            {
                 decoded.deinit(alloc);
                 try deletes.append(alloc, .{
                     .index_name = try alloc.dupe(u8, parsed.index_name),
@@ -33526,7 +33815,9 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
                     return .@"continue";
                 },
             };
-            if (decoded.generation != state.expected_generation) {
+            if (decoded.generation != state.expected_generation and
+                !enrichment_artifact_codec.isPortableUnboundGraphEdge(value))
+            {
                 decoded.deinit(state.ctx.alloc);
                 return .@"continue";
             }
@@ -40428,6 +40719,50 @@ test "db enrichment status changes notify query visibility hook" {
     try std.testing.expectEqual(QueryVisibilityChange.status, hook_ctx.change.?);
 }
 
+test "late query visibility hook observes pending index admission" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    });
+    defer db.close();
+
+    // Managed provisioning can install the hook only after open-time catalog
+    // reconciliation has already admitted the index.
+    try db.addIndexAsync(.{
+        .name = "ft_pending",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    const HookCtx = struct {
+        calls: u64 = 0,
+        change: ?QueryVisibilityChange = null,
+
+        fn onChange(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, change: QueryVisibilityChange) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.change = change;
+        }
+    };
+    var hook_ctx = HookCtx{};
+    db.setQueryVisibilityHook(.{
+        .ptr = &hook_ctx,
+        .table_name = "docs",
+        .group_id = 7001,
+        .db = &db,
+        .on_change = HookCtx.onChange,
+    });
+
+    try std.testing.expectEqual(@as(u64, 1), hook_ctx.calls);
+    try std.testing.expectEqual(QueryVisibilityChange.index_repair_pending, hook_ctx.change.?);
+}
+
 test "db full-text index and search survive reopen with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
@@ -42745,6 +43080,45 @@ test "db graph delete and recreate fences stale materialized edges" {
     try std.testing.expectEqual(current_generation, preserved_edge.generation);
 }
 
+test "db retired graph generation cleanup resumes from durable tombstone after reopen" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var edge_key: []u8 = undefined;
+    var marker_key: []u8 = undefined;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        try db.addIndex(.{ .name = "graph_retire", .kind = .graph, .config_json = "{}" });
+        const generation = db.core.index_manager.graphIndex("graph_retire").?.config.coverage_generation;
+        edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "graph_retire", "mentions", "doc:b");
+        errdefer alloc.free(edge_key);
+        marker_key = try index_manager_mod.IndexManager.retiredGraphGenerationKeyAlloc(alloc, "graph_retire", generation);
+        errdefer alloc.free(marker_key);
+        const edge_value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, generation, 1, 0, 0, "");
+        defer alloc.free(edge_value);
+        try db.core.store.putBatch(&.{.{ .key = edge_key, .value = edge_value }}, &.{});
+
+        // Model a stop after the catalog+tombstone commit but before cleanup
+        // submission. The marker must remain sufficient recovery authority.
+        db.backend_runtime.durable_jobs.closeOwner(db.repair_cleanup_owner_id);
+        db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+        try std.testing.expect(try db.deleteIndex("graph_retire"));
+        const persisted = try db.core.store.get(alloc, marker_key);
+        alloc.free(persisted);
+    }
+    defer alloc.free(edge_key);
+    defer alloc.free(marker_key);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    reopened.backend_runtime.durable_jobs.drainOwner(reopened.repair_cleanup_owner_id);
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, edge_key));
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, marker_key));
+}
+
 test "db graph direct APIs reject indexes behind the readiness barrier" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -42766,8 +43140,128 @@ test "db graph direct APIs reject indexes behind the readiness barrier" {
     try std.testing.expectError(error.IndexRebuilding, db.findKShortestPaths(alloc, "graph_building", "doc:a", "doc:b", 2, &.{}, .out, .min_hops, 4, 0, std.math.inf(f64)));
     try std.testing.expectError(error.IndexRebuilding, db.matchPattern(alloc, "graph_building", &.{"doc:a"}, &.{}, 1, &.{}));
 
+    try db.core.index_manager.completeAdmissionRebuild(db.core.store, "graph_building");
     db.core.index_manager.clearRepairUnavailable("graph_building");
     try std.testing.expect(!db.core.index_manager.repairUnavailable("graph_building"));
+}
+
+test "db asynchronous index admission survives reopen and clears only after repair" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+        const edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "graph_async", "mentions", "doc:b");
+        defer alloc.free(edge_key);
+        const edge_value = try enrichment_artifact_codec.encodePortableUnboundGraphEdgeAlloc(alloc, 0.75, 11, 12, "{\"origin\":\"go\"}");
+        defer alloc.free(edge_value);
+        try db.core.store.putBatch(&.{.{ .key = edge_key, .value = edge_value }}, &.{});
+        try db.addIndexAsync(.{
+            .name = "graph_async",
+            .kind = .graph,
+            .config_json = "{}",
+        });
+        try std.testing.expect(db.core.index_manager.admissionRebuilding("graph_async"));
+        try std.testing.expect(db.core.index_manager.repairUnavailable("graph_async"));
+        try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer reopened.close();
+    try std.testing.expect(reopened.core.index_manager.admissionRebuilding("graph_async"));
+    try std.testing.expect(reopened.core.index_manager.repairUnavailable("graph_async"));
+    const repair_id = (try reopened.indexRepairIdForIndex(alloc, "graph_async")) orelse return error.TestUnexpectedResult;
+    const result = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+    try std.testing.expect(result.repaired);
+    try std.testing.expect(!reopened.core.index_manager.admissionRebuilding("graph_async"));
+    try std.testing.expect(!reopened.core.index_manager.repairUnavailable("graph_async"));
+    try std.testing.expect(!try reopened.hasPendingIndexRepairIntents(alloc));
+    const edges = try reopened.getEdges(alloc, "graph_async", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("doc:b", edges[0].target);
+}
+
+test "db asynchronous admission checkpoints generated enrichment corpus pages" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{};
+    var repair_id: u128 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .enrichment = .{ .owner_id = "worker-a", .asset_producer = fake.producer() },
+        });
+        defer db.close();
+
+        var writes = try alloc.alloc(types.BatchWrite, 129);
+        defer alloc.free(writes);
+        var initialized: usize = 0;
+        defer for (writes[0..initialized]) |write| alloc.free(@constCast(write.key));
+        for (writes, 0..) |*write, i| {
+            write.* = .{
+                .key = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i}),
+                .value = "{\"target_doc\":\"doc:target\"}",
+            };
+            initialized += 1;
+        }
+        try db.batch(.{ .writes = writes, .sync_level = .write });
+        // No enrichment targets existed when these writes committed, so this
+        // is a legitimate caught-up watermark. Isolate admission's scoped
+        // corpus replay from unrelated pre-existing journal debt.
+        try db.enrichment_runtime.?.markAppliedThrough(db.core.nextEnrichmentSequence());
+        try db.addEnrichment(.{
+            .name = "relations_v1",
+            .kind = .asset,
+            .field = "target_doc",
+            .content_type = "application/json",
+            .producer_json = "{\"type\":\"extractor\",\"config\":{\"provider\":\"mock\"}}",
+        });
+        // Admission for one index must not fan out across unrelated table
+        // enrichments. The extractor call count below is also the regression
+        // assertion for index-scoped artifact replay.
+        try db.addEnrichment(.{
+            .name = "unrelated_v1",
+            .kind = .asset,
+            .field = "target_doc",
+            .content_type = "application/json",
+            .producer_json = "{\"type\":\"extractor\",\"config\":{\"provider\":\"mock\"}}",
+        });
+        try db.addIndexAsync(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json =
+            \\{"sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}]}
+            ,
+        });
+        try std.testing.expectEqual(@as(usize, 0), fake.extractor_calls);
+        repair_id = (try db.indexRepairIdForIndex(alloc, "relations_graph")) orelse return error.TestUnexpectedResult;
+        const first = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
+        try std.testing.expect(first.busy);
+        try std.testing.expectEqual(@as(u64, 128), first.documents_reprocessed);
+        var checkpoint = try db.loadIndexRepairEntryById(alloc, repair_id);
+        defer checkpoint.deinit(alloc);
+        try std.testing.expectEqual(index_repair_state.Phase.detected, checkpoint.intent.phase);
+        try std.testing.expect(checkpoint.intent.build_resume_key != null);
+        try std.testing.expectEqual(@as(usize, 128), fake.extractor_calls);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .enrichment = .{ .owner_id = "worker-b", .asset_producer = fake.producer() },
+    });
+    defer reopened.close();
+    _ = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+    try std.testing.expectEqual(@as(usize, 129), fake.extractor_calls);
+    try std.testing.expect((try reopened.indexRepairIdForIndex(alloc, "relations_graph")) == null);
+    try std.testing.expect(!reopened.core.index_manager.admissionRebuilding("relations_graph"));
+    try std.testing.expect(!try reopened.hasPendingIndexRepairIntents(alloc));
 }
 
 test "db resolver catalog persists across reopen" {
@@ -47913,6 +48407,7 @@ test "db document extraction chunks units through source artifact enrichment" {
         alloc,
         "doc:planned",
         "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\",\"text\":\"source document decoy\"}",
+        &.{},
         &.{},
         &.{},
     );

@@ -79,6 +79,8 @@ fn getenv(name: [*:0]const u8) ?[*:0]u8 {
 }
 
 const index_catalog_key = "\x00\x00__metadata__:indexes";
+const index_admission_catalog_key = "\x00\x00__metadata__:index_admissions";
+pub const retired_graph_generation_prefix = "\x00\x00__metadata__:retired_graph_generation:";
 const enrichment_catalog_key = "\x00\x00__metadata__:enrichments";
 const resolver_catalog_key = "\x00\x00__metadata__:resolvers";
 const text_field_analyzers_prefix = "\x00\x00__metadata__:text_field_analyzers:";
@@ -823,6 +825,10 @@ pub const IndexManager = struct {
     // intent is still in activating/validating; queries must remain closed
     // until DB validation publishes a clean checkpoint.
     repair_unavailable_indexes: std.StringHashMapUnmanaged(void) = .empty,
+    // Index admission is a distinct, durable reason for unavailability. It is
+    // persisted atomically with the index catalog so a process stop can never
+    // expose a catalog entry whose initial generation was not proven complete.
+    admission_rebuilding_indexes: std.StringHashMapUnmanaged(void) = .empty,
     index_load_states: std.StringHashMapUnmanaged(IndexLoadState) = .empty,
 
     pub const FailedIndexLoad = struct {
@@ -1848,6 +1854,8 @@ pub const IndexManager = struct {
         self.failed_index_loads.deinit(self.alloc);
         self.clearRepairUnavailableIndexes();
         self.repair_unavailable_indexes.deinit(self.alloc);
+        self.clearAdmissionRebuildingIndexes();
+        self.admission_rebuilding_indexes.deinit(self.alloc);
         self.clearIndexLoadStates();
         self.index_load_states.deinit(self.alloc);
         for (self.enrichments.items) |*entry| entry.deinit(self.alloc);
@@ -1933,13 +1941,77 @@ pub const IndexManager = struct {
     pub fn repairUnavailable(self: *IndexManager, name: []const u8) bool {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
-        return self.repair_unavailable_indexes.contains(name);
+        return self.repair_unavailable_indexes.contains(name) or
+            self.admission_rebuilding_indexes.contains(name);
+    }
+
+    pub fn hasRepairUnavailableIndexes(self: *IndexManager) bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        return self.repair_unavailable_indexes.count() != 0 or
+            self.admission_rebuilding_indexes.count() != 0;
     }
 
     fn clearRepairUnavailableIndexes(self: *IndexManager) void {
         var it = self.repair_unavailable_indexes.keyIterator();
         while (it.next()) |key| self.alloc.free(key.*);
         self.repair_unavailable_indexes.clearRetainingCapacity();
+    }
+
+    fn markAdmissionRebuildingNoLock(self: *IndexManager, name: []const u8) !void {
+        if (self.admission_rebuilding_indexes.contains(name)) return;
+        const owned = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(owned);
+        try self.admission_rebuilding_indexes.put(self.alloc, owned, {});
+    }
+
+    fn clearAdmissionRebuildingNoLock(self: *IndexManager, name: []const u8) void {
+        if (self.admission_rebuilding_indexes.fetchRemove(name)) |entry| self.alloc.free(entry.key);
+    }
+
+    fn clearAdmissionRebuildingIndexes(self: *IndexManager) void {
+        var it = self.admission_rebuilding_indexes.keyIterator();
+        while (it.next()) |key| self.alloc.free(key.*);
+        self.admission_rebuilding_indexes.clearRetainingCapacity();
+    }
+
+    /// Removes the durable admission gate only after the replacement has a
+    /// clean checkpoint. Repair intent removal subsequently releases the
+    /// independent repair gate, preserving fail-closed ordering across stops.
+    pub fn completeAdmissionRebuild(self: *IndexManager, store: anytype, name: []const u8) !void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        if (!self.admission_rebuilding_indexes.contains(name)) return;
+        const owned = try self.alloc.dupe(u8, name);
+        self.clearAdmissionRebuildingNoLock(name);
+        self.persistCatalog(store) catch |err| {
+            self.admission_rebuilding_indexes.put(self.alloc, owned, {}) catch self.alloc.free(owned);
+            return err;
+        };
+        self.alloc.free(owned);
+    }
+
+    pub fn admissionRebuilding(self: *IndexManager, name: []const u8) bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        return self.admission_rebuilding_indexes.contains(name);
+    }
+
+    pub fn admissionRebuildingIndexesAlloc(self: *IndexManager, alloc: Allocator) ![][]u8 {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const result = try alloc.alloc([]u8, self.admission_rebuilding_indexes.count());
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |name| alloc.free(name);
+            alloc.free(result);
+        }
+        var it = self.admission_rebuilding_indexes.keyIterator();
+        while (it.next()) |name| {
+            result[initialized] = try alloc.dupe(u8, name.*);
+            initialized += 1;
+        }
+        return result;
     }
 
     fn clearFailedIndexLoads(self: *IndexManager) void {
@@ -2966,6 +3038,7 @@ pub const IndexManager = struct {
         defer txn.abort();
         const data = txn.get(index_catalog_key) catch |err| switch (err) {
             error.NotFound => {
+                self.clearAdmissionRebuildingIndexes();
                 self.storeGeneratedEnrichmentTargetCache(try self.computeGeneratedEnrichmentTargetCache());
                 return;
             },
@@ -2977,6 +3050,7 @@ pub const IndexManager = struct {
             for (configs) |*cfg| cfg.deinit(self.alloc);
             self.alloc.free(configs);
         }
+        try self.loadAdmissionCatalogFromTxn(&txn, configs);
 
         var parallelism: usize = 1;
         if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) {
@@ -3034,6 +3108,7 @@ pub const IndexManager = struct {
         defer txn.abort();
         const data = txn.get(index_catalog_key) catch |err| switch (err) {
             error.NotFound => {
+                self.clearAdmissionRebuildingIndexes();
                 self.clearStatusOnlyIndexConfigs();
                 return;
             },
@@ -3045,6 +3120,7 @@ pub const IndexManager = struct {
             for (configs) |*cfg| cfg.deinit(self.alloc);
             self.alloc.free(configs);
         }
+        try self.loadAdmissionCatalogFromTxn(&txn, configs);
         self.clearStatusOnlyIndexConfigs();
         self.status_only_index_configs = configs;
     }
@@ -3186,8 +3262,12 @@ pub const IndexManager = struct {
         self.bindPrimaryStore(store);
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
 
-        if (rebuilding) try self.markRepairUnavailableNoLock(cfg.name);
-        errdefer if (rebuilding) self.clearRepairUnavailableNoLock(cfg.name);
+        if (rebuilding) {
+            try self.markRepairUnavailableNoLock(cfg.name);
+            errdefer self.clearRepairUnavailableNoLock(cfg.name);
+            try self.markAdmissionRebuildingNoLock(cfg.name);
+            errdefer self.clearAdmissionRebuildingNoLock(cfg.name);
+        }
 
         var stored_cfg = try indexConfigWithCoverageGeneration(self.alloc, cfg);
         defer stored_cfg.deinit(self.alloc);
@@ -3301,6 +3381,31 @@ pub const IndexManager = struct {
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
         try self.openConfiguredIndex(store, cfg, false, false);
         errdefer self.removeInMemory(cfg.name);
+        try self.refreshGeneratedEnrichmentTargetCache();
+    }
+
+    /// Snapshot the table enrichment catalog into an isolated replacement
+    /// manager. Shadow generations must resolve the same artifact sources as
+    /// the active manager, but must never persist or mutate that catalog while
+    /// they are still candidates. The source read lock makes the snapshot
+    /// internally consistent with concurrent enrichment administration.
+    pub fn inheritEnrichmentCatalog(self: *IndexManager, source: *const IndexManager) !void {
+        if (self == source) return;
+        const mutable_source: *IndexManager = @constCast(source);
+        mutable_source.catalog_mutex.lockShared();
+        defer mutable_source.catalog_mutex.unlockShared();
+
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        if (self.enrichments.items.len != 0) return error.EnrichmentCatalogAlreadyInitialized;
+
+        const checkpoint = self.enrichments.items.len;
+        errdefer self.truncateEnrichments(checkpoint);
+        try self.enrichments.ensureTotalCapacity(self.alloc, source.enrichments.items.len);
+        for (source.enrichments.items) |cfg| {
+            self.enrichments.appendAssumeCapacity(try enrichment_catalog.EnrichmentConfig.clone(self.alloc, cfg));
+        }
+        try self.validateEnrichmentCatalogGraph();
         try self.refreshGeneratedEnrichmentTargetCache();
     }
 
@@ -3513,15 +3618,25 @@ pub const IndexManager = struct {
     }
 
     pub fn remove(self: *IndexManager, store: anytype, name: []const u8) !bool {
+        return try self.removeWithGraphRetirement(store, name, null);
+    }
+
+    pub fn removeWithGraphRetirement(
+        self: *IndexManager,
+        store: anytype,
+        name: []const u8,
+        retired_graph_generation: ?u64,
+    ) !bool {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        if (try self.removeStatusOnlyConfig(store, name)) {
+        if (try self.removeStatusOnlyConfig(store, name, retired_graph_generation)) {
             // Quarantined (failed-to-load) indexes live in the status-only
             // list; removing one must also clear its recorded load error so a
             // subsequent recreate starts clean.
             self.dropFailedIndexLoad(name);
             self.dropIndexLoadStateNoLock(name);
             self.clearRepairUnavailableNoLock(name);
+            self.clearAdmissionRebuildingNoLock(name);
             return true;
         }
         for (self.text_indexes.items, 0..) |*entry, i| {
@@ -3537,6 +3652,7 @@ pub const IndexManager = struct {
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 self.deleteIndexRootForName(name, index_path);
                 self.clearRepairUnavailableNoLock(name);
+                self.clearAdmissionRebuildingNoLock(name);
                 return true;
             }
         }
@@ -3565,6 +3681,7 @@ pub const IndexManager = struct {
                 try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
                 self.deleteIndexRootForName(name, index_path);
                 self.clearRepairUnavailableNoLock(name);
+                self.clearAdmissionRebuildingNoLock(name);
                 return true;
             }
         }
@@ -3592,6 +3709,7 @@ pub const IndexManager = struct {
                 try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
                 self.deleteIndexRootForName(name, index_path);
                 self.clearRepairUnavailableNoLock(name);
+                self.clearAdmissionRebuildingNoLock(name);
                 return true;
             }
         }
@@ -3603,11 +3721,15 @@ pub const IndexManager = struct {
                 self.freeGraphIndexEntry(entry);
                 _ = self.graph_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
-                try self.persistCatalog(store);
+                try self.persistCatalogWithGraphRetirement(store, if (retired_graph_generation) |generation| .{
+                    .index_name = name,
+                    .generation = generation,
+                } else null);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 self.deleteIndexRootForName(name, index_path);
                 self.clearRepairUnavailableNoLock(name);
+                self.clearAdmissionRebuildingNoLock(name);
                 return true;
             }
         }
@@ -3624,6 +3746,7 @@ pub const IndexManager = struct {
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 self.deleteIndexRootForName(name, index_path);
                 self.clearRepairUnavailableNoLock(name);
+                self.clearAdmissionRebuildingNoLock(name);
                 return true;
             }
         }
@@ -3876,7 +3999,7 @@ pub const IndexManager = struct {
         }
     }
 
-    fn removeStatusOnlyConfig(self: *IndexManager, store: anytype, name: []const u8) !bool {
+    fn removeStatusOnlyConfig(self: *IndexManager, store: anytype, name: []const u8, retired_graph_generation: ?u64) !bool {
         for (self.status_only_index_configs, 0..) |cfg, i| {
             if (!std.mem.eql(u8, cfg.name, name)) continue;
 
@@ -3913,7 +4036,10 @@ pub const IndexManager = struct {
             defer self.dropIndexLoadStateNoLock(name);
 
             const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
-            try self.persistCatalog(store);
+            try self.persistCatalogWithGraphRetirement(store, if (removed.kind == .graph) if (retired_graph_generation) |generation| .{
+                .index_name = name,
+                .generation = generation,
+            } else null else null);
             self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
             try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
             if (removed.kind == .dense_vector) try self.deleteDenseIndexMetadata(store, name);
@@ -3926,15 +4052,74 @@ pub const IndexManager = struct {
     }
 
     pub fn requiresEnrichmentReplay(self: *const IndexManager, name: []const u8) !bool {
-        for (self.dense_indexes.items) |entry| {
-            if (!std.mem.eql(u8, entry.config.name, name)) continue;
-            return try self.configRequiresEnrichmentReplay(entry.config);
+        const cfg = self.get(name) orelse return false;
+        return try self.configRequiresEnrichmentReplay(cfg.*);
+    }
+
+    /// Returns the generated artifact closure consumed by one index. Keeping
+    /// admission replay scoped to this set prevents an unrelated index from
+    /// re-planning every enrichment pipeline registered on a large table.
+    pub fn generatedEnrichmentTargetsForIndexAlloc(
+        self: *const IndexManager,
+        alloc: Allocator,
+        name: []const u8,
+    ) ![][]u8 {
+        var targets = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (targets.items) |target| alloc.free(target);
+            targets.deinit(alloc);
         }
-        for (self.sparse_indexes.items) |entry| {
-            if (!std.mem.eql(u8, entry.config.name, name)) continue;
-            return try self.configRequiresEnrichmentReplay(entry.config);
+
+        const cfg = self.get(name) orelse return try targets.toOwnedSlice(alloc);
+        switch (cfg.kind) {
+            .full_text => {
+                const parsed = try parseTextConfig(alloc, cfg.config_json);
+                defer parsed.deinit(alloc);
+                if (parsed.source_artifact_name) |target| try appendUniqueOwnedString(alloc, &targets, target);
+                for (parsed.source_artifact_names) |target| try appendUniqueOwnedString(alloc, &targets, target);
+            },
+            .dense_vector => {
+                const parsed = try parseDenseConfig(alloc, cfg.config_json);
+                defer parsed.deinit(alloc);
+                if (parsed.embedding_name) |target| try appendUniqueOwnedString(alloc, &targets, target);
+                for (parsed.embedding_names) |target| try appendUniqueOwnedString(alloc, &targets, target);
+                if (try parseDenseGeneratorConfig(alloc, cfg.config_json)) |generator| {
+                    defer generator.deinit(alloc);
+                    try appendUniqueOwnedString(alloc, &targets, generator.artifact_name);
+                    try appendUniqueOwnedString(alloc, &targets, generator.embedding_name orelse cfg.name);
+                }
+            },
+            .sparse_vector => {
+                const parsed = try parseSparseConfig(alloc, cfg.config_json);
+                defer parsed.deinit(alloc);
+                for (parsed.embedding_names) |target| try appendUniqueOwnedString(alloc, &targets, target);
+                if (try parseSparseGeneratorConfig(alloc, cfg.config_json)) |generator| {
+                    defer generator.deinit(alloc);
+                    try appendUniqueOwnedString(alloc, &targets, generator.artifact_name);
+                    try appendUniqueOwnedString(alloc, &targets, generator.embedding_name orelse cfg.name);
+                }
+            },
+            .graph => {
+                var parsed = try parseGraphConfig(alloc, cfg.config_json);
+                defer parsed.deinit(alloc);
+                for (parsed.artifact_sources) |source| try appendUniqueOwnedString(alloc, &targets, source.artifact_name);
+            },
+            .algebraic => {},
         }
-        return false;
+
+        // Enrichments form a validated DAG. Walk upstream so a terminal
+        // embedding also selects the chunk/asset requests needed to produce it.
+        var cursor: usize = 0;
+        while (cursor < targets.items.len) : (cursor += 1) {
+            const target = targets.items[cursor];
+            const enrichment = self.getEnrichment(.embedding, target) orelse
+                self.getEnrichment(.chunk, target) orelse
+                self.getEnrichment(.asset, target) orelse continue;
+            if (enrichment.source_artifact_name.len > 0) {
+                try appendUniqueOwnedString(alloc, &targets, enrichment.source_artifact_name);
+            }
+        }
+        return try targets.toOwnedSlice(alloc);
     }
 
     const ExcludedEnrichment = struct {
@@ -4232,6 +4417,7 @@ pub const IndexManager = struct {
         doc_value: []const u8,
         explicit_dense: []const mapper.DenseEmbeddingWrite,
         explicit_sparse: []const mapper.SparseEmbeddingWrite,
+        target_artifact_names: []const []const u8,
     ) ![]enrichment_types.GeneratedEnrichmentRequest {
         var requests = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
         errdefer {
@@ -4241,6 +4427,7 @@ pub const IndexManager = struct {
 
         for (self.enrichments.items) |entry| {
             if (entry.kind != .asset) continue;
+            if (!generatedArtifactTargetSelected(target_artifact_names, entry.name)) continue;
             try requests.append(alloc, .{
                 .kind = .asset,
                 .index_name = try alloc.dupe(u8, entry.name),
@@ -4257,6 +4444,7 @@ pub const IndexManager = struct {
 
         for (self.text_indexes.items) |entry| {
             const chunk_name = entry.chunk_name orelse continue;
+            if (!generatedArtifactTargetSelected(target_artifact_names, chunk_name)) continue;
             const chunk_cfg = self.getEnrichment(.chunk, chunk_name) orelse continue;
             if (chunk_cfg.source_artifact_name.len > 0) continue;
             if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
@@ -4277,6 +4465,13 @@ pub const IndexManager = struct {
         }
 
         for (self.dense_indexes.items) |entry| {
+            if (!generatedVectorIndexTargetSelected(
+                target_artifact_names,
+                entry.config.name,
+                entry.chunk_name,
+                entry.embedding_name,
+                entry.embedding_names,
+            )) continue;
             if (hasExplicitDenseEmbedding(explicit_dense, entry.config.name)) continue;
             if (try mapper.extractDenseVectorField(alloc, doc_value, entry.field_name, entry.dims)) |vector| {
                 alloc.free(vector);
@@ -4388,6 +4583,13 @@ pub const IndexManager = struct {
         }
 
         for (self.sparse_indexes.items) |entry| {
+            if (!generatedVectorIndexTargetSelected(
+                target_artifact_names,
+                entry.config.name,
+                entry.chunk_name,
+                entry.embedding_name,
+                entry.embedding_names,
+            )) continue;
             if (hasExplicitSparseEmbedding(explicit_sparse, entry.config.name)) continue;
             if (try mapper.extractSparseVectorField(alloc, doc_value, entry.field_name)) |sparse_vec| {
                 var vec = sparse_vec;
@@ -7625,6 +7827,17 @@ pub const IndexManager = struct {
 
     fn configRequiresEnrichmentReplay(self: *const IndexManager, cfg: types.IndexConfig) !bool {
         switch (cfg.kind) {
+            .full_text => {
+                const text_cfg = try parseTextConfig(self.alloc, cfg.config_json);
+                defer text_cfg.deinit(self.alloc);
+                if (text_cfg.source_artifact_name) |name| {
+                    if (self.artifactSourceHasGeneratedEnrichment(name)) return true;
+                }
+                for (text_cfg.source_artifact_names) |name| {
+                    if (self.artifactSourceHasGeneratedEnrichment(name)) return true;
+                }
+                return false;
+            },
             .dense_vector => {
                 if (try parseDenseGeneratorConfig(self.alloc, cfg.config_json)) |generator| {
                     defer generator.deinit(self.alloc);
@@ -7644,8 +7857,22 @@ pub const IndexManager = struct {
                 defer sparse_cfg.deinit(self.alloc);
                 return sparse_cfg.embedding_names.len > 0;
             },
-            else => return false,
+            .graph => {
+                var graph_cfg = try parseGraphConfig(self.alloc, cfg.config_json);
+                defer graph_cfg.deinit(self.alloc);
+                for (graph_cfg.artifact_sources) |source| {
+                    if (self.artifactSourceHasGeneratedEnrichment(source.artifact_name)) return true;
+                }
+                return false;
+            },
+            .algebraic => return false,
         }
+    }
+
+    fn artifactSourceHasGeneratedEnrichment(self: *const IndexManager, name: []const u8) bool {
+        return self.getEnrichment(.chunk, name) != null or
+            self.getEnrichment(.asset, name) != null or
+            self.getEnrichment(.embedding, name) != null;
     }
 
     fn saveBackfilledAppliedSequence(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
@@ -8370,15 +8597,118 @@ pub const IndexManager = struct {
         }
     }
 
+    const GraphRetirement = struct {
+        index_name: []const u8,
+        generation: u64,
+    };
+
+    pub fn retiredGraphGenerationKeyAlloc(alloc: Allocator, index_name: []const u8, generation: u64) ![]u8 {
+        if (index_name.len > std.math.maxInt(u32)) return error.IndexNameTooLong;
+        const key = try alloc.alloc(u8, retired_graph_generation_prefix.len + 4 + index_name.len + 8);
+        @memcpy(key[0..retired_graph_generation_prefix.len], retired_graph_generation_prefix);
+        var offset = retired_graph_generation_prefix.len;
+        std.mem.writeInt(u32, key[offset..][0..4], @intCast(index_name.len), .big);
+        offset += 4;
+        @memcpy(key[offset..][0..index_name.len], index_name);
+        offset += index_name.len;
+        std.mem.writeInt(u64, key[offset..][0..8], generation, .big);
+        return key;
+    }
+
+    pub fn decodeRetiredGraphGenerationKey(key: []const u8) !struct { index_name: []const u8, generation: u64 } {
+        if (!std.mem.startsWith(u8, key, retired_graph_generation_prefix)) return error.InvalidRetiredGraphGenerationKey;
+        var offset = retired_graph_generation_prefix.len;
+        if (offset + 4 > key.len) return error.InvalidRetiredGraphGenerationKey;
+        const name_len = std.mem.readInt(u32, key[offset..][0..4], .big);
+        offset += 4;
+        if (offset + name_len + 8 != key.len) return error.InvalidRetiredGraphGenerationKey;
+        const name = key[offset..][0..name_len];
+        offset += name_len;
+        const generation = std.mem.readInt(u64, key[offset..][0..8], .big);
+        if (!coverage_identity.isValid(generation)) return error.InvalidRetiredGraphGenerationKey;
+        return .{ .index_name = name, .generation = generation };
+    }
+
     fn persistCatalog(self: *IndexManager, store: anytype) !void {
+        return try self.persistCatalogWithGraphRetirement(store, null);
+    }
+
+    fn persistCatalogWithGraphRetirement(self: *IndexManager, store: anytype, retirement: ?GraphRetirement) !void {
         const data = try serializeCatalog(self.alloc, self);
         defer self.alloc.free(data);
+        const admission_data = try self.serializeAdmissionCatalogAlloc();
+        defer self.alloc.free(admission_data);
+        const retirement_key = if (retirement) |item|
+            try retiredGraphGenerationKeyAlloc(self.alloc, item.index_name, item.generation)
+        else
+            null;
+        defer if (retirement_key) |key| self.alloc.free(key);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
         try txn.put(index_catalog_key, data);
+        try txn.put(index_admission_catalog_key, admission_data);
+        if (retirement_key) |key| try txn.put(key, "");
         try txn.commit();
+    }
+
+    fn serializeAdmissionCatalogAlloc(self: *IndexManager) ![]u8 {
+        var names = std.ArrayListUnmanaged([]const u8).empty;
+        defer names.deinit(self.alloc);
+        var it = self.admission_rebuilding_indexes.keyIterator();
+        while (it.next()) |name| {
+            // Stale in-memory entries are deliberately excluded. This makes
+            // index deletion and admission-marker removal one catalog commit.
+            if (self.has(name.*)) try names.append(self.alloc, name.*);
+        }
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lessThan);
+        if (names.items.len > std.math.maxInt(u32)) return error.IndexCatalogTooLarge;
+        var out = std.ArrayListUnmanaged(u8).empty;
+        errdefer out.deinit(self.alloc);
+        try out.appendSlice(self.alloc, "AIA1");
+        var buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &buf, @intCast(names.items.len), .little);
+        try out.appendSlice(self.alloc, &buf);
+        for (names.items) |name| {
+            if (name.len > std.math.maxInt(u32)) return error.IndexNameTooLong;
+            std.mem.writeInt(u32, &buf, @intCast(name.len), .little);
+            try out.appendSlice(self.alloc, &buf);
+            try out.appendSlice(self.alloc, name);
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn loadAdmissionCatalogFromTxn(self: *IndexManager, txn: anytype, configs: []const types.IndexConfig) !void {
+        self.clearAdmissionRebuildingIndexes();
+        const data = txn.get(index_admission_catalog_key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        if (data.len < 8 or !std.mem.eql(u8, data[0..4], "AIA1")) return error.InvalidIndexAdmissionCatalog;
+        var offset: usize = 4;
+        const entry_count = std.mem.readInt(u32, data[offset..][0..4], .little);
+        offset += 4;
+        var i: u32 = 0;
+        while (i < entry_count) : (i += 1) {
+            if (offset + 4 > data.len) return error.InvalidIndexAdmissionCatalog;
+            const len = std.mem.readInt(u32, data[offset..][0..4], .little);
+            offset += 4;
+            if (offset + len > data.len) return error.InvalidIndexAdmissionCatalog;
+            const name = data[offset..][0..len];
+            offset += len;
+            for (configs) |cfg| {
+                if (std.mem.eql(u8, cfg.name, name)) {
+                    try self.markAdmissionRebuildingNoLock(name);
+                    break;
+                }
+            }
+        }
+        if (offset != data.len) return error.InvalidIndexAdmissionCatalog;
     }
 
     fn loadEnrichmentCatalog(self: *IndexManager, store: anytype) !void {
@@ -14588,6 +14918,15 @@ fn cloneOwnedStrings(alloc: Allocator, values: []const []const u8) ![][]u8 {
     return cloned;
 }
 
+fn appendUniqueOwnedString(
+    alloc: Allocator,
+    strings: *std.ArrayListUnmanaged([]u8),
+    value: []const u8,
+) !void {
+    if (value.len == 0 or containsOwnedString(strings.items, value)) return;
+    try strings.append(alloc, try alloc.dupe(u8, value));
+}
+
 fn parseEmbeddingSemanticProducerAlloc(alloc: Allocator, raw: []const u8) !?[]u8 {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
@@ -15179,6 +15518,24 @@ fn containsOwnedString(items: []const []const u8, value: []const u8) bool {
     for (items) |item| {
         if (std.mem.eql(u8, item, value)) return true;
     }
+    return false;
+}
+
+fn generatedArtifactTargetSelected(targets: []const []const u8, artifact_name: []const u8) bool {
+    return targets.len == 0 or containsOwnedString(targets, artifact_name);
+}
+
+fn generatedVectorIndexTargetSelected(
+    targets: []const []const u8,
+    index_name: []const u8,
+    chunk_name: ?[]const u8,
+    embedding_name: ?[]const u8,
+    embedding_names: []const []const u8,
+) bool {
+    if (targets.len == 0 or containsOwnedString(targets, index_name)) return true;
+    if (chunk_name) |name| if (containsOwnedString(targets, name)) return true;
+    if (embedding_name) |name| if (containsOwnedString(targets, name)) return true;
+    for (embedding_names) |name| if (containsOwnedString(targets, name)) return true;
     return false;
 }
 
@@ -17899,7 +18256,7 @@ test "generated embedding requests carry semantic producer identity" {
         },
     });
 
-    const requests = try manager.planGeneratedEnrichments(alloc, "doc:1", "{\"body\":\"hello\"}", &.{}, &.{});
+    const requests = try manager.planGeneratedEnrichments(alloc, "doc:1", "{\"body\":\"hello\"}", &.{}, &.{}, &.{});
     defer enrichment_types.deinitGeneratedRequests(alloc, requests);
 
     var saw_dense = false;
