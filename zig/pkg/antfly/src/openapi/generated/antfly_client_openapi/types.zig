@@ -4797,7 +4797,7 @@ pub const InferenceLevel = enum {
 
 pub const InferenceMediaContentPart = MediaContentPart;
 
-/// Optional backend preference for model loading or request execution. `auto` keeps the node default behavior. `pjrt` selects the PJRT backend and requires `pjrt_plugin_path` unless the standard `PJRT_PLUGIN_PATH` environment variable is set. `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
+/// Optional backend preference for model loading or request execution. `auto` keeps the node default behavior. `pjrt` selects the PJRT backend and requires `pjrt_plugin_path` unless the standard `PJRT_PLUGIN_PATH` environment variable is set. `webgpu` selects the Wasm/WebGPU backend in Wasm builds. Generation uses WebGPU graph partition execution over the Wasm-native base session. `mode: "compiled"` may be supplied explicitly but is not required.
 pub const InferenceModelBackend = enum {
     auto,
     native,
@@ -4934,7 +4934,7 @@ pub const InferenceModelQuantization = []const u8;
 /// Model reference used by startup preload and model-loading configuration.
 pub const InferenceModelRef = struct {
     kind: InferenceModelKind,
-    /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format. Generation requests can address a preloaded artifact explicitly as `<owner>/<repo>:<format>:<quantization>`.
+    /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format. Model-backed requests can address a preloaded artifact explicitly as `<owner>/<repo>:<format>[:<quantization>]`; the selector is not part of the registry directory name. A bare model name continues to resolve the directory's default artifact, so multiple selected variants can remain resident.
     name: []const u8,
     backend: ?InferenceModelBackend = null,
     format: ?InferenceModelFormat = null,

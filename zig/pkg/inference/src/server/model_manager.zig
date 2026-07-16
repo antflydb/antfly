@@ -1941,9 +1941,28 @@ pub const ModelManager = struct {
         );
     }
 
+    pub fn loadArtifactFromDir(
+        self: *ModelManager,
+        model_dir: []const u8,
+        selection: manifest_mod.ArtifactSelection,
+        preferred_backends: ?[]const backends.BackendType,
+    ) !*LoadedModel {
+        return self.loadArtifactFromDirTracked(null, model_dir, selection, preferred_backends);
+    }
+
     pub fn loadArtifactFromDirForRequest(
         self: *ModelManager,
         request_id: u64,
+        model_dir: []const u8,
+        selection: manifest_mod.ArtifactSelection,
+        preferred_backends: ?[]const backends.BackendType,
+    ) !*LoadedModel {
+        return self.loadArtifactFromDirTracked(request_id, model_dir, selection, preferred_backends);
+    }
+
+    fn loadArtifactFromDirTracked(
+        self: *ModelManager,
+        request_id: ?u64,
         model_dir: []const u8,
         selection: manifest_mod.ArtifactSelection,
         preferred_backends: ?[]const backends.BackendType,

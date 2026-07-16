@@ -19,6 +19,7 @@ const donut_mod = @import("donut.zig");
 const moondream_mod = @import("moondream.zig");
 const ortgenai = if (build_options.enable_onnx) @import("../backends/ortgenai.zig") else struct {};
 const model_manager_mod = @import("../server/model_manager.zig");
+const manifest_mod = @import("../models/manifest.zig");
 const encoder_decoder = @import("../pipelines/encoder_decoder.zig");
 const generation = @import("../pipelines/generation.zig");
 const onnx_decoder_only_vlm = @import("../pipelines/onnx_decoder_only_vlm.zig");
@@ -53,11 +54,12 @@ const VisionLoadedReader = struct {
         session_manager: *backends.SessionManager,
         model_manager: *model_manager_mod.ModelManager,
         request_id: ?u64,
+        artifact_selection: manifest_mod.ArtifactSelection,
     ) !VisionLoadedReader {
         return .{
             .allocator = allocator,
             .parser_kind = try detectParserKind(allocator, model_path),
-            .core = try vision_reader_mod.LoadedVisionReader.loadFromDir(allocator, model_path, session_manager, model_manager, request_id),
+            .core = try vision_reader_mod.LoadedVisionReader.loadFromDir(allocator, model_path, session_manager, model_manager, request_id, artifact_selection),
         };
     }
 
@@ -235,6 +237,7 @@ pub const LoadedReader = struct {
         session_manager: *backends.SessionManager,
         model_manager: *model_manager_mod.ModelManager,
         request_id: ?u64,
+        artifact_selection: manifest_mod.ArtifactSelection,
     ) !LoadedReader {
         if (multistage_metadata.isMultiStageModelDir(allocator, model_path)) {
             var lease = try beginTransientLease(model_manager, request_id);
@@ -276,13 +279,13 @@ pub const LoadedReader = struct {
         if (usesRequestScopedVisionSessions(allocator, model_path)) {
             var lease = try beginTransientLease(model_manager, request_id);
             errdefer deinitTransientLease(&lease);
-            var reader = try VisionLoadedReader.loadFromDir(allocator, model_path, session_manager, model_manager, request_id);
+            var reader = try VisionLoadedReader.loadFromDir(allocator, model_path, session_manager, model_manager, request_id, artifact_selection);
             errdefer reader.deinit();
             try activateTransientLease(&lease);
             return .{ .impl = .{ .vision = reader }, .transient_lease = lease };
         }
 
-        return .{ .impl = .{ .vision = try VisionLoadedReader.loadFromDir(allocator, model_path, session_manager, model_manager, request_id) } };
+        return .{ .impl = .{ .vision = try VisionLoadedReader.loadFromDir(allocator, model_path, session_manager, model_manager, request_id, artifact_selection) } };
     }
 
     pub fn deinit(self: *LoadedReader) void {

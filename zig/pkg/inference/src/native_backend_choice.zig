@@ -79,17 +79,38 @@ pub fn configureSessionPreference(session_manager: *backends.SessionManager, cho
     };
 }
 
+/// Graph execution providers still require a direct session that owns model
+/// architecture metadata, weights, and fallback kernels. Keep that base
+/// session choice independent from the strict compiled provider requested by
+/// the caller. In Wasm builds `.native` is the Wasm CPU implementation.
+pub fn configureGenerationBaseSessionPreference(session_manager: *backends.SessionManager, choice: Choice) void {
+    switch (choice) {
+        .onnx, .pjrt, .webgpu => {
+            session_manager.preserve_backend_order = true;
+            session_manager.preferred_backends = if (build_options.enable_native)
+                &.{backends.BackendType.native}
+            else if (build_options.enable_metal)
+                &.{backends.BackendType.metal}
+            else if (build_options.enable_cuda)
+                &.{backends.BackendType.cuda}
+            else
+                &.{};
+        },
+        else => configureSessionPreference(session_manager, choice),
+    }
+}
+
 pub fn compiledPartitionBackend(choice: Choice) ?ops.BackendKind {
     return switch (choice) {
         .onnx => .onnx,
         .pjrt => .pjrt,
-        .auto, .native, .metal, .cuda, .webgpu => null,
+        .webgpu => .webgpu,
+        .auto, .native, .metal, .cuda => null,
     };
 }
 
 pub fn compiledPartitionBackendForMode(choice: Choice, compiled_mode_requested: bool) ?ops.BackendKind {
     if (compiled_mode_requested and choice == .metal and build_options.enable_metal) return .metal;
-    if (compiled_mode_requested and choice == .webgpu and build_options.enable_wasm and build_options.enable_webgpu) return .webgpu;
     return compiledPartitionBackend(choice);
 }
 
@@ -152,18 +173,29 @@ test "explicit backend validation never silently substitutes a runtime" {
 test "compiledPartitionBackend maps explicit compiled backends" {
     try std.testing.expectEqual(@as(?ops.BackendKind, .onnx), compiledPartitionBackend(.onnx));
     try std.testing.expectEqual(@as(?ops.BackendKind, .pjrt), compiledPartitionBackend(.pjrt));
+    try std.testing.expectEqual(@as(?ops.BackendKind, .webgpu), compiledPartitionBackend(.webgpu));
     try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackend(.metal));
-    try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackend(.webgpu));
     if (build_options.enable_metal) {
         try std.testing.expectEqual(@as(?ops.BackendKind, .metal), compiledPartitionBackendForMode(.metal, true));
     } else {
         try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackendForMode(.metal, true));
     }
     try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackendForMode(.metal, false));
-    if (build_options.enable_wasm and build_options.enable_webgpu) {
-        try std.testing.expectEqual(@as(?ops.BackendKind, .webgpu), compiledPartitionBackendForMode(.webgpu, true));
-    } else {
-        try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackendForMode(.webgpu, true));
-    }
-    try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackendForMode(.webgpu, false));
+    try std.testing.expectEqual(@as(?ops.BackendKind, .webgpu), compiledPartitionBackendForMode(.webgpu, true));
+    try std.testing.expectEqual(@as(?ops.BackendKind, .webgpu), compiledPartitionBackendForMode(.webgpu, false));
+}
+
+test "compiled generation providers use a direct base session" {
+    var manager = backends.SessionManager.init(std.testing.allocator);
+    configureGenerationBaseSessionPreference(&manager, .webgpu);
+    const expected: []const backends.BackendType = if (build_options.enable_native)
+        &.{.native}
+    else if (build_options.enable_metal)
+        &.{.metal}
+    else if (build_options.enable_cuda)
+        &.{.cuda}
+    else
+        &.{};
+    try std.testing.expectEqualSlices(backends.BackendType, expected, manager.preferred_backends);
+    try std.testing.expect(manager.preserve_backend_order);
 }

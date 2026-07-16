@@ -54,6 +54,7 @@ pub const LoadedVisionReader = struct {
         session_manager: *backends.SessionManager,
         model_manager: *model_manager_mod.ModelManager,
         request_id: ?u64,
+        artifact_selection: manifest_mod.ArtifactSelection,
     ) !LoadedVisionReader {
         const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
 
@@ -65,7 +66,12 @@ pub const LoadedVisionReader = struct {
         } else |_| {}
 
         const model = if (request_id) |id|
-            try model_manager.loadFromDirForRequest(id, model_path)
+            if (!artifact_selection.isEmpty())
+                try model_manager.loadArtifactFromDirForRequest(id, model_path, artifact_selection, null)
+            else
+                try model_manager.loadFromDirForRequest(id, model_path)
+        else if (!artifact_selection.isEmpty())
+            try model_manager.loadArtifactFromDir(model_path, artifact_selection, null)
         else
             try model_manager.loadFromDir(model_path);
         const florence_config = session_factory.getFlorenceConfig(model.session) orelse return error.InvalidModelForReading;

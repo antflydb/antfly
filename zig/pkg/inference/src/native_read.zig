@@ -90,6 +90,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         &model_manager.session_manager,
         &model_manager,
         null,
+        .{},
     );
     const load_ns = nowNs() - load_start_ns;
     if (debug_cuda_session) std.log.info("read: load reader done model={s}", .{opts.model_dir});

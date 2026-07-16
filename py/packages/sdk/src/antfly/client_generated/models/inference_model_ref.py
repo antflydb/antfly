@@ -21,15 +21,18 @@ class InferenceModelRef:
     Attributes:
         kind (InferenceModelKind): Model registry kind.
         name (str): Model name to resolve within the registry for the selected kind, usually in
-            `<owner>/<repo>` format. Generation requests can address a preloaded artifact
-            explicitly as `<owner>/<repo>:<format>:<quantization>`.
+            `<owner>/<repo>` format. Model-backed requests can address a preloaded artifact
+            explicitly as `<owner>/<repo>:<format>[:<quantization>]`; the selector is not
+            part of the registry directory name. A bare model name continues to resolve the
+            directory's default artifact, so multiple selected variants can remain resident.
              Example: antflydb/gemma-e2b.
         backend (InferenceModelBackend | Unset): Optional backend preference for model loading or request execution.
             `auto` keeps the node default behavior.
             `pjrt` selects the PJRT backend and requires `pjrt_plugin_path` unless
             the standard `PJRT_PLUGIN_PATH` environment variable is set.
-            `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with
-            `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
+            `webgpu` selects the Wasm/WebGPU backend in Wasm builds. Generation uses
+            WebGPU graph partition execution over the Wasm-native base session.
+            `mode: "compiled"` may be supplied explicitly but is not required.
         format_ (InferenceModelFormat | Unset): Optional artifact family to select when a model directory contains
             multiple loadable formats.
         quantization (str | Unset): Optional exact quantization selector within the chosen artifact family. Matching is

@@ -72,8 +72,9 @@ class InferenceGenerateRequest:
             `auto` keeps the node default behavior.
             `pjrt` selects the PJRT backend and requires `pjrt_plugin_path` unless
             the standard `PJRT_PLUGIN_PATH` environment variable is set.
-            `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with
-            `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
+            `webgpu` selects the Wasm/WebGPU backend in Wasm builds. Generation uses
+            WebGPU graph partition execution over the Wasm-native base session.
+            `mode: "compiled"` may be supplied explicitly but is not required.
         mode (InferenceGenerateRequestMode | Unset): inference-native graph execution mode. `eager` keeps the direct
             runtime path when possible.
             `compiled` runs inference graph planning, partitioning, and backend executor attachment.

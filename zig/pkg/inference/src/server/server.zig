@@ -346,23 +346,7 @@ pub const WarmModel = struct {
 };
 
 fn artifactSelectionFromModelReference(model_name: []const u8) manifest_mod.ArtifactSelection {
-    const name = if (std.mem.startsWith(u8, model_name, "hf:")) model_name[3..] else model_name;
-    const separator = std.mem.indexOfScalar(u8, name, ':') orelse return .{};
-    const suffix = name[separator + 1 ..];
-    const quantization_separator = std.mem.indexOfScalar(u8, suffix, ':');
-    const format = if (quantization_separator) |index| suffix[0..index] else suffix;
-    inline for (.{ "gguf", "onnx", "safetensors", "hybrid" }) |supported| {
-        if (std.ascii.eqlIgnoreCase(format, supported)) {
-            return .{
-                .format = format,
-                .quantization = if (quantization_separator) |index|
-                    if (index + 1 < suffix.len) suffix[index + 1 ..] else null
-                else
-                    null,
-            };
-        }
-    }
-    return .{};
+    return manifest_mod.ArtifactSelection.fromModelReference(model_name);
 }
 
 fn warmModelArtifactSelection(model: WarmModel) manifest_mod.ArtifactSelection {
@@ -461,6 +445,20 @@ fn parseGenerateBackendSelectionWithDefault(
     };
 }
 
+fn isStrictOnnxGeneration(selection: GenerateBackendSelection) bool {
+    return selection.strict_backend and selection.native_choice == .onnx;
+}
+
+fn validateStrictGenerationFeatures(
+    selection: GenerateBackendSelection,
+    grammar: ?[]const u8,
+    draft_model: ?[]const u8,
+) !void {
+    if (!isStrictOnnxGeneration(selection)) return;
+    if (grammar != null) return error.OnnxGrammarUnsupported;
+    if (draft_model != null) return error.OnnxSpeculativeDecodingUnsupported;
+}
+
 fn shouldAutoUseMetalWholeModelGenerate(
     loaded_backend: backends_mod.BackendType,
     metal_executor_supported: bool,
@@ -510,11 +508,11 @@ fn isConfiguredOnnxGenerationFallbackError(err: anyerror) bool {
     };
 }
 
-fn configureGenerateBackendPreference(
+fn configureGenerateBaseSessionPreference(
     session_manager: *backends_mod.SessionManager,
     selection: GenerateBackendSelection,
 ) void {
-    native_backend_choice.configureSessionPreference(session_manager, selection.native_choice);
+    native_backend_choice.configureGenerationBaseSessionPreference(session_manager, selection.native_choice);
 }
 
 fn singleBackendPreference(backend: backends_mod.BackendType) []const backends_mod.BackendType {
@@ -881,6 +879,26 @@ pub const Node = struct {
         return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
     }
 
+    /// Load the exact artifact named by a request without publishing it as the
+    /// directory's default alias. This keeps multiple formats/quantizations in
+    /// one directory independently addressable and makes exact preloads hit the
+    /// same canonical cache identity on subsequent requests.
+    fn loadModelReferenceForRequest(
+        self: *Node,
+        request_id: u64,
+        model_path: []const u8,
+        model_reference: ?[]const u8,
+    ) !*model_manager_mod.LoadedModel {
+        const selection = if (model_reference) |reference|
+            artifactSelectionFromModelReference(reference)
+        else
+            manifest_mod.ArtifactSelection{};
+        if (!selection.isEmpty()) {
+            return self.model_manager.loadArtifactFromDirForRequest(request_id, model_path, selection, null);
+        }
+        return self.model_manager.loadFromDirForRequest(request_id, model_path);
+    }
+
     pub fn init(allocator: std.mem.Allocator, config: NodeConfig) !Node {
         if (config.pool_size == 0) return error.InvalidPoolSize;
         if (config.backend_priority) |priority| {
@@ -947,7 +965,7 @@ pub const Node = struct {
 
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        const model = try self.model_manager.loadFromDirForRequest(request_id, model_path);
+        const model = try self.loadModelReferenceForRequest(request_id, model_path, if (model_name.len > 0) model_name else null);
         try ensureDirectEmbeddingDeadline(deadline_ns);
         if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         try model.ensureEmbeddingAssetsWithIo(io, true, false, false);
@@ -980,7 +998,7 @@ pub const Node = struct {
         defer io_impl.deinit();
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "embedders");
-        const model = try self.model_manager.loadFromDirForRequest(request_id, model_path);
+        const model = try self.loadModelReferenceForRequest(request_id, model_path, if (model_name.len > 0) model_name else null);
         if (!model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         const serialize_imported = model.usesImportedOnnxRuntime();
         if (serialize_imported) model.lockImportedPipeline(io_impl.io());
@@ -1011,7 +1029,7 @@ pub const Node = struct {
         defer io_impl.deinit();
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "rerankers");
-        const model = try self.model_manager.loadFromDirForRequest(request_id, model_path);
+        const model = try self.loadModelReferenceForRequest(request_id, model_path, if (model_name.len > 0) model_name else null);
         const serialize_imported = model.usesImportedOnnxRuntime();
         if (serialize_imported) model.lockImportedPipeline(io_impl.io());
         defer if (serialize_imported) model.unlockImportedPipeline(io_impl.io());
@@ -1712,7 +1730,7 @@ pub const Node = struct {
 
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        const model = try self.model_manager.loadFromDirForRequest(request_id, model_path);
+        const model = try self.loadModelReferenceForRequest(request_id, model_path, if (model_name.len > 0) model_name else null);
         try ensureDirectEmbeddingDeadline(deadline_ns);
         if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
 
@@ -1779,7 +1797,14 @@ pub const Node = struct {
             image_datas[i] = downloaded[i].data;
         }
 
-        var reader = try readers_mod.LoadedReader.loadFromDir(allocator, model_path, &self.session_manager, &self.model_manager, request_id);
+        var reader = try readers_mod.LoadedReader.loadFromDir(
+            allocator,
+            model_path,
+            &self.session_manager,
+            &self.model_manager,
+            request_id,
+            artifactSelectionFromModelReference(model_name),
+        );
         defer reader.deinit();
 
         const results = try reader.readBatch(image_datas, .{
@@ -1823,7 +1848,7 @@ pub const Node = struct {
         defer io_impl.deinit();
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "transcribers");
-        const model = try self.model_manager.loadFromDirForRequest(request_id, model_path);
+        const model = try self.loadModelReferenceForRequest(request_id, model_path, if (model_name.len > 0) model_name else null);
         if (session_factory.getWhisperConfig(model.session) == null) return error.UnsupportedTranscriberProvider;
 
         const transcription = @import("../pipelines/transcription.zig");
@@ -2282,7 +2307,7 @@ pub const Node = struct {
                 .message = "model not found; specify 'model' as a path or owner/name",
             });
 
-        const model = self.model_manager.loadFromDirForRequest(request_id, model_path) catch |err|
+        const model = self.loadModelReferenceForRequest(request_id, model_path, model_name) catch |err|
             return modelLoadFailure(ctx, err);
 
         if (model.manifest.hasCapability("sparse")) {
@@ -2526,7 +2551,7 @@ pub const Node = struct {
                 .message = "model not found; specify 'model' as a path or owner/name",
             });
 
-        const model = self.model_manager.loadFromDirForRequest(request_id, model_path) catch |err|
+        const model = self.loadModelReferenceForRequest(request_id, model_path, model_name) catch |err|
             return modelLoadFailure(ctx, err);
 
         const serialize_imported = model.usesImportedOnnxRuntime();
@@ -2585,7 +2610,7 @@ pub const Node = struct {
 
         // Validate request-owned media before model admission. A rejected URL
         // must not evict a healthy resident model at the configured capacity.
-        const model = self.model_manager.loadFromDirForRequest(request_id, model_path) catch |err|
+        const model = self.loadModelReferenceForRequest(request_id, model_path, model_name) catch |err|
             return modelLoadFailure(ctx, err);
 
         if (!has_images) {
@@ -2689,8 +2714,8 @@ pub const Node = struct {
         artifact_selection: manifest_mod.ArtifactSelection,
     ) !*model_manager_mod.LoadedModel {
         var request_session_manager = backends_mod.SessionManager.init(allocator);
-        const configured = if (selection.override_model_loading) blk: {
-            configureGenerateBackendPreference(&request_session_manager, selection);
+        const configured = if (selection.override_model_loading or selection.compiled_partition_backend != null) blk: {
+            configureGenerateBaseSessionPreference(&request_session_manager, selection);
             break :blk request_session_manager.preferred_backends;
         } else self.session_manager.preferred_backends;
 
@@ -2699,6 +2724,7 @@ pub const Node = struct {
         // safe here because direct session loading already skips it.
         if (artifact_selection.isEmpty() and
             !selection.override_model_loading and
+            selection.compiled_partition_backend == null and
             self.model_manager.backendPolicy(model_path) == null and
             !generationPriorityNeedsSessionFiltering(configured))
         {
@@ -3060,9 +3086,19 @@ pub const Node = struct {
                 });
             }
         }
+        if (isStrictOnnxGeneration(backend_selection) and effective_draft_model_name != null) {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "speculative decoding is not supported by the ONNX generation backend",
+            });
+        }
         if (body.response_format) |rf| {
             if (std.mem.eql(u8, rf.type, "json_object")) {
-                config.grammar = "json";
+                // Direct ONNX generators cannot enforce a token grammar, but
+                // the response is still parsed and normalized before return.
+                // Keep json_object available without pretending it is
+                // constrained decoding; json_schema remains strict below.
+                if (!isStrictOnnxGeneration(backend_selection)) config.grammar = "json";
             } else if (std.mem.eql(u8, rf.type, "json_schema")) {
                 const schema_cfg = rf.json_schema orelse {
                     return ctx.status(400).json(.{
@@ -3076,6 +3112,12 @@ pub const Node = struct {
                         .message = "response_format.json_schema.schema is required for type=json_schema",
                     });
                 };
+                if (isStrictOnnxGeneration(backend_selection)) {
+                    return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "grammar-constrained decoding is native-backend only; ONNX generation remains unconstrained-only",
+                    });
+                }
                 config.grammar = grammar_mod.buildJsonSchemaGrammar(ctx.allocator, schema) catch |err| {
                     return ctx.status(400).json(.{
                         .@"error" = "INVALID_REQUEST",
@@ -3097,6 +3139,12 @@ pub const Node = struct {
                     .message = "grammar must not be empty",
                 });
             }
+            if (isStrictOnnxGeneration(backend_selection)) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "grammar-constrained decoding is native-backend only; ONNX generation remains unconstrained-only",
+                });
+            }
             if (!std.mem.eql(u8, grammar, "json")) {
                 var compiled = grammar_mod.GbnfGrammar.parse(ctx.allocator, grammar) catch |err| {
                     return ctx.status(400).json(.{
@@ -3108,6 +3156,21 @@ pub const Node = struct {
             }
             config.grammar = grammar;
         }
+
+        validateStrictGenerationFeatures(
+            backend_selection,
+            config.grammar,
+            effective_draft_model_name,
+        ) catch |err| {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = switch (err) {
+                    error.OnnxGrammarUnsupported => "grammar-constrained decoding is native-backend only; ONNX generation remains unconstrained-only",
+                    error.OnnxSpeculativeDecodingUnsupported => "speculative decoding is not supported by the ONNX generation backend",
+                    else => unreachable,
+                },
+            });
+        };
 
         var pjrt_client: ?pjrt_lib.pjrt.Client = null;
         defer if (pjrt_client) |*client| client.deinit();
@@ -3153,13 +3216,6 @@ pub const Node = struct {
                 !c_file.fileExistsInDir(ctx.allocator, model_path, "genai_config.json") and
                 onnx_decoder_only_vlm.isSupportedModelDir(ctx.allocator, model_path))
             {
-                if (config.grammar != null) {
-                    return ctx.status(400).json(.{
-                        .@"error" = "INVALID_REQUEST",
-                        .message = "grammar-constrained decoding is native-backend only; ONNX generation remains unconstrained-only",
-                    });
-                }
-
                 var transient_lease = self.model_manager.beginTransientModelLoadForRequest(request_id) catch |err|
                     return modelLoadFailure(ctx, err);
                 defer transient_lease.deinit();
@@ -3255,13 +3311,6 @@ pub const Node = struct {
                 defer if (ort_package) |*package| package.deinit();
                 if (ort_package) |*package| {
                     const prepared_model_dir = package.path;
-                    if (config.grammar != null) {
-                        return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "grammar-constrained decoding is native-backend only; ONNX generation remains unconstrained-only",
-                        });
-                    }
-
                     var transient_lease = self.model_manager.beginTransientModelLoadForRequest(request_id) catch |err|
                         return modelLoadFailure(ctx, err);
                     defer transient_lease.deinit();
@@ -5109,7 +5158,7 @@ pub const Node = struct {
             return self.recognizeRebel(ctx, request_id, model_path, body);
         }
 
-        const model = self.model_manager.loadFromDirForRequest(request_id, model_path) catch |err|
+        const model = self.loadModelReferenceForRequest(request_id, model_path, model_name) catch |err|
             return modelLoadFailure(ctx, err);
 
         // Use GLiNER pipeline for GLiNER models, standard NER for BIO models
@@ -5392,7 +5441,7 @@ pub const Node = struct {
 
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
         if (self.resolveModelPath(ctx.io, model_name, "classifiers")) |model_path| {
-            const model = self.model_manager.loadFromDirForRequest(request_id, model_path) catch |err|
+            const model = self.loadModelReferenceForRequest(request_id, model_path, model_name) catch |err|
                 return modelLoadFailure(ctx, err);
 
             // Detect entailment index from id2label (varies by NLI model)
@@ -5427,7 +5476,7 @@ pub const Node = struct {
         } else |_| {}
 
         if (self.resolveModelPath(ctx.io, model_name, "recognizers")) |model_path| {
-            const model = self.model_manager.loadFromDirForRequest(request_id, model_path) catch |err|
+            const model = self.loadModelReferenceForRequest(request_id, model_path, model_name) catch |err|
                 return modelLoadFailure(ctx, err);
             if (!model.isGlinerModel() or !model.supportsClassification()) {
                 return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
@@ -5910,6 +5959,7 @@ pub const Node = struct {
             &self.session_manager,
             &self.model_manager,
             request_id,
+            if (model_name) |reference| artifactSelectionFromModelReference(reference) else .{},
         ) catch |err| switch (err) {
             error.ModelCapacityReached => return modelLoadFailure(ctx, err),
             error.InvalidModelForReading => return ctx.status(400).json(.{
@@ -6065,7 +6115,7 @@ pub const Node = struct {
                 tokenizer = hf_tok.tokenizer();
             }
         } else |_| {
-            const model = self.model_manager.loadFromDirForRequest(request_id, model_path) catch |err|
+            const model = self.loadModelReferenceForRequest(request_id, model_path, transcribe_model_name) catch |err|
                 return modelLoadFailure(ctx, err);
             if (session_factory.getWhisperConfig(model.session) == null) {
                 return ctx.status(400).json(.{
@@ -8033,7 +8083,7 @@ test "generate backend selection keeps compiled mode explicit" {
     if (build_options.enable_wasm and build_options.enable_webgpu) {
         const eager = try eager_webgpu;
         try std.testing.expectEqual(native_backend_choice.Choice.webgpu, eager.native_choice);
-        try std.testing.expectEqual(@as(?ops.BackendKind, null), eager.compiled_partition_backend);
+        try std.testing.expectEqual(@as(?ops.BackendKind, .webgpu), eager.compiled_partition_backend);
         try std.testing.expect(!eager.graph_mode_requested);
 
         const compiled = try parseGenerateBackendSelection(.webgpu, "compiled", null);
@@ -8094,6 +8144,23 @@ test "explicit generation backend remains strict" {
     try std.testing.expect(selection.override_model_loading);
     try std.testing.expect(selection.strict_backend);
     try std.testing.expectEqual(native_backend_choice.Choice.native, selection.native_choice);
+}
+
+test "strict ONNX generation rejects unsupported constrained and speculative features" {
+    if (!build_options.enable_onnx) return;
+    const selection = try parseGenerateBackendSelection(.onnx, null, null);
+    try std.testing.expectError(
+        error.OnnxGrammarUnsupported,
+        validateStrictGenerationFeatures(selection, "json", null),
+    );
+    try std.testing.expectError(
+        error.OnnxSpeculativeDecodingUnsupported,
+        validateStrictGenerationFeatures(selection, null, "owner/draft"),
+    );
+    try validateStrictGenerationFeatures(selection, null, null);
+
+    const configured = try parseGenerateBackendSelectionWithDefault(null, null, null, .onnx);
+    try validateStrictGenerationFeatures(configured, "json", "owner/draft");
 }
 
 test "generation priority can fall through a runtime-unusable compiled backend" {

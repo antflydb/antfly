@@ -416,6 +416,29 @@ pub const ArtifactSelection = struct {
     pub fn isEmpty(self: ArtifactSelection) bool {
         return self.format == null and self.quantization == null;
     }
+
+    /// Parse the stable `<model>:<format>[:<quantization>]` reference syntax.
+    /// The returned slices borrow from `model_reference`; callers do not need
+    /// an allocation on request hot paths.
+    pub fn fromModelReference(model_reference: []const u8) ArtifactSelection {
+        const name = if (std.mem.startsWith(u8, model_reference, "hf:")) model_reference[3..] else model_reference;
+        const separator = std.mem.indexOfScalar(u8, name, ':') orelse return .{};
+        const suffix = name[separator + 1 ..];
+        const quantization_separator = std.mem.indexOfScalar(u8, suffix, ':');
+        const format = if (quantization_separator) |index| suffix[0..index] else suffix;
+        inline for (.{ "gguf", "onnx", "safetensors", "hybrid" }) |supported| {
+            if (std.ascii.eqlIgnoreCase(format, supported)) {
+                return .{
+                    .format = format,
+                    .quantization = if (quantization_separator) |index|
+                        if (index + 1 < suffix.len) suffix[index + 1 ..] else null
+                    else
+                        null,
+                };
+            }
+        }
+        return .{};
+    }
 };
 
 pub fn loadFromDirWithArtifactSelection(

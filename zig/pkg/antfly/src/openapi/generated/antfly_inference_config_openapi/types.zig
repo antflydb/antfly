@@ -595,7 +595,7 @@ pub const ModelQuantization = []const u8;
 /// Model reference used by startup preload and model-loading configuration.
 pub const ModelRef = struct {
     kind: ModelKind,
-    /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format. Generation requests can address a preloaded artifact explicitly as `<owner>/<repo>:<format>:<quantization>`.
+    /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format. Model-backed requests can address a preloaded artifact explicitly as `<owner>/<repo>:<format>[:<quantization>]`; the selector is not part of the registry directory name. A bare model name continues to resolve the directory's default artifact, so multiple selected variants can remain resident.
     name: []const u8,
     backend: ?ModelBackend = null,
     format: ?ModelFormat = null,
