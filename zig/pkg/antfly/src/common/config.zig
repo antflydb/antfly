@@ -160,6 +160,19 @@ pub const Config = struct {
     };
 
     pub const InferenceConfig = struct {
+        pub const PromptCacheMode = enum {
+            simple,
+            block_hash,
+        };
+
+        pub const PromptCacheConfig = struct {
+            enabled: bool = false,
+            mode: PromptCacheMode = .block_hash,
+            max_bytes_mb: usize = 512,
+            min_tokens: usize = 64,
+            ttl_ms: u64 = 300_000,
+        };
+
         pub const WarmModelConfig = struct {
             kind: []u8,
             name: []u8,
@@ -184,6 +197,14 @@ pub const Config = struct {
         content_security: ?ContentSecurityConfig = null,
         s3_credentials: ?S3CredentialsConfig = null,
         preload: []WarmModelConfig = &.{},
+        backend_priority: ?[]const []u8 = null,
+        pjrt_plugin_path: ?[]u8 = null,
+        prompt_cache: PromptCacheConfig = .{},
+        keep_alive_ms: u64 = 300_000,
+        max_loaded_models: usize = 10,
+        max_concurrent_requests: usize = 32,
+        pool_size: usize = 1,
+        allow_downloads: bool = true,
 
         fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
             if (self.api_url) |value| alloc.free(value);
@@ -194,6 +215,8 @@ pub const Config = struct {
             if (self.s3_credentials) |*credentials| credentials.deinit(alloc);
             for (self.preload) |*model| model.deinit(alloc);
             if (self.preload.len > 0) alloc.free(self.preload);
+            if (self.backend_priority) |values| freeOwnedStringSlice(alloc, values);
+            if (self.pjrt_plugin_path) |value| alloc.free(value);
             self.* = undefined;
         }
     };
@@ -516,6 +539,7 @@ pub const Config = struct {
             .object => |object| object,
             else => return error.InvalidConfig,
         };
+        try rejectRemovedInferenceConfigFields(raw_root.get("inference"));
 
         var parsed_tree = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{
             .allocate = .alloc_always,
@@ -567,6 +591,26 @@ pub const Config = struct {
             synthesizing.Registry.init(alloc);
         errdefer text_to_speech.deinit();
 
+        const prompt_cache = if (validated.value.inference) |inference|
+            try promptCacheFromOpenApi(inference.prompt_cache)
+        else
+            Config.InferenceConfig.PromptCacheConfig{};
+        const inference_keep_alive_ms = if (validated.value.inference) |inference|
+            try parseGoDurationMs(inference.keep_alive orelse "5m")
+        else
+            300_000;
+        const inference_max_loaded_models = if (validated.value.inference) |inference|
+            try nonNegativeUsize(inference.max_loaded_models orelse 10)
+        else
+            10;
+        const inference_max_concurrent_requests = if (validated.value.inference) |inference|
+            try nonNegativeUsize(inference.max_concurrent_requests orelse 32)
+        else
+            32;
+        const inference_pool_size = if (validated.value.inference) |inference|
+            try positiveUsize(inference.pool_size orelse 1)
+        else
+            1;
         return .{
             .registry = registry,
             .transcribers = transcribers,
@@ -593,13 +637,24 @@ pub const Config = struct {
             .storage = storage_config,
             .transaction_sessions = try transactionSessionConfigFromOpenApi(validated.value.transaction_sessions),
             .inference = if (validated.value.inference) |inference| .{
-                .api_url = if (inference.api_url.len > 0) try alloc.dupe(u8, inference.api_url) else null,
+                .api_url = if (inference.api_url) |value|
+                    if (value.len > 0) try alloc.dupe(u8, value) else null
+                else
+                    null,
                 .api_key = try rawOptionalStringField(alloc, raw_root.get("inference"), "api_key"),
                 .models_dir = if (inference.models_dir) |value| try alloc.dupe(u8, value) else null,
                 .ml_dir = if (inference.ml_dir) |value| try alloc.dupe(u8, value) else null,
                 .content_security = if (inference.content_security) |security| try contentSecurityFromOpenApi(alloc, security) else null,
                 .s3_credentials = try parseRawInferenceS3Credentials(alloc, raw_root, inference.s3_credentials),
                 .preload = try parseInferencePreloadModels(alloc, raw_root.get("inference")),
+                .backend_priority = if (inference.backend_priority) |values| try dupOwnedStringSlice(alloc, values) else null,
+                .pjrt_plugin_path = if (inference.pjrt_plugin_path) |value| try alloc.dupe(u8, value) else null,
+                .prompt_cache = prompt_cache,
+                .keep_alive_ms = inference_keep_alive_ms,
+                .max_loaded_models = inference_max_loaded_models,
+                .max_concurrent_requests = inference_max_concurrent_requests,
+                .pool_size = inference_pool_size,
+                .allow_downloads = inference.allow_downloads orelse true,
             } else .{},
             .remote_content = if (raw_root.get("remote_content")) |remote_content|
                 try parseRemoteContentConfig(alloc, remote_content)
@@ -1795,6 +1850,99 @@ fn optionalStringArrayField(alloc: std.mem.Allocator, object: std.json.ObjectMap
     return out;
 }
 
+fn promptCacheFromOpenApi(
+    value: ?inference_config_openapi.PromptCacheConfig,
+) !Config.InferenceConfig.PromptCacheConfig {
+    const config = value orelse return .{};
+    const max_bytes_mb = try nonNegativeUsize(config.max_bytes_mb orelse 512);
+    if (max_bytes_mb > std.math.maxInt(usize) / (1024 * 1024)) return error.InvalidConfig;
+    const min_tokens = try nonNegativeUsize(config.min_tokens orelse 64);
+    const ttl_ms_raw = config.ttl_ms orelse 300_000;
+    if (ttl_ms_raw < 0) return error.InvalidConfig;
+    const ttl_ms = std.math.cast(u64, ttl_ms_raw) orelse return error.InvalidConfig;
+    const mode_raw = config.mode orelse "block_hash";
+    const mode: Config.InferenceConfig.PromptCacheMode = if (std.mem.eql(u8, mode_raw, "block_hash"))
+        .block_hash
+    else if (std.mem.eql(u8, mode_raw, "simple"))
+        .simple
+    else
+        return error.InvalidConfig;
+    return .{
+        .enabled = config.enabled orelse false,
+        .mode = mode,
+        .max_bytes_mb = max_bytes_mb,
+        .min_tokens = min_tokens,
+        .ttl_ms = ttl_ms,
+    };
+}
+
+fn nonNegativeUsize(value: i64) !usize {
+    if (value < 0) return error.InvalidConfig;
+    return std.math.cast(usize, value) orelse error.InvalidConfig;
+}
+
+fn positiveUsize(value: i64) !usize {
+    if (value <= 0) return error.InvalidConfig;
+    return std.math.cast(usize, value) orelse error.InvalidConfig;
+}
+
+fn parseGoDurationMs(value: []const u8) !u64 {
+    if (std.mem.eql(u8, value, "0")) return 0;
+    if (value.len == 0) return error.InvalidConfig;
+
+    var total_ns: u128 = 0;
+    var offset: usize = 0;
+    while (offset < value.len) {
+        const whole_start = offset;
+        while (offset < value.len and std.ascii.isDigit(value[offset])) : (offset += 1) {}
+        if (offset == whole_start) return error.InvalidConfig;
+        const whole = std.fmt.parseInt(u128, value[whole_start..offset], 10) catch return error.InvalidConfig;
+
+        var fraction: u128 = 0;
+        var fraction_scale: u128 = 1;
+        if (offset < value.len and value[offset] == '.') {
+            offset += 1;
+            const fraction_start = offset;
+            while (offset < value.len and std.ascii.isDigit(value[offset])) : (offset += 1) {
+                if (fraction_scale > std.math.maxInt(u128) / 10) return error.InvalidConfig;
+                fraction_scale *= 10;
+            }
+            if (offset == fraction_start) return error.InvalidConfig;
+            fraction = std.fmt.parseInt(u128, value[fraction_start..offset], 10) catch return error.InvalidConfig;
+        }
+
+        const unit_ns: u128 = if (std.mem.startsWith(u8, value[offset..], "ms")) unit: {
+            offset += 2;
+            break :unit std.time.ns_per_ms;
+        } else if (std.mem.startsWith(u8, value[offset..], "us")) unit: {
+            offset += 2;
+            break :unit std.time.ns_per_us;
+        } else if (std.mem.startsWith(u8, value[offset..], "ns")) unit: {
+            offset += 2;
+            break :unit 1;
+        } else if (std.mem.startsWith(u8, value[offset..], "h")) unit: {
+            offset += 1;
+            break :unit std.time.ns_per_hour;
+        } else if (std.mem.startsWith(u8, value[offset..], "m")) unit: {
+            offset += 1;
+            break :unit std.time.ns_per_min;
+        } else if (std.mem.startsWith(u8, value[offset..], "s")) unit: {
+            offset += 1;
+            break :unit std.time.ns_per_s;
+        } else return error.InvalidConfig;
+
+        const whole_ns = std.math.mul(u128, whole, unit_ns) catch return error.InvalidConfig;
+        const fraction_ns = std.math.mul(u128, fraction, unit_ns) catch return error.InvalidConfig;
+        total_ns = std.math.add(u128, total_ns, whole_ns) catch return error.InvalidConfig;
+        total_ns = std.math.add(u128, total_ns, fraction_ns / fraction_scale) catch return error.InvalidConfig;
+    }
+
+    if (total_ns == 0) return error.InvalidConfig;
+    const rounded_numerator = std.math.add(u128, total_ns, std.time.ns_per_ms - 1) catch return error.InvalidConfig;
+    const rounded_ms = rounded_numerator / std.time.ns_per_ms;
+    return std.math.cast(u64, rounded_ms) orelse error.InvalidConfig;
+}
+
 fn parseInferencePreloadModels(
     alloc: std.mem.Allocator,
     raw_inference: ?std.json.Value,
@@ -1829,6 +1977,25 @@ fn parseInferencePreloadModels(
         filled = i + 1;
     }
     return out;
+}
+
+fn rejectRemovedInferenceConfigFields(value: ?std.json.Value) !void {
+    const inference_value = value orelse return;
+    const inference = switch (inference_value) {
+        .object => |object| object,
+        else => return error.InvalidConfig,
+    };
+    inline for (.{
+        "model_strategies",
+        "embedder_models_dir",
+        "chunker_models_dir",
+        "reranker_models_dir",
+        "max_queue_size",
+        "request_timeout",
+        "max_memory_mb",
+    }) |field| {
+        if (inference.contains(field)) return error.InvalidConfig;
+    }
 }
 
 fn contentSecurityFromOpenApi(
@@ -2037,8 +2204,20 @@ test "common config extracts antfly settings" {
         \\    "api_url": "http://127.0.0.1:8083",
         \\    "models_dir": "/tmp/models",
         \\    "ml_dir": "/tmp/ml",
+        \\    "keep_alive": "1h30m",
+        \\    "max_loaded_models": 3,
+        \\    "max_concurrent_requests": 4,
+        \\    "pool_size": 2,
+        \\    "pjrt_plugin_path": "/usr/local/lib/libtpu.so",
+        \\    "prompt_cache": {
+        \\      "enabled": true,
+        \\      "mode": "simple",
+        \\      "max_bytes_mb": 256,
+        \\      "min_tokens": 32,
+        \\      "ttl_ms": 60000
+        \\    },
         \\    "preload": [
-        \\      { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal", "format": "gguf", "quantization": "q4_k" }
+        \\      { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal" }
         \\    ],
         \\    "content_security": {
         \\      "allowed_hosts": ["models.example.com"],
@@ -2062,17 +2241,35 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqualStrings("http://127.0.0.1:8083", cfg.inference.api_url.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference.models_dir.?);
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference.ml_dir.?);
+    try std.testing.expectEqual(@as(u64, 5_400_000), cfg.inference.keep_alive_ms);
+    try std.testing.expectEqual(@as(usize, 3), cfg.inference.max_loaded_models);
+    try std.testing.expectEqual(@as(usize, 4), cfg.inference.max_concurrent_requests);
+    try std.testing.expectEqual(@as(usize, 2), cfg.inference.pool_size);
+    try std.testing.expectEqualStrings("/usr/local/lib/libtpu.so", cfg.inference.pjrt_plugin_path.?);
+    try std.testing.expect(cfg.inference.prompt_cache.enabled);
+    try std.testing.expectEqual(Config.InferenceConfig.PromptCacheMode.simple, cfg.inference.prompt_cache.mode);
+    try std.testing.expectEqual(@as(usize, 256), cfg.inference.prompt_cache.max_bytes_mb);
+    try std.testing.expectEqual(@as(usize, 32), cfg.inference.prompt_cache.min_tokens);
+    try std.testing.expectEqual(@as(u64, 60_000), cfg.inference.prompt_cache.ttl_ms);
     try std.testing.expectEqual(@as(usize, 1), cfg.inference.preload.len);
     try std.testing.expectEqualStrings("generator", cfg.inference.preload[0].kind);
     try std.testing.expectEqualStrings("antflydb/gemma-e2b", cfg.inference.preload[0].name);
     try std.testing.expectEqualStrings("metal", cfg.inference.preload[0].backend.?);
-    try std.testing.expectEqualStrings("gguf", cfg.inference.preload[0].format.?);
-    try std.testing.expectEqualStrings("q4_k", cfg.inference.preload[0].quantization.?);
     try std.testing.expectEqualStrings("models.example.com", cfg.inference.content_security.?.allowed_hosts.?[0]);
     try std.testing.expectEqual(@as(?bool, true), cfg.inference.content_security.?.block_private_ips);
     try std.testing.expectEqualStrings("s3.amazonaws.com", cfg.inference.s3_credentials.?.endpoint.?);
     try std.testing.expectEqualStrings("antfly-key", cfg.inference.s3_credentials.?.access_key_id.?);
     try std.testing.expectEqualStrings("antfly-secret", cfg.inference.s3_credentials.?.secret_access_key.?);
+}
+
+test "common config parses documented model keep-alive durations" {
+    try std.testing.expectEqual(@as(u64, 0), try parseGoDurationMs("0"));
+    try std.testing.expectEqual(@as(u64, 300_000), try parseGoDurationMs("5m"));
+    try std.testing.expectEqual(@as(u64, 5_400_000), try parseGoDurationMs("1h30m"));
+    try std.testing.expectEqual(@as(u64, 1_500), try parseGoDurationMs("1.5s"));
+    try std.testing.expectError(error.InvalidConfig, parseGoDurationMs("forever"));
+    try std.testing.expectError(error.InvalidConfig, nonNegativeUsize(-1));
+    try std.testing.expectError(error.InvalidConfig, positiveUsize(0));
 }
 
 test "common config parses inference preload" {
@@ -2082,8 +2279,8 @@ test "common config parses inference preload" {
         \\  "inference": {
         \\    "api_url": "http://127.0.0.1:8090",
         \\    "preload": [
-        \\      { "kind": "generator", "name": "antflydb/gemma-e2b", "format": "gguf", "quantization": "q8" },
-        \\      { "kind": "reranker", "name": "BAAI/bge-reranker", "backend": "native", "format": "onnx" }
+        \\      { "kind": "generator", "name": "antflydb/gemma-e2b" },
+        \\      { "kind": "reranker", "name": "BAAI/bge-reranker", "backend": "native" }
         \\    ]
         \\  }
         \\}
@@ -2094,12 +2291,63 @@ test "common config parses inference preload" {
     try std.testing.expectEqual(@as(usize, 2), cfg.inference.preload.len);
     try std.testing.expectEqualStrings("generator", cfg.inference.preload[0].kind);
     try std.testing.expectEqualStrings("antflydb/gemma-e2b", cfg.inference.preload[0].name);
-    try std.testing.expectEqualStrings("gguf", cfg.inference.preload[0].format.?);
-    try std.testing.expectEqualStrings("q8", cfg.inference.preload[0].quantization.?);
     try std.testing.expectEqualStrings("reranker", cfg.inference.preload[1].kind);
     try std.testing.expectEqualStrings("BAAI/bge-reranker", cfg.inference.preload[1].name);
     try std.testing.expectEqualStrings("native", cfg.inference.preload[1].backend.?);
-    try std.testing.expectEqualStrings("onnx", cfg.inference.preload[1].format.?);
+}
+
+test "common config preserves preload artifact selectors" {
+    const raw =
+        \\{"inference":{"preload":[{"kind":"generator","name":"model","format":"gguf","quantization":"q4_k"}]}}
+    ;
+    var cfg = try Config.parseFromSlice(std.testing.allocator, raw);
+    defer cfg.deinit();
+    try std.testing.expectEqualStrings("gguf", cfg.inference.preload[0].format.?);
+    try std.testing.expectEqualStrings("q4_k", cfg.inference.preload[0].quantization.?);
+}
+
+test "common config rejects removed inference compatibility fields" {
+    inline for (.{
+        "model_strategies",
+        "embedder_models_dir",
+        "chunker_models_dir",
+        "reranker_models_dir",
+        "max_queue_size",
+        "request_timeout",
+        "max_memory_mb",
+    }) |field| {
+        const raw = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"inference\":{{\"{s}\":null}}}}",
+            .{field},
+        );
+        defer std.testing.allocator.free(raw);
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, raw));
+    }
+}
+
+test "common config accepts zero and rejects invalid prompt cache policy" {
+    const alloc = std.testing.allocator;
+    const zero_raw =
+        \\{"inference":{"api_url":"http://127.0.0.1:8090","prompt_cache":{"max_bytes_mb":0,"min_tokens":0,"ttl_ms":0}}}
+    ;
+    var zero = try Config.parseFromSlice(alloc, zero_raw);
+    defer zero.deinit();
+    try std.testing.expectEqual(@as(usize, 0), zero.inference.prompt_cache.max_bytes_mb);
+    try std.testing.expectEqual(@as(usize, 0), zero.inference.prompt_cache.min_tokens);
+    try std.testing.expectEqual(@as(u64, 0), zero.inference.prompt_cache.ttl_ms);
+
+    inline for (.{
+        \\{"inference":{"api_url":"http://127.0.0.1:8090","prompt_cache":{"mode":"unknown"}}}
+        ,
+        \\{"inference":{"api_url":"http://127.0.0.1:8090","prompt_cache":{"max_bytes_mb":-1}}}
+        ,
+        \\{"inference":{"api_url":"http://127.0.0.1:8090","prompt_cache":{"min_tokens":-1}}}
+        ,
+        \\{"inference":{"api_url":"http://127.0.0.1:8090","prompt_cache":{"ttl_ms":-1}}}
+    }) |raw| {
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, raw));
+    }
 }
 
 test "common config defaults shard scalar fields" {
@@ -2746,6 +2994,8 @@ test "common config parses minimal config with runtime defaults" {
     try std.testing.expectEqual(@as(u64, default_max_shard_size_bytes), cfg.shard_allocation.max_shard_size_bytes);
     try std.testing.expectEqual(@as(u32, default_max_shards_per_table), cfg.shard_allocation.max_shards_per_table);
     try std.testing.expect(cfg.shard_allocation.disable_shard_alloc);
+    try std.testing.expectEqual(@as(usize, 10), cfg.inference.max_loaded_models);
+    try std.testing.expectEqual(@as(usize, 32), cfg.inference.max_concurrent_requests);
 }
 
 test "common config can disable health server" {

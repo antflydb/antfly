@@ -6035,6 +6035,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: Service unavailable because request capacity is exhausted or max_loaded_models
+            has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED.
+          headers:
+            Retry-After:
+              description: Present only for capacity or queue exhaustion; recommended delay in seconds
+                before retrying.
+              schema:
+                type: string
+                example: '1'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/chunk:
     post:
       summary: Chunk text into smaller segments
@@ -6093,6 +6107,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: Service unavailable because request capacity is exhausted.
+          headers:
+            Retry-After:
+              description: Recommended delay in seconds before retrying.
+              schema:
+                type: string
+                example: '1'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/rerank_multimodal:
     post:
       summary: Rerank multimodal documents by relevance
@@ -6135,6 +6161,20 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '501':
           description: Multimodal reranking contract recognized but encoder path not implemented yet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: Service unavailable because request capacity is exhausted or max_loaded_models
+            has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED.
+          headers:
+            Retry-After:
+              description: Present only for capacity or queue exhaustion; recommended delay in seconds
+                before retrying.
+              schema:
+                type: string
+                example: '1'
           content:
             application/json:
               schema:
@@ -6217,7 +6257,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Reranking service unavailable (no models configured)
+          description: Service unavailable because request capacity is exhausted or max_loaded_models
+            has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED.
+          headers:
+            Retry-After:
+              description: Present only for capacity or queue exhaustion; recommended delay in seconds
+                before retrying.
+              schema:
+                type: string
+                example: '1'
           content:
             application/json:
               schema:
@@ -6294,7 +6342,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Generation service unavailable (no models configured)
+          description: Service unavailable because request capacity is exhausted or max_loaded_models
+            has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED.
+          headers:
+            Retry-After:
+              description: Present only for capacity or queue exhaustion; recommended delay in seconds
+                before retrying.
+              schema:
+                type: string
+                example: '1'
           content:
             application/json:
               schema:
@@ -6342,7 +6398,14 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Generation service unavailable
+          description: Service unavailable because request queue capacity is exhausted.
+          headers:
+            Retry-After:
+              description: Present only for capacity or queue exhaustion; recommended delay in seconds
+                before retrying.
+              schema:
+                type: string
+                example: '1'
           content:
             application/json:
               schema:
@@ -6393,7 +6456,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Generation service unavailable (no models configured)
+          description: Service unavailable because request capacity is exhausted or max_loaded_models
+            has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED.
+          headers:
+            Retry-After:
+              description: Present only for capacity or queue exhaustion; recommended delay in seconds
+                before retrying.
+              schema:
+                type: string
+                example: '1'
           content:
             application/json:
               schema:
@@ -6458,7 +6529,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Generation service unavailable (no models configured)
+          description: Service unavailable because request capacity is exhausted or max_loaded_models
+            has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED.
+          headers:
+            Retry-After:
+              description: Present only for capacity or queue exhaustion; recommended delay in seconds
+                before retrying.
+              schema:
+                type: string
+                example: '1'
           content:
             application/json:
               schema:
@@ -6540,7 +6619,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Reader service unavailable (no models configured)
+          description: Service unavailable because request capacity is exhausted or max_loaded_models
+            has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED.
+          headers:
+            Retry-After:
+              description: Present only for capacity or queue exhaustion; recommended delay in seconds
+                before retrying.
+              schema:
+                type: string
+                example: '1'
           content:
             application/json:
               schema:
@@ -6638,7 +6725,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Transcription service unavailable (no models configured)
+          description: Service unavailable because request capacity is exhausted or max_loaded_models
+            has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED.
+          headers:
+            Retry-After:
+              description: Present only for capacity or queue exhaustion; recommended delay in seconds
+                before retrying.
+              schema:
+                type: string
+                example: '1'
           content:
             application/json:
               schema:
@@ -6687,7 +6782,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Extraction service unavailable (no models configured)
+          description: Service unavailable because request capacity is exhausted or max_loaded_models
+            has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED.
+          headers:
+            Retry-After:
+              description: Present only for capacity or queue exhaustion; recommended delay in seconds
+                before retrying.
+              schema:
+                type: string
+                example: '1'
           content:
             application/json:
               schema:
@@ -6829,6 +6932,20 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: Service unavailable because request capacity is exhausted or max_loaded_models
+            has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED.
+          headers:
+            Retry-After:
+              description: Present only for capacity or queue exhaustion; recommended delay in seconds
+                before retrying.
+              schema:
+                type: string
+                example: '1'
           content:
             application/json:
               schema:
@@ -20034,7 +20151,11 @@ components:
       properties:
         error:
           type: string
-          description: Error message
+          description: Stable machine-readable error code when available; legacy responses may contain
+            a human-readable error string.
+        message:
+          type: string
+          description: Optional human-readable detail for the error.
     InferencePredictRequest:
       type: object
       required:
@@ -21004,7 +21125,8 @@ components:
       properties:
         model:
           type: string
-          description: Name of the generator model from models_dir/generators/
+          description: Name of the generator model from models_dir/generators/. Use `<owner>/<repo>:<format>:<quantization>`
+            to select a preloaded artifact variant.
           example: google/gemma-3-1b-it
         messages:
           type: array
@@ -21125,6 +21247,7 @@ components:
             requests without a key are never cached.
         prompt_cache:
           type: boolean
+          x-go-type-skip-optional-pointer: false
           description: >
             inference-native prompt prefix cache control. False bypasses prompt cache for this request.
         backend:
@@ -21454,48 +21577,32 @@ components:
 
         `auto` keeps the node default behavior.
 
-        `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via
+        `pjrt` selects the PJRT backend and requires `pjrt_plugin_path` unless
 
-        `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`,
+        the standard `PJRT_PLUGIN_PATH` environment variable is set.
 
-        `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
+        `webgpu` selects the Wasm/WebGPU backend in Wasm builds. Generation uses
 
-        `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with
+        WebGPU graph partition execution over the Wasm-native base session.
 
-        `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
+        `mode: "compiled"` may be supplied explicitly but is not required.
       enum:
         - auto
         - native
         - onnx
         - metal
         - cuda
-        - xla
+        - pjrt
         - webgpu
-        - wasm
-    InferenceModelFormat:
-      type: string
-      description: Optional artifact format preference for loading a model.
-      enum:
-        - gguf
-        - onnx
-        - safetensors
-        - hybrid
-    InferenceModelQuantization:
-      type: string
-      description: Optional quantization preference for loading a model.
-      enum:
-        - q4_k
-        - q8
-        - fp16
     InferenceBackendPriorityEntry:
       type: string
       description: >
-        Backend priority entry for model loading. Use `backend` or `backend:device`,
+        Backend priority entry for inference. Device policy is expressed by the
 
-        where device defaults to `auto`.
+        backend name itself, so device suffixes are not accepted.
 
 
-        Backends:
+        Backends (depend on build flags):
 
         - `native` - Native CPU backend
 
@@ -21505,21 +21612,37 @@ components:
 
         - `cuda` - NVIDIA CUDA backend
 
-        - `xla` - PJRT/XLA compiled backend
+        - `pjrt` - PJRT compiled graph backend
 
-        - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds
+        - `webgpu` - WebGPU backend for Wasm builds
+      enum:
+        - native
+        - onnx
+        - metal
+        - cuda
+        - pjrt
+        - webgpu
+    InferenceModelFormat:
+      type: string
+      description: Optional artifact family to select when a model directory contains multiple loadable
+        formats.
+      enum:
+        - gguf
+        - onnx
+        - safetensors
+        - hybrid
+    InferenceModelQuantization:
+      type: string
+      minLength: 1
+      description: >
+        Optional exact quantization selector within the chosen artifact family. Matching is
 
+        case-insensitive and treats `-` and `_` equivalently (for example, `q4_k` matches
 
-        Devices:
+        `Q4_K`). The configured model must contain exactly one matching artifact variant.
 
-        - `auto` - Auto-detect best available (default)
-
-        - `cuda` - NVIDIA CUDA GPU
-
-        - `tpu` - Google TPU (used by XLA)
-
-        - `cpu` - Force CPU only
-      pattern: ^(native|onnx|metal|cuda|xla|webgpu|wasm)(:(auto|cuda|tpu|cpu))?$
+        Quantization is not valid with the composite `hybrid` format.
+      example: q4_k
     InferenceModelRef:
       type: object
       description: Model reference used by startup preload and model-loading configuration.
@@ -21531,8 +21654,16 @@ components:
           $ref: '#/components/schemas/InferenceModelKind'
         name:
           type: string
-          description: Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>`
-            format.
+          description: >
+            Model name to resolve within the registry for the selected kind, usually in
+
+            `<owner>/<repo>` format. Model-backed requests can address a preloaded artifact
+
+            explicitly as `<owner>/<repo>:<format>[:<quantization>]`; the selector is not
+
+            part of the registry directory name. A bare model name continues to resolve the
+
+            directory's default artifact, so multiple selected variants can remain resident.
           example: antflydb/gemma-e2b
         backend:
           $ref: '#/components/schemas/InferenceModelBackend'
@@ -21586,8 +21717,6 @@ components:
           default: 300000
     InferenceConfig:
       type: object
-      required:
-        - api_url
       properties:
         api_url:
           type: string
@@ -21636,37 +21765,52 @@ components:
         keep_alive:
           type: string
           description: >
-            How long to keep models loaded in memory after last use (Ollama-compatible).
+            Idle-eviction policy for loaded models (Ollama-compatible). Runtimes that
 
-            Models are automatically unloaded after this duration of inactivity.
+            support idle eviction may unload a model after this duration of inactivity.
 
-            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading).
+            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
 
-            Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading
+            Defaults to "5m". Set to "0" to keep loaded models resident without idle
 
-            where all models are loaded at startup and never unloaded.
+            eviction. For compatibility, some runtimes also eagerly load discovered
+
+            models in this mode. Use `preload` when startup loading must be deterministic.
           default: 5m
           example: 5m
         max_loaded_models:
           type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
           description: >
-            Maximum total models loaded across all registry types (embedders, rerankers,
+            Maximum steady-state number of resident logical model instances. Manager-cached
 
-            generators, chunkers, etc.). When the limit is reached, the least-recently-used
+            models and request-scoped specialized or composite pipelines share this budget.
 
-            idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
-          default: 0
+            A composite pipeline counts as one logical model even when it owns multiple backend
+
+            sessions. At capacity, one replacement may initialize while an idle cached model
+
+            remains available; successful activation evicts that model. If no idle model is
+
+            available, the request receives 503 Service Unavailable. Set to 0 for unlimited.
+          default: 10
           example: 3
         pool_size:
           type: integer
+          minimum: 1
           description: >
-            Number of concurrent inference pipelines per model. Each pipeline loads
+            Number of reusable inference execution slots per model. Some runtimes realize
 
-            a copy of the model, so higher values use more memory but allow more
+            each slot as a complete pipeline, increasing both possible concurrency and
 
-            concurrent requests. Note: pool_size multiplies per-model memory
+            per-model memory; others pool lightweight backend providers, so memory and
 
-            independently of max_loaded_models.
+            throughput effects are backend-dependent. Generation and backends with shared
+
+            runtime state may remain serialized even when this is greater than one. Model
+
+            residency is controlled separately by `max_loaded_models`.
           default: 1
           example: 1
         prompt_cache:
@@ -21677,60 +21821,57 @@ components:
           items:
             $ref: '#/components/schemas/InferenceBackendPriorityEntry'
           description: >
-            Backend priority order for model loading with optional device specifiers.
+            Explicit backend order for inference. Antfly tries entries in order and uses the first
 
-            Format: `backend` or `backend:device` where device defaults to `auto`.
+            backend supported by both the build and the operation. Direct model loading skips
+
+            compiled-only `pjrt` entries and continues to the next backend, while generation uses
+
+            PJRT for compiled graph partitions when it is the first available entry. An empty list
+
+            is invalid. A single entry is a strict backend requirement and causes startup to fail
+
+            when that backend is unavailable or cannot directly load a model session.
 
 
-            Antfly inference tries entries in order and uses the first available backend+device
+            **Backends** (depend on build flags):
 
-            combination that supports the model.
+            - `native` - Native CPU backend
 
+            - `onnx` - ONNX Runtime backend
 
-            **Examples**:
+            - `metal` - Apple Metal backend
 
-            - `["native", "onnx", "xla"]` - Try backends with auto device detection
+            - `cuda` - NVIDIA CUDA backend
 
-            - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
-          default:
-            - native
-            - onnx
-            - xla
+            - `pjrt` - PJRT compiled graph backend
+
+            - `webgpu` - WebGPU backend for Wasm builds
           example:
-            - cuda
-            - onnx:cuda
-            - xla:tpu
+            - pjrt
             - native
+        pjrt_plugin_path:
+          type: string
+          minLength: 1
+          description: >
+            Filesystem path to the PJRT C API plugin used for compiled generation.
+
+            This is the preferred production configuration. `PJRT_PLUGIN_PATH` is
+
+            accepted as a process-level fallback when this field is unset.
+          example: /usr/local/lib/libtpu.so
         max_concurrent_requests:
           type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
           description: >
-            Maximum number of concurrent inference requests allowed.
+            Maximum weighted inference work admitted concurrently by the Zig runtime.
 
-            Additional requests will be queued up to max_queue_size.
+            Requests beyond the limit receive 503 Service Unavailable with Retry-After;
 
-            Set to 0 for unlimited (default).
-          default: 0
+            they are not held in an in-process wait queue. Set to 0 for unlimited.
+          default: 32
           example: 4
-        max_queue_size:
-          type: integer
-          description: >
-            Maximum number of requests to queue when max_concurrent_requests is reached.
-
-            When the queue is full, new requests receive 503 Service Unavailable with Retry-After header.
-
-            Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
-          default: 0
-          example: 100
-        request_timeout:
-          type: string
-          description: >
-            Maximum time to wait for a request to complete, including queue wait time.
-
-            Use Go duration format: "30s", "1m", "0" (no timeout, default).
-
-            Requests exceeding this timeout receive 504 Gateway Timeout.
-          default: '0'
-          example: 30s
         preload:
           type: array
           description: >
@@ -21740,58 +21881,15 @@ components:
 
             budgeted path as request-time generation. Other model kinds use the
 
-            best available warm path for that kind.
+            best available warm path for that kind. Specialized request-scoped pipelines
+
+            are capacity-bounded but may still initialize on their first request.
           items:
             $ref: '#/components/schemas/InferenceModelRef'
           example:
             - kind: generator
               name: antflydb/gemma-e2b
               backend: metal
-              format: gguf
-              quantization: q4_k
-        max_memory_mb:
-          type: integer
-          description: >
-            Maximum memory (in MB) to use for loaded models.
-
-            When this limit is approached, least recently used models are unloaded.
-
-            Set to 0 for unlimited (default). This is an advisory limit - actual memory
-
-            usage depends on model sizes and may temporarily exceed this value.
-
-            Works alongside max_loaded_models for fine-grained control.
-          default: 0
-          example: 4096
-        model_strategies:
-          type: object
-          additionalProperties:
-            type: string
-            enum:
-              - eager
-              - lazy
-              - bounded
-          description: >
-            Per-model loading strategy overrides. Maps model names to their loading strategy.
-
-            Models not in this map use the default strategy based on keep_alive:
-
-            - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle)
-
-            - If keep_alive="0": eager loading (load at startup, never unload)
-
-
-            When a model has strategy "eager" in this map:
-
-            - It is loaded at startup through the same startup warmup path
-
-            - It is never unloaded, even when keep_alive>0 (pinned in memory)
-
-
-            This allows mixing eager and lazy models in the same pool.
-          example:
-            BAAI/bge-small-en-v1.5: eager
-            mirth/chonky-mmbert-small-multilingual-1: lazy
         allow_downloads:
           type: boolean
           description: >
@@ -21824,13 +21922,13 @@ components:
           type: boolean
           description: Whether the CUDA backend is built into this runtime
           example: false
-        xla:
+        pjrt:
           type: boolean
           description: Whether the PJRT/XLA backend is built into this runtime
           example: false
-        wasm:
+        webgpu:
           type: boolean
-          description: Whether the WASM backend is built into this runtime
+          description: Whether the WebGPU backend is built into this runtime
           example: false
     InferenceTextContent:
       type: object

@@ -924,6 +924,12 @@ pub const WasmCompute = struct {
         };
     }
 
+    pub fn initNative(allocator: std.mem.Allocator) WasmCompute {
+        var compute = init(allocator);
+        compute.use_gpu = false;
+        return compute;
+    }
+
     pub fn registerWeight(self: *WasmCompute, name: []const u8, data: []f32) void {
         const buf = WasmBuf.fromSlice(self.allocator, data, false);
         if (build_options.enable_webgpu and self.use_gpu) {

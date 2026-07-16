@@ -296,6 +296,7 @@ from .index_status import IndexStatus
 from .index_status_shard_status import IndexStatusShardStatus
 from .index_type import IndexType
 from .inference_audio_chunk_config import InferenceAudioChunkConfig
+from .inference_backend_priority_entry import InferenceBackendPriorityEntry
 from .inference_backend_runtimes import InferenceBackendRuntimes
 from .inference_binary_content import InferenceBinaryContent
 from .inference_chat_message import InferenceChatMessage
@@ -307,8 +308,6 @@ from .inference_chunk_request import InferenceChunkRequest
 from .inference_chunk_response import InferenceChunkResponse
 from .inference_chunk_response_object import InferenceChunkResponseObject
 from .inference_config import InferenceConfig
-from .inference_config_model_strategies import InferenceConfigModelStrategies
-from .inference_config_model_strategies_additional_property import InferenceConfigModelStrategiesAdditionalProperty
 from .inference_connection import InferenceConnection
 from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
@@ -366,7 +365,6 @@ from .inference_model_backend import InferenceModelBackend
 from .inference_model_format import InferenceModelFormat
 from .inference_model_info import InferenceModelInfo
 from .inference_model_kind import InferenceModelKind
-from .inference_model_quantization import InferenceModelQuantization
 from .inference_model_ref import InferenceModelRef
 from .inference_models_response import InferenceModelsResponse
 from .inference_models_response_chunkers import InferenceModelsResponseChunkers
@@ -974,6 +972,7 @@ __all__ = (
     "IndexStatusShardStatus",
     "IndexType",
     "InferenceAudioChunkConfig",
+    "InferenceBackendPriorityEntry",
     "InferenceBackendRuntimes",
     "InferenceBinaryContent",
     "InferenceChatMessage",
@@ -985,8 +984,6 @@ __all__ = (
     "InferenceChunkResponse",
     "InferenceChunkResponseObject",
     "InferenceConfig",
-    "InferenceConfigModelStrategies",
-    "InferenceConfigModelStrategiesAdditionalProperty",
     "InferenceConnection",
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
@@ -1044,7 +1041,6 @@ __all__ = (
     "InferenceModelFormat",
     "InferenceModelInfo",
     "InferenceModelKind",
-    "InferenceModelQuantization",
     "InferenceModelRef",
     "InferenceModelsResponse",
     "InferenceModelsResponseChunkers",

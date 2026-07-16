@@ -1342,18 +1342,21 @@ pub fn decoderRuntimeEmbeddingLookup(self: anytype, request: anytype) !?MetalTen
     }
 
     const shape = [_]i32{ @intCast(request.total), @intCast(request.dim) };
+    const cache_key: ?usize = if (@hasField(@TypeOf(request), "cache_key")) request.cache_key else null;
     if (request.weight.isDevice()) {
-        const rc = termite_metal_decode_runtime_prepare_embedding_table_device(
-            runtime,
-            request.weight.deviceHandle(),
-            request.weight.deviceByteOffset(),
-            rows,
-            request.dim,
-        );
-        if (rc == 0) {
-            var output = try MetalTensor.deviceAllocate(runtime, request.total * request.dim * @sizeOf(f32), .private, &shape);
-            errdefer output.deinit();
-            const device_rc = termite_metal_decode_runtime_embedding_lookup_prepared_device(
+        var output = try MetalTensor.deviceAllocate(runtime, request.total * request.dim * @sizeOf(f32), .private, &shape);
+        errdefer output.deinit();
+        const device_rc = if (cache_key) |key| keyed: {
+            const prep_rc = termite_metal_decode_runtime_prepare_embedding_table_device_keyed(
+                runtime,
+                request.weight.deviceHandle(),
+                request.weight.deviceByteOffset(),
+                key,
+                rows,
+                request.dim,
+            );
+            if (prep_rc != 0) break :keyed prep_rc;
+            break :keyed termite_metal_decode_runtime_embedding_lookup_prepared_device(
                 runtime,
                 ids_u32.ptr,
                 request.total,
@@ -1361,17 +1364,23 @@ pub fn decoderRuntimeEmbeddingLookup(self: anytype, request: anytype) !?MetalTen
                 output.deviceHandle(),
                 output.deviceByteOffset(),
             );
-            if (device_rc == 0) return output;
-            output.deinit();
-        }
-    } else {
-        var weight = request.weight;
-        const prep_rc = termite_metal_decode_runtime_prepare_embedding_table(
+        } else termite_metal_decode_runtime_embedding_lookup_direct_device(
             runtime,
-            try tensorHostConstPtr(&weight),
+            request.weight.deviceHandle(),
+            request.weight.deviceByteOffset(),
             rows,
+            ids_u32.ptr,
+            request.total,
             request.dim,
+            output.deviceHandle(),
+            output.deviceByteOffset(),
         );
+        if (device_rc == 0) return output;
+        output.deinit();
+    } else if (cache_key) |key| {
+        var weight = request.weight;
+        const weight_ptr = try tensorHostConstPtr(&weight);
+        const prep_rc = termite_metal_decode_runtime_prepare_embedding_table_keyed(runtime, weight_ptr, key, rows, request.dim);
         if (prep_rc == 0) {
             var output = try MetalTensor.deviceAllocate(runtime, request.total * request.dim * @sizeOf(f32), .private, &shape);
             errdefer output.deinit();
@@ -1402,6 +1411,17 @@ pub fn decoderRuntimeEmbeddingLookup(self: anytype, request: anytype) !?MetalTen
     );
     if (rc != 0) return null;
     return MetalTensor.owned(output, &shape);
+}
+
+pub fn decoderRuntimeEmbeddingCacheContains(
+    self: anytype,
+    cache_key: usize,
+    rows: usize,
+    dim: usize,
+    bytes: usize,
+) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    return termite_metal_decode_runtime_embedding_cache_contains(runtime, cache_key, rows, dim, bytes) != 0;
 }
 
 pub fn decoderRuntimeDebertaEmbeddingsF32Device(self: anytype, request: anytype) !?MetalTensor {
@@ -6348,6 +6368,10 @@ pub const RawRuntimeMemoryStats = extern struct {
     managed_bytes: u64 = 0,
     embedding_logical_bytes: u64 = 0,
     embedding_bytes: u64 = 0,
+    embedding_cache_hits: u64 = 0,
+    embedding_cache_misses: u64 = 0,
+    embedding_cache_evictions: u64 = 0,
+    embedding_cache_bypasses: u64 = 0,
     norm_bytes: u64 = 0,
     dense_linear_bytes: u64 = 0,
     dense_linear_buffer_count: u64 = 0,
@@ -6472,6 +6496,13 @@ pub const RawRuntimeMemoryStats = extern struct {
     rms_norm_add_sumsq: u64 = 0,
 };
 
+pub const EmbeddingCacheProcessStats = extern struct {
+    hits_total: u64 = 0,
+    misses_total: u64 = 0,
+    evictions_total: u64 = 0,
+    bypasses_total: u64 = 0,
+};
+
 pub extern fn termite_metal_device_available() c_int;
 
 fn sleepMetalProbeRetry() void {
@@ -6525,6 +6556,7 @@ pub extern fn termite_metal_decode_runtime_memory_snapshot(
     runtime: ?*RawMetalDecodeRuntime,
     snapshot: *RawRuntimeMemoryStats,
 ) c_int;
+pub extern fn termite_metal_embedding_cache_process_snapshot(snapshot: *EmbeddingCacheProcessStats) c_int;
 pub extern fn termite_metal_decode_runtime_begin_graph_plan(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_reserve_graph_plan_slot(
     runtime: ?*RawMetalDecodeRuntime,
@@ -7132,6 +7164,12 @@ pub fn runtimeMemorySnapshot(runtime: ?*RawMetalDecodeRuntime) RawRuntimeMemoryS
     return snapshot;
 }
 
+pub fn embeddingCacheProcessStats() EmbeddingCacheProcessStats {
+    var snapshot: EmbeddingCacheProcessStats = .{};
+    _ = termite_metal_embedding_cache_process_snapshot(&snapshot);
+    return snapshot;
+}
+
 pub extern fn termite_metal_decode_runtime_prepare_decoder_only_greedy(
     runtime: ?*RawMetalDecodeRuntime,
     hidden_size: usize,
@@ -7196,6 +7234,20 @@ pub extern fn termite_metal_decode_runtime_prepare_embedding_table(
     rows: usize,
     dim: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_prepare_embedding_table_keyed(
+    runtime: ?*RawMetalDecodeRuntime,
+    weight: [*c]const f32,
+    source_id: usize,
+    rows: usize,
+    dim: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_embedding_cache_contains(
+    runtime: ?*RawMetalDecodeRuntime,
+    source_id: usize,
+    rows: usize,
+    dim: usize,
+    bytes: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_prepare_embedding_table_bf16(
     runtime: ?*RawMetalDecodeRuntime,
     weight: [*c]const u8,
@@ -7223,10 +7275,11 @@ pub extern fn termite_metal_decode_runtime_embedding_lookup_bf16_staged_rows_dev
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
-pub extern fn termite_metal_decode_runtime_prepare_embedding_table_device(
+pub extern fn termite_metal_decode_runtime_prepare_embedding_table_device_keyed(
     runtime: ?*RawMetalDecodeRuntime,
     src_handle: ?*anyopaque,
     src_offset: usize,
+    source_id: usize,
     rows: usize,
     dim: usize,
 ) c_int;
@@ -25815,30 +25868,54 @@ test "metal native decoder runtime embedding lookup" {
     var provider = try metal_native_provider.MetalNativeProvider.create();
     defer provider.deinitOwned();
     if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
 
-    const weight_data = [_]f32{
+    var weight_data = [_]f32{
         1.0, 2.0,  3.0,  4.0,
         5.0, 6.0,  7.0,  8.0,
         9.0, 10.0, 11.0, 12.0,
     };
-    var weight = try MetalTensor.ownedCloneFrom(&weight_data, &[_]i32{ 3, 4 });
+    var weight = MetalTensor.borrowed(weight_data[0..].ptr, weight_data.len, &[_]i32{ 3, 4 });
     defer weight.deinit();
+    const stats_before = runtimeMemorySnapshot(runtime);
 
-    var looked_up = (try decoderRuntimeEmbeddingLookup(&provider, .{
-        .weight = weight,
-        .ids = &[_]i64{ 2, 0 },
-        .total = 2,
-        .dim = 4,
-    })) orelse return error.UnexpectedNull;
-    defer looked_up.deinit();
+    {
+        var looked_up = (try decoderRuntimeEmbeddingLookup(&provider, .{
+            .weight = weight,
+            .ids = &[_]i64{ 2, 0 },
+            .total = 2,
+            .dim = 4,
+        })) orelse return error.UnexpectedNull;
+        defer looked_up.deinit();
 
-    var looked_up_mut = looked_up;
-    const out = try tensorHostSlice(&looked_up_mut);
-    try std.testing.expectEqual(@as(usize, 8), out.len);
-    try std.testing.expectEqualSlices(f32, &[_]f32{
-        9.0, 10.0, 11.0, 12.0,
-        1.0, 2.0,  3.0,  4.0,
-    }, out);
+        var looked_up_mut = looked_up;
+        const out = try tensorHostSlice(&looked_up_mut);
+        try std.testing.expectEqual(@as(usize, 8), out.len);
+        try std.testing.expectEqualSlices(f32, &[_]f32{
+            9.0, 10.0, 11.0, 12.0,
+            1.0, 2.0,  3.0,  4.0,
+        }, out);
+    }
+
+    @memcpy(weight_data[8..12], &[_]f32{ 90.0, 100.0, 110.0, 120.0 });
+    {
+        var looked_up = (try decoderRuntimeEmbeddingLookup(&provider, .{
+            .weight = weight,
+            .ids = &[_]i64{2},
+            .total = 1,
+            .dim = 4,
+        })) orelse return error.UnexpectedNull;
+        defer looked_up.deinit();
+
+        var looked_up_mut = looked_up;
+        const out = try tensorHostSlice(&looked_up_mut);
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 90.0, 100.0, 110.0, 120.0 }, out);
+    }
+    const stats_after = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(stats_before.embedding_bytes, stats_after.embedding_bytes);
+    try std.testing.expectEqual(stats_before.embedding_cache_hits, stats_after.embedding_cache_hits);
+    try std.testing.expectEqual(stats_before.embedding_cache_misses, stats_after.embedding_cache_misses);
+    try std.testing.expectEqual(stats_before.embedding_cache_bypasses + 2, stats_after.embedding_cache_bypasses);
 }
 
 test "metal native decoder runtime bf16 embedding lookup from mmap region" {
@@ -26061,22 +26138,93 @@ test "metal native decoder runtime embedding lookup from device weight" {
     };
     var weight = try testDeviceTensorFromSlice(runtime, &weight_data, &[_]i32{ 3, 4 });
     defer weight.deinit();
+    const stats_before = runtimeMemorySnapshot(runtime);
 
-    var looked_up = (try decoderRuntimeEmbeddingLookup(&provider, .{
-        .weight = weight,
-        .ids = &[_]i64{ 1, 2 },
-        .total = 2,
-        .dim = 4,
-    })) orelse return error.UnexpectedNull;
-    defer looked_up.deinit();
+    {
+        var looked_up = (try decoderRuntimeEmbeddingLookup(&provider, .{
+            .weight = weight,
+            .ids = &[_]i64{ 1, 2 },
+            .total = 2,
+            .dim = 4,
+        })) orelse return error.UnexpectedNull;
+        defer looked_up.deinit();
 
-    try std.testing.expect(looked_up.isDevice());
-    var looked_up_mut = looked_up;
-    const out = try tensorHostSlice(&looked_up_mut);
-    try std.testing.expectEqualSlices(f32, &[_]f32{
-        5.0, 6.0,  7.0,  8.0,
-        9.0, 10.0, 11.0, 12.0,
-    }, out);
+        try std.testing.expect(looked_up.isDevice());
+        var looked_up_mut = looked_up;
+        const out = try tensorHostSlice(&looked_up_mut);
+        try std.testing.expectEqualSlices(f32, &[_]f32{
+            5.0, 6.0,  7.0,  8.0,
+            9.0, 10.0, 11.0, 12.0,
+        }, out);
+    }
+
+    const updated_weight_data = [_]f32{
+        1.0,  2.0,  3.0,  4.0,
+        50.0, 60.0, 70.0, 80.0,
+        9.0,  10.0, 11.0, 12.0,
+    };
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_upload(
+        runtime,
+        weight.deviceHandle(),
+        weight.deviceByteOffset(),
+        @ptrCast(updated_weight_data[0..].ptr),
+        @sizeOf(@TypeOf(updated_weight_data)),
+    ));
+    {
+        var looked_up = (try decoderRuntimeEmbeddingLookup(&provider, .{
+            .weight = weight,
+            .ids = &[_]i64{1},
+            .total = 1,
+            .dim = 4,
+        })) orelse return error.UnexpectedNull;
+        defer looked_up.deinit();
+
+        var looked_up_mut = looked_up;
+        const out = try tensorHostSlice(&looked_up_mut);
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 50.0, 60.0, 70.0, 80.0 }, out);
+    }
+    const uncached_stats = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(stats_before.embedding_bytes, uncached_stats.embedding_bytes);
+    try std.testing.expectEqual(stats_before.embedding_cache_bypasses + 2, uncached_stats.embedding_cache_bypasses);
+
+    const cache_key: usize = 0x656d62656464696e;
+    {
+        var looked_up = (try decoderRuntimeEmbeddingLookup(&provider, .{
+            .weight = weight,
+            .ids = &[_]i64{1},
+            .total = 1,
+            .dim = 4,
+            .cache_key = cache_key,
+        })) orelse return error.UnexpectedNull;
+        defer looked_up.deinit();
+
+        var looked_up_mut = looked_up;
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 50.0, 60.0, 70.0, 80.0 }, try tensorHostSlice(&looked_up_mut));
+    }
+    const keyed_cache_bytes = runtimeMemorySnapshot(runtime).embedding_bytes;
+    const first_keyed_stats = runtimeMemorySnapshot(runtime);
+    try std.testing.expect(keyed_cache_bytes > stats_before.embedding_bytes);
+    try std.testing.expectEqual(uncached_stats.embedding_cache_misses + 1, first_keyed_stats.embedding_cache_misses);
+
+    var same_logical_weight = try testDeviceTensorFromSlice(runtime, &updated_weight_data, &[_]i32{ 3, 4 });
+    defer same_logical_weight.deinit();
+    try std.testing.expect(weight.deviceHandle() != same_logical_weight.deviceHandle());
+    {
+        var looked_up = (try decoderRuntimeEmbeddingLookup(&provider, .{
+            .weight = same_logical_weight,
+            .ids = &[_]i64{1},
+            .total = 1,
+            .dim = 4,
+            .cache_key = cache_key,
+        })) orelse return error.UnexpectedNull;
+        defer looked_up.deinit();
+
+        var looked_up_mut = looked_up;
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 50.0, 60.0, 70.0, 80.0 }, try tensorHostSlice(&looked_up_mut));
+    }
+    const reused_stats = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(keyed_cache_bytes, reused_stats.embedding_bytes);
+    try std.testing.expectEqual(first_keyed_stats.embedding_cache_hits + 1, reused_stats.embedding_cache_hits);
 }
 
 test "metal native decoder runtime attention device bias mask matches host" {

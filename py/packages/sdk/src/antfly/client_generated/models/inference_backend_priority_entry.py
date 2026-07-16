@@ -1,8 +1,7 @@
 from enum import Enum
 
 
-class InferenceModelBackend(str, Enum):
-    AUTO = "auto"
+class InferenceBackendPriorityEntry(str, Enum):
     CUDA = "cuda"
     METAL = "metal"
     NATIVE = "native"

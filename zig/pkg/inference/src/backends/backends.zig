@@ -41,16 +41,16 @@ pub const BackendType = enum {
     metal,
     cuda,
     pjrt,
-    wasm,
+    webgpu,
 
     pub fn available(self: BackendType) bool {
         return switch (self) {
-            .native => build_options.enable_native,
+            .native => build_options.enable_native or build_options.enable_wasm,
             .onnx => build_options.enable_onnx,
             .metal => build_options.enable_metal,
             .cuda => build_options.enable_cuda,
             .pjrt => build_options.enable_pjrt,
-            .wasm => build_options.enable_wasm,
+            .webgpu => build_options.enable_wasm and build_options.enable_webgpu,
         };
     }
 
@@ -60,7 +60,7 @@ pub const BackendType = enum {
             .metal => 15,
             .cuda => 25,
             .pjrt => 35,
-            .wasm => 50,
+            .webgpu => 50,
             .native => 100,
         };
     }
@@ -75,11 +75,60 @@ pub const BackendType = enum {
     /// Whether SessionManager.loadModel can create a Session directly for this backend.
     pub fn supportsDirectSessionLoad(self: BackendType) bool {
         return switch (self) {
-            .native, .onnx, .metal, .cuda, .wasm => true,
+            .native, .onnx, .metal, .cuda, .webgpu => true,
             .pjrt => false,
         };
     }
 };
+
+/// Only infrastructure failures and explicit backend/model incompatibility
+/// permit priority fallback. Unknown errors are terminal by default so corrupt
+/// artifacts cannot be hidden by a lower-priority implementation.
+pub fn isRetryableBackendLoadError(backend: BackendType, err: anyerror) bool {
+    switch (err) {
+        error.BackendUnavailable,
+        error.ConfiguredBackendUnavailable,
+        error.NoBackendAvailable,
+        error.UnsupportedArchitecture,
+        error.UnsupportedCudaArchitecture,
+        error.UnsupportedOnnxGraphBackend,
+        error.UnsupportedCompiledGraphRuntime,
+        error.UnsupportedResidentInputBackend,
+        error.UnsupportedDType,
+        error.UnsupportedTensorDType,
+        error.UnsupportedShape,
+        error.OnnxNotSupportedHere,
+        error.WasmNotSupportedHere,
+        => return true,
+        else => {},
+    }
+    return switch (backend) {
+        .onnx => switch (err) {
+            error.OrtEnvCreationFailed,
+            error.OrtSessionOptionsFailed,
+            error.OnnxSessionInitializationFailed,
+            => true,
+            else => false,
+        },
+        .metal => switch (err) {
+            error.MetalNotEnabled,
+            error.MetalDeviceUnavailable,
+            => true,
+            else => false,
+        },
+        .cuda => switch (err) {
+            error.CudaNotEnabled,
+            error.CudaDriverError,
+            error.CudaSymbolMissing,
+            error.NoCudaDevices,
+            => true,
+            else => false,
+        },
+        .webgpu => err == error.WebGpuUnavailable,
+        .native => err == error.NativeNotEnabled,
+        .pjrt => false,
+    };
+}
 
 const backend_order_capacity = std.meta.fields(BackendType).len;
 
@@ -87,7 +136,14 @@ const backend_order_capacity = std.meta.fields(BackendType).len;
 pub const SessionManager = struct {
     allocator: std.mem.Allocator,
     preferred_backends: []const BackendType,
+    /// Automatic defaults may apply model-aware placement heuristics. A
+    /// configured or request-scoped order is an operator contract and must be
+    /// tried exactly as written.
+    preserve_backend_order: bool = false,
     graph_runtime_strategy: ?graph_runtime_mod.Strategy = null,
+    /// Maximum overlapping compute backends per model session. Metal uses
+    /// this to bound its warm provider pool and backpressure excess work.
+    pool_size: usize = 1,
     /// Optional Io runtime threaded into compute backends so parallel GEMM
     /// dispatch goes through the caller's thread pool (linalg.sgemm*Io).
     /// Null means backends use the process-wide futex pool inside lib/linalg.
@@ -108,6 +164,21 @@ pub const SessionManager = struct {
         };
     }
 
+    pub fn initWithBackendPriority(
+        allocator: std.mem.Allocator,
+        backend_priority: ?[]const BackendType,
+    ) SessionManager {
+        return .{
+            .allocator = allocator,
+            .preferred_backends = backend_priority orelse configuredPreferredBackends(),
+            .preserve_backend_order = backend_priority != null,
+        };
+    }
+
+    pub fn setPoolSize(self: *SessionManager, pool_size: usize) void {
+        self.pool_size = @max(pool_size, 1);
+    }
+
     pub fn loadModel(self: *SessionManager, model_path: []const u8) !Session {
         return self.loadModelWithImportedOnnxContext(model_path, null);
     }
@@ -120,7 +191,10 @@ pub const SessionManager = struct {
         var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch null;
         defer if (manifest) |*m| m.deinit();
         var effective_buf: [backend_order_capacity]BackendType = undefined;
-        const effective_backends = effectiveBackendOrder(self.allocator, &effective_buf, self.preferred_backends, if (manifest) |m| m else null);
+        const effective_backends = if (self.preserve_backend_order)
+            self.preferred_backends
+        else
+            effectiveBackendOrder(self.allocator, &effective_buf, self.preferred_backends, if (manifest) |m| m else null);
 
         for (effective_backends) |backend| {
             if (!backend.available()) continue;
@@ -133,7 +207,11 @@ pub const SessionManager = struct {
             }
             std.log.info("trying backend {s} for {s}", .{ @tagName(backend), model_path });
             const effective_model_path = switch (backend) {
-                .onnx, .wasm => if (manifest) |m| m.onnx_path orelse model_path else model_path,
+                .onnx, .webgpu => if (manifest) |m| m.onnx_path orelse model_path else model_path,
+                .native => if (build_options.enable_wasm)
+                    if (manifest) |m| m.onnx_path orelse model_path else model_path
+                else
+                    model_path,
                 else => model_path,
             };
 
@@ -142,47 +220,61 @@ pub const SessionManager = struct {
                     if (!isOnnxFilePath(effective_model_path)) continue;
                     break :blk onnx.createSession(self.allocator, effective_model_path) catch |err| {
                         std.log.err("onnx runtime session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
-                        continue;
+                        if (isRetryableBackendLoadError(backend, err)) continue;
+                        return err;
                     };
                 } else continue,
                 .metal => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .metal, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx metal session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
-                        continue;
+                        if (isRetryableBackendLoadError(backend, err)) continue;
+                        return err;
                     }
                 else if (build_options.enable_metal)
                     session_factory.createMetalSession(self.allocator, model_path) catch |err| {
                         std.log.err("Metal session create failed for {s}: {s}", .{ model_path, @errorName(err) });
-                        continue;
+                        if (isRetryableBackendLoadError(backend, err)) continue;
+                        return err;
                     }
                 else
                     continue,
                 .cuda => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .cuda, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx CUDA session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
-                        continue;
+                        if (isRetryableBackendLoadError(backend, err)) continue;
+                        return err;
                     }
                 else if (build_options.enable_cuda)
                     session_factory.createCudaSession(self.allocator, model_path) catch |err| {
                         std.log.err("CUDA session create failed for {s}: {s}", .{ model_path, @errorName(err) });
-                        continue;
+                        if (isRetryableBackendLoadError(backend, err)) continue;
+                        return err;
                     }
                 else
                     continue,
-                .native => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
+                .native => if (build_options.enable_wasm and self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
+                    self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx) catch |err| {
+                        std.log.err("imported ONNX native Wasm session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
+                        if (isRetryableBackendLoadError(backend, err)) continue;
+                        return err;
+                    }
+                else if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx native session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
-                        continue;
+                        if (isRetryableBackendLoadError(backend, err)) continue;
+                        return err;
                     }
                 else
                     session_factory.createNativeSession(self.allocator, model_path) catch |err| {
                         std.log.err("native session create failed for {s}: {s}", .{ model_path, @errorName(err) });
-                        continue;
+                        if (isRetryableBackendLoadError(backend, err)) continue;
+                        return err;
                     },
-                .wasm => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
-                    self.createImportedOnnxSession(effective_model_path, .wasm, shared_backend_ctx) catch |err| {
+                .webgpu => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
+                    self.createImportedOnnxSession(effective_model_path, .webgpu, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx wasm session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
-                        continue;
+                        if (isRetryableBackendLoadError(backend, err)) continue;
+                        return err;
                     }
                 else
                     continue,
@@ -193,6 +285,7 @@ pub const SessionManager = struct {
             // received options.io), attach the SessionManager's Io now so
             // matmul work composes with the caller's runtime.  attachIo
             // is a no-op on Sessions whose vtable isn't arch_vtable.
+            session_factory.attachMetalProviderPoolSize(session, self.pool_size);
             if (self.io) |io_handle| session_factory.attachIo(session, io_handle);
             // Same lifecycle for graph-runtime strategy: today only the
             // gliner branch consults it (other architectures don't have
@@ -239,11 +332,22 @@ pub const SessionManager = struct {
 };
 
 fn configuredPreferredBackends() []const BackendType {
-    if (build_options.enable_wasm) return &.{.wasm};
+    if (build_options.enable_wasm) return if (build_options.enable_webgpu) &.{ .webgpu, .native } else &.{.native};
     if (preferredBackendOverride()) |backend| {
         return preferredBackendsForOverride(backend);
     }
     return &.{ .metal, .native };
+}
+
+/// Validate an explicit backend order before serving. At least one configured
+/// backend must be usable by this build; a single-entry list therefore acts as
+/// a strict backend requirement without relying on process environment.
+pub fn validateBackendPriority(order: []const BackendType) !void {
+    if (order.len == 0) return error.InvalidBackendPriority;
+    for (order) |backend| {
+        if (backend.available() and backend.supportsDirectSessionLoad()) return;
+    }
+    return error.ConfiguredBackendUnavailable;
 }
 
 fn preferredBackendsForOverride(backend: BackendType) []const BackendType {
@@ -253,12 +357,12 @@ fn preferredBackendsForOverride(backend: BackendType) []const BackendType {
         .cuda => if (build_options.enable_cuda) &.{ .cuda, .onnx, .metal, .native } else &.{ .native, .onnx, .metal },
         .pjrt => if (build_options.enable_pjrt) &.{ .pjrt, .onnx, .metal, .native } else &.{ .onnx, .metal, .native },
         .native => &.{ .native, .onnx, .metal },
-        .wasm => &.{ .onnx, .metal, .native },
+        .webgpu => if (build_options.enable_wasm) &.{ .webgpu, .native } else &.{ .onnx, .metal, .native },
     };
 }
 
 fn defaultImportedOnnxBackend() BackendType {
-    return if (build_options.enable_wasm) .wasm else .native;
+    return .native;
 }
 
 fn isOnnxFilePath(path: []const u8) bool {
@@ -274,9 +378,8 @@ test "onnx backend availability follows linked onnx runtime" {
     try std.testing.expectEqual(build_options.enable_onnx, BackendType.onnx.available());
     try std.testing.expect(BackendType.onnx.supportsDirectSessionLoad());
     if (build_options.enable_wasm) {
-        try std.testing.expectEqual(BackendType.wasm, configuredPreferredBackends()[0]);
-        try std.testing.expectEqual(BackendType.wasm, defaultImportedOnnxBackend());
-        try std.testing.expect(BackendType.wasm.supportsDirectSessionLoad());
+        try std.testing.expectEqual(if (build_options.enable_webgpu) BackendType.webgpu else BackendType.native, configuredPreferredBackends()[0]);
+        try std.testing.expect(BackendType.native.available());
     } else {
         try std.testing.expectEqual(BackendType.native, defaultImportedOnnxBackend());
     }
@@ -285,6 +388,43 @@ test "onnx backend availability follows linked onnx runtime" {
 test "preferred backend override keeps fallback backends" {
     try std.testing.expectEqualSlices(BackendType, &.{ .onnx, .metal, .native }, preferredBackendsForOverride(.onnx));
     try std.testing.expectEqualSlices(BackendType, &.{ .native, .onnx, .metal }, preferredBackendsForOverride(.native));
+}
+
+test "configured backend priority validates available fallbacks" {
+    try std.testing.expectError(error.InvalidBackendPriority, validateBackendPriority(&.{}));
+    if (build_options.enable_cuda)
+        try validateBackendPriority(&.{.cuda})
+    else
+        try std.testing.expectError(error.ConfiguredBackendUnavailable, validateBackendPriority(&.{.cuda}));
+    try std.testing.expectError(error.ConfiguredBackendUnavailable, validateBackendPriority(&.{.pjrt}));
+    if (build_options.enable_native) try validateBackendPriority(&.{ .pjrt, .native });
+}
+
+test "backend load fallback never masks corrupt artifacts" {
+    try std.testing.expect(!isRetryableBackendLoadError(.onnx, error.InvalidOnnxModel));
+    try std.testing.expect(!isRetryableBackendLoadError(.native, error.MissingRequiredWeights));
+    try std.testing.expect(isRetryableBackendLoadError(.onnx, error.OnnxSessionInitializationFailed));
+    try std.testing.expect(isRetryableBackendLoadError(.cuda, error.NoCudaDevices));
+    try std.testing.expect(isRetryableBackendLoadError(.metal, error.UnsupportedArchitecture));
+}
+
+test "session manager normalizes provider pool size" {
+    var manager = SessionManager.init(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), manager.pool_size);
+    manager.setPoolSize(0);
+    try std.testing.expectEqual(@as(usize, 1), manager.pool_size);
+    manager.setPoolSize(4);
+    try std.testing.expectEqual(@as(usize, 4), manager.pool_size);
+}
+
+test "configured backend priority disables automatic reordering" {
+    const configured = [_]BackendType{ .onnx, .native, .metal };
+    const manager = SessionManager.initWithBackendPriority(std.testing.allocator, &configured);
+    try std.testing.expect(manager.preserve_backend_order);
+    try std.testing.expectEqualSlices(BackendType, &configured, manager.preferred_backends);
+
+    const automatic = SessionManager.init(std.testing.allocator);
+    try std.testing.expect(!automatic.preserve_backend_order);
 }
 
 test "explicit graph runtime is independent from onnx runtime backend availability" {
@@ -310,7 +450,10 @@ fn preferredBackendOverride() ?BackendType {
     const value = std.c.getenv("ANTFLY_INFERENCE_PREFERRED_BACKEND") orelse
         std.c.getenv("TERMITE_PREFERRED_BACKEND") orelse
         return null;
-    const slice = std.mem.span(value);
+    return parseBackendOverride(std.mem.span(value));
+}
+
+fn parseBackendOverride(slice: []const u8) ?BackendType {
     if (std.ascii.eqlIgnoreCase(slice, "auto")) return null;
     if (std.ascii.eqlIgnoreCase(slice, "onnx")) return .onnx;
     if (std.ascii.eqlIgnoreCase(slice, "metal")) return .metal;
@@ -444,6 +587,8 @@ test {
     _ = activations;
     _ = session_factory;
     _ = imported_onnx_session;
+    _ = onnx;
+    _ = ortgenai;
 }
 
 test "shouldPreferBlasBeforeGpuForBytes prefers native only above eager dense threshold" {

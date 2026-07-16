@@ -44,7 +44,7 @@ var _ = Describe("InferenceProxy Controller", func() {
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
 					Models: antflyaiv1alpha1.ModelConfig{
 						Preload: []antflyaiv1alpha1.ModelSpec{
-							{Name: "bge-small-en-v1.5"},
+							{Name: "bge-small-en-v1.5", Kind: antflyaiv1alpha1.ModelKindEmbedder},
 						},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
@@ -151,7 +151,7 @@ var _ = Describe("InferenceProxy Controller", func() {
 				Spec: antflyaiv1alpha1.InferencePoolSpec{
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
 					Models: antflyaiv1alpha1.ModelConfig{
-						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "model-1"}},
+						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "model-1", Kind: antflyaiv1alpha1.ModelKindGenerator}},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
 					Replicas: antflyaiv1alpha1.ReplicaConfig{Min: 1, Max: 3},
@@ -168,7 +168,7 @@ var _ = Describe("InferenceProxy Controller", func() {
 				Spec: antflyaiv1alpha1.InferencePoolSpec{
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeBurst,
 					Models: antflyaiv1alpha1.ModelConfig{
-						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "model-1"}},
+						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "model-1", Kind: antflyaiv1alpha1.ModelKindGenerator}},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
 					Replicas: antflyaiv1alpha1.ReplicaConfig{Min: 1, Max: 10},
@@ -235,7 +235,7 @@ var _ = Describe("InferenceProxy Controller", func() {
 				Spec: antflyaiv1alpha1.InferencePoolSpec{
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
 					Models: antflyaiv1alpha1.ModelConfig{
-						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "bge-small-en-v1.5"}},
+						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "bge-small-en-v1.5", Kind: antflyaiv1alpha1.ModelKindEmbedder}},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
 					Replicas: antflyaiv1alpha1.ReplicaConfig{Min: 1, Max: 3},
@@ -298,7 +298,7 @@ var _ = Describe("InferenceProxy Controller", func() {
 				Spec: antflyaiv1alpha1.InferencePoolSpec{
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
 					Models: antflyaiv1alpha1.ModelConfig{
-						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "model-1"}},
+						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "model-1", Kind: antflyaiv1alpha1.ModelKindGenerator}},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
 					Replicas: antflyaiv1alpha1.ReplicaConfig{Min: 1, Max: 3},
@@ -315,7 +315,7 @@ var _ = Describe("InferenceProxy Controller", func() {
 				Spec: antflyaiv1alpha1.InferencePoolSpec{
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeBurst,
 					Models: antflyaiv1alpha1.ModelConfig{
-						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "model-1"}},
+						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "model-1", Kind: antflyaiv1alpha1.ModelKindGenerator}},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
 					Replicas: antflyaiv1alpha1.ReplicaConfig{Min: 0, Max: 10},

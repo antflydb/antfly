@@ -21,6 +21,7 @@ const decoder_rms_runtime = @import("../backends/decoder_rms_runtime.zig");
 const decoder_tail_runtime = @import("../backends/decoder_tail_runtime.zig");
 const metal_runtime = @import("../backends/metal_runtime.zig");
 const cache_mod = @import("cache.zig");
+const compiled_backend = @import("compiled_backend.zig");
 const session_factory = @import("../architectures/session_factory.zig");
 const gemma4_runtime = @import("../architectures/gemma4_runtime.zig");
 const generation = @import("../pipelines/generation.zig");
@@ -1880,28 +1881,39 @@ fn prewarmEmbeddingWeight(cb: *const ops.ComputeBackend, gpt_config: gpt_mod.Con
     defer cb.free(embedded);
 }
 
-pub fn prewarmSharedDecoderRuntime(
-    allocator: std.mem.Allocator,
+/// Create and warm the session-owned whole-model runtime itself. Keeping the
+/// runtime in the model graph cache makes warmup and requests reuse one
+/// prepared provider instead of preparing a temporary pool slot.
+pub fn prewarmCompiledDecoderRuntime(
     session: backends.Session,
     gpt_config: gpt_mod.Config,
+    kv_dtype: runtime.kv.pool.KvDType,
+    shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
+    cache: *cache_mod.GraphCache,
 ) !bool {
     if (!supportsSession(session)) return false;
-    if (gemma4_runtime.shouldSkipSharedDecoderPrewarm(gpt_config)) return false;
+    const allocator = cache.allocator;
 
-    var cb = try session_factory.getComputeBackend(session, allocator);
-    defer cb.deinit();
-
-    const configured_layer_count = gpt_config.num_hidden_layers;
-    const prepare = try cb.decoderRuntimePrepareOrReuseFamily(
+    var executor = try createModelExecutor(
         allocator,
+        session,
         gpt_config,
-        0,
-        configured_layer_count,
+        kv_dtype,
+        shared_moe_cache,
     );
-    if (prepare.prepared) {
-        try prewarmEmbeddingWeight(&cb, gpt_config);
-    }
-    return prepare.prepared;
+    defer executor.deinit();
+
+    const runtime_model = try compiled_backend.modelRuntimeForSessionExecutor(
+        allocator,
+        cache,
+        .metal,
+        .whole_model,
+        &executor,
+    );
+    // MTP assistants must keep their family-specific preparation lazy, but
+    // still claim the persistent provider before request-local backends do.
+    if (gemma4_runtime.shouldSkipSharedDecoderPrewarm(gpt_config)) return false;
+    return runtime_model.prepare(allocator, .{ .kv_tokens_hint = 0 });
 }
 
 pub fn createModelExecutor(
