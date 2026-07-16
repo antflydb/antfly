@@ -7518,6 +7518,8 @@ export interface components {
             source_artifact_name?: string;
             /** @description Expected embedding dimension for embedding enrichments. */
             expected_dims?: number;
+            /** @description Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producer models to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed. Dimensions are always validated independently. */
+            vector_space?: string;
             /** @description Chunk size for chunk enrichments. */
             chunk_size?: number;
             /** @description Chunk overlap for chunk enrichments. */
@@ -7531,12 +7533,19 @@ export interface components {
             full_text_index?: boolean;
             /** @description Produced asset content type for asset enrichments. */
             content_type?: string;
-            /** @description Serialized asset producer configuration. */
+            /** @description Serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded. */
             producer_json?: string;
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
         };
+        /** @description Named generated artifact stream consumed by an index. Producer inputs such as field and template belong on the matching enrichment, not on the index source. */
+        ArtifactIndexSource: {
+            /** @description Stable name of the generated artifact. */
+            artifact: string;
+        };
         FullTextIndexConfig: {
+            /** @description Chunk or textual asset artifact streams indexed together. Every artifact record is an independent full-text member. */
+            sources?: components["schemas"]["ArtifactIndexSource"][];
             /** @description Whether to use memory-only storage */
             mem_only?: boolean;
         };
@@ -8467,12 +8476,10 @@ export interface components {
             sparse?: boolean;
             /** @description Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes. */
             dimension?: number;
-            /** @description Field to extract embeddings from (managed indexes only; not allowed when external=true) */
+            /** @description Field to extract embeddings from for direct managed indexes. Omit when sources is set. */
             field?: string;
-            /** @description Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings. */
-            embedding_name?: string;
-            /** @description Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source. */
-            source_artifact_name?: string;
+            /** @description Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by the artifact name and its source key. All sources must use the same dense vector space or the same sparse token space. Not allowed for external or direct field/template indexes. */
+            sources?: components["schemas"]["ArtifactIndexSource"][];
             /**
              * @description Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
              * @example Hello, {{#if (eq Name "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old.
@@ -8505,6 +8512,55 @@ export interface components {
             chunk_size?: number;
             /** @description Non-semantic execution policy for shorthand-created chunking or embedding producers. */
             execution?: components["schemas"]["IndexExecutionConfig"];
+        };
+        GraphIndexSourceNodes: {
+            /**
+             * @default document
+             * @enum {string}
+             */
+            model?: "document" | "external";
+            /** @description Template for the source node identifier. */
+            source?: string;
+            /** @description Template for the target node identifier. */
+            target?: string;
+        };
+        GraphIndexSourceEdge: {
+            /** @description Template or literal edge type. */
+            type?: string | number;
+            /** @description Template or numeric literal edge weight. */
+            weight?: string | number;
+            /** @description Metadata object whose string leaves may contain templates. */
+            metadata?: {
+                [key: string]: unknown;
+            };
+        };
+        GraphIndexSourceContext: {
+            /** @description Document fields that source templates may reference through _doc.value. */
+            doc_fields?: string[];
+        };
+        /** @description Graph-specific artifact source. The source owns the payload path and format because different artifact streams in one graph index may require different interpretations. */
+        GraphIndexSource: {
+            /** @description Stable name of the generated graph artifact. */
+            artifact: string;
+            /**
+             * @description Optional JSON path selecting edge records within this artifact payload.
+             * @example $.relations[*]
+             */
+            path?: string;
+            /**
+             * @description Payload interpretation for this artifact source.
+             * @default extraction_relation
+             * @enum {string}
+             */
+            format?: "extraction_relation" | "extraction_graph";
+            /** @description Optional provenance edge type emitted for resolver mention decisions from this source. */
+            mention_edge_type?: string;
+            /** @description Optional node mapping templates for this artifact stream. */
+            nodes?: components["schemas"]["GraphIndexSourceNodes"];
+            /** @description Optional edge mapping templates for this artifact stream. */
+            edge?: components["schemas"]["GraphIndexSourceEdge"];
+            /** @description Document fields explicitly available to this source's mapping templates. */
+            context?: components["schemas"]["GraphIndexSourceContext"];
         };
         /** @description Configuration for a specific edge type */
         EdgeTypeConfig: {
@@ -8546,6 +8602,8 @@ export interface components {
         };
         /** @description Configuration for graph index type */
         GraphIndexConfig: {
+            /** @description Chunk or JSON asset artifact streams whose edge-like values are unioned into this graph index. */
+            sources?: components["schemas"]["GraphIndexSource"][];
             /** @description Configuration for generating node summaries (enables tree navigation in Retrieval Agent) */
             summarizer?: components["schemas"]["GeneratorConfig"];
             /**
@@ -9308,6 +9366,20 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @description Materialization status for one configured graph artifact source. */
+        GraphSourceArtifactStatus: {
+            /** @description Configured artifact source name. */
+            name: string;
+            /** @description Configured JSON path, or an empty string when the payload root is consumed. */
+            path: string;
+            /**
+             * @description Payload interpretation configured for this source.
+             * @enum {string}
+             */
+            format: "extraction_relation" | "extraction_graph";
+            /** @description Whether index-wide replay or catch-up can still change this source's visible graph materialization. */
+            materialization_pending: boolean;
+        };
         /** @description Statistics for graph index */
         GraphIndexStats: {
             /**
@@ -9373,10 +9445,8 @@ export interface components {
             catch_up_applied_sequence?: number;
             /** Format: uint64 */
             catch_up_target_sequence?: number;
-            /** @description Graph source artifact materialization status. */
-            source_artifact?: {
-                [key: string]: unknown;
-            };
+            /** @description Materialization status for every configured graph source artifact. */
+            source_artifacts?: components["schemas"]["GraphSourceArtifactStatus"][];
             /** @description Resolver replay diagnostics for graph materialization. */
             resolver_replay?: {
                 [key: string]: unknown;
@@ -9610,10 +9680,8 @@ export interface components {
             missing_groups?: number;
             /** Format: uint64 */
             unknown_remote_groups?: number;
-            /** @description Source artifact stream used to materialize graph edges. */
-            source_artifact?: {
-                [key: string]: unknown;
-            };
+            /** @description All source artifact streams used to materialize graph edges, in configured order. */
+            source_artifacts?: components["schemas"]["GraphSourceArtifactStatus"][];
             /** @description Graph resolver replay diagnostics. */
             resolver_replay?: {
                 [key: string]: unknown;

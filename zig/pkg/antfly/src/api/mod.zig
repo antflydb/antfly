@@ -93,6 +93,11 @@ test "public index contract exposes runtime status metadata" {
     try openapi_contract.expectPublicIndexRuntimeStatusMetadata();
 }
 
+test "api index artifacts preserve semantic provenance and typed graph source status" {
+    try indexes.testEmbeddingEnrichmentsPersistSemanticProducerIdentity();
+    try indexes.testGraphArtifactSourceMaterializationStatus();
+}
+
 test "public openapi documents stable exact sort diagnostics" {
     try openapi_contract.expectPublicOpenApiDocumentsStableExactSortDiagnostics();
 }

@@ -24,7 +24,6 @@ from .algebraic_index_stats_planner_last_decision import AlgebraicIndexStatsPlan
 from .algebraic_index_stats_promotion import AlgebraicIndexStatsPromotion
 from .algebraic_index_stats_resolution import AlgebraicIndexStatsResolution
 from .algebraic_index_stats_resolver_replay import AlgebraicIndexStatsResolverReplay
-from .algebraic_index_stats_source_artifact import AlgebraicIndexStatsSourceArtifact
 from .analyses import Analyses
 from .analyses_result import AnalysesResult
 from .answer_agent_result import AnswerAgentResult
@@ -39,6 +38,7 @@ from .anthropic_generator_config import AnthropicGeneratorConfig
 from .api_key import ApiKey
 from .api_key_row_filter_type_0 import ApiKeyRowFilterType0
 from .api_key_with_secret import ApiKeyWithSecret
+from .artifact_index_source import ArtifactIndexSource
 from .artifact_repair_kind import ArtifactRepairKind
 from .artifact_repair_reason import ArtifactRepairReason
 from .audio_chunk_options import AudioChunkOptions
@@ -256,6 +256,13 @@ from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDe
 from .google_embedder_config import GoogleEmbedderConfig
 from .google_generator_config import GoogleGeneratorConfig
 from .graph_index_config import GraphIndexConfig
+from .graph_index_source import GraphIndexSource
+from .graph_index_source_context import GraphIndexSourceContext
+from .graph_index_source_edge import GraphIndexSourceEdge
+from .graph_index_source_edge_metadata import GraphIndexSourceEdgeMetadata
+from .graph_index_source_format import GraphIndexSourceFormat
+from .graph_index_source_nodes import GraphIndexSourceNodes
+from .graph_index_source_nodes_model import GraphIndexSourceNodesModel
 from .graph_index_stats import GraphIndexStats
 from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
 from .graph_index_stats_algebraic_graph_traversal import GraphIndexStatsAlgebraicGraphTraversal
@@ -265,7 +272,6 @@ from .graph_index_stats_index_type import GraphIndexStatsIndexType
 from .graph_index_stats_promotion import GraphIndexStatsPromotion
 from .graph_index_stats_resolution import GraphIndexStatsResolution
 from .graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
-from .graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
 from .graph_node_selector import GraphNodeSelector
 from .graph_query import GraphQuery
 from .graph_query_params import GraphQueryParams
@@ -275,6 +281,8 @@ from .graph_query_type import GraphQueryType
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
+from .graph_source_artifact_status import GraphSourceArtifactStatus
+from .graph_source_artifact_status_format import GraphSourceArtifactStatusFormat
 from .ground_truth import GroundTruth
 from .image_url import ImageURL
 from .image_url_content_part import ImageURLContentPart
@@ -694,7 +702,6 @@ __all__ = (
     "AlgebraicIndexStatsPromotion",
     "AlgebraicIndexStatsResolution",
     "AlgebraicIndexStatsResolverReplay",
-    "AlgebraicIndexStatsSourceArtifact",
     "Analyses",
     "AnalysesResult",
     "AnswerAgentResult",
@@ -709,6 +716,7 @@ __all__ = (
     "ApiKey",
     "ApiKeyRowFilterType0",
     "ApiKeyWithSecret",
+    "ArtifactIndexSource",
     "ArtifactRepairKind",
     "ArtifactRepairReason",
     "AudioChunkOptions",
@@ -924,6 +932,13 @@ __all__ = (
     "GoogleEmbedderConfig",
     "GoogleGeneratorConfig",
     "GraphIndexConfig",
+    "GraphIndexSource",
+    "GraphIndexSourceContext",
+    "GraphIndexSourceEdge",
+    "GraphIndexSourceEdgeMetadata",
+    "GraphIndexSourceFormat",
+    "GraphIndexSourceNodes",
+    "GraphIndexSourceNodesModel",
     "GraphIndexStats",
     "GraphIndexStatsAlgebraicGraph",
     "GraphIndexStatsAlgebraicGraphTraversal",
@@ -933,7 +948,6 @@ __all__ = (
     "GraphIndexStatsPromotion",
     "GraphIndexStatsResolution",
     "GraphIndexStatsResolverReplay",
-    "GraphIndexStatsSourceArtifact",
     "GraphNodeSelector",
     "GraphQuery",
     "GraphQueryParams",
@@ -943,6 +957,8 @@ __all__ = (
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
+    "GraphSourceArtifactStatus",
+    "GraphSourceArtifactStatusFormat",
     "GroundTruth",
     "ImageURL",
     "ImageURLContentPart",

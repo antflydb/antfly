@@ -137,6 +137,7 @@ fn encodeReplayPayloadForHint(
     switch (hint) {
         .enrichment => {
             filtered.changed_doc_keys = record.changed_doc_keys;
+            filtered.generated_enrichment_refs = record.generated_enrichment_refs;
         },
         .full_text => {
             filtered.changed_doc_keys = record.changed_doc_keys;

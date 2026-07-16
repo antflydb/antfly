@@ -334,6 +334,7 @@ pub const EnrichmentConfig = struct {
     template: []const u8 = "",
     source_artifact_name: []const u8 = "",
     expected_dims: u32 = 0,
+    vector_space: []const u8 = "",
     chunk_size: u32 = 0,
     chunk_overlap: u32 = 0,
     chunker_json: []const u8 = "",
@@ -350,6 +351,7 @@ pub const EnrichmentConfig = struct {
             .template = if (cfg.template.len > 0) try alloc.dupe(u8, cfg.template) else "",
             .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
             .expected_dims = cfg.expected_dims,
+            .vector_space = if (cfg.vector_space.len > 0) try alloc.dupe(u8, cfg.vector_space) else "",
             .chunk_size = cfg.chunk_size,
             .chunk_overlap = cfg.chunk_overlap,
             .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
@@ -365,6 +367,7 @@ pub const EnrichmentConfig = struct {
         if (self.field.len > 0) alloc.free(self.field);
         if (self.template.len > 0) alloc.free(self.template);
         if (self.source_artifact_name.len > 0) alloc.free(self.source_artifact_name);
+        if (self.vector_space.len > 0) alloc.free(self.vector_space);
         if (self.chunker_json.len > 0) alloc.free(self.chunker_json);
         if (self.content_type.len > 0) alloc.free(self.content_type);
         if (self.producer_json.len > 0) alloc.free(self.producer_json);
@@ -385,6 +388,7 @@ pub fn enrichmentConfigHash(cfg: EnrichmentConfig) u64 {
     hashLengthPrefixedBytes(&hasher, cfg.template);
     hashLengthPrefixedBytes(&hasher, cfg.source_artifact_name);
     hashU32(&hasher, cfg.expected_dims);
+    hashLengthPrefixedBytes(&hasher, cfg.vector_space);
     hashU32(&hasher, cfg.chunk_size);
     hashU32(&hasher, cfg.chunk_overlap);
     hashLengthPrefixedBytes(&hasher, cfg.chunker_json);
