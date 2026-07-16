@@ -9,7 +9,6 @@ import {
   CommandList,
   CommandSeparator,
 } from "@antfly/design-system";
-import { InferenceClient } from "@antfly/sdk";
 import {
   ArrowUpDown,
   Bot,
@@ -123,15 +122,9 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
   const { hasPermission } = useAuth();
   const { selectedTable, graphIndexes, isLoadingIndexes } = useTable();
   const { theme, setTheme } = useTheme();
-  const { inferenceApiUrl } = useApiConfig();
+  const { inferenceUrl } = useApiConfig();
   const showLocalAdminRoutes = !isExternalAuthMode();
   const showAdmin = showLocalAdminRoutes && hasPermission("*", "*", "admin");
-
-  // Create InferenceClient for semantic search
-  const inferenceClient = React.useMemo(
-    () => new InferenceClient({ baseUrl: inferenceApiUrl }),
-    [inferenceApiUrl]
-  );
 
   const isCommandAvailable = React.useCallback(
     (item: { href?: string; action?: string; product?: ProductId; adminOnly?: boolean }) => {
@@ -257,7 +250,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
     setIsSearching(true);
     const timer = setTimeout(async () => {
       try {
-        const results = await semanticSearch(searchValue, inferenceClient);
+        const results = await semanticSearch(searchValue, inferenceUrl("embed"));
         const filteredResults = results.filter((result) => isCommandAvailable(result.item));
         setSemanticResults(filteredResults);
       } catch (e) {
@@ -268,7 +261,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
     }, 300);
 
     return () => clearTimeout(timer);
-  }, [searchValue, hasStringMatches, inferenceClient, isCommandAvailable]);
+  }, [searchValue, hasStringMatches, inferenceUrl, isCommandAvailable]);
 
   // Reset search state when dialog closes
   React.useEffect(() => {

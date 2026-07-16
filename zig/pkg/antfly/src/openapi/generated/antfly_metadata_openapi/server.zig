@@ -49,6 +49,17 @@ pub const ListConnectionsParams = struct {
     refresh: ?[]const u8 = null,
 };
 
+/// Invoke an Antfly-compatible inference connection
+pub const InvokeInferenceConnectionPathParams = struct {
+    connection_id: []const u8,
+    operation: []const u8,
+};
+
+/// Parse the JSON request body for invokeInferenceConnection.
+pub fn parseInvokeInferenceConnectionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for evaluate.
 pub fn parseEvaluateBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_eval_openapi.EvalRequest) {
     return std.json.parseFromSlice(antfly_eval_openapi.EvalRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -534,6 +545,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/batch", .operation_id = "multiBatchWrite" },
     .{ .method = "GET", .path = "/cluster", .operation_id = "getCluster" },
     .{ .method = "GET", .path = "/connections", .operation_id = "listConnections" },
+    .{ .method = "POST", .path = "/connections/{connection_id}/inference/{operation}", .operation_id = "invokeInferenceConnection" },
     .{ .method = "POST", .path = "/eval", .operation_id = "evaluate" },
     .{ .method = "POST", .path = "/query", .operation_id = "globalQuery" },
     .{ .method = "POST", .path = "/restore", .operation_id = "restore" },
@@ -610,6 +622,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "multiBatchWrite")) @compileError("ServerRouter: Impl missing required method 'multiBatchWrite'");
         if (!@hasDecl(Impl, "getCluster")) @compileError("ServerRouter: Impl missing required method 'getCluster'");
         if (!@hasDecl(Impl, "listConnections")) @compileError("ServerRouter: Impl missing required method 'listConnections'");
+        if (!@hasDecl(Impl, "invokeInferenceConnection")) @compileError("ServerRouter: Impl missing required method 'invokeInferenceConnection'");
         if (!@hasDecl(Impl, "evaluate")) @compileError("ServerRouter: Impl missing required method 'evaluate'");
         if (!@hasDecl(Impl, "globalQuery")) @compileError("ServerRouter: Impl missing required method 'globalQuery'");
         if (!@hasDecl(Impl, "restore")) @compileError("ServerRouter: Impl missing required method 'restore'");
@@ -687,6 +700,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/batch", multiBatchWrite);
             try server.get("/cluster", getCluster);
             try server.get("/connections", listConnections);
+            try server.post("/connections/:connection_id/inference/:operation", invokeInferenceConnection);
             try server.post("/eval", evaluate);
             try server.post("/query", globalQuery);
             try server.post("/restore", restore);
@@ -803,6 +817,15 @@ pub fn ServerRouter(comptime Impl: type) type {
                 .refresh = ctx.query("refresh"),
             };
             return impl.listConnections(ctx, query_params);
+        }
+
+        /// Invoke an Antfly-compatible inference connection
+        /// POST /connections/{connection_id}/inference/{operation}
+        fn invokeInferenceConnection(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const connection_id = ctx.param("connection_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: connection_id" });
+            const operation = ctx.param("operation") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: operation" });
+            return impl.invokeInferenceConnection(ctx, connection_id, operation);
         }
 
         /// Standalone evaluation endpoint
@@ -1299,6 +1322,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn multiBatchWrite(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getCluster(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listConnections(self: *Impl, ctx: *httpx.Context, params: ListConnectionsParams) !httpx.Response
+//   fn invokeInferenceConnection(self: *Impl, ctx: *httpx.Context, connection_id: []const u8, operation: []const u8) !httpx.Response
 //   fn evaluate(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn globalQuery(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn restore(self: *Impl, ctx: *httpx.Context) !httpx.Response

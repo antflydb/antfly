@@ -21,7 +21,6 @@ import {
   SelectValue,
   Switch,
 } from "@antfly/design-system";
-import { InferenceClient } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   AudioLines,
@@ -42,6 +41,7 @@ import { PlaygroundEmptyState } from "@/components/branded-empty-state";
 import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
 import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import { useApiConfig } from "@/hooks/use-api-config";
+import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
 import {
   arrayBufferToBase64,
   downsampleBuffer,
@@ -101,12 +101,13 @@ function selectPlaceholder(loaded: boolean, count: number, typeName: string): st
 }
 
 const TranscribePlaygroundPage: React.FC = () => {
-  const { inferenceApiUrl } = useApiConfig();
-
-  const inferenceClient = useMemo(
-    () => new InferenceClient({ baseUrl: inferenceApiUrl }),
-    [inferenceApiUrl]
-  );
+  const { inferenceApiUrl, inferenceUrl } = useApiConfig();
+  const { models: connectionTranscribers, loading: transcribersLoading } =
+    useSelectedInferenceModelNames("transcriber");
+  const { models: connectionChunkers, loading: chunkersLoading } =
+    useSelectedInferenceModelNames("chunker");
+  const { models: connectionGenerators, loading: generatorsLoading } =
+    useSelectedInferenceModelNames("generator");
 
   // Models
   const [availableTranscribers, setAvailableTranscribers] = useState<string[]>([]);
@@ -185,36 +186,30 @@ const TranscribePlaygroundPage: React.FC = () => {
     }
   }, []);
 
-  // Fetch models
   useEffect(() => {
-    let cancelled = false;
-    const fetchModels = async () => {
-      try {
-        const data = await inferenceClient.listModels();
-        if (cancelled) return;
-
-        const transcribers = Object.keys(data.transcribers || {});
-        setAvailableTranscribers(transcribers);
-        if (transcribers.length > 0) setSelectedTranscriberModel(transcribers[0]);
-
-        const chunkers = Object.keys(data.chunkers || {});
-        setAvailableChunkers(chunkers);
-        if (chunkers.length > 0) setSelectedChunkerModel(chunkers[0]);
-
-        const generators = Object.keys(data.generators || {});
-        setAvailableGenerators(generators);
-        if (generators.length > 0) setSelectedGeneratorModel(generators[0]);
-      } catch {
-        console.error("Failed to fetch models");
-      } finally {
-        if (!cancelled) setModelsLoaded(true);
-      }
-    };
-    fetchModels();
-    return () => {
-      cancelled = true;
-    };
-  }, [inferenceClient]);
+    setAvailableTranscribers(connectionTranscribers);
+    setAvailableChunkers(connectionChunkers);
+    setAvailableGenerators(connectionGenerators);
+    setSelectedTranscriberModel((current) =>
+      current && connectionTranscribers.includes(current)
+        ? current
+        : connectionTranscribers[0] || ""
+    );
+    setSelectedChunkerModel((current) =>
+      current && connectionChunkers.includes(current) ? current : connectionChunkers[0] || ""
+    );
+    setSelectedGeneratorModel((current) =>
+      current && connectionGenerators.includes(current) ? current : connectionGenerators[0] || ""
+    );
+    setModelsLoaded(!transcribersLoading && !chunkersLoading && !generatorsLoading);
+  }, [
+    connectionTranscribers,
+    connectionChunkers,
+    connectionGenerators,
+    transcribersLoading,
+    chunkersLoading,
+    generatorsLoading,
+  ]);
 
   // Audio file handling
   const processAudioFile = useCallback(
@@ -367,9 +362,18 @@ const TranscribePlaygroundPage: React.FC = () => {
       updateSegment(index, { status: "transcribing" });
 
       if (signal.aborted) return;
-      const langOpts: { model?: string; language?: string } = { model: transcriberModel };
-      if (lang.trim()) langOpts.language = lang.trim();
-      const result = await inferenceClient.transcribe(audioBase64, langOpts);
+      const response = await fetchWithRetry(inferenceUrl("transcribe"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          audio: audioBase64,
+          model: transcriberModel,
+          language: lang.trim() || undefined,
+        }),
+        signal,
+      });
+      if (!response.ok) throw new Error((await response.text()) || `HTTP ${response.status}`);
+      const result = await response.json();
       if (signal.aborted) return;
 
       const rawText = (result.data[0]?.text || "").trim();
@@ -378,7 +382,7 @@ const TranscribePlaygroundPage: React.FC = () => {
         updateSegment(index, { rawText, status: "cleaning" });
 
         try {
-          const resp = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/generate`, {
+          const resp = await fetchWithRetry(inferenceUrl("generate"), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -411,7 +415,7 @@ const TranscribePlaygroundPage: React.FC = () => {
         updateSegment(index, { rawText, status: "done" });
       }
     },
-    [inferenceClient, inferenceApiUrl, updateSegment]
+    [inferenceUrl, updateSegment]
   );
 
   // Main pipeline
@@ -440,7 +444,7 @@ const TranscribePlaygroundPage: React.FC = () => {
     try {
       if (useVAD && selectedChunkerModel && audioDuration != null && audioDuration > 30) {
         // VAD pipeline: chunk -> transcribe each -> optionally clean up
-        const resp = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/chunk`, {
+        const resp = await fetchWithRetry(inferenceUrl("chunk"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -538,6 +542,7 @@ const TranscribePlaygroundPage: React.FC = () => {
     vadConfig,
     inferenceApiUrl,
     processSegment,
+    inferenceUrl,
   ]);
 
   // Actions

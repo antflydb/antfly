@@ -2,8 +2,18 @@
  * Unit tests for liveModelSuggestions
  */
 import type { Connection } from "@antfly/sdk";
-import { describe, expect, it } from "vitest";
-import { liveModelSuggestions } from "./use-connections";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { liveModelSuggestions, useConnectionsWithModels } from "./use-connections";
+
+const { listConnections } = vi.hoisted(() => ({ listConnections: vi.fn() }));
+
+vi.mock("@/hooks/use-api-config", () => ({
+  useApiConfig: () => ({
+    apiUrl: "http://connections-dedupe-test",
+    client: { connections: { list: listConnections } },
+  }),
+}));
 
 function providerConnection(overrides: Partial<Connection> = {}): Connection {
   return {
@@ -78,5 +88,25 @@ describe("liveModelSuggestions", () => {
   it("merges unclassified models into generator suggestions", () => {
     const suggestions = liveModelSuggestions([providerConnection()], "generator");
     expect(suggestions.openai).toEqual(["gpt-4o"]);
+  });
+});
+
+describe("useConnectionsWithModels", () => {
+  beforeEach(() => listConnections.mockReset());
+
+  it("shares an in-flight provider inventory request across consumers", async () => {
+    let resolve!: (value: { connections: Connection[] }) => void;
+    listConnections.mockReturnValue(new Promise((done) => (resolve = done)));
+
+    const first = renderHook(() => useConnectionsWithModels());
+    const second = renderHook(() => useConnectionsWithModels());
+
+    expect(listConnections).toHaveBeenCalledTimes(1);
+    act(() => resolve({ connections: [] }));
+    await waitFor(() => expect(first.result.current.loading).toBe(false));
+    expect(second.result.current.loading).toBe(false);
+
+    first.unmount();
+    second.unmount();
   });
 });

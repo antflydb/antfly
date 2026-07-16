@@ -1561,6 +1561,27 @@ pub const ApiHttpServer = struct {
         return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(response, .{})});
     }
 
+    pub fn invokeInferenceConnection(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        connection_id: []const u8,
+        operation: []const u8,
+        body: []const u8,
+    ) !connections_api.InvokeResult {
+        const node_config = self.cfg.node_config orelse return error.ConnectionNotFound;
+        var client = httpx.Client.initWithConfig(alloc, self.inferenceIo(), .{ .keep_alive = false });
+        defer client.deinit();
+        return connections_api.invokeInferenceConnection(
+            alloc,
+            &client,
+            node_config,
+            self.cfg.secret_store,
+            connection_id,
+            operation,
+            body,
+        );
+    }
+
     /// Shared asynchronous I/O runtime for short-lived API helpers. Borrowers
     /// must not retain it beyond the server lifetime.
     pub fn sharedApiIo(self: *ApiHttpServer) ?std.Io {

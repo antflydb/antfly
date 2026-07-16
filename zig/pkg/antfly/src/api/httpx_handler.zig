@@ -414,6 +414,18 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    pub fn invokeInferenceConnection(self: *AntflyApiHandler, ctx: *httpx.Context, connection_id: []const u8, operation: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "request body required");
+        const result = self.api_server.invokeInferenceConnection(ctx.allocator, connection_id, operation, body) catch |err| switch (err) {
+            error.ConnectionNotFound, error.ConnectionNotInference, error.InvalidConfig, error.ConnectionURLMissing, error.InvalidConnectionURL, error.ProviderNotAntflyCompatible, error.UnsupportedInferenceOperation => return textResponse(ctx, 400, @errorName(err)),
+            else => return textResponse(ctx, 502, @errorName(err)),
+        };
+        return jsonResponse(ctx, result.status, result.body);
+    }
+
     pub fn listSecrets(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);

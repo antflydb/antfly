@@ -21,7 +21,7 @@ import {
   SelectValue,
   Textarea,
 } from "@antfly/design-system";
-import { type EmbedResponse, InferenceClient } from "@antfly/sdk";
+import type { EmbedResponse } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   ArrowDownUp,
@@ -36,21 +36,13 @@ import {
   Zap,
 } from "lucide-react";
 import type React from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { PlaygroundEmptyState } from "@/components/branded-empty-state";
 import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
 import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import { useApiConfig } from "@/hooks/use-api-config";
+import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
 import { fetchWithRetry } from "@/lib/utils";
-
-interface ModelInfo {
-  capabilities?: string[];
-}
-
-interface ModelsResponse {
-  embedders: Record<string, ModelInfo>;
-  [key: string]: Record<string, ModelInfo>;
-}
 
 interface ScoredDocument {
   index: number;
@@ -152,7 +144,7 @@ function SimilarityBar({ score, maxScore }: { score: number; maxScore: number })
 }
 
 const EmbeddingPlaygroundPage: React.FC = () => {
-  const { inferenceApiUrl } = useApiConfig();
+  const { inferenceApiUrl, inferenceUrl } = useApiConfig();
   const [query, setQuery] = useState("");
   const [documents, setDocuments] = useState<string[]>([""]);
   const [selectedModel, setSelectedModel] = useState("");
@@ -166,34 +158,18 @@ const EmbeddingPlaygroundPage: React.FC = () => {
   const [dimensions, setDimensions] = useState<number | null>(null);
   const [showSparklines, setShowSparklines] = useState(true);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const { models: connectionModels, loading: modelsLoading } =
+    useSelectedInferenceModelNames("embedder");
 
-  const inferenceClient = useMemo(
-    () => new InferenceClient({ baseUrl: inferenceApiUrl }),
-    [inferenceApiUrl]
-  );
-
-  // Fetch available embedder models
   useEffect(() => {
-    const fetchModels = async () => {
-      try {
-        const response = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/models`);
-        if (response.ok) {
-          const data: ModelsResponse = await response.json();
-          const embedders = Object.keys(data.embedders || {});
-          setAvailableModels(embedders);
-          if (embedders.length > 0) {
-            const builtin = embedders.find((m) => m.includes("bge-small"));
-            setSelectedModel(builtin || embedders[0]);
-          }
-        }
-      } catch {
-        console.error("Failed to fetch models");
-      } finally {
-        setModelsLoaded(true);
-      }
-    };
-    fetchModels();
-  }, [inferenceApiUrl]);
+    setAvailableModels(connectionModels);
+    setSelectedModel((current) =>
+      current && connectionModels.includes(current)
+        ? current
+        : connectionModels.find((model) => model.includes("bge-small")) || connectionModels[0] || ""
+    );
+    setModelsLoaded(!modelsLoading);
+  }, [connectionModels, modelsLoading]);
 
   const handleEmbed = async () => {
     const nonEmptyDocs = documents.filter((d) => d.trim());
@@ -227,7 +203,14 @@ const EmbeddingPlaygroundPage: React.FC = () => {
     try {
       // Embed query and all documents in one call
       const allTexts = [query, ...nonEmptyDocs];
-      const response: EmbedResponse = await inferenceClient.embed(selectedModel, allTexts);
+      const raw = await fetchWithRetry(inferenceUrl("embed"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: selectedModel, input: allTexts }),
+        signal: abortControllerRef.current.signal,
+      });
+      if (!raw.ok) throw new Error(`Embed failed: ${raw.status}`);
+      const response: EmbedResponse = await raw.json();
 
       const embeddings = response.data
         .map((item) => item.embedding)

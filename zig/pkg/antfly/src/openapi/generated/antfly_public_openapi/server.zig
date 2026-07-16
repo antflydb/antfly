@@ -235,6 +235,17 @@ pub const ListConnectionsParams = struct {
     refresh: ?[]const u8 = null,
 };
 
+/// Invoke an Antfly-compatible inference connection
+pub const InvokeInferenceConnectionPathParams = struct {
+    connection_id: []const u8,
+    operation: []const u8,
+};
+
+/// Parse the JSON request body for invokeInferenceConnection.
+pub fn parseInvokeInferenceConnectionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for evaluate.
 pub fn parseEvaluateBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_eval_openapi.EvalRequest) {
     return std.json.parseFromSlice(antfly_eval_openapi.EvalRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -744,6 +755,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/batch", .operation_id = "multiBatchWrite" },
     .{ .method = "GET", .path = "/cluster", .operation_id = "getCluster" },
     .{ .method = "GET", .path = "/connections", .operation_id = "listConnections" },
+    .{ .method = "POST", .path = "/connections/{connection_id}/inference/{operation}", .operation_id = "invokeInferenceConnection" },
     .{ .method = "POST", .path = "/eval", .operation_id = "evaluate" },
     .{ .method = "POST", .path = "/query", .operation_id = "globalQuery" },
     .{ .method = "POST", .path = "/restore", .operation_id = "restore" },
@@ -835,6 +847,7 @@ pub const routes = [_]Route{
 //   fn multiBatchWrite(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getCluster(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listConnections(self: *Impl, ctx: *httpx.Context, params: ListConnectionsParams) !httpx.Response
+//   fn invokeInferenceConnection(self: *Impl, ctx: *httpx.Context, connection_id: []const u8, operation: []const u8) !httpx.Response
 //   fn evaluate(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn globalQuery(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn restore(self: *Impl, ctx: *httpx.Context) !httpx.Response

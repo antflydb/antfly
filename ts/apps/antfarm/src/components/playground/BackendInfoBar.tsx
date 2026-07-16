@@ -1,67 +1,38 @@
-import { Badge, Button, Skeleton } from "@antfly/design-system";
-import { Cpu, Settings, Wifi, WifiOff } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Button, Skeleton } from "@antfly/design-system";
+import { Settings, Wifi, WifiOff } from "lucide-react";
+import { useEffect, useMemo } from "react";
 import { SettingsDialog } from "@/components/SettingsDialog";
-import type { Backend } from "@/data/inference-models";
 import { useApiConfig } from "@/hooks/use-api-config";
-
-type RuntimeInfo = Partial<Record<Backend, boolean>>;
-const RUNTIME_BACKEND_ORDER: Backend[] = ["native", "onnx", "metal", "cuda", "xla", "wasm"];
+import { useConnectedModels } from "@/hooks/use-connections";
 
 type ConnectionState = "connected" | "disconnected" | "checking";
 
 export function BackendInfoBar() {
-  const { inferenceApiUrl } = useApiConfig();
-  const [runtime, setRuntime] = useState<RuntimeInfo | null>(null);
-  const [status, setStatus] = useState<ConnectionState>("checking");
-  const isMountedRef = useRef(true);
-  const enabledBackends = runtime
-    ? RUNTIME_BACKEND_ORDER.filter((backend) => runtime[backend] === true)
-    : [];
-
-  const fetchInfo = useCallback(
-    async (signal?: AbortSignal) => {
-      try {
-        const modelsRes = await fetch(`${inferenceApiUrl}/ai/v1/models`, {
-          signal: signal ?? AbortSignal.timeout(5000),
-        });
-
-        if (!isMountedRef.current) return;
-
-        if (modelsRes.ok) {
-          const modelsData = await modelsRes.json();
-          setRuntime(modelsData.backends || null);
-        }
-
-        setStatus(modelsRes.ok ? "connected" : "disconnected");
-      } catch {
-        if (isMountedRef.current) {
-          setStatus("disconnected");
-          setRuntime(null);
-        }
-      }
-    },
-    [inferenceApiUrl]
+  const { inferenceConnectionId, setInferenceConnectionId } = useApiConfig();
+  const { providers, loading, error, retry } = useConnectedModels();
+  const compatible = useMemo(
+    () =>
+      providers
+        .filter((provider) => provider.inference?.provider === "antfly")
+        .sort((a, b) => {
+          if (a.id === "local-inference") return -1;
+          if (b.id === "local-inference") return 1;
+          return (a.display_name ?? a.name).localeCompare(b.display_name ?? b.name);
+        }),
+    [providers]
   );
+  const selected = compatible.find((provider) => provider.id === inferenceConnectionId);
+  const status: ConnectionState = loading
+    ? "checking"
+    : selected?.status === "connected"
+      ? "connected"
+      : "disconnected";
 
   useEffect(() => {
-    isMountedRef.current = true;
-    const controller = new AbortController();
-    setStatus("checking");
-    fetchInfo(controller.signal);
-
-    return () => {
-      isMountedRef.current = false;
-      controller.abort();
-    };
-  }, [fetchInfo]);
-
-  // Re-check every 30s when disconnected
-  useEffect(() => {
-    if (status !== "disconnected") return;
-    const interval = setInterval(() => fetchInfo(), 30000);
-    return () => clearInterval(interval);
-  }, [status, fetchInfo]);
+    if (!loading && compatible.length > 0 && !selected) {
+      setInferenceConnectionId(compatible[0].id);
+    }
+  }, [compatible, loading, selected, setInferenceConnectionId]);
 
   if (status === "checking") {
     return (
@@ -78,8 +49,12 @@ export function BackendInfoBar() {
       <div className="flex items-center justify-between mb-4 p-3 rounded-none border border-destructive/30 bg-destructive/5">
         <div className="flex items-center gap-2 text-sm text-destructive">
           <WifiOff className="h-4 w-4" />
-          <span>Antfly inference disconnected</span>
-          <code className="text-xs bg-muted px-1.5 py-0.5 rounded-none">{inferenceApiUrl}</code>
+          <span>
+            {error ??
+              (compatible.length === 0
+                ? "No Antfly-compatible inference connection is configured"
+                : "Selected inference connection is unavailable")}
+          </span>
         </div>
         <div className="flex items-center gap-2">
           <SettingsDialog
@@ -90,7 +65,7 @@ export function BackendInfoBar() {
               </Button>
             }
           />
-          <Button variant="outline" size="sm" onClick={() => fetchInfo()} className="h-7 text-xs">
+          <Button variant="outline" size="sm" onClick={retry} className="h-7 text-xs">
             Retry
           </Button>
         </div>
@@ -109,20 +84,21 @@ export function BackendInfoBar() {
         <Wifi className="h-3.5 w-3.5 text-muted-foreground" />
       </div>
 
-      {/* Runtime info */}
-      {runtime && (
-        <Badge className="gap-1 text-xs">
-          <Cpu className="h-3 w-3" />
-          {enabledBackends.length > 0 ? enabledBackends.join(", ") : "runtime"}
-        </Badge>
-      )}
-
-      {/* Available backends */}
-      {enabledBackends.length > 1 && (
-        <span className="text-xs text-muted-foreground ml-auto">
-          {enabledBackends.length} backends
-        </span>
-      )}
+      <label className="flex items-center gap-2 text-xs">
+        <span className="text-muted-foreground">Connection</span>
+        <select
+          value={inferenceConnectionId}
+          onChange={(event) => setInferenceConnectionId(event.target.value)}
+          className="h-7 border bg-background px-2"
+          aria-label="Inference connection"
+        >
+          {compatible.map((provider) => (
+            <option key={provider.id} value={provider.id}>
+              {provider.display_name ?? provider.name}
+            </option>
+          ))}
+        </select>
+      </label>
     </div>
   );
 }
