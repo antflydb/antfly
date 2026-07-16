@@ -28,6 +28,7 @@ const builtin = @import("builtin");
 const Socket = @import("../net/socket.zig").Socket;
 const SocketIoReader = @import("../net/socket.zig").SocketIoReader;
 const SocketIoWriter = @import("../net/socket.zig").SocketIoWriter;
+const TlsClient = @import("client_compat.zig");
 
 /// Minimum TLS version configuration.
 pub const TlsVersion = enum {
@@ -71,7 +72,7 @@ pub const VerifyMode = enum {
 /// into `TlsSession.handshake()`.
 ///
 /// - `min_version` / `max_version`: stdlib negotiates TLS 1.2/1.3 automatically.
-/// - `ca_file` / `ca_path`: system CA bundle is always used; custom CAs are ignored.
+/// - `ca_path`: CA directory scanning is not implemented.
 /// - `cert_file` / `key_file`: mutual TLS (client certificates) is not supported.
 /// - `alpn_protocols`: ALPN is not exposed by `std.crypto.tls.Client`.
 /// - `cipher_suites`: cipher selection is not configurable.
@@ -83,7 +84,7 @@ pub const TlsConfig = struct {
     max_version: TlsVersion = .tls_1_3,
     verify_mode: VerifyMode = .peer,
     verify_hostname: bool = true,
-    /// Unimplemented: system CA bundle is always used.
+    /// Optional explicit CA bundle file. When present, system roots are not loaded.
     ca_file: ?[]const u8 = null,
     /// Unimplemented: system CA bundle is always used.
     ca_path: ?[]const u8 = null,
@@ -151,7 +152,7 @@ pub const TlsSession = struct {
 
     ca_bundle: ?std.crypto.Certificate.Bundle = null,
     ca_bundle_lock: std.Io.RwLock = .init,
-    client: ?std.crypto.tls.Client = null,
+    client: ?TlsClient = null,
 
     /// Protocol negotiated via ALPN (e.g. "h2", "http/1.1").
     /// Currently always null because `std.crypto.tls.Client` does not expose
@@ -206,9 +207,8 @@ pub const TlsSession = struct {
     /// Returns error.AlreadyConnected if called again after a successful handshake.
     pub fn handshake(self: *Self, hostname: []const u8) !void {
         if (self.connected) return error.AlreadyConnected;
-        const tls = std.crypto.tls;
         const sock = self.socket orelse return error.MissingTransport;
-        const min_tls_buf = tls.Client.min_buffer_len;
+        const min_tls_buf = TlsClient.min_buffer_len;
         const net_buf_len: usize = @max(16 * 1024, min_tls_buf);
 
         // Allocate buffers once per session.
@@ -226,13 +226,20 @@ pub const TlsSession = struct {
         const verify = self.config.verify_mode != .none;
         const verify_host = verify and self.config.verify_hostname;
 
-        // System CA bundle (cross-platform); optional if verification is disabled.
+        // An explicit CA file replaces system roots. This is required for the
+        // projected Kubernetes service-account CA trust boundary.
         if (verify) {
             var bundle: std.crypto.Certificate.Bundle = .{
                 .map = .{},
                 .bytes = .empty,
             };
-            try bundle.rescan(self.allocator, self.io, Io.Timestamp.now(self.io, .real));
+            const now = Io.Timestamp.now(self.io, .real);
+            if (self.config.ca_file) |ca_file| {
+                if (!std.fs.path.isAbsolute(ca_file)) return error.InvalidCaFilePath;
+                try bundle.addCertsFromFilePathAbsolute(self.allocator, self.io, now, ca_file);
+            } else {
+                try bundle.rescan(self.allocator, self.io, now);
+            }
             // Transfer ownership to self immediately so deinit() handles cleanup
             // if a later fallible operation (e.g. tls.Client.init) fails. An errdefer
             // on the local `bundle` would cause a double-free because `bundle` is
@@ -242,13 +249,13 @@ pub const TlsSession = struct {
 
         const sni_host = self.config.server_name orelse hostname;
 
-        var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+        var entropy: [TlsClient.Options.entropy_len]u8 = undefined;
         self.io.randomSecure(&entropy) catch return error.EntropyUnavailable;
 
         const now = Io.Timestamp.now(self.io, .real);
 
-        const client = if (@hasField(tls.Client.Options, "realtime_now"))
-            try tls.Client.init(&self.net_in.?.reader_iface, &self.net_out.?.writer_iface, .{
+        const client = if (@hasField(TlsClient.Options, "realtime_now"))
+            try TlsClient.init(&self.net_in.?.reader_iface, &self.net_out.?.writer_iface, .{
                 .host = if (verify_host) .{ .explicit = sni_host } else .{ .no_verification = {} },
                 .ca = if (verify) self.caBundleOption() else .{ .no_verification = {} },
                 .ssl_key_log = null,
@@ -261,7 +268,7 @@ pub const TlsSession = struct {
                 .realtime_now = now,
             })
         else
-            try tls.Client.init(&self.net_in.?.reader_iface, &self.net_out.?.writer_iface, .{
+            try TlsClient.init(&self.net_in.?.reader_iface, &self.net_out.?.writer_iface, .{
                 .host = if (verify_host) .{ .explicit = sni_host } else .{ .no_verification = {} },
                 .ca = if (verify) self.caBundleOption() else .{ .no_verification = {} },
                 .ssl_key_log = null,
@@ -284,8 +291,8 @@ pub const TlsSession = struct {
         // Until then, callers that need h2 use "prior knowledge" mode.
     }
 
-    fn caBundleOption(self: *Self) @FieldType(std.crypto.tls.Client.Options, "ca") {
-        const CaOption = @FieldType(std.crypto.tls.Client.Options, "ca");
+    fn caBundleOption(self: *Self) @FieldType(TlsClient.Options, "ca") {
+        const CaOption = @FieldType(TlsClient.Options, "ca");
         const BundleOption = @FieldType(CaOption, "bundle");
         if (BundleOption == std.crypto.Certificate.Bundle) {
             return .{ .bundle = self.ca_bundle.? };

@@ -67,6 +67,8 @@ pub const ClientConfig = struct {
     max_response_size: usize = types.default_max_body_size,
     max_response_headers: usize = 256,
     verify_ssl: bool = true,
+    /// Optional explicit CA bundle file. When set, system roots are not loaded.
+    tls_ca_file: ?[]const u8 = null,
     /// Enable HTTP/2 via "prior knowledge" mode (RFC 7540 §3.4).
     /// The client sends the h2 preface directly without ALPN negotiation.
     /// When Zig's stdlib exposes ALPN, this will additionally negotiate h2.
@@ -276,7 +278,10 @@ pub const Client = struct {
             .io = io,
             .config = config,
             .pool = ConnectionPool.initWithConfig(allocator, io, pool_cfg, {}),
-            .tls_pool = TlsPool.initWithConfig(allocator, io, pool_cfg, .{ .verify_ssl = config.verify_ssl }),
+            .tls_pool = TlsPool.initWithConfig(allocator, io, pool_cfg, .{
+                .verify_ssl = config.verify_ssl,
+                .ca_file = config.tls_ca_file,
+            }),
         };
     }
 
@@ -1004,7 +1009,8 @@ pub const Client = struct {
 
     /// Creates a new TLS session on a socket and executes a request.
     fn executeOnNewTls(self: *Self, socket: *Socket, host: []const u8, req: *Request) !Response {
-        const tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+        var tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+        tls_cfg.ca_file = self.config.tls_ca_file;
         var session = TlsSession.init(tls_cfg, self.io);
         defer session.deinit();
         session.attachSocket(socket);
@@ -1021,7 +1027,8 @@ pub const Client = struct {
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
     ) !Response {
-        const tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+        var tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+        tls_cfg.ca_file = self.config.tls_ca_file;
         var session = TlsSession.init(tls_cfg, self.io);
         defer session.deinit();
         session.attachSocket(socket);
@@ -1069,6 +1076,7 @@ pub const Client = struct {
 
         if (is_tls) {
             var tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+            tls_cfg.ca_file = self.config.tls_ca_file;
             tls_cfg.alpn_protocols = &.{ "h2", "http/1.1" };
             entry.session = TlsSession.init(tls_cfg, self.io);
             errdefer entry.session.deinit();

@@ -18,8 +18,6 @@ RUN case "${TARGETARCH}" in \
 
 FROM --platform=$TARGETPLATFORM alpine:3.21
 
-RUN apk add --no-cache libssl3 libcrypto3
-
 LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
 LABEL org.opencontainers.image.description="AntflyDB Zig runtime image"
 LABEL org.opencontainers.image.licenses=Elastic-2.0

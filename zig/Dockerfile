@@ -21,7 +21,7 @@ ARG TARGETARCH
 ARG ZIG_OPTIMIZE=ReleaseFast
 ARG ZIG_BUILD_JOBS=1
 
-RUN apk add --no-cache build-base clang lld curl xz git perl python3 linux-headers openssl-dev
+RUN apk add --no-cache build-base clang lld curl xz git perl python3 linux-headers
 
 COPY --from=zig /opt/zig /opt/zig
 ENV PATH="/opt/zig:${PATH}"
@@ -60,8 +60,6 @@ FROM --platform=$TARGETPLATFORM alpine:3.21
 LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
 LABEL org.opencontainers.image.description="AntflyDB Zig runtime image"
 LABEL org.opencontainers.image.licenses=Elastic-2.0
-
-RUN apk add --no-cache libssl3 libcrypto3
 
 RUN addgroup -S -g 10001 antfly && adduser -S -u 10001 -G antfly -h /home/antfly antfly
 

@@ -119,6 +119,7 @@ pub const Connection = struct {
 /// Context passed to `TlsConnection.createNew` for TLS-specific configuration.
 pub const TlsPoolContext = struct {
     verify_ssl: bool,
+    ca_file: ?[]const u8 = null,
 };
 
 /// Pooled TLS connection bundle.
@@ -173,7 +174,8 @@ pub const TlsConnection = struct {
         // Initialize the TLS session.  The session stores internal pointers to
         // entry.socket (via SocketIoReader/Writer), so the entry must already
         // live at its final heap address — which it does.
-        const tls_cfg = if (ctx.verify_ssl) TlsConfig.init(allocator) else TlsConfig.insecure(allocator);
+        var tls_cfg = if (ctx.verify_ssl) TlsConfig.init(allocator) else TlsConfig.insecure(allocator);
+        tls_cfg.ca_file = ctx.ca_file;
         entry.session = TlsSession.init(tls_cfg, io);
         errdefer entry.session.deinit();
 
