@@ -1852,6 +1852,8 @@ type HAStatus struct {
 
 	// PrimaryWatchdogProof is the last runtime-originated, authenticated proof
 	// that the exact primary process had the Kubernetes Lease watchdog active.
+	// Active capability without authority is retained only for a same-owner
+	// bootstrap/restart Lease renewal and is never authoritative primary health.
 	// The operator retains it across an admin outage only for binding to the
 	// same live Pod/container incarnation at a later isolation boundary.
 	// +optional

@@ -8753,6 +8753,13 @@ func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatus(ctx context.Contex
 	status, err := r.observeHAPrimaryStatusTyped(ctx, cluster, adminURL, ha)
 	if err != nil {
 		haStatus := cluster.Status.HAStatus
+		// A pending proof is authenticated process capability, not primary
+		// health. Retain only that proof so the exact current owner can advance
+		// the just-created Lease once; do not merge LSN, slots, retention, sync,
+		// or mark the admin endpoint reachable until authority is granted.
+		if status.WatchdogProof != nil && status.WatchdogProof.Active && !status.WatchdogProof.AuthorityGranted {
+			haStatus.PrimaryWatchdogProof = status.WatchdogProof.DeepCopy()
+		}
 		now := r.haNow()
 		if haStatus.PrimaryAdminReachable || haStatus.PrimaryAdminUnreachableSince == nil {
 			since := metav1.NewTime(now)
@@ -8846,11 +8853,14 @@ func (r *AntflyClusterReconciler) observeHAPrimaryStatusTyped(ctx context.Contex
 		return haObservedPrimaryStatus{}, err
 	}
 	if haRuntimeLeaseWatchdogEnabled(cluster) {
-		proof, err := haWatchdogProofFromAdmin(status.RawWatchdogProof, cluster, status.NodeID, true, requestStartedAt, observedAt)
+		proof, err := haWatchdogProofFromAdmin(status.RawWatchdogProof, cluster, status.NodeID, false, requestStartedAt, observedAt)
 		if err != nil {
 			return haObservedPrimaryStatus{}, err
 		}
 		status.WatchdogProof = proof
+		if !proof.AuthorityGranted {
+			return status, fmt.Errorf("HA Lease watchdog authority is pending for node %s", status.NodeID)
+		}
 	}
 	return status, nil
 }
