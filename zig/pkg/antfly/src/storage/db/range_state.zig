@@ -24,9 +24,42 @@ const split_delta_final_seq_key = "\x00\x00__metadata__:split_delta_final_seq";
 const split_bootstrap_marker_key = "\x00\x00__metadata__:split_bootstrap_marker";
 
 pub const SplitBootstrapMarker = struct {
+    transition_id: u64,
+    attempt_epoch: u64,
     source_group_id: u64,
     destination_group_id: u64,
+    bootstrap_complete: bool,
 };
+
+pub fn splitBootstrapMetadataWrites(
+    byte_range: docstore_mod.ByteRange,
+    sequence: u64,
+    marker: SplitBootstrapMarker,
+    range_buf: []u8,
+    sequence_buf: *[8]u8,
+    marker_buf: *[4 * @sizeOf(u64) + 1]u8,
+) ![3]docstore_mod.KVPair {
+    if (marker.transition_id == 0 or marker.attempt_epoch == 0 or
+        marker.source_group_id == 0 or marker.destination_group_id == 0)
+    {
+        return error.InvalidSplitBootstrapMarker;
+    }
+    std.mem.writeInt(u64, sequence_buf, sequence, .little);
+    std.mem.writeInt(u64, marker_buf[0..8], marker.transition_id, .little);
+    std.mem.writeInt(u64, marker_buf[8..16], marker.attempt_epoch, .little);
+    std.mem.writeInt(u64, marker_buf[16..24], marker.source_group_id, .little);
+    std.mem.writeInt(u64, marker_buf[24..32], marker.destination_group_id, .little);
+    marker_buf[32] = @intFromBool(marker.bootstrap_complete);
+    return .{
+        .{ .key = range_key, .value = try encodeRange(byte_range, range_buf) },
+        .{ .key = split_delta_final_seq_key, .value = sequence_buf },
+        .{ .key = split_bootstrap_marker_key, .value = marker_buf },
+    };
+}
+
+pub fn rangeMetadataWrite(byte_range: docstore_mod.ByteRange, range_buf: []u8) !docstore_mod.KVPair {
+    return .{ .key = range_key, .value = try encodeRange(byte_range, range_buf) };
+}
 
 pub fn loadRange(alloc: Allocator, store: anytype) !docstore_mod.ByteRange {
     return try loadRangeAtKey(alloc, store, range_key);
@@ -150,17 +183,28 @@ pub fn loadSplitBootstrapMarker(alloc: Allocator, store: anytype) !?SplitBootstr
         error.NotFound => return null,
         else => return err,
     };
-    if (borrowed.len != 2 * @sizeOf(u64)) return error.InvalidSplitBootstrapMarker;
+    if (borrowed.len != 4 * @sizeOf(u64) + 1) return error.InvalidSplitBootstrapMarker;
+    const bootstrap_complete = switch (borrowed[32]) {
+        0 => false,
+        1 => true,
+        else => return error.InvalidSplitBootstrapMarker,
+    };
     return .{
-        .source_group_id = std.mem.readInt(u64, borrowed[0..8], .little),
-        .destination_group_id = std.mem.readInt(u64, borrowed[8..16], .little),
+        .transition_id = std.mem.readInt(u64, borrowed[0..8], .little),
+        .attempt_epoch = std.mem.readInt(u64, borrowed[8..16], .little),
+        .source_group_id = std.mem.readInt(u64, borrowed[16..24], .little),
+        .destination_group_id = std.mem.readInt(u64, borrowed[24..32], .little),
+        .bootstrap_complete = bootstrap_complete,
     };
 }
 
 pub fn saveSplitBootstrapMarker(store: anytype, marker: SplitBootstrapMarker) !void {
-    var buf: [2 * @sizeOf(u64)]u8 = undefined;
-    std.mem.writeInt(u64, buf[0..8], marker.source_group_id, .little);
-    std.mem.writeInt(u64, buf[8..16], marker.destination_group_id, .little);
+    var buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
+    std.mem.writeInt(u64, buf[0..8], marker.transition_id, .little);
+    std.mem.writeInt(u64, buf[8..16], marker.attempt_epoch, .little);
+    std.mem.writeInt(u64, buf[16..24], marker.source_group_id, .little);
+    std.mem.writeInt(u64, buf[24..32], marker.destination_group_id, .little);
+    buf[32] = @intFromBool(marker.bootstrap_complete);
     var runtime = try initRuntimeStore(std.heap.page_allocator, store);
     defer runtime.deinit();
     var txn = try runtime.store.beginWrite();
@@ -285,6 +329,43 @@ test "range state saves and loads via memory backend store" {
     try std.testing.expectEqual(@as(u64, 17), try loadSplitDeltaFinalSeq(std.testing.allocator, runtime));
     try clearSplitDeltaFinalSeq(runtime);
     try std.testing.expectEqual(@as(u64, 0), try loadSplitDeltaFinalSeq(std.testing.allocator, runtime));
+}
+
+test "split bootstrap marker distinguishes reservation from completion" {
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    try saveSplitBootstrapMarker(runtime, .{
+        .transition_id = 41,
+        .attempt_epoch = 7,
+        .source_group_id = 42,
+        .destination_group_id = 43,
+        .bootstrap_complete = false,
+    });
+    const reserved = (try loadSplitBootstrapMarker(std.testing.allocator, runtime)) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 41), reserved.transition_id);
+    try std.testing.expectEqual(@as(u64, 7), reserved.attempt_epoch);
+    try std.testing.expectEqual(@as(u64, 42), reserved.source_group_id);
+    try std.testing.expectEqual(@as(u64, 43), reserved.destination_group_id);
+    try std.testing.expect(!reserved.bootstrap_complete);
+
+    try saveSplitBootstrapMarker(runtime, .{
+        .transition_id = 41,
+        .attempt_epoch = 7,
+        .source_group_id = 42,
+        .destination_group_id = 43,
+        .bootstrap_complete = true,
+    });
+    const completed = (try loadSplitBootstrapMarker(std.testing.allocator, runtime)) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(completed.bootstrap_complete);
+
+    try clearSplitBootstrapMarker(runtime);
+    try std.testing.expect((try loadSplitBootstrapMarker(std.testing.allocator, runtime)) == null);
 }
 
 test "range state saves and loads via lsm backend store" {

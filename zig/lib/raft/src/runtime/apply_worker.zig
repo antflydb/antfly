@@ -18,10 +18,12 @@ const storage_iface = @import("storage_iface.zig");
 
 const ApplyTask = struct {
     group_id: core.types.GroupId,
+    snapshot: ?core.types.Snapshot,
     entries: []core.Entry,
     read_states: []core.ReadState,
 
     fn deinit(self: *ApplyTask, alloc: std.mem.Allocator) void {
+        if (self.snapshot) |*snapshot| snapshot.deinit(alloc);
         core.types.freeEntries(alloc, self.entries);
         for (self.read_states) |*read_state| read_state.deinit(alloc);
         if (self.read_states.len > 0) alloc.free(self.read_states);
@@ -53,6 +55,7 @@ pub const QueuedApplyWorker = struct {
             .vtable = &.{
                 .enqueue_apply = enqueueApply,
                 .drain = drain,
+                .abort = abort,
             },
         };
     }
@@ -60,27 +63,67 @@ pub const QueuedApplyWorker = struct {
     fn enqueueApply(
         ptr: *anyopaque,
         group_id: core.types.GroupId,
+        snapshot: ?core.types.Snapshot,
         committed_entries: []const core.Entry,
         read_states: []const core.ReadState,
     ) !void {
         const self: *QueuedApplyWorker = @ptrCast(@alignCast(ptr));
         var cloned_read_states = try self.alloc.alloc(core.ReadState, read_states.len);
-        errdefer self.alloc.free(cloned_read_states);
-        for (read_states, 0..) |read_state, i| cloned_read_states[i] = try read_state.clone(self.alloc);
+        var cloned_read_state_count: usize = 0;
+        var read_states_owned = true;
+        errdefer if (read_states_owned) {
+            for (cloned_read_states[0..cloned_read_state_count]) |*read_state| read_state.deinit(self.alloc);
+            if (cloned_read_states.len > 0) self.alloc.free(cloned_read_states);
+        };
+        for (read_states, 0..) |read_state, i| {
+            cloned_read_states[i] = try read_state.clone(self.alloc);
+            cloned_read_state_count += 1;
+        }
 
-        try self.tasks.append(self.alloc, .{
+        var cloned_snapshot = if (snapshot) |value| try value.clone(self.alloc) else null;
+        var snapshot_owned = true;
+        errdefer if (snapshot_owned) if (cloned_snapshot) |*value| value.deinit(self.alloc);
+        const cloned_entries = try core.types.cloneEntries(self.alloc, committed_entries);
+        var entries_owned = true;
+        errdefer if (entries_owned) core.types.freeEntries(self.alloc, cloned_entries);
+        var task: ApplyTask = .{
             .group_id = group_id,
-            .entries = try core.types.cloneEntries(self.alloc, committed_entries),
+            .snapshot = cloned_snapshot,
+            .entries = cloned_entries,
             .read_states = cloned_read_states,
-        });
+        };
+        read_states_owned = false;
+        snapshot_owned = false;
+        entries_owned = false;
+        self.tasks.append(self.alloc, task) catch |err| {
+            task.deinit(self.alloc);
+            return err;
+        };
     }
 
-    fn drain(ptr: *anyopaque) !void {
+    fn drain(ptr: *anyopaque) storage_iface.ApplyDrainResult {
         const self: *QueuedApplyWorker = @ptrCast(@alignCast(ptr));
-        for (self.tasks.items) |*task| {
-            try self.state_machine.applyReady(task.group_id, task.entries, task.read_states);
+        var completed: usize = 0;
+        defer {
+            if (completed > 0) {
+                const remaining = self.tasks.items.len - completed;
+                std.mem.copyForwards(ApplyTask, self.tasks.items[0..remaining], self.tasks.items[completed..]);
+                self.tasks.items.len = remaining;
+            }
+        }
+        while (completed < self.tasks.items.len) : (completed += 1) {
+            const task = &self.tasks.items[completed];
+            self.state_machine.applyReady(task.group_id, task.snapshot, task.entries, task.read_states) catch |err| {
+                return .{ .completed = completed, .failure = err };
+            };
             task.deinit(self.alloc);
         }
+        return .{ .completed = completed };
+    }
+
+    fn abort(ptr: *anyopaque) void {
+        const self: *QueuedApplyWorker = @ptrCast(@alignCast(ptr));
+        for (self.tasks.items) |*task| task.deinit(self.alloc);
         self.tasks.clearRetainingCapacity();
     }
 };
@@ -101,6 +144,7 @@ test "queued apply worker drains queued tasks into state machine" {
         fn applyReady(
             ptr: *anyopaque,
             group_id: core.types.GroupId,
+            _: ?core.types.Snapshot,
             committed_entries: []const core.Entry,
             read_states: []const core.ReadState,
         ) !void {
@@ -123,7 +167,60 @@ test "queued apply worker drains queued tasks into state machine" {
     };
     defer entry.deinit(std.testing.allocator);
 
-    try worker.queue().enqueueApply(1, &.{entry}, &.{});
-    try worker.queue().drain();
+    try worker.queue().enqueueApply(1, null, &.{entry}, &.{});
+    const result = worker.queue().drain();
+    try std.testing.expectEqual(@as(usize, 1), result.completed);
+    try std.testing.expectEqual(@as(?anyerror, null), result.failure);
     try std.testing.expectEqual(@as(usize, 1), recorder.entries);
+}
+
+test "queued apply worker consumes successful prefix when a later task fails" {
+    const Recorder = struct {
+        first_applies: usize = 0,
+        second_applies: usize = 0,
+        fail_second: bool = true,
+
+        fn stateMachine(self: *@This()) storage_iface.StateMachine {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .apply_ready = applyReady },
+            };
+        }
+
+        fn applyReady(
+            ptr: *anyopaque,
+            group_id: core.types.GroupId,
+            _: ?core.types.Snapshot,
+            _: []const core.Entry,
+            _: []const core.ReadState,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (group_id == 1) {
+                self.first_applies += 1;
+                return;
+            }
+            if (self.fail_second) return error.InjectedApplyFailure;
+            self.second_applies += 1;
+        }
+    };
+
+    var recorder = Recorder{};
+    var worker = QueuedApplyWorker.init(std.testing.allocator, recorder.stateMachine());
+    defer worker.deinit();
+    try worker.queue().enqueueApply(1, null, &.{.{ .term = 1, .index = 1 }}, &.{});
+    try worker.queue().enqueueApply(2, null, &.{.{ .term = 1, .index = 1 }}, &.{});
+
+    const failed = worker.queue().drain();
+    try std.testing.expectEqual(@as(usize, 1), failed.completed);
+    try std.testing.expectEqual(error.InjectedApplyFailure, failed.failure.?);
+    try std.testing.expectEqual(@as(usize, 1), recorder.first_applies);
+    try std.testing.expectEqual(@as(usize, 1), worker.tasks.items.len);
+
+    recorder.fail_second = false;
+    const retried = worker.queue().drain();
+    try std.testing.expectEqual(@as(usize, 1), retried.completed);
+    try std.testing.expectEqual(@as(?anyerror, null), retried.failure);
+    try std.testing.expectEqual(@as(usize, 1), recorder.first_applies);
+    try std.testing.expectEqual(@as(usize, 1), recorder.second_applies);
+    try std.testing.expectEqual(@as(usize, 0), worker.tasks.items.len);
 }

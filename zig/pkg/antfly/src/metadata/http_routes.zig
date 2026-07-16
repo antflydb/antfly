@@ -19,6 +19,7 @@ pub const Routes = struct {
     pub const head = "/metadata/v1/head";
     pub const status = "/metadata/v1/status";
     pub const admin_snapshot = "/metadata/v1/admin/snapshot";
+    pub const internal_catalog_publication_check = "/internal/v1/catalog/publication-check";
     pub const active_transitions = "/metadata/v1/transitions/active";
     pub const table_ranges_prefix = "/metadata/v1/tables/";
     pub const table_ranges_suffix = "/ranges";

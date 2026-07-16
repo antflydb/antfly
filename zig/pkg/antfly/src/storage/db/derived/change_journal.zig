@@ -16,6 +16,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const derived_log_mod = @import("derived_log.zig");
 const derived_types = @import("derived_types.zig");
+const enrichment_types = @import("../enrichment/enrichment_types.zig");
 const internal_keys = @import("../../internal_keys.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 
@@ -45,6 +46,7 @@ pub const Record = struct {
     deleted_doc_keys: []const []const u8 = &.{},
     overwritten_doc_keys: []const []const u8 = &.{},
     changed_artifact_keys: []const []const u8 = &.{},
+    generated_enrichment_refs: []const enrichment_types.GeneratedEnrichmentRef = &.{},
     target_hints: []const TargetHint = &.{},
 
     pub fn jsonStringify(self: Record, jw: anytype) !void {
@@ -75,6 +77,10 @@ pub const Record = struct {
             try jw.objectField("changed_artifact_keys");
             try jw.write(self.changed_artifact_keys);
         }
+        if (self.generated_enrichment_refs.len > 0) {
+            try jw.objectField("generated_enrichment_refs");
+            try jw.write(self.generated_enrichment_refs);
+        }
         try jw.endObject();
     }
 };
@@ -103,6 +109,7 @@ pub const BorrowedBinaryRecord = struct {
         if (self.record.deleted_doc_keys.len > 0) self.alloc.free(self.record.deleted_doc_keys);
         if (self.record.overwritten_doc_keys.len > 0) self.alloc.free(self.record.overwritten_doc_keys);
         if (self.record.changed_artifact_keys.len > 0) self.alloc.free(self.record.changed_artifact_keys);
+        if (self.record.generated_enrichment_refs.len > 0) self.alloc.free(self.record.generated_enrichment_refs);
         freeTargetHintsIfOwned(self.alloc, self.record.target_hints);
         self.* = undefined;
     }
@@ -113,6 +120,7 @@ pub const BorrowedBinaryRecordScratch = struct {
     deleted_doc_keys: std.ArrayListUnmanaged([]const u8) = .empty,
     overwritten_doc_keys: std.ArrayListUnmanaged([]const u8) = .empty,
     changed_artifact_keys: std.ArrayListUnmanaged([]const u8) = .empty,
+    generated_enrichment_refs: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef) = .empty,
     target_hints: std.ArrayListUnmanaged(TargetHint) = .empty,
 
     pub fn deinit(self: *BorrowedBinaryRecordScratch, alloc: Allocator) void {
@@ -120,6 +128,7 @@ pub const BorrowedBinaryRecordScratch = struct {
         self.deleted_doc_keys.deinit(alloc);
         self.overwritten_doc_keys.deinit(alloc);
         self.changed_artifact_keys.deinit(alloc);
+        self.generated_enrichment_refs.deinit(alloc);
         self.target_hints.deinit(alloc);
         self.* = undefined;
     }
@@ -129,6 +138,7 @@ pub const BorrowedBinaryRecordScratch = struct {
         self.deleted_doc_keys.clearRetainingCapacity();
         self.overwritten_doc_keys.clearRetainingCapacity();
         self.changed_artifact_keys.clearRetainingCapacity();
+        self.generated_enrichment_refs.clearRetainingCapacity();
         self.target_hints.clearRetainingCapacity();
     }
 };
@@ -139,7 +149,8 @@ const FieldMask = packed struct(u8) {
     deleted_doc_keys: bool = false,
     overwritten_doc_keys: bool = false,
     changed_artifact_keys: bool = false,
-    _padding: u4 = 0,
+    generated_enrichment_refs: bool = false,
+    _padding: u3 = 0,
 };
 
 pub fn deinitRecord(alloc: Allocator, record: *Record) void {
@@ -154,6 +165,10 @@ pub fn deinitRecord(alloc: Allocator, record: *Record) void {
 
     for (record.changed_artifact_keys) |key| alloc.free(key);
     if (record.changed_artifact_keys.len > 0) alloc.free(record.changed_artifact_keys);
+
+    if (record.generated_enrichment_refs.len > 0) {
+        enrichment_types.deinitGeneratedRefs(alloc, record.generated_enrichment_refs);
+    }
 
     freeTargetHintsIfOwned(alloc, record.target_hints);
     record.* = undefined;
@@ -171,6 +186,11 @@ fn appendUniqueString(
     const owned = try alloc.dupe(u8, value);
     errdefer alloc.free(owned);
     try list.append(alloc, owned);
+}
+
+fn freeOwnedStringSlice(alloc: Allocator, values: []const []const u8) void {
+    for (values) |value| alloc.free(value);
+    if (values.len > 0) alloc.free(values);
 }
 
 pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatch, sequence: u64) !Record {
@@ -284,13 +304,29 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
         try appendUniqueString(alloc, &changed_doc_keys, ref.doc_key);
     }
 
+    const owned_changed_doc_keys = try changed_doc_keys.toOwnedSlice(alloc);
+    errdefer freeOwnedStringSlice(alloc, owned_changed_doc_keys);
+    const owned_deleted_doc_keys = try deleted_doc_keys.toOwnedSlice(alloc);
+    errdefer freeOwnedStringSlice(alloc, owned_deleted_doc_keys);
+    const owned_overwritten_doc_keys = try overwritten_doc_keys.toOwnedSlice(alloc);
+    errdefer freeOwnedStringSlice(alloc, owned_overwritten_doc_keys);
+    const owned_changed_artifact_keys = try changed_artifact_keys.toOwnedSlice(alloc);
+    errdefer freeOwnedStringSlice(alloc, owned_changed_artifact_keys);
+    const owned_generated_enrichment_refs = try enrichment_types.cloneGeneratedRefs(alloc, batch.generated_enrichment_refs);
+    errdefer if (owned_generated_enrichment_refs.len > 0) {
+        enrichment_types.deinitGeneratedRefs(alloc, owned_generated_enrichment_refs);
+    };
+    const owned_target_hints = try target_hints.toOwnedSlice(alloc);
+    errdefer if (owned_target_hints.len > 0) alloc.free(owned_target_hints);
+
     return .{
         .sequence = sequence,
-        .changed_doc_keys = try changed_doc_keys.toOwnedSlice(alloc),
-        .deleted_doc_keys = try deleted_doc_keys.toOwnedSlice(alloc),
-        .overwritten_doc_keys = try overwritten_doc_keys.toOwnedSlice(alloc),
-        .changed_artifact_keys = try changed_artifact_keys.toOwnedSlice(alloc),
-        .target_hints = try target_hints.toOwnedSlice(alloc),
+        .changed_doc_keys = owned_changed_doc_keys,
+        .deleted_doc_keys = owned_deleted_doc_keys,
+        .overwritten_doc_keys = owned_overwritten_doc_keys,
+        .changed_artifact_keys = owned_changed_artifact_keys,
+        .generated_enrichment_refs = owned_generated_enrichment_refs,
+        .target_hints = owned_target_hints,
     };
 }
 
@@ -310,6 +346,7 @@ pub fn encodeRecord(alloc: Allocator, record: Record) ![]u8 {
         .deleted_doc_keys = record.deleted_doc_keys.len > 0,
         .overwritten_doc_keys = record.overwritten_doc_keys.len > 0,
         .changed_artifact_keys = record.changed_artifact_keys.len > 0,
+        .generated_enrichment_refs = record.generated_enrichment_refs.len > 0,
     };
 
     try payload.appendSlice(alloc, binary_magic);
@@ -322,6 +359,7 @@ pub fn encodeRecord(alloc: Allocator, record: Record) ![]u8 {
     if (field_mask.deleted_doc_keys) try encodeStringList(&payload, alloc, record.deleted_doc_keys);
     if (field_mask.overwritten_doc_keys) try encodeStringList(&payload, alloc, record.overwritten_doc_keys);
     if (field_mask.changed_artifact_keys) try encodeStringList(&payload, alloc, record.changed_artifact_keys);
+    if (field_mask.generated_enrichment_refs) try encodeGeneratedEnrichmentRefs(&payload, alloc, record.generated_enrichment_refs);
 
     return try payload.toOwnedSlice(alloc);
 }
@@ -527,6 +565,26 @@ fn encodeStringList(payload: *std.ArrayListUnmanaged(u8), alloc: Allocator, valu
     }
 }
 
+fn encodeBinaryString(payload: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: []const u8) !void {
+    try appendInt(payload, alloc, u32, @intCast(value.len));
+    try payload.appendSlice(alloc, value);
+}
+
+fn encodeGeneratedEnrichmentRefs(
+    payload: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    refs: []const enrichment_types.GeneratedEnrichmentRef,
+) !void {
+    try appendInt(payload, alloc, u32, @intCast(refs.len));
+    for (refs) |ref| {
+        try payload.append(alloc, @intFromEnum(ref.kind));
+        try encodeBinaryString(payload, alloc, ref.index_name);
+        try encodeBinaryString(payload, alloc, ref.artifact_name);
+        try encodeBinaryString(payload, alloc, ref.embedding_name);
+        try encodeBinaryString(payload, alloc, ref.doc_key);
+    }
+}
+
 const BinaryDecodeError = error{
     InvalidBinaryRecord,
     UnexpectedEndOfInput,
@@ -607,6 +665,66 @@ fn decodeBinaryStringListBorrowedScratch(
     return list.items;
 }
 
+fn decodeBinaryStringBorrowed(cursor: *BinaryCursor) BinaryDecodeError![]const u8 {
+    const len = try cursor.readInt(u32);
+    return try cursor.readBytes(len);
+}
+
+fn decodeGeneratedEnrichmentRefBorrowed(cursor: *BinaryCursor) BinaryDecodeError!enrichment_types.GeneratedEnrichmentRef {
+    const kind: enrichment_types.GeneratedEnrichmentKind = switch (try cursor.readInt(u8)) {
+        0 => .dense_embedding,
+        1 => .sparse_embedding,
+        2 => .chunk_text,
+        3 => .asset,
+        else => return error.InvalidBinaryRecord,
+    };
+    return .{
+        .kind = kind,
+        .index_name = try decodeBinaryStringBorrowed(cursor),
+        .artifact_name = try decodeBinaryStringBorrowed(cursor),
+        .embedding_name = try decodeBinaryStringBorrowed(cursor),
+        .doc_key = try decodeBinaryStringBorrowed(cursor),
+    };
+}
+
+fn decodeGeneratedEnrichmentRefsOwned(alloc: Allocator, cursor: *BinaryCursor) BinaryDecodeError![]const enrichment_types.GeneratedEnrichmentRef {
+    const count = try cursor.readInt(u32);
+    if (count == 0) return &.{};
+    const refs = try alloc.alloc(enrichment_types.GeneratedEnrichmentRef, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (refs[0..initialized]) |ref| enrichment_types.freeGeneratedRef(alloc, ref);
+        alloc.free(refs);
+    }
+    for (refs) |*ref| {
+        const borrowed = try decodeGeneratedEnrichmentRefBorrowed(cursor);
+        ref.* = try enrichment_types.cloneGeneratedRef(alloc, borrowed);
+        initialized += 1;
+    }
+    return refs;
+}
+
+fn decodeGeneratedEnrichmentRefsBorrowed(alloc: Allocator, cursor: *BinaryCursor) BinaryDecodeError![]const enrichment_types.GeneratedEnrichmentRef {
+    const count = try cursor.readInt(u32);
+    if (count == 0) return &.{};
+    const refs = try alloc.alloc(enrichment_types.GeneratedEnrichmentRef, count);
+    errdefer alloc.free(refs);
+    for (refs) |*ref| ref.* = try decodeGeneratedEnrichmentRefBorrowed(cursor);
+    return refs;
+}
+
+fn decodeGeneratedEnrichmentRefsBorrowedScratch(
+    alloc: Allocator,
+    cursor: *BinaryCursor,
+    refs: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef),
+) BinaryDecodeError![]const enrichment_types.GeneratedEnrichmentRef {
+    refs.clearRetainingCapacity();
+    const count = try cursor.readInt(u32);
+    try refs.ensureTotalCapacity(alloc, count);
+    for (0..count) |_| refs.appendAssumeCapacity(try decodeGeneratedEnrichmentRefBorrowed(cursor));
+    return refs.items;
+}
+
 fn decodeBinaryRecord(alloc: Allocator, raw: []const u8) !Record {
     var cursor = BinaryCursor{
         .raw = raw[binary_magic.len..],
@@ -631,6 +749,7 @@ fn decodeBinaryRecord(alloc: Allocator, raw: []const u8) !Record {
     if (field_mask.deleted_doc_keys) record.deleted_doc_keys = try decodeBinaryStringList(alloc, &cursor);
     if (field_mask.overwritten_doc_keys) record.overwritten_doc_keys = try decodeBinaryStringList(alloc, &cursor);
     if (field_mask.changed_artifact_keys) record.changed_artifact_keys = try decodeBinaryStringList(alloc, &cursor);
+    if (field_mask.generated_enrichment_refs) record.generated_enrichment_refs = try decodeGeneratedEnrichmentRefsOwned(alloc, &cursor);
     if (cursor.remaining() != 0) return error.InvalidBinaryRecord;
     return record;
 }
@@ -660,6 +779,7 @@ pub fn decodeBinaryRecordBorrowed(alloc: Allocator, raw: []const u8) !BorrowedBi
         if (record.deleted_doc_keys.len > 0) alloc.free(record.deleted_doc_keys);
         if (record.overwritten_doc_keys.len > 0) alloc.free(record.overwritten_doc_keys);
         if (record.changed_artifact_keys.len > 0) alloc.free(record.changed_artifact_keys);
+        if (record.generated_enrichment_refs.len > 0) alloc.free(record.generated_enrichment_refs);
         freeTargetHintsIfOwned(alloc, record.target_hints);
     }
 
@@ -667,6 +787,7 @@ pub fn decodeBinaryRecordBorrowed(alloc: Allocator, raw: []const u8) !BorrowedBi
     if (field_mask.deleted_doc_keys) record.deleted_doc_keys = try decodeBinaryStringListBorrowed(alloc, &cursor);
     if (field_mask.overwritten_doc_keys) record.overwritten_doc_keys = try decodeBinaryStringListBorrowed(alloc, &cursor);
     if (field_mask.changed_artifact_keys) record.changed_artifact_keys = try decodeBinaryStringListBorrowed(alloc, &cursor);
+    if (field_mask.generated_enrichment_refs) record.generated_enrichment_refs = try decodeGeneratedEnrichmentRefsBorrowed(alloc, &cursor);
     if (cursor.remaining() != 0) return error.InvalidBinaryRecord;
 
     return .{
@@ -703,6 +824,7 @@ pub fn decodeBinaryRecordBorrowedScratch(
     if (field_mask.deleted_doc_keys) record.deleted_doc_keys = try decodeBinaryStringListBorrowedScratch(alloc, &cursor, &scratch.deleted_doc_keys);
     if (field_mask.overwritten_doc_keys) record.overwritten_doc_keys = try decodeBinaryStringListBorrowedScratch(alloc, &cursor, &scratch.overwritten_doc_keys);
     if (field_mask.changed_artifact_keys) record.changed_artifact_keys = try decodeBinaryStringListBorrowedScratch(alloc, &cursor, &scratch.changed_artifact_keys);
+    if (field_mask.generated_enrichment_refs) record.generated_enrichment_refs = try decodeGeneratedEnrichmentRefsBorrowedScratch(alloc, &cursor, &scratch.generated_enrichment_refs);
     if (cursor.remaining() != 0) return error.InvalidBinaryRecord;
     return record;
 }
@@ -936,6 +1058,7 @@ test "change journal record derives thin identities from derived batch" {
 
     try std.testing.expectEqual(@as(u64, 42), record.sequence);
     try std.testing.expectEqual(@as(usize, 1), record.changed_doc_keys.len);
+    try std.testing.expectEqual(@as(usize, 1), record.generated_enrichment_refs.len);
     try std.testing.expectEqualStrings("doc:a", record.changed_doc_keys[0]);
     try std.testing.expectEqual(@as(usize, 1), record.deleted_doc_keys.len);
     try std.testing.expectEqualStrings("doc:gone", record.deleted_doc_keys[0]);
@@ -945,6 +1068,13 @@ test "change journal record derives thin identities from derived batch" {
     try std.testing.expect(recordHasHint(record, .dense_vector));
     try std.testing.expect(recordHasHint(record, .sparse_vector));
     try std.testing.expect(recordHasHint(record, .graph));
+
+    const encoded = try encodeRecord(alloc, record);
+    defer alloc.free(encoded);
+    var decoded = try decodeRecord(alloc, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), decoded.record.generated_enrichment_refs.len);
+    try std.testing.expectEqualStrings("body_chunks_v1", decoded.record.generated_enrichment_refs[0].artifact_name);
 }
 
 test "change journal embedding-only batch does not invent primary document replay" {

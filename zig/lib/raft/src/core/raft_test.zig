@@ -491,6 +491,73 @@ test "leader provides snapshot to active follower behind compaction" {
     try std.testing.expectEqual(@as(types.Index, 11), fixture.raft.messages.items[0].snapshot.?.metadata.index);
 }
 
+test "leader incrementally catches up follower within retained snapshot suffix" {
+    var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var voters = [_]types.NodeId{ 1, 2 };
+    try storage.seedConfState(.{ .voters = voters[0..] });
+    var entries: [11]types.Entry = undefined;
+    for (&entries, 1..) |*entry, index| {
+        entry.* = .{ .index = @intCast(index), .term = @intCast(index) };
+    }
+    try storage.append(&entries);
+    try storage.compactToSnapshot(.{
+        .metadata = .{
+            .index = 11,
+            .term = 11,
+            .conf_state = .{ .voters = voters[0..] },
+        },
+        .data = "latest-state",
+    }, 7);
+    storage.setHardState(.{ .current_term = 11, .commit_index = 11 });
+
+    var raft = try raft_mod.Raft.init(std.testing.allocator, .{
+        .id = 1,
+        .group_id = 1,
+        .peers = &.{ 1, 2 },
+        .election_tick = 10,
+        .heartbeat_tick = 1,
+        .check_quorum = false,
+        .pre_vote = false,
+    }, storage.storage());
+    defer raft.deinit();
+
+    try raft.campaign();
+    clearMessages(&raft);
+    try raft.step(.{
+        .msg_type = .request_vote_response,
+        .from = 2,
+        .to = 1,
+        .term = 12,
+    });
+    clearMessages(&raft);
+
+    raft.progress[1] = .{
+        .match_index = 7,
+        .next_index = 8,
+        .state = .probe,
+        .recent_active = true,
+    };
+    try raft.step(.{
+        .msg_type = .append_entries_response,
+        .from = 2,
+        .to = 1,
+        .term = 12,
+        .log_index = 7,
+        .reject = true,
+        .reject_hint = 8,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), raft.messages.items.len);
+    const append = raft.messages.items[0];
+    try std.testing.expectEqual(message_mod.MessageType.append_entries, append.msg_type);
+    try std.testing.expectEqual(@as(types.Index, 7), append.log_index);
+    try std.testing.expectEqual(@as(types.Term, 7), append.log_term);
+    try std.testing.expect(append.entries.len > 0);
+    try std.testing.expectEqual(@as(types.Index, 8), append.entries[0].index);
+}
+
 test "leader ignores providing snapshot to inactive follower" {
     var fixture = try initLeaderFromSnapshot();
     defer fixture.raft.deinit();
@@ -855,6 +922,36 @@ test "applying voter changes keeps all peer-indexed leader state aligned" {
     _ = try raft.applyConfChange(.{ .change_type = .remove_node, .node_id = 1 });
     try std.testing.expectEqualSlices(types.NodeId, &.{ 2, 3 }, raft.status().conf_state.voters);
     try raft.propose("still-aligned");
+}
+
+test "removed leader rejects proposals without mutating its log" {
+    var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    try storage.seedConfState(.{ .voters = @constCast((&[_]types.NodeId{1})[0..]) });
+
+    var raft = try raft_mod.Raft.init(std.testing.allocator, .{
+        .id = 1,
+        .group_id = 1,
+        .peers = &.{1},
+        .election_tick = 3,
+        .heartbeat_tick = 1,
+        .check_quorum = false,
+        .pre_vote = false,
+        .step_down_on_removal = false,
+    }, storage.storage());
+    defer raft.deinit();
+
+    try raft.campaign();
+    _ = try raft.applyConfChange(.{ .change_type = .add_node, .node_id = 2 });
+    _ = try raft.applyConfChange(.{ .change_type = .remove_node, .node_id = 1 });
+
+    const last_index = raft.status().last_index;
+    try std.testing.expectEqual(types.StateRole.leader, raft.status().soft.role);
+    try std.testing.expectError(error.NotLeader, raft.propose("must-not-append"));
+    try std.testing.expectError(error.NotLeader, raft.proposeConfChangeV2(.{
+        .changes = &.{.{ .change_type = .add_node, .node_id = 3 }},
+    }));
+    try std.testing.expectEqual(last_index, raft.status().last_index);
 }
 
 test "memory storage compaction preserves snapshot term and trimmed bounds" {

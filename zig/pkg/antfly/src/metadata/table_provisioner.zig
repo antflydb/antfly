@@ -57,6 +57,7 @@ pub const ProvisionSummary = struct {
 pub const ReconcileReplicaRootOptions = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     shard_db_adapter: ?shard_db_adapter_mod.ShardDbAdapter = null,
+    embedding_options: managed_embedder.InitOptions = .{},
 };
 
 fn provisioningDbOpenOptions() db_mod.OpenOptions {
@@ -182,7 +183,10 @@ pub fn reconcileReplicaRootWithOptions(
         var db = try db_mod.DB.open(alloc, path, open_options);
         defer db.close();
         summary.dbs_opened += 1;
-        const index_summary = try reconcileDbIndexes(alloc, &db, table.indexes_json);
+        const index_summary = try reconcileDbIndexesWithOptions(alloc, &db, table.indexes_json, .{
+            .embedding_options = options.embedding_options,
+            .index_admission = .managed_async,
+        });
         summary.indexes_removed += index_summary.indexes_removed;
         summary.indexes_added += index_summary.indexes_added;
         summary.enrichments_added += index_summary.enrichments_added;
@@ -210,8 +214,12 @@ pub fn reconcileDbIndexes(
     return try reconcileDbIndexesWithOptions(alloc, db, indexes_json, .{});
 }
 
+pub const IndexAdmission = enum { synchronous, managed_async };
+
 pub const ReconcileDbIndexOptions = struct {
     drain_resolver_backfill: bool = true,
+    embedding_options: managed_embedder.InitOptions = .{},
+    index_admission: IndexAdmission = .synchronous,
 };
 
 fn dbIndexReconciliationCanMutate(db: *const db_mod.DB) bool {
@@ -229,7 +237,7 @@ pub fn reconcileDbIndexesWithOptions(
         for (desired_enrichments.items) |*cfg| cfg.deinit(alloc);
         desired_enrichments.deinit(alloc);
     }
-    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, &desired_enrichments);
+    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, options.embedding_options, &desired_enrichments);
     try indexes_api.validateArtifactEnrichmentConfigs(desired_enrichments.items);
     dedupeDesiredEnrichments(alloc, &desired_enrichments);
     indexes_api.sortArtifactEnrichmentsByDependency(desired_enrichments.items);
@@ -244,7 +252,7 @@ pub fn reconcileDbIndexesWithOptions(
         .drain_backfill = options.drain_resolver_backfill,
     });
     const missing_indexes_removed = try removeMissingIndexes(alloc, db, indexes_json);
-    const index_summary = try ensureIndexes(alloc, db, indexes_json);
+    const index_summary = try ensureIndexes(alloc, db, indexes_json, options.index_admission);
     const enrichments_removed = try removeMissingEnrichments(alloc, db, desired_enrichments.items);
     const indexes_removed = missing_indexes_removed + index_summary.removed;
     if (index_summary.added > 0 or indexes_removed > 0 or enrichment_summary.changed() or enrichments_removed > 0 or resolver_summary.changed()) {
@@ -576,7 +584,12 @@ const IndexEnsureSummary = struct {
     removed: usize = 0,
 };
 
-fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !IndexEnsureSummary {
+fn ensureIndexes(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    indexes_json: []const u8,
+    admission: IndexAdmission,
+) !IndexEnsureSummary {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer parsed.deinit();
     const object = switch (parsed.value) {
@@ -597,7 +610,7 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
             const name = try indexDefinitionName(item);
             const kind = try parseIndexKind(item);
             const config_value = indexDefinitionConfigValue(item);
-            try ensureIndexDefinition(alloc, db, current, &summary, name, kind, config_value, true);
+            try ensureIndexDefinition(alloc, db, current, &summary, name, kind, config_value, true, admission);
         }
         return summary;
     }
@@ -609,7 +622,7 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
         if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or
             std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
         const kind = try parseIndexKind(entry.value_ptr.*);
-        try ensureIndexDefinition(alloc, db, current, &summary, entry.key_ptr.*, kind, entry.value_ptr.*, false);
+        try ensureIndexDefinition(alloc, db, current, &summary, entry.key_ptr.*, kind, entry.value_ptr.*, false, admission);
     }
     return summary;
 }
@@ -623,6 +636,7 @@ fn ensureIndexDefinition(
     kind: db_mod.types.IndexKind,
     config_value: std.json.Value,
     storage_config: bool,
+    admission: IndexAdmission,
 ) !void {
     const config_json = if (storage_config)
         try extractStoredIndexConfigJson(alloc, config_value)
@@ -647,12 +661,16 @@ fn ensureIndexDefinition(
         if (try indexConfigsEqual(alloc, existing_cfg, desired)) return;
         if (try db.deleteIndex(desired.name)) summary.removed += 1;
     }
-    try db.addIndex(.{
+    const cfg = db_mod.types.IndexConfig{
         .name = desired.name,
         .kind = desired.kind,
         .config_json = desired.config_json,
         .coverage_generation = desired.coverage_generation,
-    });
+    };
+    switch (admission) {
+        .synchronous => try db.addIndex(cfg),
+        .managed_async => try db.addIndexAsync(cfg),
+    }
     summary.added += 1;
 }
 
@@ -770,10 +788,11 @@ fn jsonValuesEqualIgnoringTopLevelEnrichments(a: std.json.Value, b: std.json.Val
 fn collectDesiredEnrichmentsFromJson(
     alloc: std.mem.Allocator,
     indexes_json: []const u8,
+    embedding_options: managed_embedder.InitOptions,
     out: *std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig),
 ) !void {
     {
-        const collected = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
+        const collected = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(alloc, indexes_json, embedding_options);
         errdefer db_mod.types.freeEnrichmentConfigs(alloc, collected);
         try out.appendSlice(alloc, collected);
         alloc.free(collected);
@@ -874,6 +893,7 @@ fn enrichmentConfigsEqual(a: db_mod.types.EnrichmentConfig, b: db_mod.types.Enri
         std.mem.eql(u8, a.template, b.template) and
         std.mem.eql(u8, a.source_artifact_name, b.source_artifact_name) and
         a.expected_dims == b.expected_dims and
+        std.mem.eql(u8, a.vector_space, b.vector_space) and
         a.chunk_size == b.chunk_size and
         a.chunk_overlap == b.chunk_overlap and
         std.mem.eql(u8, a.chunker_json, b.chunker_json) and
@@ -1197,6 +1217,9 @@ fn extractIndexConfigJsonForKind(
     if (value != .object) return try alloc.dupe(u8, "{}");
     switch (kind) {
         .dense_vector, .sparse_vector => return try managed_embedder.translateEmbeddingsIndexConfigJson(alloc, index_name, value),
+        .graph => if (value.object.get("source") != null or value.object.get("artifact") != null) {
+            return error.InvalidCreateTableRequest;
+        },
         else => {},
     }
 
@@ -1477,7 +1500,7 @@ test "table provisioner reconciles stored algebraic metadata without public type
     const indexes_json =
         \\{"alg":{"version":1,"table":"docs","schema_version":1,"group_fields":[{"name":"product","path":"product","type":"string"}],"materializations":[]}}
     ;
-    const summary = try ensureIndexes(std.testing.allocator, &db, indexes_json);
+    const summary = try ensureIndexes(std.testing.allocator, &db, indexes_json, .synchronous);
     try std.testing.expectEqual(@as(usize, 0), summary.added);
     try std.testing.expectEqual(@as(usize, 0), summary.removed);
     try std.testing.expect(db.core.index_manager.algebraicIndex("alg") != null);
@@ -1570,8 +1593,8 @@ test "table provisioner registers a resolver declared in the table index config"
     const indexes_json =
         \\{
         \\  "relations_graph":{"type":"graph",
-        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
+        \\    "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
+        \\    "enrichments":[{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}]},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
         \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}
@@ -1627,8 +1650,8 @@ test "table provisioner registers a resolver declared in the table index config"
     const bumped_indexes_json =
         \\{
         \\  "relations_graph":{"type":"graph",
-        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
+        \\    "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
+        \\    "enrichments":[{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}]},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
         \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":2}
@@ -1673,8 +1696,8 @@ test "table provisioner registers a resolver declared in the table index config"
     const removed_indexes_json =
         \\{
         \\  "relations_graph":{"type":"graph",
-        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
+        \\    "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
+        \\    "enrichments":[{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}]},
         \\  "resolvers":[]
         \\}
     ;

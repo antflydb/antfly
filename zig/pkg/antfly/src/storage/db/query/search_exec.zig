@@ -20,6 +20,7 @@ const index_manager_mod = @import("../catalog/index_manager.zig");
 const runtime_schema_mod = @import("../../schema.zig");
 const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
+const artifact_ids = @import("../artifact_ids.zig");
 const doc_set = @import("../doc_set.zig");
 const doc_identity = @import("../doc_identity.zig");
 const typed_dv_coverage = @import("../typed_doc_values_coverage.zig");
@@ -339,6 +340,12 @@ pub const DenseSearchExecutor = struct {
         index_name: []const u8,
         vector_id: u64,
     ) anyerror!?[]u8,
+    resolve_hit_key: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        entry: *index_manager_mod.IndexManager.DenseIndex,
+        key: []const u8,
+    ) anyerror![]u8 = null,
     lookup_vector_id: *const fn (
         ctx: ?*anyopaque,
         index_name: []const u8,
@@ -12164,6 +12171,7 @@ fn searchDenseInternal(
 
     const chunk_backed = entry.chunk_name != null;
     const group_chunk_parents = shouldGroupChunkParents(req, chunk_backed);
+    const multi_source_members = entry.embedding_names.len > 0;
     const paging = componentPaging(req);
     const index_stats = entry.index.stats();
     const constraint_start = platform_time.monotonicNs();
@@ -12178,12 +12186,19 @@ fn searchDenseInternal(
         native_constraints.filter_query_json_resolved,
         native_constraints.exclusion_query_json_resolved,
     );
-    const full_candidate_window = group_chunk_parents or unresolved_stored_filters;
+    const exhaustive_candidate_window = group_chunk_parents or unresolved_stored_filters;
+    const full_candidate_window = exhaustive_candidate_window or multi_source_members;
     const page_candidate_window = pagingCandidateWindow(paging);
-    const effective_k: u32 = if (full_candidate_window)
+    const base_effective_k = scoreOrderCandidateWindowK(dense.k, paging);
+    const effective_k: u32 = if (exhaustive_candidate_window)
         @intCast(index_stats.active_count)
+    else if (multi_source_members)
+        @intCast(@min(
+            index_stats.active_count,
+            @as(u64, base_effective_k) *| @as(u64, @intCast(entry.embedding_names.len)),
+        ))
     else
-        scoreOrderCandidateWindowK(dense.k, paging);
+        base_effective_k;
     const effort = resolvedSearchEffort(req.search_effort);
     const resolved_search_width = resolveSearchWidth(dense.k, effort, index_stats);
     const resolved_epsilon = resolveSearchEpsilon(effort);
@@ -12228,8 +12243,10 @@ fn searchDenseInternal(
             bounded_full_candidate_count -|= active_excluded;
         }
     }
-    var candidate_window: u32 = if (full_candidate_window)
+    var candidate_window: u32 = if (exhaustive_candidate_window)
         initialDenseFullCandidateWindow(bounded_full_candidate_count, paging)
+    else if (multi_source_members)
+        @min(bounded_full_candidate_count, effective_k)
     else
         effective_k;
 
@@ -12244,7 +12261,10 @@ fn searchDenseInternal(
             .query = dense.vector,
             .k = hbc_effective_k,
             .rerank_k = if (full_candidate_window)
-                @as(usize, @intCast(@min(paging.offset +| paging.limit, hbc_effective_k)))
+                @as(usize, @intCast(if (multi_source_members)
+                    hbc_effective_k
+                else
+                    @min(paging.offset +| paging.limit, hbc_effective_k)))
             else if (exhaustive_broad_live_window)
                 @as(usize, @intCast(bounded_full_candidate_count))
             else
@@ -12367,7 +12387,7 @@ fn searchDenseInternal(
         for (raw_hits[@intCast(start)..@intCast(end)], 0..) |hit, i| {
             const result_index: usize = @as(usize, @intCast(start)) + i;
             const resolve_start = platform_time.monotonicNs();
-            const doc_key = if (results.takeMetadata(result_index)) |metadata| blk: {
+            var doc_key = if (results.takeMetadata(result_index)) |metadata| blk: {
                 profile.inline_metadata_hits += 1;
                 break :blk metadata;
             } else blk: {
@@ -12386,6 +12406,19 @@ fn searchDenseInternal(
                 profile.lookup_doc_key_hits += 1;
                 break :blk looked_up;
             };
+            var source_artifact_ref = if (entry.embedding_names.len > 0)
+                try artifact_ids.decodeArtifactRefAlloc(alloc, doc_key)
+            else
+                null;
+            var source_artifact_ref_owned = source_artifact_ref != null;
+            errdefer if (source_artifact_ref_owned) {
+                if (source_artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
+            };
+            if (executor.resolve_hit_key) |resolve_hit_key| {
+                const resolved = try resolve_hit_key(executor.ctx, alloc, entry, doc_key);
+                alloc.free(doc_key);
+                doc_key = resolved;
+            }
             profile.doc_key_resolve_ns += platform_time.monotonicNs() - resolve_start;
             var doc_key_owned = true;
             errdefer if (doc_key_owned) alloc.free(doc_key);
@@ -12410,9 +12443,11 @@ fn searchDenseInternal(
                 .doc_ordinal = null,
                 .score = hit.distance,
                 .stored_data = stored_data,
+                .artifact_ref = source_artifact_ref,
             });
             doc_key_owned = false;
             stored_data_owned = false;
+            source_artifact_ref_owned = false;
         }
         const ordinal_lookup_start = platform_time.monotonicNs();
         try lookupDenseHitDocOrdinals(alloc, postprocess_req, executor, hit_vector_ids.items, hits.items);
@@ -12439,7 +12474,7 @@ fn searchDenseInternal(
             continue;
         }
         if (candidate_window_incomplete) result.total_hits_relation = .gte;
-        if (unresolved_stored_filters) {
+        if (unresolved_stored_filters or (multi_source_members and !group_chunk_parents)) {
             result = try pageSearchResultInPlace(alloc, result, paging);
         }
         profile.postprocess_ns += platform_time.monotonicNs() - postprocess_start;
@@ -12991,6 +13026,7 @@ pub fn searchSparse(
     const entry = (try executor.sparse_index(executor.ctx, req.index_name)) orelse return error.IndexNotFound;
     const chunk_backed = entry.chunk_name != null;
     const group_chunk_parents = shouldGroupChunkParents(req, chunk_backed);
+    const multi_source_members = entry.embedding_names.len > 0;
     const paging = componentPaging(req);
     const constraint_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var native_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, req, .{
@@ -13016,15 +13052,22 @@ pub fn searchSparse(
         native_constraints.filter_query_json_resolved,
         native_constraints.exclusion_query_json_resolved,
     );
-    const full_candidate_window = group_chunk_parents or unresolved_stored_filters;
+    const exhaustive_candidate_window = group_chunk_parents or unresolved_stored_filters;
+    const full_candidate_window = exhaustive_candidate_window or multi_source_members;
     const bounded_sparse_candidate_count: u64 = if (native_constraints.positive_filter)
         @as(u64, native_constraints.filter_doc_ids.len) +| @as(u64, native_constraints.filter_doc_nums.len)
     else
         entry.index.next_doc_num;
-    const effective_k: u32 = if (full_candidate_window)
+    const base_effective_k = scoreOrderCandidateWindowK(sparse.k, paging);
+    const effective_k: u32 = if (exhaustive_candidate_window)
         @intCast(entry.index.next_doc_num)
+    else if (multi_source_members)
+        @intCast(@min(
+            entry.index.next_doc_num,
+            @as(u64, base_effective_k) *| @as(u64, @intCast(entry.embedding_names.len)),
+        ))
     else
-        scoreOrderCandidateWindowK(sparse.k, paging);
+        base_effective_k;
     const query = sparse_mod.SparseVector{
         .indices = sparse.indices,
         .values = sparse.values,
@@ -13053,6 +13096,7 @@ pub fn searchSparse(
     const end: u32 = if (full_candidate_window) @intCast(raw_hits.len) else @min(start + paging.limit, @as(u32, @intCast(raw_hits.len)));
     const sparse_doc_nums_are_ordinals =
         !chunk_backed and
+        entry.embedding_names.len == 0 and
         native_constraints.positive_filter and
         native_constraints.filter_doc_nums.len > 0 and
         native_constraints.filter_doc_ids.len == 0;
@@ -13069,7 +13113,7 @@ pub fn searchSparse(
 
     var batch_doc_ordinals: []?doc_set.DocOrdinal = &.{};
     defer if (batch_doc_ordinals.len > 0) alloc.free(batch_doc_ordinals);
-    if (!chunk_backed and !sparse_doc_nums_are_ordinals) {
+    if (!chunk_backed and entry.embedding_names.len == 0 and !sparse_doc_nums_are_ordinals) {
         if (executor.lookup_doc_ordinals) |lookup_many| {
             const selected = raw_hits[@intCast(start)..@intCast(end)];
             if (selected.len > 0) {
@@ -13084,19 +13128,40 @@ pub fn searchSparse(
 
     const hit_build_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     for (raw_hits[@intCast(start)..@intCast(end)], 0..) |hit, i| {
+        var source_artifact_ref = if (entry.embedding_names.len > 0)
+            try artifact_ids.decodeArtifactRefAlloc(alloc, hit.doc_id)
+        else
+            null;
+        var source_artifact_ref_owned = source_artifact_ref != null;
+        errdefer if (source_artifact_ref_owned) {
+            if (source_artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
+        };
+        const hit_id = if (entry.embedding_names.len > 0) blk: {
+            var identity = (try artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, hit.doc_id)) orelse return error.InvalidInternalUserKey;
+            defer identity.deinit(alloc);
+            break :blk try alloc.dupe(u8, identity.doc_key);
+        } else try alloc.dupe(u8, hit.doc_id);
+        errdefer alloc.free(hit_id);
         hits[i] = .{
-            .id = try alloc.dupe(u8, hit.doc_id),
-            .doc_ordinal = if (chunk_backed)
-                try sparseHitParentOrdinal(alloc, executor, hit.doc_id, req.identity_read_generation)
+            .id = hit_id,
+            .doc_ordinal = if (entry.embedding_names.len > 0)
+                if (internal_keys.isChunkArtifactRecordKey(hit_id))
+                    try sparseHitParentOrdinal(alloc, executor, hit_id, req.identity_read_generation)
+                else
+                    try sparseHitOrdinal(alloc, executor, hit_id, req.identity_read_generation)
+            else if (chunk_backed)
+                try sparseHitParentOrdinal(alloc, executor, hit_id, req.identity_read_generation)
             else if (sparse_doc_nums_are_ordinals and hit.doc_num != null)
                 hit.doc_num.?
             else if (batch_doc_ordinals.len > 0)
                 batch_doc_ordinals[i]
             else
-                try sparseHitOrdinal(alloc, executor, hit.doc_id, req.identity_read_generation),
+                try sparseHitOrdinal(alloc, executor, hit_id, req.identity_read_generation),
             .score = hit.score,
             .stored_data = null,
+            .artifact_ref = source_artifact_ref,
         };
+        source_artifact_ref_owned = false;
         initialized += 1;
     }
     if (bench_query_profile) hit_build_ns = platform_time.monotonicNs() - hit_build_start_ns;
@@ -13112,7 +13177,7 @@ pub fn searchSparse(
     }, chunk_backed);
     if (bench_query_profile) postprocess_ns = platform_time.monotonicNs() - postprocess_start_ns;
     errdefer result.deinit();
-    if (unresolved_stored_filters) {
+    if (unresolved_stored_filters or (multi_source_members and !group_chunk_parents)) {
         const page_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
         result = try pageSearchResultInPlace(alloc, result, paging);
         if (bench_query_profile) page_ns = platform_time.monotonicNs() - page_start_ns;

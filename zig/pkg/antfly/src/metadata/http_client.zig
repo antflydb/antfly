@@ -77,6 +77,28 @@ pub const MetadataHttpClient = struct {
         return try self.getJson(metadata_api.AdminSnapshot, base_uri, routes.Routes.admin_snapshot);
     }
 
+    pub fn validateCatalogPublication(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        contract: metadata_api.CatalogPublicationContract,
+    ) !bool {
+        const body = try std.json.Stringify.valueAlloc(self.alloc, contract, .{});
+        defer self.alloc.free(body);
+        self.requestWithBody(
+            base_uri,
+            .POST,
+            routes.Routes.internal_catalog_publication_check,
+            body,
+            null,
+            null,
+            error.CatalogChanged,
+        ) catch |err| switch (err) {
+            error.CatalogChanged => return false,
+            else => return err,
+        };
+        return true;
+    }
+
     pub fn listTableRanges(self: *MetadataHttpClient, base_uri: []const u8, table_id: u64) !std.json.Parsed([]metadata_table_manager.RangeRecord) {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{
             routes.Routes.table_ranges_prefix,
@@ -838,7 +860,7 @@ test "metadata http client round-trips server endpoints" {
             .{ .record = .{ .group_id = 10, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted }, .peer_node_ids = placement_peer_ids[0..] },
         };
         const split_transitions = [_]metadata_transition_state.SplitTransitionRecord{
-            .{ .transition_id = 9001, .source_group_id = 10, .destination_group_id = 12, .phase = .bootstrap_peer },
+            .{ .transition_id = 9001, .attempt_epoch = 1, .source_group_id = 10, .destination_group_id = 12, .phase = .bootstrap_peer },
         };
         const merge_transitions = [_]metadata_transition_state.MergeTransitionRecord{
             .{ .transition_id = 9010, .donor_group_id = 11, .receiver_group_id = 10, .phase = .prepare },

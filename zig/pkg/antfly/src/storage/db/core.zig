@@ -470,6 +470,11 @@ pub const DBCore = struct {
         try range_state_mod.saveRange(self.store, self.shard_manager.getByteRange());
     }
 
+    pub fn replaceRangeInMemoryOwned(self: *DBCore, start: []u8, end: []u8) void {
+        self.shard_manager.replaceByteRangeOwned(start, end);
+        self.refreshIndexRange();
+    }
+
     pub fn nextDerivedSequence(self: *DBCore) u64 {
         return self.store.lastReplaySequence(0);
     }
@@ -553,7 +558,19 @@ pub const DBCore = struct {
     }
 
     pub fn addIndex(self: *DBCore, cfg: types.IndexConfig) !u64 {
-        try self.index_manager.add(self.store, cfg);
+        return try self.addIndexWithReadiness(cfg, false);
+    }
+
+    pub fn addIndexRebuilding(self: *DBCore, cfg: types.IndexConfig) !u64 {
+        return try self.addIndexWithReadiness(cfg, true);
+    }
+
+    fn addIndexWithReadiness(self: *DBCore, cfg: types.IndexConfig, rebuilding: bool) !u64 {
+        if (rebuilding) {
+            try self.index_manager.addRebuilding(self.store, cfg);
+        } else {
+            try self.index_manager.add(self.store, cfg);
+        }
         const applied = if (try self.index_manager.requiresEnrichmentReplay(cfg.name))
             0
         else
@@ -638,6 +655,10 @@ pub const DBCore = struct {
         return try self.index_manager.remove(self.store, name);
     }
 
+    pub fn deleteIndexWithGraphRetirement(self: *DBCore, name: []const u8, generation: ?u64) !bool {
+        return try self.index_manager.removeWithGraphRetirement(self.store, name, generation);
+    }
+
     pub fn deleteEnrichment(self: *DBCore, kind: types.EnrichmentKind, name: []const u8) !bool {
         return try self.index_manager.removeEnrichment(self.store, kind, name);
     }
@@ -653,6 +674,7 @@ pub const DBCore = struct {
         cleaned: []const u8,
         dense_embeddings: []const types.EnrichmentDenseEmbeddingWrite,
         sparse_embeddings: []const types.EnrichmentSparseEmbeddingWrite,
+        target_artifact_names: []const []const u8,
     ) ![]enrichment_types.GeneratedEnrichmentRequest {
         var explicit_dense = try alloc.alloc(mapper.DenseEmbeddingWrite, dense_embeddings.len);
         defer alloc.free(explicit_dense);
@@ -682,6 +704,7 @@ pub const DBCore = struct {
             cleaned,
             explicit_dense,
             explicit_sparse,
+            target_artifact_names,
         );
     }
 

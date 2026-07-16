@@ -145,15 +145,26 @@ pub const HostMetrics = struct {
     pending_apply_bytes: usize = 0,
     transport_queue_denials: usize = 0,
     apply_queue_denials: usize = 0,
+    snapshot_compaction_requests: usize = 0,
+    snapshot_compaction_completions: usize = 0,
+    snapshot_compaction_failures: usize = 0,
+    snapshot_compaction_busy_skips: usize = 0,
+    snapshot_compaction_stale_drops: usize = 0,
+    snapshot_compaction_retries: usize = 0,
+    snapshot_compaction_candidates: usize = 0,
+    snapshot_compaction_bytes: usize = 0,
+    snapshot_compaction_build_ns: u64 = 0,
 };
 
 const PendingApplyTask = struct {
     group_id: core.types.GroupId,
+    snapshot: ?core.types.Snapshot,
     entries: []core.Entry,
     read_states: []core.ReadState,
     approx_bytes: usize,
 
     fn deinit(self: *PendingApplyTask, alloc: std.mem.Allocator) void {
+        if (self.snapshot) |*snapshot| snapshot.deinit(alloc);
         core.types.freeEntries(alloc, self.entries);
         for (self.read_states) |*read_state| read_state.deinit(alloc);
         if (self.read_states.len > 0) alloc.free(self.read_states);
@@ -161,14 +172,231 @@ const PendingApplyTask = struct {
     }
 };
 
+const SnapshotBuildRequest = struct {
+    group_id: core.types.GroupId,
+    incarnation: u64,
+    compact_index: core.types.Index,
+    source: storage_iface.SnapshotSource,
+    metadata: core.types.SnapshotMetadata,
+
+    fn deinit(self: *@This()) void {
+        self.source.deinit();
+        self.metadata.deinit(std.heap.page_allocator);
+        self.* = undefined;
+    }
+};
+
+const SnapshotBuildResult = union(enum) {
+    success: struct {
+        group_id: core.types.GroupId,
+        incarnation: u64,
+        compact_index: core.types.Index,
+        metadata: core.types.SnapshotMetadata,
+        payload: storage_iface.SnapshotMaterialization,
+        build_ns: u64,
+    },
+    failure: struct {
+        group_id: core.types.GroupId,
+        incarnation: u64,
+        applied_index: core.types.Index,
+        cause: anyerror,
+    },
+
+    fn deinit(self: *@This()) void {
+        switch (self.*) {
+            .success => |*result| {
+                result.metadata.deinit(std.heap.page_allocator);
+                result.payload.deinit(std.heap.page_allocator);
+            },
+            .failure => {},
+        }
+        self.* = undefined;
+    }
+
+    fn belongsTo(self: @This(), group_id: core.types.GroupId, incarnation: u64) bool {
+        return switch (self) {
+            .success => |result| result.group_id == group_id and result.incarnation == incarnation,
+            .failure => |result| result.group_id == group_id and result.incarnation == incarnation,
+        };
+    }
+};
+
+const SnapshotBuildWorker = struct {
+    io_impl: std.Io.Threaded,
+    mutex: std.Io.Mutex = .init,
+    ready: std.Io.Condition = .init,
+    thread: ?std.Thread = null,
+    stopping: bool = false,
+    running: bool = false,
+    pending: ?SnapshotBuildRequest = null,
+    running_source: ?storage_iface.SnapshotSource = null,
+    running_group_id: ?core.types.GroupId = null,
+    running_incarnation: u64 = 0,
+    result: ?SnapshotBuildResult = null,
+
+    fn start(self: *@This()) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn deinit(self: *@This()) void {
+        const io = self.io_impl.io();
+        self.mutex.lockUncancelable(io);
+        self.stopping = true;
+        if (self.running_source) |source| source.cancel();
+        self.ready.broadcast(io);
+        self.mutex.unlock(io);
+        if (self.thread) |thread| thread.join();
+        if (self.pending) |*request| request.deinit();
+        if (self.result) |*result| result.deinit();
+        self.io_impl.deinit();
+        self.* = undefined;
+    }
+
+    fn canSubmit(self: *@This()) bool {
+        const io = self.io_impl.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return !self.stopping and !self.running and self.pending == null and self.result == null;
+    }
+
+    fn submit(self: *@This(), request: SnapshotBuildRequest) bool {
+        const io = self.io_impl.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.stopping or self.running or self.pending != null or self.result != null) return false;
+        self.pending = request;
+        self.ready.signal(io);
+        return true;
+    }
+
+    fn takeResult(self: *@This()) ?SnapshotBuildResult {
+        const io = self.io_impl.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const result = self.result;
+        self.result = null;
+        return result;
+    }
+
+    fn retireGroup(self: *@This(), group_id: core.types.GroupId, incarnation: u64) void {
+        const io = self.io_impl.io();
+        var pending: ?SnapshotBuildRequest = null;
+        var result: ?SnapshotBuildResult = null;
+
+        self.mutex.lockUncancelable(io);
+        if (self.pending) |request| {
+            if (request.group_id == group_id and request.incarnation == incarnation) {
+                pending = request;
+                self.pending = null;
+            }
+        }
+        if (self.running_group_id == group_id and self.running_incarnation == incarnation) {
+            if (self.running_source) |source| source.cancel();
+        }
+        if (self.result) |completed| {
+            if (completed.belongsTo(group_id, incarnation)) {
+                result = completed;
+                self.result = null;
+            }
+        }
+        self.mutex.unlock(io);
+
+        if (pending) |*request| {
+            request.source.cancel();
+            request.deinit();
+        }
+        if (result) |*completed| completed.deinit();
+    }
+
+    fn run(self: *@This()) void {
+        const io = self.io_impl.io();
+        while (true) {
+            self.mutex.lockUncancelable(io);
+            while (!self.stopping and self.pending == null) self.ready.waitUncancelable(io, &self.mutex);
+            if (self.stopping) {
+                self.mutex.unlock(io);
+                return;
+            }
+            var request = self.pending.?;
+            self.pending = null;
+            self.running = true;
+            self.running_source = request.source;
+            self.running_group_id = request.group_id;
+            self.running_incarnation = request.incarnation;
+            self.mutex.unlock(io);
+
+            const started_ns = clock.monotonicNs();
+            const applied_index = request.metadata.index;
+            const payload = request.source.materialize(std.heap.page_allocator);
+
+            self.mutex.lockUncancelable(io);
+            self.running_source = null;
+            self.running_group_id = null;
+            self.running_incarnation = 0;
+            self.mutex.unlock(io);
+            request.source.deinit();
+            request.source = undefined;
+            const result: SnapshotBuildResult = if (payload) |snapshot_payload|
+                .{ .success = .{
+                    .group_id = request.group_id,
+                    .incarnation = request.incarnation,
+                    .compact_index = request.compact_index,
+                    .metadata = request.metadata,
+                    .payload = snapshot_payload,
+                    .build_ns = clock.elapsedSinceNs(started_ns),
+                } }
+            else |err| blk: {
+                request.metadata.deinit(std.heap.page_allocator);
+                break :blk .{ .failure = .{
+                    .group_id = request.group_id,
+                    .incarnation = request.incarnation,
+                    .applied_index = applied_index,
+                    .cause = err,
+                } };
+            };
+
+            self.mutex.lockUncancelable(io);
+            self.running = false;
+            std.debug.assert(self.result == null);
+            self.result = result;
+            self.mutex.unlock(io);
+        }
+    }
+};
+
+const SnapshotCandidate = struct {
+    applied_index: core.types.Index,
+    incarnation: u64,
+    enqueue_sequence: u64,
+    retry_attempt: u8 = 0,
+    retry_after_ns: u64 = 0,
+};
+
+const snapshot_retry_base_ns: u64 = 10 * std.time.ns_per_ms;
+const snapshot_retry_max_ns: u64 = 5 * std.time.ns_per_s;
+const snapshot_publish_inline_retry_limit: u8 = 5;
+
+fn snapshotRetryDelayNs(attempt: u8) u64 {
+    const shift: u6 = @intCast(@min(attempt -| 1, 9));
+    return @min(snapshot_retry_base_ns << shift, snapshot_retry_max_ns);
+}
+
 pub const MultiRaft = struct {
     alloc: std.mem.Allocator,
     cfg: RuntimeConfig,
     hooks: RuntimeHooks,
     scheduler: scheduler_mod.Scheduler,
     groups: std.AutoHashMapUnmanaged(core.types.GroupId, group_mod.Group) = .empty,
+    group_incarnations: std.AutoHashMapUnmanaged(core.types.GroupId, u64) = .empty,
+    next_group_incarnation: u64 = 1,
     pending_outbox: TransportOutbox = .{},
     pending_apply: std.ArrayListUnmanaged(PendingApplyTask) = .empty,
+    snapshot_candidates: std.AutoHashMapUnmanaged(core.types.GroupId, SnapshotCandidate) = .empty,
+    next_snapshot_candidate_sequence: u64 = 1,
+    snapshot_worker: ?*SnapshotBuildWorker = null,
+    snapshot_publish: ?SnapshotBuildResult = null,
+    snapshot_publish_retry_attempt: u8 = 0,
+    snapshot_publish_retry_after_ns: u64 = 0,
     metrics: HostMetrics = .{},
 
     pub fn init(alloc: std.mem.Allocator, cfg: RuntimeConfig, hooks: RuntimeHooks) MultiRaft {
@@ -184,12 +412,19 @@ pub const MultiRaft = struct {
     }
 
     pub fn deinit(self: *MultiRaft) void {
+        if (self.snapshot_worker) |worker| {
+            worker.deinit();
+            self.alloc.destroy(worker);
+        }
+        if (self.snapshot_publish) |*result| result.deinit();
         var it = self.groups.valueIterator();
         while (it.next()) |grp| grp.deinit();
         self.groups.deinit(self.alloc);
+        self.group_incarnations.deinit(self.alloc);
         self.pending_outbox.deinit(self.alloc);
         for (self.pending_apply.items) |*task| task.deinit(self.alloc);
         self.pending_apply.deinit(self.alloc);
+        self.snapshot_candidates.deinit(self.alloc);
         self.scheduler.deinit();
         self.* = undefined;
     }
@@ -199,10 +434,23 @@ pub const MultiRaft = struct {
         if (self.groups.contains(cfg.group_id)) return error.GroupAlreadyExists;
 
         var grp = try group_mod.Group.init(self.alloc, cfg);
-        errdefer grp.deinit();
+        var grp_owned = true;
+        errdefer if (grp_owned) grp.deinit();
+
+        const incarnation = self.next_group_incarnation;
+        self.next_group_incarnation +%= 1;
+        if (self.next_group_incarnation == 0) self.next_group_incarnation = 1;
+        try self.group_incarnations.put(self.alloc, cfg.group_id, incarnation);
+        errdefer _ = self.group_incarnations.remove(cfg.group_id);
 
         try self.groups.put(self.alloc, cfg.group_id, grp);
+        grp_owned = false;
+        errdefer if (self.groups.fetchRemove(cfg.group_id)) |removed| {
+            var failed_group = removed.value;
+            failed_group.deinit();
+        };
         try self.scheduler.registerGroup(cfg.group_id);
+        errdefer _ = self.scheduler.unregisterGroup(cfg.group_id);
         if (self.hooks.transport) |transport| {
             try transport.serveGroup(cfg.group_id, self.transportReceiver());
             self.metrics.transport_group_serves += 1;
@@ -245,8 +493,13 @@ pub const MultiRaft = struct {
     }
 
     pub fn removeReplica(self: *MultiRaft, group_id: core.types.GroupId) !void {
-        if (!self.removeGroup(group_id)) return error.UnknownGroup;
+        if (!self.groups.contains(group_id)) return error.UnknownGroup;
+        // The catalog is the durable admission record. Remove it before local
+        // teardown so a catalog I/O failure leaves the hosted replica intact and
+        // visible to the next reconciliation pass.
         if (self.hooks.replica_catalog) |catalog| _ = try catalog.removeReplica(group_id);
+        std.debug.assert(self.removeGroup(group_id));
+        if (self.hooks.group_storage) |group_storage| group_storage.retireGroup(group_id);
     }
 
     pub fn restoreReplicasFromCatalog(self: *MultiRaft, alloc: std.mem.Allocator) !usize {
@@ -271,7 +524,21 @@ pub const MultiRaft = struct {
     }
 
     pub fn removeGroup(self: *MultiRaft, group_id: core.types.GroupId) bool {
+        const incarnation = self.group_incarnations.get(group_id) orelse return false;
         const removed = self.groups.fetchRemove(group_id) orelse return false;
+        _ = self.group_incarnations.remove(group_id);
+        _ = self.snapshot_candidates.remove(group_id);
+        if (self.snapshot_worker) |worker| worker.retireGroup(group_id, incarnation);
+        if (self.snapshot_publish) |*result| {
+            if (result.belongsTo(group_id, incarnation)) {
+                result.deinit();
+                self.snapshot_publish = null;
+                self.snapshot_publish_retry_attempt = 0;
+                self.snapshot_publish_retry_after_ns = 0;
+            }
+        }
+        self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
+        self.removePendingAppliesForGroup(group_id);
         var grp = removed.value;
         grp.deinit();
         _ = self.scheduler.unregisterGroup(group_id);
@@ -280,6 +547,7 @@ pub const MultiRaft = struct {
             self.metrics.transport_group_unserves += 1;
         }
         self.refreshMetricsTopology();
+        self.refreshQueueMetrics();
         return true;
     }
 
@@ -610,8 +878,8 @@ pub const MultiRaft = struct {
             return false;
         }
         if (!self.hasApplyCapacity(
-            if (ready.committed_entries.len > 0 or ready.read_states.len > 0) 1 else 0,
-            ready_pressure.committed_entry_bytes + approxReadStatesSize(ready.read_states),
+            if (ready.snapshot != null or ready.committed_entries.len > 0 or ready.read_states.len > 0) 1 else 0,
+            ready_pressure.snapshot_bytes + ready_pressure.committed_entry_bytes + approxReadStatesSize(ready.read_states),
         )) {
             if (diagnostics) |diag| {
                 diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
@@ -677,7 +945,7 @@ pub const MultiRaft = struct {
             if (diagnostics) |diag| diag.async_ready_elapsed_ns = clock.elapsedSinceNs(async_ready_start_ns);
         } else {
             const enqueue_apply_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-            try self.enqueueApply(group_id, ready.committed_entries, ready.read_states);
+            try self.enqueueApply(group_id, ready.snapshot, ready.committed_entries, ready.read_states);
             if (diagnostics) |diag| diag.enqueue_apply_elapsed_ns = clock.elapsedSinceNs(enqueue_apply_start_ns);
             const outbox_append_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             try outbox.appendMessages(self.alloc, group_id, ready.messages);
@@ -721,7 +989,7 @@ pub const MultiRaft = struct {
         if (diagnostics) |diag| diag.clone_messages_elapsed_ns = clock.elapsedSinceNs(clone_messages_start_ns);
 
         const enqueue_apply_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-        try self.enqueueApply(group_id, ready.committed_entries, ready.read_states);
+        try self.enqueueApply(group_id, ready.snapshot, ready.committed_entries, ready.read_states);
         if (diagnostics) |diag| diag.enqueue_apply_elapsed_ns = clock.elapsedSinceNs(enqueue_apply_start_ns);
         if (flush_apply_queue) {
             const inline_apply_flush_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
@@ -743,64 +1011,403 @@ pub const MultiRaft = struct {
     fn enqueueApply(
         self: *MultiRaft,
         group_id: core.types.GroupId,
+        snapshot: ?core.types.Snapshot,
         committed_entries: []const core.Entry,
         read_states: []const core.ReadState,
     ) !void {
-        if (committed_entries.len == 0 and read_states.len == 0) return;
+        if (snapshot == null and committed_entries.len == 0 and read_states.len == 0) return;
 
         var cloned_read_states = try self.alloc.alloc(core.ReadState, read_states.len);
-        errdefer self.alloc.free(cloned_read_states);
-        for (read_states, 0..) |read_state, i| cloned_read_states[i] = try read_state.clone(self.alloc);
+        var cloned_read_state_count: usize = 0;
+        var read_states_owned = true;
+        errdefer if (read_states_owned) {
+            for (cloned_read_states[0..cloned_read_state_count]) |*read_state| read_state.deinit(self.alloc);
+            if (cloned_read_states.len > 0) self.alloc.free(cloned_read_states);
+        };
+        for (read_states, 0..) |read_state, i| {
+            cloned_read_states[i] = try read_state.clone(self.alloc);
+            cloned_read_state_count += 1;
+        }
 
-        try self.pending_apply.append(self.alloc, .{
+        var cloned_snapshot = if (snapshot) |value| try value.clone(self.alloc) else null;
+        var snapshot_owned = true;
+        errdefer if (snapshot_owned) if (cloned_snapshot) |*value| value.deinit(self.alloc);
+        const cloned_entries = try core.types.cloneEntries(self.alloc, committed_entries);
+        var entries_owned = true;
+        errdefer if (entries_owned) core.types.freeEntries(self.alloc, cloned_entries);
+        var task: PendingApplyTask = .{
             .group_id = group_id,
-            .entries = try core.types.cloneEntries(self.alloc, committed_entries),
+            .snapshot = cloned_snapshot,
+            .entries = cloned_entries,
             .read_states = cloned_read_states,
-            .approx_bytes = core.types.entriesApproxEncodedSize(committed_entries) + approxReadStatesSize(read_states),
-        });
+            .approx_bytes = core.types.entriesApproxEncodedSize(committed_entries) +
+                approxReadStatesSize(read_states) +
+                if (snapshot) |value| value.data.len else 0,
+        };
+        read_states_owned = false;
+        snapshot_owned = false;
+        entries_owned = false;
+        self.pending_apply.append(self.alloc, task) catch |err| {
+            task.deinit(self.alloc);
+            return err;
+        };
+        if (snapshot != null) {
+            _ = self.snapshot_candidates.remove(group_id);
+            self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
+        }
     }
 
     fn flushPendingApply(self: *MultiRaft) !void {
-        if (self.pending_apply.items.len == 0) return;
+        if (self.pending_apply.items.len == 0) {
+            self.runSnapshotMaintenance();
+            return;
+        }
 
         const drain_count = @min(self.cfg.max_apply_tasks_per_round, self.pending_apply.items.len);
         if (drain_count == 0) return;
 
+        var completed: usize = 0;
+        var apply_failure: ?anyerror = null;
         if (self.hooks.apply_queue) |apply_queue| {
             for (self.pending_apply.items[0..drain_count]) |task| {
-                try apply_queue.enqueueApply(task.group_id, task.entries, task.read_states);
+                apply_queue.enqueueApply(task.group_id, task.snapshot, task.entries, task.read_states) catch |err| {
+                    apply_queue.abort();
+                    return err;
+                };
             }
-            try apply_queue.drain();
+            const result = apply_queue.drain();
+            completed = result.completed;
+            apply_failure = result.failure;
+            if (completed > drain_count) {
+                apply_queue.abort();
+                return error.InvalidApplyProgress;
+            }
+            if (apply_failure == null and completed != drain_count) {
+                apply_failure = error.IncompleteApplyDrain;
+            } else if (apply_failure != null and completed == drain_count) {
+                apply_failure = error.InvalidApplyProgress;
+            }
+            apply_queue.abort();
             self.metrics.apply_queue_drains += 1;
         } else if (self.hooks.state_machine) |state_machine| {
             for (self.pending_apply.items[0..drain_count]) |task| {
-                try state_machine.applyReady(task.group_id, task.entries, task.read_states);
+                state_machine.applyReady(task.group_id, task.snapshot, task.entries, task.read_states) catch |err| {
+                    apply_failure = err;
+                    break;
+                };
+                completed += 1;
             }
+        } else {
+            completed = drain_count;
         }
-        try self.compactAppliedLogs(self.pending_apply.items[0..drain_count]);
 
-        self.consumePendingApplyPrefix(drain_count);
+        const applied_snapshot = self.scheduleAppliedLogCompaction(self.pending_apply.items[0..completed]);
+        self.consumePendingApplyPrefix(completed);
+        if (apply_failure) |err| return err;
+
+        // Async Ready advances its RawNode after apply drains. Defer maintenance
+        // for a round so an incoming snapshot is visible before stale local
+        // compaction results are considered for publication.
+        if (!applied_snapshot) self.runSnapshotMaintenance();
     }
 
-    fn compactAppliedLogs(self: *MultiRaft, tasks: []const PendingApplyTask) !void {
-        if (self.cfg.applied_log_retained_entries == 0) return;
-        for (tasks) |task| {
+    fn scheduleAppliedLogCompaction(self: *MultiRaft, tasks: []const PendingApplyTask) bool {
+        var applied_snapshot = false;
+        if (self.cfg.applied_log_retained_entries == 0) {
+            for (tasks) |task| applied_snapshot = applied_snapshot or task.snapshot != null;
+            return applied_snapshot;
+        }
+        for (tasks, 0..) |task, task_index| {
+            if (task.snapshot != null) {
+                applied_snapshot = true;
+                _ = self.snapshot_candidates.remove(task.group_id);
+            }
             if (task.entries.len == 0) continue;
+            var has_later_group_entries = false;
+            for (tasks[task_index + 1 ..]) |later| {
+                if (later.group_id == task.group_id and later.entries.len > 0) {
+                    has_later_group_entries = true;
+                    break;
+                }
+            }
+            if (has_later_group_entries) continue;
             const last_applied = task.entries[task.entries.len - 1].index;
-            if (last_applied <= self.cfg.applied_log_retained_entries) continue;
-            const compact_index = last_applied - self.cfg.applied_log_retained_entries;
-            const grp = self.groups.getPtr(task.group_id) orelse continue;
-            if (self.cfg.applied_log_compaction_single_node_only and grp.status().conf_state.voters.len != 1) continue;
-            const first_index = grp.raw_node.raft.log.firstIndex();
-            if (compact_index < first_index) continue;
-            const snapshot_index = first_index - 1;
-            if (self.cfg.applied_log_compaction_min_interval_entries > 0 and
-                compact_index - snapshot_index < self.cfg.applied_log_compaction_min_interval_entries)
-            {
+            const incarnation = self.group_incarnations.get(task.group_id) orelse continue;
+            self.queueSnapshotCandidate(task.group_id, last_applied, incarnation, false) catch |err| {
+                self.metrics.snapshot_compaction_failures += 1;
+                std.log.warn("raft snapshot compaction candidate deferred group_id={d} applied_index={d} error={s}", .{
+                    task.group_id,
+                    last_applied,
+                    @errorName(err),
+                });
+            };
+        }
+        self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
+        return applied_snapshot;
+    }
+
+    fn runSnapshotMaintenance(self: *MultiRaft) void {
+        self.publishCompletedSnapshotCompaction() catch |err| {
+            self.metrics.snapshot_compaction_failures += 1;
+            std.log.warn("raft snapshot compaction publication maintenance deferred error={s}", .{@errorName(err)});
+            return;
+        };
+        self.dispatchNextSnapshotCompaction() catch |err| {
+            self.metrics.snapshot_compaction_failures += 1;
+            std.log.warn("raft snapshot compaction dispatch maintenance deferred error={s}", .{@errorName(err)});
+        };
+    }
+
+    fn queueSnapshotCandidate(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        applied_index: core.types.Index,
+        incarnation: u64,
+        retry: bool,
+    ) !void {
+        const candidate = try self.snapshot_candidates.getOrPut(self.alloc, group_id);
+        if (!candidate.found_existing or candidate.value_ptr.incarnation != incarnation) {
+            candidate.value_ptr.* = .{
+                .applied_index = applied_index,
+                .incarnation = incarnation,
+                .enqueue_sequence = self.takeSnapshotCandidateSequence(),
+            };
+        } else if (applied_index > candidate.value_ptr.applied_index) {
+            candidate.value_ptr.applied_index = applied_index;
+        }
+        if (retry) {
+            candidate.value_ptr.retry_attempt +|= 1;
+            candidate.value_ptr.retry_after_ns = clock.monotonicNs() + snapshotRetryDelayNs(candidate.value_ptr.retry_attempt);
+            self.metrics.snapshot_compaction_retries += 1;
+        }
+    }
+
+    fn takeSnapshotCandidateSequence(self: *MultiRaft) u64 {
+        const sequence = self.next_snapshot_candidate_sequence;
+        self.next_snapshot_candidate_sequence +%= 1;
+        if (self.next_snapshot_candidate_sequence == 0) self.next_snapshot_candidate_sequence = 1;
+        return sequence;
+    }
+
+    fn dispatchNextSnapshotCompaction(self: *MultiRaft) !void {
+        if (self.cfg.applied_log_retained_entries == 0 or self.snapshot_candidates.count() == 0) return;
+        defer self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
+        if (self.snapshot_publish != null) return;
+        const state_machine = self.hooks.state_machine orelse return;
+        if (state_machine.vtable.prepare_snapshot == null) {
+            self.snapshot_candidates.clearRetainingCapacity();
+            return;
+        }
+        if (self.hooks.group_storage == null) return;
+        const worker = try self.ensureSnapshotWorker();
+        if (!worker.canSubmit()) {
+            self.metrics.snapshot_compaction_busy_skips += 1;
+            return;
+        }
+
+        while (self.snapshot_candidates.count() > 0) {
+            const now_ns = clock.monotonicNs();
+            var selected_group_id: ?core.types.GroupId = null;
+            var selected: SnapshotCandidate = undefined;
+            var candidates = self.snapshot_candidates.iterator();
+            while (candidates.next()) |candidate| {
+                if (candidate.value_ptr.retry_after_ns > now_ns) continue;
+                if (selected_group_id == null or candidate.value_ptr.enqueue_sequence < selected.enqueue_sequence) {
+                    selected_group_id = candidate.key_ptr.*;
+                    selected = candidate.value_ptr.*;
+                }
+            }
+            const group_id = selected_group_id orelse return;
+            const last_applied = selected.applied_index;
+            const incarnation = selected.incarnation;
+            if (self.group_incarnations.get(group_id) != incarnation) {
+                _ = self.snapshot_candidates.remove(group_id);
                 continue;
             }
-            try grp.compactAppliedLogTo(compact_index);
+            const grp = self.groups.getPtr(group_id) orelse {
+                _ = self.snapshot_candidates.remove(group_id);
+                continue;
+            };
+            if (last_applied <= self.cfg.applied_log_retained_entries) {
+                _ = self.snapshot_candidates.remove(group_id);
+                continue;
+            }
+            const compact_index = last_applied - self.cfg.applied_log_retained_entries;
+            if (self.cfg.applied_log_compaction_single_node_only and grp.status().conf_state.voters.len != 1) {
+                _ = self.snapshot_candidates.remove(group_id);
+                continue;
+            }
+            const first_index = grp.raw_node.raft.log.firstIndex();
+            if (compact_index < first_index) {
+                _ = self.snapshot_candidates.remove(group_id);
+                continue;
+            }
+            const compacted_index = first_index - 1;
+            if (self.cfg.applied_log_compaction_min_interval_entries > 0 and
+                compact_index - compacted_index < self.cfg.applied_log_compaction_min_interval_entries)
+            {
+                _ = self.snapshot_candidates.remove(group_id);
+                continue;
+            }
+            const source = (state_machine.prepareSnapshot(group_id, last_applied) catch |err| {
+                self.metrics.snapshot_compaction_failures += 1;
+                try self.queueSnapshotCandidate(group_id, last_applied, incarnation, true);
+                std.log.warn("raft snapshot compaction preparation deferred group_id={d} applied_index={d} error={s}", .{
+                    group_id,
+                    last_applied,
+                    @errorName(err),
+                });
+                return;
+            }) orelse {
+                _ = self.snapshot_candidates.remove(group_id);
+                continue;
+            };
+            var source_owned = true;
+            defer if (source_owned) source.deinit();
+            const status = grp.status();
+            const snapshot_term = grp.termAt(last_applied) catch |err| {
+                if (err == error.IndexNotFound) {
+                    _ = self.snapshot_candidates.remove(group_id);
+                    self.metrics.snapshot_compaction_stale_drops += 1;
+                    continue;
+                }
+                self.metrics.snapshot_compaction_failures += 1;
+                try self.queueSnapshotCandidate(group_id, last_applied, incarnation, true);
+                std.log.warn("raft snapshot compaction term lookup deferred group_id={d} applied_index={d} error={s}", .{
+                    group_id,
+                    last_applied,
+                    @errorName(err),
+                });
+                return;
+            };
+            var metadata = core.types.SnapshotMetadata{
+                .index = last_applied,
+                .term = snapshot_term,
+                .conf_state = try status.conf_state.clone(std.heap.page_allocator),
+            };
+            var metadata_owned = true;
+            defer if (metadata_owned) metadata.deinit(std.heap.page_allocator);
+            if (!worker.submit(.{
+                .group_id = group_id,
+                .incarnation = incarnation,
+                .compact_index = compact_index,
+                .source = source,
+                .metadata = metadata,
+            })) {
+                self.metrics.snapshot_compaction_busy_skips += 1;
+                return;
+            }
+            source_owned = false;
+            metadata_owned = false;
+            _ = self.snapshot_candidates.remove(group_id);
+            self.metrics.snapshot_compaction_requests += 1;
+            return;
         }
+    }
+
+    fn ensureSnapshotWorker(self: *MultiRaft) !*SnapshotBuildWorker {
+        if (self.snapshot_worker) |worker| return worker;
+        const worker = try self.alloc.create(SnapshotBuildWorker);
+        errdefer self.alloc.destroy(worker);
+        worker.* = .{ .io_impl = std.Io.Threaded.init(self.alloc, .{}) };
+        errdefer worker.io_impl.deinit();
+        try worker.start();
+        self.snapshot_worker = worker;
+        return worker;
+    }
+
+    fn publishCompletedSnapshotCompaction(self: *MultiRaft) !void {
+        if (self.snapshot_publish == null) {
+            const worker = self.snapshot_worker orelse return;
+            self.snapshot_publish = worker.takeResult();
+        }
+        const result = if (self.snapshot_publish) |*value| value else return;
+        if (self.snapshot_publish_retry_after_ns > clock.monotonicNs()) return;
+        switch (result.*) {
+            .failure => |failure| {
+                self.metrics.snapshot_compaction_failures += 1;
+                std.log.warn("raft snapshot compaction build failed group_id={d} applied_index={d} error={s}", .{
+                    failure.group_id,
+                    failure.applied_index,
+                    @errorName(failure.cause),
+                });
+                if (self.group_incarnations.get(failure.group_id) == failure.incarnation) {
+                    try self.queueSnapshotCandidate(failure.group_id, failure.applied_index, failure.incarnation, true);
+                }
+                self.snapshot_publish = null;
+                self.snapshot_publish_retry_attempt = 0;
+                self.snapshot_publish_retry_after_ns = 0;
+                self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
+            },
+            .success => |*completed| {
+                if (self.group_incarnations.get(completed.group_id) != completed.incarnation) {
+                    self.metrics.snapshot_compaction_stale_drops += 1;
+                    self.clearSnapshotPublish(result);
+                    return;
+                }
+                const grp = self.groups.getPtr(completed.group_id) orelse {
+                    self.clearSnapshotPublish(result);
+                    return;
+                };
+                const current_compacted_index = grp.raw_node.raft.log.firstIndex() - 1;
+                if (completed.metadata.index < current_compacted_index or
+                    completed.compact_index < current_compacted_index)
+                {
+                    self.metrics.snapshot_compaction_stale_drops += 1;
+                    self.clearSnapshotPublish(result);
+                    return;
+                }
+                const group_storage = self.hooks.group_storage orelse return;
+                const publish_result = switch (completed.payload) {
+                    .bytes => |bytes| group_storage.compactSnapshot(completed.group_id, .{
+                        .metadata = completed.metadata,
+                        .data = bytes,
+                    }, completed.compact_index),
+                    .artifact => |artifact| group_storage.compactSnapshotArtifact(
+                        std.heap.page_allocator,
+                        completed.group_id,
+                        completed.metadata,
+                        artifact,
+                        completed.compact_index,
+                    ),
+                };
+                publish_result catch |err| {
+                    self.metrics.snapshot_compaction_failures += 1;
+                    self.snapshot_publish_retry_attempt +|= 1;
+                    self.snapshot_publish_retry_after_ns = clock.monotonicNs() + snapshotRetryDelayNs(self.snapshot_publish_retry_attempt);
+                    self.metrics.snapshot_compaction_retries += 1;
+                    std.log.warn("raft snapshot compaction publish deferred group_id={d} applied_index={d} attempt={d} error={s}", .{
+                        completed.group_id,
+                        completed.metadata.index,
+                        self.snapshot_publish_retry_attempt,
+                        @errorName(err),
+                    });
+                    if (self.snapshot_publish_retry_attempt >= snapshot_publish_inline_retry_limit) {
+                        try self.queueSnapshotCandidate(
+                            completed.group_id,
+                            completed.metadata.index,
+                            completed.incarnation,
+                            true,
+                        );
+                        self.clearSnapshotPublish(result);
+                        self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
+                    }
+                    return;
+                };
+                try grp.compactAppliedLogTo(completed.compact_index);
+                self.metrics.snapshot_compaction_completions += 1;
+                self.metrics.snapshot_compaction_bytes += @intCast(completed.payload.len());
+                self.metrics.snapshot_compaction_build_ns += completed.build_ns;
+                self.clearSnapshotPublish(result);
+            },
+        }
+    }
+
+    fn clearSnapshotPublish(self: *MultiRaft, result: *SnapshotBuildResult) void {
+        result.deinit();
+        self.snapshot_publish = null;
+        self.snapshot_publish_retry_attempt = 0;
+        self.snapshot_publish_retry_after_ns = 0;
     }
 
     fn refreshMetricsTopology(self: *MultiRaft) void {
@@ -864,6 +1471,19 @@ pub const MultiRaft = struct {
         const remaining = self.pending_apply.items.len - count;
         std.mem.copyForwards(PendingApplyTask, self.pending_apply.items[0..remaining], self.pending_apply.items[count..]);
         self.pending_apply.items.len = remaining;
+    }
+
+    fn removePendingAppliesForGroup(self: *MultiRaft, group_id: core.types.GroupId) void {
+        var retained: usize = 0;
+        for (self.pending_apply.items, 0..) |*task, index| {
+            if (task.group_id == group_id) {
+                task.deinit(self.alloc);
+                continue;
+            }
+            if (retained != index) self.pending_apply.items[retained] = task.*;
+            retained += 1;
+        }
+        self.pending_apply.items.len = retained;
     }
 
     fn resumeOnActivity(self: *MultiRaft, group_id: core.types.GroupId) !void {
@@ -986,6 +1606,23 @@ fn approxReadStatesSize(read_states: []const core.ReadState) usize {
     var total: usize = 0;
     for (read_states) |read_state| total += 16 + read_state.request_ctx.len;
     return total;
+}
+
+test "snapshot candidate coalescing ignores later read-only apply work" {
+    var host = MultiRaft.init(std.testing.allocator, .{ .applied_log_retained_entries = 2 }, .{});
+    defer host.deinit();
+    try host.group_incarnations.put(std.testing.allocator, 7, 1);
+
+    var entries = [_]core.Entry{.{ .term = 1, .index = 5 }};
+    var read_states = [_]core.ReadState{.{ .index = 5, .request_ctx = &.{} }};
+    const tasks = [_]PendingApplyTask{
+        .{ .group_id = 7, .snapshot = null, .entries = &entries, .read_states = &.{}, .approx_bytes = 0 },
+        .{ .group_id = 7, .snapshot = null, .entries = &.{}, .read_states = &read_states, .approx_bytes = 0 },
+    };
+
+    try std.testing.expect(!host.scheduleAppliedLogCompaction(&tasks));
+    const candidate = host.snapshot_candidates.get(7) orelse return error.MissingSnapshotCandidate;
+    try std.testing.expectEqual(@as(core.types.Index, 5), candidate.applied_index);
 }
 
 const GroupBatchBuilder = struct {

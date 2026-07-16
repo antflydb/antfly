@@ -2256,6 +2256,7 @@ const EncodedTransitionAction = struct {
         rollback_merge,
     },
     transition_id: u64,
+    attempt_epoch: u64 = 0,
     source_group_id: ?u64 = null,
     destination_group_id: ?u64 = null,
     donor_group_id: ?u64 = null,
@@ -2272,6 +2273,7 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
         .prepare_split_source => |op| .{
             .kind = .prepare_split_source,
             .transition_id = op.transition_id,
+            .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
             .split_key = op.split_key,
@@ -2280,12 +2282,14 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
         .start_split_source => |op| .{
             .kind = .start_split_source,
             .transition_id = op.transition_id,
+            .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
         },
         .bootstrap_split_destination => |op| .{
             .kind = .bootstrap_split_destination,
             .transition_id = op.transition_id,
+            .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
             .destination_base_uri = op.destination_base_uri,
@@ -2293,6 +2297,7 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
         .catch_up_split_destination => |op| .{
             .kind = .catch_up_split_destination,
             .transition_id = op.transition_id,
+            .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
             .destination_base_uri = op.destination_base_uri,
@@ -2300,12 +2305,14 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
         .finalize_split_source => |op| .{
             .kind = .finalize_split_source,
             .transition_id = op.transition_id,
+            .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
         },
         .rollback_split => |op| .{
             .kind = .rollback_split,
             .transition_id = op.transition_id,
+            .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
         },

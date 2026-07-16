@@ -165,6 +165,9 @@ pub const HostMetrics = struct {
     runtime_pending_apply_bytes: usize = 0,
     runtime_transport_queue_denials: usize = 0,
     runtime_apply_queue_denials: usize = 0,
+    runtime_snapshot_compaction_completions: usize = 0,
+    runtime_snapshot_compaction_failures: usize = 0,
+    runtime_snapshot_compaction_candidates: usize = 0,
     backup_bootstrap_attempts: usize = 0,
     backup_bootstrap_failures: usize = 0,
     backup_bootstrap_successes: usize = 0,
@@ -359,12 +362,15 @@ pub const Host = struct {
     }
 
     pub fn removeReplica(self: *Host, group_id: u64) !void {
-        try self.runtime_host.removeReplica(group_id);
-        self.metrics.remove_replica_calls += 1;
-        self.clearBootstrapStatus(group_id);
+        if (self.runtime_host.group(group_id) == null) return error.UnknownGroup;
+        // Persist removal intent before tearing down the live owner. A catalog
+        // failure therefore remains retryable through normal reconciliation.
         if (self.deps.replica_catalog) |replica_catalog| {
             _ = try replica_catalog.removeReplica(group_id);
         }
+        try self.runtime_host.removeReplica(group_id);
+        self.metrics.remove_replica_calls += 1;
+        self.clearBootstrapStatus(group_id);
     }
 
     pub fn refreshPeerEndpoints(self: *Host, group_id: u64, node_id: u64) !usize {
@@ -486,6 +492,9 @@ pub const Host = struct {
         snapshot.runtime_pending_apply_bytes = runtime_metrics.pending_apply_bytes;
         snapshot.runtime_transport_queue_denials = runtime_metrics.transport_queue_denials;
         snapshot.runtime_apply_queue_denials = runtime_metrics.apply_queue_denials;
+        snapshot.runtime_snapshot_compaction_completions = runtime_metrics.snapshot_compaction_completions;
+        snapshot.runtime_snapshot_compaction_failures = runtime_metrics.snapshot_compaction_failures;
+        snapshot.runtime_snapshot_compaction_candidates = runtime_metrics.snapshot_compaction_candidates;
         return snapshot;
     }
 
@@ -1080,11 +1089,42 @@ test "host can ensure and remove a replica" {
         }
     };
 
+    const RemovalCatalog = struct {
+        fail_remove: bool = true,
+        remove_calls: usize = 0,
+
+        fn iface(self: *@This()) catalog.ReplicaCatalog {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .upsert_replica = upsertReplica,
+                    .remove_replica = removeReplica,
+                    .list_replicas = listReplicas,
+                },
+            };
+        }
+
+        fn upsertReplica(_: *anyopaque, _: catalog.ReplicaRecord) !void {}
+
+        fn removeReplica(ptr: *anyopaque, _: u64) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.remove_calls += 1;
+            if (self.fail_remove) return error.InjectedCatalogRemovalFailure;
+            return true;
+        }
+
+        fn listReplicas(_: *anyopaque, alloc: std.mem.Allocator) ![]catalog.ReplicaRecord {
+            return try alloc.alloc(catalog.ReplicaRecord, 0);
+        }
+    };
+
     var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
     var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
+    var replica_catalog = RemovalCatalog{};
     var host = Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
         .descriptor_factory = factory.iface(),
+        .replica_catalog = replica_catalog.iface(),
     });
     defer host.deinit();
 
@@ -1096,8 +1136,13 @@ test "host can ensure and remove a replica" {
     try std.testing.expectEqual(.active, host.status(41));
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().hosted_groups);
 
+    try std.testing.expectError(error.InjectedCatalogRemovalFailure, host.removeReplica(41));
+    try std.testing.expectEqual(.active, host.status(41));
+
+    replica_catalog.fail_remove = false;
     try host.removeReplica(41);
     try std.testing.expectEqual(.absent, host.status(41));
+    try std.testing.expectEqual(@as(usize, 2), replica_catalog.remove_calls);
 }
 
 test "host rejects live snapshot uploads addressed to another node" {

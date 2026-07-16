@@ -17,7 +17,7 @@ func basePool() *antflyaiv1alpha1.InferencePool {
 		Spec: antflyaiv1alpha1.InferencePoolSpec{
 			Models: antflyaiv1alpha1.ModelConfig{
 				Preload: []antflyaiv1alpha1.ModelSpec{
-					{Name: "bge-small-en-v1.5"},
+					{Name: "bge-small-en-v1.5", Kind: antflyaiv1alpha1.ModelKindEmbedder},
 				},
 			},
 			Replicas: antflyaiv1alpha1.ReplicaConfig{Min: 1, Max: 3},

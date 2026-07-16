@@ -63,8 +63,7 @@ DOCUMENTS_INDEXES = {
     # index parse ignores it while the provisioner registers it.
     "relations_graph": {
         "type": "graph",
-        "source": {
-            "kind": "artifact",
+        "sources": [{
             "artifact": "relations_v1",
             "path": "$.relations[*]",
             "format": "extraction_relation",
@@ -73,13 +72,13 @@ DOCUMENTS_INDEXES = {
             # document can hydrate the canonical entity cross-table (DocRef
             # hydration routing).
             "mention_edge_type": "mentions",
-        },
-        "artifact": {
+        }],
+        "enrichments": [{
             "name": "relations_v1",
             "kind": "asset",
             "field": "relations",
             "content_type": "application/json",
-        },
+        }],
         "edge_types": [{"name": "mentions"}],
         # Prefix blocking links a mention to an existing entity under the same
         # `label/` namespace (cross-shard read of the entities table).

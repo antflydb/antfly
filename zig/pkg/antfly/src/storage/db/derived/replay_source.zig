@@ -18,6 +18,7 @@ const backend_erased = @import("../../backend_erased.zig");
 const change_journal_mod = @import("change_journal.zig");
 const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
+const enrichment_types = @import("../enrichment/enrichment_types.zig");
 const mem_backend_mod = @import("../../mem_backend.zig");
 const platform_time = @import("antfly_platform").time;
 
@@ -26,6 +27,22 @@ pub const TargetHint = change_journal_mod.TargetHint;
 pub const PendingDocumentGroup = struct {
     sequence: u64,
     doc_key: []const u8,
+    /// Empty when this is an unscoped replay record and every configured
+    /// enrichment for the document must be planned.
+    generated_enrichment_refs: []const enrichment_types.GeneratedEnrichmentRef = &.{},
+    all_targets: bool = true,
+};
+
+const PendingDocumentGroupBuilder = struct {
+    sequence: u64,
+    doc_key: []const u8,
+    generated_enrichment_refs: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef) = .empty,
+    all_targets: bool = false,
+
+    fn deinit(self: *PendingDocumentGroupBuilder, alloc: Allocator) void {
+        for (self.generated_enrichment_refs.items) |ref| enrichment_types.freeGeneratedRef(alloc, ref);
+        self.generated_enrichment_refs.deinit(alloc);
+    }
 };
 
 pub const StopReplayChunk = error{StopReplayChunk};
@@ -183,7 +200,12 @@ pub const Source = struct {
 };
 
 pub fn freePendingDocumentGroups(alloc: Allocator, groups: []PendingDocumentGroup) void {
-    for (groups) |group| alloc.free(group.doc_key);
+    for (groups) |group| {
+        alloc.free(group.doc_key);
+        if (group.generated_enrichment_refs.len > 0) {
+            enrichment_types.deinitGeneratedRefs(alloc, group.generated_enrichment_refs);
+        }
+    }
     alloc.free(groups);
 }
 
@@ -565,12 +587,12 @@ fn primaryStoreLatestMatchingSequence(
 }
 
 fn primaryStoreCollectEnrichmentDocumentGroups(ptr: *anyopaque, alloc: Allocator, from_sequence: u64) ![]PendingDocumentGroup {
-    var pending = std.StringHashMapUnmanaged(PendingDocumentGroup).empty;
+    var pending = std.StringHashMapUnmanaged(PendingDocumentGroupBuilder).empty;
     errdefer cleanupPendingDocumentGroupMap(alloc, &pending);
 
     const Context = struct {
         alloc: Allocator,
-        pending: *std.StringHashMapUnmanaged(PendingDocumentGroup),
+        pending: *std.StringHashMapUnmanaged(PendingDocumentGroupBuilder),
 
         fn consume(ctx_ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
             const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
@@ -578,9 +600,7 @@ fn primaryStoreCollectEnrichmentDocumentGroups(ptr: *anyopaque, alloc: Allocator
             defer record.deinit();
             if (!recordHasEnrichmentHint(record.record)) return;
 
-            for (record.record.changed_doc_keys) |doc_key| {
-                try appendPendingDocumentGroup(ctx.alloc, ctx.pending, sequence, doc_key);
-            }
+            try appendRecordPendingDocumentGroups(ctx.alloc, ctx.pending, sequence, record.record);
         }
     };
 
@@ -606,7 +626,7 @@ fn primaryStoreIsSequenceVisible(ptr: *anyopaque, sequence: u64) !bool {
 }
 
 fn collectEnrichmentDocumentGroupsFromEntries(alloc: Allocator, entries: anytype) ![]PendingDocumentGroup {
-    var pending = std.StringHashMapUnmanaged(PendingDocumentGroup).empty;
+    var pending = std.StringHashMapUnmanaged(PendingDocumentGroupBuilder).empty;
     errdefer cleanupPendingDocumentGroupMap(alloc, &pending);
 
     for (entries) |entry| {
@@ -614,49 +634,106 @@ fn collectEnrichmentDocumentGroupsFromEntries(alloc: Allocator, entries: anytype
         defer record.deinit();
         if (!recordHasEnrichmentHint(record.record)) continue;
 
-        for (record.record.changed_doc_keys) |doc_key| {
-            try appendPendingDocumentGroup(alloc, &pending, entry.sequence, doc_key);
-        }
+        try appendRecordPendingDocumentGroups(alloc, &pending, entry.sequence, record.record);
     }
 
     return try pendingDocumentGroupsToOwnedSlice(alloc, &pending);
 }
 
-fn cleanupPendingDocumentGroupMap(alloc: Allocator, pending: *std.StringHashMapUnmanaged(PendingDocumentGroup)) void {
+fn cleanupPendingDocumentGroupMap(alloc: Allocator, pending: *std.StringHashMapUnmanaged(PendingDocumentGroupBuilder)) void {
     var it = pending.iterator();
-    while (it.next()) |entry| alloc.free(entry.key_ptr.*);
+    while (it.next()) |entry| {
+        entry.value_ptr.deinit(alloc);
+        alloc.free(entry.key_ptr.*);
+    }
     pending.deinit(alloc);
+}
+
+fn appendRecordPendingDocumentGroups(
+    alloc: Allocator,
+    pending: *std.StringHashMapUnmanaged(PendingDocumentGroupBuilder),
+    sequence: u64,
+    record: change_journal_mod.Record,
+) !void {
+    if (record.generated_enrichment_refs.len == 0) {
+        for (record.changed_doc_keys) |doc_key| {
+            try appendPendingDocumentGroup(alloc, pending, sequence, doc_key, null);
+        }
+        return;
+    }
+    for (record.generated_enrichment_refs) |ref| {
+        try appendPendingDocumentGroup(alloc, pending, sequence, ref.doc_key, ref);
+    }
 }
 
 fn appendPendingDocumentGroup(
     alloc: Allocator,
-    pending: *std.StringHashMapUnmanaged(PendingDocumentGroup),
+    pending: *std.StringHashMapUnmanaged(PendingDocumentGroupBuilder),
     sequence: u64,
     doc_key: []const u8,
+    generated_ref: ?enrichment_types.GeneratedEnrichmentRef,
 ) !void {
     const owned_key = try alloc.dupe(u8, doc_key);
-    errdefer alloc.free(owned_key);
+    var key_owned = true;
+    errdefer if (key_owned) alloc.free(owned_key);
     const gop = try pending.getOrPut(alloc, owned_key);
     if (gop.found_existing) {
         alloc.free(owned_key);
+        key_owned = false;
     } else {
+        key_owned = false;
         gop.key_ptr.* = owned_key;
+        gop.value_ptr.* = .{
+            .sequence = sequence,
+            .doc_key = gop.key_ptr.*,
+        };
     }
-    gop.value_ptr.* = .{
-        .sequence = sequence,
-        .doc_key = gop.key_ptr.*,
-    };
+    gop.value_ptr.sequence = @max(gop.value_ptr.sequence, sequence);
+    if (generated_ref) |ref| {
+        if (gop.value_ptr.all_targets) return;
+        for (gop.value_ptr.generated_enrichment_refs.items) |existing| {
+            if (generatedRefsEqual(existing, ref)) return;
+        }
+        const cloned = try enrichment_types.cloneGeneratedRef(alloc, ref);
+        errdefer enrichment_types.freeGeneratedRef(alloc, cloned);
+        try gop.value_ptr.generated_enrichment_refs.append(alloc, cloned);
+    } else {
+        gop.value_ptr.all_targets = true;
+        for (gop.value_ptr.generated_enrichment_refs.items) |ref| enrichment_types.freeGeneratedRef(alloc, ref);
+        gop.value_ptr.generated_enrichment_refs.clearRetainingCapacity();
+    }
+}
+
+fn generatedRefsEqual(lhs: enrichment_types.GeneratedEnrichmentRef, rhs: enrichment_types.GeneratedEnrichmentRef) bool {
+    return lhs.kind == rhs.kind and
+        std.mem.eql(u8, lhs.index_name, rhs.index_name) and
+        std.mem.eql(u8, lhs.artifact_name, rhs.artifact_name) and
+        std.mem.eql(u8, lhs.embedding_name, rhs.embedding_name) and
+        std.mem.eql(u8, lhs.doc_key, rhs.doc_key);
 }
 
 fn pendingDocumentGroupsToOwnedSlice(
     alloc: Allocator,
-    pending: *std.StringHashMapUnmanaged(PendingDocumentGroup),
+    pending: *std.StringHashMapUnmanaged(PendingDocumentGroupBuilder),
 ) ![]PendingDocumentGroup {
     var groups = try alloc.alloc(PendingDocumentGroup, pending.count());
     var index: usize = 0;
+    errdefer {
+        for (groups[0..index]) |group| {
+            if (group.generated_enrichment_refs.len > 0) {
+                enrichment_types.deinitGeneratedRefs(alloc, group.generated_enrichment_refs);
+            }
+        }
+        alloc.free(groups);
+    }
     var it = pending.iterator();
     while (it.next()) |entry| : (index += 1) {
-        groups[index] = entry.value_ptr.*;
+        groups[index] = .{
+            .sequence = entry.value_ptr.sequence,
+            .doc_key = entry.value_ptr.doc_key,
+            .generated_enrichment_refs = try entry.value_ptr.generated_enrichment_refs.toOwnedSlice(alloc),
+            .all_targets = entry.value_ptr.all_targets,
+        };
     }
     pending.deinit(alloc);
 

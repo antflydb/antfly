@@ -181,9 +181,14 @@ fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
 }
 
 pub const ProvisionedGroupStorage = struct {
+    const VisibleRootGeneration = struct {
+        generation: u64 = table_reads.backend_current_root_generation,
+        reservations: usize = 0,
+    };
+
     alloc: std.mem.Allocator,
     group_visible_root_generation_mutex: std.atomic.Mutex = .unlocked,
-    group_visible_root_generations: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    group_visible_root_generations: std.AutoHashMapUnmanaged(u64, VisibleRootGeneration) = .empty,
     resource_manager: resource_manager_mod.ResourceManager,
     filesystem_capacity_probe: ?filesystem_capacity.Probe = null,
     lsm_cache: lsm_backend.Cache,
@@ -298,7 +303,16 @@ pub const ProvisionedGroupStorage = struct {
     pub fn visibleRootGenerationForGroup(self: *ProvisionedGroupStorage, group_id: u64) u64 {
         lockAtomic(&self.group_visible_root_generation_mutex);
         defer self.group_visible_root_generation_mutex.unlock();
-        return self.group_visible_root_generations.get(group_id) orelse table_reads.backend_current_root_generation;
+        return if (self.group_visible_root_generations.get(group_id)) |entry| entry.generation else table_reads.backend_current_root_generation;
+    }
+
+    /// Publish schema/index metadata reconciled into the currently visible
+    /// physical roots. Query owners and artifact handles must reopen, but the
+    /// root generation must remain stable: advancing it would fence the one
+    /// live writer even though no root replacement occurred.
+    pub fn invalidateInPlaceMetadataReconcileCaches(self: *ProvisionedGroupStorage) void {
+        self.read_cache.clear();
+        self.hbc_cache.clear();
     }
 
     pub fn bumpGroupVisibleRootGenerations(self: *ProvisionedGroupStorage, group_ids: []const u64) !void {
@@ -307,10 +321,30 @@ pub const ProvisionedGroupStorage = struct {
         for (group_ids) |group_id| {
             const entry = try self.group_visible_root_generations.getOrPut(self.alloc, group_id);
             if (entry.found_existing) {
-                entry.value_ptr.* +%= 1;
+                entry.value_ptr.generation +%= 1;
             } else {
-                entry.value_ptr.* = 1;
+                entry.value_ptr.* = .{ .generation = 1 };
             }
+        }
+    }
+
+    fn reserveGroupVisibleRootGeneration(self: *ProvisionedGroupStorage, group_id: u64) !void {
+        lockAtomic(&self.group_visible_root_generation_mutex);
+        defer self.group_visible_root_generation_mutex.unlock();
+        const entry = try self.group_visible_root_generations.getOrPut(self.alloc, group_id);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        entry.value_ptr.reservations = std.math.add(usize, entry.value_ptr.reservations, 1) catch return error.TooManyGenerationReservations;
+    }
+
+    fn finishGroupVisibleRootGenerationReservation(self: *ProvisionedGroupStorage, group_id: u64, advance: bool) void {
+        lockAtomic(&self.group_visible_root_generation_mutex);
+        defer self.group_visible_root_generation_mutex.unlock();
+        const entry = self.group_visible_root_generations.getPtr(group_id) orelse unreachable;
+        std.debug.assert(entry.reservations > 0);
+        if (advance) entry.generation +%= 1;
+        entry.reservations -= 1;
+        if (!advance and entry.reservations == 0 and entry.generation == table_reads.backend_current_root_generation) {
+            _ = self.group_visible_root_generations.remove(group_id);
         }
     }
 
@@ -325,6 +359,7 @@ pub const ProvisionedGroupStorage = struct {
             for (retain_group_ids) |group_id| {
                 if (entry.key_ptr.* == group_id) break;
             } else {
+                if (entry.value_ptr.reservations != 0) continue;
                 stale.append(self.alloc, entry.key_ptr.*) catch return;
             }
         }
@@ -335,6 +370,8 @@ pub const ProvisionedGroupStorage = struct {
         return .{
             .ptr = self,
             .visible_root_generation_for_group = groupVisibleRootGenerationForGroup,
+            .reserve_root_generation_for_group = reserveGroupVisibleRootGenerationForGroup,
+            .finish_root_generation_reservation = finishGroupVisibleRootGenerationReservationForGroup,
         };
     }
 
@@ -342,16 +379,42 @@ pub const ProvisionedGroupStorage = struct {
         const self: *ProvisionedGroupStorage = @ptrCast(@alignCast(ptr));
         return self.visibleRootGenerationForGroup(group_id);
     }
+
+    fn reserveGroupVisibleRootGenerationForGroup(ptr: *anyopaque, group_id: u64) !void {
+        const self: *ProvisionedGroupStorage = @ptrCast(@alignCast(ptr));
+        try self.reserveGroupVisibleRootGeneration(group_id);
+    }
+
+    fn finishGroupVisibleRootGenerationReservationForGroup(ptr: *anyopaque, group_id: u64, advance: bool) void {
+        const self: *ProvisionedGroupStorage = @ptrCast(@alignCast(ptr));
+        self.finishGroupVisibleRootGenerationReservation(group_id, advance);
+    }
 };
 
 test "provisioned group storage prunes stale visible root generations" {
     var storage = ProvisionedGroupStorage.init(std.testing.allocator);
     defer storage.deinit();
 
+    const generation_source = storage.groupVisibleRootGenerationSource();
+    var reservation = (try generation_source.reserveRootGenerationForGroup(44)).?;
+    defer reservation.deinit();
+    try std.testing.expectEqual(@as(u64, table_reads.backend_current_root_generation), storage.visibleRootGenerationForGroup(44));
+    storage.pruneGroupVisibleRootGenerations(&.{});
+    try std.testing.expectEqual(@as(u64, table_reads.backend_current_root_generation), storage.visibleRootGenerationForGroup(44));
+    reservation.advance();
+    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(44));
+
+    var cancelled = (try generation_source.reserveRootGenerationForGroup(55)).?;
+    cancelled.deinit();
+    try std.testing.expect(!storage.group_visible_root_generations.contains(55));
+
     try storage.bumpGroupVisibleRootGenerations(&.{ 11, 22, 33 });
     try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(11));
     try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(22));
     try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(33));
+
+    storage.invalidateInPlaceMetadataReconcileCaches();
+    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(11));
 
     storage.pruneGroupVisibleRootGenerations(&.{ 11, 33 });
     try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(11));

@@ -19,6 +19,7 @@ const group_ids = @import("../../common/group_ids.zig");
 const docstore = @import("../../storage/docstore.zig");
 const lsm_backend = @import("../../storage/lsm_backend.zig");
 const metadata = @import("../mod.zig");
+const metadata_incarnation = @import("../incarnation.zig");
 const extension_domain = @import("../../extensions/mod.zig");
 const metadata_table_manager = @import("../table_manager.zig");
 const raft_catalog = @import("../../raft/catalog.zig");
@@ -55,6 +56,7 @@ pub const ExtensionLifecycleDelta = struct {
 };
 
 pub const TransitionCommand = union(enum) {
+    initialize_metadata_incarnation: metadata_incarnation.MetadataClusterIncarnation,
     upsert_node: metadata.NodeRecord,
     register_node: metadata.NodeRecord,
     remove_node: struct {
@@ -102,6 +104,10 @@ pub const TransitionCommand = union(enum) {
     upsert_range: metadata.RangeRecord,
     remove_range: struct {
         group_id: u64,
+    },
+    admit_split_transition: struct {
+        expected_source_epoch: u64,
+        record: metadata.SplitTransitionRecord,
     },
     upsert_split_transition: metadata.SplitTransitionRecord,
     remove_split_transition: struct {
@@ -182,6 +188,11 @@ pub const TransitionCommand = union(enum) {
                 if (record.source_range_end) |end| alloc.free(end);
                 if (record.rollback_reason) |reason| alloc.free(reason);
             },
+            .admit_split_transition => |*admission| {
+                if (admission.record.split_key) |split_key| alloc.free(split_key);
+                if (admission.record.source_range_end) |end| alloc.free(end);
+                if (admission.record.rollback_reason) |reason| alloc.free(reason);
+            },
             .upsert_merge_transition => |*record| {
                 if (record.rollback_reason) |reason| alloc.free(reason);
             },
@@ -229,6 +240,19 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
         .remove_restore_progress => |record| try group_ids.requireDataGroupId(record.group_id),
         .upsert_range => |record| try group_ids.requireDataGroupId(record.group_id),
         .remove_range => |record| try group_ids.requireDataGroupId(record.group_id),
+        .admit_split_transition => |admission| {
+            try group_ids.requireDataGroupId(admission.record.source_group_id);
+            try group_ids.requireDataGroupId(admission.record.destination_group_id);
+            if (admission.record.transition_id == 0 or
+                admission.record.attempt_epoch == 0 or
+                admission.expected_source_epoch == std.math.maxInt(u64) or
+                admission.record.attempt_epoch != admission.expected_source_epoch + 1 or
+                admission.record.phase != .prepare or
+                admission.record.split_key == null)
+            {
+                return error.InvalidSplitAdmission;
+            }
+        },
         .upsert_split_transition => |record| {
             try group_ids.requireDataGroupId(record.source_group_id);
             try group_ids.requireDataGroupId(record.destination_group_id);
@@ -265,8 +289,8 @@ test "transition command validation rejects metadata group ids in data group fie
         .{ .remove_restore_progress = .{ .table_id = 1, .node_id = 1, .group_id = metadata_group_id } },
         .{ .upsert_range = .{ .group_id = metadata_group_id, .table_id = 1, .start_key = "" } },
         .{ .remove_range = .{ .group_id = metadata_group_id } },
-        .{ .upsert_split_transition = .{ .transition_id = 1, .source_group_id = metadata_group_id, .destination_group_id = 2 } },
-        .{ .upsert_split_transition = .{ .transition_id = 1, .source_group_id = 2, .destination_group_id = metadata_group_id } },
+        .{ .upsert_split_transition = .{ .transition_id = 1, .attempt_epoch = 1, .source_group_id = metadata_group_id, .destination_group_id = 2 } },
+        .{ .upsert_split_transition = .{ .transition_id = 1, .attempt_epoch = 1, .source_group_id = 2, .destination_group_id = metadata_group_id } },
         .{ .upsert_merge_transition = .{ .transition_id = 1, .donor_group_id = metadata_group_id, .receiver_group_id = 2 } },
         .{ .upsert_merge_transition = .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = metadata_group_id } },
         .{ .upsert_shuffle_join_lease = .{ .job_id = 1, .owner_group_id = metadata_group_id, .expires_at_ms = 1 } },
@@ -355,6 +379,138 @@ test "metadata raft apply store replicates restore job records" {
     try std.testing.expect((try store.getRestoreJobValue(std.testing.allocator, group_id, logical_key)) == null);
 }
 
+test "metadata raft apply store initializes one durable snapshotted cluster incarnation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-incarnation-source", .{tmp.sub_path});
+    defer std.testing.allocator.free(source_root);
+    const target_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-incarnation-target", .{tmp.sub_path});
+    defer std.testing.allocator.free(target_root);
+    const group_id = group_ids.main_metadata_group_id;
+    const first: metadata_incarnation.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const competing: metadata_incarnation.MetadataClusterIncarnation = "22222222222222222222222222222222".*;
+
+    const initialize = try encodeTransitionCommand(std.testing.allocator, .{ .initialize_metadata_incarnation = first });
+    defer std.testing.allocator.free(initialize);
+    const compete = try encodeTransitionCommand(std.testing.allocator, .{ .initialize_metadata_incarnation = competing });
+    defer std.testing.allocator.free(compete);
+    const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = initialize },
+        .{ .term = 2, .index = 2, .entry_type = .normal, .data = compete },
+    });
+    defer std.testing.allocator.free(entries);
+
+    var source = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
+    try source.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 2, .entries_bytes = entries });
+    try std.testing.expectEqual(first, (try source.getMetadataIncarnation(group_id)).?);
+    const snapshot = try source.snapshotBuilder().buildSnapshot(std.testing.allocator, group_id);
+    defer std.testing.allocator.free(snapshot);
+    source.deinit();
+
+    var reopened = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
+    defer reopened.deinit();
+    try std.testing.expectEqual(first, (try reopened.getMetadataIncarnation(group_id)).?);
+
+    var target = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = target_root });
+    defer target.deinit();
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(std.testing.allocator, group_id, 2, snapshot));
+    try std.testing.expectEqual(first, (try target.getMetadataIncarnation(group_id)).?);
+}
+
+test "metadata raft apply store snapshot replaces one complete projection and preserves other groups" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-snapshot-source", .{tmp.sub_path});
+    defer std.testing.allocator.free(source_root);
+    const target_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-snapshot-target", .{tmp.sub_path});
+    defer std.testing.allocator.free(target_root);
+    const group_id = group_ids.main_metadata_group_id;
+    const other_group_id = group_id + 1;
+    const retained_key = "\x00\x00__api_restore_jobs__:0000000000000001";
+    const stale_key = "\x00\x00__api_restore_jobs__:0000000000000002";
+    const other_group_key = "\x00\x00__api_restore_jobs__:0000000000000003";
+
+    const retained_command = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_restore_job = .{ .key = retained_key, .value = "retained" },
+    });
+    defer std.testing.allocator.free(retained_command);
+    const split_command = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_split_transition = .{
+            .transition_id = 71,
+            .attempt_epoch = 1,
+            .source_group_id = 101,
+            .destination_group_id = 102,
+            .phase = .prepare,
+            .split_key = "m",
+        },
+    });
+    defer std.testing.allocator.free(split_command);
+    const source_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = retained_command },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = split_command },
+    });
+    defer std.testing.allocator.free(source_entries);
+
+    var source = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
+    defer source.deinit();
+    try source.snapshotBuilder().applyBatch(.{
+        .group_id = group_id,
+        .commit_index = 2,
+        .entries_bytes = source_entries,
+    });
+    var prepared = (try source.snapshotBuilder().prepareSnapshot(group_id, 2)) orelse return error.MissingMetadataSnapshotSource;
+    defer prepared.deinit();
+    var materialized = try prepared.materialize(std.testing.allocator);
+    defer materialized.deinit(std.testing.allocator);
+    const snapshot = switch (materialized) {
+        .bytes => |bytes| bytes,
+        .artifact => return error.UnexpectedMetadataSnapshotArtifact,
+    };
+    const rebuilt_snapshot = try source.snapshotBuilder().buildSnapshot(std.testing.allocator, group_id);
+    defer std.testing.allocator.free(rebuilt_snapshot);
+    try std.testing.expectEqualSlices(u8, rebuilt_snapshot, snapshot);
+
+    var target = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = target_root });
+    defer target.deinit();
+    const stale_command = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_restore_job = .{ .key = stale_key, .value = "stale" },
+    });
+    defer std.testing.allocator.free(stale_command);
+    const stale_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = stale_command },
+    });
+    defer std.testing.allocator.free(stale_entries);
+    try target.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 1, .entries_bytes = stale_entries });
+
+    const other_group_command = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_restore_job = .{ .key = other_group_key, .value = "other-group" },
+    });
+    defer std.testing.allocator.free(other_group_command);
+    const other_group_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = other_group_command },
+    });
+    defer std.testing.allocator.free(other_group_entries);
+    try target.snapshotBuilder().applyBatch(.{ .group_id = other_group_id, .commit_index = 1, .entries_bytes = other_group_entries });
+
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(std.testing.allocator, group_id, 2, snapshot));
+    const retained = (try target.getRestoreJobValue(std.testing.allocator, group_id, retained_key)).?;
+    defer std.testing.allocator.free(retained);
+    try std.testing.expectEqualStrings("retained", retained);
+    try std.testing.expect((try target.getRestoreJobValue(std.testing.allocator, group_id, stale_key)) == null);
+    const other = (try target.getRestoreJobValue(std.testing.allocator, other_group_id, other_group_key)).?;
+    defer std.testing.allocator.free(other);
+    try std.testing.expectEqualStrings("other-group", other);
+    const splits = try target.listSplitTransitions(std.testing.allocator, group_id);
+    defer target.freeSplitTransitions(std.testing.allocator, splits);
+    try std.testing.expectEqual(@as(usize, 1), splits.len);
+    try std.testing.expectEqual(@as(u64, 71), splits[0].transition_id);
+    const batch = (try target.latestBatch(group_id)).?;
+    try std.testing.expectEqual(@as(u64, 2), batch.commit_index);
+    const installed_snapshot = try target.snapshotBuilder().buildSnapshot(std.testing.allocator, group_id);
+    defer std.testing.allocator.free(installed_snapshot);
+    try std.testing.expectEqualSlices(u8, snapshot, installed_snapshot);
+}
+
 pub const RaftApplyStoreConfig = struct {
     root_dir: []const u8,
     map_size: usize = 16 * 1024 * 1024,
@@ -424,6 +580,123 @@ pub const CommittedKeyListener = struct {
     }
 };
 
+pub const CommittedTransitionDelta = union(enum) {
+    upsert_split: metadata.SplitTransitionRecord,
+    remove_split: u64,
+    upsert_merge: metadata.MergeTransitionRecord,
+    remove_merge: u64,
+};
+
+const OwnedProjectionSignal = struct {
+    signal: ProjectionSignal,
+    table_name: ?[]u8 = null,
+
+    fn deinit(self: *OwnedProjectionSignal, alloc: std.mem.Allocator) void {
+        if (self.table_name) |name| alloc.free(name);
+        self.* = undefined;
+    }
+};
+
+const OwnedCommittedKeySignal = struct {
+    metadata_group_id: u64,
+    key: []u8,
+
+    fn deinit(self: *OwnedCommittedKeySignal, alloc: std.mem.Allocator) void {
+        alloc.free(self.key);
+        self.* = undefined;
+    }
+};
+
+pub const CommittedApplyOutcome = struct {
+    alloc: std.mem.Allocator,
+    collect_transition_deltas: bool = true,
+    projection_signals: std.ArrayListUnmanaged(OwnedProjectionSignal) = .empty,
+    committed_keys: std.ArrayListUnmanaged(OwnedCommittedKeySignal) = .empty,
+    transition_deltas: std.ArrayListUnmanaged(CommittedTransitionDelta) = .empty,
+    failure: ?anyerror = null,
+
+    pub fn deinit(self: *CommittedApplyOutcome) void {
+        for (self.projection_signals.items) |*signal| signal.deinit(self.alloc);
+        self.projection_signals.deinit(self.alloc);
+        for (self.committed_keys.items) |*signal| signal.deinit(self.alloc);
+        self.committed_keys.deinit(self.alloc);
+        for (self.transition_deltas.items) |*delta| deinitCommittedTransitionDelta(self.alloc, delta);
+        self.transition_deltas.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn appendProjection(self: *CommittedApplyOutcome, signal: ProjectionSignal) !void {
+        const table_name = if (signal.table_name) |name| try self.alloc.dupe(u8, name) else null;
+        errdefer if (table_name) |name| self.alloc.free(name);
+        var owned_signal = signal;
+        owned_signal.table_name = table_name;
+        try self.projection_signals.append(self.alloc, .{
+            .signal = owned_signal,
+            .table_name = table_name,
+        });
+    }
+
+    fn appendCommittedKey(self: *CommittedApplyOutcome, signal: CommittedKeySignal) !void {
+        const key = try self.alloc.dupe(u8, signal.key);
+        errdefer self.alloc.free(key);
+        try self.committed_keys.append(self.alloc, .{
+            .metadata_group_id = signal.metadata_group_id,
+            .key = key,
+        });
+    }
+
+    fn appendTransition(self: *CommittedApplyOutcome, delta: CommittedTransitionDelta) !void {
+        const owned = try cloneCommittedTransitionDelta(self.alloc, delta);
+        errdefer {
+            var doomed = owned;
+            deinitCommittedTransitionDelta(self.alloc, &doomed);
+        }
+        try self.transition_deltas.append(self.alloc, owned);
+    }
+
+    fn recordFailure(self: *CommittedApplyOutcome, err: anyerror) void {
+        if (self.failure == null) self.failure = err;
+    }
+};
+
+fn cloneCommittedTransitionDelta(alloc: std.mem.Allocator, delta: CommittedTransitionDelta) !CommittedTransitionDelta {
+    return switch (delta) {
+        .upsert_split => |record| .{ .upsert_split = try cloneCommittedSplitTransition(alloc, record) },
+        .remove_split => |transition_id| .{ .remove_split = transition_id },
+        .upsert_merge => |record| .{ .upsert_merge = try cloneCommittedMergeTransition(alloc, record) },
+        .remove_merge => |transition_id| .{ .remove_merge = transition_id },
+    };
+}
+
+fn cloneCommittedSplitTransition(alloc: std.mem.Allocator, record: metadata.SplitTransitionRecord) !metadata.SplitTransitionRecord {
+    var owned = record;
+    owned.split_key = null;
+    owned.source_range_end = null;
+    owned.rollback_reason = null;
+    errdefer metadata_table_manager.freeSplitTransitionRecord(alloc, owned);
+    if (record.split_key) |value| owned.split_key = try alloc.dupe(u8, value);
+    if (record.source_range_end) |value| owned.source_range_end = try alloc.dupe(u8, value);
+    if (record.rollback_reason) |value| owned.rollback_reason = try alloc.dupe(u8, value);
+    return owned;
+}
+
+fn cloneCommittedMergeTransition(alloc: std.mem.Allocator, record: metadata.MergeTransitionRecord) !metadata.MergeTransitionRecord {
+    var owned = record;
+    owned.rollback_reason = null;
+    errdefer metadata_table_manager.freeMergeTransitionRecord(alloc, owned);
+    if (record.rollback_reason) |value| owned.rollback_reason = try alloc.dupe(u8, value);
+    return owned;
+}
+
+fn deinitCommittedTransitionDelta(alloc: std.mem.Allocator, delta: *CommittedTransitionDelta) void {
+    switch (delta.*) {
+        .upsert_split => |record| metadata_table_manager.freeSplitTransitionRecord(alloc, record),
+        .upsert_merge => |record| metadata_table_manager.freeMergeTransitionRecord(alloc, record),
+        .remove_split, .remove_merge => {},
+    }
+    delta.* = undefined;
+}
+
 pub const RaftApplyStore = struct {
     alloc: std.mem.Allocator,
     io_impl: std.Io.Threaded,
@@ -436,6 +709,8 @@ pub const RaftApplyStore = struct {
     loaded_placement_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
     projection_listeners: std.ArrayListUnmanaged(ProjectionListener) = .empty,
     committed_key_listeners: std.ArrayListUnmanaged(CommittedKeyListener) = .empty,
+    apply_mutex: std.Io.Mutex = .init,
+    active_outcome: ?*CommittedApplyOutcome = null,
 
     const OwnedBatch = struct {
         commit_index: u64,
@@ -504,6 +779,8 @@ pub const RaftApplyStore = struct {
             .ptr = self,
             .vtable = &.{
                 .build_snapshot = buildSnapshot,
+                .prepare_snapshot = prepareSnapshot,
+                .install_snapshot = installSnapshotFromRaft,
                 .apply_batch = applyBatch,
             },
         };
@@ -531,6 +808,26 @@ pub const RaftApplyStore = struct {
 
     pub fn addCommittedKeyListener(self: *RaftApplyStore, listener: CommittedKeyListener) !void {
         try self.committed_key_listeners.append(self.alloc, listener);
+    }
+
+    pub fn getMetadataIncarnation(
+        self: *RaftApplyStore,
+        group_id: u64,
+    ) !?metadata_incarnation.MetadataClusterIncarnation {
+        var key_buf: [160]u8 = undefined;
+        const key = try metadataIncarnationKeyForGroup(&key_buf, group_id);
+        const encoded = self.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer self.alloc.free(encoded);
+        if (encoded.len != @sizeOf(metadata_incarnation.MetadataClusterIncarnation)) {
+            return error.InvalidMetadataIncarnation;
+        }
+        var incarnation: metadata_incarnation.MetadataClusterIncarnation = undefined;
+        @memcpy(&incarnation, encoded);
+        if (!metadata_incarnation.isValid(incarnation)) return error.InvalidMetadataIncarnation;
+        return incarnation;
     }
 
     pub fn listSplitTransitions(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.SplitTransitionRecord {
@@ -1120,10 +1417,288 @@ pub const RaftApplyStore = struct {
         alloc.free(rows);
     }
 
+    const metadata_snapshot_magic = "AFMS";
+    const metadata_snapshot_version: u8 = 1;
+
+    const MetadataSnapshotKeyFn = *const fn ([]u8, u64) anyerror![]const u8;
+    const MetadataSnapshotProjection = enum {
+        metadata_incarnation,
+        split_transition,
+        merge_transition,
+        placement,
+        node,
+        store,
+        table,
+        schema_progress,
+        restore_progress,
+        replication_source_status,
+        extension_package,
+        installed_extension,
+        extension_member,
+        extension_dependency,
+        shuffle_join_lease,
+        restore_job,
+        range,
+        reconcile_lease,
+        reallocation_request,
+    };
+    const MetadataSnapshotKey = union(enum) {
+        prefix: MetadataSnapshotKeyFn,
+        point: MetadataSnapshotKeyFn,
+    };
+    const MetadataSnapshotProjectionDescriptor = struct {
+        projection: MetadataSnapshotProjection,
+        key: MetadataSnapshotKey,
+    };
+    const metadata_snapshot_projections = [_]MetadataSnapshotProjectionDescriptor{
+        .{ .projection = .metadata_incarnation, .key = .{ .point = metadataIncarnationKeyForGroup } },
+        .{ .projection = .split_transition, .key = .{ .prefix = splitTransitionPrefixForGroup } },
+        .{ .projection = .merge_transition, .key = .{ .prefix = mergeTransitionPrefixForGroup } },
+        .{ .projection = .placement, .key = .{ .prefix = placementPrefixForGroup } },
+        .{ .projection = .node, .key = .{ .prefix = nodePrefixForGroup } },
+        .{ .projection = .store, .key = .{ .prefix = storePrefixForGroup } },
+        .{ .projection = .table, .key = .{ .prefix = tablePrefixForGroup } },
+        .{ .projection = .schema_progress, .key = .{ .prefix = schemaProgressPrefixForGroup } },
+        .{ .projection = .restore_progress, .key = .{ .prefix = restoreProgressPrefixForGroup } },
+        .{ .projection = .replication_source_status, .key = .{ .prefix = replicationSourceStatusPrefixForGroup } },
+        .{ .projection = .extension_package, .key = .{ .prefix = extensionPackagePrefixForGroup } },
+        .{ .projection = .installed_extension, .key = .{ .prefix = installedExtensionPrefixForGroup } },
+        .{ .projection = .extension_member, .key = .{ .prefix = extensionMemberPrefixForGroup } },
+        .{ .projection = .extension_dependency, .key = .{ .prefix = extensionDependencyPrefixForGroup } },
+        .{ .projection = .shuffle_join_lease, .key = .{ .prefix = shuffleJoinLeasePrefixForGroup } },
+        .{ .projection = .restore_job, .key = .{ .prefix = restoreJobPrefixForGroup } },
+        .{ .projection = .range, .key = .{ .prefix = rangePrefixForGroup } },
+        .{ .projection = .reconcile_lease, .key = .{ .point = reconcileLeaseKeyForGroup } },
+        .{ .projection = .reallocation_request, .key = .{ .point = reallocationRequestKeyForGroup } },
+    };
+
+    fn metadataSnapshotProjectionBit(projection: MetadataSnapshotProjection) u32 {
+        return @as(u32, 1) << @intFromEnum(projection);
+    }
+
+    /// Exhaustively ties every durable transition command to the projection
+    /// classes that must survive a metadata Raft snapshot. Adding a command
+    /// without classifying its durable output is therefore a compile error.
+    fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) u32 {
+        return switch (tag) {
+            .initialize_metadata_incarnation => metadataSnapshotProjectionBit(.metadata_incarnation),
+            .upsert_node, .register_node, .remove_node => metadataSnapshotProjectionBit(.node),
+            .request_node_shutdown, .cancel_node_shutdown, .finalize_node_shutdown => metadataSnapshotProjectionBit(.node) | metadataSnapshotProjectionBit(.store),
+            .upsert_store, .register_store, .remove_store => metadataSnapshotProjectionBit(.store),
+            .upsert_replica_intent, .remove_replica_intent => metadataSnapshotProjectionBit(.placement),
+            .upsert_table, .remove_table => metadataSnapshotProjectionBit(.table),
+            .upsert_schema_progress, .remove_schema_progress => metadataSnapshotProjectionBit(.schema_progress),
+            .upsert_restore_progress, .remove_restore_progress => metadataSnapshotProjectionBit(.restore_progress),
+            .upsert_replication_source_status, .remove_replication_source_status => metadataSnapshotProjectionBit(.replication_source_status),
+            .upsert_range, .remove_range => metadataSnapshotProjectionBit(.range),
+            .admit_split_transition => metadataSnapshotProjectionBit(.split_transition) | metadataSnapshotProjectionBit(.range),
+            .upsert_split_transition, .remove_split_transition => metadataSnapshotProjectionBit(.split_transition),
+            .upsert_merge_transition, .remove_merge_transition => metadataSnapshotProjectionBit(.merge_transition),
+            .upsert_reconcile_lease, .remove_reconcile_lease => metadataSnapshotProjectionBit(.reconcile_lease),
+            .upsert_shuffle_join_lease, .remove_shuffle_join_lease => metadataSnapshotProjectionBit(.shuffle_join_lease),
+            .upsert_restore_job, .remove_restore_job, .remove_restore_jobs => metadataSnapshotProjectionBit(.restore_job),
+            .upsert_reallocation_request, .remove_reallocation_request => metadataSnapshotProjectionBit(.reallocation_request),
+            .upsert_extension_package, .remove_extension_package => metadataSnapshotProjectionBit(.extension_package),
+            .upsert_installed_extension, .remove_installed_extension => metadataSnapshotProjectionBit(.installed_extension),
+            .upsert_extension_member, .remove_extension_member => metadataSnapshotProjectionBit(.extension_member),
+            .upsert_extension_dependency, .remove_extension_dependency => metadataSnapshotProjectionBit(.extension_dependency),
+            .apply_extension_lifecycle => metadataSnapshotProjectionBit(.table) |
+                metadataSnapshotProjectionBit(.installed_extension) |
+                metadataSnapshotProjectionBit(.extension_member) |
+                metadataSnapshotProjectionBit(.extension_dependency),
+        };
+    }
+
+    const PreparedSnapshot = struct {
+        owner: *RaftApplyStore,
+        txn: docstore.DocStore.Txn,
+        group_id: u64,
+        cancelled: std.atomic.Value(bool) = .init(false),
+
+        fn source(self: *@This()) raft_engine.runtime.storage_iface.SnapshotSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .materialize = materialize,
+                    .cancel = cancel,
+                    .deinit = PreparedSnapshot.deinit,
+                },
+            };
+        }
+
+        fn materialize(ptr: *anyopaque, alloc: std.mem.Allocator) !raft_engine.runtime.storage_iface.SnapshotMaterialization {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.cancelled.load(.acquire)) return error.SnapshotBuildCancelled;
+            return .{ .bytes = try self.owner.buildMetadataSnapshotTxn(alloc, &self.txn, self.group_id, &self.cancelled) };
+        }
+
+        fn cancel(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.cancelled.store(true, .release);
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.txn.abort();
+            std.heap.page_allocator.destroy(self);
+        }
+    };
+
     fn buildSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) ![]u8 {
         const self: *RaftApplyStore = @ptrCast(@alignCast(ptr));
-        const batch = try self.ensureLoaded(group_id) orelse return error.MissingAppliedBatch;
-        return try alloc.dupe(u8, batch.entries_bytes);
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        return try self.buildMetadataSnapshotTxn(alloc, &txn, group_id, null);
+    }
+
+    fn prepareSnapshot(ptr: *anyopaque, group_id: u64, applied_index: u64) !?raft_engine.runtime.storage_iface.SnapshotSource {
+        const self: *RaftApplyStore = @ptrCast(@alignCast(ptr));
+        var txn = try self.store.beginReadTxn();
+        errdefer txn.abort();
+        var key_buf: [128]u8 = undefined;
+        const key = try keyForGroup(&key_buf, group_id);
+        const value = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        if (value.len < @sizeOf(u64)) return error.InvalidMetadataApplyBatch;
+        if (std.mem.readInt(u64, value[0..8], .little) != applied_index) return error.AppliedSnapshotIndexMismatch;
+
+        const prepared = try std.heap.page_allocator.create(PreparedSnapshot);
+        prepared.* = .{
+            .owner = self,
+            .txn = txn,
+            .group_id = group_id,
+        };
+        return prepared.source();
+    }
+
+    fn installSnapshotFromRaft(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        commit_index: u64,
+        encoded: []const u8,
+    ) !void {
+        const self: *RaftApplyStore = @ptrCast(@alignCast(ptr));
+        const rows = try decodeMetadataSnapshotAlloc(alloc, encoded);
+        defer freeMetadataSnapshotRows(alloc, rows);
+        try validateMetadataSnapshotRows(alloc, group_id, rows);
+
+        const empty_entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{});
+        defer alloc.free(empty_entries);
+        const owned_entries = try self.alloc.dupe(u8, empty_entries);
+        errdefer self.alloc.free(owned_entries);
+        const io = self.io_impl.io();
+        self.apply_mutex.lockUncancelable(io);
+        defer self.apply_mutex.unlock(io);
+        try self.batches.ensureUnusedCapacity(self.alloc, 1);
+
+        const existing = blk: {
+            var read_txn = try self.store.beginReadTxn();
+            defer read_txn.abort();
+            break :blk try self.collectMetadataSnapshotRowsTxn(alloc, &read_txn, group_id, null);
+        };
+        defer freeMetadataSnapshotRows(alloc, existing);
+
+        const watermark = try alloc.alloc(u8, @sizeOf(u64) + empty_entries.len);
+        defer alloc.free(watermark);
+        std.mem.writeInt(u64, watermark[0..8], commit_index, .little);
+        @memcpy(watermark[8..], empty_entries);
+        var watermark_key_buf: [128]u8 = undefined;
+        const watermark_key = try keyForGroup(&watermark_key_buf, group_id);
+
+        const writes = try alloc.alloc(docstore.KVPair, rows.len + 1);
+        defer alloc.free(writes);
+        for (rows, 0..) |row, i| writes[i] = .{ .key = row.key, .value = row.value };
+        writes[rows.len] = .{ .key = watermark_key, .value = watermark };
+        const deletes = try alloc.alloc([]const u8, existing.len);
+        defer alloc.free(deletes);
+        for (existing, 0..) |row, i| deletes[i] = row.key;
+        try self.store.putBatch(writes, deletes);
+
+        if (self.batches.getPtr(group_id)) |batch| {
+            self.alloc.free(batch.entries_bytes);
+            batch.* = .{ .commit_index = commit_index, .entries_bytes = owned_entries };
+        } else {
+            self.batches.putAssumeCapacity(group_id, .{ .commit_index = commit_index, .entries_bytes = owned_entries });
+        }
+        self.invalidateProjectedPlacementGroup(group_id);
+        self.notifyMetadataSnapshotInstalled(group_id);
+        for (existing) |row| self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = row.key });
+        for (rows) |row| self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = row.key });
+    }
+
+    fn buildMetadataSnapshotTxn(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        cancelled: ?*const std.atomic.Value(bool),
+    ) ![]u8 {
+        const rows = try self.collectMetadataSnapshotRowsTxn(alloc, txn, group_id, cancelled);
+        defer freeMetadataSnapshotRows(alloc, rows);
+        return try encodeMetadataSnapshot(alloc, rows);
+    }
+
+    fn collectMetadataSnapshotRowsTxn(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        cancelled: ?*const std.atomic.Value(bool),
+    ) ![]docstore.OwnedKVPair {
+        _ = self;
+        var rows = std.ArrayListUnmanaged(docstore.OwnedKVPair).empty;
+        errdefer {
+            for (rows.items) |row| {
+                alloc.free(row.key);
+                alloc.free(row.value);
+            }
+            rows.deinit(alloc);
+        }
+        var buf: [256]u8 = undefined;
+        for (metadata_snapshot_projections) |descriptor| {
+            if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+            switch (descriptor.key) {
+                .prefix => |key_fn| try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try key_fn(&buf, group_id)),
+                .point => |key_fn| try appendMetadataPointRowTxn(alloc, txn, &rows, try key_fn(&buf, group_id)),
+            }
+        }
+        std.sort.pdq(docstore.OwnedKVPair, rows.items, {}, metadataSnapshotRowLessThan);
+        return try rows.toOwnedSlice(alloc);
+    }
+
+    fn invalidateProjectedPlacementGroup(self: *RaftApplyStore, group_id: u64) void {
+        var i = self.projected_placement_intents.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.projected_placement_intents.items[i].metadata_group_id != group_id) continue;
+            const removed = self.projected_placement_intents.swapRemove(i);
+            freePlacementIntent(self.alloc, removed.intent);
+        }
+        _ = self.loaded_placement_groups.remove(group_id);
+    }
+
+    fn notifyMetadataSnapshotInstalled(self: *RaftApplyStore, group_id: u64) void {
+        const kinds = [_]ProjectionSignalKind{
+            .table,
+            .range,
+            .store,
+            .placement_intent,
+            .reconcile_lease,
+            .shuffle_join_lease,
+            .split_transition,
+            .merge_transition,
+            .schema_progress,
+            .restore_progress,
+            .restore_job,
+            .replication_source_status,
+        };
+        for (kinds) |kind| self.notifyProjectionListeners(.{
+            .kind = kind,
+            .metadata_group_id = group_id,
+        });
     }
 
     fn applyBatch(ptr: *anyopaque, batch: raft_state_machine.ApplyBatch) !void {
@@ -1132,10 +1707,50 @@ pub const RaftApplyStore = struct {
     }
 
     fn writeBatch(self: *RaftApplyStore, group_id: u64, commit_index: u64, entries_bytes: []const u8) !void {
+        var outcome = try self.applyCommittedBatchInternal(group_id, commit_index, entries_bytes, false);
+        defer outcome.deinit();
+    }
+
+    /// Applies one committed Raft batch and returns only projection changes
+    /// that actually mutated durable state. Listener signals are dispatched
+    /// after commit and before this method returns.
+    pub fn applyCommittedBatch(
+        self: *RaftApplyStore,
+        group_id: u64,
+        commit_index: u64,
+        entries_bytes: []const u8,
+    ) !CommittedApplyOutcome {
+        return try self.applyCommittedBatchInternal(group_id, commit_index, entries_bytes, true);
+    }
+
+    fn applyCommittedBatchInternal(
+        self: *RaftApplyStore,
+        group_id: u64,
+        commit_index: u64,
+        entries_bytes: []const u8,
+        collect_transition_deltas: bool,
+    ) !CommittedApplyOutcome {
         var value = try self.alloc.alloc(u8, @sizeOf(u64) + entries_bytes.len);
         defer self.alloc.free(value);
         std.mem.writeInt(u64, value[0..8], commit_index, .little);
         @memcpy(value[8..], entries_bytes);
+
+        const owned_entries = try self.alloc.dupe(u8, entries_bytes);
+        errdefer self.alloc.free(owned_entries);
+
+        const io = self.io_impl.io();
+        self.apply_mutex.lockUncancelable(io);
+        var apply_locked = true;
+        defer if (apply_locked) self.apply_mutex.unlock(io);
+        try self.batches.ensureUnusedCapacity(self.alloc, 1);
+        std.debug.assert(self.active_outcome == null);
+        var outcome = CommittedApplyOutcome{
+            .alloc = self.alloc,
+            .collect_transition_deltas = collect_transition_deltas,
+        };
+        errdefer outcome.deinit();
+        self.active_outcome = &outcome;
+        defer self.active_outcome = null;
 
         var key_buf: [128]u8 = undefined;
         const key = try keyForGroup(&key_buf, group_id);
@@ -1143,22 +1758,26 @@ pub const RaftApplyStore = struct {
         errdefer txn.abort();
         try txn.put(key, value);
         try self.projectEntriesTxn(&txn, group_id, entries_bytes);
+        if (outcome.failure) |err| return err;
         try txn.commit();
 
-        const owned_entries = try self.alloc.dupe(u8, entries_bytes);
-        errdefer self.alloc.free(owned_entries);
         if (self.batches.getPtr(group_id)) |existing| {
             self.alloc.free(existing.entries_bytes);
             existing.* = .{
                 .commit_index = commit_index,
                 .entries_bytes = owned_entries,
             };
-            return;
+        } else {
+            self.batches.putAssumeCapacity(group_id, .{
+                .commit_index = commit_index,
+                .entries_bytes = owned_entries,
+            });
         }
-        try self.batches.put(self.alloc, group_id, .{
-            .commit_index = commit_index,
-            .entries_bytes = owned_entries,
-        });
+        self.active_outcome = null;
+        self.dispatchCommittedOutcome(&outcome);
+        self.apply_mutex.unlock(io);
+        apply_locked = false;
+        return outcome;
     }
 
     fn ensureLoaded(self: *RaftApplyStore, group_id: u64) !?*OwnedBatch {
@@ -1205,6 +1824,27 @@ pub const RaftApplyStore = struct {
     fn applyTransitionCommandTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, command: TransitionCommand) !void {
         try validateTransitionCommandDataGroupIds(command);
         switch (command) {
+            .initialize_metadata_incarnation => |incarnation| {
+                if (!metadata_incarnation.isValid(incarnation)) return error.InvalidMetadataIncarnation;
+                var key_buf: [160]u8 = undefined;
+                const key = try metadataIncarnationKeyForGroup(&key_buf, group_id);
+                const existing = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => {
+                        try txn.put(key, &incarnation);
+                        return;
+                    },
+                    else => return err,
+                };
+                if (existing.len != @sizeOf(metadata_incarnation.MetadataClusterIncarnation)) {
+                    return error.InvalidMetadataIncarnation;
+                }
+                var committed: metadata_incarnation.MetadataClusterIncarnation = undefined;
+                @memcpy(&committed, existing);
+                if (!metadata_incarnation.isValid(committed)) return error.InvalidMetadataIncarnation;
+                // Initialization is first-writer-wins. A proposal accepted by a
+                // superseded leader may race a later term, but it must never
+                // replace the cluster identity selected by the committed log.
+            },
             .upsert_node => |record| {
                 var key_buf: [160]u8 = undefined;
                 const key = try nodeKeyForGroup(&key_buf, group_id, record.node_id);
@@ -1501,57 +2141,20 @@ pub const RaftApplyStore = struct {
                     .group_id = record.group_id,
                 });
             },
+            .admit_split_transition => |admission| {
+                try self.applySplitAdmissionTxn(txn, group_id, admission.expected_source_epoch, admission.record);
+            },
             .upsert_split_transition => |record| {
-                var key_buf: [160]u8 = undefined;
-                const key = try splitTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
-                const value = try encodeSplitTransitionRecord(self.alloc, record);
-                defer self.alloc.free(value);
-                try txn.put(key, value);
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
-                self.notifyProjectionListeners(.{
-                    .kind = .split_transition,
-                    .metadata_group_id = group_id,
-                    .group_id = record.source_group_id,
-                });
+                try self.applySplitTransitionUpsertTxn(txn, group_id, record);
             },
             .remove_split_transition => |record| {
-                var key_buf: [160]u8 = undefined;
-                const key = try splitTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
-                txn.delete(key) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                };
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
-                self.notifyProjectionListeners(.{
-                    .kind = .split_transition,
-                    .metadata_group_id = group_id,
-                });
+                try self.applySplitTransitionRemovalTxn(txn, group_id, record.transition_id);
             },
             .upsert_merge_transition => |record| {
-                var key_buf: [160]u8 = undefined;
-                const key = try mergeTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
-                const value = try encodeMergeTransitionRecord(self.alloc, record);
-                defer self.alloc.free(value);
-                try txn.put(key, value);
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
-                self.notifyProjectionListeners(.{
-                    .kind = .merge_transition,
-                    .metadata_group_id = group_id,
-                    .group_id = record.receiver_group_id,
-                });
+                try self.applyMergeTransitionUpsertTxn(txn, group_id, record);
             },
             .remove_merge_transition => |record| {
-                var key_buf: [160]u8 = undefined;
-                const key = try mergeTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
-                txn.delete(key) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                };
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
-                self.notifyProjectionListeners(.{
-                    .kind = .merge_transition,
-                    .metadata_group_id = group_id,
-                });
+                try self.applyMergeTransitionRemovalTxn(txn, group_id, record.transition_id);
             },
             .upsert_reconcile_lease => |record| {
                 var key_buf: [160]u8 = undefined;
@@ -1730,6 +2333,205 @@ pub const RaftApplyStore = struct {
                 try self.applyExtensionLifecycleDeltaTxn(txn, group_id, delta);
             },
         }
+    }
+
+    fn applySplitTransitionUpsertTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        record: metadata.SplitTransitionRecord,
+    ) !void {
+        var key_buf: [160]u8 = undefined;
+        const key = try splitTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
+        const encoded_existing = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (encoded_existing) |encoded| {
+            const existing = try decodeSplitTransitionRecord(self.alloc, encoded);
+            defer metadata_table_manager.freeSplitTransitionRecord(self.alloc, existing);
+            if (!splitTransitionUpdateAllowed(existing, record)) return;
+        }
+
+        const value = try encodeSplitTransitionRecord(self.alloc, record);
+        defer self.alloc.free(value);
+        try txn.put(key, value);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        self.notifyProjectionListeners(.{
+            .kind = .split_transition,
+            .metadata_group_id = group_id,
+            .group_id = record.source_group_id,
+        });
+        self.notifyCommittedTransition(.{ .upsert_split = record });
+    }
+
+    fn applySplitTransitionRemovalTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        transition_id: u64,
+    ) !void {
+        var key_buf: [160]u8 = undefined;
+        const key = try splitTransitionKeyForGroup(&key_buf, group_id, transition_id);
+        const encoded = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        const existing = try decodeSplitTransitionRecord(self.alloc, encoded);
+        defer metadata_table_manager.freeSplitTransitionRecord(self.alloc, existing);
+        if (!transitionPhaseTerminal(existing.phase)) return;
+
+        try txn.delete(key);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        self.notifyProjectionListeners(.{
+            .kind = .split_transition,
+            .metadata_group_id = group_id,
+        });
+        self.notifyCommittedTransition(.{ .remove_split = transition_id });
+    }
+
+    fn applyMergeTransitionUpsertTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        record: metadata.MergeTransitionRecord,
+    ) !void {
+        var key_buf: [160]u8 = undefined;
+        const key = try mergeTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
+        const encoded_existing = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (encoded_existing) |encoded| {
+            const existing = try decodeMergeTransitionRecord(self.alloc, encoded);
+            defer metadata_table_manager.freeMergeTransitionRecord(self.alloc, existing);
+            if (!mergeTransitionUpdateAllowed(existing, record)) return;
+        }
+
+        const value = try encodeMergeTransitionRecord(self.alloc, record);
+        defer self.alloc.free(value);
+        try txn.put(key, value);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        self.notifyProjectionListeners(.{
+            .kind = .merge_transition,
+            .metadata_group_id = group_id,
+            .group_id = record.receiver_group_id,
+        });
+        self.notifyCommittedTransition(.{ .upsert_merge = record });
+    }
+
+    fn applyMergeTransitionRemovalTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        transition_id: u64,
+    ) !void {
+        var key_buf: [160]u8 = undefined;
+        const key = try mergeTransitionKeyForGroup(&key_buf, group_id, transition_id);
+        const encoded = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        const existing = try decodeMergeTransitionRecord(self.alloc, encoded);
+        defer metadata_table_manager.freeMergeTransitionRecord(self.alloc, existing);
+        if (!transitionPhaseTerminal(existing.phase)) return;
+
+        try txn.delete(key);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        self.notifyProjectionListeners(.{
+            .kind = .merge_transition,
+            .metadata_group_id = group_id,
+        });
+        self.notifyCommittedTransition(.{ .remove_merge = transition_id });
+    }
+
+    /// Atomically reserves the next source-local split epoch and publishes its
+    /// transition. Failed compare-and-set preconditions are deterministic
+    /// no-ops because a committed Raft command must always remain applicable.
+    fn applySplitAdmissionTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        expected_source_epoch: u64,
+        record: metadata.SplitTransitionRecord,
+    ) !void {
+        const split_key = record.split_key orelse return error.InvalidSplitAdmission;
+
+        var transition_key_buf: [160]u8 = undefined;
+        const transition_key = try splitTransitionKeyForGroup(&transition_key_buf, group_id, record.transition_id);
+        const existing_transition = txn.get(transition_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (existing_transition) |encoded| {
+            const existing = try decodeSplitTransitionRecord(self.alloc, encoded);
+            defer metadata_table_manager.freeSplitTransitionRecord(self.alloc, existing);
+            if (splitTransitionActive(existing)) return;
+        }
+
+        var source_key_buf: [160]u8 = undefined;
+        const source_key = try rangeKeyForGroup(&source_key_buf, group_id, record.source_group_id);
+        const encoded_source = txn.get(source_key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        var source = try decodeRangeRecord(self.alloc, encoded_source);
+        defer metadata_table_manager.freeRange(self.alloc, source);
+        if (source.split_attempt_epoch != expected_source_epoch or
+            expected_source_epoch == std.math.maxInt(u64) or
+            record.attempt_epoch != expected_source_epoch + 1 or
+            !optionalBytesEqual(source.end_key, record.source_range_end) or
+            !keyStrictlyInsideRange(split_key, source.start_key, source.end_key))
+        {
+            return;
+        }
+
+        var destination_key_buf: [160]u8 = undefined;
+        const destination_key = try rangeKeyForGroup(&destination_key_buf, group_id, record.destination_group_id);
+        if (txn.get(destination_key)) |_| {
+            return;
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
+
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try splitTransitionPrefixForGroup(&prefix_buf, group_id);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(prefix);
+        while (entry) |kv| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+            const existing = try decodeSplitTransitionRecord(self.alloc, kv.value);
+            defer metadata_table_manager.freeSplitTransitionRecord(self.alloc, existing);
+            if (splitTransitionActive(existing) and existing.source_group_id == record.source_group_id) return;
+        }
+
+        source.split_attempt_epoch = record.attempt_epoch;
+        const source_value = try encodeRangeRecord(self.alloc, source);
+        defer self.alloc.free(source_value);
+        const transition_value = try encodeSplitTransitionRecord(self.alloc, record);
+        defer self.alloc.free(transition_value);
+        try txn.put(source_key, source_value);
+        try txn.put(transition_key, transition_value);
+
+        const table_name = try self.lookupTableNameTxn(txn, group_id, source.table_id);
+        defer if (table_name) |name| self.alloc.free(name);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = source_key });
+        self.notifyProjectionListeners(.{
+            .kind = .range,
+            .metadata_group_id = group_id,
+            .table_name = table_name,
+            .table_id = source.table_id,
+            .group_id = source.group_id,
+        });
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = transition_key });
+        self.notifyProjectionListeners(.{
+            .kind = .split_transition,
+            .metadata_group_id = group_id,
+            .group_id = record.source_group_id,
+        });
+        self.notifyCommittedTransition(.{ .upsert_split = record });
     }
 
     fn applyExtensionLifecycleDeltaTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, delta: ExtensionLifecycleDelta) !void {
@@ -2027,11 +2829,42 @@ pub const RaftApplyStore = struct {
     }
 
     fn notifyProjectionListeners(self: *RaftApplyStore, signal: ProjectionSignal) void {
+        if (self.active_outcome) |outcome| {
+            outcome.appendProjection(signal) catch |err| outcome.recordFailure(err);
+            return;
+        }
         for (self.projection_listeners.items) |listener| listener.onProjectionSignal(signal);
     }
 
     fn notifyCommittedKeyListeners(self: *RaftApplyStore, signal: CommittedKeySignal) void {
+        if (self.active_outcome) |outcome| {
+            outcome.appendCommittedKey(signal) catch |err| outcome.recordFailure(err);
+            return;
+        }
         for (self.committed_key_listeners.items) |listener| listener.onCommittedKey(signal);
+    }
+
+    fn notifyCommittedTransition(self: *RaftApplyStore, delta: CommittedTransitionDelta) void {
+        const outcome = self.active_outcome orelse {
+            std.debug.assert(false);
+            return;
+        };
+        if (!outcome.collect_transition_deltas) return;
+        outcome.appendTransition(delta) catch |err| outcome.recordFailure(err);
+    }
+
+    fn dispatchCommittedOutcome(self: *RaftApplyStore, outcome: *const CommittedApplyOutcome) void {
+        std.debug.assert(outcome.failure == null);
+        for (outcome.projection_signals.items) |owned| {
+            for (self.projection_listeners.items) |listener| listener.onProjectionSignal(owned.signal);
+        }
+        for (outcome.committed_keys.items) |owned| {
+            const signal = CommittedKeySignal{
+                .metadata_group_id = owned.metadata_group_id,
+                .key = owned.key,
+            };
+            for (self.committed_key_listeners.items) |listener| listener.onCommittedKey(signal);
+        }
     }
 
     fn lookupTableName(self: *RaftApplyStore, group_id: u64, table_id: u64) !?[]u8 {
@@ -2065,6 +2898,7 @@ const runtime_status_record_version: u16 = 7;
 const group_status_record_version: u16 = 1;
 
 const TransitionTag = enum(u8) {
+    initialize_metadata_incarnation = 45,
     upsert_node = 1,
     remove_node = 2,
     upsert_store = 3,
@@ -2108,6 +2942,7 @@ const TransitionTag = enum(u8) {
     upsert_restore_job = 41,
     remove_restore_job = 42,
     remove_restore_jobs = 43,
+    admit_split_transition = 44,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -2116,6 +2951,10 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
 
     try out.appendSlice(alloc, transition_magic);
     switch (command) {
+        .initialize_metadata_incarnation => |incarnation| {
+            try out.append(alloc, @intFromEnum(TransitionTag.initialize_metadata_incarnation));
+            try out.appendSlice(alloc, &incarnation);
+        },
         .upsert_node => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_node));
             try appendNodeRecord(alloc, &out, record);
@@ -2204,6 +3043,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .remove_range => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.remove_range));
             try appendInt(alloc, &out, u64, record.group_id);
+        },
+        .admit_split_transition => |admission| {
+            try out.append(alloc, @intFromEnum(TransitionTag.admit_split_transition));
+            try appendInt(alloc, &out, u64, admission.expected_source_epoch);
+            try appendSplitTransitionRecord(alloc, &out, admission.record);
         },
         .upsert_split_transition => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_split_transition));
@@ -2311,6 +3155,14 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
     pos += 1;
 
     return switch (tag) {
+        .initialize_metadata_incarnation => blk: {
+            if (pos + @sizeOf(metadata_incarnation.MetadataClusterIncarnation) != encoded.len) {
+                return error.InvalidMetadataTransitionEncoding;
+            }
+            var incarnation: metadata_incarnation.MetadataClusterIncarnation = undefined;
+            @memcpy(&incarnation, encoded[pos..][0..incarnation.len]);
+            break :blk .{ .initialize_metadata_incarnation = incarnation };
+        },
         .upsert_node => .{
             .upsert_node = try readNodeRecord(alloc, encoded, &pos),
         },
@@ -2386,6 +3238,12 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         },
         .remove_range => .{
             .remove_range = .{ .group_id = try readInt(encoded, &pos, u64) },
+        },
+        .admit_split_transition => .{
+            .admit_split_transition = .{
+                .expected_source_epoch = try readInt(encoded, &pos, u64),
+                .record = try readSplitTransitionRecord(alloc, encoded, &pos),
+            },
         },
         .upsert_split_transition => .{
             .upsert_split_transition = try readSplitTransitionRecord(alloc, encoded, &pos),
@@ -3458,6 +4316,7 @@ fn appendRangeRecord(
     try appendInt(alloc, out, u64, range_id);
     try appendInt(alloc, out, u64, record.doc_identity_shard_id);
     try appendInt(alloc, out, u64, record.doc_identity_range_id);
+    try appendInt(alloc, out, u64, record.split_attempt_epoch);
 }
 
 fn appendSplitTransitionRecord(
@@ -3465,7 +4324,13 @@ fn appendSplitTransitionRecord(
     out: *std.ArrayListUnmanaged(u8),
     record: metadata.SplitTransitionRecord,
 ) !void {
+    if (record.transition_id == 0 or record.attempt_epoch == 0 or
+        record.source_group_id == 0 or record.destination_group_id == 0)
+    {
+        return error.InvalidMetadataTransitionEncoding;
+    }
     try appendInt(alloc, out, u64, record.transition_id);
+    try appendInt(alloc, out, u64, record.attempt_epoch);
     try appendInt(alloc, out, u64, record.source_group_id);
     try appendInt(alloc, out, u64, record.destination_group_id);
     try out.append(alloc, @intFromEnum(record.phase));
@@ -3819,6 +4684,7 @@ fn readRangeRecord(
         try readInt(encoded, pos, u64)
     else
         0;
+    const split_attempt_epoch = try readInt(encoded, pos, u64);
     return .{
         .group_id = group_id,
         .range_id = if (range_id == 0) group_id else range_id,
@@ -3827,6 +4693,7 @@ fn readRangeRecord(
         .end_key = end_key,
         .doc_identity_shard_id = doc_identity_shard_id,
         .doc_identity_range_id = doc_identity_range_id,
+        .split_attempt_epoch = split_attempt_epoch,
         .restore_backup_id = restore_backup_id,
         .restore_location = restore_location,
         .restore_snapshot_path = restore_snapshot_path,
@@ -4059,16 +4926,21 @@ fn readSplitTransitionRecord(
     pos: *usize,
 ) !metadata.SplitTransitionRecord {
     const transition_id = try readInt(encoded, pos, u64);
+    const attempt_epoch = try readInt(encoded, pos, u64);
     const source_group_id = try readInt(encoded, pos, u64);
     const destination_group_id = try readInt(encoded, pos, u64);
+    if (transition_id == 0 or attempt_epoch == 0 or source_group_id == 0 or destination_group_id == 0)
+        return error.InvalidMetadataTransitionEncoding;
     if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
-    const phase: metadata.TransitionPhase = @enumFromInt(encoded[pos.*]);
+    const phase = std.enums.fromInt(metadata.TransitionPhase, encoded[pos.*]) orelse
+        return error.InvalidMetadataTransitionEncoding;
     pos.* += 1;
     const split_key = try readOptionalString(alloc, encoded, pos);
     const source_range_end = try readOptionalString(alloc, encoded, pos);
     const rollback_reason = try readOptionalString(alloc, encoded, pos);
     return .{
         .transition_id = transition_id,
+        .attempt_epoch = attempt_epoch,
         .source_group_id = source_group_id,
         .destination_group_id = destination_group_id,
         .phase = phase,
@@ -4133,6 +5005,162 @@ fn readReallocationRequestRecord(
     return .{
         .requested_at_ms = try readInt(encoded, pos, u64),
     };
+}
+
+fn appendMetadataPrefixRowsTxn(
+    alloc: std.mem.Allocator,
+    txn: *docstore.DocStore.Txn,
+    out: *std.ArrayListUnmanaged(docstore.OwnedKVPair),
+    prefix: []const u8,
+) !void {
+    const rows = try docstore.DocStore.scanPrefixTxn(alloc, txn, prefix);
+    var transferred = false;
+    defer {
+        if (!transferred) freeMetadataSnapshotRows(alloc, rows) else alloc.free(rows);
+    }
+    try out.appendSlice(alloc, rows);
+    transferred = true;
+}
+
+fn appendMetadataPointRowTxn(
+    alloc: std.mem.Allocator,
+    txn: *docstore.DocStore.Txn,
+    out: *std.ArrayListUnmanaged(docstore.OwnedKVPair),
+    key: []const u8,
+) !void {
+    const borrowed = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return,
+        else => return err,
+    };
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const owned_value = try alloc.dupe(u8, borrowed);
+    errdefer alloc.free(owned_value);
+    try out.append(alloc, .{ .key = owned_key, .value = owned_value });
+}
+
+fn metadataSnapshotRowLessThan(_: void, lhs: docstore.OwnedKVPair, rhs: docstore.OwnedKVPair) bool {
+    return std.mem.order(u8, lhs.key, rhs.key) == .lt;
+}
+
+fn encodeMetadataSnapshot(alloc: std.mem.Allocator, rows: []const docstore.OwnedKVPair) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, RaftApplyStore.metadata_snapshot_magic);
+    try out.append(alloc, RaftApplyStore.metadata_snapshot_version);
+    try appendInt(alloc, &out, u32, std.math.cast(u32, rows.len) orelse return error.MetadataSnapshotTooLarge);
+    for (rows) |row| {
+        try appendInt(alloc, &out, u32, std.math.cast(u32, row.key.len) orelse return error.MetadataSnapshotTooLarge);
+        try out.appendSlice(alloc, row.key);
+        try appendInt(alloc, &out, u32, std.math.cast(u32, row.value.len) orelse return error.MetadataSnapshotTooLarge);
+        try out.appendSlice(alloc, row.value);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn decodeMetadataSnapshotAlloc(alloc: std.mem.Allocator, encoded: []const u8) ![]docstore.OwnedKVPair {
+    if (encoded.len < RaftApplyStore.metadata_snapshot_magic.len + 1 + @sizeOf(u32) or
+        !std.mem.eql(u8, encoded[0..RaftApplyStore.metadata_snapshot_magic.len], RaftApplyStore.metadata_snapshot_magic) or
+        encoded[RaftApplyStore.metadata_snapshot_magic.len] != RaftApplyStore.metadata_snapshot_version)
+    {
+        return error.InvalidMetadataSnapshot;
+    }
+    var pos: usize = RaftApplyStore.metadata_snapshot_magic.len + 1;
+    const count = readInt(encoded, &pos, u32) catch return error.InvalidMetadataSnapshot;
+    if (count > (encoded.len - pos) / 8) return error.InvalidMetadataSnapshot;
+    const rows = try alloc.alloc(docstore.OwnedKVPair, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (rows[0..initialized]) |row| {
+            alloc.free(row.key);
+            alloc.free(row.value);
+        }
+        alloc.free(rows);
+    }
+    while (initialized < rows.len) : (initialized += 1) {
+        const key_len = readInt(encoded, &pos, u32) catch return error.InvalidMetadataSnapshot;
+        if (key_len > encoded.len - pos) return error.InvalidMetadataSnapshot;
+        const key = try alloc.dupe(u8, encoded[pos .. pos + key_len]);
+        pos += key_len;
+        errdefer alloc.free(key);
+        const value_len = readInt(encoded, &pos, u32) catch return error.InvalidMetadataSnapshot;
+        if (value_len > encoded.len - pos) return error.InvalidMetadataSnapshot;
+        const value = try alloc.dupe(u8, encoded[pos .. pos + value_len]);
+        pos += value_len;
+        rows[initialized] = .{ .key = key, .value = value };
+    }
+    if (pos != encoded.len) return error.InvalidMetadataSnapshot;
+    return rows;
+}
+
+fn freeMetadataSnapshotRows(alloc: std.mem.Allocator, rows: []const docstore.OwnedKVPair) void {
+    for (rows) |row| {
+        alloc.free(row.key);
+        alloc.free(row.value);
+    }
+    alloc.free(rows);
+}
+
+fn validateMetadataSnapshotRows(
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    rows: []const docstore.OwnedKVPair,
+) !void {
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    try seen.ensureTotalCapacity(alloc, @intCast(rows.len));
+    for (rows) |row| {
+        if (!metadataSnapshotKeyBelongsToGroup(group_id, row.key)) return error.InvalidMetadataSnapshot;
+        const result = try seen.getOrPut(alloc, row.key);
+        if (result.found_existing) return error.InvalidMetadataSnapshot;
+    }
+}
+
+fn metadataSnapshotKeyBelongsToGroup(group_id: u64, key: []const u8) bool {
+    var buf: [256]u8 = undefined;
+    for (RaftApplyStore.metadata_snapshot_projections) |descriptor| {
+        const owned_key = switch (descriptor.key) {
+            .prefix => |key_fn| key_fn(&buf, group_id) catch return false,
+            .point => |key_fn| key_fn(&buf, group_id) catch return false,
+        };
+        switch (descriptor.key) {
+            .prefix => if (std.mem.startsWith(u8, key, owned_key)) return true,
+            .point => if (std.mem.eql(u8, key, owned_key)) return true,
+        }
+    }
+    return false;
+}
+
+test "metadata raft apply store snapshot key registry covers every durable projection class" {
+    const projection_count = @typeInfo(RaftApplyStore.MetadataSnapshotProjection).@"enum".fields.len;
+    try std.testing.expectEqual(projection_count, RaftApplyStore.metadata_snapshot_projections.len);
+
+    var seen = [_]bool{false} ** projection_count;
+    var buf: [256]u8 = undefined;
+    for (RaftApplyStore.metadata_snapshot_projections) |descriptor| {
+        const ordinal = @intFromEnum(descriptor.projection);
+        try std.testing.expect(!seen[ordinal]);
+        seen[ordinal] = true;
+        const key = switch (descriptor.key) {
+            .prefix => |key_fn| try key_fn(&buf, 41),
+            .point => |key_fn| try key_fn(&buf, 41),
+        };
+        try std.testing.expect(metadataSnapshotKeyBelongsToGroup(41, key));
+        try std.testing.expect(!metadataSnapshotKeyBelongsToGroup(42, key));
+    }
+    for (seen) |present| try std.testing.expect(present);
+
+    var descriptor_mask: u32 = 0;
+    for (RaftApplyStore.metadata_snapshot_projections) |descriptor| {
+        descriptor_mask |= RaftApplyStore.metadataSnapshotProjectionBit(descriptor.projection);
+    }
+    var command_mask: u32 = 0;
+    inline for (std.meta.tags(std.meta.Tag(TransitionCommand))) |tag| {
+        const mask = RaftApplyStore.transitionCommandProjectionMask(tag);
+        try std.testing.expect(mask != 0);
+        command_mask |= mask;
+    }
+    try std.testing.expectEqual(descriptor_mask, command_mask);
 }
 
 fn appendInt(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), comptime T: type, value: T) !void {
@@ -4237,6 +5265,10 @@ pub fn reconcileLeaseKeyForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_reconcile_lease:{d}", .{group_id});
 }
 
+pub fn metadataIncarnationKeyForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_incarnation:{d}", .{group_id});
+}
+
 pub fn reallocationRequestKeyForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_reallocation_request:{d}", .{group_id});
 }
@@ -4301,6 +5333,52 @@ fn storeKeyForGroup(buf: []u8, group_id: u64, store_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_store:{d}:{d}", .{ group_id, store_id });
 }
 
+fn splitTransitionActive(record: metadata.SplitTransitionRecord) bool {
+    return !transitionPhaseTerminal(record.phase);
+}
+
+fn transitionPhaseTerminal(phase: metadata.TransitionPhase) bool {
+    return phase == .finalized or phase == .rolled_back;
+}
+
+fn transitionPhaseCanAdvance(existing: metadata.TransitionPhase, incoming: metadata.TransitionPhase) bool {
+    if (transitionPhaseTerminal(existing)) return incoming == existing;
+    if (existing == .rolling_back) return incoming == .rolling_back or incoming == .rolled_back;
+    if (transitionPhaseTerminal(incoming)) return true;
+    return @intFromEnum(incoming) >= @intFromEnum(existing);
+}
+
+fn splitTransitionUpdateAllowed(existing: metadata.SplitTransitionRecord, incoming: metadata.SplitTransitionRecord) bool {
+    return existing.transition_id == incoming.transition_id and
+        existing.attempt_epoch == incoming.attempt_epoch and
+        existing.source_group_id == incoming.source_group_id and
+        existing.destination_group_id == incoming.destination_group_id and
+        optionalBytesEqual(existing.split_key, incoming.split_key) and
+        optionalBytesEqual(existing.source_range_end, incoming.source_range_end) and
+        transitionPhaseCanAdvance(existing.phase, incoming.phase) and
+        !(existing.rollback_reason != null and incoming.rollback_reason == null);
+}
+
+fn mergeTransitionUpdateAllowed(existing: metadata.MergeTransitionRecord, incoming: metadata.MergeTransitionRecord) bool {
+    return existing.transition_id == incoming.transition_id and
+        existing.donor_group_id == incoming.donor_group_id and
+        existing.receiver_group_id == incoming.receiver_group_id and
+        existing.allow_doc_identity_reassignment == incoming.allow_doc_identity_reassignment and
+        transitionPhaseCanAdvance(existing.phase, incoming.phase) and
+        !(existing.rollback_reason != null and incoming.rollback_reason == null);
+}
+
+fn optionalBytesEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn keyStrictlyInsideRange(key: []const u8, start_key: []const u8, end_key: ?[]const u8) bool {
+    if (std.mem.order(u8, key, start_key) != .gt) return false;
+    if (end_key) |end| return std.mem.order(u8, key, end) == .lt;
+    return true;
+}
+
 test "metadata raft apply store persists batches across reopen" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4327,7 +5405,7 @@ test "metadata raft apply store persists batches across reopen" {
     }
 }
 
-test "metadata raft apply store projects transition records from committed entries" {
+test "metadata raft apply store fences transition identity and active removal" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -4337,6 +5415,7 @@ test "metadata raft apply store projects transition records from committed entri
     const split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_split_transition = .{
             .transition_id = 501,
+            .attempt_epoch = 1,
             .source_group_id = 21,
             .destination_group_id = 22,
             .phase = .bootstrap_peer,
@@ -4387,38 +5466,300 @@ test "metadata raft apply store projects transition records from committed entri
         try std.testing.expect(merges[0].allow_doc_identity_reassignment);
     }
 
-    const remove_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+    const conflicting_split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_split_transition = .{
+            .transition_id = 501,
+            .attempt_epoch = 2,
+            .source_group_id = 21,
+            .destination_group_id = 22,
+            .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
+        },
+    });
+    defer std.testing.allocator.free(conflicting_split_cmd);
+    const regressive_merge_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_merge_transition = .{
+            .transition_id = 601,
+            .donor_group_id = 31,
+            .receiver_group_id = 30,
+            .phase = .prepare,
+            .allow_doc_identity_reassignment = true,
+        },
+    });
+    defer std.testing.allocator.free(regressive_merge_cmd);
+    const remove_active_split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .remove_split_transition = .{ .transition_id = 501 },
     });
-    defer std.testing.allocator.free(remove_cmd);
-    const encoded_remove = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 2, .index = 9, .entry_type = .normal, .data = remove_cmd },
+    defer std.testing.allocator.free(remove_active_split_cmd);
+    const remove_active_merge_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_merge_transition = .{ .transition_id = 601 },
     });
-    defer std.testing.allocator.free(encoded_remove);
+    defer std.testing.allocator.free(remove_active_merge_cmd);
+    const encoded_stale_commands = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 2, .index = 9, .entry_type = .normal, .data = conflicting_split_cmd },
+        .{ .term = 2, .index = 10, .entry_type = .normal, .data = regressive_merge_cmd },
+        .{ .term = 2, .index = 11, .entry_type = .normal, .data = remove_active_split_cmd },
+        .{ .term = 2, .index = 12, .entry_type = .normal, .data = remove_active_merge_cmd },
+    });
+    defer std.testing.allocator.free(encoded_stale_commands);
 
     {
         var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
         defer store.deinit();
         try store.snapshotBuilder().applyBatch(.{
             .group_id = 21,
-            .commit_index = 9,
-            .entries_bytes = encoded_remove,
+            .commit_index = 12,
+            .entries_bytes = encoded_stale_commands,
         });
-    }
 
-    {
-        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
-        defer store.deinit();
         const splits = try store.listSplitTransitions(std.testing.allocator, 21);
         defer store.freeSplitTransitions(std.testing.allocator, splits);
         const merges = try store.listMergeTransitions(std.testing.allocator, 21);
         defer store.freeMergeTransitions(std.testing.allocator, merges);
 
-        try std.testing.expectEqual(@as(usize, 0), splits.len);
+        try std.testing.expectEqual(@as(usize, 1), splits.len);
+        try std.testing.expectEqual(@as(u64, 1), splits[0].attempt_epoch);
+        try std.testing.expectEqual(metadata.TransitionPhase.bootstrap_peer, splits[0].phase);
         try std.testing.expectEqual(@as(usize, 1), merges.len);
-        try std.testing.expectEqual(@as(u64, 601), merges[0].transition_id);
-        try std.testing.expect(merges[0].allow_doc_identity_reassignment);
+        try std.testing.expectEqual(metadata.TransitionPhase.replay_deltas, merges[0].phase);
     }
+
+    const finalize_split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_split_transition = .{
+            .transition_id = 501,
+            .attempt_epoch = 1,
+            .source_group_id = 21,
+            .destination_group_id = 22,
+            .phase = .finalized,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
+            .rollback_reason = "slow-peer",
+        },
+    });
+    defer std.testing.allocator.free(finalize_split_cmd);
+    const finalize_merge_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_merge_transition = .{
+            .transition_id = 601,
+            .donor_group_id = 31,
+            .receiver_group_id = 30,
+            .phase = .finalized,
+            .allow_doc_identity_reassignment = true,
+        },
+    });
+    defer std.testing.allocator.free(finalize_merge_cmd);
+    const encoded_terminal = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 2, .index = 13, .entry_type = .normal, .data = finalize_split_cmd },
+        .{ .term = 2, .index = 14, .entry_type = .normal, .data = finalize_merge_cmd },
+    });
+    defer std.testing.allocator.free(encoded_terminal);
+
+    {
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer store.deinit();
+        try store.snapshotBuilder().applyBatch(.{
+            .group_id = 21,
+            .commit_index = 14,
+            .entries_bytes = encoded_terminal,
+        });
+
+        const splits = try store.listSplitTransitions(std.testing.allocator, 21);
+        defer store.freeSplitTransitions(std.testing.allocator, splits);
+        const merges = try store.listMergeTransitions(std.testing.allocator, 21);
+        defer store.freeMergeTransitions(std.testing.allocator, merges);
+        try std.testing.expectEqual(metadata.TransitionPhase.finalized, splits[0].phase);
+        try std.testing.expectEqual(metadata.TransitionPhase.finalized, merges[0].phase);
+    }
+
+    const remove_split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_split_transition = .{ .transition_id = 501 },
+    });
+    defer std.testing.allocator.free(remove_split_cmd);
+    const remove_merge_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_merge_transition = .{ .transition_id = 601 },
+    });
+    defer std.testing.allocator.free(remove_merge_cmd);
+    const encoded_terminal_remove = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 3, .index = 15, .entry_type = .normal, .data = remove_split_cmd },
+        .{ .term = 3, .index = 16, .entry_type = .normal, .data = remove_merge_cmd },
+    });
+    defer std.testing.allocator.free(encoded_terminal_remove);
+
+    {
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer store.deinit();
+        try store.snapshotBuilder().applyBatch(.{
+            .group_id = 21,
+            .commit_index = 16,
+            .entries_bytes = encoded_terminal_remove,
+        });
+
+        const splits = try store.listSplitTransitions(std.testing.allocator, 21);
+        defer store.freeSplitTransitions(std.testing.allocator, splits);
+        const merges = try store.listMergeTransitions(std.testing.allocator, 21);
+        defer store.freeMergeTransitions(std.testing.allocator, merges);
+        try std.testing.expectEqual(@as(usize, 0), splits.len);
+        try std.testing.expectEqual(@as(usize, 0), merges.len);
+    }
+}
+
+test "metadata raft apply store returns only durable transition deltas" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-committed-transition-deltas", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+
+    const split = metadata.SplitTransitionRecord{
+        .transition_id = 701,
+        .attempt_epoch = 1,
+        .source_group_id = 71,
+        .destination_group_id = 72,
+        .phase = .prepare,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
+    };
+    const merge = metadata.MergeTransitionRecord{
+        .transition_id = 801,
+        .donor_group_id = 81,
+        .receiver_group_id = 80,
+        .phase = .prepare,
+    };
+
+    const split_upsert = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_split_transition = split });
+    defer std.testing.allocator.free(split_upsert);
+    const merge_upsert = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_merge_transition = merge });
+    defer std.testing.allocator.free(merge_upsert);
+    const initial_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = split_upsert },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = merge_upsert },
+    });
+    defer std.testing.allocator.free(initial_entries);
+    var initial = try store.applyCommittedBatch(41, 2, initial_entries);
+    defer initial.deinit();
+    try std.testing.expectEqual(@as(usize, 2), initial.transition_deltas.items.len);
+    try std.testing.expectEqual(@as(u64, 701), initial.transition_deltas.items[0].upsert_split.transition_id);
+    try std.testing.expectEqual(@as(u64, 801), initial.transition_deltas.items[1].upsert_merge.transition_id);
+
+    const split_remove = try encodeTransitionCommand(std.testing.allocator, .{ .remove_split_transition = .{ .transition_id = 701 } });
+    defer std.testing.allocator.free(split_remove);
+    const merge_remove = try encodeTransitionCommand(std.testing.allocator, .{ .remove_merge_transition = .{ .transition_id = 801 } });
+    defer std.testing.allocator.free(merge_remove);
+    const active_remove_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = split_remove },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = merge_remove },
+    });
+    defer std.testing.allocator.free(active_remove_entries);
+    var active_remove = try store.applyCommittedBatch(41, 4, active_remove_entries);
+    defer active_remove.deinit();
+    try std.testing.expectEqual(@as(usize, 0), active_remove.transition_deltas.items.len);
+    const active_splits = try store.listSplitTransitions(std.testing.allocator, 41);
+    defer store.freeSplitTransitions(std.testing.allocator, active_splits);
+    const active_merges = try store.listMergeTransitions(std.testing.allocator, 41);
+    defer store.freeMergeTransitions(std.testing.allocator, active_merges);
+    try std.testing.expectEqual(@as(usize, 1), active_splits.len);
+    try std.testing.expectEqual(@as(usize, 1), active_merges.len);
+
+    var rolled_back_split = split;
+    rolled_back_split.phase = .rolled_back;
+    rolled_back_split.rollback_reason = "operator cancel";
+    var rolled_back_merge = merge;
+    rolled_back_merge.phase = .rolled_back;
+    rolled_back_merge.rollback_reason = "operator cancel";
+    const split_terminal = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_split_transition = rolled_back_split });
+    defer std.testing.allocator.free(split_terminal);
+    const merge_terminal = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_merge_transition = rolled_back_merge });
+    defer std.testing.allocator.free(merge_terminal);
+    const terminal_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = split_terminal },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = merge_terminal },
+    });
+    defer std.testing.allocator.free(terminal_entries);
+    var terminal = try store.applyCommittedBatch(41, 6, terminal_entries);
+    defer terminal.deinit();
+    try std.testing.expectEqual(@as(usize, 2), terminal.transition_deltas.items.len);
+    try std.testing.expectEqual(metadata.TransitionPhase.rolled_back, terminal.transition_deltas.items[0].upsert_split.phase);
+    try std.testing.expectEqual(metadata.TransitionPhase.rolled_back, terminal.transition_deltas.items[1].upsert_merge.phase);
+
+    const terminal_remove_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = split_remove },
+        .{ .term = 1, .index = 8, .entry_type = .normal, .data = merge_remove },
+    });
+    defer std.testing.allocator.free(terminal_remove_entries);
+    var terminal_remove = try store.applyCommittedBatch(41, 8, terminal_remove_entries);
+    defer terminal_remove.deinit();
+    try std.testing.expectEqual(@as(usize, 2), terminal_remove.transition_deltas.items.len);
+    try std.testing.expectEqual(@as(u64, 701), terminal_remove.transition_deltas.items[0].remove_split);
+    try std.testing.expectEqual(@as(u64, 801), terminal_remove.transition_deltas.items[1].remove_merge);
+}
+
+test "metadata raft apply store publishes listeners only after commit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-post-commit-listeners", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const Capture = struct {
+        projections: usize = 0,
+        keys: usize = 0,
+
+        fn onProjection(ptr: *anyopaque, _: ProjectionSignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.projections += 1;
+        }
+
+        fn matchesKey(_: *anyopaque, _: CommittedKeySignal) bool {
+            return true;
+        }
+
+        fn onKey(ptr: *anyopaque, _: CommittedKeySignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.keys += 1;
+        }
+    };
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    var capture = Capture{};
+    try store.addProjectionListener(.{ .ptr = &capture, .vtable = &.{ .on_projection_signal = Capture.onProjection } });
+    try store.addCommittedKeyListener(.{
+        .ptr = &capture,
+        .vtable = &.{
+            .matches_key = Capture.matchesKey,
+            .on_committed_key = Capture.onKey,
+        },
+    });
+
+    const table = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_table = .{
+        .table_id = 91,
+        .name = "docs",
+    } });
+    defer std.testing.allocator.free(table);
+    const invalid_split = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_split_transition = .{
+        .transition_id = 901,
+        .attempt_epoch = 1,
+        .source_group_id = 91,
+        .destination_group_id = group_ids.main_metadata_group_id,
+        .phase = .prepare,
+    } });
+    defer std.testing.allocator.free(invalid_split);
+    const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = invalid_split },
+    });
+    defer std.testing.allocator.free(entries);
+
+    try std.testing.expectError(error.ReservedGroupId, store.applyCommittedBatch(41, 2, entries));
+    try std.testing.expectEqual(@as(usize, 0), capture.projections);
+    try std.testing.expectEqual(@as(usize, 0), capture.keys);
+    try std.testing.expectEqual(@as(?AppliedMetadataBatch, null), try store.latestBatch(41));
+    const tables = try store.listTables(std.testing.allocator, 41);
+    defer store.freeTables(std.testing.allocator, tables);
+    try std.testing.expectEqual(@as(usize, 0), tables.len);
 }
 
 test "metadata raft apply store resolves stale store drain intent at apply time" {
@@ -4510,6 +5851,72 @@ test "metadata raft apply store preserves node drain across store upsert" {
     try std.testing.expect(!metadata_table_manager.nodeLifecycleActive(nodes[0].lifecycle));
     try std.testing.expectEqual(@as(usize, 1), stores.len);
     try std.testing.expect(stores[0].drain_requested);
+}
+
+test "metadata raft apply store admits one split epoch atomically and retries idempotently" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-split-admission", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const source_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_range = .{
+        .group_id = 101,
+        .table_id = 10,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    } });
+    defer std.testing.allocator.free(source_cmd);
+    const first_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .admit_split_transition = .{
+        .expected_source_epoch = 0,
+        .record = .{
+            .transition_id = 7001,
+            .attempt_epoch = 1,
+            .source_group_id = 101,
+            .destination_group_id = 103,
+            .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
+        },
+    } });
+    defer std.testing.allocator.free(first_cmd);
+    const competing_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .admit_split_transition = .{
+        .expected_source_epoch = 0,
+        .record = .{
+            .transition_id = 7002,
+            .attempt_epoch = 1,
+            .source_group_id = 101,
+            .destination_group_id = 104,
+            .phase = .prepare,
+            .split_key = "doc:n",
+            .source_range_end = "doc:z",
+        },
+    } });
+    defer std.testing.allocator.free(competing_cmd);
+    const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = source_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = first_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = competing_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = first_cmd },
+    });
+    defer std.testing.allocator.free(encoded_entries);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 21,
+        .commit_index = 4,
+        .entries_bytes = encoded_entries,
+    });
+
+    const ranges = try store.listRanges(std.testing.allocator, 21);
+    defer store.freeRanges(std.testing.allocator, ranges);
+    const transitions = try store.listSplitTransitions(std.testing.allocator, 21);
+    defer store.freeSplitTransitions(std.testing.allocator, transitions);
+    try std.testing.expectEqual(@as(usize, 1), ranges.len);
+    try std.testing.expectEqual(@as(u64, 1), ranges[0].split_attempt_epoch);
+    try std.testing.expectEqual(@as(usize, 1), transitions.len);
+    try std.testing.expectEqual(@as(u64, 7001), transitions[0].transition_id);
+    try std.testing.expectEqual(@as(u64, 1), transitions[0].attempt_epoch);
 }
 
 test "metadata raft apply store ignores stale drained first store registration after cancellation" {
@@ -4855,6 +6262,7 @@ test "metadata raft apply store rejects reserved data group ids in transition re
     const split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_split_transition = .{
             .transition_id = 501,
+            .attempt_epoch = 1,
             .source_group_id = 21,
             .destination_group_id = group_ids.main_metadata_group_id,
             .phase = .prepare,
@@ -5850,6 +7258,7 @@ test "metadata state machine projects transitions through metadata apply store" 
     const cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_split_transition = .{
             .transition_id = 701,
+            .attempt_epoch = 1,
             .source_group_id = 41,
             .destination_group_id = 42,
             .phase = .bootstrap_peer,
@@ -5857,7 +7266,7 @@ test "metadata state machine projects transitions through metadata apply store" 
     });
     defer std.testing.allocator.free(cmd);
 
-    try sm.stateMachine().applyReady(41, &.{
+    try sm.stateMachine().applyReady(41, null, &.{
         .{ .term = 3, .index = 12, .entry_type = .normal, .data = cmd },
     }, &.{});
 
@@ -5966,6 +7375,7 @@ test "metadata apply store replay is idempotent when applied watermark lags WAL 
     const cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_split_transition = .{
             .transition_id = 902,
+            .attempt_epoch = 1,
             .source_group_id = 51,
             .destination_group_id = 52,
             .phase = .bootstrap_peer,
@@ -5997,7 +7407,7 @@ test "metadata apply store replay is idempotent when applied watermark lags WAL 
             .applied_sink = raft_state_machine.noopAppliedIndexSink(),
             .snapshot_builder = store.snapshotBuilder(),
         };
-        try sm.stateMachine().applyReady(202, &.{
+        try sm.stateMachine().applyReady(202, null, &.{
             .{ .term = 5, .index = 1, .entry_type = .normal, .data = cmd },
         }, &.{});
     }
@@ -6031,7 +7441,7 @@ test "metadata apply store replay is idempotent when applied watermark lags WAL 
             .applied_sink = raft_state_machine.noopAppliedIndexSink(),
             .snapshot_builder = store.snapshotBuilder(),
         };
-        try sm.stateMachine().applyReady(202, rd.committed_entries, &.{});
+        try sm.stateMachine().applyReady(202, rd.snapshot, rd.committed_entries, &.{});
 
         const batch = (try store.latestBatch(202)) orelse return error.MissingMetadataBatch;
         try std.testing.expectEqual(@as(u64, 1), batch.commit_index);

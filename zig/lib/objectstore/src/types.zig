@@ -43,6 +43,8 @@ pub const PutOptions = struct {
 pub const GetOptions = struct {
     version_id: ?[]const u8 = null,
     range: ?ByteRange = null,
+    /// Strong conditional read. Implementations must return
+    /// `error.PreconditionFailed` rather than data from another object version.
     if_match_etag: ?[]const u8 = null,
     part_number: ?u32 = null,
 };
