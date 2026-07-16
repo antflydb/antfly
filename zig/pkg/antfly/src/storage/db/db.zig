@@ -286,6 +286,13 @@ pub const OpenOptions = struct {
     index_backends: db_config.IndexBackendOptions = .{},
     index_base_path: ?[]const u8 = null,
     index_open_parallelism: ?usize = null,
+    /// Authoritative local-provisioning schema to persist after the primary
+    /// store is open but before any configured index is opened or backfilled.
+    /// The caller retains ownership for the duration of `open`. This closes a
+    /// schema-migration ordering hole where an interrupted target-generation
+    /// backfill could resume with the previously persisted (or schema-less)
+    /// mapper before the provisioner got a chance to call `setSchema`.
+    schema_before_index_load: ?schema_mod.TableSchema = null,
     identity_namespace: ?doc_identity.Namespace = null,
     prefer_existing_identity_namespace: bool = false,
     executor: derived_executor_mod.Config = .{},
@@ -3210,6 +3217,13 @@ pub const DB = struct {
             try db.initAsyncInfrastructure(effective_executor, opts.resource_manager);
             profile.init_async_infrastructure_ns = elapsedSince(init_async_started_ns);
             executor_ready = true;
+            if (opts.schema_before_index_load) |table_schema| {
+                // This option is used by the metadata-authoritative local
+                // provisioner. Persist directly through the core before index
+                // open; no index runtime exists yet and the metadata record is
+                // already the durable authority for this replica projection.
+                try db.core.setSchema(table_schema);
+            }
             const optional_runtimes_initialized = opts.open_mode.allowsOptionalRuntimes() and opts.start_optional_runtimes and !ha_standby_role;
             const optional_runtime_workers_enabled = optional_runtimes_initialized and opts.start_optional_runtime_workers;
             db.optional_runtime_workers_enabled = optional_runtime_workers_enabled;
@@ -63717,6 +63731,74 @@ test "db text compaction preserves ordinal filters across reopen" {
         try std.testing.expectEqualStrings("doc:8", result.hits[0].id);
         try std.testing.expectEqual(@as(?doc_set.DocOrdinal, expected_ordinal), result.hits[0].doc_ordinal);
     }
+}
+
+test "db provisioning schema is persisted before configured full text indexes open" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    // Persist the target-generation catalog entry while the shard still has
+    // no target schema. This is the state an interrupted migration presents
+    // to the next provisioning open.
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "full_text_index_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+    }
+
+    const schema_json =
+        \\{
+        \\  "version": 1,
+        \\  "default_type": "doc",
+        \\  "enforce_types": true,
+        \\  "document_schemas": {
+        \\    "doc": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "additionalProperties": false,
+        \\        "properties": {
+        \\          "body": {
+        \\            "type": "string",
+        \\            "x-antfly-types": ["text"],
+        \\            "x-antfly-include-in-all": false
+        \\          }
+        \\        },
+        \\        "required": ["body"]
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .schema_before_index_load = runtime_schema,
+    });
+    defer reopened.close();
+
+    const entry = reopened.core.index_manager.textIndexEntry("full_text_index_v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), entry.runtime_schema.?.version);
+    try reopened.batch(.{
+        .writes = &.{.{ .key = "doc:1", .value = "{\"body\":\"alpha beta\"}" }},
+        .sync_level = .full_text,
+    });
+
+    const snapshot = entry.persistent.snapshot();
+    try std.testing.expectEqual(@as(u32, 1), try snapshot.termDocFreq(alloc, "body", "alpha"));
+    try std.testing.expectEqual(@as(u32, 0), try snapshot.termDocFreq(alloc, "body.keyword", "alpha beta"));
+    try std.testing.expectEqual(@as(u32, 0), try snapshot.termDocFreq(alloc, "_all", "alpha"));
 }
 
 test "db best effort force compact leaves text merge debt under pressure" {

@@ -8705,7 +8705,7 @@ pub const IndexManager = struct {
             const snap = index.snapshot();
             const planned = (try text_index_maintenance.planPolicyMergeAlloc(self.alloc, snap, policy)) orelse return;
             defer self.alloc.free(planned);
-            var reservation = try self.reserveTextMergeBuffers(index, snap, planned);
+            var reservation = try self.reserveTextMergeBuffers(index, snap, planned, .strict);
             defer if (reservation) |*active| active.release();
 
             if (!try text_index_maintenance.applyPlannedMerge(
@@ -8973,7 +8973,7 @@ pub const IndexManager = struct {
         const owned_index_name = try self.alloc.dupe(u8, index_name);
         errdefer self.alloc.free(owned_index_name);
 
-        var buffer_reservation = try self.reserveTextMergeBuffers(persistent, snap, planned);
+        var buffer_reservation = try self.reserveTextMergeBuffers(persistent, snap, planned, .bounded_task);
         errdefer if (buffer_reservation) |*reservation| reservation.release();
 
         const source = try self.alloc.alloc(TextMergeSourceSegment, planned.len);
@@ -9011,6 +9011,7 @@ pub const IndexManager = struct {
         persistent: *const persistent_mod.PersistentIndex,
         snap: *const index_mod.IndexSnapshot,
         planned: []const usize,
+        mode: enum { strict, bounded_task },
     ) !?resource_manager_mod.Reservation {
         const manager = self.resource_manager orelse return null;
 
@@ -9039,12 +9040,17 @@ pub const IndexManager = struct {
                 reservation_bytes = @min(reservation_bytes, enforced_cap);
             }
         }
-        // Permit one merge up to 2x the normal hard limit. ResourceManager
-        // keeps the operation exclusive, fully accounted, and visible as hard
-        // pressure. Above that envelope the task allocator, not a disk-size
-        // proxy, is authoritative: it enforces the exact same cap and turns a
-        // real working-set overrun into ResourceBudgetExceeded.
-        return try manager.reserveBoundedOversizedSingle(.text_merge_buffers, reservation_bytes, 2);
+        return switch (mode) {
+            // Synchronous compaction executes with the manager allocator, so
+            // its estimate must fit the ordinary hard limit. Granting it the
+            // oversized exception would account the estimate without actually
+            // bounding the live working set.
+            .strict => try manager.reserve(.text_merge_buffers, reservation_bytes),
+            // Scheduled tasks execute through PhaseTrackingAllocator. Permit
+            // one task up to 2x the normal hard limit: ResourceManager keeps it
+            // exclusive and the task allocator enforces the same live cap.
+            .bounded_task => try manager.reserveBoundedOversizedSingle(.text_merge_buffers, reservation_bytes, 2),
+        };
     }
 
     fn estimateFileBackedMergeWorkingSetBytes(seg: *const index_mod.SegmentEntry) !u64 {
@@ -9146,7 +9152,7 @@ pub const IndexManager = struct {
 
             const planned = try text_index_maintenance.planForceCompactAlloc(self.alloc, snap, force_merge_max_segments_at_once);
             defer self.alloc.free(planned);
-            var reservation = self.reserveTextMergeBuffers(&entry.persistent, snap, planned) catch |err| switch (err) {
+            var reservation = self.reserveTextMergeBuffers(&entry.persistent, snap, planned, .strict) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => if (options.mode == .best_effort) return false else return err,
             };
             defer if (reservation) |*active| active.release();

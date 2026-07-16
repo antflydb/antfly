@@ -2506,7 +2506,29 @@ status unavailable during maintenance. ReleaseFast validation against the
 preserved 5.03M-document corpus confirmed the distinction under active v1
 backfill: the process was using about 146% CPU, `/healthz` remained healthy,
 and `GET /db/v1/tables/antfly-benchmark` returned HTTP 200 in 0.8 ms with
-`migration.state = rebuilding`.
+`migration.state = rebuilding`. The same run exposed that an explicit
+`startup_catch_up/opening` placeholder carried zero counters, which the cached
+table-status path initially rendered as `empty=true`. A nonzero cached count
+can prove non-emptiness even when stale, but only a fresh zero can prove an
+empty table. The endpoint now omits optional storage status for an
+opening/catching-up zero snapshot instead of blocking or publishing a false
+empty state.
+
+The same distinction applies to schema-progress reconciliation. An explicit
+runtime report with `startup_catch_up/opening` means the live shard owner has
+been observed but is not ready yet; it does not mean runtime status is
+unavailable. Both metadata service variants previously treated an empty set of
+*ready* schema-progress records as absence of any runtime observation and fell
+back to opening the shard DB from the filesystem. During the preserved v1
+backfill this reopened the 6.65 GB primary state and the old full-text
+generation once per second, consuming roughly 265-295 ms per poll. Metadata
+reconciliation now checks coverage separately from readiness: if every locally
+hosted migrating group has an explicit runtime observation, including an
+opening/catching-up report, it does not perform the query-readonly DB fallback.
+The fallback remains enabled when even one hosted migrating group lacks a
+runtime observation, so the optimization cannot hide a genuinely missing
+owner/status report. This removes redundant CPU, allocation, mmap, and I/O
+pressure; it is independent of HTTP listener availability.
 
 The preserved corpus also reports 6.655 GB across 30 active primary LSM runs.
 This is not retained-generation or WAL amplification in this run: the manifest
@@ -2533,6 +2555,19 @@ wire version or dropping compatibility with runs written by `origin/main`:
   consecutive prefix and size the filter from that count. This preserves Bloom
   membership semantics and the encoded section layout while eliminating the
   entry-proportional disk and builder-memory cost.
+
+The next writer revision addresses the separate fixed-width offset cost. LSM
+table v10 stores a `u16` block-local entry offset instead of a `u32` table-global
+offset. Logical blocks are capped at 32 KiB, while an oversized entry is a
+singleton at local offset zero, so the representation is exact. Footer-only
+readers dispatch from an explicit metadata marker and full readers accept both
+the shipped v9 layout and v10. Readers expand once to the existing global
+`u32` lookup array, preserving point/range CPU behavior; streaming builders
+retain the packed form. Across the preserved 30,199,943 entries and 30 runs,
+this projects a net 60,399,646-byte disk reduction after the eight-byte marker
+per run, and halves
+the offset portion of table-builder memory. A generated origin/main v9 fixture
+proves full-file, footer-only, sequential, and exact-lookup compatibility.
 
 The remaining 5.621 GB compressed entry payload includes product source records
 and durable document-identity metadata that the kernel comparator intentionally

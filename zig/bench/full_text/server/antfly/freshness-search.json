@@ -6,7 +6,7 @@
       "match": "{marker}",
       "field": "body"
     },
-    "fields": [],
+    "fields": ["_id"],
     "limit": 10,
     "count": false
   },

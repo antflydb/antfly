@@ -3,7 +3,7 @@
   "path": "/tables/antfly-benchmark/query",
   "body": {
     "count": false,
-    "fields": [],
+    "fields": ["_id"],
     "full_text_search": {
       "field": "body",
       "match": "alpha"

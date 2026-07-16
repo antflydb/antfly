@@ -174,12 +174,14 @@ pub fn reconcileReplicaRootWithOptions(
         try fs_paths.createDirPathPortable(io_impl.io(), path);
         try applyRestoreIntentIfNeeded(alloc, path, group_id, table, range);
 
+        const runtime_schema = try runtimeTableSchemaFromJson(alloc, table.schema_json);
+        defer if (runtime_schema) |schema| @import("../storage/schema.zig").freeSchema(alloc, schema);
         var open_options = provisioningDbOpenOptions();
         open_options.backend_runtime = options.backend_runtime;
+        open_options.schema_before_index_load = runtime_schema;
         var db = try db_mod.DB.open(alloc, path, open_options);
         defer db.close();
         summary.dbs_opened += 1;
-        try applyTableSchemaJson(alloc, &db, table.schema_json);
         const index_summary = try reconcileDbIndexes(alloc, &db, table.indexes_json);
         summary.indexes_removed += index_summary.indexes_removed;
         summary.indexes_added += index_summary.indexes_added;
@@ -193,13 +195,11 @@ pub fn reconcileReplicaRootWithOptions(
     return summary;
 }
 
-fn applyTableSchemaJson(alloc: std.mem.Allocator, db: *db_mod.DB, schema_json: []const u8) !void {
-    if (schema_json.len == 0) return;
+fn runtimeTableSchemaFromJson(alloc: std.mem.Allocator, schema_json: []const u8) !?@import("../storage/schema.zig").TableSchema {
+    if (schema_json.len == 0) return null;
     var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
-    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
-    defer @import("../storage/schema.zig").freeSchema(alloc, runtime_schema);
-    try db.setSchema(runtime_schema);
+    return try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
 }
 
 pub fn reconcileDbIndexes(
@@ -383,6 +383,57 @@ pub fn collectLocalSchemaProgressFromRuntime(
         }
     }.lessThan);
     return try out.toOwnedSlice(alloc);
+}
+
+/// Whether projected runtime observations cover every locally hosted range
+/// participating in a schema migration. An explicit opening/catching-up
+/// observation is coverage even though it is not ready: falling back to a
+/// filesystem DB reopen in that state duplicates the live owner's work and
+/// cannot make the migration ready sooner.
+pub fn localSchemaRuntimeCoverageComplete(
+    local_node_id: u64,
+    hosted_group_ids: []const u64,
+    tables: []const table_manager.TableRecord,
+    ranges: []const table_manager.RangeRecord,
+    stores: []const table_manager.StoreRecord,
+) bool {
+    var saw_migrating_group = false;
+    for (hosted_group_ids) |group_id| {
+        const range = findRange(ranges, group_id) orelse continue;
+        const table = findTable(tables, range.table_id) orelse continue;
+        if (table.read_schema_json.len == 0) continue;
+        saw_migrating_group = true;
+        _ = findLocalRuntimeStatus(stores, local_node_id, table.table_id, group_id) orelse return false;
+    }
+    return saw_migrating_group;
+}
+
+test "schema progress runtime coverage treats opening observations as authoritative without hiding missing groups" {
+    const tables = [_]table_manager.TableRecord{.{
+        .table_id = 11,
+        .name = "docs",
+        .schema_json = "{\"version\":1}",
+        .read_schema_json = "{\"version\":0}",
+    }};
+    const ranges = [_]table_manager.RangeRecord{
+        .{ .group_id = 7, .table_id = 11, .start_key = "", .end_key = "m" },
+        .{ .group_id = 8, .table_id = 11, .start_key = "m" },
+    };
+    const hosted = [_]u64{ 7, 8 };
+    var runtimes = [_]table_manager.RuntimeGroupStatusReport{
+        .{ .table_id = 11, .group_id = 7, .node_id = 3, .source = "startup_catch_up", .freshness = "opening" },
+        .{ .table_id = 11, .group_id = 8, .node_id = 3, .source = "startup_catch_up", .freshness = "opening" },
+    };
+    var stores = [_]table_manager.StoreRecord{.{
+        .store_id = 5,
+        .node_id = 3,
+        .runtime_statuses = runtimes[0..1],
+    }};
+
+    try std.testing.expect(!localSchemaRuntimeCoverageComplete(3, &hosted, &tables, &ranges, &stores));
+    stores[0].runtime_statuses = &runtimes;
+    try std.testing.expect(localSchemaRuntimeCoverageComplete(3, &hosted, &tables, &ranges, &stores));
+    try std.testing.expect(!localSchemaRuntimeCoverageComplete(4, &hosted, &tables, &ranges, &stores));
 }
 
 pub fn collectLocalRestoreProgress(

@@ -2025,26 +2025,44 @@ pub const MetadataService = struct {
         defer self.freeProjectedTables(self.alloc, tables);
         const ranges = try self.listProjectedRanges(self.alloc);
         defer self.freeProjectedRanges(self.alloc, ranges);
-        const backend_runtime = try self.ensureBackendRuntime();
-        var fallback_shard_db = metadata_mod.FallbackLocalShardDbAdapter{
-            .replica_root_dir = replica_root_dir,
-            .backend_runtime = backend_runtime,
-        };
-        const shard_db = self.local_shard_db_adapter orelse fallback_shard_db.adapter();
-        const local_progress = try metadata_table_provisioner.collectLocalSchemaProgressWithOptions(
+        const stores = try self.listProjectedStores(self.alloc);
+        defer self.freeProjectedStores(self.alloc, stores);
+        var local_progress = try metadata_table_provisioner.collectLocalSchemaProgressFromRuntime(
             self.alloc,
-            replica_root_dir,
-            self.metadata_group_id,
+            local_node_id,
+            tables,
+            ranges,
+            stores,
+        );
+        defer self.alloc.free(local_progress);
+        if (local_progress.len == 0 and !metadata_table_provisioner.localSchemaRuntimeCoverageComplete(
             local_node_id,
             group_ids,
             tables,
             ranges,
-            .{
+            stores,
+        )) {
+            self.alloc.free(local_progress);
+            const backend_runtime = try self.ensureBackendRuntime();
+            var fallback_shard_db = metadata_mod.FallbackLocalShardDbAdapter{
+                .replica_root_dir = replica_root_dir,
                 .backend_runtime = backend_runtime,
-                .shard_db_adapter = shard_db,
-            },
-        );
-        defer self.alloc.free(local_progress);
+            };
+            const shard_db = self.local_shard_db_adapter orelse fallback_shard_db.adapter();
+            local_progress = try metadata_table_provisioner.collectLocalSchemaProgressWithOptions(
+                self.alloc,
+                replica_root_dir,
+                self.metadata_group_id,
+                local_node_id,
+                group_ids,
+                tables,
+                ranges,
+                .{
+                    .backend_runtime = backend_runtime,
+                    .shard_db_adapter = shard_db,
+                },
+            );
+        }
         const projected_progress = try self.listProjectedSchemaProgress(self.alloc);
         defer self.freeProjectedSchemaProgress(self.alloc, projected_progress);
         try syncLocalSchemaProgress(self, local_node_id, local_progress, projected_progress);
@@ -3850,7 +3868,13 @@ pub const MetadataHttpService = struct {
             inputs.stores,
         );
         defer self.alloc.free(local_progress);
-        if (local_progress.len == 0) {
+        if (local_progress.len == 0 and !metadata_table_provisioner.localSchemaRuntimeCoverageComplete(
+            local_node_id,
+            group_ids,
+            inputs.tables,
+            inputs.ranges,
+            inputs.stores,
+        )) {
             self.alloc.free(local_progress);
             const backend_runtime = try self.ensureBackendRuntime();
             var fallback_shard_db = metadata_mod.FallbackLocalShardDbAdapter{
