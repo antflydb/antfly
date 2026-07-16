@@ -352,7 +352,11 @@ fn executeModelForwardViaDefinition(
             shape.attention_mode,
             inferFallbackVocabSize(graph),
         ) catch |err| switch (err) {
-            error.FileNotFound, error.InvalidCharacter, error.SyntaxError, error.UnexpectedToken, error.UnknownField, error.ArtifactShapeMismatch => blk: {
+            // A missing model-specific package permits discovery of legacy
+            // manifests. A package that exists but cannot be parsed, validated,
+            // or matched is corrupt and must fail closed rather than silently
+            // selecting a stale artifact or lower-priority provider.
+            error.FileNotFound => blk: {
                 const found = try findMatchingOnnxWholeModelArtifact(
                     allocator,
                     artifact_dir,
@@ -588,7 +592,7 @@ fn findMatchingOnnxArtifactFromPackage(
     defer allocator.free(package_path);
 
     var parsed = compiled_artifact.readPackageManifest(allocator, io, package_path) catch |err| switch (err) {
-        error.FileNotFound, error.InvalidCharacter, error.SyntaxError, error.UnexpectedToken, error.UnknownField => return null,
+        error.FileNotFound => return null,
         else => return err,
     };
     defer parsed.deinit();
@@ -631,7 +635,7 @@ fn findMatchingOnnxDecodeArtifactFromPackage(
     defer allocator.free(package_path);
 
     var parsed = compiled_artifact.readPackageManifest(allocator, io, package_path) catch |err| switch (err) {
-        error.FileNotFound, error.InvalidCharacter, error.SyntaxError, error.UnexpectedToken, error.UnknownField => return null,
+        error.FileNotFound => return null,
         else => return err,
     };
     defer parsed.deinit();
@@ -753,6 +757,45 @@ test "ONNX whole-model artifact lookup resolves package manifest entries" {
         allocator.free(decode.?.artifact_path);
     }
     try std.testing.expectEqualStrings("/tmp/model.decode.onnx.inference.json", decode.?.manifest_path);
+}
+
+test "ONNX model-specific package corruption is terminal" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(base_dir);
+    const package_path = try compiled_artifact.packageManifestPath(
+        allocator,
+        base_dir,
+        "onnx",
+        "/tmp/model",
+        "onnx_graph",
+        null,
+    );
+    defer allocator.free(package_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = package_path, .data = "[1]" });
+
+    try std.testing.expectError(
+        error.UnexpectedToken,
+        findMatchingOnnxWholeModelArtifact(
+            allocator,
+            base_dir,
+            "/tmp/model",
+            .{ .prefill = .{
+                .input_ids = &.{1},
+                .seq_len = 1,
+                .query_seq_len = 1,
+                .attention_mode = .paged_prefill,
+            } },
+        ),
+    );
+    try std.testing.expectError(
+        error.UnexpectedToken,
+        findMatchingOnnxWholeModelDecodeArtifact(allocator, base_dir, "/tmp/model"),
+    );
 }
 
 const ArtifactShape = struct {

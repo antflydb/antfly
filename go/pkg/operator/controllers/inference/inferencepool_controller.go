@@ -57,7 +57,7 @@ const (
 	// InferenceAPIPort is the port the Inference API server listens on.
 	// This must match ANTFLY_INFERENCE_URL in the container image (default: http://0.0.0.0:8080).
 	InferenceAPIPort = 8080
-	// defaultTPUPJRTPluginPath is part of the omni inference image contract.
+	// defaultTPUPJRTPluginPath is part of the operator's TPU runtime image contract.
 	// Custom images may override it through spec.config.pjrt_plugin_path.
 	defaultTPUPJRTPluginPath = "/usr/local/lib/libtpu.so"
 )

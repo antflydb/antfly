@@ -451,6 +451,37 @@ fn isRetryableGenerationBaseLoadError(
     return false;
 }
 
+/// `GenerateBatchError.retryable` promises that retrying the same item may
+/// succeed. Keep this list deliberately narrow: capacity pressure and timeouts
+/// can clear between attempts, while model, artifact, tensor, binding, and
+/// backend-capability failures are deterministic until the deployment changes.
+fn isRetryableBatchRuntimeError(err: anyerror) bool {
+    return switch (err) {
+        error.OutOfMemory,
+        error.MemoryBudgetExceeded,
+        error.ModelCapacityReached,
+        error.QueueFull,
+        error.Timeout,
+        => true,
+        else => false,
+    };
+}
+
+fn batchRuntimeFailure(default_code: []const u8, err: anyerror) api.GenerateBatchError {
+    return .{
+        .code = switch (err) {
+            error.OutOfMemory => "RESOURCE_EXHAUSTED",
+            error.MemoryBudgetExceeded => "MEMORY_BUDGET_EXCEEDED",
+            error.ModelCapacityReached => "MODEL_CAPACITY_REACHED",
+            error.QueueFull => "QUEUE_FULL",
+            error.Timeout => "TIMEOUT",
+            else => default_code,
+        },
+        .message = @errorName(err),
+        .retryable = isRetryableBatchRuntimeError(err),
+    };
+}
+
 /// A failed direct base makes every compiled provider sharing that base
 /// unusable. Mark the complete bounded segment before choosing the next
 /// operation backend, otherwise fallback can loop back into the same failed
@@ -4379,7 +4410,7 @@ pub const Node = struct {
 
         fn run(self: *@This()) std.Io.Cancelable!void {
             self.runInner() catch |err| {
-                self.out.@"error" = .{ .code = "GENERATION_FAILED", .message = @errorName(err), .retryable = true };
+                self.out.@"error" = batchRuntimeFailure("GENERATION_FAILED", err);
             };
         }
 
@@ -4656,7 +4687,7 @@ pub const Node = struct {
                 var cb = session_factory.getComputeBackendWithBudget(model.session, ctx.allocator, &run_budget) catch |err| {
                     for (group_indices.items) |idx| {
                         if (!pending[idx]) continue;
-                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
+                        results[idx].@"error" = batchRuntimeFailure("BACKEND_ERROR", err);
                         pending[idx] = false;
                     }
                     continue;
@@ -4684,7 +4715,7 @@ pub const Node = struct {
                 }) catch |err| {
                     for (group_indices.items) |idx| {
                         if (!pending[idx]) continue;
-                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
+                        results[idx].@"error" = batchRuntimeFailure("BACKEND_ERROR", err);
                         pending[idx] = false;
                     }
                     continue;
@@ -4700,7 +4731,7 @@ pub const Node = struct {
                 }) catch |err| {
                     for (group_indices.items) |idx| {
                         if (!pending[idx]) continue;
-                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
+                        results[idx].@"error" = batchRuntimeFailure("BACKEND_ERROR", err);
                         pending[idx] = false;
                     }
                     continue;
@@ -4709,7 +4740,7 @@ pub const Node = struct {
                 cb.provisionKvDeviceWriteHook(&kv_storage) catch |err| {
                     for (group_indices.items) |idx| {
                         if (!pending[idx]) continue;
-                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
+                        results[idx].@"error" = batchRuntimeFailure("BACKEND_ERROR", err);
                         pending[idx] = false;
                     }
                     continue;
@@ -4824,7 +4855,7 @@ pub const Node = struct {
                             task_results[pos].completion_tokens,
                         );
                     } else {
-                        results[idx].@"error" = .{ .code = "GENERATION_FAILED", .message = "missing batch generation result", .retryable = true };
+                        results[idx].@"error" = .{ .code = "GENERATION_FAILED", .message = "missing batch generation result", .retryable = false };
                     }
                     pending[idx] = false;
                 }
@@ -8410,9 +8441,14 @@ test "generate backend selection keeps compiled mode explicit" {
     try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, true, auto_default));
     try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, auto_compiled));
 
-    const metal_eager = try parseGenerateBackendSelection(.metal, "eager", null);
-    try std.testing.expect(metal_eager.eager_mode_requested);
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, metal_eager));
+    const metal_eager_result = parseGenerateBackendSelection(.metal, "eager", null);
+    if (build_options.enable_metal) {
+        const metal_eager = try metal_eager_result;
+        try std.testing.expect(metal_eager.eager_mode_requested);
+        try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, metal_eager));
+    } else {
+        try std.testing.expectError(error.BackendUnavailable, metal_eager_result);
+    }
 
     try std.testing.expectError(error.InvalidGenerateMode, parseGenerateBackendSelection(null, "graph", null));
     try std.testing.expectError(error.InvalidCompiledTarget, parseGenerateBackendSelection(null, "compiled", "full"));
@@ -8571,6 +8607,27 @@ test "generation base failure advances beyond every provider sharing the base" {
     try std.testing.expect(isRetryableGenerationBaseLoadError(direct, error.NoBackendAvailable));
     try std.testing.expect(!isRetryableGenerationBaseLoadError(direct, error.MissingRequiredWeights));
     try std.testing.expect(!isRetryableGenerationBaseLoadError(direct, error.InvalidArtifact));
+}
+
+test "batch generation retries only transient runtime pressure" {
+    try std.testing.expect(isRetryableBatchRuntimeError(error.OutOfMemory));
+    try std.testing.expect(isRetryableBatchRuntimeError(error.MemoryBudgetExceeded));
+    try std.testing.expect(isRetryableBatchRuntimeError(error.ModelCapacityReached));
+    try std.testing.expect(isRetryableBatchRuntimeError(error.QueueFull));
+    try std.testing.expect(isRetryableBatchRuntimeError(error.Timeout));
+
+    try std.testing.expect(!isRetryableBatchRuntimeError(error.InvalidTensorShape));
+    try std.testing.expect(!isRetryableBatchRuntimeError(error.MissingRequiredWeights));
+    try std.testing.expect(!isRetryableBatchRuntimeError(error.InvalidArtifact));
+    try std.testing.expect(!isRetryableBatchRuntimeError(error.BackendUnavailable));
+
+    const deterministic = batchRuntimeFailure("GENERATION_FAILED", error.InvalidTensorShape);
+    try std.testing.expectEqualStrings("GENERATION_FAILED", deterministic.code);
+    try std.testing.expect(!deterministic.retryable.?);
+
+    const exhausted = batchRuntimeFailure("BACKEND_ERROR", error.MemoryBudgetExceeded);
+    try std.testing.expectEqualStrings("MEMORY_BUDGET_EXCEEDED", exhausted.code);
+    try std.testing.expect(exhausted.retryable.?);
 }
 
 test "compiled generation fallback preserves configured ordering boundary" {
