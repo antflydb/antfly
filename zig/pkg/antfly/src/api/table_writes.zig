@@ -8617,6 +8617,11 @@ pub const ProvisionedTableWriteSource = struct {
                 attempts += 1;
                 const busy = try work.repairOnce(path);
                 if (!busy) {
+                    // Restore repair can discover durable index-repair debt
+                    // while rebuilding derived artifacts. The isolated repair
+                    // DB has no visibility hook, so explicitly enqueue the
+                    // group for the normal automatic repair owner.
+                    work.source.notifyLocalIndexRepairDebt(work.table_name, work.group_id, .enqueue);
                     work.source.enqueueRestoreRepairComplete(work.table_name);
                     std.log.info("restore background catch-up complete table={s} group_id={d} attempts={d}", .{
                         work.table_name,
@@ -10212,6 +10217,11 @@ pub const ProvisionedTableWriteSource = struct {
 
         self.invalidateSharedPathCaches(path);
         transition.finishMutation();
+        // The restore-repair DB is intentionally isolated from the live
+        // visibility hooks. If it created durable index-repair intent (for
+        // example while bootstrapping a missing artifact counter), hand that
+        // debt to the normal automatic repair owner after publication.
+        self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue);
         self.publishRestoreRepairComplete(table_name);
         self.notifyLocalChange(table_name, .structural);
         self.notifyLocalChange(table_name, .data);
