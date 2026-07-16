@@ -18,7 +18,7 @@ const manifest_types = @import("types.zig");
 const manifest_codec = @import("codec.zig");
 const manifest_store = @import("store.zig");
 const object_store_support = @import("../object_store_support.zig");
-const platform_clock = @import("../../platform/clock.zig");
+const platform_clock = @import("antfly_platform").clock;
 
 const winner_visibility_attempts: usize = 5;
 const winner_visibility_initial_backoff_ms: u64 = 1;
