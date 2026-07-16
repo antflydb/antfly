@@ -129,6 +129,33 @@ func SetPriority(order []BackendType) {
 	copy(configPriority, order)
 }
 
+type gpuModeConfigurableBackend interface {
+	SetGPUMode(GPUMode)
+}
+
+// ConfigurePriorityDevices applies the first device requirement for each
+// concrete backend before any model sessions are created. SessionManager keeps
+// device metadata for selection and diagnostics, while backends such as ONNX
+// use this hook to configure their execution provider globally.
+func ConfigurePriorityDevices(priority []BackendSpec) {
+	seen := make(map[BackendType]struct{}, len(priority))
+	for _, spec := range priority {
+		if _, exists := seen[spec.Backend]; exists {
+			continue
+		}
+		seen[spec.Backend] = struct{}{}
+		backend, exists := GetBackend(spec.Backend)
+		if !exists {
+			continue
+		}
+		configurable, ok := backend.(gpuModeConfigurableBackend)
+		if !ok {
+			continue
+		}
+		configurable.SetGPUMode(spec.Device.ToGPUMode())
+	}
+}
+
 // GetPriority returns the current backend priority order.
 // Returns the configured priority if set, otherwise the default.
 func GetPriority() []BackendType {
@@ -186,26 +213,35 @@ func GetBackendWithFallback(preferred BackendType) (Backend, BackendType, error)
 	return b, b.Type(), nil
 }
 
-// ParseBackendType parses a string into BackendType.
-// Returns an error for unrecognized values.
+// ParseBackendType translates the public inference backend vocabulary into the
+// implementation-specific backend used by the Go runtime. Public config must
+// not expose GoMLX/CoreML naming: those are implementation details and differ
+// from the shared Antfly API used by the Zig runtime.
 func ParseBackendType(s string) (BackendType, error) {
 	switch strings.ToLower(s) {
 	case "onnx":
 		return BackendONNX, nil
-	case "xla", "pjrt":
+	case "pjrt":
 		return BackendXLA, nil
-	case "coreml":
+	case "metal":
 		return BackendCoreML, nil
-	case "go":
+	case "native":
 		return BackendGo, nil
+	case "cuda":
+		// CUDA is realized by the ONNX backend in the Go runtime. ParseBackendSpec
+		// supplies DeviceCUDA so loaders that consume device preferences can make
+		// the execution-provider requirement explicit.
+		return BackendONNX, nil
+	case "webgpu":
+		return "", fmt.Errorf("backend %q is not supported by the Go inference runtime", s)
 	default:
-		return "", fmt.Errorf("unknown backend type: %q (valid: onnx, xla, coreml, go)", s)
+		return "", fmt.Errorf("unknown backend type: %q (valid: native, onnx, metal, cuda, pjrt, webgpu)", s)
 	}
 }
 
 // BackendTypeStrings returns valid backend type strings for documentation/validation.
 func BackendTypeStrings() []string {
-	return []string{"onnx", "xla", "coreml", "go"}
+	return []string{"native", "onnx", "metal", "cuda", "pjrt", "webgpu"}
 }
 
 // ParseDeviceType parses a string into DeviceType.
@@ -226,17 +262,27 @@ func ParseDeviceType(s string) (DeviceType, error) {
 	}
 }
 
-// ParseBackendSpec parses a "backend" or "backend:device" string.
-// Examples: "onnx", "onnx:cuda", "xla:tpu", "go"
+// ParseBackendSpec parses a public "backend" or "backend:device" string and
+// translates it to the Go runtime's internal backend/device pair.
 func ParseBackendSpec(s string) (BackendSpec, error) {
 	parts := strings.SplitN(s, ":", 2)
+	publicBackend := strings.ToLower(strings.TrimSpace(parts[0]))
 
-	backend, err := ParseBackendType(parts[0])
+	backend, err := ParseBackendType(publicBackend)
 	if err != nil {
 		return BackendSpec{}, err
 	}
 
-	spec := BackendSpec{Backend: backend, Device: DeviceAuto}
+	defaultDevice := DeviceAuto
+	switch publicBackend {
+	case "native":
+		defaultDevice = DeviceCPU
+	case "metal":
+		defaultDevice = DeviceCoreML
+	case "cuda":
+		defaultDevice = DeviceCUDA
+	}
+	spec := BackendSpec{Backend: backend, Device: defaultDevice}
 
 	if len(parts) == 2 {
 		device, err := ParseDeviceType(parts[1])
@@ -250,13 +296,13 @@ func ParseBackendSpec(s string) (BackendSpec, error) {
 }
 
 // ParseBackendPriority parses a list of backend:device strings into BackendSpecs.
-// Each element can be a single spec ("onnx", "xla:tpu") or comma-separated
-// ("onnx,xla,go") to handle environment variables where viper returns the
+// Each element can be a single spec ("onnx", "pjrt:tpu") or comma-separated
+// ("onnx,pjrt,native") to handle environment variables where viper returns the
 // entire value as a single string slice element.
 func ParseBackendPriority(priority []string) ([]BackendSpec, error) {
 	specs := make([]BackendSpec, 0, len(priority))
 	for _, s := range priority {
-		// Split on commas to handle env vars like TERMITE_BACKEND_PRIORITY="onnx,xla,go"
+		// Split on commas to handle env vars like TERMITE_BACKEND_PRIORITY="onnx,pjrt,native"
 		for part := range strings.SplitSeq(s, ",") {
 			part = strings.TrimSpace(part)
 			if part == "" {

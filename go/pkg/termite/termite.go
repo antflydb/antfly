@@ -198,6 +198,7 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 		for _, spec := range backendPriority {
 			globalPriority = append(globalPriority, spec.Backend)
 		}
+		backends.ConfigurePriorityDevices(backendPriority)
 		backends.SetPriority(globalPriority)
 		zl.Info("Backend priority configured", zap.Any("priority", config.BackendPriority))
 	}

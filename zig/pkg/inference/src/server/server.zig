@@ -217,8 +217,16 @@ pub const NodeConfig = struct {
 pub const GenerationBackend = native_backend_choice.Choice;
 
 fn generationBackendFromPriority(priority: ?[]const backends_mod.BackendType) GenerationBackend {
+    return generationBackendFromPriorityExcluding(priority, null);
+}
+
+fn generationBackendFromPriorityExcluding(
+    priority: ?[]const backends_mod.BackendType,
+    excluded: ?backends_mod.BackendType,
+) GenerationBackend {
     const configured = priority orelse return .auto;
     for (configured) |backend| {
+        if (excluded != null and backend == excluded.?) continue;
         if (!backend.available()) continue;
         return switch (backend) {
             .native => .native,
@@ -230,6 +238,43 @@ fn generationBackendFromPriority(priority: ?[]const backends_mod.BackendType) Ge
         };
     }
     return .auto;
+}
+
+const backend_priority_capacity = std.meta.fields(backends_mod.BackendType).len;
+
+/// Native generation requires a session exposing the GPT architecture and
+/// compute backend. Compiled providers such as PJRT/ONNX are layered over that
+/// direct session, rather than being accepted as the model session itself.
+fn nativeGenerationLoadPriority(
+    scratch: *[backend_priority_capacity]backends_mod.BackendType,
+    configured: []const backends_mod.BackendType,
+) []const backends_mod.BackendType {
+    var len: usize = 0;
+    for (configured) |backend| {
+        switch (backend) {
+            .native, .metal, .cuda => {},
+            .onnx, .pjrt, .webgpu => continue,
+        }
+        var duplicate = false;
+        for (scratch[0..len]) |existing| {
+            if (existing == backend) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        scratch[len] = backend;
+        len += 1;
+    }
+    return scratch[0..len];
+}
+
+fn generationPriorityNeedsSessionFiltering(configured: []const backends_mod.BackendType) bool {
+    for (configured) |backend| switch (backend) {
+        .onnx, .webgpu => return true,
+        .native, .metal, .cuda, .pjrt => {},
+    };
+    return false;
 }
 
 pub const WarmModelKind = enum {
@@ -2243,6 +2288,54 @@ pub const Node = struct {
         return writeRerankScoresResponse(ctx, body.model, scores, prompt_tokens);
     }
 
+    fn loadNativeGenerationModelForRequest(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        request_id: u64,
+        model_path: []const u8,
+        selection: GenerateBackendSelection,
+    ) !*model_manager_mod.LoadedModel {
+        var request_session_manager = backends_mod.SessionManager.init(allocator);
+        const configured = if (selection.override_model_loading) blk: {
+            configureGenerateBackendPreference(&request_session_manager, selection);
+            break :blk request_session_manager.preferred_backends;
+        } else self.session_manager.preferred_backends;
+
+        // Preserve the alias-based, allocation-light hot path when the shared
+        // priority can only produce generation-compatible sessions. PJRT is
+        // safe here because direct session loading already skips it.
+        if (!selection.override_model_loading and !generationPriorityNeedsSessionFiltering(configured)) {
+            return self.model_manager.loadFromDirForRequest(request_id, model_path);
+        }
+
+        var scratch: [backend_priority_capacity]backends_mod.BackendType = undefined;
+        const direct_backends = nativeGenerationLoadPriority(&scratch, configured);
+        if (direct_backends.len == 0) return error.NoNativeGenerationBackend;
+
+        // Generation-specific variants must not replace the default alias: an
+        // ONNX-first node may legitimately cache both a direct ONNX model for
+        // embeddings and a native model for graph-backed generation.
+        return self.model_manager.loadFromDirWithPreferredBackendsForRequest(
+            request_id,
+            model_path,
+            direct_backends,
+            false,
+        );
+    }
+
+    fn fallbackConfiguredGenerationSelection(
+        self: *Node,
+        body: api.GenerateRequest,
+        excluded: backends_mod.BackendType,
+    ) !GenerateBackendSelection {
+        return parseGenerateBackendSelectionWithDefault(
+            null,
+            body.mode,
+            body.compiled_target,
+            generationBackendFromPriorityExcluding(self.config.backend_priority, excluded),
+        );
+    }
+
     pub fn generateContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
         var parsed = (try ctx.parseJson(api.GenerateRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
@@ -2495,7 +2588,7 @@ pub const Node = struct {
             .prompt_cache_enabled = self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and prompt_cache_key != null and !want_stream,
             .prompt_cache_key = prompt_cache_key,
         };
-        const backend_selection = parseGenerateBackendSelectionWithDefault(
+        var backend_selection = parseGenerateBackendSelectionWithDefault(
             body.backend,
             body.mode,
             body.compiled_target,
@@ -2510,10 +2603,6 @@ pub const Node = struct {
                 },
             });
         };
-        const allow_onnx = effective_draft_model_name == null and
-            !backend_selection.graph_mode_requested and
-            (backend_selection.native_choice == .auto or backend_selection.native_choice == .onnx);
-
         if (body.response_format) |rf| {
             if (std.mem.eql(u8, rf.type, "json_object")) {
                 config.grammar = "json";
@@ -2562,6 +2651,15 @@ pub const Node = struct {
             }
             config.grammar = grammar;
         }
+
+        // The direct ONNX generator implementations do not support grammar or
+        // speculative decoding. A configured ONNX preference falls through to
+        // graph-backed native generation for those requests; an ordinary ONNX
+        // model session is never passed to the native generation pipeline.
+        const allow_onnx = config.grammar == null and
+            effective_draft_model_name == null and
+            !backend_selection.graph_mode_requested and
+            (backend_selection.native_choice == .auto or backend_selection.native_choice == .onnx);
 
         // Try plain HF ONNX decoder-only VLM packages before Ort GenAI overlays.
         if (allow_onnx and build_options.enable_onnx and
@@ -2757,12 +2855,12 @@ pub const Node = struct {
         }
 
         // Fall back to native generation (CPU/GPU GPT arch forward pass).
-        const model = if (backend_selection.override_model_loading) blk: {
-            var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
-            configureGenerateBackendPreference(&request_session_manager, backend_selection);
-            break :blk self.model_manager.loadFromDirWithPreferredBackendsForRequest(request_id, model_path, request_session_manager.preferred_backends, false) catch |err|
-                return modelLoadFailure(ctx, err);
-        } else self.model_manager.loadFromDirForRequest(request_id, model_path) catch |err|
+        const model = self.loadNativeGenerationModelForRequest(
+            ctx.allocator,
+            request_id,
+            model_path,
+            backend_selection,
+        ) catch |err|
             return modelLoadFailure(ctx, err);
         model.lockNativeGenerationWithIo(ctx.io);
         defer model.unlockNativeGenerationWithIo(ctx.io);
@@ -2837,13 +2935,30 @@ pub const Node = struct {
         defer if (pjrt_plugin_path) |path| ctx.allocator.free(path);
         if (backend_selection.compiled_partition_backend == .pjrt) {
             pjrt_plugin_path = try native_backend_choice.pjrtPluginPathFromEnv(ctx.allocator);
-            const plugin_path = pjrt_plugin_path orelse
+            if (pjrt_plugin_path) |plugin_path| {
+                if (pjrt_lib.pjrt.Client.init(plugin_path)) |client| {
+                    pjrt_client = client;
+                } else |err| {
+                    if (backend_selection.override_model_loading) {
+                        return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                    }
+                    std.log.warn(
+                        "configured PJRT backend initialization failed ({s}); continuing with backend priority fallback",
+                        .{@errorName(err)},
+                    );
+                    backend_selection = self.fallbackConfiguredGenerationSelection(body, .pjrt) catch
+                        return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "failed to resolve generation backend fallback" });
+                }
+            } else if (backend_selection.override_model_loading) {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
                     .message = "pjrt backend requires ANTFLY_INFERENCE_PJRT_PLUGIN or PJRT_PLUGIN_PATH",
                 });
-            pjrt_client = pjrt_lib.pjrt.Client.init(plugin_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+            } else {
+                std.log.warn("configured PJRT backend has no plugin path; continuing with backend priority fallback", .{});
+                backend_selection = self.fallbackConfiguredGenerationSelection(body, .pjrt) catch
+                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "failed to resolve generation backend fallback" });
+            }
         }
 
         if (effective_draft_model_name) |draft_model_name| {
@@ -2864,12 +2979,12 @@ pub const Node = struct {
                     }
                 }
                 if (load_draft_backend) {
-                    const draft_model = if (backend_selection.override_model_loading) blk: {
-                        var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
-                        configureGenerateBackendPreference(&request_session_manager, backend_selection);
-                        break :blk self.model_manager.loadFromDirWithPreferredBackendsForRequest(request_id, draft_model_path, request_session_manager.preferred_backends, false) catch |err|
-                            return modelLoadFailure(ctx, err);
-                    } else self.model_manager.loadFromDirForRequest(request_id, draft_model_path) catch |err|
+                    const draft_model = self.loadNativeGenerationModelForRequest(
+                        ctx.allocator,
+                        request_id,
+                        draft_model_path,
+                        backend_selection,
+                    ) catch |err|
                         return modelLoadFailure(ctx, err);
                     const draft_cfg = session_factory.getGptConfig(draft_model.session) orelse
                         return ctx.status(400).json(.{
@@ -3564,21 +3679,12 @@ pub const Node = struct {
                 try group_indices.append(ctx.allocator, idx);
             }
 
-            const model = if (selection.override_model_loading) blk: {
-                var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
-                configureGenerateBackendPreference(&request_session_manager, selection);
-                break :blk self.model_manager.loadFromDirWithPreferredBackendsForRequest(group_request_id, model_path, request_session_manager.preferred_backends, false) catch |err| {
-                    for (group_indices.items) |idx| {
-                        results[idx].@"error" = .{
-                            .code = if (err == error.ModelCapacityReached) "MODEL_CAPACITY_REACHED" else "MODEL_LOAD_FAILED",
-                            .message = @errorName(err),
-                            .retryable = true,
-                        };
-                        pending[idx] = false;
-                    }
-                    continue;
-                };
-            } else self.model_manager.loadFromDirForRequest(group_request_id, model_path) catch |err| {
+            const model = self.loadNativeGenerationModelForRequest(
+                ctx.allocator,
+                group_request_id,
+                model_path,
+                selection,
+            ) catch |err| {
                 for (group_indices.items) |idx| {
                     results[idx].@"error" = .{
                         .code = if (err == error.ModelCapacityReached) "MODEL_CAPACITY_REACHED" else "MODEL_LOAD_FAILED",
@@ -7321,6 +7427,28 @@ test "generate backend selection follows shared priority" {
         try std.testing.expectEqual(native_backend_choice.Choice.auto, selection.native_choice);
         try std.testing.expectEqual(@as(?ops.BackendKind, null), selection.compiled_partition_backend);
     }
+}
+
+test "generation priority can fall through a runtime-unusable compiled backend" {
+    const fallback = generationBackendFromPriorityExcluding(&.{ .pjrt, .onnx, .native }, .pjrt);
+    if (build_options.enable_onnx) {
+        try std.testing.expectEqual(GenerationBackend.onnx, fallback);
+    } else if (build_options.enable_native) {
+        try std.testing.expectEqual(GenerationBackend.native, fallback);
+    } else {
+        try std.testing.expectEqual(GenerationBackend.auto, fallback);
+    }
+}
+
+test "native generation load priority excludes compiled and incompatible sessions" {
+    var scratch: [backend_priority_capacity]backends_mod.BackendType = undefined;
+    const direct = nativeGenerationLoadPriority(
+        &scratch,
+        &.{ .pjrt, .onnx, .cuda, .native, .cuda, .webgpu },
+    );
+    try std.testing.expectEqualSlices(backends_mod.BackendType, &.{ .cuda, .native }, direct);
+    try std.testing.expect(generationPriorityNeedsSessionFiltering(&.{ .pjrt, .onnx, .native }));
+    try std.testing.expect(!generationPriorityNeedsSessionFiltering(&.{ .pjrt, .cuda, .native }));
 }
 
 test "singleBackendPreference is strict" {

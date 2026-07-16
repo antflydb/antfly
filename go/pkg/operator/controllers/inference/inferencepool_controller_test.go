@@ -105,8 +105,10 @@ var _ = Describe("InferencePool Controller", func() {
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_POOL"]).To(Equal(poolName))
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_WORKLOAD_TYPE"]).To(Equal("general"))
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_LOADING_STRATEGY"]).To(Equal("eager"))
-			var runtimeConfig map[string]any
-			Expect(json.Unmarshal([]byte(createdConfigMap.Data["config.json"]), &runtimeConfig)).To(Succeed())
+			var completeConfig map[string]any
+			Expect(json.Unmarshal([]byte(createdConfigMap.Data["config.json"]), &completeConfig)).To(Succeed())
+			runtimeConfig, ok := completeConfig["inference"].(map[string]any)
+			Expect(ok).To(BeTrue())
 			Expect(runtimeConfig["backend_priority"]).To(HaveExactElements("pjrt", "native"))
 			Expect(runtimeConfig["preload"]).To(HaveLen(1))
 
@@ -125,7 +127,7 @@ var _ = Describe("InferencePool Controller", func() {
 			Expect(createdSts.Spec.Template.Spec.Containers).To(HaveLen(1))
 			Expect(createdSts.Spec.Template.Spec.Containers[0].Name).To(Equal("inference"))
 			Expect(createdSts.Spec.Template.Spec.Containers[0].Command).To(Equal([]string{"/antfly"}))
-			Expect(createdSts.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"inference", "run", "--host", "0.0.0.0", "--port", "8080", "--config", "/config/config.json"}))
+			Expect(createdSts.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"inference", "run", "--config", "/config/config.json"}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers).To(HaveLen(1))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Command).To(Equal([]string{"/antfly"}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Args).To(Equal([]string{
@@ -192,6 +194,8 @@ var _ = Describe("InferencePool Controller", func() {
 			}, timeout, interval).Should(BeTrue())
 
 			Expect(*createdSts.Spec.Replicas).To(Equal(int32(1)))
+			initialConfigHash := createdSts.Spec.Template.Annotations["inference.antfly.io/config-hash"]
+			Expect(initialConfigHash).NotTo(BeEmpty())
 
 			// Update the pool
 			poolLookupKey := types.NamespacedName{Name: "update-test-pool", Namespace: poolNamespace}
@@ -355,8 +359,10 @@ var _ = Describe("InferencePool Controller", func() {
 			}
 			configJSON, err := reconciler.generateCompleteConfig(pool)
 			Expect(err).NotTo(HaveOccurred())
-			var config map[string]any
-			Expect(json.Unmarshal([]byte(configJSON), &config)).To(Succeed())
+			var completeConfig map[string]any
+			Expect(json.Unmarshal([]byte(configJSON), &completeConfig)).To(Succeed())
+			config, ok := completeConfig["inference"].(map[string]any)
+			Expect(ok).To(BeTrue())
 			Expect(config).NotTo(HaveKey("preload"))
 			Expect(config["keep_alive"]).To(Equal("5m"))
 		})

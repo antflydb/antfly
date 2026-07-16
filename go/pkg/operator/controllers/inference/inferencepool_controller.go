@@ -287,13 +287,18 @@ func (r *InferencePoolReconciler) generateConfigMapData(pool *antflyaiv1alpha1.I
 	return data, nil
 }
 
-// generateCompleteConfig merges user-provided config with auto-generated settings
+// generateCompleteConfig merges user-provided inference config with
+// auto-generated settings and wraps it in the top-level Antfly config shape
+// consumed by `antfly inference run`.
 func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.InferencePool) (string, error) {
-	// Start with user config or empty object
-	config := make(map[string]any)
+	// spec.config is intentionally scoped to inference settings. The Antfly CLI
+	// parses the mounted file as common.Config and then passes common.Config.Inference
+	// to the runtime, so the persisted document must nest these values under the
+	// `inference` key.
+	inferenceConfig := make(map[string]any)
 
 	if pool.Spec.Config != "" {
-		if err := json.Unmarshal([]byte(pool.Spec.Config), &config); err != nil {
+		if err := json.Unmarshal([]byte(pool.Spec.Config), &inferenceConfig); err != nil {
 			return "", fmt.Errorf("failed to parse spec.config: %w", err)
 		}
 	}
@@ -319,15 +324,15 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 	}
 
 	// Set auto-generated config (don't override if user specified)
-	if _, exists := config["preload"]; !exists && len(preload) > 0 {
-		config["preload"] = preload
+	if _, exists := inferenceConfig["preload"]; !exists && len(preload) > 0 {
+		inferenceConfig["preload"] = preload
 	}
-	if _, exists := config["max_loaded_models"]; !exists && len(preload) > 10 {
-		config["max_loaded_models"] = len(preload)
+	if _, exists := inferenceConfig["max_loaded_models"]; !exists && len(preload) > 10 {
+		inferenceConfig["max_loaded_models"] = len(preload)
 	}
 
-	if _, exists := config["models_dir"]; !exists {
-		config["models_dir"] = "/models"
+	if _, exists := inferenceConfig["models_dir"]; !exists {
+		inferenceConfig["models_dir"] = "/models"
 	}
 
 	// Set loading strategy config
@@ -337,31 +342,31 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 		switch loadingStrategy {
 		case antflyaiv1alpha1.LoadingStrategyEager:
 			// Eager loading: explicitly set keep_alive=0 to load all models at startup
-			if _, exists := config["keep_alive"]; !exists {
-				config["keep_alive"] = "0"
+			if _, exists := inferenceConfig["keep_alive"]; !exists {
+				inferenceConfig["keep_alive"] = "0"
 			}
 		case antflyaiv1alpha1.LoadingStrategyLazy:
 			// Lazy loading: set keep_alive if not specified (matches Inference default)
-			if _, exists := config["keep_alive"]; !exists {
+			if _, exists := inferenceConfig["keep_alive"]; !exists {
 				if pool.Spec.Models.KeepAlive != nil {
-					config["keep_alive"] = pool.Spec.Models.KeepAlive.Duration.String()
+					inferenceConfig["keep_alive"] = pool.Spec.Models.KeepAlive.Duration.String()
 				} else {
-					config["keep_alive"] = "5m" // Default 5 minutes
+					inferenceConfig["keep_alive"] = "5m" // Default 5 minutes
 				}
 			}
 		case antflyaiv1alpha1.LoadingStrategyBounded:
 			// Bounded loading: set max_loaded_models
-			if _, exists := config["max_loaded_models"]; !exists {
+			if _, exists := inferenceConfig["max_loaded_models"]; !exists {
 				if pool.Spec.Models.MaxLoadedModels != nil {
-					config["max_loaded_models"] = *pool.Spec.Models.MaxLoadedModels
+					inferenceConfig["max_loaded_models"] = *pool.Spec.Models.MaxLoadedModels
 				}
 			}
 			// Also set keep_alive for LRU eviction
-			if _, exists := config["keep_alive"]; !exists {
+			if _, exists := inferenceConfig["keep_alive"]; !exists {
 				if pool.Spec.Models.KeepAlive != nil {
-					config["keep_alive"] = pool.Spec.Models.KeepAlive.Duration.String()
+					inferenceConfig["keep_alive"] = pool.Spec.Models.KeepAlive.Duration.String()
 				} else {
-					config["keep_alive"] = "5m"
+					inferenceConfig["keep_alive"] = "5m"
 				}
 			}
 		}
@@ -373,12 +378,21 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 	// directly, so TPU pools retain native as their direct-loading fallback.
 	if pool.Spec.Hardware.Accelerator != "" {
 		if strings.Contains(pool.Spec.Hardware.Accelerator, "tpu") {
-			if _, exists := config["backend_priority"]; !exists {
-				config["backend_priority"] = []string{"pjrt", "native"}
+			if _, exists := inferenceConfig["backend_priority"]; !exists {
+				inferenceConfig["backend_priority"] = []string{"pjrt", "native"}
 			}
-		} else if _, exists := config["backend_priority"]; !exists {
-			config["backend_priority"] = []string{"cuda"}
+		} else if _, exists := inferenceConfig["backend_priority"]; !exists {
+			inferenceConfig["backend_priority"] = []string{"cuda"}
 		}
+	}
+
+	config := map[string]any{"inference": inferenceConfig}
+	// The CLI constructs its logger before starting the inference runtime. Mirror
+	// an inference-scoped log override at the common-config level so the mounted
+	// configuration controls the logger as documented without changing the
+	// public InferencePool config shape.
+	if logConfig, exists := inferenceConfig["log"]; exists {
+		config["log"] = logConfig
 	}
 
 	// Marshal to JSON
@@ -452,7 +466,7 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 							Name:    "inference",
 							Image:   image,
 							Command: []string{"/antfly"},
-							Args:    []string{"inference", "run", "--host", "0.0.0.0", "--port", strconv.Itoa(InferenceAPIPort), "--config", "/config/config.json"},
+							Args:    []string{"inference", "run", "--config", "/config/config.json"},
 							Ports: []corev1.ContainerPort{
 								{Name: "http", ContainerPort: InferenceAPIPort, Protocol: corev1.ProtocolTCP},
 							},
