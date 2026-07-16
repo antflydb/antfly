@@ -567,6 +567,30 @@ fn addSnowballModule(b: *std.Build, lib_mod: *std.Build.Module) void {
     lib_mod.addImport("snowball", snowball_mod);
 }
 
+fn addOpenSslLeaseTransport(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    mod.addCSourceFile(.{
+        .file = b.path("pkg/antfly/src/standalone/openssl_lease_transport.c"),
+        .flags = &.{"-std=c11"},
+    });
+    mod.linkSystemLibrary("ssl", .{});
+    mod.linkSystemLibrary("crypto", .{});
+    if (target.result.os.tag == .macos) {
+        const prefixes = [_][]const u8{
+            "/opt/homebrew/opt/openssl@3",
+            "/usr/local/opt/openssl@3",
+        };
+        for (prefixes) |prefix| {
+            const include_dir = b.fmt("{s}/include", .{prefix});
+            const lib_dir = b.fmt("{s}/lib", .{prefix});
+            if (pathExists(b, include_dir) and pathExists(b, lib_dir)) {
+                mod.addSystemIncludePath(.{ .cwd_relative = include_dir });
+                mod.addLibraryPath(.{ .cwd_relative = lib_dir });
+                break;
+            }
+        }
+    }
+}
+
 fn snowballGeneratedPath(b: *std.Build, comptime fmt: []const u8, args: anytype) []const u8 {
     return b.fmt(snowball_generated_root ++ "/" ++ fmt, args);
 }
@@ -1697,6 +1721,7 @@ pub fn build(b: *std.Build) void {
         .sanitize_thread = sanitize_thread,
     });
     antfly_imports.configure(b, lib_mod, false, link_libc);
+    addOpenSslLeaseTransport(b, lib_mod, target);
 
     const lib_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/root.zig"),
@@ -1704,6 +1729,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     antfly_imports.configure(b, lib_test_mod, true, true);
+    addOpenSslLeaseTransport(b, lib_test_mod, target);
 
     const introducer_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/introducer.zig"),
@@ -5220,6 +5246,7 @@ pub fn build(b: *std.Build) void {
     var standalone_runtime_imports = antfly_imports;
     standalone_runtime_imports.build_options = standalone_runtime_build_options;
     standalone_runtime_imports.configure(b, standalone_runtime_test_mod, true, true);
+    addOpenSslLeaseTransport(b, standalone_runtime_test_mod, target);
     const usermgr_storage_standalone_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
         .target = target,
@@ -5268,8 +5295,10 @@ pub fn build(b: *std.Build) void {
             "standalone metadata rolls back an undurable catalog mutation",
             "standalone unified server lifecycle propagates startup failure",
             "runtime lease watchdog fetch and validation failures publish no bootstrap capability",
-            "runtime lease watchdog uses configured client without reusing connections",
+            "runtime lease watchdog retains a bounded Kubernetes response budget",
             "runtime lease watchdog prefers a DNS-verified Kubernetes API host and retains the injected port",
+            "OpenSSL Lease executor rejects unscoped request shapes",
+            "OpenSSL Lease executor accepts optional CertificateRequest with verified hostname",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

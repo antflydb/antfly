@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const openssl_lease_executor = @import("openssl_lease_executor.zig");
 const platform_sync = @import("antfly_platform").sync;
 const httpx = @import("httpx");
 const antfly = @import("../root.zig");
@@ -50,13 +51,7 @@ const ha_lease_timing_jitter_ns: u64 = std.time.ns_per_s;
 const ha_lease_min_grace_ms: u64 = 10_000;
 const ha_lease_api_host_env = "ANTFLY_HA_LEASE_API_HOST";
 const ha_lease_default_api_host = "kubernetes.default.svc";
-const ha_lease_http_executor_config: antfly.common.http.StdHttpExecutorConfig = .{
-    .max_response_bytes = 256 * 1024,
-    // Use the client carrying the projected Kubernetes CA, but force every
-    // request to close so the watchdog does not retain API-server connections.
-    .keep_alive = true,
-    .max_requests_per_connection = 1,
-};
+const ha_lease_max_response_bytes: usize = 256 * 1024;
 
 var termination_requested: std.atomic.Value(bool) = .init(false);
 
@@ -192,7 +187,7 @@ const RuntimeLeaseWatchdog = struct {
     const ObservationFailureStage = enum { fetch, validation };
 
     watchdog: antfly.ha.kubernetes_lease_watchdog.Watchdog,
-    executor: antfly.common.http.StdHttpExecutor,
+    executor: openssl_lease_executor.OpenSslLeaseExecutor,
     uri: []u8,
     token_path: []const u8,
     lease_name: []const u8,
@@ -256,12 +251,13 @@ const RuntimeLeaseWatchdog = struct {
         var entropy: [32]u8 = undefined;
         try io.randomSecure(&entropy);
         const process_boot_id = std.fmt.bytesToHex(entropy, .lower);
-        var executor = antfly.common.http.StdHttpExecutor.init(alloc, ha_lease_http_executor_config);
-        errdefer executor.deinit();
-        try antfly.ha.kubernetes_lease_watchdog.configureKubernetesCA(
-            &executor,
+        var executor = try openssl_lease_executor.OpenSslLeaseExecutor.init(
+            alloc,
+            io,
             env.get("ANTFLY_HA_LEASE_CA_PATH") orelse antfly.ha.kubernetes_lease_watchdog.service_account_ca_path,
+            ha_lease_max_response_bytes,
         );
+        errdefer executor.deinit();
         return .{
             .watchdog = try .init(.{
                 .scope = scope,
@@ -354,7 +350,7 @@ const RuntimeLeaseWatchdog = struct {
         alloc: std.mem.Allocator,
         data_server: *antfly.data.runtime.DataServer,
     ) !void {
-        const io = self.executor.io_impl.io();
+        const io = self.executor.io;
         const poll_started_ns = authority_time.authorityNs();
         if (poll_started_ns < self.next_poll_ns) return;
         self.next_poll_ns = poll_started_ns +| ha_lease_poll_interval_ns;
@@ -5969,9 +5965,8 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
     }
 }
 
-test "runtime lease watchdog uses configured client without reusing connections" {
-    try std.testing.expect(ha_lease_http_executor_config.keep_alive);
-    try std.testing.expectEqual(@as(u32, 1), ha_lease_http_executor_config.max_requests_per_connection);
+test "runtime lease watchdog retains a bounded Kubernetes response budget" {
+    try std.testing.expectEqual(@as(usize, 256 * 1024), ha_lease_max_response_bytes);
 }
 
 test "runtime lease watchdog prefers a DNS-verified Kubernetes API host and retains the injected port" {

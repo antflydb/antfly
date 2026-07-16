@@ -21,7 +21,7 @@ ARG TARGETARCH
 ARG ZIG_OPTIMIZE=ReleaseFast
 ARG ZIG_BUILD_JOBS=1
 
-RUN apk add --no-cache build-base clang lld curl xz git perl python3 linux-headers
+RUN apk add --no-cache build-base clang lld curl xz git perl python3 linux-headers openssl-dev
 
 COPY --from=zig /opt/zig /opt/zig
 ENV PATH="/opt/zig:${PATH}"
