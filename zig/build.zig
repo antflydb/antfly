@@ -575,8 +575,18 @@ fn addOpenSslLeaseTransport(b: *std.Build, mod: *std.Build.Module, target: std.B
     mod.linkSystemLibrary("ssl", .{});
     mod.linkSystemLibrary("crypto", .{});
     if (target.result.os.tag == .linux) {
-        // Container builds pass an explicit *-linux-musl target, so Zig does
-        // not implicitly search the native Alpine sysroot.
+        if (target.result.abi == .gnu) {
+            const multiarch = switch (target.result.cpu.arch) {
+                .x86_64 => "x86_64-linux-gnu",
+                .aarch64 => "aarch64-linux-gnu",
+                else => null,
+            };
+            if (multiarch) |dir| {
+                mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("/usr/include/{s}", .{dir}) });
+                mod.addLibraryPath(.{ .cwd_relative = b.fmt("/usr/lib/{s}", .{dir}) });
+            }
+        }
+        // Explicit Linux targets do not implicitly search the native sysroot.
         mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
         mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
     } else if (target.result.os.tag == .macos) {
@@ -1103,9 +1113,15 @@ pub fn build(b: *std.Build) void {
     // builds may include .sframe sections with relocation types that Zig's
     // linker cannot yet handle. Defaulting Linux builds to an explicit GNU
     // target keeps user-supplied -Dtarget overrides intact while making the
-    // no-argument path use Zig's bundled libc startup objects.
+    // no-argument path use Zig's bundled libc startup objects. Carry the
+    // detected glibc floor so native system libraries remain link-compatible.
     const default_target: std.Target.Query = if (builtin.os.tag == .linux)
-        .{ .cpu_arch = builtin.cpu.arch, .os_tag = .linux, .abi = .gnu }
+        .{
+            .cpu_arch = builtin.cpu.arch,
+            .os_tag = .linux,
+            .abi = .gnu,
+            .glibc_version = b.graph.host.result.os.versionRange().gnuLibCVersion(),
+        }
     else
         .{};
     const target = b.standardTargetOptions(.{ .default_target = default_target });
