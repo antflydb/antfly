@@ -406,6 +406,23 @@ const onnx_subdirs = [_][]const u8{ "", "onnx" };
 
 /// Load a model manifest by inspecting the directory contents and parsing configs.
 pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !ModelManifest {
+    return loadFromDirWithArtifactSelection(allocator, model_dir_path, .{});
+}
+
+pub const ArtifactSelection = struct {
+    format: ?[]const u8 = null,
+    quantization: ?[]const u8 = null,
+
+    pub fn isEmpty(self: ArtifactSelection) bool {
+        return self.format == null and self.quantization == null;
+    }
+};
+
+pub fn loadFromDirWithArtifactSelection(
+    allocator: std.mem.Allocator,
+    model_dir_path: []const u8,
+    selection: ArtifactSelection,
+) !ModelManifest {
     var manifest = ModelManifest{ .allocator = allocator };
 
     if (std.mem.endsWith(u8, model_dir_path, ".gguf")) {
@@ -521,6 +538,13 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
 
     applyImplicitSparseOutputLayout(&manifest, model_dir_path);
     applyImplicitModelTypeHints(&manifest, model_dir_path);
+
+    if (!selection.isEmpty()) {
+        applyArtifactSelection(&manifest, allocator, model_dir_path, selection) catch |err| {
+            manifest.deinit();
+            return err;
+        };
+    }
 
     return manifest;
 }
@@ -1558,6 +1582,266 @@ fn parseInferenceVariantsFile(manifest: *ModelManifest, allocator: std.mem.Alloc
     try parseInferenceVariantsJson(manifest, allocator, model_dir_path, variants_bytes);
 }
 
+fn artifactSelectorEqual(lhs: []const u8, rhs: []const u8) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |a_raw, b_raw| {
+        const a = if (a_raw == '-') '_' else std.ascii.toLower(a_raw);
+        const b = if (b_raw == '-') '_' else std.ascii.toLower(b_raw);
+        if (a != b) return false;
+    }
+    return true;
+}
+
+fn validateArtifactSelection(selection: ArtifactSelection) !void {
+    if (selection.format) |format| {
+        if (format.len == 0) return error.InvalidModelArtifactFormat;
+        inline for (.{ "gguf", "onnx", "safetensors", "hybrid" }) |supported| {
+            if (artifactSelectorEqual(format, supported)) break;
+        } else return error.InvalidModelArtifactFormat;
+    }
+    if (selection.quantization) |quantization| {
+        if (std.mem.trim(u8, quantization, " \t\r\n").len == 0) return error.InvalidModelQuantization;
+        if (selection.format) |format| {
+            if (artifactSelectorEqual(format, "hybrid")) return error.InvalidModelQuantization;
+        }
+    }
+}
+
+fn variantMatchesSelection(variant: std.json.Value, selection: ArtifactSelection) bool {
+    if (variant != .object) return false;
+    if (selection.format) |wanted| {
+        const target = variant.object.get("target") orelse return false;
+        if (target != .string or !artifactSelectorEqual(target.string, wanted)) return false;
+    }
+    if (selection.quantization) |wanted| {
+        const format = variant.object.get("format") orelse return false;
+        if (format != .string or !artifactSelectorEqual(format.string, wanted)) return false;
+    }
+    return true;
+}
+
+fn clearOptionalPath(allocator: std.mem.Allocator, path: *?[]const u8) void {
+    if (path.*) |value| allocator.free(value);
+    path.* = null;
+}
+
+fn clearOnnxArtifacts(manifest: *ModelManifest, allocator: std.mem.Allocator) void {
+    clearOptionalPath(allocator, &manifest.onnx_path);
+    clearOptionalPath(allocator, &manifest.visual_model_path);
+    clearOptionalPath(allocator, &manifest.audio_model_path);
+    clearOptionalPath(allocator, &manifest.text_projection_path);
+    clearOptionalPath(allocator, &manifest.visual_projection_path);
+    clearOptionalPath(allocator, &manifest.audio_projection_path);
+}
+
+fn clearGgufArtifacts(manifest: *ModelManifest, allocator: std.mem.Allocator) void {
+    clearOptionalPath(allocator, &manifest.gguf_path);
+    clearOptionalPath(allocator, &manifest.gguf_projector_path);
+    clearOptionalPath(allocator, &manifest.gliner_head_gguf_path);
+}
+
+fn clearSafetensorsArtifacts(manifest: *ModelManifest, allocator: std.mem.Allocator) void {
+    clearOptionalPath(allocator, &manifest.safetensors_path);
+    clearOptionalPath(allocator, &manifest.safetensors_index_path);
+    clearOptionalPath(allocator, &manifest.gliner_head_safetensors_path);
+}
+
+fn setVariantPath(
+    allocator: std.mem.Allocator,
+    model_dir_path: []const u8,
+    variant: std.json.Value,
+    field: []const u8,
+    destination: *?[]const u8,
+) !bool {
+    const value = variant.object.get(field) orelse return false;
+    if (value != .string or value.string.len == 0) return error.InvalidInferenceVariantsManifest;
+    const path = try resolveBundlePath(allocator, model_dir_path, value.string);
+    errdefer allocator.free(path);
+    if (!c_file.fileExists(allocator, path)) return error.ModelArtifactVariantNotFound;
+    setOptionalPath(allocator, destination, path);
+    return true;
+}
+
+fn applySelectedVariant(
+    manifest: *ModelManifest,
+    allocator: std.mem.Allocator,
+    model_dir_path: []const u8,
+    variant: std.json.Value,
+) !void {
+    const target_value = variant.object.get("target") orelse return error.InvalidInferenceVariantsManifest;
+    if (target_value != .string) return error.InvalidInferenceVariantsManifest;
+    const target = target_value.string;
+
+    if (artifactSelectorEqual(target, "gguf")) {
+        clearOnnxArtifacts(manifest, allocator);
+        clearSafetensorsArtifacts(manifest, allocator);
+        if (isClipclapGgufVariant(variant)) {
+            var pair = (try resolveExistingClipclapGgufVariant(allocator, model_dir_path, variant)) orelse return error.ModelArtifactVariantNotFound;
+            defer pair.deinit(allocator);
+            setOptionalPath(allocator, &manifest.gguf_path, pair.clip_path);
+            pair.clip_path = "";
+            setOptionalPath(allocator, &manifest.audio_model_path, pair.clap_path);
+            pair.clap_path = "";
+            var family = try allocator.dupe(u8, "clipclap_gguf_bundle/v1");
+            errdefer if (family.len > 0) allocator.free(family);
+            var arch = try allocator.dupe(u8, "clipclap");
+            errdefer if (arch.len > 0) allocator.free(arch);
+            if (manifest.inference_bundle_family.len > 0) allocator.free(manifest.inference_bundle_family);
+            manifest.inference_bundle_family = family;
+            family = "";
+            manifest.native_arch_hint = .clip;
+            if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
+            manifest.config_model_arch = arch;
+            arch = "";
+            try setManifestInputs(allocator, manifest, &.{ "text", "image", "audio" });
+            return;
+        }
+        if (isGliner2GgufVariant(variant)) {
+            var pair = (try resolveExistingGliner2GgufVariant(allocator, model_dir_path, variant)) orelse return error.ModelArtifactVariantNotFound;
+            defer pair.deinit(allocator);
+            setOptionalPath(allocator, &manifest.gguf_path, pair.encoder_path);
+            pair.encoder_path = "";
+            setOptionalPath(allocator, &manifest.gliner_head_gguf_path, pair.head_path);
+            pair.head_path = "";
+            var family = try allocator.dupe(u8, "gliner2_split_bundle/v1");
+            errdefer if (family.len > 0) allocator.free(family);
+            var wrapper = try allocator.dupe(u8, "gliner2");
+            errdefer if (wrapper.len > 0) allocator.free(wrapper);
+            if (manifest.inference_bundle_family.len > 0) allocator.free(manifest.inference_bundle_family);
+            manifest.inference_bundle_family = family;
+            family = "";
+            if (manifest.gliner_model_type.len > 0) allocator.free(manifest.gliner_model_type);
+            manifest.gliner_model_type = wrapper;
+            wrapper = "";
+            manifest.model_type = .recognizer;
+            try setManifestInputs(allocator, manifest, &.{"text"});
+            return;
+        }
+        if (isFlorence2GgufVariant(variant)) {
+            var selected = (try resolveExistingFlorence2GgufVariant(allocator, model_dir_path, variant)) orelse return error.ModelArtifactVariantNotFound;
+            defer selected.deinit(allocator);
+            try applyFlorence2GgufBundle(manifest, allocator, selected.model_path);
+            selected.model_path = "";
+            return;
+        }
+        if (!try setVariantPath(allocator, model_dir_path, variant, "model", &manifest.gguf_path) and
+            !try setVariantPath(allocator, model_dir_path, variant, "gguf", &manifest.gguf_path))
+        {
+            return error.InvalidInferenceVariantsManifest;
+        }
+        return;
+    }
+
+    if (artifactSelectorEqual(target, "onnx")) {
+        clearGgufArtifacts(manifest, allocator);
+        clearSafetensorsArtifacts(manifest, allocator);
+        var set_any = try setVariantPath(allocator, model_dir_path, variant, "model", &manifest.onnx_path);
+        set_any = (try setVariantPath(allocator, model_dir_path, variant, "text_model", &manifest.onnx_path)) or set_any;
+        set_any = (try setVariantPath(allocator, model_dir_path, variant, "visual_model", &manifest.visual_model_path)) or set_any;
+        set_any = (try setVariantPath(allocator, model_dir_path, variant, "audio_model", &manifest.audio_model_path)) or set_any;
+        set_any = (try setVariantPath(allocator, model_dir_path, variant, "text_projection", &manifest.text_projection_path)) or set_any;
+        set_any = (try setVariantPath(allocator, model_dir_path, variant, "visual_projection", &manifest.visual_projection_path)) or set_any;
+        set_any = (try setVariantPath(allocator, model_dir_path, variant, "audio_projection", &manifest.audio_projection_path)) or set_any;
+        if (!set_any) return error.InvalidInferenceVariantsManifest;
+        return;
+    }
+
+    if (artifactSelectorEqual(target, "safetensors")) {
+        clearGgufArtifacts(manifest, allocator);
+        clearOnnxArtifacts(manifest, allocator);
+        if (!try setVariantPath(allocator, model_dir_path, variant, "model", &manifest.safetensors_path) and
+            !try setVariantPath(allocator, model_dir_path, variant, "safetensors", &manifest.safetensors_path))
+        {
+            return error.InvalidInferenceVariantsManifest;
+        }
+        return;
+    }
+
+    return error.UnsupportedModelArtifactVariant;
+}
+
+fn applyArtifactSelection(
+    manifest: *ModelManifest,
+    allocator: std.mem.Allocator,
+    model_dir_path: []const u8,
+    selection: ArtifactSelection,
+) !void {
+    try validateArtifactSelection(selection);
+
+    var selected_found = false;
+    if (c_file.readFileFromDir(allocator, model_dir_path, "antfly_inference_variants.json")) |bytes| {
+        defer allocator.free(bytes);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidInferenceVariantsManifest;
+        if (parsed.value.object.get("variants")) |variants| {
+            if (variants != .array) return error.InvalidInferenceVariantsManifest;
+            var selected_variant: ?std.json.Value = null;
+            var selected_is_preferred_default = false;
+            var nonpreferred_is_ambiguous = false;
+            for (variants.array.items) |variant| {
+                if (!variantMatchesSelection(variant, selection)) continue;
+                // ONNX directories have an explicit base/default artifact; a
+                // format-only selector should use it instead of guessing among
+                // optional quantized exports.
+                if (selection.quantization == null and selection.format != null and
+                    (artifactSelectorEqual(selection.format.?, "onnx") or
+                        artifactSelectorEqual(selection.format.?, "hybrid"))) continue;
+
+                const preferred_default = if (variant.object.get("format")) |format|
+                    format == .string and artifactSelectorEqual(format.string, "q4_k")
+                else
+                    false;
+                if (selection.quantization != null and selected_variant != null)
+                    return error.AmbiguousModelArtifactVariant;
+                if (selected_variant == null) {
+                    selected_variant = variant;
+                    selected_is_preferred_default = preferred_default;
+                } else if (selection.quantization == null and preferred_default and !selected_is_preferred_default) {
+                    selected_variant = variant;
+                    selected_is_preferred_default = true;
+                } else if (selection.quantization == null and preferred_default and selected_is_preferred_default) {
+                    return error.AmbiguousModelArtifactVariant;
+                } else if (!selected_is_preferred_default) {
+                    nonpreferred_is_ambiguous = true;
+                }
+            }
+            if (!selected_is_preferred_default and nonpreferred_is_ambiguous)
+                return error.AmbiguousModelArtifactVariant;
+            if (selected_variant) |variant| {
+                selected_found = true;
+                try applySelectedVariant(manifest, allocator, model_dir_path, variant);
+            }
+        }
+    } else |_| {}
+
+    if (selection.quantization != null and !selected_found) return error.ModelArtifactVariantNotFound;
+
+    if (selection.format) |format| {
+        if (artifactSelectorEqual(format, "gguf")) {
+            if (manifest.gguf_path == null) return error.ModelArtifactVariantNotFound;
+            if (!selected_found) {
+                clearOnnxArtifacts(manifest, allocator);
+                clearSafetensorsArtifacts(manifest, allocator);
+            }
+        } else if (artifactSelectorEqual(format, "onnx")) {
+            if (manifest.onnx_path == null and manifest.visual_model_path == null and manifest.audio_model_path == null)
+                return error.ModelArtifactVariantNotFound;
+            if (!selected_found) {
+                clearGgufArtifacts(manifest, allocator);
+                clearSafetensorsArtifacts(manifest, allocator);
+            }
+        } else if (artifactSelectorEqual(format, "safetensors")) {
+            if (manifest.safetensors_path == null and manifest.safetensors_index_path == null)
+                return error.ModelArtifactVariantNotFound;
+            if (!selected_found) {
+                clearGgufArtifacts(manifest, allocator);
+                clearOnnxArtifacts(manifest, allocator);
+            }
+        }
+    }
+}
+
 fn parseGliner2InferenceVariantsJson(
     manifest: *ModelManifest,
     allocator: std.mem.Allocator,
@@ -2403,6 +2687,72 @@ test "manifest parses clipclap variants gguf pair" {
     try std.testing.expect(manifest.hasInput("text"));
     try std.testing.expect(manifest.hasInput("image"));
     try std.testing.expect(manifest.hasInput("audio"));
+}
+
+test "artifact selection chooses an exact quantized variant" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "manifest-exact-artifact-selection");
+    defer {
+        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    inline for (.{ "model.Q4_K.gguf", "model.Q8_0.gguf" }) |name| {
+        const path = try std.fs.path.join(allocator, &.{ dir_path, name });
+        defer allocator.free(path);
+        try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = "artifact" });
+    }
+    const variants_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
+    defer allocator.free(variants_path);
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = variants_path,
+        .data =
+        \\{"family":"decoder_variants/v1","variants":[
+        \\  {"target":"gguf","format":"Q4_K","model":"model.Q4_K.gguf"},
+        \\  {"target":"gguf","format":"Q8_0","model":"model.Q8_0.gguf"}
+        \\]}
+        ,
+    });
+
+    var manifest = try loadFromDirWithArtifactSelection(allocator, dir_path, .{
+        .format = "gguf",
+        .quantization = "q8-0",
+    });
+    defer manifest.deinit();
+    try std.testing.expect(std.mem.endsWith(u8, manifest.gguf_path.?, "/model.Q8_0.gguf"));
+    try std.testing.expect(manifest.onnx_path == null);
+
+    var default_manifest = try loadFromDirWithArtifactSelection(allocator, dir_path, .{ .format = "gguf" });
+    defer default_manifest.deinit();
+    try std.testing.expect(std.mem.endsWith(u8, default_manifest.gguf_path.?, "/model.Q4_K.gguf"));
+}
+
+test "artifact selection rejects ambiguous quantized variants" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "manifest-ambiguous-artifact-selection");
+    defer {
+        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    inline for (.{ "first.gguf", "second.gguf" }) |name| {
+        const path = try std.fs.path.join(allocator, &.{ dir_path, name });
+        defer allocator.free(path);
+        try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = "artifact" });
+    }
+    const variants_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
+    defer allocator.free(variants_path);
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = variants_path,
+        .data =
+        \\{"family":"decoder_variants/v1","variants":[
+        \\  {"target":"gguf","format":"Q4_K","model":"first.gguf"},
+        \\  {"target":"gguf","format":"Q4_K","model":"second.gguf"}
+        \\]}
+        ,
+    });
+    try std.testing.expectError(
+        error.AmbiguousModelArtifactVariant,
+        loadFromDirWithArtifactSelection(allocator, dir_path, .{ .format = "gguf", .quantization = "q4_k" }),
+    );
 }
 
 test "manifest loads canonical antfly clipclap variants before first gguf fallback" {

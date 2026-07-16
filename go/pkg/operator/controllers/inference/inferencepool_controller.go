@@ -379,12 +379,10 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 	// accelerator backend is unavailable instead of silently running on CPU.
 	// PJRT executes compiled graph partitions and cannot load model sessions
 	// directly, so TPU pools retain native as their direct-loading fallback.
-	if pool.Spec.Hardware.Accelerator != "" {
-		if strings.Contains(pool.Spec.Hardware.Accelerator, "tpu") {
-			if _, exists := inferenceConfig["backend_priority"]; !exists {
-				inferenceConfig["backend_priority"] = []string{"pjrt", "native"}
-			}
-		} else if _, exists := inferenceConfig["backend_priority"]; !exists {
+	if _, exists := inferenceConfig["backend_priority"]; !exists {
+		if isTPUInferencePool(pool) {
+			inferenceConfig["backend_priority"] = []string{"pjrt", "native"}
+		} else if hasNVIDIAGPUResources(pool) {
 			inferenceConfig["backend_priority"] = []string{"cuda"}
 		}
 	}
@@ -528,7 +526,7 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 
 	// Add TPU node selector and tolerations (works in both Standard and Autopilot modes)
 	// In Autopilot, TPU provisioning is triggered by these selectors, not by compute class
-	if pool.Spec.Hardware.Accelerator != "" {
+	if isTPUInferencePool(pool) {
 		if sts.Spec.Template.Spec.NodeSelector == nil {
 			sts.Spec.Template.Spec.NodeSelector = make(map[string]string)
 		}
@@ -1411,7 +1409,7 @@ func (r *InferencePoolReconciler) buildResources(pool *antflyaiv1alpha1.Inferenc
 	// If user provided explicit resources, use those
 	if pool.Spec.Resources != nil {
 		resources := pool.Spec.Resources.DeepCopy()
-		// Ensure TPU resources are set if accelerator is configured
+		// Ensure TPU resources are set when this is a TPU pool.
 		r.ensureTPUResources(resources, pool)
 		return *resources
 	}
@@ -1434,11 +1432,10 @@ func (r *InferencePoolReconciler) buildResources(pool *antflyaiv1alpha1.Inferenc
 	return resources
 }
 
-// ensureTPUResources adds google.com/tpu resource requests/limits if an accelerator is configured
+// ensureTPUResources adds google.com/tpu resource requests/limits for TPU pools
 // and TPU resources are not already specified. This is required for GKE Autopilot.
 func (r *InferencePoolReconciler) ensureTPUResources(resources *corev1.ResourceRequirements, pool *antflyaiv1alpha1.InferencePool) {
-	// Only add TPU resources if accelerator is configured
-	if pool.Spec.Hardware.Accelerator == "" {
+	if !isTPUInferencePool(pool) {
 		return
 	}
 
@@ -1464,6 +1461,24 @@ func (r *InferencePoolReconciler) ensureTPUResources(resources *corev1.ResourceR
 	if _, exists := resources.Limits[tpuResourceName]; !exists {
 		resources.Limits[tpuResourceName] = *resource.NewQuantity(int64(tpuCount), resource.DecimalSI)
 	}
+}
+
+func isTPUInferencePool(pool *antflyaiv1alpha1.InferencePool) bool {
+	return strings.Contains(strings.ToLower(pool.Spec.Hardware.Accelerator), "tpu")
+}
+
+func hasNVIDIAGPUResources(pool *antflyaiv1alpha1.InferencePool) bool {
+	if pool.Spec.Resources == nil {
+		return false
+	}
+	gpuName := corev1.ResourceName("nvidia.com/gpu")
+	if quantity, ok := pool.Spec.Resources.Limits[gpuName]; ok && !quantity.IsZero() {
+		return true
+	}
+	if quantity, ok := pool.Spec.Resources.Requests[gpuName]; ok && !quantity.IsZero() {
+		return true
+	}
+	return false
 }
 
 // calculateTPUCountFromTopology parses a topology string like "2x2" and returns the TPU count

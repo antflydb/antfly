@@ -243,6 +243,7 @@ pub const NodeConfig = struct {
     pool_size: usize = 1,
     allow_downloads: bool = true,
     backend_priority: ?[]const backends_mod.BackendType = null,
+    pjrt_plugin_path: ?[]const u8 = null,
     generation_budget_overrides: BudgetOverrides = .{},
     prompt_cache: PromptCacheConfig = .{},
     prompt_cache_resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver = null,
@@ -328,7 +329,42 @@ pub const WarmModel = struct {
     kind: WarmModelKind = .generator,
     name: []const u8,
     backend: ?backends_mod.BackendType = null,
+    format: ?[]const u8 = null,
+    quantization: ?[]const u8 = null,
 };
+
+fn artifactSelectionFromModelReference(model_name: []const u8) manifest_mod.ArtifactSelection {
+    const name = if (std.mem.startsWith(u8, model_name, "hf:")) model_name[3..] else model_name;
+    const separator = std.mem.indexOfScalar(u8, name, ':') orelse return .{};
+    const suffix = name[separator + 1 ..];
+    const quantization_separator = std.mem.indexOfScalar(u8, suffix, ':');
+    const format = if (quantization_separator) |index| suffix[0..index] else suffix;
+    inline for (.{ "gguf", "onnx", "safetensors", "hybrid" }) |supported| {
+        if (std.ascii.eqlIgnoreCase(format, supported)) {
+            return .{
+                .format = format,
+                .quantization = if (quantization_separator) |index|
+                    if (index + 1 < suffix.len) suffix[index + 1 ..] else null
+                else
+                    null,
+            };
+        }
+    }
+    return .{};
+}
+
+fn artifactFormatIs(selection: manifest_mod.ArtifactSelection, format: []const u8) bool {
+    const selected = selection.format orelse return false;
+    return std.ascii.eqlIgnoreCase(selected, format);
+}
+
+fn artifactSupportsGenerationBackend(selection: manifest_mod.ArtifactSelection, backend: backends_mod.BackendType) bool {
+    if (selection.format == null or artifactFormatIs(selection, "hybrid")) return true;
+    return switch (backend) {
+        .onnx, .webgpu => artifactFormatIs(selection, "onnx"),
+        .native, .metal, .cuda, .pjrt => artifactFormatIs(selection, "gguf") or artifactFormatIs(selection, "safetensors"),
+    };
+}
 
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
@@ -341,6 +377,7 @@ const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
 const GenerateBackendSelection = struct {
     native_choice: native_backend_choice.Choice = .auto,
     override_model_loading: bool = false,
+    strict_backend: bool = false,
     compiled_partition_backend: ?ops.BackendKind = null,
     compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = .partitioned,
     graph_mode_requested: bool = false,
@@ -393,6 +430,7 @@ fn parseGenerateBackendSelectionWithDefault(
     return .{
         .native_choice = choice,
         .override_model_loading = backend_value != null and choice != .auto,
+        .strict_backend = backend_value != null and choice != .auto,
         .compiled_partition_backend = explicit_partition_backend,
         .compiled_attachment_target = compiled_attachment_target,
         .graph_mode_requested = compiled_mode_requested,
@@ -420,6 +458,17 @@ fn modelBackendToNativeChoice(value: api.ModelBackend) native_backend_choice.Cho
         .auto => .auto,
         .onnx => .onnx,
         .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+        .pjrt => .pjrt,
+        .webgpu => .webgpu,
+    };
+}
+
+fn backendTypeToGenerationChoice(value: backends_mod.BackendType) GenerationBackend {
+    return switch (value) {
+        .native => .native,
+        .onnx => .onnx,
         .metal => .metal,
         .cuda => .cuda,
         .pjrt => .pjrt,
@@ -966,7 +1015,7 @@ pub const Node = struct {
             };
         }
 
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null, null);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null, .{}, null, null);
     }
 
     pub fn generateMessagesDirect(
@@ -975,7 +1024,7 @@ pub const Node = struct {
         model_name: []const u8,
         messages: []const generation.Message,
     ) ![]u8 {
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null, null);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null, .{}, null, null);
     }
 
     const DirectGenerateTiming = struct {
@@ -1020,6 +1069,8 @@ pub const Node = struct {
         messages: []const generation.Message,
         max_tokens: i32,
         preferred_backends: ?[]const backends_mod.BackendType,
+        compiled_backend: ?ops.BackendKind,
+        artifact_selection: manifest_mod.ArtifactSelection,
         timing: ?*DirectGenerateTiming,
         warm_request_id: ?u64,
     ) ![]u8 {
@@ -1036,9 +1087,20 @@ pub const Node = struct {
         defer io_impl.deinit();
         const io = io_impl.io();
 
+        const effective_artifact_selection = if (artifact_selection.isEmpty())
+            artifactSelectionFromModelReference(model_name)
+        else
+            artifact_selection;
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "generators");
         const resolved_at_ns = embedTimingNowNs();
-        const model = if (preferred_backends) |backends|
+        const model = if (!effective_artifact_selection.isEmpty())
+            try self.model_manager.loadArtifactFromDirForRequest(
+                request_id,
+                model_path,
+                effective_artifact_selection,
+                preferred_backends,
+            )
+        else if (preferred_backends) |backends|
             try self.model_manager.loadFromDirWithPreferredBackendsForRequest(request_id, model_path, backends, false)
         else
             try self.model_manager.loadFromDirForRequest(request_id, model_path);
@@ -1082,7 +1144,7 @@ pub const Node = struct {
             return err;
         };
 
-        const use_metal_whole_model = build_options.enable_metal and
+        const use_metal_whole_model = compiled_backend == null and build_options.enable_metal and
             model.session.backend() == .metal and
             graph_mod.metal_executor.supportsSession(model.session) and
             !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config);
@@ -1144,6 +1206,21 @@ pub const Node = struct {
         decode_state.kv_storage = &kv_storage;
         defer decode_state.deinit();
 
+        var pjrt_client: ?pjrt_lib.pjrt.Client = null;
+        defer if (pjrt_client) |*client| client.deinit();
+        var pjrt_plugin_path: ?[:0]u8 = null;
+        defer if (pjrt_plugin_path) |path| allocator.free(path);
+        if (compiled_backend == .pjrt) {
+            pjrt_plugin_path = try native_backend_choice.resolvePjrtPluginPath(allocator, self.config.pjrt_plugin_path);
+            const plugin_path = pjrt_plugin_path orelse return error.MissingPjrtPluginPath;
+            pjrt_client = pjrt_lib.pjrt.Client.init(plugin_path) catch return error.PjrtProviderUnavailable;
+        }
+        var request_graph_cache: ?graph_mod.cache.GraphCache = if (compiled_backend != null and !use_metal_whole_model)
+            graph_mod.cache.GraphCache.init(allocator)
+        else
+            null;
+        defer if (request_graph_cache) |*cache| cache.deinit();
+
         var pipeline = generation.NativeGenerationPipeline{
             .allocator = allocator,
             .io = io,
@@ -1159,9 +1236,15 @@ pub const Node = struct {
             .model_dir = model_path,
             .gguf_projector_path = model.manifest.gguf_projector_path,
             .decode_state = &decode_state,
-            .graph_cache = if (use_metal_whole_model) &model.native_generation_graph_cache else null,
-            .compiled_partition_backend = if (use_metal_whole_model) .metal else null,
+            .graph_cache = if (use_metal_whole_model)
+                &model.native_generation_graph_cache
+            else if (request_graph_cache) |*cache|
+                cache
+            else
+                null,
+            .compiled_partition_backend = if (use_metal_whole_model) .metal else compiled_backend,
             .compiled_attachment_target = if (use_metal_whole_model) .whole_model else .partitioned,
+            .pjrt_client = if (pjrt_client) |*client| client else null,
         };
         const debug_metal_timing = timing != null and use_metal_whole_model and platform.env.getenvBool("TERMITE_DEBUG_METAL_TIMING");
         if (debug_metal_timing) graph_mod.metal_executor.resetTimingStats();
@@ -1220,9 +1303,9 @@ pub const Node = struct {
 
     fn warmModelForRequest(self: *Node, allocator: std.mem.Allocator, model: WarmModel, request_id: u64) !void {
         switch (model.kind) {
-            .generator => try self.warmGeneratorWithBackend(allocator, model.name, model.backend, request_id),
-            .embedder => try self.warmEmbedder(allocator, model.name, model.backend, request_id),
-            .reranker => try self.warmReranker(allocator, model.name, model.backend, request_id),
+            .generator => try self.warmGeneratorWithBackend(allocator, model, request_id),
+            .embedder => try self.warmEmbedder(allocator, model, request_id),
+            .reranker => try self.warmReranker(allocator, model, request_id),
             .chunker, .classifier, .recognizer, .rewriter, .reader, .transcriber, .extractor => try self.warmLoadOnlyModel(allocator, model, request_id),
         }
     }
@@ -1230,21 +1313,183 @@ pub const Node = struct {
     pub fn warmGenerator(self: *Node, allocator: std.mem.Allocator, model_name: []const u8) !void {
         const request_id = try self.model_manager.beginRequest(modelLifecycleNowMs());
         defer self.model_manager.endRequest(request_id, modelLifecycleNowMs());
-        try self.warmGeneratorWithBackend(allocator, model_name, null, request_id);
+        try self.warmGeneratorWithBackend(allocator, .{ .name = model_name }, request_id);
     }
 
-    fn warmGeneratorWithBackend(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType, request_id: u64) !void {
+    fn warmOnnxGenerator(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        messages: []const generation.Message,
+        artifact_selection: manifest_mod.ArtifactSelection,
+        request_id: u64,
+    ) !void {
+        if (comptime build_options.enable_onnx) {
+            if (artifact_selection.quantization != null) return error.UnsupportedGeneratorArtifactSelection;
+            var transient_lease = try self.model_manager.beginTransientModelLoadForRequest(request_id);
+            defer transient_lease.deinit();
+
+            if (!c_file.fileExistsInDir(allocator, model_path, "genai_config.json") and
+                onnx_decoder_only_vlm.isSupportedModelDir(allocator, model_path))
+            {
+                var pipeline = try onnx_decoder_only_vlm.Pipeline.load(allocator, model_path);
+                defer pipeline.deinit();
+                try transient_lease.activate();
+                var result = try pipeline.generate(messages, .{ .max_tokens = 1 });
+                defer result.deinit();
+                return;
+            }
+
+            const prepared_model_dir = try backends_mod.ortgenai.prepareGenerativeModelPackage(allocator, model_path) orelse
+                return error.UnsupportedGeneratorProvider;
+            defer allocator.free(prepared_model_dir);
+
+            var manifest = try manifest_mod.loadFromDir(allocator, prepared_model_dir);
+            defer manifest.deinit();
+            var chat_template: ?generation.ChatTemplate = null;
+            defer if (chat_template) |*template| template.deinit();
+            if (manifest.chat_template) |source| {
+                chat_template = try generation.ChatTemplate.init(
+                    allocator,
+                    source,
+                    manifest.bos_token,
+                    manifest.eos_token,
+                    manifest.unk_token,
+                    manifest.pad_token,
+                );
+            }
+
+            var gen_model = try backends_mod.ortgenai.GenAiModel.load(allocator, prepared_model_dir);
+            defer gen_model.deinit();
+            try transient_lease.activate();
+            var pipeline = generation.GenerationPipeline{
+                .allocator = allocator,
+                .model = &gen_model,
+                .chat_template = if (chat_template) |*template| template else null,
+            };
+            var result = try pipeline.generate(messages, .{ .max_tokens = 1 });
+            defer result.deinit();
+            return;
+        }
+        return error.BackendUnavailable;
+    }
+
+    fn warmGenerationBackend(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_path: []const u8,
+        messages: []const generation.Message,
+        backend: backends_mod.BackendType,
+        artifact_selection: manifest_mod.ArtifactSelection,
+        timing: *DirectGenerateTiming,
+        request_id: u64,
+    ) !void {
+        if (!artifactSupportsGenerationBackend(artifact_selection, backend)) return error.BackendUnavailable;
+        switch (backend) {
+            .onnx => try self.warmOnnxGenerator(allocator, model_path, messages, artifact_selection, request_id),
+            .pjrt => {
+                var manager = backends_mod.SessionManager.init(allocator);
+                native_backend_choice.configureSessionPreference(&manager, .pjrt);
+                if (manager.preferred_backends.len == 0) return error.NoNativeGenerationBackend;
+                const text = try self.generateMessagesDirectMaxTokens(
+                    allocator,
+                    model_name,
+                    messages,
+                    1,
+                    manager.preferred_backends,
+                    .pjrt,
+                    artifact_selection,
+                    timing,
+                    request_id,
+                );
+                allocator.free(text);
+            },
+            .native, .metal, .cuda => {
+                const text = try self.generateMessagesDirectMaxTokens(
+                    allocator,
+                    model_name,
+                    messages,
+                    1,
+                    singleBackendPreference(backend),
+                    null,
+                    artifact_selection,
+                    timing,
+                    request_id,
+                );
+                allocator.free(text);
+            },
+            .webgpu => return error.UnsupportedGeneratorProvider,
+        }
+    }
+
+    fn isGenerationWarmFallbackError(backend: backends_mod.BackendType, err: anyerror) bool {
+        if (backends_mod.isRetryableBackendLoadError(backend, err)) return true;
+        return switch (err) {
+            error.UnsupportedGeneratorProvider,
+            error.NoNativeGenerationBackend,
+            error.PjrtProviderUnavailable,
+            error.MissingPjrtPluginPath,
+            => true,
+            else => false,
+        };
+    }
+
+    fn warmGeneratorWithBackend(self: *Node, allocator: std.mem.Allocator, model: WarmModel, request_id: u64) !void {
+        const model_name = model.name;
+        const backend = model.backend;
+        const artifact_selection: manifest_mod.ArtifactSelection = .{ .format = model.format, .quantization = model.quantization };
         if (model_name.len == 0) return error.InvalidGenerationRequest;
         const started_at_ns = embedTimingNowNs();
         std.log.info("warming inference generator model={s}", .{model_name});
-        const preferred_backends = if (backend) |value| singleBackendPreference(value) else null;
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const model_path = try self.resolveModelPath(io_impl.io(), model_name, "generators");
+        if (backend) |value| {
+            if (artifact_selection.isEmpty())
+                try self.model_manager.setBackendPolicy(model_path, value)
+            else
+                try self.model_manager.setArtifactBackendPolicy(model_path, artifact_selection, value);
+        }
         const messages = [_]generation.Message{.{
             .role = "user",
             .content = "ping",
         }};
         var timing = DirectGenerateTiming{};
-        const text = try self.generateMessagesDirectMaxTokens(allocator, model_name, &messages, 1, preferred_backends, &timing, request_id);
-        defer allocator.free(text);
+        if (backend) |preferred_backend| {
+            self.warmGenerationBackend(allocator, model_name, model_path, &messages, preferred_backend, artifact_selection, &timing, request_id) catch |preferred_err| {
+                if (!isGenerationWarmFallbackError(preferred_backend, preferred_err)) return preferred_err;
+                var last_retryable_error: anyerror = preferred_err;
+                const fallback_priority = self.config.backend_priority orelse self.session_manager.preferred_backends;
+                for (fallback_priority) |candidate| {
+                    if (candidate == preferred_backend or !candidate.available()) continue;
+                    self.warmGenerationBackend(allocator, model_name, model_path, &messages, candidate, artifact_selection, &timing, request_id) catch |err| {
+                        if (!isGenerationWarmFallbackError(candidate, err)) return err;
+                        last_retryable_error = err;
+                        continue;
+                    };
+                    break;
+                } else return last_retryable_error;
+            };
+        } else if (self.config.backend_priority) |priority| {
+            var last_retryable_error: ?anyerror = null;
+            for (priority) |candidate| {
+                if (!candidate.available()) continue;
+                self.warmGenerationBackend(allocator, model_name, model_path, &messages, candidate, artifact_selection, &timing, request_id) catch |err| {
+                    if (!isGenerationWarmFallbackError(candidate, err)) return err;
+                    last_retryable_error = err;
+                    std.log.warn(
+                        "configured generator warm backend {s} unavailable for model={s} ({s}); trying next priority",
+                        .{ @tagName(candidate), model_name, @errorName(err) },
+                    );
+                    continue;
+                };
+                break;
+            } else return last_retryable_error orelse error.NoConfiguredGenerationBackendFallback;
+        } else {
+            const text = try self.generateMessagesDirectMaxTokens(allocator, model_name, &messages, 1, null, null, artifact_selection, &timing, request_id);
+            allocator.free(text);
+        }
         const elapsed_ms = elapsedMs(started_at_ns, embedTimingNowNs());
         std.log.info(
             "warmed inference generator model={s} elapsed_ms={d} resolve_ms={d} load_ms={d} setup_ms={d} generate_ms={d}",
@@ -1259,7 +1504,10 @@ pub const Node = struct {
         );
     }
 
-    fn warmEmbedder(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType, request_id: u64) !void {
+    fn warmEmbedder(self: *Node, allocator: std.mem.Allocator, warm_model: WarmModel, request_id: u64) !void {
+        const model_name = warm_model.name;
+        const backend = warm_model.backend;
+        const artifact_selection: manifest_mod.ArtifactSelection = .{ .format = warm_model.format, .quantization = warm_model.quantization };
         if (model_name.len == 0) return error.InvalidGenerationRequest;
         const started_at_ns = embedTimingNowNs();
         std.log.info("warming inference embedder model={s}", .{model_name});
@@ -1268,7 +1516,20 @@ pub const Node = struct {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
         const model_path = try self.resolveModelPath(io_impl.io(), model_name, "embedders");
-        const model = if (backend) |value|
+        if (backend) |value| {
+            if (artifact_selection.isEmpty())
+                try self.model_manager.setBackendPolicy(model_path, value)
+            else
+                try self.model_manager.setArtifactBackendPolicy(model_path, artifact_selection, value);
+        }
+        const model = if (!artifact_selection.isEmpty())
+            try self.model_manager.loadArtifactFromDirForRequest(
+                request_id,
+                model_path,
+                artifact_selection,
+                if (backend) |value| singleBackendPreference(value) else null,
+            )
+        else if (backend) |value|
             try self.model_manager.loadFromDirWithPreferredBackendsForRequest(request_id, model_path, singleBackendPreference(value), false)
         else
             try self.model_manager.loadFromDirForRequest(request_id, model_path);
@@ -1303,7 +1564,10 @@ pub const Node = struct {
         std.log.info("warmed inference embedder model={s} elapsed_ms={d}", .{ model_name, elapsedMs(started_at_ns, embedTimingNowNs()) });
     }
 
-    fn warmReranker(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType, request_id: u64) !void {
+    fn warmReranker(self: *Node, allocator: std.mem.Allocator, warm_model: WarmModel, request_id: u64) !void {
+        const model_name = warm_model.name;
+        const backend = warm_model.backend;
+        const artifact_selection: manifest_mod.ArtifactSelection = .{ .format = warm_model.format, .quantization = warm_model.quantization };
         if (model_name.len == 0) return error.InvalidGenerationRequest;
         const started_at_ns = embedTimingNowNs();
         std.log.info("warming inference reranker model={s}", .{model_name});
@@ -1311,7 +1575,20 @@ pub const Node = struct {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
         const model_path = try self.resolveModelPath(io_impl.io(), model_name, "rerankers");
-        const model = if (backend) |value|
+        if (backend) |value| {
+            if (artifact_selection.isEmpty())
+                try self.model_manager.setBackendPolicy(model_path, value)
+            else
+                try self.model_manager.setArtifactBackendPolicy(model_path, artifact_selection, value);
+        }
+        const model = if (!artifact_selection.isEmpty())
+            try self.model_manager.loadArtifactFromDirForRequest(
+                request_id,
+                model_path,
+                artifact_selection,
+                if (backend) |value| singleBackendPreference(value) else null,
+            )
+        else if (backend) |value|
             try self.model_manager.loadFromDirWithPreferredBackendsForRequest(request_id, model_path, singleBackendPreference(value), false)
         else
             try self.model_manager.loadFromDirForRequest(request_id, model_path);
@@ -1341,7 +1618,21 @@ pub const Node = struct {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
         const model_path = try self.resolveModelPath(io_impl.io(), model.name, task_dir);
-        _ = if (model.backend) |backend|
+        const artifact_selection: manifest_mod.ArtifactSelection = .{ .format = model.format, .quantization = model.quantization };
+        if (model.backend) |backend| {
+            if (artifact_selection.isEmpty())
+                try self.model_manager.setBackendPolicy(model_path, backend)
+            else
+                try self.model_manager.setArtifactBackendPolicy(model_path, artifact_selection, backend);
+        }
+        _ = if (!artifact_selection.isEmpty())
+            try self.model_manager.loadArtifactFromDirForRequest(
+                request_id,
+                model_path,
+                artifact_selection,
+                if (model.backend) |backend| singleBackendPreference(backend) else null,
+            )
+        else if (model.backend) |backend|
             try self.model_manager.loadFromDirWithPreferredBackendsForRequest(request_id, model_path, singleBackendPreference(backend), false)
         else
             try self.model_manager.loadFromDirForRequest(request_id, model_path);
@@ -2349,6 +2640,7 @@ pub const Node = struct {
         request_id: u64,
         model_path: []const u8,
         selection: GenerateBackendSelection,
+        artifact_selection: manifest_mod.ArtifactSelection,
     ) !*model_manager_mod.LoadedModel {
         var request_session_manager = backends_mod.SessionManager.init(allocator);
         const configured = if (selection.override_model_loading) blk: {
@@ -2359,13 +2651,26 @@ pub const Node = struct {
         // Preserve the alias-based, allocation-light hot path when the shared
         // priority can only produce generation-compatible sessions. PJRT is
         // safe here because direct session loading already skips it.
-        if (!selection.override_model_loading and !generationPriorityNeedsSessionFiltering(configured)) {
+        if (artifact_selection.isEmpty() and
+            !selection.override_model_loading and
+            self.model_manager.backendPolicy(model_path) == null and
+            !generationPriorityNeedsSessionFiltering(configured))
+        {
             return self.model_manager.loadFromDirForRequest(request_id, model_path);
         }
 
         var scratch: [backend_priority_capacity]backends_mod.BackendType = undefined;
         const direct_backends = nativeGenerationLoadPriority(&scratch, configured);
         if (direct_backends.len == 0) return error.NoNativeGenerationBackend;
+
+        if (!artifact_selection.isEmpty()) {
+            return self.model_manager.loadArtifactFromDirForRequest(
+                request_id,
+                model_path,
+                artifact_selection,
+                direct_backends,
+            );
+        }
 
         // Generation-specific variants must not replace the default alias: an
         // ONNX-first node may legitimately cache both a direct ONNX model for
@@ -2416,6 +2721,7 @@ pub const Node = struct {
 
         // Resolve model
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
+        const artifact_selection = artifactSelectionFromModelReference(body.model);
         const model_path = self.resolveModelPath(ctx.io, model_name, "generators") catch
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
 
@@ -2650,11 +2956,22 @@ pub const Node = struct {
             .prompt_cache_enabled = self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and prompt_cache_key != null and !want_stream,
             .prompt_cache_key = prompt_cache_key,
         };
+        const model_backend_policy = if (body.backend == null)
+            try self.model_manager.artifactBackendPolicy(model_path, artifact_selection)
+        else
+            null;
+        const configured_generation_backend = if (body.backend == null)
+            if (model_backend_policy) |policy|
+                backendTypeToGenerationChoice(policy)
+            else
+                generationBackendFromPriority(self.config.backend_priority)
+        else
+            generationBackendFromPriority(self.config.backend_priority);
         var backend_selection = parseGenerateBackendSelectionWithDefault(
             body.backend,
             body.mode,
             body.compiled_target,
-            generationBackendFromPriority(self.config.backend_priority),
+            configured_generation_backend,
         ) catch |err| {
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
@@ -2665,6 +2982,30 @@ pub const Node = struct {
                 },
             });
         };
+        if (model_backend_policy != null) backend_selection.override_model_loading = true;
+        if (artifact_selection.quantization != null and artifactFormatIs(artifact_selection, "onnx")) {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "quantized ONNX generator artifact selection is not supported",
+            });
+        }
+        if (backend_selection.strict_backend) {
+            const strict_backend: backends_mod.BackendType = switch (backend_selection.native_choice) {
+                .native => .native,
+                .onnx => .onnx,
+                .metal => .metal,
+                .cuda => .cuda,
+                .pjrt => .pjrt,
+                .webgpu => .webgpu,
+                .auto => unreachable,
+            };
+            if (!artifactSupportsGenerationBackend(artifact_selection, strict_backend)) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "backend is incompatible with the selected model artifact format",
+                });
+            }
+        }
         if (body.response_format) |rf| {
             if (std.mem.eql(u8, rf.type, "json_object")) {
                 config.grammar = "json";
@@ -2721,7 +3062,8 @@ pub const Node = struct {
         var allow_onnx = config.grammar == null and
             effective_draft_model_name == null and
             !backend_selection.graph_mode_requested and
-            (backend_selection.native_choice == .auto or backend_selection.native_choice == .onnx);
+            (backend_selection.native_choice == .auto or backend_selection.native_choice == .onnx) and
+            (artifact_selection.format == null or artifactFormatIs(artifact_selection, "onnx") or artifactFormatIs(artifact_selection, "hybrid"));
 
         // Try plain HF ONNX decoder-only VLM packages before Ort GenAI overlays.
         plain_onnx_generation: {
@@ -2753,7 +3095,7 @@ pub const Node = struct {
                 }
 
                 var pipeline = onnx_decoder_only_vlm.Pipeline.load(ctx.allocator, model_path) catch |err| {
-                    if (!backend_selection.override_model_loading and isConfiguredOnnxGenerationFallbackError(err)) {
+                    if (!backend_selection.strict_backend and isConfiguredOnnxGenerationFallbackError(err)) {
                         backend_selection = self.fallbackConfiguredGenerationSelection(body, .onnx) catch {
                             return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
                         };
@@ -2879,7 +3221,7 @@ pub const Node = struct {
                     }
 
                     var gen_model = ortgenai.GenAiModel.load(ctx.allocator, prepared_model_dir) catch |err| {
-                        if (!backend_selection.override_model_loading and isConfiguredOnnxGenerationFallbackError(err)) {
+                        if (!backend_selection.strict_backend and isConfiguredOnnxGenerationFallbackError(err)) {
                             backend_selection = self.fallbackConfiguredGenerationSelection(body, .onnx) catch {
                                 return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
                             };
@@ -2956,6 +3298,7 @@ pub const Node = struct {
             request_id,
             model_path,
             backend_selection,
+            artifact_selection,
         ) catch |err|
             return modelLoadFailure(ctx, err);
         model.lockNativeGenerationWithIo(ctx.io);
@@ -3030,12 +3373,12 @@ pub const Node = struct {
         var pjrt_plugin_path: ?[:0]u8 = null;
         defer if (pjrt_plugin_path) |path| ctx.allocator.free(path);
         if (backend_selection.compiled_partition_backend == .pjrt) {
-            pjrt_plugin_path = try native_backend_choice.pjrtPluginPathFromEnv(ctx.allocator);
+            pjrt_plugin_path = try native_backend_choice.resolvePjrtPluginPath(ctx.allocator, self.config.pjrt_plugin_path);
             if (pjrt_plugin_path) |plugin_path| {
                 if (pjrt_lib.pjrt.Client.init(plugin_path)) |client| {
                     pjrt_client = client;
                 } else |err| {
-                    if (backend_selection.override_model_loading) {
+                    if (backend_selection.strict_backend) {
                         return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
                     }
                     std.log.warn(
@@ -3045,10 +3388,10 @@ pub const Node = struct {
                     backend_selection = self.fallbackConfiguredGenerationSelection(body, .pjrt) catch
                         return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "failed to resolve generation backend fallback" });
                 }
-            } else if (backend_selection.override_model_loading) {
+            } else if (backend_selection.strict_backend) {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
-                    .message = "pjrt backend requires ANTFLY_INFERENCE_PJRT_PLUGIN or PJRT_PLUGIN_PATH",
+                    .message = "pjrt backend requires inference.pjrt_plugin_path or PJRT_PLUGIN_PATH",
                 });
             } else {
                 std.log.warn("configured PJRT backend has no plugin path; continuing with backend priority fallback", .{});
@@ -3080,6 +3423,7 @@ pub const Node = struct {
                         request_id,
                         draft_model_path,
                         backend_selection,
+                        artifactSelectionFromModelReference(draft_model_name),
                     ) catch |err|
                         return modelLoadFailure(ctx, err);
                     const draft_cfg = session_factory.getGptConfig(draft_model.session) orelse
@@ -3746,21 +4090,39 @@ pub const Node = struct {
                 break :blk null;
             } orelse break;
             const first_body = body.requests[first_idx].body;
+            const artifact_selection = artifactSelectionFromModelReference(first_body.model);
             const model_path = self.resolveModelPath(ctx.io, first_body.model, "generators") catch {
                 results[first_idx].@"error" = .{ .code = "MODEL_NOT_FOUND", .message = "model not found", .retryable = false };
                 pending[first_idx] = false;
                 continue;
             };
-            const selection = parseGenerateBackendSelectionWithDefault(
+            const model_backend_policy = if (first_body.backend == null)
+                try self.model_manager.artifactBackendPolicy(model_path, artifact_selection)
+            else
+                null;
+            const configured_generation_backend = if (first_body.backend == null)
+                if (model_backend_policy) |policy|
+                    backendTypeToGenerationChoice(policy)
+                else
+                    generationBackendFromPriority(self.config.backend_priority)
+            else
+                generationBackendFromPriority(self.config.backend_priority);
+            var selection = parseGenerateBackendSelectionWithDefault(
                 first_body.backend,
                 first_body.mode,
                 first_body.compiled_target,
-                generationBackendFromPriority(self.config.backend_priority),
+                configured_generation_backend,
             ) catch {
                 results[first_idx].@"error" = .{ .code = "INVALID_REQUEST", .message = "unsupported backend", .retryable = false };
                 pending[first_idx] = false;
                 continue;
             };
+            if (model_backend_policy != null) selection.override_model_loading = true;
+            if (artifactFormatIs(artifact_selection, "onnx")) {
+                results[first_idx].@"error" = .{ .code = "INVALID_REQUEST", .message = "ONNX artifact selection is not supported by batch generation", .retryable = false };
+                pending[first_idx] = false;
+                continue;
+            }
 
             var group_indices = std.ArrayListUnmanaged(usize).empty;
             defer group_indices.deinit(ctx.allocator);
@@ -3780,6 +4142,7 @@ pub const Node = struct {
                 group_request_id,
                 model_path,
                 selection,
+                artifact_selection,
             ) catch |err| {
                 for (group_indices.items) |idx| {
                     results[idx].@"error" = .{
@@ -7542,6 +7905,28 @@ test "configured ONNX fallback excludes artifact failures" {
     try std.testing.expect(!isConfiguredOnnxGenerationFallbackError(error.OrtGenAiFailed));
 }
 
+test "generation warm fallback excludes artifact failures" {
+    try std.testing.expect(Node.isGenerationWarmFallbackError(.onnx, error.OrtEnvCreationFailed));
+    try std.testing.expect(Node.isGenerationWarmFallbackError(.pjrt, error.MissingPjrtPluginPath));
+    try std.testing.expect(Node.isGenerationWarmFallbackError(.native, error.NoNativeGenerationBackend));
+    try std.testing.expect(!Node.isGenerationWarmFallbackError(.onnx, error.InvalidOnnxModel));
+    try std.testing.expect(!Node.isGenerationWarmFallbackError(.native, error.MissingRequiredWeights));
+}
+
+test "generation model references preserve artifact variant identity" {
+    const selected = artifactSelectionFromModelReference("hf:owner/model:gguf:Q4_K");
+    try std.testing.expectEqualStrings("gguf", selected.format.?);
+    try std.testing.expectEqualStrings("Q4_K", selected.quantization.?);
+    try std.testing.expect(artifactSelectionFromModelReference("owner/model:i8").isEmpty());
+    try std.testing.expect(artifactSelectionFromModelReference("owner/model").isEmpty());
+    try std.testing.expect(artifactSupportsGenerationBackend(selected, .native));
+    try std.testing.expect(artifactSupportsGenerationBackend(selected, .pjrt));
+    try std.testing.expect(!artifactSupportsGenerationBackend(selected, .onnx));
+    const onnx = artifactSelectionFromModelReference("owner/model:onnx");
+    try std.testing.expect(artifactSupportsGenerationBackend(onnx, .onnx));
+    try std.testing.expect(!artifactSupportsGenerationBackend(onnx, .native));
+}
+
 test "generation backend exclusion advances configured priority" {
     const priority = [_]backends_mod.BackendType{ .onnx, .pjrt, .native };
     const expected: GenerationBackend = if (build_options.enable_pjrt) .pjrt else .native;
@@ -7595,6 +7980,7 @@ test "generate backend selection follows shared priority" {
         default_backend,
     );
     try std.testing.expect(!selection.override_model_loading);
+    try std.testing.expect(!selection.strict_backend);
     if (build_options.enable_pjrt) {
         try std.testing.expectEqual(native_backend_choice.Choice.pjrt, selection.native_choice);
         try std.testing.expectEqual(@as(?ops.BackendKind, .pjrt), selection.compiled_partition_backend);
@@ -7605,6 +7991,14 @@ test "generate backend selection follows shared priority" {
         try std.testing.expectEqual(native_backend_choice.Choice.auto, selection.native_choice);
         try std.testing.expectEqual(@as(?ops.BackendKind, null), selection.compiled_partition_backend);
     }
+}
+
+test "explicit generation backend remains strict" {
+    if (!build_options.enable_native) return;
+    const selection = try parseGenerateBackendSelection(.native, null, null);
+    try std.testing.expect(selection.override_model_loading);
+    try std.testing.expect(selection.strict_backend);
+    try std.testing.expectEqual(native_backend_choice.Choice.native, selection.native_choice);
 }
 
 test "generation priority can fall through a runtime-unusable compiled backend" {

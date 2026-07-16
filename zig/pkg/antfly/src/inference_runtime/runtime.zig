@@ -286,6 +286,8 @@ fn appendConfiguredPreloads(
             .kind = parsePreloadModelKind(model.kind) orelse return error.InvalidConfig,
             .name = model.name,
             .backend = parseOptionalBackendType(model.backend) catch return error.InvalidConfig,
+            .format = model.format,
+            .quantization = model.quantization,
         });
     }
 }
@@ -362,6 +364,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
         .preload = preload_models.items,
         .backend_priority = backend_priority.items,
+        .pjrt_plugin_path = if (loaded_config) |*config| config.inference.pjrt_plugin_path else null,
     };
     if (loaded_config) |*config| {
         if (config.inference.content_security) |security| node_config.content_security = security;

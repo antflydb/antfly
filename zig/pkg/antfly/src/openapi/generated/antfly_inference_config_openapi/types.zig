@@ -104,6 +104,8 @@ pub const Config = struct {
     prompt_cache: ?PromptCacheConfig = null,
     /// Explicit backend order for inference. Antfly tries entries in order and uses the first backend supported by both the build and the operation. Direct model loading skips compiled-only `pjrt` entries and continues to the next backend, while generation uses PJRT for compiled graph partitions when it is the first available entry. An empty list is invalid. A single entry is a strict backend requirement and causes startup to fail when that backend is unavailable or cannot directly load a model session. **Backends** (depend on build flags): - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `pjrt` - PJRT compiled graph backend - `webgpu` - WebGPU backend for Wasm builds
     backend_priority: ?[]const []const u8 = null,
+    /// Filesystem path to the PJRT C API plugin used for compiled generation. This is the preferred production configuration. `PJRT_PLUGIN_PATH` is accepted as a process-level fallback when this field is unset.
+    pjrt_plugin_path: ?[]const u8 = null,
     /// Maximum weighted inference work admitted concurrently by the Zig runtime. Requests beyond the limit receive 503 Service Unavailable with Retry-After; they are not held in an in-process wait queue. Set to 0 for unlimited.
     max_concurrent_requests: ?i64 = null,
     /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind. Specialized request-scoped pipelines are capacity-bounded but may still initialize on their first request.
@@ -383,7 +385,7 @@ pub const GenerateMessage = struct {
 };
 
 pub const GenerateRequest = struct {
-    /// Name of the generator model from models_dir/generators/
+    /// Name of the generator model from models_dir/generators/. Use `<owner>/<repo>:<format>:<quantization>` to select a preloaded artifact variant.
     model: []const u8,
     /// Conversation messages (OpenAI-compatible format)
     messages: []const ChatMessage,
@@ -456,7 +458,7 @@ pub const MediaContentPart = struct {
     mime_type: ?[]const u8 = null,
 };
 
-/// Optional backend preference for model loading or request execution. `auto` keeps the node default behavior. `pjrt` selects the PJRT backend and may require a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds.
+/// Optional backend preference for model loading or request execution. `auto` keeps the node default behavior. `pjrt` selects the PJRT backend and requires `pjrt_plugin_path` unless the standard `PJRT_PLUGIN_PATH` environment variable is set. `webgpu` selects the Wasm/WebGPU backend in Wasm builds.
 pub const ModelBackend = enum {
     auto,
     native,
@@ -492,6 +494,38 @@ pub const ModelBackend = enum {
             .{ "cuda", .cuda },
             .{ "pjrt", .pjrt },
             .{ "webgpu", .webgpu },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Optional artifact family to select when a model directory contains multiple loadable formats.
+pub const ModelFormat = enum {
+    gguf,
+    onnx,
+    safetensors,
+    hybrid,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .gguf => "gguf",
+            .onnx => "onnx",
+            .safetensors => "safetensors",
+            .hybrid => "hybrid",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "gguf", .gguf },
+            .{ "onnx", .onnx },
+            .{ "safetensors", .safetensors },
+            .{ "hybrid", .hybrid },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -555,12 +589,17 @@ pub const ModelKind = enum {
     }
 };
 
+/// Optional exact quantization selector within the chosen artifact family. Matching is case-insensitive and treats `-` and `_` equivalently (for example, `q4_k` matches `Q4_K`). The configured model must contain exactly one matching artifact variant. Quantization is not valid with the composite `hybrid` format.
+pub const ModelQuantization = []const u8;
+
 /// Model reference used by startup preload and model-loading configuration.
 pub const ModelRef = struct {
     kind: ModelKind,
-    /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
+    /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format. Generation requests can address a preloaded artifact explicitly as `<owner>/<repo>:<format>:<quantization>`.
     name: []const u8,
     backend: ?ModelBackend = null,
+    format: ?ModelFormat = null,
+    quantization: ?ModelQuantization = null,
 };
 
 pub const ModelsResponse = struct {

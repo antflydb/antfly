@@ -81,6 +81,10 @@ class InferenceConfig:
             - `pjrt` - PJRT compiled graph backend
             - `webgpu` - WebGPU backend for Wasm builds
              Example: ['pjrt', 'native'].
+        pjrt_plugin_path (str | Unset): Filesystem path to the PJRT C API plugin used for compiled generation.
+            This is the preferred production configuration. `PJRT_PLUGIN_PATH` is
+            accepted as a process-level fallback when this field is unset.
+             Example: /usr/local/lib/libtpu.so.
         max_concurrent_requests (int | Unset): Maximum weighted inference work admitted concurrently by the Zig runtime.
             Requests beyond the limit receive 503 Service Unavailable with Retry-After;
             they are not held in an in-process wait queue. Set to 0 for unlimited.
@@ -110,6 +114,7 @@ class InferenceConfig:
     pool_size: int | Unset = 1
     prompt_cache: InferencePromptCacheConfig | Unset = UNSET
     backend_priority: list[InferenceBackendPriorityEntry] | Unset = UNSET
+    pjrt_plugin_path: str | Unset = UNSET
     max_concurrent_requests: int | Unset = 32
     preload: list[InferenceModelRef] | Unset = UNSET
     allow_downloads: bool | Unset = True
@@ -149,6 +154,8 @@ class InferenceConfig:
             for backend_priority_item_data in self.backend_priority:
                 backend_priority_item = backend_priority_item_data.value
                 backend_priority.append(backend_priority_item)
+
+        pjrt_plugin_path = self.pjrt_plugin_path
 
         max_concurrent_requests = self.max_concurrent_requests
 
@@ -190,6 +197,8 @@ class InferenceConfig:
             field_dict["prompt_cache"] = prompt_cache
         if backend_priority is not UNSET:
             field_dict["backend_priority"] = backend_priority
+        if pjrt_plugin_path is not UNSET:
+            field_dict["pjrt_plugin_path"] = pjrt_plugin_path
         if max_concurrent_requests is not UNSET:
             field_dict["max_concurrent_requests"] = max_concurrent_requests
         if preload is not UNSET:
@@ -254,6 +263,8 @@ class InferenceConfig:
 
                 backend_priority.append(backend_priority_item)
 
+        pjrt_plugin_path = d.pop("pjrt_plugin_path", UNSET)
+
         max_concurrent_requests = d.pop("max_concurrent_requests", UNSET)
 
         _preload = d.pop("preload", UNSET)
@@ -286,6 +297,7 @@ class InferenceConfig:
             pool_size=pool_size,
             prompt_cache=prompt_cache,
             backend_priority=backend_priority,
+            pjrt_plugin_path=pjrt_plugin_path,
             max_concurrent_requests=max_concurrent_requests,
             preload=preload,
             allow_downloads=allow_downloads,

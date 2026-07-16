@@ -184,11 +184,15 @@ pub const Config = struct {
             kind: []u8,
             name: []u8,
             backend: ?[]u8 = null,
+            format: ?[]u8 = null,
+            quantization: ?[]u8 = null,
 
             fn deinit(self: *WarmModelConfig, alloc: std.mem.Allocator) void {
                 alloc.free(self.kind);
                 alloc.free(self.name);
                 if (self.backend) |value| alloc.free(value);
+                if (self.format) |value| alloc.free(value);
+                if (self.quantization) |value| alloc.free(value);
                 self.* = undefined;
             }
         };
@@ -201,6 +205,7 @@ pub const Config = struct {
         s3_credentials: ?S3CredentialsConfig = null,
         preload: []WarmModelConfig = &.{},
         backend_priority: ?[]const []u8 = null,
+        pjrt_plugin_path: ?[]u8 = null,
         prompt_cache: PromptCacheConfig = .{},
         query_embedding_cache: QueryEmbeddingCacheConfig = .{},
         keep_alive_ms: u64 = 300_000,
@@ -219,6 +224,7 @@ pub const Config = struct {
             for (self.preload) |*model| model.deinit(alloc);
             if (self.preload.len > 0) alloc.free(self.preload);
             if (self.backend_priority) |values| freeOwnedStringSlice(alloc, values);
+            if (self.pjrt_plugin_path) |value| alloc.free(value);
             self.* = undefined;
         }
     };
@@ -654,6 +660,7 @@ pub const Config = struct {
                 .s3_credentials = try parseRawInferenceS3Credentials(alloc, raw_root, inference.s3_credentials),
                 .preload = try parseInferencePreloadModels(alloc, raw_root.get("inference")),
                 .backend_priority = if (inference.backend_priority) |values| try dupOwnedStringSlice(alloc, values) else null,
+                .pjrt_plugin_path = if (inference.pjrt_plugin_path) |value| try alloc.dupe(u8, value) else null,
                 .prompt_cache = prompt_cache,
                 .query_embedding_cache = query_embedding_cache,
                 .keep_alive_ms = inference_keep_alive_ms,
@@ -1989,11 +1996,12 @@ fn parseInferencePreloadModels(
             .object => |entry| entry,
             else => return error.InvalidConfig,
         };
-        if (model_object.contains("format") or model_object.contains("quantization")) return error.InvalidConfig;
         out[i] = .{
             .kind = try requiredStringFieldDup(alloc, model_object, "kind"),
             .name = try requiredStringFieldDup(alloc, model_object, "name"),
             .backend = try optionalStringFieldDup(alloc, model_object, "backend"),
+            .format = try optionalStringFieldDup(alloc, model_object, "format"),
+            .quantization = try optionalStringFieldDup(alloc, model_object, "quantization"),
         };
         filled = i + 1;
     }
@@ -2229,6 +2237,7 @@ test "common config extracts antfly settings" {
         \\    "max_loaded_models": 3,
         \\    "max_concurrent_requests": 4,
         \\    "pool_size": 2,
+        \\    "pjrt_plugin_path": "/usr/local/lib/libtpu.so",
         \\    "prompt_cache": {
         \\      "enabled": true,
         \\      "mode": "simple",
@@ -2271,6 +2280,7 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqual(@as(usize, 3), cfg.inference.max_loaded_models);
     try std.testing.expectEqual(@as(usize, 4), cfg.inference.max_concurrent_requests);
     try std.testing.expectEqual(@as(usize, 2), cfg.inference.pool_size);
+    try std.testing.expectEqualStrings("/usr/local/lib/libtpu.so", cfg.inference.pjrt_plugin_path.?);
     try std.testing.expect(cfg.inference.prompt_cache.enabled);
     try std.testing.expectEqual(Config.InferenceConfig.PromptCacheMode.simple, cfg.inference.prompt_cache.mode);
     try std.testing.expectEqual(@as(usize, 256), cfg.inference.prompt_cache.max_bytes_mb);
@@ -2325,16 +2335,14 @@ test "common config parses inference preload" {
     try std.testing.expectEqualStrings("native", cfg.inference.preload[1].backend.?);
 }
 
-test "common config rejects unsupported preload artifact selectors" {
-    inline for (.{ "format", "quantization" }) |field| {
-        const raw = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "{{\"inference\":{{\"preload\":[{{\"kind\":\"generator\",\"name\":\"model\",\"{s}\":\"value\"}}]}}}}",
-            .{field},
-        );
-        defer std.testing.allocator.free(raw);
-        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, raw));
-    }
+test "common config preserves preload artifact selectors" {
+    const raw =
+        \\{"inference":{"preload":[{"kind":"generator","name":"model","format":"gguf","quantization":"q4_k"}]}}
+    ;
+    var cfg = try Config.parseFromSlice(std.testing.allocator, raw);
+    defer cfg.deinit();
+    try std.testing.expectEqualStrings("gguf", cfg.inference.preload[0].format.?);
+    try std.testing.expectEqualStrings("q4_k", cfg.inference.preload[0].quantization.?);
 }
 
 test "common config rejects removed inference compatibility fields" {

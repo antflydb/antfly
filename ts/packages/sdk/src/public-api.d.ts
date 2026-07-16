@@ -11426,7 +11426,7 @@ export interface components {
         };
         InferenceGenerateRequest: {
             /**
-             * @description Name of the generator model from models_dir/generators/
+             * @description Name of the generator model from models_dir/generators/. Use `<owner>/<repo>:<format>:<quantization>` to select a preloaded artifact variant.
              * @example google/gemma-3-1b-it
              */
             model: string;
@@ -11700,9 +11700,8 @@ export interface components {
         /**
          * @description Optional backend preference for model loading or request execution.
          *     `auto` keeps the node default behavior.
-         *     `pjrt` selects the PJRT backend and may require a PJRT plugin path via
-         *     `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`,
-         *     `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
+         *     `pjrt` selects the PJRT backend and requires `pjrt_plugin_path` unless
+         *     the standard `PJRT_PLUGIN_PATH` environment variable is set.
          *     `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with
          *     `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
          * @enum {string}
@@ -11722,15 +11721,32 @@ export interface components {
          * @enum {string}
          */
         InferenceBackendPriorityEntry: "native" | "onnx" | "metal" | "cuda" | "pjrt" | "webgpu";
+        /**
+         * @description Optional artifact family to select when a model directory contains multiple loadable formats.
+         * @enum {string}
+         */
+        InferenceModelFormat: "gguf" | "onnx" | "safetensors" | "hybrid";
+        /**
+         * @description Optional exact quantization selector within the chosen artifact family. Matching is
+         *     case-insensitive and treats `-` and `_` equivalently (for example, `q4_k` matches
+         *     `Q4_K`). The configured model must contain exactly one matching artifact variant.
+         *     Quantization is not valid with the composite `hybrid` format.
+         * @example q4_k
+         */
+        InferenceModelQuantization: string;
         /** @description Model reference used by startup preload and model-loading configuration. */
         InferenceModelRef: {
             kind: components["schemas"]["InferenceModelKind"];
             /**
-             * @description Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
+             * @description Model name to resolve within the registry for the selected kind, usually in
+             *     `<owner>/<repo>` format. Generation requests can address a preloaded artifact
+             *     explicitly as `<owner>/<repo>:<format>:<quantization>`.
              * @example antflydb/gemma-e2b
              */
             name: string;
             backend?: components["schemas"]["InferenceModelBackend"];
+            format?: components["schemas"]["InferenceModelFormat"];
+            quantization?: components["schemas"]["InferenceModelQuantization"];
         };
         /** @description Native generator prompt KV cache configuration. */
         InferencePromptCacheConfig: {
@@ -11857,6 +11873,13 @@ export interface components {
              *     ]
              */
             backend_priority?: components["schemas"]["InferenceBackendPriorityEntry"][];
+            /**
+             * @description Filesystem path to the PJRT C API plugin used for compiled generation.
+             *     This is the preferred production configuration. `PJRT_PLUGIN_PATH` is
+             *     accepted as a process-level fallback when this field is unset.
+             * @example /usr/local/lib/libtpu.so
+             */
+            pjrt_plugin_path?: string;
             /**
              * @description Maximum weighted inference work admitted concurrently by the Zig runtime.
              *     Requests beyond the limit receive 503 Service Unavailable with Retry-After;

@@ -1138,6 +1138,7 @@ pub const ModelManager = struct {
     session_manager: backends.SessionManager,
     loaded: std.StringHashMapUnmanaged(*LoadedModel),
     loaded_aliases: std.StringHashMapUnmanaged(*LoadedModel),
+    backend_policies: std.StringHashMapUnmanaged(backends.BackendType),
     max_loaded_models: usize = 0,
     keep_alive_ms: u64 = 0,
     active_requests: std.AutoHashMapUnmanaged(u64, ActiveRequest) = .empty,
@@ -1164,6 +1165,7 @@ pub const ModelManager = struct {
             .session_manager = session_manager,
             .loaded = std.StringHashMapUnmanaged(*LoadedModel){},
             .loaded_aliases = std.StringHashMapUnmanaged(*LoadedModel){},
+            .backend_policies = std.StringHashMapUnmanaged(backends.BackendType){},
         };
     }
 
@@ -1181,6 +1183,9 @@ pub const ModelManager = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.loaded_aliases.deinit(self.allocator);
+        var policy_it = self.backend_policies.iterator();
+        while (policy_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.backend_policies.deinit(self.allocator);
         std.debug.assert(self.active_requests.count() == 0);
         std.debug.assert(self.pending_transient_loads == 0);
         std.debug.assert(self.active_transient_models == 0);
@@ -1378,6 +1383,52 @@ pub const ModelManager = struct {
         self.lockState();
         defer self.unlockState();
         return self.loaded.count();
+    }
+
+    /// Persist the configured backend for a model independently of residency.
+    /// This makes startup preload policy survive eviction and avoids publishing
+    /// an alias that could silently select a different backend after reload.
+    pub fn setBackendPolicy(self: *ModelManager, model_dir: []const u8, backend: backends.BackendType) !void {
+        const owned_key = try self.allocator.dupe(u8, model_dir);
+        errdefer self.allocator.free(owned_key);
+
+        self.lockState();
+        defer self.unlockState();
+        if (self.backend_policies.getPtr(model_dir)) |existing| {
+            existing.* = backend;
+            self.allocator.free(owned_key);
+        } else {
+            try self.backend_policies.put(self.allocator, owned_key, backend);
+        }
+        if (self.loaded_aliases.fetchRemove(model_dir)) |alias| self.allocator.free(alias.key);
+    }
+
+    pub fn backendPolicy(self: *ModelManager, model_dir: []const u8) ?backends.BackendType {
+        self.lockState();
+        defer self.unlockState();
+        return self.backend_policies.get(model_dir);
+    }
+
+    pub fn setArtifactBackendPolicy(
+        self: *ModelManager,
+        model_dir: []const u8,
+        selection: manifest_mod.ArtifactSelection,
+        backend: backends.BackendType,
+    ) !void {
+        const identity = try artifactSelectionCacheIdentity(self.allocator, model_dir, selection);
+        defer self.allocator.free(identity);
+        try self.setBackendPolicy(identity, backend);
+    }
+
+    pub fn artifactBackendPolicy(
+        self: *ModelManager,
+        model_dir: []const u8,
+        selection: manifest_mod.ArtifactSelection,
+    ) !?backends.BackendType {
+        if (selection.isEmpty()) return self.backendPolicy(model_dir);
+        const identity = try artifactSelectionCacheIdentity(self.allocator, model_dir, selection);
+        defer self.allocator.free(identity);
+        return self.backendPolicy(identity);
     }
 
     pub fn residentModelCount(self: *ModelManager) usize {
@@ -1842,6 +1893,10 @@ pub const ModelManager = struct {
     }
 
     fn loadFromDirTracked(self: *ModelManager, request_id: ?u64, model_dir: []const u8) !*LoadedModel {
+        if (self.backendPolicy(model_dir)) |backend| {
+            var preferred = [_]backends.BackendType{backend};
+            return self.loadFromDirWithPreferredBackendsTracked(request_id, model_dir, &preferred, false, true, .{});
+        }
         if (try self.lookupAndTouch(model_dir, request_id)) |model| return model;
         return self.loadFromDirWithPreferredBackendsTracked(
             request_id,
@@ -1849,6 +1904,7 @@ pub const ModelManager = struct {
             self.session_manager.preferred_backends,
             true,
             self.session_manager.preserve_backend_order,
+            .{},
         );
     }
 
@@ -1864,6 +1920,7 @@ pub const ModelManager = struct {
             preferred_backends,
             cache_default_alias,
             true,
+            .{},
         );
     }
 
@@ -1880,6 +1937,41 @@ pub const ModelManager = struct {
             preferred_backends,
             cache_default_alias,
             true,
+            .{},
+        );
+    }
+
+    pub fn loadArtifactFromDirForRequest(
+        self: *ModelManager,
+        request_id: u64,
+        model_dir: []const u8,
+        selection: manifest_mod.ArtifactSelection,
+        preferred_backends: ?[]const backends.BackendType,
+    ) !*LoadedModel {
+        const identity = try artifactSelectionCacheIdentity(self.allocator, model_dir, selection);
+        defer self.allocator.free(identity);
+        var policy_preference: [1]backends.BackendType = undefined;
+        const effective_preference = preferred_backends orelse if (self.backendPolicy(identity)) |backend| blk: {
+            policy_preference[0] = backend;
+            break :blk policy_preference[0..];
+        } else self.session_manager.preferred_backends;
+        if (selection.isEmpty()) {
+            return self.loadFromDirWithPreferredBackendsTracked(
+                request_id,
+                model_dir,
+                effective_preference,
+                false,
+                true,
+                .{},
+            );
+        }
+        return self.loadFromDirWithPreferredBackendsTracked(
+            request_id,
+            model_dir,
+            effective_preference,
+            false,
+            true,
+            selection,
         );
     }
 
@@ -1890,13 +1982,16 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
         preserve_backend_order: bool,
+        artifact_selection: manifest_mod.ArtifactSelection,
     ) !*LoadedModel {
-        const pending_key = try self.pendingLoadKey(model_dir, preferred_backends);
+        const model_identity = try artifactSelectionCacheIdentity(self.allocator, model_dir, artifact_selection);
+        defer self.allocator.free(model_identity);
+        const pending_key = try self.pendingLoadKey(model_identity, preferred_backends);
         defer self.allocator.free(pending_key);
 
         while (true) {
-            if (try self.lookupPreferredAndTouch(model_dir, preferred_backends, request_id)) |model| {
-                if (cache_default_alias) try self.ensureDefaultAlias(model_dir, model);
+            if (try self.lookupPreferredAndTouch(model_identity, preferred_backends, request_id)) |model| {
+                if (cache_default_alias) try self.ensureDefaultAlias(model_identity, model);
                 return model;
             }
 
@@ -1921,13 +2016,13 @@ pub const ModelManager = struct {
 
             // Close the cache-miss/flight-claim race while holding the flight
             // map lock. Publication never takes this lock while holding state.
-            const cached = self.lookupPreferredAndTouch(model_dir, preferred_backends, request_id) catch |err| {
+            const cached = self.lookupPreferredAndTouch(model_identity, preferred_backends, request_id) catch |err| {
                 self.pending_model_loads_lock.unlock(coordination_io);
                 return err;
             };
             if (cached) |model| {
                 self.pending_model_loads_lock.unlock(coordination_io);
-                if (cache_default_alias) try self.ensureDefaultAlias(model_dir, model);
+                if (cache_default_alias) try self.ensureDefaultAlias(model_identity, model);
                 return model;
             }
 
@@ -1966,7 +2061,7 @@ pub const ModelManager = struct {
                 preserve_backend_order,
                 &self.session_manager,
             );
-            const loaded = self.loadFromDirUncached(request_id, model_dir, &session_manager, cache_default_alias) catch |err| {
+            const loaded = self.loadFromDirUncached(request_id, model_dir, model_identity, artifact_selection, &session_manager, cache_default_alias) catch |err| {
                 self.releaseLoadSlot();
                 self.finishPendingModelLoad(pending_key, null, err);
                 return err;
@@ -1982,13 +2077,15 @@ pub const ModelManager = struct {
         self: *ModelManager,
         request_id: ?u64,
         model_dir: []const u8,
+        model_identity: []const u8,
+        artifact_selection: manifest_mod.ArtifactSelection,
         sm: *backends.SessionManager,
         cache_default_alias: bool,
     ) !*LoadedModel {
 
         // Load manifest
         var resources_owned_by_model = false;
-        var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
+        var man = try manifest_mod.loadFromDirWithArtifactSelection(self.allocator, model_dir, artifact_selection);
         errdefer if (!resources_owned_by_model) man.deinit();
         if (man.hasIncompleteGlinerBundle()) return error.IncompleteGlinerBundle;
         if (man.hasIncompleteColqwenBundle()) return error.IncompleteColqwenBundle;
@@ -2116,9 +2213,9 @@ pub const ModelManager = struct {
 
         // Publish by actual loaded session backend. Cold I/O stays outside the
         // manager lock; a concurrent duplicate load is discarded here.
-        const variant_key = try backendVariantCacheKey(self.allocator, model_dir, model.session.backend());
+        const variant_key = try backendVariantCacheKey(self.allocator, model_identity, model.session.backend());
         errdefer self.allocator.free(variant_key);
-        const alias_key = if (cache_default_alias) try self.allocator.dupe(u8, model_dir) else null;
+        const alias_key = if (cache_default_alias) try self.allocator.dupe(u8, model_identity) else null;
         errdefer if (alias_key) |key| self.allocator.free(key);
 
         self.lockState();
@@ -2175,7 +2272,7 @@ pub const ModelManager = struct {
         self.loaded.putAssumeCapacity(variant_key, model);
         var alias_inserted = false;
         if (alias_key) |key| {
-            if (self.loaded.get(model_dir) == null and self.loaded_aliases.get(model_dir) == null) {
+            if (self.loaded.get(model_identity) == null and self.loaded_aliases.get(model_identity) == null) {
                 self.loaded_aliases.putAssumeCapacity(key, model);
                 alias_inserted = true;
             }
@@ -2216,6 +2313,29 @@ fn backendVariantCacheKey(
     backend: backends.BackendType,
 ) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}\nbackend={s}", .{ model_dir, @tagName(backend) });
+}
+
+fn artifactSelectionCacheIdentity(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    selection: manifest_mod.ArtifactSelection,
+) ![]u8 {
+    if (selection.isEmpty()) return allocator.dupe(u8, model_dir);
+    const format = try canonicalArtifactSelectorAlloc(allocator, selection.format orelse "auto");
+    defer allocator.free(format);
+    const quantization = try canonicalArtifactSelectorAlloc(allocator, selection.quantization orelse "auto");
+    defer allocator.free(quantization);
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}\nformat={s}\nquantization={s}",
+        .{ model_dir, format, quantization },
+    );
+}
+
+fn canonicalArtifactSelectorAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    const normalized = try allocator.alloc(u8, value.len);
+    for (value, 0..) |char, i| normalized[i] = if (char == '-') '_' else std.ascii.toLower(char);
+    return normalized;
 }
 
 fn preferredModelPathForBackend(
@@ -2299,7 +2419,10 @@ fn loadSessionForPreferredBackends(
         );
         if (backend_session_manager.loadModel(candidate_path)) |session| {
             return session;
-        } else |_| {}
+        } else |err| {
+            if (backends.isRetryableBackendLoadError(backend, err)) continue;
+            return err;
+        }
     }
 
     std.log.err("loadModel({s}) failed: no backend accepted model", .{model_dir});
@@ -2543,6 +2666,39 @@ test "model manager cold-load flight key is shared across backend preferences" {
     defer std.testing.allocator.free(explicit);
 
     try std.testing.expectEqualStrings(automatic, explicit);
+}
+
+test "model manager backend policy survives independently of residency" {
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+
+    try manager.setBackendPolicy("/models/embedder", .cuda);
+    try std.testing.expectEqual(backends.BackendType.cuda, manager.backendPolicy("/models/embedder").?);
+    try manager.setBackendPolicy("/models/embedder", .onnx);
+    try std.testing.expectEqual(backends.BackendType.onnx, manager.backendPolicy("/models/embedder").?);
+    try std.testing.expectEqual(@as(usize, 0), manager.loadedModelCount());
+}
+
+test "artifact selectors produce independent resident cache identities" {
+    const allocator = std.testing.allocator;
+    const q4 = try artifactSelectionCacheIdentity(allocator, "/models/example", .{ .format = "gguf", .quantization = "q4_k" });
+    defer allocator.free(q4);
+    const q8 = try artifactSelectionCacheIdentity(allocator, "/models/example", .{ .format = "gguf", .quantization = "q8_0" });
+    defer allocator.free(q8);
+    const automatic = try artifactSelectionCacheIdentity(allocator, "/models/example", .{});
+    defer allocator.free(automatic);
+    const q4_alias = try artifactSelectionCacheIdentity(allocator, "/models/example", .{ .format = "GGUF", .quantization = "Q4-K" });
+    defer allocator.free(q4_alias);
+    try std.testing.expect(!std.mem.eql(u8, q4, q8));
+    try std.testing.expect(!std.mem.eql(u8, q4, automatic));
+    try std.testing.expectEqualStrings(q4, q4_alias);
+    try std.testing.expectEqualStrings("/models/example", automatic);
+
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer manager.deinit();
+    try manager.setArtifactBackendPolicy("/models/example", .{ .format = "GGUF", .quantization = "Q4-K" }, .cuda);
+    try std.testing.expectEqual(backends.BackendType.cuda, manager.backendPolicy(q4).?);
+    try std.testing.expect(manager.backendPolicy("/models/example") == null);
 }
 
 test "model manager refreshes alias capacity when publishing a cold load" {

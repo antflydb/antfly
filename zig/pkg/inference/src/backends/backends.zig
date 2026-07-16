@@ -81,6 +81,55 @@ pub const BackendType = enum {
     }
 };
 
+/// Only infrastructure failures and explicit backend/model incompatibility
+/// permit priority fallback. Unknown errors are terminal by default so corrupt
+/// artifacts cannot be hidden by a lower-priority implementation.
+pub fn isRetryableBackendLoadError(backend: BackendType, err: anyerror) bool {
+    switch (err) {
+        error.BackendUnavailable,
+        error.ConfiguredBackendUnavailable,
+        error.NoBackendAvailable,
+        error.UnsupportedArchitecture,
+        error.UnsupportedCudaArchitecture,
+        error.UnsupportedOnnxGraphBackend,
+        error.UnsupportedCompiledGraphRuntime,
+        error.UnsupportedResidentInputBackend,
+        error.UnsupportedDType,
+        error.UnsupportedTensorDType,
+        error.UnsupportedShape,
+        error.OnnxNotSupportedHere,
+        error.WasmNotSupportedHere,
+        => return true,
+        else => {},
+    }
+    return switch (backend) {
+        .onnx => switch (err) {
+            error.OrtEnvCreationFailed,
+            error.OrtSessionOptionsFailed,
+            error.OnnxSessionInitializationFailed,
+            => true,
+            else => false,
+        },
+        .metal => switch (err) {
+            error.MetalNotEnabled,
+            error.MetalDeviceUnavailable,
+            => true,
+            else => false,
+        },
+        .cuda => switch (err) {
+            error.CudaNotEnabled,
+            error.CudaDriverError,
+            error.CudaSymbolMissing,
+            error.NoCudaDevices,
+            => true,
+            else => false,
+        },
+        .webgpu => err == error.WebGpuUnavailable,
+        .native => err == error.NativeNotEnabled,
+        .pjrt => false,
+    };
+}
+
 const backend_order_capacity = std.meta.fields(BackendType).len;
 
 /// SessionManager selects the best available backend and creates sessions.
@@ -171,52 +220,61 @@ pub const SessionManager = struct {
                     if (!isOnnxFilePath(effective_model_path)) continue;
                     break :blk onnx.createSession(self.allocator, effective_model_path) catch |err| {
                         std.log.err("onnx runtime session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
-                        continue;
+                        if (isRetryableBackendLoadError(backend, err)) continue;
+                        return err;
                     };
                 } else continue,
                 .metal => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .metal, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx metal session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
-                        continue;
+                        if (isRetryableBackendLoadError(backend, err)) continue;
+                        return err;
                     }
                 else if (build_options.enable_metal)
                     session_factory.createMetalSession(self.allocator, model_path) catch |err| {
                         std.log.err("Metal session create failed for {s}: {s}", .{ model_path, @errorName(err) });
-                        continue;
+                        if (isRetryableBackendLoadError(backend, err)) continue;
+                        return err;
                     }
                 else
                     continue,
                 .cuda => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .cuda, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx CUDA session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
-                        continue;
+                        if (isRetryableBackendLoadError(backend, err)) continue;
+                        return err;
                     }
                 else if (build_options.enable_cuda)
                     session_factory.createCudaSession(self.allocator, model_path) catch |err| {
                         std.log.err("CUDA session create failed for {s}: {s}", .{ model_path, @errorName(err) });
-                        continue;
+                        if (isRetryableBackendLoadError(backend, err)) continue;
+                        return err;
                     }
                 else
                     continue,
                 .native => if (build_options.enable_wasm and self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx) catch |err| {
                         std.log.err("imported ONNX native Wasm session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
-                        continue;
+                        if (isRetryableBackendLoadError(backend, err)) continue;
+                        return err;
                     }
                 else if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx native session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
-                        continue;
+                        if (isRetryableBackendLoadError(backend, err)) continue;
+                        return err;
                     }
                 else
                     session_factory.createNativeSession(self.allocator, model_path) catch |err| {
                         std.log.err("native session create failed for {s}: {s}", .{ model_path, @errorName(err) });
-                        continue;
+                        if (isRetryableBackendLoadError(backend, err)) continue;
+                        return err;
                     },
                 .webgpu => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .webgpu, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx wasm session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
-                        continue;
+                        if (isRetryableBackendLoadError(backend, err)) continue;
+                        return err;
                     }
                 else
                     continue,
@@ -340,6 +398,14 @@ test "configured backend priority validates available fallbacks" {
         try std.testing.expectError(error.ConfiguredBackendUnavailable, validateBackendPriority(&.{.cuda}));
     try std.testing.expectError(error.ConfiguredBackendUnavailable, validateBackendPriority(&.{.pjrt}));
     if (build_options.enable_native) try validateBackendPriority(&.{ .pjrt, .native });
+}
+
+test "backend load fallback never masks corrupt artifacts" {
+    try std.testing.expect(!isRetryableBackendLoadError(.onnx, error.InvalidOnnxModel));
+    try std.testing.expect(!isRetryableBackendLoadError(.native, error.MissingRequiredWeights));
+    try std.testing.expect(isRetryableBackendLoadError(.onnx, error.OnnxSessionInitializationFailed));
+    try std.testing.expect(isRetryableBackendLoadError(.cuda, error.NoCudaDevices));
+    try std.testing.expect(isRetryableBackendLoadError(.metal, error.UnsupportedArchitecture));
 }
 
 test "session manager normalizes provider pool size" {

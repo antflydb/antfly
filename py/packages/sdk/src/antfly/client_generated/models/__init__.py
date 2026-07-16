@@ -350,6 +350,7 @@ from .inference_level import InferenceLevel
 from .inference_media_content_part import InferenceMediaContentPart
 from .inference_media_content_part_type import InferenceMediaContentPartType
 from .inference_model_backend import InferenceModelBackend
+from .inference_model_format import InferenceModelFormat
 from .inference_model_info import InferenceModelInfo
 from .inference_model_kind import InferenceModelKind
 from .inference_model_ref import InferenceModelRef
@@ -1012,6 +1013,7 @@ __all__ = (
     "InferenceMediaContentPart",
     "InferenceMediaContentPartType",
     "InferenceModelBackend",
+    "InferenceModelFormat",
     "InferenceModelInfo",
     "InferenceModelKind",
     "InferenceModelRef",

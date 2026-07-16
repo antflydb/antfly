@@ -97,16 +97,27 @@ pub fn forcesGraphMode(choice: Choice) bool {
     return compiledPartitionBackend(choice) != null;
 }
 
-pub fn pjrtPluginPathFromEnv(allocator: std.mem.Allocator) !?[:0]u8 {
+pub fn resolvePjrtPluginPath(allocator: std.mem.Allocator, configured: ?[]const u8) !?[:0]u8 {
     if (!build_options.enable_pjrt) return null;
-    const raw = platform.env.getenv("ANTFLY_INFERENCE_XLA_PLUGIN") orelse
-        platform.env.getenv("ANTFLY_INFERENCE_PJRT_PLUGIN") orelse
-        platform.env.getenv("TERMITE_XLA_PLUGIN") orelse
-        platform.env.getenv("TERMITE_PJRT_PLUGIN") orelse
-        platform.env.getenv("PJRT_PLUGIN_PATH") orelse
-        platform.env.getenv("PJRT_PLUGIN") orelse
-        return null;
+    const raw = configured orelse platform.env.getenv("PJRT_PLUGIN_PATH") orelse return null;
+    if (raw.len == 0) return error.InvalidPjrtPluginPath;
     return try allocator.dupeZ(u8, raw);
+}
+
+pub fn pjrtPluginPathFromEnv(allocator: std.mem.Allocator) !?[:0]u8 {
+    return resolvePjrtPluginPath(allocator, null);
+}
+
+test "configured PJRT plugin path takes precedence over environment lookup" {
+    if (!build_options.enable_pjrt) {
+        try std.testing.expectEqual(@as(?[:0]u8, null), try resolvePjrtPluginPath(std.testing.allocator, "/configured/libpjrt.so"));
+        return;
+    }
+
+    const path = (try resolvePjrtPluginPath(std.testing.allocator, "/configured/libpjrt.so")).?;
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("/configured/libpjrt.so", path);
+    try std.testing.expectError(error.InvalidPjrtPluginPath, resolvePjrtPluginPath(std.testing.allocator, ""));
 }
 
 test "parse accepts explicit compiled backends" {

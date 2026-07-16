@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -160,6 +161,49 @@ var _ = Describe("InferencePool Controller", func() {
 
 			// Cleanup
 			Expect(k8sClient.Delete(ctx, pool)).Should(Succeed())
+		})
+	})
+
+	Context("When selecting accelerator backends", func() {
+		It("derives CUDA from NVIDIA resources without adding TPU resources", func() {
+			pool := &antflyaiv1alpha1.InferencePool{
+				Spec: antflyaiv1alpha1.InferencePoolSpec{
+					Models: antflyaiv1alpha1.ModelConfig{LoadingStrategy: antflyaiv1alpha1.LoadingStrategyLazy},
+					Resources: &corev1.ResourceRequirements{
+						Limits: corev1.ResourceList{
+							corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("1"),
+						},
+					},
+				},
+			}
+			reconciler := &InferencePoolReconciler{}
+			configJSON, err := reconciler.generateCompleteConfig(pool)
+			Expect(err).NotTo(HaveOccurred())
+			var config map[string]any
+			Expect(json.Unmarshal([]byte(configJSON), &config)).To(Succeed())
+			inferenceConfig := config["inference"].(map[string]any)
+			Expect(inferenceConfig["backend_priority"]).To(HaveExactElements("cuda"))
+
+			resources := reconciler.buildResources(pool)
+			Expect(resources.Limits).NotTo(HaveKey(corev1.ResourceName("google.com/tpu")))
+			Expect(resources.Requests).NotTo(HaveKey(corev1.ResourceName("google.com/tpu")))
+			Expect(isTPUInferencePool(pool)).To(BeFalse())
+		})
+
+		It("does not treat an unknown accelerator label as a TPU or CUDA declaration", func() {
+			pool := &antflyaiv1alpha1.InferencePool{
+				Spec: antflyaiv1alpha1.InferencePoolSpec{
+					Models:   antflyaiv1alpha1.ModelConfig{LoadingStrategy: antflyaiv1alpha1.LoadingStrategyLazy},
+					Hardware: antflyaiv1alpha1.HardwareConfig{Accelerator: "custom-accelerator"},
+				},
+			}
+			reconciler := &InferencePoolReconciler{}
+			configJSON, err := reconciler.generateCompleteConfig(pool)
+			Expect(err).NotTo(HaveOccurred())
+			var config map[string]any
+			Expect(json.Unmarshal([]byte(configJSON), &config)).To(Succeed())
+			Expect(config["inference"].(map[string]any)).NotTo(HaveKey("backend_priority"))
+			Expect(reconciler.buildResources(pool).Limits).NotTo(HaveKey(corev1.ResourceName("google.com/tpu")))
 		})
 	})
 

@@ -1296,6 +1296,7 @@ pub fn runFromIterator(
         .generation_budget_overrides = resolveInferenceBudgetOverrides(cli),
         .preload = resolved_warm_models.items,
         .backend_priority = resolved_backend_priority.items,
+        .pjrt_plugin_path = if (loaded_config) |*cfg| cfg.inference.pjrt_plugin_path else null,
     };
     if (loaded_config) |*cfg| {
         if (cfg.effectiveAntflyContentSecurity()) |security| antfly_node_cfg.content_security = security.*;
@@ -3568,6 +3569,8 @@ fn resolveInferenceWarmModels(
             .kind = parsePreloadModelKind(model.kind) orelse return error.InvalidConfig,
             .name = model.name,
             .backend = antfly.inference_runtime.parseOptionalBackendType(model.backend) catch return error.InvalidConfig,
+            .format = model.format,
+            .quantization = model.quantization,
         };
     }
     return .{ .items = out, .owned = true };

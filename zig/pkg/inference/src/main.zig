@@ -60,6 +60,7 @@ const RunConfig = struct {
     content_security: ?inference.scraping.ContentSecurityConfig = null,
     s3_credentials: ?inference.scraping.S3CredentialsConfig = null,
     preload: []const WarmModelConfig = &.{},
+    pjrt_plugin_path: ?[]const u8 = null,
     keep_alive_ms: ?u64 = null,
     max_loaded_models: ?usize = null,
     max_concurrent_requests: ?usize = null,
@@ -305,6 +306,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .preload = preload_models.items,
+        .pjrt_plugin_path = if (loaded_cfg) |cfg| cfg.pjrt_plugin_path else null,
     };
     if (loaded_cfg) |cfg| {
         node_cfg.content_security = cfg.content_security;
