@@ -73,6 +73,7 @@ pub const PersistentReplicaProvider = struct {
                     .persist_ready = persistReady,
                     .compact_snapshot = compactSnapshot,
                     .compact_snapshot_artifact = compactSnapshotArtifact,
+                    .retire_group = retireGroup,
                 },
             },
         };
@@ -138,10 +139,19 @@ pub const PersistentReplicaProvider = struct {
         try state.setAppliedIndex(index);
     }
 
+    fn retireGroup(ptr: *anyopaque, group_id: u64) !void {
+        const self: *PersistentReplicaProvider = @ptrCast(@alignCast(ptr));
+        const removed = self.states.fetchRemove(group_id) orelse {
+            return;
+        };
+        removed.value.deinit();
+        self.alloc.destroy(removed.value);
+    }
+
     fn ensureState(self: *PersistentReplicaProvider, record: catalog.ReplicaRecord) !*replica_state.PersistentReplicaState {
         if (self.states.get(record.group_id)) |state| return state;
 
-        var layout = try storage_mod.ReplicaPathLayout.initForReplica(self.alloc, self.root_dir, record.group_id, record.replica_id);
+        var layout = try storage_mod.ReplicaPathLayout.initForLocalNode(self.alloc, self.root_dir, record.group_id, record.local_node_id);
         defer layout.deinit(self.alloc);
 
         const state = try self.alloc.create(replica_state.PersistentReplicaState);
@@ -229,6 +239,23 @@ test "persistent replica provider wires host through persisted local state" {
 
         const state = provider.stateForGroup(401) orelse return error.MissingState;
         try std.testing.expect((try state.storage().lastIndex()) >= 1);
+
+        _ = try local_host.ensureReplica(.{
+            .group_id = 401,
+            .replica_id = 2,
+            .local_node_id = 1,
+            .bootstrap_mode = .persisted,
+        });
+        try local_host.removeReplica(401);
+        try std.testing.expect(provider.stateForGroup(401) == null);
+        _ = try local_host.ensureReplica(.{
+            .group_id = 401,
+            .replica_id = 2,
+            .local_node_id = 1,
+            .bootstrap_mode = .persisted,
+        });
+        const replacement = provider.stateForGroup(401) orelse return error.MissingState;
+        try std.testing.expect((try replacement.storage().lastIndex()) >= 1);
     }
 
     {

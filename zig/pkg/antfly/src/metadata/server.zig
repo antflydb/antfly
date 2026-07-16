@@ -342,6 +342,14 @@ pub const MetadataServer = struct {
         try self.svc.runRound();
     }
 
+    pub fn runRaftRoundOnly(self: *MetadataServer) !void {
+        try self.svc.runRaftRoundOnly();
+    }
+
+    pub fn runControlRoundOnly(self: *MetadataServer) !void {
+        try self.svc.runControlRoundOnly();
+    }
+
     pub fn runCdcRound(self: *MetadataServer) !void {
         try self.svc.runCdcRound();
     }

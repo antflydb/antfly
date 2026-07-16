@@ -33,6 +33,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const shard_state_store = @import("../data/storage/shard_state_store.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
+const range_state_mod = @import("../storage/db/range_state.zig");
 const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
 const backend_types = @import("../storage/backend_types.zig");
@@ -10512,6 +10513,15 @@ pub const ProvisionedTableWriteSource = struct {
         defer {
             self.endGroupOperation(table_name, group_id);
         }
+        // A reader may open after the pre-apply invalidation while this write
+        // is still in flight. Retire that generation after every completed
+        // apply so subsequent reads cannot remain pinned to the pre-commit
+        // view. Active read leases may finish against their snapshot.
+        defer {
+            lockAtomic(&self.local_db_mutex);
+            defer self.local_db_mutex.unlock();
+            self.invalidateReadCache(table_name);
+        }
         errdefer {
             lockAtomic(&self.local_db_mutex);
             defer self.local_db_mutex.unlock();
@@ -10537,29 +10547,11 @@ pub const ProvisionedTableWriteSource = struct {
             try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
             runTestBeforeBatchExecutionHook();
             if (apply_req.split_checkpoint) |checkpoint| {
-                if (checkpoint.destination_group_id != group_id and checkpoint.source_group_id != group_id) {
-                    return error.InvalidBatchRequest;
-                }
-                if (checkpoint.kind == .destination) {
-                    if (checkpoint.destination_group_id != group_id) return error.InvalidBatchRequest;
-                    _ = try cached.db.replaceSplitBootstrap(
-                        alloc,
-                        .{ .start = checkpoint.range_start, .end = checkpoint.range_end },
-                        apply_req.writes,
-                        checkpoint.delta_sequence,
-                        .{
-                            .transition_id = checkpoint.transition_id,
-                            .attempt_epoch = checkpoint.attempt_epoch,
-                            .source_group_id = checkpoint.source_group_id,
-                            .destination_group_id = checkpoint.destination_group_id,
-                            .bootstrap_complete = true,
-                        },
-                    );
-                } else if (checkpoint.source_group_id != group_id) return error.InvalidBatchRequest;
+                try applySplitCheckpointToDocumentDb(alloc, cached.db, group_id, checkpoint);
             } else if (apply_req.split_replication) |replication| {
                 try validateSplitReplicationMarker(alloc, cached.db, replication);
             }
-            if (apply_req.split_checkpoint == null or apply_req.split_checkpoint.?.kind != .destination) {
+            if (apply_req.split_checkpoint == null) {
                 try cached.db.batchReplicatedApply(apply_req);
             }
             cache.publishCachedLeaseGeneration(&cached, target_generation);
@@ -10587,29 +10579,11 @@ pub const ProvisionedTableWriteSource = struct {
             try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
             runTestBeforeBatchExecutionHook();
             if (apply_req.split_checkpoint) |checkpoint| {
-                if (checkpoint.destination_group_id != group_id and checkpoint.source_group_id != group_id) {
-                    return error.InvalidBatchRequest;
-                }
-                if (checkpoint.kind == .destination) {
-                    if (checkpoint.destination_group_id != group_id) return error.InvalidBatchRequest;
-                    _ = try db.replaceSplitBootstrap(
-                        alloc,
-                        .{ .start = checkpoint.range_start, .end = checkpoint.range_end },
-                        apply_req.writes,
-                        checkpoint.delta_sequence,
-                        .{
-                            .transition_id = checkpoint.transition_id,
-                            .attempt_epoch = checkpoint.attempt_epoch,
-                            .source_group_id = checkpoint.source_group_id,
-                            .destination_group_id = checkpoint.destination_group_id,
-                            .bootstrap_complete = true,
-                        },
-                    );
-                } else if (checkpoint.source_group_id != group_id) return error.InvalidBatchRequest;
+                try applySplitCheckpointToDocumentDb(alloc, &db, group_id, checkpoint);
             } else if (apply_req.split_replication) |replication| {
                 try validateSplitReplicationMarker(alloc, &db, replication);
             }
-            if (apply_req.split_checkpoint == null or apply_req.split_checkpoint.?.kind != .destination) {
+            if (apply_req.split_checkpoint == null) {
                 try db.batchReplicatedApply(apply_req);
             }
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
@@ -17388,7 +17362,7 @@ fn validateProvisionedDbIdentityNamespaceExpected(expected: ?doc_identity.Namesp
 fn validateSplitReplicationForApply(req: db_mod.types.BatchRequest, group_id: u64) !?doc_identity.Namespace {
     const replication = req.split_replication orelse {
         if (req.split_checkpoint) |checkpoint| {
-            if (checkpoint.kind == .destination) return error.MissingSplitReplicationContext;
+            if (checkpoint.kind != .source_ack) return error.MissingSplitReplicationContext;
         }
         return null;
     };
@@ -17403,7 +17377,7 @@ fn validateSplitReplicationForApply(req: db_mod.types.BatchRequest, group_id: u6
         return error.InvalidBatchRequest;
     }
     if (req.split_checkpoint) |checkpoint| {
-        if (checkpoint.kind != .destination or
+        if (checkpoint.kind == .source_ack or
             checkpoint.transition_id != replication.transition_id or
             checkpoint.attempt_epoch != replication.attempt_epoch or
             checkpoint.source_group_id != replication.source_group_id or
@@ -17413,12 +17387,59 @@ fn validateSplitReplicationForApply(req: db_mod.types.BatchRequest, group_id: u6
         }
         if (req.deletes.len != 0 or req.transforms.len != 0 or
             req.graph_writes.len != 0 or req.graph_deletes.len != 0 or
-            req.predicates.len != 0)
+            req.predicates.len != 0 or req.writes.len != 0)
         {
             return error.InvalidBatchRequest;
         }
+        switch (checkpoint.kind) {
+            .destination_begin => if (replication.bootstrap_sequence == null or
+                replication.bootstrap_sequence.? != checkpoint.delta_sequence)
+            {
+                return error.InvalidBatchRequest;
+            },
+            .destination_complete => if (replication.bootstrap_sequence) |sequence| {
+                if (sequence != checkpoint.delta_sequence) return error.InvalidBatchRequest;
+            },
+            .source_ack => unreachable,
+        }
     }
     return replication.identity_namespace;
+}
+
+fn applySplitCheckpointToDocumentDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    group_id: u64,
+    checkpoint: db_mod.types.SplitReplicationCheckpoint,
+) !void {
+    if (checkpoint.destination_group_id != group_id) return error.InvalidBatchRequest;
+    const marker = range_state_mod.SplitBootstrapMarker{
+        .transition_id = checkpoint.transition_id,
+        .attempt_epoch = checkpoint.attempt_epoch,
+        .source_group_id = checkpoint.source_group_id,
+        .destination_group_id = checkpoint.destination_group_id,
+        .bootstrap_complete = checkpoint.kind == .destination_complete,
+    };
+    const byte_range = db_mod.types.ByteRange{
+        .start = checkpoint.range_start,
+        .end = checkpoint.range_end,
+    };
+    switch (checkpoint.kind) {
+        .destination_begin => _ = try db.replaceSplitBootstrap(
+            alloc,
+            byte_range,
+            &.{},
+            checkpoint.delta_sequence,
+            marker,
+        ),
+        .destination_complete => _ = try db.completeSplitBootstrap(
+            alloc,
+            byte_range,
+            checkpoint.delta_sequence,
+            marker,
+        ),
+        .source_ack => return error.InvalidBatchRequest,
+    }
 }
 
 fn validateSplitReplicationMarker(
@@ -17430,10 +17451,17 @@ fn validateSplitReplicationMarker(
     if (marker.transition_id != replication.transition_id or
         marker.attempt_epoch != replication.attempt_epoch or
         marker.source_group_id != replication.source_group_id or
-        marker.destination_group_id != replication.destination_group_id or
-        !marker.bootstrap_complete)
+        marker.destination_group_id != replication.destination_group_id)
     {
         return error.ConflictingSplitTransition;
+    }
+    if (replication.bootstrap_sequence) |expected_sequence| {
+        if (marker.bootstrap_complete) return error.SplitBootstrapComplete;
+        if (try db.getSplitDeltaFinalSeq(alloc) != expected_sequence) {
+            return error.StaleSplitBootstrap;
+        }
+    } else if (!marker.bootstrap_complete) {
+        return error.SplitBootstrapRequired;
     }
 }
 
@@ -18045,14 +18073,30 @@ test "replicated split destination seeds inherited doc identity before range pub
     defer source.deinit();
     source.write_cache = &write_cache;
 
+    const replication = db_mod.types.SplitReplicationContext{
+        .transition_id = 7002,
+        .attempt_epoch = 1,
+        .source_group_id = 7001,
+        .destination_group_id = 7002,
+        .identity_namespace = namespace,
+        .bootstrap_sequence = 0,
+    };
     _ = try source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", .{
-        .writes = &.{.{ .key = "doc:m", .value = "{\"title\":\"m\"}" }},
-        .split_replication = .{
+        .split_replication = replication,
+        .split_checkpoint = .{
+            .kind = .destination_begin,
             .transition_id = 7002,
+            .attempt_epoch = 1,
             .source_group_id = 7001,
             .destination_group_id = 7002,
-            .identity_namespace = namespace,
+            .range_start = "doc:m",
+            .range_end = "doc:z",
+            .delta_sequence = 0,
         },
+    });
+    _ = try source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", .{
+        .writes = &.{.{ .key = "doc:m", .value = "{\"title\":\"m\"}" }},
+        .split_replication = replication,
     });
 
     {
@@ -18072,22 +18116,20 @@ test "replicated split destination seeds inherited doc identity before range pub
     try std.testing.expectError(error.ConflictingSplitTransition, source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", .{
         .split_replication = .{
             .transition_id = 7003,
+            .attempt_epoch = 1,
             .source_group_id = 7001,
             .destination_group_id = 7002,
             .identity_namespace = namespace,
+            .bootstrap_sequence = 0,
         },
     }));
 
     _ = try source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", .{
-        .split_replication = .{
-            .transition_id = 7002,
-            .source_group_id = 7001,
-            .destination_group_id = 7002,
-            .identity_namespace = namespace,
-        },
+        .split_replication = replication,
         .split_checkpoint = .{
-            .kind = .destination,
+            .kind = .destination_complete,
             .transition_id = 7002,
+            .attempt_epoch = 1,
             .source_group_id = 7001,
             .destination_group_id = 7002,
             .range_start = "doc:m",
@@ -18104,9 +18146,36 @@ test "replicated split destination seeds inherited doc identity before range pub
         try std.testing.expect(completed_marker.bootstrap_complete);
     }
 
+    // A delayed source acknowledgement can race with a controller retry. A
+    // repeated begin for the completed generation must not clear transferred
+    // documents while that acknowledgement authorizes cutover.
+    _ = try source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", .{
+        .split_replication = replication,
+        .split_checkpoint = .{
+            .kind = .destination_begin,
+            .transition_id = 7002,
+            .attempt_epoch = 1,
+            .source_group_id = 7001,
+            .destination_group_id = 7002,
+            .range_start = "doc:m",
+            .range_end = "doc:z",
+            .delta_sequence = 0,
+        },
+    });
+    {
+        var destination = (try source.leaseCachedTransitionGroupWriter(alloc, 7002, "docs", namespace)) orelse
+            return error.TestUnexpectedResult;
+        defer destination.deinit(alloc);
+        var doc = (try destination.db.lookup(alloc, "doc:m", .{})) orelse return error.TestUnexpectedResult;
+        defer doc.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, doc.json, "\"m\"") != null);
+        try std.testing.expect((try destination.db.getSplitBootstrapMarker(alloc)).?.bootstrap_complete);
+    }
+
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", .{
         .split_replication = .{
             .transition_id = 7002,
+            .attempt_epoch = 1,
             .source_group_id = 7001,
             .destination_group_id = 7002,
             .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 7002 },
@@ -29875,7 +29944,7 @@ test "write cache retirement is allocation-free after entry installation" {
     try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
 }
 
-test "provisioned table write source group batch does not hold local db mutex during db batch" {
+test "provisioned group apply releases source mutex and retires readers opened during apply" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -29948,7 +30017,10 @@ test "provisioned table write source group batch does not hold local db mutex du
 
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
+    var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
+    defer read_cache.deinit();
     var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    source.read_cache = &read_cache;
     source.write_cache = &write_cache;
 
     var probe = BatchProbe{};
@@ -29965,14 +30037,18 @@ test "provisioned table write source group batch does not hold local db mutex du
     try std.testing.expect(source.local_db_mutex.tryLock());
     source.local_db_mutex.unlock();
 
+    var pre_commit = try read_cache.getOrOpen(path, Catalog.iface(), 7001, 0, "docs");
+    try std.testing.expect((try pre_commit.db.lookup(alloc, "doc:a", .{})) == null);
+    pre_commit.release();
+
     probe.release.store(true, .release);
     thread.join();
 
     if (worker.err) |err| return err;
 
-    var db = try db_mod.DB.open(alloc, path, .{});
-    defer db.close();
-    var result = (try db.lookup(alloc, "doc:a", .{})).?;
+    var post_commit = try read_cache.getOrOpen(path, Catalog.iface(), 7001, 0, "docs");
+    defer post_commit.release();
+    var result = (try post_commit.db.lookup(alloc, "doc:a", .{})).?;
     defer result.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
 }

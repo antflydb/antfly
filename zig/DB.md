@@ -437,13 +437,36 @@ machine cannot apply `prepare` twice while advancing to `start`.
 A source group created before data-Raft projection has no apply watermark yet.
 Its first split preparation seeds the source snapshot and a synthetic index-zero
 watermark in one DocStore batch under the per-group apply lock. Index zero is
-reserved for this baseline; real Raft indexes remain unchanged. Once any durable
-batch exists, the apply store is authoritative and split retries must never
-rescan the live document DB or replace projected state. A crash before the seed
-batch commits leaves no watermark and may retry safely; a crash after commit
-observes the watermark and reuses the existing state. This prevents repeated
-prepare attempts from opening a second writer or discarding concurrent apply
-history.
+reserved for this baseline; real Raft indexes remain unchanged. A replica
+replacement may instead inherit an authoritative document generation while its
+new local Raft projection contains only a bootstrap batch. In that case a
+non-null watermark does not prove that the projection includes the inherited
+documents.
+
+Split preparation reconciles an inherited generation only at an exact durable
+apply watermark. It first waits until the document state machine has applied
+through that watermark, scans the generation-owned writer, and then compares and
+replaces only the projected range and documents while holding the per-group
+apply lock. Normal-entry history and the watermark remain unchanged. If Raft
+advances during the scan, the compare fails and preparation retries from a new
+snapshot; once split control state exists, reconciliation is forbidden and only
+replicated split deltas may mutate the projection. This keeps steady-state apply
+authoritative while making replica handoff complete without discarding
+concurrent history or opening a competing writer.
+
+Transition observation reads the source phase, terminal fence,
+acknowledgement, and delta sequence atomically under one apply-store shard lock.
+It never seeds or scans the document DB. Observation and reconciliation fail
+fast with a retryable unavailable result while snapshot generation staging is
+active; they do not wait behind generation I/O and consume the HTTP worker pool.
+Managed data-Raft status collection follows the same ownership boundary: it
+uses writer-published runtime snapshots when available and conservative
+Raft/transition facts on a cold cache. It never opens an independent status DB
+over a Raft-owned root. Transition readiness comes from observations published
+by the transition owner into metadata, then from durable phase/snapshot facts;
+status paths never instantiate split or merge coordinators to inspect live
+roots. Non-Raft deployments may retain the bounded status-only open because no
+competing managed writer exists.
 
 Split execution dispatch follows ownership as well. A data-Raft server uses the
 replicated destination route. A server with an injected local transition runtime

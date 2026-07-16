@@ -374,15 +374,18 @@ pub const Reconciler = struct {
                 continue;
             }
 
-            var effective_record = try cloneSplitRecord(self.alloc, desired);
+            // Admission fixes the transition identity. Desired state may add a
+            // rollback request, but it must never rewrite the epoch or routing
+            // coordinates underneath already-applied data-group commands.
+            var effective_record = try cloneSplitRecord(self.alloc, existing.?);
             var effective_record_owned = true;
             errdefer if (effective_record_owned) table_manager.freeSplitTransitionRecord(self.alloc, effective_record);
-            if (existing.?.rollback_reason) |reason| {
-                if (effective_record.rollback_reason == null) {
+            if (effective_record.rollback_reason == null and splitTransitionCanRollback(existing.?)) {
+                if (desired.rollback_reason) |reason| {
                     effective_record.rollback_reason = try self.alloc.dupe(u8, reason);
+                } else if (!splitTransitionDocIdentityCompatible(current, existing.?)) {
+                    effective_record.rollback_reason = try self.alloc.dupe(u8, doc_identity_transition_rollback_reason);
                 }
-            } else if (splitTransitionCanRollback(existing.?) and !splitTransitionDocIdentityCompatible(current, existing.?)) {
-                effective_record.rollback_reason = try self.alloc.dupe(u8, doc_identity_transition_rollback_reason);
             }
 
             if (!splitRecordsEqual(existing.?, effective_record)) {
@@ -410,15 +413,16 @@ pub const Reconciler = struct {
                 continue;
             }
 
-            var effective_record = try cloneMergeRecord(self.alloc, desired);
+            // As with splits, only rollback intent is mutable after admission.
+            var effective_record = try cloneMergeRecord(self.alloc, existing.?);
             var effective_record_owned = true;
             errdefer if (effective_record_owned) table_manager.freeMergeTransitionRecord(self.alloc, effective_record);
-            if (existing.?.rollback_reason) |reason| {
-                if (effective_record.rollback_reason == null) {
+            if (effective_record.rollback_reason == null and mergeTransitionCanRollback(existing.?)) {
+                if (desired.rollback_reason) |reason| {
                     effective_record.rollback_reason = try self.alloc.dupe(u8, reason);
+                } else if (!mergeTransitionDocIdentityCompatible(current, existing.?, .allow_existing_active)) {
+                    effective_record.rollback_reason = try self.alloc.dupe(u8, doc_identity_merge_rollback_reason);
                 }
-            } else if (mergeTransitionCanRollback(existing.?) and !mergeTransitionDocIdentityCompatible(current, existing.?, .allow_existing_active)) {
-                effective_record.rollback_reason = try self.alloc.dupe(u8, doc_identity_merge_rollback_reason);
             }
 
             if (!mergeRecordsEqual(existing.?, effective_record)) {
@@ -471,10 +475,40 @@ pub const Reconciler = struct {
             if (findRangeRecord(desired_ranges, record.group_id) == null) try range_removals.append(self.alloc, record.group_id);
         }
         for (current.split_transitions) |record| {
-            if (findSplitRecord(desired_splits, record.transition_id) == null) try split_removals.append(self.alloc, record.transition_id);
+            if (findSplitRecord(desired_splits, record.transition_id) != null) continue;
+            const observation = findSplitObservation(current.split_observations, record.transition_id) orelse defaultSplitObservation();
+            if (!splitTransitionCanRollback(record)) {
+                try split_removals.append(self.alloc, record.transition_id);
+            } else if (terminalSplitObservationPhase(observation)) |phase| {
+                var terminal_record = try cloneSplitRecord(self.alloc, record);
+                terminal_record.phase = phase;
+                try split_upserts.append(self.alloc, terminal_record);
+            } else {
+                const planned_record = try cloneSplitRecord(self.alloc, record);
+                errdefer table_manager.freeSplitTransitionRecord(self.alloc, planned_record);
+                try split_steps.append(self.alloc, .{
+                    .record = planned_record,
+                    .execution = transition_controller.TransitionController.describeSplit(planned_record, observation),
+                });
+            }
         }
         for (current.merge_transitions) |record| {
-            if (findMergeRecord(desired_merges, record.transition_id) == null) try merge_removals.append(self.alloc, record.transition_id);
+            if (findMergeRecord(desired_merges, record.transition_id) != null) continue;
+            const observation = findMergeObservation(current.merge_observations, record.transition_id) orelse defaultMergeObservation(record);
+            if (!mergeTransitionCanRollback(record)) {
+                try merge_removals.append(self.alloc, record.transition_id);
+            } else if (terminalMergeObservationPhase(observation)) |phase| {
+                var terminal_record = try cloneMergeRecord(self.alloc, record);
+                terminal_record.phase = phase;
+                try merge_upserts.append(self.alloc, terminal_record);
+            } else {
+                const planned_record = try cloneMergeRecord(self.alloc, record);
+                errdefer table_manager.freeMergeTransitionRecord(self.alloc, planned_record);
+                try merge_steps.append(self.alloc, .{
+                    .record = planned_record,
+                    .execution = transition_controller.TransitionController.describeMerge(planned_record, observation),
+                });
+            }
         }
 
         var repair_placement_groups: usize = 0;
@@ -1546,10 +1580,26 @@ fn splitTransitionCanRollback(record: transition_state.SplitTransitionRecord) bo
     };
 }
 
+fn terminalSplitObservationPhase(observation: transition_state.SplitObservation) ?transition_state.TransitionPhase {
+    return switch (observation.status.phase) {
+        .finalized => .finalized,
+        .rolled_back => .rolled_back,
+        else => null,
+    };
+}
+
 fn mergeTransitionCanRollback(record: transition_state.MergeTransitionRecord) bool {
     return switch (record.phase) {
         .finalized, .rolled_back => false,
         else => true,
+    };
+}
+
+fn terminalMergeObservationPhase(observation: transition_state.MergeObservation) ?transition_state.TransitionPhase {
+    return switch (observation.receiver.phase) {
+        .finalized => .finalized,
+        .rolled_back => .rolled_back,
+        else => null,
     };
 }
 
@@ -2335,7 +2385,7 @@ test "metadata reconciler provisions split destination without publishing overla
     try std.testing.expectEqual(@as(usize, 1), plan.split_upserts.len);
 }
 
-test "metadata reconciler emits runtime steps once transitions are committed" {
+test "metadata reconciler resumes projected transition after authority handoff" {
     var manager = table_manager.TableManager.init(std.testing.allocator);
     defer manager.deinit();
 
@@ -2345,6 +2395,7 @@ test "metadata reconciler emits runtime steps once transitions are committed" {
         .table_id = 10,
         .start_key = "doc:a",
         .end_key = "doc:m",
+        .split_attempt_epoch = 1,
     });
     try manager.upsertRange(.{
         .group_id = 102,
@@ -2352,13 +2403,15 @@ test "metadata reconciler emits runtime steps once transitions are committed" {
         .start_key = "doc:m",
         .end_key = "doc:z",
     });
-    try manager.requestSplit(.{
+    const projected = [_]transition_state.SplitTransitionRecord{.{
         .transition_id = 7101,
-        .table_id = 10,
+        .attempt_epoch = 1,
         .source_group_id = 101,
         .destination_group_id = 103,
         .split_key = "doc:h",
-    });
+        .source_range_end = "doc:m",
+    }};
+    try manager.syncProjectedSplitTransitions(&projected);
 
     const desired = try manager.listDesiredSplitTransitions(std.testing.allocator);
     defer manager.freeSplitTransitions(std.testing.allocator, desired);
@@ -2383,10 +2436,125 @@ test "metadata reconciler emits runtime steps once transitions are committed" {
 
     try std.testing.expectEqual(@as(usize, 0), plan.table_upserts.len);
     try std.testing.expectEqual(@as(usize, 0), plan.range_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.split_admissions.len);
     try std.testing.expectEqual(@as(usize, 0), plan.split_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.split_removals.len);
     try std.testing.expectEqual(@as(usize, 1), plan.split_steps.len);
     try std.testing.expectEqual(transition_controller.SplitExecutionStateTag.awaiting_source_start, plan.split_steps[0].execution.tag);
     try std.testing.expect(plan.split_steps[0].execution.actionable());
+}
+
+test "metadata reconciler never removes an unterminated durable transition" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+    try manager.upsertTable(.{ .table_id = 10, .name = "docs" });
+    try manager.upsertRange(.{
+        .group_id = 101,
+        .table_id = 10,
+        .start_key = "doc:a",
+        .end_key = "doc:m",
+        .split_attempt_epoch = 1,
+    });
+
+    const tables = try manager.listTables(std.testing.allocator);
+    defer manager.freeTables(std.testing.allocator, tables);
+    const ranges = try manager.listRanges(std.testing.allocator);
+    defer manager.freeRanges(std.testing.allocator, ranges);
+    const durable = [_]transition_state.SplitTransitionRecord{.{
+        .transition_id = 7102,
+        .attempt_epoch = 1,
+        .source_group_id = 101,
+        .destination_group_id = 103,
+        .split_key = "doc:h",
+        .source_range_end = "doc:m",
+    }};
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    defer reconciler.deinit();
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .split_transitions = &durable,
+        .split_observations = &.{.{
+            .transition_id = 7102,
+            .observation = defaultSplitObservation(),
+        }},
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), plan.split_removals.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.split_admissions.len);
+    try std.testing.expectEqual(@as(usize, 1), plan.split_steps.len);
+    try std.testing.expectEqual(@as(u64, 1), plan.split_steps[0].record.attempt_epoch);
+
+    var finalized_observation = defaultSplitObservation();
+    finalized_observation.status.phase = .finalized;
+    var terminal_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .split_transitions = &durable,
+        .split_observations = &.{.{
+            .transition_id = 7102,
+            .observation = finalized_observation,
+        }},
+    });
+    defer terminal_plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), terminal_plan.split_removals.len);
+    try std.testing.expectEqual(@as(usize, 1), terminal_plan.split_upserts.len);
+    try std.testing.expectEqual(transition_state.TransitionPhase.finalized, terminal_plan.split_upserts[0].phase);
+}
+
+test "metadata reconciler preserves admitted split identity" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+    try manager.upsertTable(.{ .table_id = 10, .name = "docs" });
+    try manager.upsertRange(.{
+        .group_id = 101,
+        .table_id = 10,
+        .start_key = "doc:a",
+        .end_key = "doc:m",
+        .split_attempt_epoch = 2,
+    });
+    const desired = [_]transition_state.SplitTransitionRecord{.{
+        .transition_id = 7103,
+        .attempt_epoch = 2,
+        .source_group_id = 101,
+        .destination_group_id = 103,
+        .split_key = "doc:h",
+        .source_range_end = "doc:m",
+    }};
+    try manager.syncProjectedSplitTransitions(&desired);
+
+    const tables = try manager.listTables(std.testing.allocator);
+    defer manager.freeTables(std.testing.allocator, tables);
+    const ranges = try manager.listRanges(std.testing.allocator);
+    defer manager.freeRanges(std.testing.allocator, ranges);
+    const admitted = [_]transition_state.SplitTransitionRecord{.{
+        .transition_id = 7103,
+        .attempt_epoch = 1,
+        .source_group_id = 101,
+        .destination_group_id = 103,
+        .split_key = "doc:h",
+        .source_range_end = "doc:m",
+    }};
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .split_transitions = &admitted,
+        .split_observations = &.{.{
+            .transition_id = 7103,
+            .observation = defaultSplitObservation(),
+        }},
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), plan.split_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.split_removals.len);
+    try std.testing.expectEqual(@as(usize, 1), plan.split_steps.len);
+    try std.testing.expectEqual(@as(u64, 1), plan.split_steps[0].record.attempt_epoch);
 }
 
 test "metadata reconciler rolls back existing split with stale doc identity namespace" {

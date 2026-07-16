@@ -40,8 +40,7 @@ pub fn splitBootstrapMetadataWrites(
     marker_buf: *[4 * @sizeOf(u64) + 1]u8,
 ) ![3]docstore_mod.KVPair {
     if (marker.transition_id == 0 or marker.attempt_epoch == 0 or
-        marker.source_group_id == 0 or marker.destination_group_id == 0 or
-        !marker.bootstrap_complete)
+        marker.source_group_id == 0 or marker.destination_group_id == 0)
     {
         return error.InvalidSplitBootstrapMarker;
     }
@@ -50,7 +49,7 @@ pub fn splitBootstrapMetadataWrites(
     std.mem.writeInt(u64, marker_buf[8..16], marker.attempt_epoch, .little);
     std.mem.writeInt(u64, marker_buf[16..24], marker.source_group_id, .little);
     std.mem.writeInt(u64, marker_buf[24..32], marker.destination_group_id, .little);
-    marker_buf[32] = 1;
+    marker_buf[32] = @intFromBool(marker.bootstrap_complete);
     return .{
         .{ .key = range_key, .value = try encodeRange(byte_range, range_buf) },
         .{ .key = split_delta_final_seq_key, .value = sequence_buf },

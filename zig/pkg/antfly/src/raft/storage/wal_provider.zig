@@ -94,6 +94,7 @@ pub const WalReplicaProvider = struct {
                     .persist_ready = persistReady,
                     .compact_snapshot = compactSnapshot,
                     .compact_snapshot_artifact = compactSnapshotArtifact,
+                    .retire_group = retireGroup,
                 },
             },
         };
@@ -180,10 +181,25 @@ pub const WalReplicaProvider = struct {
         try state.setAppliedIndex(index);
     }
 
+    fn retireGroup(ptr: *anyopaque, group_id: u64) !void {
+        const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
+        const state = self.states.get(group_id) orelse {
+            return;
+        };
+        var flush_error: ?anyerror = null;
+        if (self.cfg.flush_on_deinit) state.flushForShutdown() catch |err| {
+            flush_error = err;
+        };
+        const removed = self.states.fetchRemove(group_id) orelse unreachable;
+        removed.value.deinit();
+        self.alloc.destroy(removed.value);
+        if (flush_error) |err| return err;
+    }
+
     fn ensureState(self: *WalReplicaProvider, record: catalog.ReplicaRecord) !*wal_replica_state.WalReplicaState {
         if (self.states.get(record.group_id)) |state| return state;
 
-        var layout = try storage_mod.ReplicaPathLayout.initForReplica(self.alloc, self.root_dir, record.group_id, record.replica_id);
+        var layout = try storage_mod.ReplicaPathLayout.initForLocalNode(self.alloc, self.root_dir, record.group_id, record.local_node_id);
         defer layout.deinit(self.alloc);
 
         const state = try self.alloc.create(wal_replica_state.WalReplicaState);
@@ -274,6 +290,23 @@ test "wal replica provider wires host through WAL-backed local state" {
         var initial_state = try state.storage().initialState(std.testing.allocator);
         defer initial_state.deinit(std.testing.allocator);
         try std.testing.expectEqualSlices(u64, &.{1}, initial_state.conf_state.voters);
+
+        _ = try local_host.ensureReplica(.{
+            .group_id = 501,
+            .replica_id = 2,
+            .local_node_id = 1,
+            .bootstrap_mode = .persisted,
+        });
+        try local_host.removeReplica(501);
+        try std.testing.expect(provider.stateForGroup(501) == null);
+        _ = try local_host.ensureReplica(.{
+            .group_id = 501,
+            .replica_id = 2,
+            .local_node_id = 1,
+            .bootstrap_mode = .persisted,
+        });
+        const replacement = provider.stateForGroup(501) orelse return error.MissingState;
+        try std.testing.expect((try replacement.storage().lastIndex()) >= 1);
     }
 
     {

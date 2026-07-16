@@ -109,18 +109,7 @@ pub fn observeSplitStatus(alloc: std.mem.Allocator, cfg: SyncConfig) !SplitSyncS
     const source_seq = try source.currentSplitDeltaSequence(alloc, cfg.source_group_id);
     const dest_seq = try progress_db.getSplitDeltaFinalSeq(alloc);
     if (matching_terminal) |outcome| {
-        const finalized = outcome == .finalized;
-        return .{
-            .phase = if (finalized) .finalized else .rolled_back,
-            .source_split_phase = .none,
-            .bootstrapped = finalized,
-            .replay_required = false,
-            .replay_caught_up = false,
-            .cutover_ready = finalized,
-            .destination_ready_for_reads = finalized,
-            .source_delta_sequence = source_seq,
-            .dest_delta_sequence = dest_seq,
-        };
+        return range_transition.completedSplitStatus(outcome == .finalized, source_seq, dest_seq);
     }
     // No active source state is the prepare trigger for a successor. The
     // controller uses the record's split coordinates to issue the fenced
@@ -711,6 +700,27 @@ pub const SyncCoordinator = struct {
         const source_state = try source.currentSplitState(self.alloc, self.source_group_id);
         defer if (source_state) |state| shard_state_store.freeSplitState(self.alloc, state);
         if (source_state) |state| try self.validateActiveState(state);
+        const source_terminal = try source.currentSplitTerminal(self.alloc, self.source_group_id);
+        defer if (source_terminal) |terminal| shard_state_store.freeSplitTerminal(self.alloc, terminal);
+        if (source_state == null) {
+            if (source_terminal) |terminal| {
+                if (self.attempt_epoch < terminal.attempt_epoch) return error.StaleSplitAttempt;
+                if (self.attempt_epoch == terminal.attempt_epoch) {
+                    try shard_state_store.validateSplitTerminalIdentity(
+                        terminal,
+                        self.transition_id,
+                        self.attempt_epoch,
+                        self.dest_group_id,
+                        null,
+                    );
+                    return range_transition.completedSplitStatus(
+                        terminal.outcome == .finalized,
+                        try source.currentSplitDeltaSequence(self.alloc, self.source_group_id),
+                        try dest.appliedDeltaSequence(self.alloc),
+                    );
+                }
+            }
+        }
 
         const bootstrap_marker = try dest.db.getSplitBootstrapMarker(self.alloc);
         const bootstrapped = if (bootstrap_marker) |marker|
@@ -1719,7 +1729,8 @@ test "db split status borrows the live raft apply store without a second writer"
         .source_store = &source,
         .dest = .{ .root_dir = dst_root },
     });
-    try std.testing.expectEqual(SplitTransitionPhase.rolled_back, status.phase);
+    try std.testing.expectEqual(SplitTransitionPhase.prepare, status.phase);
+    try std.testing.expect(!status.bootstrapped);
 }
 
 test "db split status uses source acknowledgement without opening destination" {
@@ -1757,8 +1768,8 @@ test "db split status uses source acknowledgement without opening destination" {
         .source_store = &source,
         .progress_db = &progress,
     });
-    try std.testing.expectEqual(SplitTransitionPhase.rolled_back, status.phase);
-    try std.testing.expect(status.bootstrapped);
+    try std.testing.expectEqual(SplitTransitionPhase.prepare, status.phase);
+    try std.testing.expect(!status.bootstrapped);
 }
 
 test "db split sync coordinator tracks explicit split transition phases" {

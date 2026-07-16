@@ -200,6 +200,10 @@ fn parseBatchRequestWithOptions(
         const table_id = try parseInternalU64(table_value);
         const shard_id = try parseInternalU64(shard_value);
         const range_id = try parseInternalU64(range_value);
+        const bootstrap_sequence = if (object.get("bootstrap_sequence")) |sequence_value|
+            try parseInternalU64(sequence_value)
+        else
+            null;
         if (transition_id == 0 or attempt_epoch == 0 or source_group_id == 0 or destination_group_id == 0 or table_id == 0 or shard_id == 0 or range_id == 0)
             return error.InvalidBatchRequest;
         break :replication .{
@@ -212,6 +216,7 @@ fn parseBatchRequestWithOptions(
                 .shard_id = shard_id,
                 .range_id = range_id,
             },
+            .bootstrap_sequence = bootstrap_sequence,
         };
     };
 
@@ -357,7 +362,7 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         });
     }
     if (req.split_replication) |replication| {
-        try writer.print(",\"_split_replication\":{{\"transition_id\":\"{d}\",\"attempt_epoch\":\"{d}\",\"source_group_id\":\"{d}\",\"destination_group_id\":\"{d}\",\"namespace_table_id\":\"{d}\",\"namespace_shard_id\":\"{d}\",\"namespace_range_id\":\"{d}\"}}", .{
+        try writer.print(",\"_split_replication\":{{\"transition_id\":\"{d}\",\"attempt_epoch\":\"{d}\",\"source_group_id\":\"{d}\",\"destination_group_id\":\"{d}\",\"namespace_table_id\":\"{d}\",\"namespace_shard_id\":\"{d}\",\"namespace_range_id\":\"{d}\"", .{
             replication.transition_id,
             replication.attempt_epoch,
             replication.source_group_id,
@@ -366,6 +371,10 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
             replication.identity_namespace.shard_id,
             replication.identity_namespace.range_id,
         });
+        if (replication.bootstrap_sequence) |sequence| {
+            try writer.print(",\"bootstrap_sequence\":\"{d}\"", .{sequence});
+        }
+        try writer.writeByte('}');
     }
     if (req.split_transition) |transition| {
         try writer.print(",\"_split_transition\":{{\"kind\":{f},\"transition_id\":\"{d}\",\"attempt_epoch\":\"{d}\",\"destination_group_id\":\"{d}\",\"split_key\":{f}}}", .{
@@ -586,14 +595,14 @@ test "batch parser preserves oversized value errors" {
 
 test "internal batch parser owns and round trips split checkpoint" {
     const body =
-        \\{"inserts":{},"deletes":[],"_split_checkpoint":{"kind":"destination","transition_id":40,"source_group_id":41,"destination_group_id":42,"range_start":"doc:m","range_end":"doc:z","delta_sequence":7}}
+        \\{"inserts":{},"deletes":[],"_split_checkpoint":{"kind":"destination_complete","transition_id":40,"attempt_epoch":1,"source_group_id":41,"destination_group_id":42,"range_start":"doc:m","range_end":"doc:z","delta_sequence":7}}
     ;
     try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(std.testing.allocator, body));
 
     var owned = try parseInternalBatchRequest(std.testing.allocator, body);
     defer owned.deinit(std.testing.allocator);
     const checkpoint = owned.req.split_checkpoint orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(db_mod.types.SplitReplicationCheckpoint.Kind.destination, checkpoint.kind);
+    try std.testing.expectEqual(db_mod.types.SplitReplicationCheckpoint.Kind.destination_complete, checkpoint.kind);
     try std.testing.expectEqual(@as(u64, 40), checkpoint.transition_id);
     try std.testing.expectEqual(@as(u64, 41), checkpoint.source_group_id);
     try std.testing.expectEqual(@as(u64, 42), checkpoint.destination_group_id);

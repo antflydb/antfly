@@ -448,6 +448,7 @@ pub const MultiRaft = struct {
 
     pub fn removeReplica(self: *MultiRaft, group_id: core.types.GroupId) !void {
         if (!self.removeGroup(group_id)) return error.UnknownGroup;
+        if (self.hooks.group_storage) |group_storage| try group_storage.retireGroup(group_id);
         if (self.hooks.replica_catalog) |catalog| _ = try catalog.removeReplica(group_id);
     }
 
@@ -477,6 +478,7 @@ pub const MultiRaft = struct {
         _ = self.group_incarnations.remove(group_id);
         _ = self.snapshot_candidates.remove(group_id);
         self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
+        self.removePendingAppliesForGroup(group_id);
         var grp = removed.value;
         grp.deinit();
         _ = self.scheduler.unregisterGroup(group_id);
@@ -485,6 +487,7 @@ pub const MultiRaft = struct {
             self.metrics.transport_group_unserves += 1;
         }
         self.refreshMetricsTopology();
+        self.refreshQueueMetrics();
         return true;
     }
 
@@ -1328,6 +1331,19 @@ pub const MultiRaft = struct {
         const remaining = self.pending_apply.items.len - count;
         std.mem.copyForwards(PendingApplyTask, self.pending_apply.items[0..remaining], self.pending_apply.items[count..]);
         self.pending_apply.items.len = remaining;
+    }
+
+    fn removePendingAppliesForGroup(self: *MultiRaft, group_id: core.types.GroupId) void {
+        var retained: usize = 0;
+        for (self.pending_apply.items, 0..) |*task, index| {
+            if (task.group_id == group_id) {
+                task.deinit(self.alloc);
+                continue;
+            }
+            if (retained != index) self.pending_apply.items[retained] = task.*;
+            retained += 1;
+        }
+        self.pending_apply.items.len = retained;
     }
 
     fn resumeOnActivity(self: *MultiRaft, group_id: core.types.GroupId) !void {

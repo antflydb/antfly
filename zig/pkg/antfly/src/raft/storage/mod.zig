@@ -65,6 +65,23 @@ pub const ReplicaPathLayout = struct {
         };
     }
 
+    /// Derives the durable owner path for a Raft peer. Placement replica IDs
+    /// are ordinals and may change when membership is reordered; the local
+    /// Raft node ID is the stable storage identity.
+    pub fn initForLocalNode(alloc: std.mem.Allocator, base_dir: []const u8, group_id: u64, local_node_id: u64) !ReplicaPathLayout {
+        const root_dir = try std.fmt.allocPrint(alloc, "{s}/group-{d}/node-{d}", .{ base_dir, group_id, local_node_id });
+        errdefer alloc.free(root_dir);
+        const log_dir = try std.fmt.allocPrint(alloc, "{s}/raft-log", .{root_dir});
+        errdefer alloc.free(log_dir);
+        const snapshot_dir = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{root_dir});
+        errdefer alloc.free(snapshot_dir);
+        return .{
+            .root_dir = root_dir,
+            .log_dir = log_dir,
+            .snapshot_dir = snapshot_dir,
+        };
+    }
+
     pub fn deinit(self: *ReplicaPathLayout, alloc: std.mem.Allocator) void {
         alloc.free(self.root_dir);
         alloc.free(self.log_dir);
@@ -99,4 +116,13 @@ test "replica path layout derives stable directories" {
     try std.testing.expectEqualStrings("/tmp/antfly-raft/group-42/replica-7", layout.root_dir);
     try std.testing.expectEqualStrings("/tmp/antfly-raft/group-42/replica-7/raft-log", layout.log_dir);
     try std.testing.expectEqualStrings("/tmp/antfly-raft/group-42/replica-7/snapshots", layout.snapshot_dir);
+}
+
+test "raft peer path layout is stable across placement ordinals" {
+    var layout = try ReplicaPathLayout.initForLocalNode(std.testing.allocator, "/tmp/antfly-raft", 42, 101);
+    defer layout.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("/tmp/antfly-raft/group-42/node-101", layout.root_dir);
+    try std.testing.expectEqualStrings("/tmp/antfly-raft/group-42/node-101/raft-log", layout.log_dir);
+    try std.testing.expectEqualStrings("/tmp/antfly-raft/group-42/node-101/snapshots", layout.snapshot_dir);
 }

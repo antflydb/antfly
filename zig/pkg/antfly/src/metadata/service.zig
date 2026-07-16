@@ -2776,6 +2776,36 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn runRound(self: *MetadataHttpService) !void {
+        try self.runRoundInternal(true);
+    }
+
+    /// Advances only the latency-sensitive Raft runtime. Production runtimes
+    /// drive this from a dedicated ticker so control-plane I/O cannot starve
+    /// elections, heartbeats, or Ready processing.
+    pub fn runRaftRoundOnly(self: *MetadataHttpService) !void {
+        try self.ensureLifecycleListenerRegistered();
+        var raft_diagnostics_snapshot: MetadataRaftDiagnosticsSnapshot = .{};
+        self.lockRuntime();
+        {
+            defer self.unlockRuntime();
+            if (self.raft.pending_updates.items.len > 0) {
+                _ = try self.raft.syncPendingRaftOnly();
+            } else {
+                try self.raft.runRaftRoundOnly();
+            }
+            raft_diagnostics_snapshot = self.raftDiagnosticsSnapshotLocked();
+        }
+        if (raft_diagnostics_snapshot.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
+    }
+
+    /// Runs metadata projection and reconciliation without advancing Raft.
+    /// Callers must concurrently drive `runRaftRoundOnly` at the configured
+    /// tick cadence.
+    pub fn runControlRoundOnly(self: *MetadataHttpService) !void {
+        try self.runRoundInternal(false);
+    }
+
+    fn runRoundInternal(self: *MetadataHttpService, advance_raft: bool) !void {
         var run_round_trace = MetadataRunRoundTrace.init();
         defer run_round_trace.logIfSlow();
         var phase_start_ns = platform_time.monotonicNs();
@@ -2791,24 +2821,26 @@ pub const MetadataHttpService = struct {
             self.lifecycle_signal.notify(null);
             run_round_trace.recordSince("lifecycle_signal_notify", lifecycle_signal_phase_start_ns);
         }
-        phase_start_ns = platform_time.monotonicNs();
         var raft_diagnostics_snapshot: MetadataRaftDiagnosticsSnapshot = .{};
-        self.lockRuntime();
-        {
-            defer self.unlockRuntime();
-            if (self.raft.pending_updates.items.len > 0) {
-                _ = try self.raft.syncPendingRaftOnly();
-            } else {
-                try self.raft.runRaftRoundOnly();
+        if (advance_raft) {
+            phase_start_ns = platform_time.monotonicNs();
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (self.raft.pending_updates.items.len > 0) {
+                    _ = try self.raft.syncPendingRaftOnly();
+                } else {
+                    try self.raft.runRaftRoundOnly();
+                }
+                raft_diagnostics_snapshot = self.raftDiagnosticsSnapshotLocked();
             }
-            raft_diagnostics_snapshot = self.raftDiagnosticsSnapshotLocked();
+            run_round_trace.recordSince("raft_round", phase_start_ns);
         }
         if (!try self.ensureMetadataIncarnation()) {
             self.probe_ready.store(false, .release);
             return;
         }
         self.refreshProbeReady();
-        run_round_trace.recordSince("raft_round", phase_start_ns);
         if (raft_diagnostics_snapshot.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
         if (!self.observe_local_replica_root) return;
 
@@ -6434,6 +6466,14 @@ test "metadata service proposes split transitions into the metadata group" {
     try svc.campaignMetadataGroup();
     try svc.runRound();
 
+    try svc.upsertTable(.{ .table_id = 20, .name = "docs" });
+    try svc.upsertRange(.{
+        .group_id = 2001,
+        .table_id = 20,
+        .start_key = "",
+        .end_key = "doc:z",
+        .split_attempt_epoch = 1,
+    });
     try svc.upsertSplitTransition(.{
         .transition_id = 4001,
         .attempt_epoch = 1,
@@ -6441,6 +6481,7 @@ test "metadata service proposes split transitions into the metadata group" {
         .destination_group_id = 2002,
         .phase = .prepare,
         .split_key = "doc:m",
+        .source_range_end = "doc:z",
     });
 
     try runServiceRounds(&svc, 8);

@@ -857,6 +857,36 @@ test "applying voter changes keeps all peer-indexed leader state aligned" {
     try raft.propose("still-aligned");
 }
 
+test "removed leader rejects proposals without mutating its log" {
+    var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    try storage.seedConfState(.{ .voters = @constCast((&[_]types.NodeId{1})[0..]) });
+
+    var raft = try raft_mod.Raft.init(std.testing.allocator, .{
+        .id = 1,
+        .group_id = 1,
+        .peers = &.{1},
+        .election_tick = 3,
+        .heartbeat_tick = 1,
+        .check_quorum = false,
+        .pre_vote = false,
+        .step_down_on_removal = false,
+    }, storage.storage());
+    defer raft.deinit();
+
+    try raft.campaign();
+    _ = try raft.applyConfChange(.{ .change_type = .add_node, .node_id = 2 });
+    _ = try raft.applyConfChange(.{ .change_type = .remove_node, .node_id = 1 });
+
+    const last_index = raft.status().last_index;
+    try std.testing.expectEqual(types.StateRole.leader, raft.status().soft.role);
+    try std.testing.expectError(error.NotLeader, raft.propose("must-not-append"));
+    try std.testing.expectError(error.NotLeader, raft.proposeConfChangeV2(.{
+        .changes = &.{.{ .change_type = .add_node, .node_id = 3 }},
+    }));
+    try std.testing.expectEqual(last_index, raft.status().last_index);
+}
+
 test "memory storage compaction preserves snapshot term and trimmed bounds" {
     var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();

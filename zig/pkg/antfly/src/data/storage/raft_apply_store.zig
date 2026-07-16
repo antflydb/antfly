@@ -20,6 +20,7 @@ const fs_paths = @import("../../common/fs_paths.zig");
 const background_runtime = @import("../../storage/background_runtime.zig");
 const docstore = @import("../../storage/docstore.zig");
 const generation_lifecycle = @import("../../storage/db/generation_lifecycle.zig");
+const range_state = @import("../../storage/db/range_state.zig");
 const lsm_backend = @import("../../storage/lsm_backend.zig");
 const resource_manager_mod = @import("../../storage/resource_manager.zig");
 const raft_storage_mod = @import("../../raft/storage/mod.zig");
@@ -53,6 +54,28 @@ pub const AppliedDataKV = shard_state_store.AppliedDataKV;
 pub const AppliedDataRange = shard_state_store.AppliedDataRange;
 pub const AppliedSplitState = shard_state_store.AppliedSplitState;
 pub const SplitHandoff = shard_state_store.SplitHandoff;
+
+pub const SplitControlObservation = struct {
+    state: ?AppliedSplitState = null,
+    terminal: ?shard_state_store.AppliedSplitTerminal = null,
+    acknowledgement: ?shard_state_store.SplitAcknowledgement = null,
+    delta_sequence: u64 = 0,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.state) |state| shard_state_store.freeSplitState(alloc, state);
+        if (self.terminal) |terminal| shard_state_store.freeSplitTerminal(alloc, terminal);
+        self.* = undefined;
+    }
+};
+
+fn groupSnapshotsEqual(left: []const AppliedDataKV, right: []const AppliedDataKV) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_entry, right_entry| {
+        if (!std.mem.eql(u8, left_entry.key, right_entry.key) or
+            !std.mem.eql(u8, left_entry.value, right_entry.value)) return false;
+    }
+    return true;
+}
 
 pub const RaftApplyStoreConfig = struct {
     root_dir: []const u8,
@@ -541,6 +564,12 @@ pub const RaftApplyStore = struct {
         if (shard.placement_filter_enabled and !shard.active_groups.contains(group_id)) return error.ApplyStoreGroupRetired;
     }
 
+    fn requireTransitionReadyLocked(self: *RaftApplyStore, shard: *BatchShard, group_id: u64) !void {
+        if (self.shutting_down.load(.acquire)) return error.ApplyStoreShuttingDown;
+        if (shard.generation_preparations.contains(group_id)) return error.SplitSourceProjectionNotReady;
+        if (shard.placement_filter_enabled and !shard.active_groups.contains(group_id)) return error.ApplyStoreGroupRetired;
+    }
+
     fn beginGenerationPreparation(self: *RaftApplyStore, group_id: u64) !void {
         const io = self.io_impl.io();
         const shard = self.batchShard(group_id);
@@ -584,6 +613,19 @@ pub const RaftApplyStore = struct {
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
         try self.waitForGenerationPreparationLocked(shard, group_id);
+        const batch = (try self.ensureLoaded(shard, group_id)) orelse return null;
+        return batch.*;
+    }
+
+    /// Returns a transition watermark without waiting behind snapshot
+    /// installation. Transition RPCs are retried by the metadata driver and
+    /// must not consume an HTTP worker while a replacement generation stages.
+    pub fn latestBatchForTransition(self: *RaftApplyStore, group_id: u64) !?AppliedDataBatch {
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        try self.requireTransitionReadyLocked(shard, group_id);
         const batch = (try self.ensureLoaded(shard, group_id)) orelse return null;
         return batch.*;
     }
@@ -759,6 +801,53 @@ pub const RaftApplyStore = struct {
         return true;
     }
 
+    /// Reconciles the split projection from the authoritative document DB only
+    /// while Raft remains at the caller's observed watermark. This is the
+    /// generation-handoff counterpart to `seedGroupSnapshotIfAbsent`: replica
+    /// replacement may inherit a document root while its new Raft generation
+    /// starts with only a bootstrap entry. Normal-entry history and the apply
+    /// watermark are preserved. Once a split starts, only replicated split
+    /// deltas may mutate the projection.
+    pub fn reconcileGroupSnapshotAtWatermark(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        expected: AppliedDataBatch,
+        byte_range: AppliedDataRange,
+        entries: []const AppliedDataKV,
+    ) !bool {
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        try self.requireTransitionReadyLocked(shard, group_id);
+        const current = (try self.ensureLoaded(shard, group_id)) orelse return false;
+        if (current.commit_index != expected.commit_index or
+            current.last_entry_index != expected.last_entry_index or
+            current.last_entry_term != expected.last_entry_term)
+        {
+            return false;
+        }
+        const group_store = try self.writableGroupStoreLocked(shard, group_id);
+        if (try shard_state_store.currentSplitState(&group_store.store, alloc, group_id)) |state| {
+            shard_state_store.freeSplitState(alloc, state);
+            return error.SplitInProgress;
+        }
+
+        const current_range = try shard_state_store.currentRange(&group_store.store, alloc, group_id);
+        defer range_state.freeRange(alloc, current_range);
+        const current_entries = try shard_state_store.groupState(&group_store.store, alloc, group_id);
+        defer shard_state_store.freeGroupStateEntries(alloc, current_entries);
+        if (std.mem.eql(u8, current_range.start, byte_range.start) and
+            std.mem.eql(u8, current_range.end, byte_range.end) and
+            groupSnapshotsEqual(current_entries, entries))
+        {
+            return true;
+        }
+        try shard_state_store.replaceGroupSnapshot(&group_store.store, alloc, group_id, byte_range, entries);
+        return true;
+    }
+
     pub fn currentRange(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !AppliedDataRange {
         const io = self.io_impl.io();
         const shard = self.batchShard(group_id);
@@ -777,6 +866,31 @@ pub const RaftApplyStore = struct {
         try self.waitForGenerationPreparationLocked(shard, group_id);
         const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return null;
         return try shard_state_store.currentSplitState(&group_store.store, alloc, group_id);
+    }
+
+    /// Reads all source split control fields under one apply-store shard lock.
+    /// Unlike the general state accessors, observation fails fast while a new
+    /// generation is staging so control-plane polling cannot wedge serving
+    /// threads behind snapshot I/O.
+    pub fn observeSplitControl(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+    ) !SplitControlObservation {
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        try self.requireTransitionReadyLocked(shard, group_id);
+        const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return .{};
+
+        var observation = SplitControlObservation{};
+        errdefer observation.deinit(alloc);
+        observation.state = try shard_state_store.currentSplitState(&group_store.store, alloc, group_id);
+        observation.terminal = try shard_state_store.currentSplitTerminal(&group_store.store, alloc, group_id);
+        observation.acknowledgement = try shard_state_store.currentSplitAcknowledgement(&group_store.store, alloc, group_id);
+        observation.delta_sequence = try shard_state_store.currentSplitDeltaSequence(&group_store.store, alloc, group_id);
+        return observation;
     }
 
     pub fn currentSplitDeltaSequence(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !u64 {
@@ -2226,6 +2340,114 @@ test "data raft apply store seeds pre-raft snapshots once at reserved index zero
     try std.testing.expectEqual(@as(usize, 2), state.len);
     try std.testing.expectEqualStrings("doc:a", state[0].key);
     try std.testing.expectEqualStrings("doc:b", state[1].key);
+}
+
+test "data raft apply store reconciles an inherited document root at an exact watermark" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-reconcile", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+
+    const bootstrap = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{.{
+        .term = 1,
+        .index = 1,
+        .entry_type = .normal,
+        .data = @constCast(""),
+    }});
+    defer std.testing.allocator.free(bootstrap);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 312,
+        .commit_index = 1,
+        .entries_bytes = bootstrap,
+    });
+    const bootstrap_watermark = (try store.latestBatch(312)) orelse return error.MissingDataBatch;
+    try std.testing.expect(try store.reconcileGroupSnapshotAtWatermark(
+        std.testing.allocator,
+        312,
+        bootstrap_watermark,
+        .{ .start = "doc:a", .end = "doc:z" },
+        &.{
+            .{ .key = "doc:a", .value = "{\"v\":1}" },
+            .{ .key = "doc:t", .value = "{\"v\":2}" },
+        },
+    ));
+
+    const reconciled = try store.groupState(std.testing.allocator, 312);
+    defer shard_state_store.freeGroupStateEntries(std.testing.allocator, reconciled);
+    try std.testing.expectEqual(@as(usize, 2), reconciled.len);
+    try std.testing.expectEqualStrings("doc:t", reconciled[1].key);
+    try std.testing.expectEqual(bootstrap_watermark, (try store.latestBatch(312)).?);
+
+    const advanced = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{.{
+        .term = 1,
+        .index = 2,
+        .entry_type = .normal,
+        .data = @constCast("put:doc:u={\"v\":3}"),
+    }});
+    defer std.testing.allocator.free(advanced);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 312,
+        .commit_index = 2,
+        .entries_bytes = advanced,
+    });
+    try std.testing.expect(!try store.reconcileGroupSnapshotAtWatermark(
+        std.testing.allocator,
+        312,
+        bootstrap_watermark,
+        .{ .start = "doc:a", .end = "doc:z" },
+        &.{.{ .key = "doc:stale", .value = "{}" }},
+    ));
+    const after_stale_attempt = try store.groupState(std.testing.allocator, 312);
+    defer shard_state_store.freeGroupStateEntries(std.testing.allocator, after_stale_attempt);
+    try std.testing.expectEqual(@as(usize, 3), after_stale_attempt.len);
+    try std.testing.expectEqualStrings("doc:u", after_stale_attempt[2].key);
+}
+
+test "data raft apply store transition reads fail fast during generation staging" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-transition-ready", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+
+    const bootstrap = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{.{
+        .term = 1,
+        .index = 1,
+        .entry_type = .normal,
+        .data = @constCast(""),
+    }});
+    defer std.testing.allocator.free(bootstrap);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 313,
+        .commit_index = 1,
+        .entries_bytes = bootstrap,
+    });
+    const watermark = (try store.latestBatch(313)) orelse return error.MissingDataBatch;
+
+    try store.beginGenerationPreparation(313);
+    var preparation_active = true;
+    defer if (preparation_active) store.cancelGenerationPreparation(313);
+    try std.testing.expectError(error.SplitSourceProjectionNotReady, store.latestBatchForTransition(313));
+    try std.testing.expectError(error.SplitSourceProjectionNotReady, store.observeSplitControl(std.testing.allocator, 313));
+    try std.testing.expectError(error.SplitSourceProjectionNotReady, store.reconcileGroupSnapshotAtWatermark(
+        std.testing.allocator,
+        313,
+        watermark,
+        .{ .start = "doc:a", .end = "doc:z" },
+        &.{},
+    ));
+    store.cancelGenerationPreparation(313);
+    preparation_active = false;
+
+    var observation = try store.observeSplitControl(std.testing.allocator, 313);
+    defer observation.deinit(std.testing.allocator);
+    try std.testing.expect(observation.state == null);
+    try std.testing.expectEqual(@as(u64, 0), observation.delta_sequence);
 }
 
 test "data raft apply store installs snapshot watermark atomically" {

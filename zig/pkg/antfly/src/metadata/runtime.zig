@@ -121,6 +121,7 @@ const Factory = struct {
                     .heartbeat_tick = 1,
                     .pre_vote = true,
                     .check_quorum = true,
+                    .step_down_on_removal = true,
                     .random_seed = antfly.raft.stableRandomSeed(record.group_id, record.local_node_id),
                 },
                 .storage = self.store.storage(),
@@ -583,6 +584,15 @@ pub const Server = struct {
         self.refreshMetadataRaftStorageDiagnostics();
     }
 
+    pub fn runRaftRoundOnly(self: *Server) !void {
+        try self.server.runRaftRoundOnly();
+        self.refreshMetadataRaftStorageDiagnostics();
+    }
+
+    pub fn runControlRoundOnly(self: *Server) !void {
+        try self.server.runControlRoundOnly();
+    }
+
     pub fn runCdcRound(self: *Server) !void {
         try self.server.runCdcRound();
     }
@@ -700,6 +710,48 @@ fn metadataBootstrapCampaignRetryIntervalNs(tick_ms: u64) u64 {
         tick_ms * std.time.ns_per_ms * metadata_raft_election_max_ticks * 2,
     );
 }
+
+const MetadataRaftTicker = struct {
+    server: *Server,
+    io: std.Io,
+    interval_ns: u64,
+    stop_requested: std.atomic.Value(bool) = .init(false),
+    failed: std.atomic.Value(bool) = .init(false),
+    failure: ?anyerror = null,
+
+    fn run(self: *@This()) void {
+        while (!self.stop_requested.load(.acquire)) {
+            const started_ns = platform_time.monotonicNs();
+            self.server.runRaftRoundOnly() catch |err| {
+                self.failure = err;
+                self.failed.store(true, .release);
+                return;
+            };
+            const elapsed_ns = platform_time.monotonicNs() -| started_ns;
+            if (elapsed_ns < self.interval_ns) {
+                self.io.sleep(
+                    std.Io.Duration.fromNanoseconds(self.interval_ns - elapsed_ns),
+                    .awake,
+                ) catch |err| {
+                    if (self.stop_requested.load(.acquire)) return;
+                    self.failure = err;
+                    self.failed.store(true, .release);
+                    return;
+                };
+            }
+        }
+    }
+
+    fn check(self: *const @This()) !void {
+        if (!self.failed.load(.acquire)) return;
+        return self.failure orelse error.MetadataRaftTickerFailed;
+    }
+
+    fn stop(self: *@This(), thread: *std.Thread) void {
+        self.stop_requested.store(true, .release);
+        thread.join();
+    }
+};
 
 fn allocMetadataPeerNodeIds(
     alloc: std.mem.Allocator,
@@ -887,7 +939,15 @@ pub fn runFromIterator(
     const preferred_bootstrap_campaigner = metadataClusterPreferredCampaigner(cluster_peers, local_node_id);
     const bootstrap_campaign_retry_interval_ns = metadataBootstrapCampaignRetryIntervalNs(tick_ms);
     var last_bootstrap_campaign_retry_ns = platform_time.monotonicNs();
+    var raft_ticker = MetadataRaftTicker{
+        .server = &server,
+        .io = init.io,
+        .interval_ns = tick_ms * std.time.ns_per_ms,
+    };
+    var raft_ticker_thread = try std.Thread.spawn(.{}, MetadataRaftTicker.run, .{&raft_ticker});
+    defer raft_ticker.stop(&raft_ticker_thread);
     while (true) {
+        try raft_ticker.check();
         if (preferred_bootstrap_campaigner) {
             const now_ns = platform_time.monotonicNs();
             if (last_bootstrap_campaign_retry_ns == 0 or
@@ -900,7 +960,7 @@ pub fn runFromIterator(
             }
         }
         const run_round_start_ns = platform_time.monotonicNs();
-        try server.runRound();
+        try server.runControlRoundOnly();
         const run_round_elapsed_ns = platform_time.monotonicNs() -| run_round_start_ns;
         if (run_round_elapsed_ns > antfly.metadata_service.metadata_run_round_slow_threshold_ns) {
             std.log.warn("metadata runRound slow elapsed_ms={d}", .{@divTrunc(run_round_elapsed_ns, std.time.ns_per_ms)});

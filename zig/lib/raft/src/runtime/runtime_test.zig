@@ -27,6 +27,7 @@ const StorageRecorder = struct {
     compact_failure_group: ?core.types.GroupId = null,
     compact_successes: usize = 0,
     compacted_groups: [8]core.types.GroupId = [_]core.types.GroupId{0} ** 8,
+    retired_groups: usize = 0,
 
     fn deinit(self: *StorageRecorder) void {
         self.stores.deinit(self.alloc);
@@ -43,6 +44,7 @@ const StorageRecorder = struct {
             .vtable = &.{
                 .persist_ready = persistReady,
                 .compact_snapshot = compactSnapshot,
+                .retire_group = retireGroup,
             },
         };
     }
@@ -82,6 +84,12 @@ const StorageRecorder = struct {
             self.compacted_groups[self.compact_successes] = group_id;
         }
         self.compact_successes += 1;
+    }
+
+    fn retireGroup(ptr: *anyopaque, group_id: core.types.GroupId) !void {
+        const self: *StorageRecorder = @ptrCast(@alignCast(ptr));
+        self.retired_groups += 1;
+        _ = self.stores.remove(group_id);
     }
 };
 
@@ -1783,6 +1791,34 @@ test "multi raft apply queue drains with per-round budget" {
     try std.testing.expectEqual(@as(usize, 0), try host.drainReady(0));
     try std.testing.expectEqual(@as(usize, 2), apply_recorder.applied_entries);
     try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_apply_tasks);
+}
+
+test "multi raft removal drops pending applies and retires replica storage" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    var storage_recorder = StorageRecorder{ .alloc = std.testing.allocator };
+    defer storage_recorder.deinit();
+    try storage_recorder.registerStore(157, &store);
+
+    var apply_recorder = ApplyRecorder{ .alloc = std.testing.allocator };
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{
+        .max_apply_tasks_per_round = 0,
+    }, .{
+        .group_storage = storage_recorder.iface(),
+        .state_machine = apply_recorder.iface(),
+    });
+    defer host.deinit();
+
+    try addSingleNodeGroup(&host, 157, &store, false);
+    try host.campaignGroup(157);
+    try std.testing.expect(try host.processReady(157));
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().pending_apply_tasks);
+
+    try host.removeReplica(157);
+    try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_apply_tasks);
+    try std.testing.expectEqual(@as(usize, 0), apply_recorder.applied_entries);
+    try std.testing.expectEqual(@as(usize, 1), storage_recorder.retired_groups);
 }
 
 test "in-memory disk batcher and queued apply worker integrate with host" {

@@ -177,6 +177,16 @@ pub fn readinessResultForLocalSplitTransition(
             .source = .local_observation,
         };
     }
+    return readinessResultForSplitTransition(record, split_observations);
+}
+
+/// Derive split readiness exclusively from control-plane state. Callers that
+/// do not own the transition DBs must use this form so observation cannot open
+/// a second storage owner behind an active runtime.
+pub fn readinessResultForSplitTransition(
+    record: SplitTransitionRecord,
+    split_observations: []const SplitObservationRecord,
+) GroupTransitionReadinessResult {
     if (findSplitObservation(split_observations, record.transition_id)) |observation| {
         return .{
             .readiness = readinessFromObservedSplit(observation.status),
@@ -201,6 +211,16 @@ pub fn readinessResultForLocalMergeTransition(
             .source = .local_observation,
         };
     }
+    return readinessResultForMergeTransition(record, merge_observations);
+}
+
+/// Derive merge readiness exclusively from control-plane state. Transition
+/// owners publish observations; status/reporting paths consume them without
+/// manufacturing another DB owner.
+pub fn readinessResultForMergeTransition(
+    record: MergeTransitionRecord,
+    merge_observations: []const MergeObservationRecord,
+) GroupTransitionReadinessResult {
     if (findMergeObservation(merge_observations, record.transition_id)) |observation| {
         return .{
             .readiness = readinessFromObservedMerge(observation.receiver),

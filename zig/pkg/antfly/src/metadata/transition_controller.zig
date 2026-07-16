@@ -119,10 +119,7 @@ pub const TransitionController = struct {
             .cutover_ready => .ready_to_finalize,
             .finalized => .finalized,
             .rolling_back => .rolling_back,
-            // No active source state is also how a new durable attempt is
-            // observed before prepare. The source epoch distinguishes it from
-            // the terminal predecessor when the prepare action is applied.
-            .rolled_back => if (record.split_key != null) .awaiting_source_start else .rolled_back,
+            .rolled_back => .rolled_back,
         };
     }
 
@@ -133,8 +130,8 @@ pub const TransitionController = struct {
     ) TransitionDecision {
         return switch (tag) {
             .awaiting_source_start => .{
-                .next_phase = if (observation.status.phase == .rolled_back) .prepare else .bootstrap_peer,
-                .action = if (observation.status.phase == .rolled_back)
+                .next_phase = if (observation.status.source_split_phase == null) .prepare else .bootstrap_peer,
+                .action = if (observation.status.source_split_phase == null)
                     if (record.split_key) |split_key| .{
                         .prepare_split_source = .{
                             .transition_id = record.transition_id,
@@ -294,7 +291,25 @@ test "transition controller plans split start bootstrap and finalize actions" {
         .attempt_epoch = 1,
         .source_group_id = 41,
         .destination_group_id = 42,
+        .split_key = "doc:m",
     };
+
+    const prepare = TransitionController.planSplit(split_record, .{
+        .status = .{
+            .phase = .prepare,
+            .source_split_phase = null,
+            .bootstrapped = false,
+            .replay_required = false,
+            .replay_caught_up = false,
+            .cutover_ready = false,
+            .destination_ready_for_reads = false,
+            .source_delta_sequence = 0,
+            .dest_delta_sequence = 0,
+        },
+    });
+    try std.testing.expectEqual(transition_state.TransitionPhase.prepare, prepare.next_phase);
+    try std.testing.expect(prepare.action == .prepare_split_source);
+    try std.testing.expectEqualStrings("doc:m", prepare.action.prepare_split_source.split_key);
 
     const start = TransitionController.planSplit(split_record, .{
         .status = .{

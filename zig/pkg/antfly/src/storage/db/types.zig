@@ -113,7 +113,8 @@ pub const DocumentTransform = struct {
 
 pub const SplitReplicationCheckpoint = struct {
     pub const Kind = enum {
-        destination,
+        destination_begin,
+        destination_complete,
         source_ack,
     };
 
@@ -136,6 +137,10 @@ pub const SplitReplicationContext = struct {
     source_group_id: u64,
     destination_group_id: u64,
     identity_namespace: doc_identity_mod.Namespace,
+    /// Present only while streaming a baseline bootstrap. The destination's
+    /// reservation stores this sequence and rejects chunks from superseded
+    /// retries. Catch-up replication uses null and requires a completed marker.
+    bootstrap_sequence: ?u64 = null,
 };
 
 pub const SplitTransitionMutation = struct {

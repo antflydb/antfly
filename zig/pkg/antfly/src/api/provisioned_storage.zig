@@ -285,6 +285,15 @@ pub const ProvisionedGroupStorage = struct {
         return if (self.group_visible_root_generations.get(group_id)) |entry| entry.generation else table_reads.backend_current_root_generation;
     }
 
+    /// Publish schema/index metadata reconciled into the currently visible
+    /// physical roots. Query owners and artifact handles must reopen, but the
+    /// root generation must remain stable: advancing it would fence the one
+    /// live writer even though no root replacement occurred.
+    pub fn invalidateInPlaceMetadataReconcileCaches(self: *ProvisionedGroupStorage) void {
+        self.read_cache.clear();
+        self.hbc_cache.clear();
+    }
+
     pub fn bumpGroupVisibleRootGenerations(self: *ProvisionedGroupStorage, group_ids: []const u64) !void {
         lockAtomic(&self.group_visible_root_generation_mutex);
         defer self.group_visible_root_generation_mutex.unlock();
@@ -382,6 +391,9 @@ test "provisioned group storage prunes stale visible root generations" {
     try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(11));
     try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(22));
     try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(33));
+
+    storage.invalidateInPlaceMetadataReconcileCaches();
+    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(11));
 
     storage.pruneGroupVisibleRootGenerations(&.{ 11, 33 });
     try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(11));

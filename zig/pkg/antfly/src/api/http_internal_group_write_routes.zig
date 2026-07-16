@@ -248,6 +248,12 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         var observation = ops.observeSplit(record) catch |err| switch (err) {
             error.UnknownGroup, error.UnknownSplitRuntime, error.MissingSplitRuntime => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.LeaderUnavailable,
+            error.GroupLeaderUnavailable,
+            error.SplitSourceProjectionNotReady,
+            error.ApplyStoreGroupRetired,
+            error.ApplyStoreShuttingDown,
+            => return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable"),
             else => return err,
         };
         if (route.group_id == record.source_group_id) observation.source_local_leader = true;
@@ -266,6 +272,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         var observation = ops.observeMerge(record) catch |err| switch (err) {
             error.UnknownGroup, error.UnknownMergeRuntime, error.MissingMergeRuntime => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.LeaderUnavailable, error.GroupLeaderUnavailable => return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable"),
             else => return err,
         };
         if (route.group_id == record.donor_group_id) observation.donor_local_leader = true;
@@ -287,7 +294,14 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             },
             error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
-            error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => {
+            error.LeaderUnavailable,
+            error.GroupLeaderUnavailable,
+            error.MetadataSnapshotUnavailable,
+            error.SplitSourceProjectionNotReady,
+            error.SplitSourceProjectionAdvanced,
+            error.ApplyStoreGroupRetired,
+            error.ApplyStoreShuttingDown,
+            => {
                 return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable");
             },
             error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),

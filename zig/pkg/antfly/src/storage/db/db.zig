@@ -11079,10 +11079,10 @@ pub const DB = struct {
         try self.refreshSplitBootstrapRangeInMemory(byte_range);
     }
 
-    /// Atomically replaces a split destination generation. The primary
-    /// document mutations, derived replay record, range, replay fence, and
-    /// completed marker share one storage commit. Callers must hold the
-    /// destination generation's exclusive lifecycle lease.
+    /// Atomically starts or replaces a split destination bootstrap. An
+    /// incomplete marker fences ordinary replication while bounded bootstrap
+    /// chunks are streamed. Callers must hold the destination generation's
+    /// exclusive lifecycle lease.
     pub fn replaceSplitBootstrap(
         self: *DB,
         alloc: Allocator,
@@ -11096,7 +11096,7 @@ pub const DB = struct {
 
         if (marker.transition_id == 0 or marker.attempt_epoch == 0 or
             marker.source_group_id == 0 or marker.destination_group_id == 0 or
-            !marker.bootstrap_complete)
+            marker.bootstrap_complete)
         {
             return error.InvalidSplitBootstrapMarker;
         }
@@ -11115,13 +11115,24 @@ pub const DB = struct {
         }
 
         if (try self.getSplitBootstrapMarker(alloc)) |existing| {
-            if (splitBootstrapMarkersEqual(existing, marker)) {
-                try self.refreshSplitBootstrapRangeInMemory(byte_range);
+            const same_attempt = existing.transition_id == marker.transition_id and
+                existing.attempt_epoch == marker.attempt_epoch and
+                existing.source_group_id == marker.source_group_id and
+                existing.destination_group_id == marker.destination_group_id;
+            if (same_attempt and existing.bootstrap_complete) {
+                const completed_sequence = try self.getSplitDeltaFinalSeq(alloc);
+                if (base_delta_sequence < completed_sequence) return error.StaleSplitBootstrap;
+                if (base_delta_sequence > completed_sequence or
+                    !byteRangesEqual(self.core.byteRange(), byte_range))
+                {
+                    return error.SplitBootstrapComplete;
+                }
                 return false;
             }
-            if (existing.source_group_id != marker.source_group_id or
-                existing.destination_group_id != marker.destination_group_id or
-                existing.attempt_epoch >= marker.attempt_epoch)
+            if (!same_attempt and
+                (existing.source_group_id != marker.source_group_id or
+                    existing.destination_group_id != marker.destination_group_id or
+                    existing.attempt_epoch >= marker.attempt_epoch))
             {
                 return error.ConflictingSplitTransition;
             }
@@ -11183,6 +11194,69 @@ pub const DB = struct {
             }
             return err;
         };
+        try self.refreshSplitBootstrapRangeInMemory(byte_range);
+        return true;
+    }
+
+    /// Atomically publishes a fully streamed split bootstrap. Completion is
+    /// valid only for the exact reservation installed by replaceSplitBootstrap.
+    pub fn completeSplitBootstrap(
+        self: *DB,
+        alloc: Allocator,
+        byte_range: types.ByteRange,
+        base_delta_sequence: u64,
+        marker: range_state_mod.SplitBootstrapMarker,
+    ) !bool {
+        lockAtomicWithBackoff(&self.generation_replace_mutex);
+        defer self.generation_replace_mutex.unlock();
+
+        if (marker.transition_id == 0 or marker.attempt_epoch == 0 or
+            marker.source_group_id == 0 or marker.destination_group_id == 0 or
+            !marker.bootstrap_complete)
+        {
+            return error.InvalidSplitBootstrapMarker;
+        }
+        if (byte_range.start.len > 0 and byte_range.end.len > 0 and
+            std.mem.order(u8, byte_range.start, byte_range.end) != .lt)
+        {
+            return error.InvalidAppliedDataRange;
+        }
+
+        const existing = (try self.getSplitBootstrapMarker(alloc)) orelse
+            return error.SplitBootstrapRequired;
+        if (existing.transition_id != marker.transition_id or
+            existing.attempt_epoch != marker.attempt_epoch or
+            existing.source_group_id != marker.source_group_id or
+            existing.destination_group_id != marker.destination_group_id)
+        {
+            return error.ConflictingSplitTransition;
+        }
+        if (existing.bootstrap_complete) {
+            const current_sequence = try self.getSplitDeltaFinalSeq(alloc);
+            if (base_delta_sequence < current_sequence) return error.StaleSplitBootstrap;
+            if (base_delta_sequence == current_sequence) {
+                try self.refreshSplitBootstrapRangeInMemory(byte_range);
+                return false;
+            }
+        }
+
+        var range_buf: [1024]u8 = undefined;
+        var sequence_buf: [8]u8 = undefined;
+        var marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
+        const metadata_writes = try range_state_mod.splitBootstrapMetadataWrites(
+            byte_range,
+            base_delta_sequence,
+            marker,
+            &range_buf,
+            &sequence_buf,
+            &marker_buf,
+        );
+        try self.batchInternal(.{ .sync_level = .write }, null, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+            .bypass_ha_write_gate = true,
+            .extra_store_writes = &metadata_writes,
+        });
         try self.refreshSplitBootstrapRangeInMemory(byte_range);
         return true;
     }
@@ -68921,7 +68995,7 @@ test "db split bootstrap replacement preserves overlapping incoming documents" {
             .attempt_epoch = 1,
             .source_group_id = 101,
             .destination_group_id = 102,
-            .bootstrap_complete = true,
+            .bootstrap_complete = false,
         },
     ));
 
@@ -68932,6 +69006,45 @@ test "db split bootstrap replacement preserves overlapping incoming documents" {
     defer alloc.free(added);
     try std.testing.expectEqualStrings("{\"new\":true}", added);
     try std.testing.expect((try db.get(alloc, "doc:stale")) == null);
+}
+
+test "db completed split bootstrap rejects destructive begin retry" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    const byte_range: types.ByteRange = .{ .start = "doc:m", .end = "doc:z" };
+    const incomplete: range_state_mod.SplitBootstrapMarker = .{
+        .transition_id = 11,
+        .attempt_epoch = 1,
+        .source_group_id = 101,
+        .destination_group_id = 102,
+        .bootstrap_complete = false,
+    };
+    try std.testing.expect(try db.replaceSplitBootstrap(
+        alloc,
+        byte_range,
+        &.{.{ .key = "doc:m", .value = "{\"version\":1}" }},
+        17,
+        incomplete,
+    ));
+    var complete = incomplete;
+    complete.bootstrap_complete = true;
+    try std.testing.expect(try db.completeSplitBootstrap(alloc, byte_range, 17, complete));
+
+    try std.testing.expect(!try db.replaceSplitBootstrap(alloc, byte_range, &.{}, 17, incomplete));
+    const retained = (try db.get(alloc, "doc:m")).?;
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("{\"version\":1}", retained);
+    try std.testing.expect((try db.getSplitBootstrapMarker(alloc)).?.bootstrap_complete);
+
+    try std.testing.expectError(
+        error.SplitBootstrapComplete,
+        db.replaceSplitBootstrap(alloc, byte_range, &.{}, 18, incomplete),
+    );
 }
 
 test "db split cutover fences enrichment to the owning range with durable lsm primary backend" {

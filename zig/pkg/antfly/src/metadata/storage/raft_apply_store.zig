@@ -1977,56 +1977,16 @@ pub const RaftApplyStore = struct {
                 try self.applySplitAdmissionTxn(txn, group_id, admission.expected_source_epoch, admission.record);
             },
             .upsert_split_transition => |record| {
-                var key_buf: [160]u8 = undefined;
-                const key = try splitTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
-                const value = try encodeSplitTransitionRecord(self.alloc, record);
-                defer self.alloc.free(value);
-                try txn.put(key, value);
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
-                self.notifyProjectionListeners(.{
-                    .kind = .split_transition,
-                    .metadata_group_id = group_id,
-                    .group_id = record.source_group_id,
-                });
+                try self.applySplitTransitionUpsertTxn(txn, group_id, record);
             },
             .remove_split_transition => |record| {
-                var key_buf: [160]u8 = undefined;
-                const key = try splitTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
-                txn.delete(key) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                };
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
-                self.notifyProjectionListeners(.{
-                    .kind = .split_transition,
-                    .metadata_group_id = group_id,
-                });
+                try self.applySplitTransitionRemovalTxn(txn, group_id, record.transition_id);
             },
             .upsert_merge_transition => |record| {
-                var key_buf: [160]u8 = undefined;
-                const key = try mergeTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
-                const value = try encodeMergeTransitionRecord(self.alloc, record);
-                defer self.alloc.free(value);
-                try txn.put(key, value);
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
-                self.notifyProjectionListeners(.{
-                    .kind = .merge_transition,
-                    .metadata_group_id = group_id,
-                    .group_id = record.receiver_group_id,
-                });
+                try self.applyMergeTransitionUpsertTxn(txn, group_id, record);
             },
             .remove_merge_transition => |record| {
-                var key_buf: [160]u8 = undefined;
-                const key = try mergeTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
-                txn.delete(key) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                };
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
-                self.notifyProjectionListeners(.{
-                    .kind = .merge_transition,
-                    .metadata_group_id = group_id,
-                });
+                try self.applyMergeTransitionRemovalTxn(txn, group_id, record.transition_id);
             },
             .upsert_reconcile_lease => |record| {
                 var key_buf: [160]u8 = undefined;
@@ -2205,6 +2165,112 @@ pub const RaftApplyStore = struct {
                 try self.applyExtensionLifecycleDeltaTxn(txn, group_id, delta);
             },
         }
+    }
+
+    fn applySplitTransitionUpsertTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        record: metadata.SplitTransitionRecord,
+    ) !void {
+        var key_buf: [160]u8 = undefined;
+        const key = try splitTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
+        const encoded_existing = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (encoded_existing) |encoded| {
+            const existing = try decodeSplitTransitionRecord(self.alloc, encoded);
+            defer metadata_table_manager.freeSplitTransitionRecord(self.alloc, existing);
+            if (!splitTransitionUpdateAllowed(existing, record)) return;
+        }
+
+        const value = try encodeSplitTransitionRecord(self.alloc, record);
+        defer self.alloc.free(value);
+        try txn.put(key, value);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        self.notifyProjectionListeners(.{
+            .kind = .split_transition,
+            .metadata_group_id = group_id,
+            .group_id = record.source_group_id,
+        });
+    }
+
+    fn applySplitTransitionRemovalTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        transition_id: u64,
+    ) !void {
+        var key_buf: [160]u8 = undefined;
+        const key = try splitTransitionKeyForGroup(&key_buf, group_id, transition_id);
+        const encoded = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        const existing = try decodeSplitTransitionRecord(self.alloc, encoded);
+        defer metadata_table_manager.freeSplitTransitionRecord(self.alloc, existing);
+        if (!transitionPhaseTerminal(existing.phase)) return;
+
+        try txn.delete(key);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        self.notifyProjectionListeners(.{
+            .kind = .split_transition,
+            .metadata_group_id = group_id,
+        });
+    }
+
+    fn applyMergeTransitionUpsertTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        record: metadata.MergeTransitionRecord,
+    ) !void {
+        var key_buf: [160]u8 = undefined;
+        const key = try mergeTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
+        const encoded_existing = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (encoded_existing) |encoded| {
+            const existing = try decodeMergeTransitionRecord(self.alloc, encoded);
+            defer metadata_table_manager.freeMergeTransitionRecord(self.alloc, existing);
+            if (!mergeTransitionUpdateAllowed(existing, record)) return;
+        }
+
+        const value = try encodeMergeTransitionRecord(self.alloc, record);
+        defer self.alloc.free(value);
+        try txn.put(key, value);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        self.notifyProjectionListeners(.{
+            .kind = .merge_transition,
+            .metadata_group_id = group_id,
+            .group_id = record.receiver_group_id,
+        });
+    }
+
+    fn applyMergeTransitionRemovalTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        transition_id: u64,
+    ) !void {
+        var key_buf: [160]u8 = undefined;
+        const key = try mergeTransitionKeyForGroup(&key_buf, group_id, transition_id);
+        const encoded = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        const existing = try decodeMergeTransitionRecord(self.alloc, encoded);
+        defer metadata_table_manager.freeMergeTransitionRecord(self.alloc, existing);
+        if (!transitionPhaseTerminal(existing.phase)) return;
+
+        try txn.delete(key);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        self.notifyProjectionListeners(.{
+            .kind = .merge_transition,
+            .metadata_group_id = group_id,
+        });
     }
 
     /// Atomically reserves the next source-local split epoch and publishes its
@@ -5064,7 +5130,38 @@ fn storeKeyForGroup(buf: []u8, group_id: u64, store_id: u64) ![]const u8 {
 }
 
 fn splitTransitionActive(record: metadata.SplitTransitionRecord) bool {
-    return record.phase != .finalized and record.phase != .rolled_back;
+    return !transitionPhaseTerminal(record.phase);
+}
+
+fn transitionPhaseTerminal(phase: metadata.TransitionPhase) bool {
+    return phase == .finalized or phase == .rolled_back;
+}
+
+fn transitionPhaseCanAdvance(existing: metadata.TransitionPhase, incoming: metadata.TransitionPhase) bool {
+    if (transitionPhaseTerminal(existing)) return incoming == existing;
+    if (existing == .rolling_back) return incoming == .rolling_back or incoming == .rolled_back;
+    if (transitionPhaseTerminal(incoming)) return true;
+    return @intFromEnum(incoming) >= @intFromEnum(existing);
+}
+
+fn splitTransitionUpdateAllowed(existing: metadata.SplitTransitionRecord, incoming: metadata.SplitTransitionRecord) bool {
+    return existing.transition_id == incoming.transition_id and
+        existing.attempt_epoch == incoming.attempt_epoch and
+        existing.source_group_id == incoming.source_group_id and
+        existing.destination_group_id == incoming.destination_group_id and
+        optionalBytesEqual(existing.split_key, incoming.split_key) and
+        optionalBytesEqual(existing.source_range_end, incoming.source_range_end) and
+        transitionPhaseCanAdvance(existing.phase, incoming.phase) and
+        !(existing.rollback_reason != null and incoming.rollback_reason == null);
+}
+
+fn mergeTransitionUpdateAllowed(existing: metadata.MergeTransitionRecord, incoming: metadata.MergeTransitionRecord) bool {
+    return existing.transition_id == incoming.transition_id and
+        existing.donor_group_id == incoming.donor_group_id and
+        existing.receiver_group_id == incoming.receiver_group_id and
+        existing.allow_doc_identity_reassignment == incoming.allow_doc_identity_reassignment and
+        transitionPhaseCanAdvance(existing.phase, incoming.phase) and
+        !(existing.rollback_reason != null and incoming.rollback_reason == null);
 }
 
 fn optionalBytesEqual(a: ?[]const u8, b: ?[]const u8) bool {
@@ -5104,7 +5201,7 @@ test "metadata raft apply store persists batches across reopen" {
     }
 }
 
-test "metadata raft apply store projects transition records from committed entries" {
+test "metadata raft apply store fences transition identity and active removal" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5165,37 +5262,140 @@ test "metadata raft apply store projects transition records from committed entri
         try std.testing.expect(merges[0].allow_doc_identity_reassignment);
     }
 
-    const remove_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+    const conflicting_split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_split_transition = .{
+            .transition_id = 501,
+            .attempt_epoch = 2,
+            .source_group_id = 21,
+            .destination_group_id = 22,
+            .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
+        },
+    });
+    defer std.testing.allocator.free(conflicting_split_cmd);
+    const regressive_merge_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_merge_transition = .{
+            .transition_id = 601,
+            .donor_group_id = 31,
+            .receiver_group_id = 30,
+            .phase = .prepare,
+            .allow_doc_identity_reassignment = true,
+        },
+    });
+    defer std.testing.allocator.free(regressive_merge_cmd);
+    const remove_active_split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .remove_split_transition = .{ .transition_id = 501 },
     });
-    defer std.testing.allocator.free(remove_cmd);
-    const encoded_remove = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 2, .index = 9, .entry_type = .normal, .data = remove_cmd },
+    defer std.testing.allocator.free(remove_active_split_cmd);
+    const remove_active_merge_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_merge_transition = .{ .transition_id = 601 },
     });
-    defer std.testing.allocator.free(encoded_remove);
+    defer std.testing.allocator.free(remove_active_merge_cmd);
+    const encoded_stale_commands = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 2, .index = 9, .entry_type = .normal, .data = conflicting_split_cmd },
+        .{ .term = 2, .index = 10, .entry_type = .normal, .data = regressive_merge_cmd },
+        .{ .term = 2, .index = 11, .entry_type = .normal, .data = remove_active_split_cmd },
+        .{ .term = 2, .index = 12, .entry_type = .normal, .data = remove_active_merge_cmd },
+    });
+    defer std.testing.allocator.free(encoded_stale_commands);
 
     {
         var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
         defer store.deinit();
         try store.snapshotBuilder().applyBatch(.{
             .group_id = 21,
-            .commit_index = 9,
-            .entries_bytes = encoded_remove,
+            .commit_index = 12,
+            .entries_bytes = encoded_stale_commands,
         });
-    }
 
-    {
-        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
-        defer store.deinit();
         const splits = try store.listSplitTransitions(std.testing.allocator, 21);
         defer store.freeSplitTransitions(std.testing.allocator, splits);
         const merges = try store.listMergeTransitions(std.testing.allocator, 21);
         defer store.freeMergeTransitions(std.testing.allocator, merges);
 
-        try std.testing.expectEqual(@as(usize, 0), splits.len);
+        try std.testing.expectEqual(@as(usize, 1), splits.len);
+        try std.testing.expectEqual(@as(u64, 1), splits[0].attempt_epoch);
+        try std.testing.expectEqual(metadata.TransitionPhase.bootstrap_peer, splits[0].phase);
         try std.testing.expectEqual(@as(usize, 1), merges.len);
-        try std.testing.expectEqual(@as(u64, 601), merges[0].transition_id);
-        try std.testing.expect(merges[0].allow_doc_identity_reassignment);
+        try std.testing.expectEqual(metadata.TransitionPhase.replay_deltas, merges[0].phase);
+    }
+
+    const finalize_split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_split_transition = .{
+            .transition_id = 501,
+            .attempt_epoch = 1,
+            .source_group_id = 21,
+            .destination_group_id = 22,
+            .phase = .finalized,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
+            .rollback_reason = "slow-peer",
+        },
+    });
+    defer std.testing.allocator.free(finalize_split_cmd);
+    const finalize_merge_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_merge_transition = .{
+            .transition_id = 601,
+            .donor_group_id = 31,
+            .receiver_group_id = 30,
+            .phase = .finalized,
+            .allow_doc_identity_reassignment = true,
+        },
+    });
+    defer std.testing.allocator.free(finalize_merge_cmd);
+    const encoded_terminal = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 2, .index = 13, .entry_type = .normal, .data = finalize_split_cmd },
+        .{ .term = 2, .index = 14, .entry_type = .normal, .data = finalize_merge_cmd },
+    });
+    defer std.testing.allocator.free(encoded_terminal);
+
+    {
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer store.deinit();
+        try store.snapshotBuilder().applyBatch(.{
+            .group_id = 21,
+            .commit_index = 14,
+            .entries_bytes = encoded_terminal,
+        });
+
+        const splits = try store.listSplitTransitions(std.testing.allocator, 21);
+        defer store.freeSplitTransitions(std.testing.allocator, splits);
+        const merges = try store.listMergeTransitions(std.testing.allocator, 21);
+        defer store.freeMergeTransitions(std.testing.allocator, merges);
+        try std.testing.expectEqual(metadata.TransitionPhase.finalized, splits[0].phase);
+        try std.testing.expectEqual(metadata.TransitionPhase.finalized, merges[0].phase);
+    }
+
+    const remove_split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_split_transition = .{ .transition_id = 501 },
+    });
+    defer std.testing.allocator.free(remove_split_cmd);
+    const remove_merge_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_merge_transition = .{ .transition_id = 601 },
+    });
+    defer std.testing.allocator.free(remove_merge_cmd);
+    const encoded_terminal_remove = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 3, .index = 15, .entry_type = .normal, .data = remove_split_cmd },
+        .{ .term = 3, .index = 16, .entry_type = .normal, .data = remove_merge_cmd },
+    });
+    defer std.testing.allocator.free(encoded_terminal_remove);
+
+    {
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer store.deinit();
+        try store.snapshotBuilder().applyBatch(.{
+            .group_id = 21,
+            .commit_index = 16,
+            .entries_bytes = encoded_terminal_remove,
+        });
+
+        const splits = try store.listSplitTransitions(std.testing.allocator, 21);
+        defer store.freeSplitTransitions(std.testing.allocator, splits);
+        const merges = try store.listMergeTransitions(std.testing.allocator, 21);
+        defer store.freeMergeTransitions(std.testing.allocator, merges);
+        try std.testing.expectEqual(@as(usize, 0), splits.len);
+        try std.testing.expectEqual(@as(usize, 0), merges.len);
     }
 }
 
