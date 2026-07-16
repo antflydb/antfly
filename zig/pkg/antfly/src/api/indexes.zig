@@ -1675,6 +1675,7 @@ const EmbeddingsRuntimeView = struct {
     replay_applied_sequence: u64,
     replay_target_sequence: u64,
     replay_catch_up_required: bool,
+    coverage_policy_failed: bool = false,
 };
 
 const CoverageEvaluation = struct {
@@ -1685,6 +1686,7 @@ const CoverageEvaluation = struct {
     degraded: bool,
     source_visible: bool,
     counters_valid: bool,
+    all_sources_terminal: bool,
 };
 
 const CoverageIncompleteReason = enum {
@@ -1738,6 +1740,7 @@ fn evaluateCoverage(
         .degraded = complete and terminal_failed > 0,
         .source_visible = source_total == 0 or policy_covered > 0,
         .counters_valid = counters_valid,
+        .all_sources_terminal = all_sources_terminal,
     };
 }
 
@@ -1746,6 +1749,7 @@ test "derived coverage evaluation is policy exact and observation gated" {
     try std.testing.expectEqual(@as(u64, 1), strict.covered);
     try std.testing.expectEqual(@as(?u64, 2), strict.pending);
     try std.testing.expect(!strict.complete);
+    try std.testing.expect(strict.all_sources_terminal);
 
     const partial = evaluateCoverage(.partial, 3, 1, 2, 0, true, true);
     try std.testing.expectEqual(@as(u64, 3), partial.covered);
@@ -1765,6 +1769,7 @@ test "derived coverage evaluation is policy exact and observation gated" {
     try std.testing.expectEqual(@as(?u64, null), incomplete_observation.pending);
     try std.testing.expect(!incomplete_observation.complete);
     try std.testing.expect(!incomplete_observation.healthy);
+    try std.testing.expect(incomplete_observation.all_sources_terminal);
 
     const excess_outcomes = evaluateCoverage(.partial, 2, 2, 1, 0, true, true);
     try std.testing.expectEqual(@as(u64, 3), excess_outcomes.covered);
@@ -1780,6 +1785,41 @@ test "derived coverage evaluation is policy exact and observation gated" {
     const external_complete = evaluateCoverage(.external, 3, 3, 0, 0, true, true);
     try std.testing.expect(external_complete.complete);
     try std.testing.expect(external_complete.healthy);
+}
+
+test "strict terminal coverage stops backfill as failed" {
+    const item = .{
+        .backfill_active = true,
+        .backfill_progress = 0.5,
+        .replay_applied_sequence = @as(u64, 9),
+        .replay_target_sequence = @as(u64, 9),
+        .replay_catch_up_required = false,
+        .coverage_produced_count = @as(u64, 1),
+        .coverage_skipped_count = @as(u64, 1),
+        .coverage_terminal_failed_count = @as(u64, 0),
+        .coverage_summary_ready = true,
+        .coverage_config_mismatch_count = @as(u64, 0),
+        .coverage_generation = @as(u64, 7),
+        .coverage_config_hash = @as(u64, 11),
+        .missing_group_count = @as(u64, 0),
+        .remote_unknown_group_count = @as(u64, 0),
+        .unknown_group_count = @as(u64, 0),
+        .stale_group_count = @as(u64, 0),
+        .expected_group_count = @as(u64, 1),
+        .fresh_group_count = @as(u64, 1),
+        .doc_count = @as(u64, 1),
+        .node_count = @as(u64, 1),
+        .root_node = @as(u64, 1),
+    };
+    const strict = embeddingsRuntimeView(item, 2, .strict, false, 7, 11, null, true);
+    try std.testing.expect(strict.coverage_policy_failed);
+    try std.testing.expect(!strict.backfill_active);
+    try std.testing.expectEqual(@as(f64, 1.0), strict.backfill_progress);
+    try std.testing.expect(!strict.replay_catch_up_required);
+
+    const partial = embeddingsRuntimeView(item, 2, .partial, false, 7, 11, null, true);
+    try std.testing.expect(!partial.coverage_policy_failed);
+    try std.testing.expect(!partial.backfill_active);
 }
 
 test "derived coverage aggregation rejects mixed config observations" {
@@ -2053,6 +2093,31 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         view.backfill_progress = 1.0;
         return view;
     }
+    const terminal_coverage = evaluateCoverage(
+        coverage_policy,
+        table_doc_count,
+        produced_count,
+        skipped_count,
+        terminal_failed_count,
+        !coverage_incomplete,
+        coverageReplayCurrent(view.replay_applied_sequence, view.replay_target_sequence, view.replay_catch_up_required),
+    );
+    // A strict (or partial) policy can reject a fully observed set of terminal
+    // source outcomes. That is a durable policy failure, not replay work. Keep
+    // the rejected outcomes pending in coverage while stopping the backfill
+    // spinner once replay and enrichment have both settled.
+    if (coverage_policy != .external and
+        terminal_coverage.all_sources_terminal and
+        !terminal_coverage.complete and
+        !enrichment_pending)
+    {
+        view.coverage_policy_failed = true;
+        view.replay_applied_sequence = @max(view.replay_applied_sequence, view.replay_target_sequence);
+        view.replay_catch_up_required = false;
+        view.backfill_active = false;
+        view.backfill_progress = 1.0;
+        return view;
+    }
     const replay_ready = view.replay_target_sequence > 0 and
         view.replay_target_sequence <= view.replay_applied_sequence and
         !(if (enrichment) |stats| stats.retrying or stats.worker_failed else false);
@@ -2307,6 +2372,7 @@ fn appendSingleIndexRuntimeStatus(
     var replay_applied_sequence = if (embeddings_view) |view| view.replay_applied_sequence else item.replay_applied_sequence;
     var replay_target_sequence = if (embeddings_view) |view| view.replay_target_sequence else item.replay_target_sequence;
     var replay_catch_up_required = if (embeddings_view) |view| view.replay_catch_up_required else item.replay_catch_up_required;
+    const coverage_policy_failed = if (embeddings_view) |view| view.coverage_policy_failed else false;
     const dense_catch_up = async_indexing.dense_catch_up;
     var catch_up_active = item.catch_up_active;
     var catch_up_phase = item.catch_up_phase;
@@ -2402,13 +2468,16 @@ fn appendSingleIndexRuntimeStatus(
     } else if (repair_state != null and std.mem.eql(u8, repair_state.?, "waiting")) {
         try appendJsonString(alloc, out, "retrying");
     } else {
-        try appendJsonString(alloc, out, backfillState(index_type, backfill_active, item.enrichment_failed, replay_applied_sequence, replay_target_sequence, enrichment));
+        try appendJsonString(alloc, out, backfillState(index_type, backfill_active, item.enrichment_failed or coverage_policy_failed, replay_applied_sequence, replay_target_sequence, enrichment));
     }
     if (load_error) |err_name| {
         const msg = try std.fmt.allocPrint(alloc, "load failed: {s}", .{err_name});
         defer alloc.free(msg);
         try out.appendSlice(alloc, ",\"error\":");
         try appendJsonString(alloc, out, msg);
+    } else if (coverage_policy_failed) {
+        try out.appendSlice(alloc, ",\"error\":");
+        try appendJsonString(alloc, out, "coverage policy unsatisfied: terminal source outcomes are not accepted");
     }
     if (repair_state) |state| {
         try out.appendSlice(alloc, ",\"repair\":{\"state\":");

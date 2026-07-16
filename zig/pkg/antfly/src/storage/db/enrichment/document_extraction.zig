@@ -69,6 +69,7 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
             pub const PageTextAnalysis = struct {
                 text: []u8,
                 runs: []TextRun,
+                outline_fallback: bool = false,
 
                 pub fn deinit(_: *PageTextAnalysis, _: Allocator) void {}
             };
@@ -472,6 +473,26 @@ pub fn assessOcrQuality(text: []const u8, config: OcrQualityConfig) OcrQuality {
     if (codepoints > 0) out.replacement_char_ratio = @as(f64, @floatFromInt(replacements)) / @as(f64, @floatFromInt(codepoints));
     out.replacement_corrupted = out.replacement_char_ratio > config.max_replacement_char_ratio;
     return out;
+}
+
+pub fn hasMeaningfulOcrContent(text: []const u8) bool {
+    const view = std.unicode.Utf8View.init(text) catch return false;
+    var iter = view.iterator();
+    while (iter.nextCodepoint()) |cp| {
+        if (cp < 0x80) {
+            if (std.ascii.isAlphanumeric(@intCast(cp))) return true;
+            continue;
+        }
+        if ((cp >= 0x00c0 and cp <= 0x02af) or
+            (cp >= 0x0370 and cp <= 0x052f) or
+            (cp >= 0x0590 and cp <= 0x0e7f) or
+            (cp >= 0x3040 and cp <= 0x30ff) or
+            (cp >= 0x3400 and cp <= 0x4dbf) or
+            (cp >= 0x4e00 and cp <= 0x9fff) or
+            (cp >= 0xac00 and cp <= 0xd7af) or
+            (cp >= 0xf900 and cp <= 0xfaff)) return true;
+    }
+    return false;
 }
 
 fn fontCorruptionScore(text_raw: []const u8) f64 {
@@ -1274,6 +1295,11 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
         errdefer alloc.free(text);
         const text_regions: []TextRegion = try extractPdfTextRegionsFromRunsAlloc(alloc, analysis.runs, text);
         errdefer if (text_regions.len > 0) alloc.free(text_regions);
+        const extraction_warning: ?[]u8 = if (analysis.outline_fallback)
+            try alloc.dupe(u8, "embedded_font_outline_unsupported")
+        else
+            null;
+        errdefer if (extraction_warning) |value| alloc.free(value);
         const page_box = parsed.extractPageBox(page_num) catch null;
         const page_rotation = parsed.extractPageRotation(page_num) catch null;
         const char_start = std.math.cast(u32, cursor);
@@ -1299,6 +1325,7 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
             .ocr_used = false,
             .ocr_trigger_reasons = if (scanned_page) try ocrTriggerReasonsAlloc(alloc, quality, force_ocr) else null,
             .ocr_embedded_quality = if (scanned_page) try ocrQualityJsonAlloc(alloc, quality) else null,
+            .extraction_warning = extraction_warning,
             .page_number = @intCast(page_num),
             .page_label = page_label.?,
             .page_bbox = if (page_box) |box| .{ box.min_x, box.min_y, box.max_x, box.max_y } else null,
@@ -1345,6 +1372,11 @@ fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []cons
         errdefer alloc.free(text);
         var text_regions: []TextRegion = try extractPdfTextRegionsFromRunsAlloc(alloc, analysis.runs, text);
         errdefer if (text_regions.len > 0) alloc.free(text_regions);
+        var extraction_warning: ?[]u8 = if (analysis.outline_fallback)
+            try alloc.dupe(u8, "embedded_font_outline_unsupported")
+        else
+            null;
+        errdefer if (extraction_warning) |value| alloc.free(value);
         const page_text_len = text.len;
         const page_box = parsed.extractPageBox(page_num) catch null;
         const page_rotation = parsed.extractPageRotation(page_num) catch null;
@@ -1371,6 +1403,7 @@ fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []cons
             .ocr_used = false,
             .ocr_trigger_reasons = if (scanned_page) try ocrTriggerReasonsAlloc(alloc, quality, force_ocr) else null,
             .ocr_embedded_quality = if (scanned_page) try ocrQualityJsonAlloc(alloc, quality) else null,
+            .extraction_warning = extraction_warning,
             .page_number = @intCast(page_num),
             .page_label = page_label.?,
             .page_bbox = if (page_box) |box| .{ box.min_x, box.min_y, box.max_x, box.max_y } else null,
@@ -1386,6 +1419,7 @@ fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []cons
         page_label = null;
         text = &.{};
         text_regions = &.{};
+        extraction_warning = null;
         errdefer unit.deinit(alloc);
         try sink.on_unit(sink.ptr, &unit);
         unit.deinit(alloc);
@@ -3386,6 +3420,13 @@ test "OCR text selection retains embedded text on ties and chooses a better tran
     try std.testing.expect(trivial_ocr.too_short);
     try std.testing.expect(!embedded.too_short);
     try std.testing.expect(!preferOcrText(embedded, trivial_ocr));
+}
+
+test "OCR meaningful content rejects punctuation while retaining text and table values" {
+    try std.testing.expect(!hasMeaningfulOcrContent(""));
+    try std.testing.expect(!hasMeaningfulOcrContent(" - … | "));
+    try std.testing.expect(hasMeaningfulOcrContent("Revenue | 2025 | $42"));
+    try std.testing.expect(hasMeaningfulOcrContent("扫描表格"));
 }
 
 test "OCR options parse configurable thresholds resolution model and explicit prompt" {

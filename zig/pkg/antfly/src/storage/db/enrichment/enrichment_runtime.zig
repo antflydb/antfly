@@ -2362,6 +2362,7 @@ fn processDocumentExtractionAsset(
                 config.content_type,
                 @errorName(err),
                 "remote content download failed",
+                "remote_content_download",
                 manifest_key,
                 state_key,
                 previous_child_ranges,
@@ -2386,6 +2387,7 @@ fn processDocumentExtractionAsset(
                 config.content_type,
                 "RemoteDocumentFetchFailed",
                 message,
+                "remote_content_http",
                 manifest_key,
                 state_key,
                 previous_child_ranges,
@@ -2456,6 +2458,7 @@ fn processDocumentExtractionAsset(
             if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type,
             @errorName(err),
             "document extraction failed",
+            documentExtractionFailureStage(err, "document_extraction"),
             manifest_key,
             state_key,
             previous_child_ranges,
@@ -2628,6 +2631,7 @@ fn processDocumentExtractionAsset(
             collect_ctx.info.content_type,
             @errorName(err),
             "document extraction materialization failed",
+            documentExtractionFailureStage(err, "document_materialization"),
             manifest_key,
             state_key,
             previous_child_ranges,
@@ -2704,6 +2708,37 @@ fn processDocumentExtractionAsset(
     clearRuntimeKVBatch(runtime, &writes, &deletes);
 }
 
+fn documentExtractionFailureStage(err: anyerror, fallback: []const u8) []const u8 {
+    return switch (err) {
+        error.InvalidFlateStream,
+        error.MalformedLzw,
+        error.MalformedPredictorData,
+        error.MalformedRunLength,
+        error.MalformedAscii85,
+        error.MalformedAsciiHex,
+        error.UnsupportedStreamFilter,
+        error.UnsupportedPredictor,
+        error.DecodedStreamTooLarge,
+        => "pdf_stream_decode",
+        error.UnsupportedPdfRendering,
+        error.RenderedPageTooLarge,
+        error.InvalidPageBox,
+        => "pdf_page_render",
+        error.InvalidType1,
+        error.TruncatedType1,
+        error.UnsupportedType1,
+        => "pdf_font_outline",
+        error.InvalidPdfHeader,
+        error.InvalidXref,
+        error.MalformedXrefStream,
+        error.MalformedXrefTable,
+        error.InvalidObjectStream,
+        error.InvalidPageTree,
+        => "pdf_structure",
+        else => fallback,
+    };
+}
+
 fn writeDocumentExtractionFailureManifest(
     runtime: *EnrichmentRuntime,
     doc_key: []const u8,
@@ -2713,6 +2748,7 @@ fn writeDocumentExtractionFailureManifest(
     content_type: []const u8,
     error_code: []const u8,
     error_message: []const u8,
+    error_stage: []const u8,
     manifest_key: []const u8,
     state_key: []const u8,
     previous_child_ranges: []const types.DocumentArtifactChildRange,
@@ -2753,7 +2789,7 @@ fn writeDocumentExtractionFailureManifest(
         from_generation,
         to_generation,
         "failed",
-        .{ .code = error_code, .message = error_message },
+        .{ .code = error_code, .message = error_message, .stage = error_stage },
     );
     defer runtime.alloc.free(manifest);
 
@@ -3041,7 +3077,7 @@ fn flushRuntimeGeneratedTextBatch(
         produced[i] = &.{};
         applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], item, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
             if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
-            try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[unit_idx], kind, "inference");
+            try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
             try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
         };
     }
@@ -3068,14 +3104,14 @@ fn flushRuntimeGeneratedTextBatchSequential(
         const produced = producer.produce(runtime.alloc, request) catch |err| {
             logRuntimeOcrBatchProfile(runtime, profile_source_id, units, &.{unit_idx}, 1, runtimeGeneratedTextRequestBytes(request), "serial", @errorName(err), started_ns);
             if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
-            try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[unit_idx], kind, "inference");
+            try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
             try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
             continue;
         };
         logRuntimeOcrBatchProfile(runtime, profile_source_id, units, &.{unit_idx}, 1, runtimeGeneratedTextRequestBytes(request), "serial", fallback_reason, started_ns);
         applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], produced, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
             if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
-            try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[unit_idx], kind, "inference");
+            try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
             try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
         };
     }
@@ -3220,6 +3256,7 @@ fn applyRuntimeGeneratedUnitText(
     var parsed = try parseRuntimeGeneratedUnitTextOutputAlloc(alloc, produced);
     errdefer parsed.deinit(alloc);
     if (kind == .ocr and document_extraction_mod.isOcrPromptEcho(parsed.text, ocr_prompt)) return error.OcrPromptEcho;
+    if (kind == .ocr and !document_extraction_mod.hasMeaningfulOcrContent(parsed.text)) return error.TrivialOcrOutput;
     if (kind == .ocr and !std.mem.eql(u8, unit.unit_type, "image")) {
         unit.ocr_attempted = true;
         const embedded_quality = document_extraction_mod.assessOcrQuality(unit.text, quality_config);
@@ -3338,6 +3375,13 @@ fn setRuntimeGeneratedUnitFailureStage(
     const owned = try alloc.dupe(u8, stage);
     if (unit.ocr_failure_stage) |value| alloc.free(value);
     unit.ocr_failure_stage = owned;
+}
+
+fn runtimeGeneratedTextFailureStage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.OcrPromptEcho, error.TrivialOcrOutput => "ocr_output_validation",
+        else => "inference",
+    };
 }
 
 const RuntimeParsedGeneratedUnitText = struct {
@@ -5151,7 +5195,15 @@ fn processMaterializedChunkDenseRequest(
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
-    if (desired_chunk_keys.count() == 0) try markDerivedCoverageSkipped(runtime, window, request.doc_key, consumer_indexes);
+    if (desired_chunk_keys.count() == 0) {
+        try queueDerivedCoverageOutcome(
+            runtime,
+            window,
+            request.doc_key,
+            consumer_indexes,
+            try materializedChunkEmptyCoverageOutcome(runtime, request, chunk_artifact_name),
+        );
+    }
     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
 }
 
@@ -5362,7 +5414,15 @@ fn processMaterializedChunkSparseRequest(
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
-    if (desired_chunk_keys.count() == 0) try markDerivedCoverageSkipped(runtime, window, request.doc_key, consumer_indexes);
+    if (desired_chunk_keys.count() == 0) {
+        try queueDerivedCoverageOutcome(
+            runtime,
+            window,
+            request.doc_key,
+            consumer_indexes,
+            try materializedChunkEmptyCoverageOutcome(runtime, request, chunk_artifact_name),
+        );
+    }
     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
 }
 
@@ -7276,6 +7336,60 @@ fn documentExtractionManifestHasLastError(alloc: Allocator, manifest_json: []con
     return parsed.value.object.get("last_error") != null;
 }
 
+fn documentExtractionEmptyCoverageOutcome(alloc: Allocator, manifest_json: []const u8) !CoverageOutcome {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentExtractionManifest;
+    const object = parsed.value.object;
+    if (object.get("last_error") != null) return .terminal_failed;
+    if (object.get("merge_status")) |value| {
+        if (value == .string and std.mem.eql(u8, value.string, "failed")) return .terminal_failed;
+    }
+    if (object.get("route_type")) |value| {
+        if (value == .string and std.mem.eql(u8, value.string, "error")) return .terminal_failed;
+    }
+    const chunk_count = try jsonObjectU64(object, "chunk_count");
+    const ocr_failed_count = try jsonObjectU64(object, "ocr_failed_count");
+    const failed_pages = if (object.get("ocr_failed_page_numbers")) |value|
+        if (value == .array) value.array.items.len else 0
+    else
+        0;
+    if (chunk_count == 0 and (ocr_failed_count > 0 or failed_pages > 0)) return .terminal_failed;
+    return .skipped;
+}
+
+fn materializedChunkEmptyCoverageOutcome(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    chunk_artifact_name: []const u8,
+) !CoverageOutcome {
+    const chunk_cfg = runtime.index_manager.getEnrichment(.chunk, chunk_artifact_name) orelse return .skipped;
+    if (chunk_cfg.source_artifact_name.len == 0) return .skipped;
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", chunk_cfg.source_artifact_name);
+    defer runtime.alloc.free(manifest_key);
+    const manifest = storeGetAlloc(runtime, manifest_key) catch |err| switch (err) {
+        std.mem.Allocator.Error.OutOfMemory => return err,
+        else => return .skipped,
+    };
+    defer runtime.alloc.free(manifest);
+    return documentExtractionEmptyCoverageOutcome(runtime.alloc, manifest);
+}
+
+test "empty document extraction coverage distinguishes skip and terminal failure" {
+    try std.testing.expectEqual(
+        CoverageOutcome.skipped,
+        try documentExtractionEmptyCoverageOutcome(std.testing.allocator, "{\"route_type\":\"pdf\",\"merge_status\":\"converged\",\"chunk_count\":0,\"ocr_failed_count\":0}"),
+    );
+    try std.testing.expectEqual(
+        CoverageOutcome.terminal_failed,
+        try documentExtractionEmptyCoverageOutcome(std.testing.allocator, "{\"route_type\":\"error\",\"merge_status\":\"failed\",\"chunk_count\":0,\"ocr_failed_count\":0,\"last_error\":{\"code\":\"InvalidFlateStream\"}}"),
+    );
+    try std.testing.expectEqual(
+        CoverageOutcome.terminal_failed,
+        try documentExtractionEmptyCoverageOutcome(std.testing.allocator, "{\"route_type\":\"pdf\",\"merge_status\":\"converged\",\"chunk_count\":0,\"ocr_failed_count\":1,\"ocr_failed_page_numbers\":[7]}"),
+    );
+}
+
 fn jsonObjectStringDup(alloc: Allocator, object: std.json.ObjectMap, field_name: []const u8) ![]u8 {
     const value = object.get(field_name) orelse return "";
     if (value != .string) return "";
@@ -7694,6 +7808,7 @@ fn appendDocumentExtractionMergeOperation(
 const DocumentExtractionLastError = struct {
     code: []const u8,
     message: []const u8,
+    stage: ?[]const u8 = null,
 };
 
 fn documentExtractionManifestPayloadAlloc(
@@ -7740,6 +7855,7 @@ fn documentExtractionManifestPayloadAlloc(
         var error_first = true;
         try appendJsonFieldString(alloc, &out, &error_first, "code", value.code);
         try appendJsonFieldString(alloc, &out, &error_first, "message", value.message);
+        if (value.stage) |stage| try appendJsonFieldString(alloc, &out, &error_first, "stage", stage);
         try out.append(alloc, '}');
     }
     try appendJsonFieldUsize(alloc, &out, &first, "unit_count", if (unit_text_lengths.len > 0) unit_text_lengths.len else extraction.units.len);
