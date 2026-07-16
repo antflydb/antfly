@@ -48,6 +48,13 @@ const ha_lease_poll_interval_ns: u64 = 2 * std.time.ns_per_s;
 const ha_lease_request_timeout_ms: u32 = 1_000;
 const ha_lease_timing_jitter_ns: u64 = std.time.ns_per_s;
 const ha_lease_min_grace_ms: u64 = 10_000;
+const ha_lease_http_executor_config: antfly.common.http.StdHttpExecutorConfig = .{
+    .max_response_bytes = 256 * 1024,
+    // Use the client carrying the projected Kubernetes CA, but force every
+    // request to close so the watchdog does not retain API-server connections.
+    .keep_alive = true,
+    .max_requests_per_connection = 1,
+};
 
 var termination_requested: std.atomic.Value(bool) = .init(false);
 
@@ -236,10 +243,7 @@ const RuntimeLeaseWatchdog = struct {
         var entropy: [32]u8 = undefined;
         try io.randomSecure(&entropy);
         const process_boot_id = std.fmt.bytesToHex(entropy, .lower);
-        var executor = antfly.common.http.StdHttpExecutor.init(alloc, .{
-            .max_response_bytes = 256 * 1024,
-            .keep_alive = false,
-        });
+        var executor = antfly.common.http.StdHttpExecutor.init(alloc, ha_lease_http_executor_config);
         errdefer executor.deinit();
         try antfly.ha.kubernetes_lease_watchdog.configureKubernetesCA(
             &executor,
@@ -5950,4 +5954,9 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
         try std.testing.expectEqual(@as(i64, 0), proof.observed_lease_transitions);
         try std.testing.expectEqual(@as(usize, 0), proof.observed_holder_node_id.len);
     }
+}
+
+test "runtime lease watchdog uses configured client without reusing connections" {
+    try std.testing.expect(ha_lease_http_executor_config.keep_alive);
+    try std.testing.expectEqual(@as(u32, 1), ha_lease_http_executor_config.max_requests_per_connection);
 }

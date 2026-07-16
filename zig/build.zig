@@ -5268,6 +5268,7 @@ pub fn build(b: *std.Build) void {
             "standalone metadata rolls back an undurable catalog mutation",
             "standalone unified server lifecycle propagates startup failure",
             "runtime lease watchdog fetch and validation failures publish no bootstrap capability",
+            "runtime lease watchdog uses configured client without reusing connections",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
