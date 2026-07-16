@@ -10580,6 +10580,17 @@ func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpe
 	}
 	volumeMounts, volumes := haAdminJobStorage(cluster, admin, action)
 	labels := haAdminJobLabels(cluster, action)
+	podTemplateLabels := maps.Clone(labels)
+	if kind := haActionKind(action.Kind); kind == haActionPublishSeedArtifact || kind == haActionGCSourceSeedGenerations {
+		// Source-PVC jobs must co-locate with the exact live RWO consumer.
+		// Runtime identity labels make them match the AntflyCluster pods'
+		// required self anti-affinity, producing an impossible placement:
+		// podAffinity requires the source node while podAntiAffinity rejects it.
+		// Keep those labels on the Job object for ownership/discovery, but do not
+		// project runtime topology identity onto the Job's executable Pod.
+		delete(podTemplateLabels, "cloud.antfly.io/instance-id")
+		delete(podTemplateLabels, "app.kubernetes.io/instance")
+	}
 	annotations := map[string]string{
 		"antfly.io/ha-action-kind":  action.Kind,
 		"antfly.io/ha-admin-url":    action.AdminURL,
@@ -10610,7 +10621,7 @@ func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpe
 			ActiveDeadlineSeconds: &deadlineSeconds,
 			BackoffLimit:          &backoffLimit,
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels, Annotations: maps.Clone(seedIdentityAnnotations)},
+				ObjectMeta: metav1.ObjectMeta{Labels: podTemplateLabels, Annotations: maps.Clone(seedIdentityAnnotations)},
 				Spec: corev1.PodSpec{
 					ServiceAccountName: cluster.Spec.ServiceAccountName,
 					RestartPolicy:      corev1.RestartPolicyNever,

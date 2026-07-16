@@ -4925,7 +4925,13 @@ func TestPortableArtifactJobFollowsLiveRWOConsumerPod(t *testing.T) {
 	g.Expect(corev1.AddToScheme(s)).To(Succeed())
 
 	cluster := &antflyv1.AntflyCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "primary", Namespace: "default",
+			Labels: map[string]string{
+				"cloud.antfly.io/instance-id": "cloud-instance-a",
+				"cloud.antfly.io/org-id":      "org-a",
+			},
+		},
 		Spec: antflyv1.AntflyClusterSpec{Image: "antfly:test", HighAvailability: &antflyv1.HighAvailabilitySpec{
 			Standbys: []antflyv1.HAStandbySpec{{Name: "standby-a", SeedArtifact: &antflyv1.HASeedArtifactSpec{
 				Location: "s3://ha-seeds/cluster-a", StagingRoot: "/target/staging",
@@ -4939,6 +4945,21 @@ func TestPortableArtifactJobFollowsLiveRWOConsumerPod(t *testing.T) {
 	}
 	job := buildHAAdminJob(cluster, &antflyv1.HAAdminSpec{}, action)
 	g.Expect(job.Spec.Template.Spec.Affinity).To(BeNil(), "placement depends on live PVC consumers, not claim-name guessing")
+	g.Expect(job.Labels).To(HaveKeyWithValue("cloud.antfly.io/instance-id", "cloud-instance-a"))
+	g.Expect(job.Labels).To(HaveKeyWithValue("app.kubernetes.io/instance", "primary"))
+	g.Expect(job.Spec.Template.Labels).NotTo(HaveKey("cloud.antfly.io/instance-id"),
+		"source-PVC Jobs must not match the runtime's required cloud-instance self anti-affinity")
+	g.Expect(job.Spec.Template.Labels).NotTo(HaveKey("app.kubernetes.io/instance"),
+		"source-PVC Jobs must not inherit runtime identity selectors")
+	g.Expect(job.Spec.Template.Labels).To(HaveKeyWithValue("antfly.io/ha-action-kind", "publishseedartifact"))
+	g.Expect(job.Spec.Template.Labels).To(HaveKeyWithValue("app.kubernetes.io/component", "ha-admin"))
+	gcAction := action
+	gcAction.Kind = string(haActionGCSourceSeedGenerations)
+	gcJob := buildHAAdminJob(cluster, &antflyv1.HAAdminSpec{}, gcAction)
+	g.Expect(gcJob.Labels).To(HaveKeyWithValue("cloud.antfly.io/instance-id", "cloud-instance-a"))
+	g.Expect(gcJob.Spec.Template.Labels).NotTo(HaveKey("cloud.antfly.io/instance-id"))
+	g.Expect(gcJob.Spec.Template.Labels).NotTo(HaveKey("app.kubernetes.io/instance"))
+	g.Expect(gcJob.Spec.Template.Labels).To(HaveKeyWithValue("antfly.io/ha-action-kind", "gcsourceseedgenerations"))
 
 	consumer := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
