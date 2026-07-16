@@ -88,6 +88,7 @@ const metadata_server = @import("../metadata/server.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const query_embedding_cache = @import("../inference/query_embedding_cache.zig");
 const cache_budget = @import("../common/cache_budget.zig");
+const resource_manager_mod = @import("../storage/resource_manager.zig");
 const connections_api = @import("connections.zig");
 const common_config = @import("../common/config.zig");
 const generating_runtime = @import("../generating/mod.zig");
@@ -327,11 +328,9 @@ pub const ApiHttpServerConfig = struct {
     session_savepoint_limit: ?usize = null,
     session_max_count: ?usize = null,
     session_max_record_bytes: ?usize = null,
-    /// Explicit override for query embedding caching. When null, values come
-    /// from node_config.inference.query_embedding_cache or built-in defaults.
-    query_embedding_cache: ?query_embedding_cache.Config = null,
-    /// Optional node-wide coordinator. The owner must outlive ApiHttpServer.
-    inference_cache_budget: ?*cache_budget.CacheBudget = null,
+    /// Optional node-wide resource owner. The owner must outlive ApiHttpServer.
+    /// Cache budgets and concurrency are intentionally not HTTP/API config.
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
 
 pub const trusted_principal_header = "X-Antfly-Trusted-Principal";
@@ -1163,8 +1162,8 @@ pub const ApiHttpServer = struct {
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
-    local_inference_cache_budget: cache_budget.CacheBudget,
-    shared_inference_cache_budget: ?*cache_budget.CacheBudget,
+    local_resource_manager: resource_manager_mod.ResourceManager,
+    shared_resource_manager: ?*resource_manager_mod.ResourceManager,
     query_embedding_cache: query_embedding_cache.QueryEmbeddingCache,
 
     pub const RequestStats = struct {
@@ -1272,8 +1271,8 @@ pub const ApiHttpServer = struct {
             .restore_job_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
             .session_maintenance_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
             .connections_cache = connections_api.Cache.init(owner_alloc),
-            .local_inference_cache_budget = cache_budget.CacheBudget.init(effective_query_embedding_cache.max_bytes),
-            .shared_inference_cache_budget = cfg.inference_cache_budget,
+            .local_resource_manager = resource_manager_mod.ResourceManager.init(.{}),
+            .shared_resource_manager = cfg.resource_manager,
             .query_embedding_cache = query_embedding_cache.QueryEmbeddingCache.init(owner_alloc, queryEmbeddingCacheIo(cfg), effective_query_embedding_cache),
             .mcp_sessions = mcp.InMemorySessionStore.init(owner_alloc),
             .a2a_tasks = a2a.InMemoryTaskStore.init(owner_alloc),
@@ -1281,14 +1280,13 @@ pub const ApiHttpServer = struct {
     }
 
     fn effectiveQueryEmbeddingCacheConfig(cfg: ApiHttpServerConfig) query_embedding_cache.Config {
-        if (cfg.query_embedding_cache) |explicit| return explicit;
-        const node_config = cfg.node_config orelse return .{};
-        const configured = node_config.inference.query_embedding_cache;
+        const manager = cfg.resource_manager orelse return .{};
+        const policy = manager.queryEmbeddingPolicy();
         return .{
-            .enabled = configured.enabled,
-            .max_bytes = std.math.mul(usize, configured.max_bytes_mb, 1024 * 1024) catch std.math.maxInt(usize),
-            .ttl_ns = configured.ttl_ms * std.time.ns_per_ms,
-            .max_inflight = configured.max_inflight,
+            .enabled = policy.enabled,
+            .max_bytes = manager.queryEmbeddingCacheBudget().max_bytes,
+            .ttl_ns = policy.ttl_ns,
+            .max_inflight = policy.max_inflight,
         };
     }
 
@@ -1452,6 +1450,7 @@ pub const ApiHttpServer = struct {
         }
         self.connections_cache.deinit();
         self.query_embedding_cache.deinit(self.inferenceCacheBudget());
+        self.local_resource_manager.deinit(self.owner_alloc);
         self.* = undefined;
     }
 
@@ -1510,7 +1509,8 @@ pub const ApiHttpServer = struct {
     }
 
     fn inferenceCacheBudget(self: *ApiHttpServer) *cache_budget.CacheBudget {
-        return self.shared_inference_cache_budget orelse &self.local_inference_cache_budget;
+        const manager = self.shared_resource_manager orelse &self.local_resource_manager;
+        return manager.queryEmbeddingCacheBudget();
     }
 
     pub fn semanticStatusResolver(
@@ -1669,6 +1669,13 @@ pub const ApiHttpServer = struct {
         if (!self.mutationBackgroundExecutionPermitted()) return;
         try self.maybeCleanupExpiredSessions();
         try self.maybeRenewOwnedSessionLeases();
+        // Durable named-index cancellation is correctness work, not a client
+        // polling obligation. Advance at most one queued pass per supervisor
+        // tick; the repair-job FIFO and BackendRuntime maintenance queue keep
+        // this O(1), bounded, and fair with other maintenance.
+        self.resumePendingDurableRepairCancellationOnce() catch |err| {
+            std.log.warn("failed to resume durable table repair cancellation err={s}", .{@errorName(err)});
+        };
         self.join_job_store.cleanupExpiredJoinJobs();
         self.artifact_reprocess_job_store.cleanupExpiredJobs();
         self.repair_job_store.cleanupExpiredJobs();
@@ -1681,6 +1688,15 @@ pub const ApiHttpServer = struct {
 
     fn mutationBackgroundExecutionPermitted(self: *const ApiHttpServer) bool {
         return !self.cfg.ha_failover_safe_mutations_only;
+    }
+
+    fn resumePendingDurableRepairCancellationOnce(self: *ApiHttpServer) !void {
+        if (self.table_writes == null) return;
+        const encoded = (try self.repair_job_store.nextPendingDurableCancelAlloc(self.alloc)) orelse return;
+        defer self.alloc.free(encoded);
+        var parsed = try std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try self.continueDurableRepairCancellation(parsed.value.table_name, encoded);
     }
 
     const SessionMaintenanceWork = struct {
@@ -6732,6 +6748,7 @@ pub const ApiHttpServer = struct {
             error.TableNotFound => return error.NotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.EnrichmentRetryInProgress => return error.Backpressured,
+            error.DenseRepairBackpressure => return error.DenseRepairBackpressure,
             error.LeaderUnavailable => return error.WriteUnavailable,
             error.HASyncCommitWouldBlock,
             error.HASyncCommitWaitLimitExceeded,
@@ -6761,6 +6778,7 @@ pub const ApiHttpServer = struct {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.Timeout => return error.ReadUnavailable,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.IndexRebuilding => return error.IndexRebuilding,
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
@@ -6866,6 +6884,7 @@ pub const ApiHttpServer = struct {
                 error.EmbedUpstreamFailure,
                 => return err,
                 error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+                error.IndexRebuilding => return error.IndexRebuilding,
                 error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
                 error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
                 error.Timeout => return error.Timeout,
@@ -6894,6 +6913,7 @@ pub const ApiHttpServer = struct {
             error.EmbedUpstreamFailure,
             => return err,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.IndexRebuilding => return error.IndexRebuilding,
             error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
             else => {
@@ -8274,15 +8294,30 @@ pub const ApiHttpServer = struct {
     pub fn handlePublicTableBatch(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
         var resp = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi());
         defer resp.deinit(self.alloc);
-        return switch (resp.status) {
+        var response = switch (resp.status) {
             201 => blk: {
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena_impl.deinit();
                 const parsed = try parseJsonResponseBody(metadata_openapi.BatchResponse, arena_impl.allocator(), resp.body);
                 break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
             },
-            else => try textResponse(self.alloc, resp.status, resp.body),
+            else => if (resp.json)
+                try jsonBodyResponseWithStatus(self.alloc, resp.status, resp.body)
+            else
+                try textResponse(self.alloc, resp.status, resp.body),
         };
+        if (resp.retry_after_seconds) |seconds| {
+            response.headers = try self.alloc.alloc(http_common.Header, 1);
+            errdefer {
+                self.alloc.free(response.headers);
+                response.headers = &.{};
+                response.deinit(self.alloc);
+            }
+            const value = try std.fmt.allocPrint(self.alloc, "{d}", .{seconds});
+            defer self.alloc.free(value);
+            response.headers[0] = try ownedHeader(self.alloc, "Retry-After", value);
+        }
+        return response;
     }
 
     pub fn handlePublicTableQueryWithContentType(
@@ -8329,6 +8364,7 @@ pub const ApiHttpServer = struct {
             error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
             error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+            error.IndexRebuilding => return try indexRebuildingResponse(self.alloc),
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return try textResponse(self.alloc, 500, "query failed");
@@ -8399,6 +8435,7 @@ pub const ApiHttpServer = struct {
                 error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                 error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
                 error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+                error.IndexRebuilding => return try indexRebuildingResponse(self.alloc),
                 else => {
                     std.log.err("public table multiquery execution failed table={s} err={}", .{ table_name, err });
                     return try textResponse(self.alloc, 500, "query failed");
@@ -8641,6 +8678,8 @@ pub const ApiHttpServer = struct {
         cursor: ?[]const u8 = null,
         limit: ?u32 = null,
         force: bool = false,
+        control: ?[]const u8 = null,
+        repair_id: ?[]const u8 = null,
     };
 
     pub fn handlePublicRunTableRepair(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
@@ -8654,6 +8693,14 @@ pub const ApiHttpServer = struct {
         const raw_limit = parsed.value.limit orelse 100;
         if (raw_limit == 0) return try textResponse(self.alloc, 400, "invalid limit");
         const limit: u32 = @min(raw_limit, 1000);
+        const control = if (parsed.value.control) |raw|
+            std.meta.stringToEnum(db_mod.types.IndexRepairControl, raw) orelse return try textResponse(self.alloc, 400, "invalid repair control")
+        else
+            null;
+        const repair_id = if (parsed.value.repair_id) |raw|
+            std.fmt.parseInt(u128, raw, 10) catch return try textResponse(self.alloc, 400, "invalid repair id")
+        else
+            null;
         var result = (source.repairArtifactIssues(self.alloc, table_name, .{
             .target = target,
             .artifact_kind = parsed.value.kind,
@@ -8661,8 +8708,11 @@ pub const ApiHttpServer = struct {
             .limit = limit,
             .cursor = parsed.value.cursor,
             .force = parsed.value.force,
+            .control = control,
+            .repair_id = repair_id,
         }) catch |err| switch (err) {
             error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid repair request"),
+            error.StaleIndexRepairControl => return try textResponse(self.alloc, 409, "repair changed; refresh and retry"),
             else => {
                 std.log.err("table repair failed table={s} err={}", .{ table_name, err });
                 return try textResponse(self.alloc, 500, "table repair failed");
@@ -8747,6 +8797,11 @@ pub const ApiHttpServer = struct {
             return try textResponse(self.alloc, 500, "invalid repair job state");
         };
         defer parsed_cancelled.deinit();
+        if (repair_jobs.requiresDurableCancel(parsed_cancelled.value) and
+            std.mem.eql(u8, parsed_cancelled.value.phase, repair_jobs.phaseString(.queued)))
+        {
+            return try self.advanceTableRepairJobState(table_name, parsed_cancelled.value);
+        }
         return try jsonBodyResponseWithStatus(self.alloc, if (repair_jobs.isTerminalPhase(parsed_cancelled.value.phase)) 200 else 202, cancelled);
     }
 
@@ -8791,8 +8846,31 @@ pub const ApiHttpServer = struct {
             defer parsed.deinit();
             const heartbeat = work.server.submitTableRepairJobHeartbeat(parsed.value.job_id, parsed.value.attempt_id) catch null;
             defer if (heartbeat) |hb| hb.stop.store(true, .release);
-            const updated = try work.server.runTableRepairJobPass(work.table_name, parsed.value);
-            work.server.alloc.free(updated);
+            const updated = work.server.runTableRepairJobPass(work.table_name, parsed.value) catch |err| {
+                // An unexpected worker failure is operational, not evidence
+                // that the repair request is invalid. Return it to the durable
+                // backoff queue so cancellation and operator work remain
+                // restart-safe.
+                const recovered = work.server.repair_job_store.recordRetryableFailure(
+                    work.server.alloc,
+                    parsed.value,
+                    @errorName(err),
+                ) catch |recovery_err| {
+                    std.log.err("failed to recover table repair job state table={s} job_id={d} worker_err={s} recovery_err={s}", .{
+                        work.table_name,
+                        parsed.value.job_id,
+                        @errorName(err),
+                        @errorName(recovery_err),
+                    });
+                    return recovery_err;
+                };
+                work.server.alloc.free(recovered);
+                return err;
+            };
+            defer work.server.alloc.free(updated);
+            work.server.continueDurableRepairCancellation(work.table_name, updated) catch |err| {
+                std.log.warn("failed to continue durable table repair cancellation table={s} err={s}", .{ work.table_name, @errorName(err) });
+            };
         }
 
         fn deinit(ptr: *anyopaque) void {
@@ -8927,18 +9005,37 @@ pub const ApiHttpServer = struct {
             work_consumed = true;
             var parsed = try std.json.parseFromSlice(repair_jobs.JobState, self.alloc, running_encoded, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            const failed = try self.repair_job_store.markPhase(self.alloc, parsed.value, .failed, @errorName(err));
-            defer self.alloc.free(failed);
+            const queued = try self.repair_job_store.recordRetryableFailure(self.alloc, parsed.value, @errorName(err));
+            defer self.alloc.free(queued);
             if (err == error.BackgroundOwnerClosing) {
-                std.log.warn("table repair job submission canceled during shutdown table={s} job_id={d}", .{ table_name, job_id });
+                std.log.warn("table repair job submission deferred during shutdown table={s} job_id={d}", .{ table_name, job_id });
             } else {
-                std.log.err("failed to submit table repair job table={s} job_id={d} err={}", .{ table_name, job_id, err });
+                std.log.warn("table repair job submission deferred table={s} job_id={d} err={}", .{ table_name, job_id, err });
             }
-            return try self.repair_job_store.loadJobAlloc(self.alloc, job_id) orelse try self.alloc.dupe(u8, failed);
+            return try self.repair_job_store.loadJobAlloc(self.alloc, job_id) orelse try self.alloc.dupe(u8, queued);
         };
         work_consumed = true;
 
         return try self.repair_job_store.loadJobAlloc(self.alloc, job_id) orelse try self.alloc.dupe(u8, running_encoded);
+    }
+
+    fn continueDurableRepairCancellation(self: *ApiHttpServer, table_name: []const u8, encoded: []const u8) !void {
+        var parsed = try std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (!repair_jobs.requiresDurableCancel(parsed.value) or
+            !std.mem.eql(u8, parsed.value.phase, repair_jobs.phaseString(.queued))) return;
+
+        const begin = try self.repair_job_store.beginAdvance(self.alloc, parsed.value);
+        defer self.alloc.free(begin.encoded);
+        if (!begin.started) return;
+        var running = try std.json.parseFromSlice(repair_jobs.JobState, self.alloc, begin.encoded, .{ .ignore_unknown_fields = true });
+        defer running.deinit();
+        if (try self.submitTableRepairJobPass(table_name, begin.encoded, running.value.job_id)) |submitted| {
+            self.alloc.free(submitted);
+        } else {
+            const updated = try self.runTableRepairJobPass(table_name, running.value);
+            self.alloc.free(updated);
+        }
     }
 
     fn runTableRepairJobPass(self: *ApiHttpServer, table_name: []const u8, running_state: repair_jobs.JobState) ![]u8 {
@@ -8948,6 +9045,27 @@ pub const ApiHttpServer = struct {
         const target = std.meta.stringToEnum(db_mod.types.RepairTarget, running_state.target) orelse {
             return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, "invalid repair target");
         };
+        if (repair_jobs.requiresDurableCancel(running_state)) {
+            var cancel_result = (source.repairArtifactIssuesControlled(self.alloc, table_name, .{
+                .target = .index,
+                .index_name = running_state.index,
+                .limit = running_state.limit,
+                .cursor = running_state.cursor,
+                .control = .pause_automatic,
+            }, .{}) catch |err| switch (err) {
+                error.InvalidArgument, error.NotFound => {
+                    return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+                },
+                else => {
+                    std.log.warn("durable table repair cancellation deferred table={s} job_id={d} err={s}", .{ table_name, running_state.job_id, @errorName(err) });
+                    return try self.repair_job_store.recordRetryableFailure(self.alloc, running_state, @errorName(err));
+                },
+            }) orelse {
+                return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, "method not allowed");
+            };
+            defer cancel_result.deinit(self.alloc);
+            return try self.repair_job_store.recordDurableCancelPass(self.alloc, running_state, cancel_result);
+        }
         var cancel_probe = TableRepairCancelProbe{
             .server = self,
             .job_id = running_state.job_id,
@@ -8962,6 +9080,7 @@ pub const ApiHttpServer = struct {
             .force = running_state.force,
             .repair_job_id = running_state.job_id,
             .repair_attempt_id = running_state.attempt_id,
+            .repair_job_created_at_ms = running_state.created_at_millis,
         }, .{
             .cancel_check = .{
                 .ptr = &cancel_probe,
@@ -8978,8 +9097,8 @@ pub const ApiHttpServer = struct {
                 return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
             },
             else => {
-                std.log.err("public table repair job failed table={s} job_id={d} err={}", .{ table_name, running_state.job_id, err });
-                return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+                std.log.warn("public table repair job deferred table={s} job_id={d} err={}", .{ table_name, running_state.job_id, err });
+                return try self.repair_job_store.recordRetryableFailure(self.alloc, running_state, @errorName(err));
             },
         }) orelse {
             return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, "method not allowed");
@@ -11382,7 +11501,7 @@ test "required permissions decode table path resources" {
     try std.testing.expectError(error.InvalidArgument, requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs%ZZ/artifacts"));
 }
 
-test "api http server marks table repair job failed when background submit is closing" {
+test "api http server durably retries table repair job when background submit is closing" {
     if (@import("builtin").os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
@@ -11423,8 +11542,84 @@ test "api http server marks table repair job failed when background submit is cl
 
     var parsed_updated = try std.json.parseFromSlice(repair_jobs.JobState, alloc, updated, .{ .ignore_unknown_fields = true });
     defer parsed_updated.deinit();
-    try std.testing.expectEqualStrings("failed", parsed_updated.value.phase);
+    try std.testing.expectEqualStrings("queued", parsed_updated.value.phase);
     try std.testing.expectEqualStrings("BackgroundOwnerClosing", parsed_updated.value.last_error.?);
+    try std.testing.expect(parsed_updated.value.next_retry_at_millis > parsed_updated.value.last_updated_at_millis);
+}
+
+test "api maintenance resumes recovered durable named index cancellation without client advance" {
+    const alloc = std.testing.allocator;
+    const DummyStatus = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    const FakeWrites = struct {
+        calls: usize = 0,
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) anyerror!?void {
+            return null;
+        }
+
+        fn repair(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.ArtifactRepairRunRequest,
+            _: db_mod.types.ArtifactRepairRunOptions,
+        ) anyerror!?db_mod.types.ArtifactRepairResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(db_mod.types.RepairTarget.index, req.target);
+            try std.testing.expectEqual(db_mod.types.IndexRepairControl.pause_automatic, req.control.?);
+            self.calls += 1;
+            return .{
+                .scanned = 1,
+                .groups_scanned = 1,
+                .controls_applied = 1,
+            };
+        }
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .repair_artifact_issues_controlled = repair,
+                },
+            };
+        }
+    };
+
+    var writes = FakeWrites{};
+    var server = ApiHttpServer.init(alloc, .{}, .{
+        .ptr = undefined,
+        .vtable = &.{ .status = DummyStatus.status },
+    }, null, writes.source());
+    defer server.deinit();
+
+    const started = try server.repair_job_store.startJob(alloc, "docs", .{
+        .target = "index",
+        .index = "semantic",
+    });
+    defer alloc.free(started);
+    var parsed_started = try std.json.parseFromSlice(repair_jobs.JobState, alloc, started, .{ .ignore_unknown_fields = true });
+    defer parsed_started.deinit();
+    const cancelling = try server.repair_job_store.requestCancel(alloc, parsed_started.value);
+    defer alloc.free(cancelling);
+
+    try server.runSessionMaintenanceOnce();
+    try std.testing.expectEqual(@as(usize, 1), writes.calls);
+    const finished = (try server.repair_job_store.loadJobAlloc(alloc, parsed_started.value.job_id)).?;
+    defer alloc.free(finished);
+    var parsed_finished = try std.json.parseFromSlice(repair_jobs.JobState, alloc, finished, .{ .ignore_unknown_fields = true });
+    defer parsed_finished.deinit();
+    try std.testing.expectEqualStrings("cancelled", parsed_finished.value.phase);
 }
 
 fn base64UrlDecodeAlloc(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
@@ -11592,6 +11787,14 @@ fn queryCandidateBudgetExceededResponse(alloc: std.mem.Allocator) !http_common.H
         .sort_rejection_reason = public_rejection.reason,
         .sort_rejection_detail = public_rejection.detail,
         .sort_rejection_field = diagnostic.field,
+    });
+}
+
+fn indexRebuildingResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+    return try jsonResponseWithStatus(alloc, 503, .{
+        .code = "index_rebuilding",
+        .message = "required index is rebuilding",
+        .retryable = true,
     });
 }
 
@@ -13579,37 +13782,19 @@ test "api http plain public query preserves outer absolute request deadline" {
     try std.testing.expectEqualStrings("{\"hits\":[],\"total\":0}", response.json);
 }
 
-test "api http server applies node query embedding cache policy and explicit override" {
+test "api http server obtains query embedding policy from resource manager" {
     const alloc = std.testing.allocator;
-    var node_config = try common_config.Config.parseFromSlice(alloc,
-        \\{
-        \\  "inference": {
-        \\    "api_url": "http://127.0.0.1:8082",
-        \\    "query_embedding_cache": {
-        \\      "enabled": false,
-        \\      "max_bytes_mb": 7,
-        \\      "ttl_ms": 1234,
-        \\      "max_inflight": 42
-        \\    }
-        \\  }
-        \\}
-    );
-    defer node_config.deinit();
-
-    const configured = ApiHttpServer.effectiveQueryEmbeddingCacheConfig(.{ .node_config = &node_config });
-    try std.testing.expect(!configured.enabled);
+    var manager = resource_manager_mod.ResourceManager.init(.{
+        .query_embedding_cache_bytes = 7 * 1024 * 1024,
+        .query_embedding_cache_ttl_ns = 1234 * std.time.ns_per_ms,
+        .query_embedding_max_inflight = 42,
+    });
+    defer manager.deinit(alloc);
+    const configured = ApiHttpServer.effectiveQueryEmbeddingCacheConfig(.{ .resource_manager = &manager });
+    try std.testing.expect(configured.enabled);
     try std.testing.expectEqual(@as(usize, 7 * 1024 * 1024), configured.max_bytes);
     try std.testing.expectEqual(@as(u64, 1234 * std.time.ns_per_ms), configured.ttl_ns);
     try std.testing.expectEqual(@as(usize, 42), configured.max_inflight);
-
-    const explicit = ApiHttpServer.effectiveQueryEmbeddingCacheConfig(.{
-        .node_config = &node_config,
-        .query_embedding_cache = .{ .enabled = true, .max_bytes = 99, .ttl_ns = 77, .max_inflight = 3 },
-    });
-    try std.testing.expect(explicit.enabled);
-    try std.testing.expectEqual(@as(usize, 99), explicit.max_bytes);
-    try std.testing.expectEqual(@as(u64, 77), explicit.ttl_ns);
-    try std.testing.expectEqual(@as(usize, 3), explicit.max_inflight);
 
     var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer runtime.deinit();

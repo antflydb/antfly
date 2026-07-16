@@ -131,6 +131,16 @@ pub const BulkIngestFinishOptions = struct {
     bulk_rebuild_hbc_leaf_min_members: ?usize = null,
     progress_ctx: ?*anyopaque = null,
     progress_fn: ?*const fn (*anyopaque, Progress) void = null,
+    /// Optional internal admission fence invoked before each bounded bulk
+    /// publication window. Storage engines propagate its error without
+    /// publishing the next window, leaving the session resumable/quarantined
+    /// according to its caller's durability contract.
+    admission_ctx: ?*anyopaque = null,
+    admission_fn: ?*const fn (*anyopaque) anyerror!void = null,
+
+    pub fn checkAdmission(self: @This()) !void {
+        if (self.admission_fn) |check| if (self.admission_ctx) |ctx| try check(ctx);
+    }
 };
 
 /// Common range-scan request shape for higher-level storage layers.
