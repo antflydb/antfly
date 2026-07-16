@@ -101,7 +101,7 @@ function selectPlaceholder(loaded: boolean, count: number, typeName: string): st
 }
 
 const TranscribePlaygroundPage: React.FC = () => {
-  const { inferenceApiUrl, inferenceUrl } = useApiConfig();
+  const { inferenceUrl } = useApiConfig();
   const { models: connectionTranscribers, loading: transcribersLoading } =
     useSelectedInferenceModelNames("transcriber");
   const { models: connectionChunkers, loading: chunkersLoading } =
@@ -522,11 +522,7 @@ const TranscribePlaygroundPage: React.FC = () => {
       setProcessingTime(performance.now() - startTime);
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") return;
-      setError(
-        err instanceof Error
-          ? err.message
-          : `Failed to connect to Antfly inference at ${inferenceApiUrl}`
-      );
+      setError(err instanceof Error ? err.message : "Failed to connect to inference");
     } finally {
       setIsLoading(false);
     }
@@ -540,7 +536,6 @@ const TranscribePlaygroundPage: React.FC = () => {
     useVAD,
     useLLMCleanup,
     vadConfig,
-    inferenceApiUrl,
     processSegment,
     inferenceUrl,
   ]);

@@ -43,9 +43,9 @@ named `<cluster-name>-inference` in the same namespace and owned by the
 
 If `spec.inference.image` is omitted, the operator uses the configured
 `--inference-antfly-image` value for Inference pods. The binary default is
-`ghcr.io/antflydb/antfly:omni`. Override it during deployment if that image is
-unavailable in your environment. The image must provide the `/antfly inference`
-runtime contract.
+`ghcr.io/antflydb/antfly:latest`, the supported Zig runtime image. Production
+deployments should override it with an immutable release tag or digest. The image
+must provide the `/antfly inference` runtime contract.
 
 `spec.inference` does not create `InferenceProxy` resources. Direct `InferenceProxy`
 manifests remain supported for explicit routing configuration.

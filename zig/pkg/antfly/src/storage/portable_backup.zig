@@ -1108,6 +1108,9 @@ fn validateEdgeBatchPayload(alloc: Allocator, payload: []const u8) !void {
         }
         alloc.free(result.entries);
     }
+    for (result.entries) |entry| {
+        _ = try validatePortableGraphEdgeValue(alloc, entry.value);
+    }
 }
 
 fn validateImportedIdentityNamespace(store: *DocStore, opts: ImportOptions) !void {
@@ -1527,18 +1530,162 @@ fn importEdgeBatch(alloc: Allocator, store: *DocStore, payload: []const u8) !voi
 }
 
 fn graphArtifactValueFromPortableEdgeValueAlloc(alloc: Allocator, value: []const u8) ![]u8 {
-    if (enrichment_artifact_codec.decodeHeader(value)) |header| {
-        if (header.kind == .graph_edge) return try alloc.dupe(u8, value);
-    } else |_| {}
+    const encoding = try validatePortableGraphEdgeValue(alloc, value);
+    if (encoding == .zig_artifact) return try alloc.dupe(u8, value);
 
-    if (value.len >= 24) {
-        const weight = @as(f64, @bitCast(std.mem.readInt(u64, value[0..][0..8], .little)));
-        const created_at = std.mem.readInt(u64, value[8..][0..8], .little);
-        const updated_at = std.mem.readInt(u64, value[16..][0..8], .little);
-        return try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, weight, created_at, updated_at, value[24..]);
+    // Go's portable AFB edge value is semantic data, not an index page:
+    // [weight:f64 LE][created:u64 LE][updated:u64 LE][metadata bytes]. Mark it
+    // explicitly generation-neutral so a Zig restore can bind it to the
+    // configured graph generation without pretending generation zero is a
+    // valid incarnation.
+    if (value.len < 24) return error.InvalidPortableGraphEdgeValue;
+    const weight: f64 = @bitCast(std.mem.readInt(u64, value[0..8], .little));
+    const created_at = std.mem.readInt(u64, value[8..16], .little);
+    const updated_at = std.mem.readInt(u64, value[16..24], .little);
+    return try enrichment_artifact_codec.encodePortableUnboundGraphEdgeAlloc(
+        alloc,
+        weight,
+        created_at,
+        updated_at,
+        value[24..],
+    );
+}
+
+const PortableGraphEdgeEncoding = enum { zig_artifact, go_semantic };
+
+fn validatePortableGraphEdgeValue(alloc: Allocator, value: []const u8) !PortableGraphEdgeEncoding {
+    if (value.len >= enrichment_artifact_codec.magic.len and
+        std.mem.eql(u8, value[0..enrichment_artifact_codec.magic.len], &enrichment_artifact_codec.magic))
+    {
+        if (enrichment_artifact_codec.decodeHeader(value)) |header| {
+            if (header.kind == .graph_edge and header.flags.has_graph_generation) {
+                const fixed_payload_len = @sizeOf(u64) * 4 + @sizeOf(u32);
+                if (header.payload_len < fixed_payload_len) return error.InvalidPortableGraphEdgeValue;
+                const payload = value[enrichment_artifact_codec.header_len..];
+                const generation = std.mem.readInt(u64, payload[0..8], .little);
+                const metadata_len = std.mem.readInt(u32, payload[@sizeOf(u64) * 4 ..][0..4], .little);
+                if (payload.len != fixed_payload_len + @as(usize, metadata_len) or
+                    header.flags.portable_unbound_graph_generation != (generation == 0))
+                {
+                    return error.InvalidPortableGraphEdgeValue;
+                }
+                return .zig_artifact;
+            }
+        } else |_| {}
+
+        // The Go representation is untagged and begins with an arbitrary f64.
+        // A legal weight can therefore equal the Zig magic exactly. In this
+        // rare collision path, require the remaining Go metadata to have the
+        // same object/null JSON shape accepted by Go's Edge decoder before
+        // classifying the value as semantic data.
+        try validateGoSemanticGraphEdgeValue(alloc, value);
+        return .go_semantic;
     }
 
-    return try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 1.0, 0, 0, value);
+    // Go portable semantic edge value.
+    try validateGoSemanticGraphEdgeValue(alloc, value);
+    return .go_semantic;
+}
+
+fn validateGoSemanticGraphEdgeValue(alloc: Allocator, value: []const u8) !void {
+    if (value.len < 24) return error.InvalidPortableGraphEdgeValue;
+    if (value.len == 24) return;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, value[24..], .{}) catch
+        return error.InvalidPortableGraphEdgeValue;
+    defer parsed.deinit();
+    if (parsed.value != .object and parsed.value != .null) return error.InvalidPortableGraphEdgeValue;
+}
+
+test "portable graph edge values accept Go semantic encoding without guessing a generation" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidPortableGraphEdgeValue, graphArtifactValueFromPortableEdgeValueAlloc(alloc, "short"));
+    var malformed_codec: [40]u8 = @splat(0);
+    @memcpy(malformed_codec[0..enrichment_artifact_codec.magic.len], &enrichment_artifact_codec.magic);
+    try std.testing.expectError(error.InvalidPortableGraphEdgeValue, graphArtifactValueFromPortableEdgeValueAlloc(alloc, &malformed_codec));
+    var malformed_go: [25]u8 = @splat(0);
+    malformed_go[24] = '{';
+    try std.testing.expectError(error.InvalidPortableGraphEdgeValue, graphArtifactValueFromPortableEdgeValueAlloc(alloc, &malformed_go));
+
+    var colliding_raw: [26]u8 = @splat(0);
+    @memcpy(colliding_raw[0..enrichment_artifact_codec.magic.len], &enrichment_artifact_codec.magic);
+    @memcpy(colliding_raw[24..], "{}");
+    const normalized_collision = try graphArtifactValueFromPortableEdgeValueAlloc(alloc, &colliding_raw);
+    defer alloc.free(normalized_collision);
+    try std.testing.expect(enrichment_artifact_codec.isPortableUnboundGraphEdge(normalized_collision));
+
+    const metadata = "{\"source\":\"go-portable\"}";
+    var raw: [24 + metadata.len]u8 = undefined;
+    std.mem.writeInt(u64, raw[0..8], @as(u64, @bitCast(@as(f64, 0.625))), .little);
+    std.mem.writeInt(u64, raw[8..16], 101, .little);
+    std.mem.writeInt(u64, raw[16..24], 202, .little);
+    @memcpy(raw[24..], metadata);
+    const normalized = try graphArtifactValueFromPortableEdgeValueAlloc(alloc, &raw);
+    defer alloc.free(normalized);
+    try std.testing.expect(enrichment_artifact_codec.isPortableUnboundGraphEdge(normalized));
+    var portable_decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, normalized);
+    defer portable_decoded.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 0), portable_decoded.generation);
+    try std.testing.expectEqual(@as(f64, 0.625), portable_decoded.weight);
+    try std.testing.expectEqual(@as(u64, 101), portable_decoded.created_at);
+    try std.testing.expectEqual(@as(u64, 202), portable_decoded.updated_at);
+    try std.testing.expectEqualStrings(metadata, portable_decoded.metadata_json);
+
+    const encoded = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 73, 0.75, 11, 12, "{\"source\":\"test\"}");
+    defer alloc.free(encoded);
+    const restored = try graphArtifactValueFromPortableEdgeValueAlloc(alloc, encoded);
+    defer alloc.free(restored);
+    var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, restored);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 73), decoded.generation);
+    try std.testing.expectEqual(@as(f64, 0.75), decoded.weight);
+    try std.testing.expectEqualStrings("{\"source\":\"test\"}", decoded.metadata_json);
+}
+
+test "import accepts Go portable AFB edge batch encoding end to end" {
+    const alloc = std.testing.allocator;
+    const metadata = "{\"origin\":\"go\"}";
+    var raw: [24 + metadata.len]u8 = undefined;
+    std.mem.writeInt(u64, raw[0..8], @as(u64, @bitCast(@as(f64, 1.25))), .little);
+    std.mem.writeInt(u64, raw[8..16], 17, .little);
+    std.mem.writeInt(u64, raw[16..24], 29, .little);
+    @memcpy(raw[24..], metadata);
+    const payload = try backup_codec.encodeEdgeBatch(alloc, "relations", &.{.{
+        .source_key = "doc:a",
+        .target_key = "doc:b",
+        .edge_type = "mentions",
+        .value = &raw,
+    }});
+    defer alloc.free(payload);
+
+    var afb: ArrayList(u8) = .empty;
+    defer afb.deinit(alloc);
+    try backup_codec.writeHeader(&afb, alloc, .{
+        .format_version = backup_codec.format_version,
+        .flags = 0,
+        .created_at_ns = 0,
+        .backup_id = @splat(0),
+        .table_count = 1,
+        .shard_count = 1,
+    });
+    try backup_codec.writeBlock(&afb, alloc, .edge_batch, payload);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(alloc, &tmp);
+    defer store.close();
+    try importPortable(alloc, &store, afb.items);
+
+    const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations", "mentions", "doc:b");
+    defer alloc.free(key);
+    const value = try store.get(alloc, key);
+    defer alloc.free(value);
+    try std.testing.expect(enrichment_artifact_codec.isPortableUnboundGraphEdge(value));
+    var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, value);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(@as(f64, 1.25), decoded.weight);
+    try std.testing.expectEqual(@as(u64, 17), decoded.created_at);
+    try std.testing.expectEqual(@as(u64, 29), decoded.updated_at);
+    try std.testing.expectEqualStrings(metadata, decoded.metadata_json);
 }
 
 /// Decode an edge batch payload (mirrors backup_codec.encodeEdgeBatch).
@@ -2225,7 +2372,7 @@ test "export and import graph edge artifacts round trip with arbitrary ids" {
 
     const edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, source_doc, "social\x00idx", "follows:fast", target_doc);
     defer alloc.free(edge_key);
-    const edge_val = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 2.5, 11, 22, "{\"ok\":true}");
+    const edge_val = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 42, 2.5, 11, 22, "{\"ok\":true}");
     defer alloc.free(edge_val);
     try src.putBatch(&.{.{ .key = edge_key, .value = edge_val }}, &.{});
 

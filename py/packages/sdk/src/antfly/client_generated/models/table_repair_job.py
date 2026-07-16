@@ -32,10 +32,10 @@ class TableRepairJob:
             bounded job stopped because unsupported or failed debt still requires operator action.
         target (RepairTarget): Repair subsystem to inspect or run.
         limit (int): Effective per-pass repair limit.
-        force (bool): Whether the job forces a named index rebuild.
+        force (bool): Whether the next bounded pass still needs to dispatch the job's one forced named-index generation.
         result (TableRepairRunResult): Result of one bounded table repair pass.
-        cancel_requested (bool): Whether cancellation has been requested for a running pass. Running passes finish at a
-            bounded repair boundary before the job transitions to cancelled.
+        cancel_requested (bool): Whether cancellation is pending. For a named-index job, cancellation durably pauses the
+            matching repair in every group and becomes terminal only after that bounded traversal completes.
         created_at_millis (int): Unix epoch milliseconds when the job was created.
         last_updated_at_millis (int): Unix epoch milliseconds when the job state was last updated.
         expires_at_millis (int): Unix epoch milliseconds when the job is eligible for cleanup.

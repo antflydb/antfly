@@ -144,7 +144,7 @@ function SimilarityBar({ score, maxScore }: { score: number; maxScore: number })
 }
 
 const EmbeddingPlaygroundPage: React.FC = () => {
-  const { inferenceApiUrl, inferenceUrl } = useApiConfig();
+  const { inferenceUrl } = useApiConfig();
   const [query, setQuery] = useState("");
   const [documents, setDocuments] = useState<string[]>([""]);
   const [selectedModel, setSelectedModel] = useState("");
@@ -240,11 +240,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
       if (err instanceof Error && err.name === "AbortError") {
         return;
       }
-      setError(
-        err instanceof Error
-          ? err.message
-          : `Failed to connect to Antfly inference at ${inferenceApiUrl}`
-      );
+      setError(err instanceof Error ? err.message : "Failed to connect to inference");
     } finally {
       setIsLoading(false);
     }

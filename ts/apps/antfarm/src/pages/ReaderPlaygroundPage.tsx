@@ -135,7 +135,7 @@ function copyToClipboard(text: string) {
 // --- Component ---
 
 const ReaderPlaygroundPage: React.FC = () => {
-  const { inferenceApiUrl, inferenceUrl } = useApiConfig();
+  const { inferenceUrl } = useApiConfig();
 
   // Shared state
   const [isLoading, setIsLoading] = useState(false);
@@ -285,11 +285,7 @@ const ReaderPlaygroundPage: React.FC = () => {
       setOutputTab("text");
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") return;
-      setError(
-        err instanceof Error
-          ? err.message
-          : `Failed to connect to Antfly inference at ${inferenceApiUrl}`
-      );
+      setError(err instanceof Error ? err.message : "Failed to connect to inference");
     } finally {
       setIsLoading(false);
     }

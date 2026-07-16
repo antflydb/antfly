@@ -28,6 +28,7 @@ class TableRepairRunResult:
             them.
         indexes_rebuilt (int): Number of indexes rebuilt by this pass when target is index.
         indexes_degraded (int): Number of selected indexes that were already degraded or quarantined before repair.
+        controls_applied (int): Number of existing index repairs that accepted the requested control.
         limit (int): Effective repair limit.
         has_more (bool): Whether another repair scan page is available via next_cursor.
         debt_remaining (bool): Whether repair debt remains after this bounded pass. If true and next_cursor is absent,
@@ -47,6 +48,7 @@ class TableRepairRunResult:
     in_progress: int
     indexes_rebuilt: int
     indexes_degraded: int
+    controls_applied: int
     limit: int
     has_more: bool
     debt_remaining: bool
@@ -76,6 +78,8 @@ class TableRepairRunResult:
 
         indexes_degraded = self.indexes_degraded
 
+        controls_applied = self.controls_applied
+
         limit = self.limit
 
         has_more = self.has_more
@@ -103,6 +107,7 @@ class TableRepairRunResult:
                 "in_progress": in_progress,
                 "indexes_rebuilt": indexes_rebuilt,
                 "indexes_degraded": indexes_degraded,
+                "controls_applied": controls_applied,
                 "limit": limit,
                 "has_more": has_more,
                 "debt_remaining": debt_remaining,
@@ -138,6 +143,8 @@ class TableRepairRunResult:
 
         indexes_degraded = d.pop("indexes_degraded")
 
+        controls_applied = d.pop("controls_applied")
+
         limit = d.pop("limit")
 
         has_more = d.pop("has_more")
@@ -165,6 +172,7 @@ class TableRepairRunResult:
             in_progress=in_progress,
             indexes_rebuilt=indexes_rebuilt,
             indexes_degraded=indexes_degraded,
+            controls_applied=controls_applied,
             limit=limit,
             has_more=has_more,
             debt_remaining=debt_remaining,

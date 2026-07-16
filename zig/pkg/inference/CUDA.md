@@ -586,11 +586,8 @@ portable `compute_75` PTX.
 ### Phase 7: XLA/PJRT NVIDIA Lane
 
 - Keep `--backend xla` as PJRT, with CUDA GPU plugin supplied externally.
-- Document required environment variables:
-  - `ANTFLY_INFERENCE_XLA_PLUGIN`
-  - `ANTFLY_INFERENCE_PJRT_PLUGIN`
-  - `PJRT_PLUGIN_PATH`
-  - `PJRT_PLUGIN`
+- Configure the plugin through `pjrt_plugin_path`; standalone artifact tools use
+  the standard `PJRT_PLUGIN_PATH` environment variable.
 - Use XLA first for dense/static graph models and compiled artifact workflows.
 - Do not use XLA as the default GGUF path unless a model is exported to dense
   graph artifacts and fits memory.
@@ -631,7 +628,7 @@ Concrete PJRT work:
 
 - Make `-Dpjrt=true` a real configurable build option if it is intended for
   NVIDIA deployments; today `build.zig` hardcodes `enable_pjrt` false.
-- Add NVIDIA-specific docs for `ANTFLY_INFERENCE_XLA_PLUGIN`/`PJRT_PLUGIN_PATH`.
+- Add NVIDIA-specific docs for `pjrt_plugin_path`/`PJRT_PLUGIN_PATH`.
 - Add a dense graph smoke on a CUDA PJRT plugin once available.
 - Add a clear error when `--backend xla` is requested without a plugin.
 - Keep PJRT artifacts and native CUDA artifacts separate in manifests.

@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const c_file = @import("../util/c_file.zig");
+const compat = @import("../io/compat.zig");
 
 const c = @cImport({
     @cInclude("ort_genai_c.h");
@@ -64,6 +65,13 @@ fn mkdirIfMissing(path: []const u8) !void {
     if (c_file.c.mkdir(path_z.ptr, @as(c_file.c.mode_t, 0o755)) != 0 and !fileExists(path)) {
         return error.CreateDirectoryFailed;
     }
+}
+
+fn mkdirNew(path: []const u8) !void {
+    const path_z = try std.heap.page_allocator.dupeZ(u8, path);
+    defer std.heap.page_allocator.free(path_z);
+    if (c_file.c.mkdir(path_z.ptr, @as(c_file.c.mode_t, 0o700)) != 0)
+        return error.CreateDirectoryFailed;
 }
 
 fn symlinkIfMissing(target: []const u8, link_path: []const u8) !void {
@@ -114,7 +122,7 @@ fn absolutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd_z = c_file.c.getcwd(&buf, buf.len) orelse return error.GetCwdFailed;
-    const cwd = std.mem.span(cwd_z);
+    const cwd = std.mem.sliceTo(cwd_z, 0);
     return std.fs.path.join(allocator, &.{ cwd, path });
 }
 
@@ -272,6 +280,8 @@ fn writeGeneratedGenAiConfig(
 ) !void {
     const eos_json = try allocIntArrayJson(allocator, eos_token_ids);
     defer allocator.free(eos_json);
+    const decoder_filename_json = try std.json.Stringify.valueAlloc(allocator, decoder_filename, .{});
+    defer allocator.free(decoder_filename_json);
     const out = try std.fmt.allocPrint(
         allocator,
         \\{{
@@ -283,7 +293,7 @@ fn writeGeneratedGenAiConfig(
         \\        "log_id": "onnxruntime-genai",
         \\        "provider_options": []
         \\      }},
-        \\      "filename": "{s}",
+        \\      "filename": {s},
         \\      "head_size": {d},
         \\      "hidden_size": {d},
         \\      "inputs": {{
@@ -327,7 +337,7 @@ fn writeGeneratedGenAiConfig(
         .{
             bos_token_id,
             context_length,
-            decoder_filename,
+            decoder_filename_json,
             head_dim,
             hidden_size,
             num_attention_heads,
@@ -465,10 +475,55 @@ fn writeGeneratedHuggingFaceConfigFromGenAi(allocator: std.mem.Allocator, model_
     if (written != @as(isize, @intCast(out.len))) return error.ConfigWriteFailed;
 }
 
-pub fn ensureGenerativeModelPackage(allocator: std.mem.Allocator, model_dir: []const u8) !bool {
-    if (modelJoinExists(allocator, model_dir, "genai_config.json")) return true;
+fn writeSelectedGenAiConfig(
+    allocator: std.mem.Allocator,
+    source_model_dir: []const u8,
+    destination_model_dir: []const u8,
+    selected_decoder_path: []const u8,
+) !void {
+    const source_path = try std.fs.path.join(allocator, &.{ source_model_dir, "genai_config.json" });
+    defer allocator.free(source_path);
+    const source = try c_file.readFileMax(allocator, source_path, 16 * 1024 * 1024);
+    defer allocator.free(source);
 
-    const decoder_filename = findGenerativeOnnxRelativePath(allocator, model_dir) orelse return false;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, source, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidGenAiConfig;
+    const model = parsed.value.object.getPtr("model") orelse return error.InvalidGenAiConfig;
+    if (model.* != .object) return error.InvalidGenAiConfig;
+    const decoder = model.object.getPtr("decoder") orelse return error.InvalidGenAiConfig;
+    if (decoder.* != .object) return error.InvalidGenAiConfig;
+    const filename = decoder.object.getPtr("filename") orelse return error.InvalidGenAiConfig;
+    filename.* = .{ .string = selected_decoder_path };
+
+    const rendered = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
+    defer allocator.free(rendered);
+    const destination_path = try std.fs.path.join(allocator, &.{ destination_model_dir, "genai_config.json" });
+    defer allocator.free(destination_path);
+    const destination_path_z = try allocator.dupeZ(u8, destination_path);
+    defer allocator.free(destination_path_z);
+    const fd = c_file.c.open(destination_path_z.ptr, c_file.c.O_WRONLY | c_file.c.O_CREAT | c_file.c.O_TRUNC, @as(c_file.c.mode_t, 0o644));
+    if (fd < 0) return error.GenAiConfigWriteFailed;
+    defer _ = c_file.c.close(fd);
+    const written = c_file.c.write(fd, rendered.ptr, rendered.len);
+    if (written != @as(isize, @intCast(rendered.len))) return error.GenAiConfigWriteFailed;
+}
+
+fn ensureGenerativeModelPackage(allocator: std.mem.Allocator, model_dir: []const u8) !bool {
+    return ensureGenerativeModelPackageWithDecoder(allocator, model_dir, null);
+}
+
+fn ensureGenerativeModelPackageWithDecoder(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    decoder_override: ?[]const u8,
+) !bool {
+    if (decoder_override == null and modelJoinExists(allocator, model_dir, "genai_config.json")) return true;
+
+    const decoder_filename = if (decoder_override) |path|
+        try allocator.dupe(u8, path)
+    else
+        findGenerativeOnnxRelativePath(allocator, model_dir) orelse return false;
     defer allocator.free(decoder_filename);
     if (!modelJoinExists(allocator, model_dir, "config.json")) return false;
 
@@ -552,16 +607,25 @@ pub fn ensureGenerativeModelPackage(allocator: std.mem.Allocator, model_dir: []c
     return true;
 }
 
-fn createOverlayPackage(allocator: std.mem.Allocator, model_dir: []const u8) ![]u8 {
+fn createOverlayPackage(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    selected_decoder_path: ?[]const u8,
+) ![]u8 {
     const absolute_model_dir = try absolutePath(allocator, model_dir);
     defer allocator.free(absolute_model_dir);
+    const absolute_selected_decoder = if (selected_decoder_path) |path| try absolutePath(allocator, path) else null;
+    defer if (absolute_selected_decoder) |path| allocator.free(path);
     const hash = std.hash.Wyhash.hash(0, absolute_model_dir);
-    try mkdirIfMissing("/tmp/termite-ortgenai");
+    try mkdirIfMissing("/tmp/antfly-ortgenai");
     const nonce = overlay_package_nonce.fetchAdd(1, .monotonic);
     const pid: u32 = @intCast(c_file.c.getpid());
-    const base_dir = try std.fmt.allocPrint(allocator, "/tmp/termite-ortgenai/{x}-{x}-{x}", .{ hash, pid, nonce });
+    const base_dir = try std.fmt.allocPrint(allocator, "/tmp/antfly-ortgenai/{x}-{x}-{x}", .{ hash, pid, nonce });
     errdefer allocator.free(base_dir);
-    try mkdirIfMissing(base_dir);
+    // The leaf must be created exclusively. Reusing an existing directory
+    // would allow stale or externally-created links to influence the package.
+    try mkdirNew(base_dir);
+    errdefer compat.cwd().deleteTree(compat.io(), base_dir) catch {};
 
     const optional_files = [_][]const u8{
         "config.json",
@@ -624,24 +688,75 @@ fn createOverlayPackage(allocator: std.mem.Allocator, model_dir: []const u8) ![]
         defer allocator.free(genai_path_z);
         _ = c_file.c.unlink(genai_path_z.ptr);
     }
-    _ = try ensureGenerativeModelPackage(allocator, base_dir);
+    if (absolute_selected_decoder != null and modelJoinExists(allocator, absolute_model_dir, "genai_config.json")) {
+        try writeSelectedGenAiConfig(allocator, absolute_model_dir, base_dir, absolute_selected_decoder.?);
+    } else if (!try ensureGenerativeModelPackageWithDecoder(allocator, base_dir, absolute_selected_decoder)) {
+        return error.UnsupportedGeneratorArtifactSelection;
+    }
     try writeGeneratedHuggingFaceConfigFromGenAi(allocator, base_dir);
     return base_dir;
 }
 
-pub fn prepareGenerativeModelPackage(allocator: std.mem.Allocator, model_dir: []const u8) !?[]u8 {
+pub const PreparedGenerativeModelPackage = struct {
+    allocator: std.mem.Allocator,
+    path: []u8,
+    transient: bool,
+
+    pub fn deinit(self: *PreparedGenerativeModelPackage) void {
+        if (self.transient) removeTransientOverlay(self.path);
+        self.allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
+fn preparedSourcePackage(allocator: std.mem.Allocator, model_dir: []const u8) !PreparedGenerativeModelPackage {
+    return .{
+        .allocator = allocator,
+        .path = try allocator.dupe(u8, model_dir),
+        .transient = false,
+    };
+}
+
+fn preparedOverlayPackage(allocator: std.mem.Allocator, path: []u8) PreparedGenerativeModelPackage {
+    return .{ .allocator = allocator, .path = path, .transient = true };
+}
+
+pub fn prepareGenerativeModelPackage(allocator: std.mem.Allocator, model_dir: []const u8) !?PreparedGenerativeModelPackage {
     if (modelJoinExists(allocator, model_dir, "genai_config.json")) {
         if (shouldForceOverlayGenAiPackage(allocator, model_dir)) {
-            return try createOverlayPackage(allocator, model_dir);
+            return preparedOverlayPackage(allocator, try createOverlayPackage(allocator, model_dir, null));
         }
-        return try allocator.dupe(u8, model_dir);
+        return try preparedSourcePackage(allocator, model_dir);
     }
     if (!isGenerativeModel(model_dir)) return null;
-    if (ensureGenerativeModelPackage(allocator, model_dir)) |_| {
-        return try allocator.dupe(u8, model_dir);
-    } else |_| {
-        return try createOverlayPackage(allocator, model_dir);
-    }
+    // Model directories are immutable runtime inputs. Building an isolated,
+    // metadata-only overlay avoids racing concurrent cold requests and works
+    // for read-only registry mounts without copying model weights.
+    return preparedOverlayPackage(allocator, try createOverlayPackage(allocator, model_dir, null));
+}
+
+/// Prepare a generation package whose decoder is the exact ONNX artifact
+/// selected by the model-variant manifest. The generated overlay references
+/// the source artifact by absolute path, so external tensor data remains
+/// relative to the original artifact directory and no model bytes are copied.
+pub fn prepareGenerativeModelPackageForArtifact(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    selected_onnx_path: []const u8,
+) !PreparedGenerativeModelPackage {
+    if (!fileExists(selected_onnx_path)) return error.ModelArtifactVariantNotFound;
+    return preparedOverlayPackage(allocator, try createOverlayPackage(allocator, model_dir, selected_onnx_path));
+}
+
+fn removeTransientOverlay(path: []const u8) void {
+    const prefix = "/tmp/antfly-ortgenai/";
+    if (!std.mem.startsWith(u8, path, prefix)) return;
+    const leaf = path[prefix.len..];
+    if (leaf.len == 0 or std.mem.indexOfScalar(u8, leaf, '/') != null or
+        std.mem.eql(u8, leaf, ".") or std.mem.eql(u8, leaf, "..")) return;
+    compat.cwd().deleteTree(compat.io(), path) catch |err| {
+        std.log.warn("failed to remove transient Ort GenAI package {s}: {s}", .{ path, @errorName(err) });
+    };
 }
 
 /// Check an OGA result and return an error if non-null.
@@ -651,6 +766,75 @@ fn check(result: ?*c.OgaResult) !void {
             std.log.err("ortgenai: {s}", .{std.mem.span(msg)});
         }
         defer c.OgaDestroyResult(r);
+        return error.OrtGenAiFailed;
+    }
+}
+
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    for (0..haystack.len - needle.len + 1) |offset| {
+        if (std.ascii.eqlIgnoreCase(haystack[offset .. offset + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn isExecutionProviderFailure(message: []const u8) bool {
+    // OGA exposes only a textual error here. Match provider-specific failure
+    // phrases rather than bare backend names: model paths and artifact names
+    // commonly contain strings such as "cuda", and treating those as provider
+    // failures would incorrectly mask corrupt artifacts behind fallback.
+    const provider_markers = [_][]const u8{
+        "execution provider is not available",
+        "failed to load execution provider",
+        "failed to initialize execution provider",
+        "provider library could not be loaded",
+        "loadlibrary failed",
+        "dlopen(",
+        "libonnxruntime_providers_cuda",
+        "libonnxruntime_providers_tensorrt",
+        "cuda driver version is insufficient",
+        "cuda initialization failure",
+        "cuda failure",
+        "cuda error",
+        "no cuda-capable device",
+        "cudnn error",
+        "cublas error",
+        "tensorrt execution provider",
+        "directml execution provider",
+        "coreml execution provider",
+    };
+    for (provider_markers) |marker| {
+        if (containsAsciiIgnoreCase(message, marker)) return true;
+    }
+    return false;
+}
+
+test "execution provider classification does not inspect artifact names" {
+    try std.testing.expect(!isExecutionProviderFailure(
+        "failed to parse /models/acme-cuda-model/genai_config.json",
+    ));
+    try std.testing.expect(isExecutionProviderFailure(
+        "LoadLibrary failed while loading libonnxruntime_providers_cuda.so",
+    ));
+    try std.testing.expect(isExecutionProviderFailure(
+        "CUDA driver version is insufficient for CUDA runtime version",
+    ));
+}
+
+/// Model construction can fail because the selected execution provider is not
+/// usable or because the artifact/configuration is invalid. Only the former is
+/// eligible for configured-priority fallback.
+fn checkModelCreate(result: ?*c.OgaResult) !void {
+    if (result) |r| {
+        var provider_failure = false;
+        if (c.OgaResultGetError(r)) |msg| {
+            const message = std.mem.span(msg);
+            std.log.err("ortgenai: {s}", .{message});
+            provider_failure = isExecutionProviderFailure(message);
+        }
+        defer c.OgaDestroyResult(r);
+        if (provider_failure) return error.OrtGenAiBackendUnavailable;
         return error.OrtGenAiFailed;
     }
 }
@@ -666,7 +850,7 @@ pub const GenAiModel = struct {
         defer allocator.free(path_z);
 
         var model: ?*c.OgaModel = null;
-        try check(c.OgaCreateModel(path_z.ptr, &model));
+        try checkModelCreate(c.OgaCreateModel(path_z.ptr, &model));
         errdefer c.OgaDestroyModel(model.?);
 
         var tokenizer: ?*c.OgaTokenizer = null;
@@ -1170,10 +1354,87 @@ test "prepareGenerativeModelPackage uses overlay dir when forced" {
     const path = try testingTmpDirPath(allocator, &tmp);
     defer allocator.free(path);
 
-    const overlay = (try prepareGenerativeModelPackage(allocator, path)).?;
-    defer allocator.free(overlay);
-    try std.testing.expect(!std.mem.eql(u8, overlay, path));
-    const generated = try c_file.readFileFromDir(allocator, overlay, "genai_config.json");
+    var package = (try prepareGenerativeModelPackage(allocator, path)).?;
+    defer package.deinit();
+    try std.testing.expect(package.transient);
+    try std.testing.expect(!std.mem.eql(u8, package.path, path));
+    const generated = try c_file.readFileFromDir(allocator, package.path, "genai_config.json");
     defer allocator.free(generated);
     try std.testing.expect(std.mem.indexOf(u8, generated, "\"filename\": \"onnx/decoder_model_merged.onnx\"") != null);
+}
+
+test "source-backed generative package remains owned by the model registry" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data =
+        \\{"model_type":"gpt2"}
+    });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "genai_config.json", .data = "{}" });
+    const path = try testingTmpDirPath(allocator, &tmp);
+    defer allocator.free(path);
+
+    var package = (try prepareGenerativeModelPackage(allocator, path)).?;
+    try std.testing.expect(!package.transient);
+    try std.testing.expectEqualStrings(path, package.path);
+    package.deinit();
+
+    try std.testing.expect(modelJoinExists(allocator, path, "genai_config.json"));
+}
+
+test "selected ONNX generation artifact produces a zero-copy exact package" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "onnx");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "onnx/decoder_model_merged.onnx", .data = "default" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "onnx/decoder_model_merged.Q8_0.onnx", .data = "selected" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data =
+        \\{"model_type":"gpt2","bos_token_id":1,"eos_token_id":2,"pad_token_id":0,"vocab_size":32,"hidden_size":8,"num_hidden_layers":1,"num_attention_heads":1,"max_position_embeddings":32}
+    });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "genai_config.json", .data =
+        \\{"model":{"bos_token_id":1,"context_length":32,"decoder":{"filename":"onnx/decoder_model_merged.onnx","head_size":8,"hidden_size":8,"num_attention_heads":1,"num_hidden_layers":1,"num_key_value_heads":1,"session_options":{"log_id":"preserved"}},"eos_token_id":[2],"pad_token_id":0,"type":"gpt2","vocab_size":32},"search":{"custom_setting":true}}
+    });
+
+    const path = try testingTmpDirPath(allocator, &tmp);
+    defer allocator.free(path);
+    const selected_path = try std.fs.path.join(allocator, &.{ path, "onnx/decoder_model_merged.Q8_0.onnx" });
+    defer allocator.free(selected_path);
+    var package = try prepareGenerativeModelPackageForArtifact(allocator, path, selected_path);
+    defer package.deinit();
+    try std.testing.expect(package.transient);
+    const generated = try c_file.readFileFromDir(allocator, package.path, "genai_config.json");
+    defer allocator.free(generated);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "decoder_model_merged.Q8_0.onnx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "decoder_model_merged.onnx\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "\"log_id\": \"preserved\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "\"custom_setting\": true") != null);
+}
+
+test "package preparation does not mutate source model metadata" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "onnx");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "onnx/decoder_model_merged.onnx", .data = "model" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data =
+        \\{"model_type":"gpt2","bos_token_id":1,"eos_token_id":2,"pad_token_id":0,"vocab_size":32,"hidden_size":8,"num_hidden_layers":1,"num_attention_heads":1,"max_position_embeddings":32}
+    });
+
+    const path = try testingTmpDirPath(allocator, &tmp);
+    defer allocator.free(path);
+    var first = (try prepareGenerativeModelPackage(allocator, path)).?;
+    defer first.deinit();
+    var second = (try prepareGenerativeModelPackage(allocator, path)).?;
+    defer second.deinit();
+
+    try std.testing.expect(first.transient);
+    try std.testing.expect(second.transient);
+    try std.testing.expect(!std.mem.eql(u8, first.path, second.path));
+    try std.testing.expect(!modelJoinExists(allocator, path, "genai_config.json"));
+    try std.testing.expect(modelJoinExists(allocator, first.path, "genai_config.json"));
+    try std.testing.expect(modelJoinExists(allocator, second.path, "genai_config.json"));
 }

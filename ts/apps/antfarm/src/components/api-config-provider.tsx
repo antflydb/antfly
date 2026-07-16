@@ -1,6 +1,6 @@
 import { AntflyClient } from "@antfly/sdk";
 import type { ReactNode } from "react";
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { ApiConfigContext } from "@/contexts/api-config-context";
 import { getAntfarmRuntimeConfig } from "@/runtime-config";
 
@@ -74,15 +74,18 @@ export function ApiConfigProvider({ children }: { children: ReactNode }) {
     localStorage.removeItem(INFERENCE_STORAGE_KEY);
   };
 
-  const setInferenceConnectionId = (id: string) => {
+  const setInferenceConnectionId = useCallback((id: string) => {
     setInferenceConnectionIdState(id);
     localStorage.setItem(INFERENCE_CONNECTION_STORAGE_KEY, id);
-  };
+  }, []);
 
-  const inferenceUrl = (operation: string) =>
-    inferenceConnectionId === "local-inference"
-      ? `${inferenceApiUrl}/ai/v1/${operation}`
-      : `${apiUrl}/connections/${encodeURIComponent(inferenceConnectionId)}/inference/${operation}`;
+  const inferenceUrl = useCallback(
+    (operation: string) =>
+      inferenceConnectionId === "local-inference"
+        ? `${inferenceApiUrl}/ai/v1/${operation}`
+        : `${apiUrl}/connections/${encodeURIComponent(inferenceConnectionId)}/inference/${operation}`,
+    [apiUrl, inferenceApiUrl, inferenceConnectionId]
+  );
 
   return (
     <ApiConfigContext.Provider

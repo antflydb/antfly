@@ -169,9 +169,14 @@ export type EnrichmentConfig = components["schemas"]["EnrichmentConfig"];
 export type IndexConfig = components["schemas"]["IndexConfig"];
 export type IndexType = components["schemas"]["IndexType"];
 export type IndexStatus = components["schemas"]["IndexStatus"];
+export type ArtifactIndexSource = components["schemas"]["ArtifactIndexSource"];
+export type FullTextIndexConfig = components["schemas"]["FullTextIndexConfig"];
+export type EmbeddingsIndexConfig = components["schemas"]["EmbeddingsIndexConfig"];
+export type AlgebraicIndexConfig = components["schemas"]["AlgebraicIndexConfig"];
 
 // Graph index types
 export type GraphIndexConfig = components["schemas"]["GraphIndexConfig"];
+export type GraphIndexSource = components["schemas"]["GraphIndexSource"];
 export type EdgeTypeConfig = components["schemas"]["EdgeTypeConfig"];
 export type EdgeTopology = NonNullable<EdgeTypeConfig["topology"]>;
 
