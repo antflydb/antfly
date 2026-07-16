@@ -150,11 +150,12 @@ pub fn writeClipclapVariantsManifest(allocator: Allocator, io: std.Io, model_dir
     try writer.writeAll(
         \\{
         \\  "family": "clipclap_variants/v1",
-        \\  "defaults":
+        \\  "defaults": {
     );
+    var wrote_default = false;
     if (has_default_onnx) {
+        wrote_default = true;
         try writer.writeAll(
-            \\{
             \\    "onnx": {
             \\      "format": "F32",
             \\      "text_model": "text_model.onnx",
@@ -164,13 +165,22 @@ pub fn writeClipclapVariantsManifest(allocator: Allocator, io: std.Io, model_dir
             \\      "visual_projection": "visual_projection.onnx",
             \\      "audio_projection": "audio_projection.onnx"
             \\    }
-            \\  }
         );
-    } else {
-        try writer.writeAll("{}");
+    }
+    if (hasFile(names.items, "clipclap-clip.gguf") and hasFile(names.items, "clipclap-clap.gguf")) {
+        if (wrote_default) try writer.writeAll(",\n");
+        wrote_default = true;
+        try writer.writeAll(
+            \\    "gguf": {
+            \\      "target": "gguf",
+            \\      "format": "F32",
+            \\      "clip": "clipclap-clip.gguf",
+            \\      "clap": "clipclap-clap.gguf"
+            \\    }
+        );
     }
     try writer.writeAll(
-        \\,
+        \\  },
         \\  "variants": [
         \\
     );
@@ -263,22 +273,32 @@ pub fn writeGliner2VariantsManifest(allocator: Allocator, io: std.Io, model_dir:
     try writer.writeAll(
         \\{
         \\  "family": "gliner2_variants/v1",
-        \\  "defaults":
+        \\  "defaults": {
     );
+    var wrote_default = false;
     if (hasFile(names.items, "model.onnx")) {
+        wrote_default = true;
         try writer.writeAll(
-            \\{
             \\    "onnx": {
             \\      "format": "F32",
             \\      "model": "model.onnx"
             \\    }
-            \\  }
         );
-    } else {
-        try writer.writeAll("{}");
+    }
+    if (hasFile(names.items, "gliner2-encoder.gguf") and hasFile(names.items, "gliner2-head.gguf")) {
+        if (wrote_default) try writer.writeAll(",\n");
+        wrote_default = true;
+        try writer.writeAll(
+            \\    "gguf": {
+            \\      "target": "gguf",
+            \\      "format": "F32",
+            \\      "encoder": "gliner2-encoder.gguf",
+            \\      "head": "gliner2-head.gguf"
+            \\    }
+        );
     }
     try writer.writeAll(
-        \\,
+        \\  },
         \\  "variants": [
         \\
     );
@@ -358,7 +378,26 @@ pub fn writeFlorence2VariantsManifestForModel(
     try writer.writeAll(
         \\{
         \\  "family": "florence2_variants/v1",
-        \\  "defaults": {},
+        \\  "defaults": {
+    );
+    var default_name: ?[]const u8 = null;
+    for (gguf_names.items) |name| {
+        if (florence2FormatSuffixFromGgufName(name).len == 0) {
+            default_name = name;
+            break;
+        }
+    }
+    if (default_name) |name| {
+        try writer.print(
+            \\    "gguf": {{
+            \\      "target": "gguf",
+            \\      "format": "F32",
+            \\      "model": "{s}"
+            \\    }}
+        , .{name});
+    }
+    try writer.writeAll(
+        \\  },
         \\  "variants": [
         \\
     );

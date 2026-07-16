@@ -394,6 +394,38 @@ var _ = Describe("InferencePool Controller", func() {
 	})
 
 	Context("When generating model loading configuration", func() {
+		It("Should preserve artifact variants as structured eager preload identity", func() {
+			reconciler := &InferencePoolReconciler{}
+			pool := &antflyaiv1alpha1.InferencePool{
+				Spec: antflyaiv1alpha1.InferencePoolSpec{
+					Models: antflyaiv1alpha1.ModelConfig{
+						Preload: []antflyaiv1alpha1.ModelSpec{
+							{Name: "hf:owner/model:gguf:Q4_K", Kind: antflyaiv1alpha1.ModelKindGenerator},
+							{Name: "hf:owner/model:gguf:Q8_0", Kind: antflyaiv1alpha1.ModelKindGenerator},
+							{Name: "owner/legacy:i8", Kind: antflyaiv1alpha1.ModelKindEmbedder},
+						},
+						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
+					},
+				},
+			}
+			configJSON, err := reconciler.generateCompleteConfig(pool)
+			Expect(err).NotTo(HaveOccurred())
+			var completeConfig map[string]any
+			Expect(json.Unmarshal([]byte(configJSON), &completeConfig)).To(Succeed())
+			config := completeConfig["inference"].(map[string]any)
+			preload := config["preload"].([]any)
+			Expect(preload).To(HaveLen(3))
+			Expect(preload[0].(map[string]any)).To(SatisfyAll(
+				HaveKeyWithValue("format", "gguf"),
+				HaveKeyWithValue("quantization", "Q4_K"),
+			))
+			Expect(preload[1].(map[string]any)).To(SatisfyAll(
+				HaveKeyWithValue("format", "gguf"),
+				HaveKeyWithValue("quantization", "Q8_0"),
+			))
+			Expect(preload[2].(map[string]any)).NotTo(HaveKey("format"))
+		})
+
 		It("Should only warm models for eager pools", func() {
 			reconciler := &InferencePoolReconciler{}
 			pool := &antflyaiv1alpha1.InferencePool{

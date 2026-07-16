@@ -108,8 +108,10 @@ fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
     var backend: ?inference.backends.BackendType = null;
     if (std.mem.indexOfScalar(u8, model_name, ':')) |backend_separator| {
         const backend_name = model_name[0..backend_separator];
-        backend = parseBackendType(backend_name) orelse return error.InvalidArguments;
-        model_name = model_name[backend_separator + 1 ..];
+        if (parseBackendType(backend_name)) |parsed_backend| {
+            backend = parsed_backend;
+            model_name = model_name[backend_separator + 1 ..];
+        }
     }
     if (model_name.len == 0) return error.InvalidArguments;
     return .{
@@ -119,6 +121,17 @@ fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
         .format = null,
         .quantization = null,
     };
+}
+
+test "preload flag preserves artifact variant suffixes" {
+    const variant = try parsePreloadModelFlag("generator:hf:owner/model:gguf:Q8_0");
+    try std.testing.expectEqual(inference.server.WarmModelKind.generator, variant.kind);
+    try std.testing.expectEqualStrings("hf:owner/model:gguf:Q8_0", variant.name);
+    try std.testing.expectEqual(@as(?inference.backends.BackendType, null), variant.backend);
+
+    const explicit_backend = try parsePreloadModelFlag("generator:cuda:hf:owner/model:gguf:Q8_0");
+    try std.testing.expectEqualStrings("hf:owner/model:gguf:Q8_0", explicit_backend.name);
+    try std.testing.expectEqual(inference.backends.BackendType.cuda, explicit_backend.backend.?);
 }
 
 fn parseNonNegativeUsize(value: []const u8) !usize {

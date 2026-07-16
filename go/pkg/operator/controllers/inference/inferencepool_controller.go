@@ -316,10 +316,17 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 			return "", fmt.Errorf("preload model %q is missing kind", m.Name)
 		}
 		if loadingStrategy == antflyaiv1alpha1.LoadingStrategyEager {
-			preload = append(preload, map[string]any{
+			entry := map[string]any{
 				"kind": m.Kind,
 				"name": m.Name,
-			})
+			}
+			if format, quantization, ok := inferenceArtifactSelection(m.Name); ok {
+				entry["format"] = format
+				if quantization != "" {
+					entry["quantization"] = quantization
+				}
+			}
+			preload = append(preload, entry)
 		}
 	}
 
@@ -403,6 +410,35 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 	}
 
 	return string(configJSON), nil
+}
+
+// inferenceArtifactSelection recognizes only runtime artifact-family suffixes.
+// Other registry variants such as :i8 remain opaque pull references.
+func inferenceArtifactSelection(modelRef string) (format, quantization string, ok bool) {
+	ref := modelRef
+	if strings.HasPrefix(ref, "hf:") {
+		ref = ref[len("hf:"):]
+	}
+	separator := strings.IndexByte(ref, ':')
+	if separator < 0 {
+		return "", "", false
+	}
+	suffix := ref[separator+1:]
+	if quantizationSeparator := strings.IndexByte(suffix, ':'); quantizationSeparator >= 0 {
+		format = suffix[:quantizationSeparator]
+		quantization = suffix[quantizationSeparator+1:]
+		if quantization == "" {
+			return "", "", false
+		}
+	} else {
+		format = suffix
+	}
+	switch strings.ToLower(format) {
+	case "gguf", "onnx", "safetensors", "hybrid":
+		return strings.ToLower(format), quantization, true
+	default:
+		return "", "", false
+	}
 }
 
 func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool *antflyaiv1alpha1.InferencePool) error {

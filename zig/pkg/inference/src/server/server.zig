@@ -252,16 +252,28 @@ pub const NodeConfig = struct {
 pub const GenerationBackend = native_backend_choice.Choice;
 
 fn generationBackendFromPriority(priority: ?[]const backends_mod.BackendType) GenerationBackend {
-    return generationBackendFromPriorityExcluding(priority, null);
+    return generationBackendFromPrioritySkipping(
+        priority,
+        std.EnumSet(backends_mod.BackendType).initEmpty(),
+    );
 }
 
 fn generationBackendFromPriorityExcluding(
     priority: ?[]const backends_mod.BackendType,
     excluded: ?backends_mod.BackendType,
 ) GenerationBackend {
+    var excluded_backends = std.EnumSet(backends_mod.BackendType).initEmpty();
+    if (excluded) |backend| excluded_backends.insert(backend);
+    return generationBackendFromPrioritySkipping(priority, excluded_backends);
+}
+
+fn generationBackendFromPrioritySkipping(
+    priority: ?[]const backends_mod.BackendType,
+    excluded: std.EnumSet(backends_mod.BackendType),
+) GenerationBackend {
     const configured = priority orelse return .auto;
     for (configured) |backend| {
-        if (excluded != null and backend == excluded.?) continue;
+        if (excluded.contains(backend)) continue;
         if (!backend.available()) continue;
         return switch (backend) {
             .native => .native,
@@ -351,6 +363,17 @@ fn artifactSelectionFromModelReference(model_name: []const u8) manifest_mod.Arti
         }
     }
     return .{};
+}
+
+fn warmModelArtifactSelection(model: WarmModel) manifest_mod.ArtifactSelection {
+    const configured: manifest_mod.ArtifactSelection = .{
+        .format = model.format,
+        .quantization = model.quantization,
+    };
+    // Structured configuration is authoritative. The suffix fallback keeps
+    // operator ModelSpec references and the CLI's compact model references
+    // lossless without adding parsing or allocation to request hot paths.
+    return if (configured.isEmpty()) artifactSelectionFromModelReference(model.name) else configured;
 }
 
 fn artifactFormatIs(selection: manifest_mod.ArtifactSelection, format: []const u8) bool {
@@ -1316,6 +1339,28 @@ pub const Node = struct {
         try self.warmGeneratorWithBackend(allocator, .{ .name = model_name }, request_id);
     }
 
+    fn prepareOnnxGeneratorModelDir(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        artifact_selection: manifest_mod.ArtifactSelection,
+    ) !?[]u8 {
+        if (artifact_selection.quantization == null)
+            return backends_mod.ortgenai.prepareGenerativeModelPackage(allocator, model_path);
+
+        var selected_manifest = try manifest_mod.loadFromDirWithArtifactSelection(
+            allocator,
+            model_path,
+            artifact_selection,
+        );
+        defer selected_manifest.deinit();
+        const selected_onnx_path = selected_manifest.onnx_path orelse return error.UnsupportedGeneratorArtifactSelection;
+        return try backends_mod.ortgenai.prepareGenerativeModelPackageForArtifact(
+            allocator,
+            model_path,
+            selected_onnx_path,
+        );
+    }
+
     fn warmOnnxGenerator(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -1325,11 +1370,11 @@ pub const Node = struct {
         request_id: u64,
     ) !void {
         if (comptime build_options.enable_onnx) {
-            if (artifact_selection.quantization != null) return error.UnsupportedGeneratorArtifactSelection;
             var transient_lease = try self.model_manager.beginTransientModelLoadForRequest(request_id);
             defer transient_lease.deinit();
 
-            if (!c_file.fileExistsInDir(allocator, model_path, "genai_config.json") and
+            if (artifact_selection.quantization == null and
+                !c_file.fileExistsInDir(allocator, model_path, "genai_config.json") and
                 onnx_decoder_only_vlm.isSupportedModelDir(allocator, model_path))
             {
                 var pipeline = try onnx_decoder_only_vlm.Pipeline.load(allocator, model_path);
@@ -1340,9 +1385,10 @@ pub const Node = struct {
                 return;
             }
 
-            const prepared_model_dir = try backends_mod.ortgenai.prepareGenerativeModelPackage(allocator, model_path) orelse
+            const prepared_model_dir = try prepareOnnxGeneratorModelDir(allocator, model_path, artifact_selection) orelse
                 return error.UnsupportedGeneratorProvider;
             defer allocator.free(prepared_model_dir);
+            defer backends_mod.ortgenai.releaseGenerativeModelPackage(prepared_model_dir);
 
             var manifest = try manifest_mod.loadFromDir(allocator, prepared_model_dir);
             defer manifest.deinit();
@@ -1438,7 +1484,7 @@ pub const Node = struct {
     fn warmGeneratorWithBackend(self: *Node, allocator: std.mem.Allocator, model: WarmModel, request_id: u64) !void {
         const model_name = model.name;
         const backend = model.backend;
-        const artifact_selection: manifest_mod.ArtifactSelection = .{ .format = model.format, .quantization = model.quantization };
+        const artifact_selection = warmModelArtifactSelection(model);
         if (model_name.len == 0) return error.InvalidGenerationRequest;
         const started_at_ns = embedTimingNowNs();
         std.log.info("warming inference generator model={s}", .{model_name});
@@ -1507,7 +1553,7 @@ pub const Node = struct {
     fn warmEmbedder(self: *Node, allocator: std.mem.Allocator, warm_model: WarmModel, request_id: u64) !void {
         const model_name = warm_model.name;
         const backend = warm_model.backend;
-        const artifact_selection: manifest_mod.ArtifactSelection = .{ .format = warm_model.format, .quantization = warm_model.quantization };
+        const artifact_selection = warmModelArtifactSelection(warm_model);
         if (model_name.len == 0) return error.InvalidGenerationRequest;
         const started_at_ns = embedTimingNowNs();
         std.log.info("warming inference embedder model={s}", .{model_name});
@@ -1567,7 +1613,7 @@ pub const Node = struct {
     fn warmReranker(self: *Node, allocator: std.mem.Allocator, warm_model: WarmModel, request_id: u64) !void {
         const model_name = warm_model.name;
         const backend = warm_model.backend;
-        const artifact_selection: manifest_mod.ArtifactSelection = .{ .format = warm_model.format, .quantization = warm_model.quantization };
+        const artifact_selection = warmModelArtifactSelection(warm_model);
         if (model_name.len == 0) return error.InvalidGenerationRequest;
         const started_at_ns = embedTimingNowNs();
         std.log.info("warming inference reranker model={s}", .{model_name});
@@ -1618,7 +1664,7 @@ pub const Node = struct {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
         const model_path = try self.resolveModelPath(io_impl.io(), model.name, task_dir);
-        const artifact_selection: manifest_mod.ArtifactSelection = .{ .format = model.format, .quantization = model.quantization };
+        const artifact_selection = warmModelArtifactSelection(model);
         if (model.backend) |backend| {
             if (artifact_selection.isEmpty())
                 try self.model_manager.setBackendPolicy(model_path, backend)
@@ -2686,9 +2732,11 @@ pub const Node = struct {
     fn fallbackConfiguredGenerationSelection(
         self: *Node,
         body: api.GenerateRequest,
-        excluded: backends_mod.BackendType,
+        failed_backends: *std.EnumSet(backends_mod.BackendType),
+        failed: backends_mod.BackendType,
     ) !GenerateBackendSelection {
-        const fallback_choice = generationBackendFromPriorityExcluding(self.config.backend_priority, excluded);
+        failed_backends.insert(failed);
+        const fallback_choice = generationBackendFromPrioritySkipping(self.config.backend_priority, failed_backends.*);
         // A configured list must never escape to the implicit auto/default
         // order. In particular, a one-entry list is strict even when the
         // request did not include an explicit backend override.
@@ -2701,6 +2749,17 @@ pub const Node = struct {
             body.compiled_target,
             fallback_choice,
         );
+    }
+
+    fn initializeConfiguredPjrtClient(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        plugin_path_out: *?[:0]u8,
+    ) !pjrt_lib.pjrt.Client {
+        std.debug.assert(plugin_path_out.* == null);
+        plugin_path_out.* = try native_backend_choice.resolvePjrtPluginPath(allocator, self.config.pjrt_plugin_path);
+        const plugin_path = plugin_path_out.* orelse return error.MissingPjrtPluginPath;
+        return pjrt_lib.pjrt.Client.init(plugin_path) catch return error.PjrtProviderUnavailable;
     }
 
     pub fn generateContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -2982,13 +3041,8 @@ pub const Node = struct {
                 },
             });
         };
+        var failed_generation_backends = std.EnumSet(backends_mod.BackendType).initEmpty();
         if (model_backend_policy != null) backend_selection.override_model_loading = true;
-        if (artifact_selection.quantization != null and artifactFormatIs(artifact_selection, "onnx")) {
-            return ctx.status(400).json(.{
-                .@"error" = "INVALID_REQUEST",
-                .message = "quantized ONNX generator artifact selection is not supported",
-            });
-        }
         if (backend_selection.strict_backend) {
             const strict_backend: backends_mod.BackendType = switch (backend_selection.native_choice) {
                 .native => .native,
@@ -3055,6 +3109,34 @@ pub const Node = struct {
             config.grammar = grammar;
         }
 
+        var pjrt_client: ?pjrt_lib.pjrt.Client = null;
+        defer if (pjrt_client) |*client| client.deinit();
+        var pjrt_plugin_path: ?[:0]u8 = null;
+        defer if (pjrt_plugin_path) |path| ctx.allocator.free(path);
+
+        // Probe an initially selected PJRT provider before the ONNX stage. If
+        // it is unavailable, the next configured backend must still get its
+        // native operation-specific implementation rather than being entered
+        // later as a compiled partition backend.
+        if (backend_selection.compiled_partition_backend == .pjrt) {
+            if (self.initializeConfiguredPjrtClient(ctx.allocator, &pjrt_plugin_path)) |client| {
+                pjrt_client = client;
+            } else |err| {
+                if (backend_selection.strict_backend) {
+                    return ctx.status(if (err == error.MissingPjrtPluginPath) 400 else 500).json(.{
+                        .@"error" = if (err == error.MissingPjrtPluginPath) "INVALID_REQUEST" else "BACKEND_ERROR",
+                        .message = if (err == error.MissingPjrtPluginPath)
+                            "pjrt backend requires inference.pjrt_plugin_path or PJRT_PLUGIN_PATH"
+                        else
+                            @errorName(err),
+                    });
+                }
+                std.log.warn("configured PJRT backend unavailable ({s}); advancing backend priority", .{@errorName(err)});
+                backend_selection = self.fallbackConfiguredGenerationSelection(body, &failed_generation_backends, .pjrt) catch
+                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "failed to resolve generation backend fallback" });
+            }
+        }
+
         // The direct ONNX generator implementations do not support grammar or
         // speculative decoding. A configured ONNX preference falls through to
         // graph-backed native generation for those requests; an ordinary ONNX
@@ -3067,7 +3149,7 @@ pub const Node = struct {
 
         // Try plain HF ONNX decoder-only VLM packages before Ort GenAI overlays.
         plain_onnx_generation: {
-            if (allow_onnx and build_options.enable_onnx and
+            if (allow_onnx and artifact_selection.quantization == null and build_options.enable_onnx and
                 !c_file.fileExistsInDir(ctx.allocator, model_path, "genai_config.json") and
                 onnx_decoder_only_vlm.isSupportedModelDir(ctx.allocator, model_path))
             {
@@ -3096,7 +3178,7 @@ pub const Node = struct {
 
                 var pipeline = onnx_decoder_only_vlm.Pipeline.load(ctx.allocator, model_path) catch |err| {
                     if (!backend_selection.strict_backend and isConfiguredOnnxGenerationFallbackError(err)) {
-                        backend_selection = self.fallbackConfiguredGenerationSelection(body, .onnx) catch {
+                        backend_selection = self.fallbackConfiguredGenerationSelection(body, &failed_generation_backends, .onnx) catch {
                             return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
                         };
                         allow_onnx = false;
@@ -3168,9 +3250,10 @@ pub const Node = struct {
                 // artifact or local filesystem and must remain terminal; they
                 // are not evidence that the configured ONNX provider is
                 // unavailable.
-                const ort_model_dir = ortgenai.prepareGenerativeModelPackage(ctx.allocator, model_path) catch |err|
+                const ort_model_dir = prepareOnnxGeneratorModelDir(ctx.allocator, model_path, artifact_selection) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
                 defer if (ort_model_dir) |prepared| ctx.allocator.free(prepared);
+                defer if (ort_model_dir) |prepared| ortgenai.releaseGenerativeModelPackage(prepared);
                 if (ort_model_dir) |prepared_model_dir| {
                     if (config.grammar != null) {
                         return ctx.status(400).json(.{
@@ -3222,7 +3305,7 @@ pub const Node = struct {
 
                     var gen_model = ortgenai.GenAiModel.load(ctx.allocator, prepared_model_dir) catch |err| {
                         if (!backend_selection.strict_backend and isConfiguredOnnxGenerationFallbackError(err)) {
-                            backend_selection = self.fallbackConfiguredGenerationSelection(body, .onnx) catch {
+                            backend_selection = self.fallbackConfiguredGenerationSelection(body, &failed_generation_backends, .onnx) catch {
                                 return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
                             };
                             allow_onnx = false;
@@ -3368,34 +3451,21 @@ pub const Node = struct {
         var draft_cb: ?ops.ComputeBackend = null;
         defer if (draft_cb) |*cb_value| cb_value.deinit();
         var draft_gpt_config: ?@import("../models/gpt.zig").Config = null;
-        var pjrt_client: ?pjrt_lib.pjrt.Client = null;
-        defer if (pjrt_client) |*client| client.deinit();
-        var pjrt_plugin_path: ?[:0]u8 = null;
-        defer if (pjrt_plugin_path) |path| ctx.allocator.free(path);
-        if (backend_selection.compiled_partition_backend == .pjrt) {
-            pjrt_plugin_path = try native_backend_choice.resolvePjrtPluginPath(ctx.allocator, self.config.pjrt_plugin_path);
-            if (pjrt_plugin_path) |plugin_path| {
-                if (pjrt_lib.pjrt.Client.init(plugin_path)) |client| {
-                    pjrt_client = client;
-                } else |err| {
-                    if (backend_selection.strict_backend) {
-                        return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
-                    }
-                    std.log.warn(
-                        "configured PJRT backend initialization failed ({s}); continuing with backend priority fallback",
-                        .{@errorName(err)},
-                    );
-                    backend_selection = self.fallbackConfiguredGenerationSelection(body, .pjrt) catch
-                        return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "failed to resolve generation backend fallback" });
+        if (backend_selection.compiled_partition_backend == .pjrt and pjrt_client == null) {
+            if (self.initializeConfiguredPjrtClient(ctx.allocator, &pjrt_plugin_path)) |client| {
+                pjrt_client = client;
+            } else |err| {
+                if (backend_selection.strict_backend) {
+                    return ctx.status(if (err == error.MissingPjrtPluginPath) 400 else 500).json(.{
+                        .@"error" = if (err == error.MissingPjrtPluginPath) "INVALID_REQUEST" else "BACKEND_ERROR",
+                        .message = if (err == error.MissingPjrtPluginPath)
+                            "pjrt backend requires inference.pjrt_plugin_path or PJRT_PLUGIN_PATH"
+                        else
+                            @errorName(err),
+                    });
                 }
-            } else if (backend_selection.strict_backend) {
-                return ctx.status(400).json(.{
-                    .@"error" = "INVALID_REQUEST",
-                    .message = "pjrt backend requires inference.pjrt_plugin_path or PJRT_PLUGIN_PATH",
-                });
-            } else {
-                std.log.warn("configured PJRT backend has no plugin path; continuing with backend priority fallback", .{});
-                backend_selection = self.fallbackConfiguredGenerationSelection(body, .pjrt) catch
+                std.log.warn("configured PJRT backend unavailable ({s}); advancing backend priority", .{@errorName(err)});
+                backend_selection = self.fallbackConfiguredGenerationSelection(body, &failed_generation_backends, .pjrt) catch
                     return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "failed to resolve generation backend fallback" });
             }
         }
@@ -7925,6 +7995,31 @@ test "generation model references preserve artifact variant identity" {
     const onnx = artifactSelectionFromModelReference("owner/model:onnx");
     try std.testing.expect(artifactSupportsGenerationBackend(onnx, .onnx));
     try std.testing.expect(!artifactSupportsGenerationBackend(onnx, .native));
+
+    const warm_selection = warmModelArtifactSelection(.{ .name = "hf:owner/model:gguf:Q8_0" });
+    try std.testing.expectEqualStrings("gguf", warm_selection.format.?);
+    try std.testing.expectEqualStrings("Q8_0", warm_selection.quantization.?);
+    const structured = warmModelArtifactSelection(.{
+        .name = "owner/model:gguf:Q8_0",
+        .format = "safetensors",
+        .quantization = "bf16",
+    });
+    try std.testing.expectEqualStrings("safetensors", structured.format.?);
+    try std.testing.expectEqualStrings("bf16", structured.quantization.?);
+}
+
+test "generation fallback advances monotonically through configured priority" {
+    var failed = std.EnumSet(backends_mod.BackendType).initEmpty();
+    failed.insert(.onnx);
+    try std.testing.expectEqual(
+        if (build_options.enable_pjrt) GenerationBackend.pjrt else GenerationBackend.native,
+        generationBackendFromPrioritySkipping(&.{ .onnx, .pjrt, .native }, failed),
+    );
+    failed.insert(.pjrt);
+    try std.testing.expectEqual(
+        GenerationBackend.native,
+        generationBackendFromPrioritySkipping(&.{ .onnx, .pjrt, .native }, failed),
+    );
 }
 
 test "generation backend exclusion advances configured priority" {
