@@ -554,6 +554,7 @@ test "metadata control loop rewrites desired topology after finalized split" {
         ranges: []const metadata_table_manager.RangeRecord,
         split_records: []const transition_state.SplitTransitionRecord,
         range_upserts: usize = 0,
+        split_upserts: usize = 0,
         split_removals: usize = 0,
 
         pub fn listProjectedTables(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
@@ -658,6 +659,7 @@ test "metadata control loop rewrites desired topology after finalized split" {
 
         pub fn applyReconciliationPlan(self: *@This(), plan: *const metadata_reconciler.ReconciliationPlan) !void {
             self.range_upserts += plan.range_upserts.len;
+            self.split_upserts += plan.split_upserts.len;
             self.split_removals += plan.split_removals.len;
         }
     };
@@ -699,7 +701,9 @@ test "metadata control loop rewrites desired topology after finalized split" {
 
     const summary = try loop.reconcileOnce(&fake);
     try std.testing.expectEqual(@as(usize, 2), summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.split_removals);
+    try std.testing.expectEqual(@as(usize, 1), summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 0), summary.split_removals);
     try std.testing.expectEqual(@as(usize, 2), fake.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), fake.split_removals);
+    try std.testing.expectEqual(@as(usize, 1), fake.split_upserts);
+    try std.testing.expectEqual(@as(usize, 0), fake.split_removals);
 }

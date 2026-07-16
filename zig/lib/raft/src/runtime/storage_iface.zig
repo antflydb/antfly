@@ -84,20 +84,29 @@ pub const ReadyPersistenceDiagnostics = struct {
     delta_bytes_since_checkpoint: u64 = 0,
 };
 
-// GroupStorage owns raft-log durability for one hosted group.
-// Implementations must consume the passed slices synchronously and must not retain them.
+// GroupStorage owns raft-log durability for one hosted group. Snapshot
+// publication records state at snapshot.metadata.index while compact_index is
+// the inclusive durable log-prefix boundary; entries after it remain available
+// for incremental follower catch-up. Implementations must consume passed
+// slices synchronously and must not retain them.
 pub const GroupStorage = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
         persist_ready: *const fn (ptr: *anyopaque, group_id: core.types.GroupId, ready: core.Ready) anyerror!void,
-        compact_snapshot: *const fn (ptr: *anyopaque, group_id: core.types.GroupId, snapshot: core.types.Snapshot) anyerror!void,
+        compact_snapshot: *const fn (
+            ptr: *anyopaque,
+            group_id: core.types.GroupId,
+            snapshot: core.types.Snapshot,
+            compact_index: core.types.Index,
+        ) anyerror!void,
         compact_snapshot_artifact: ?*const fn (
             ptr: *anyopaque,
             group_id: core.types.GroupId,
             metadata: core.types.SnapshotMetadata,
             artifact: SnapshotArtifact,
+            compact_index: core.types.Index,
         ) anyerror!void = null,
         persist_ready_diagnostics: ?*const fn (
             ptr: *anyopaque,
@@ -115,8 +124,13 @@ pub const GroupStorage = struct {
         return try self.vtable.persist_ready(self.ptr, group_id, ready);
     }
 
-    pub fn compactSnapshot(self: GroupStorage, group_id: core.types.GroupId, snapshot: core.types.Snapshot) !void {
-        return try self.vtable.compact_snapshot(self.ptr, group_id, snapshot);
+    pub fn compactSnapshot(
+        self: GroupStorage,
+        group_id: core.types.GroupId,
+        snapshot: core.types.Snapshot,
+        compact_index: core.types.Index,
+    ) !void {
+        return try self.vtable.compact_snapshot(self.ptr, group_id, snapshot, compact_index);
     }
 
     pub fn compactSnapshotArtifact(
@@ -125,13 +139,14 @@ pub const GroupStorage = struct {
         group_id: core.types.GroupId,
         metadata: core.types.SnapshotMetadata,
         artifact: SnapshotArtifact,
+        compact_index: core.types.Index,
     ) !void {
         if (self.vtable.compact_snapshot_artifact) |compact| {
-            return try compact(self.ptr, group_id, metadata, artifact);
+            return try compact(self.ptr, group_id, metadata, artifact, compact_index);
         }
         const data = try artifact.readAll(alloc);
         defer alloc.free(data);
-        return try self.compactSnapshot(group_id, .{ .metadata = metadata, .data = data });
+        return try self.compactSnapshot(group_id, .{ .metadata = metadata, .data = data }, compact_index);
     }
 
     pub fn persistReadyWithDiagnostics(

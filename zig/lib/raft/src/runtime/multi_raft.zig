@@ -175,6 +175,7 @@ const PendingApplyTask = struct {
 const SnapshotBuildRequest = struct {
     group_id: core.types.GroupId,
     incarnation: u64,
+    compact_index: core.types.Index,
     source: storage_iface.SnapshotSource,
     metadata: core.types.SnapshotMetadata,
 
@@ -189,6 +190,7 @@ const SnapshotBuildResult = union(enum) {
     success: struct {
         group_id: core.types.GroupId,
         incarnation: u64,
+        compact_index: core.types.Index,
         metadata: core.types.SnapshotMetadata,
         payload: storage_iface.SnapshotMaterialization,
         build_ns: u64,
@@ -295,6 +297,7 @@ const SnapshotBuildWorker = struct {
                 .{ .success = .{
                     .group_id = request.group_id,
                     .incarnation = request.incarnation,
+                    .compact_index = request.compact_index,
                     .metadata = request.metadata,
                     .payload = snapshot_payload,
                     .build_ns = clock.elapsedSinceNs(started_ns),
@@ -1063,14 +1066,14 @@ pub const MultiRaft = struct {
                 _ = self.snapshot_candidates.remove(task.group_id);
             }
             if (task.entries.len == 0) continue;
-            var has_later_group_task = false;
+            var has_later_group_entries = false;
             for (tasks[task_index + 1 ..]) |later| {
-                if (later.group_id == task.group_id) {
-                    has_later_group_task = true;
+                if (later.group_id == task.group_id and later.entries.len > 0) {
+                    has_later_group_entries = true;
                     break;
                 }
             }
-            if (has_later_group_task) continue;
+            if (has_later_group_entries) continue;
             const last_applied = task.entries[task.entries.len - 1].index;
             const incarnation = self.group_incarnations.get(task.group_id) orelse continue;
             self.queueSnapshotCandidate(task.group_id, last_applied, incarnation, false) catch |err| {
@@ -1182,9 +1185,9 @@ pub const MultiRaft = struct {
                 _ = self.snapshot_candidates.remove(group_id);
                 continue;
             }
-            const snapshot_index = first_index - 1;
+            const compacted_index = first_index - 1;
             if (self.cfg.applied_log_compaction_min_interval_entries > 0 and
-                compact_index - snapshot_index < self.cfg.applied_log_compaction_min_interval_entries)
+                compact_index - compacted_index < self.cfg.applied_log_compaction_min_interval_entries)
             {
                 _ = self.snapshot_candidates.remove(group_id);
                 continue;
@@ -1230,6 +1233,7 @@ pub const MultiRaft = struct {
             if (!worker.submit(.{
                 .group_id = group_id,
                 .incarnation = incarnation,
+                .compact_index = compact_index,
                 .source = source,
                 .metadata = metadata,
             })) {
@@ -1288,8 +1292,10 @@ pub const MultiRaft = struct {
                     self.clearSnapshotPublish(result);
                     return;
                 };
-                const current_snapshot_index = grp.raw_node.raft.log.firstIndex() - 1;
-                if (completed.metadata.index < current_snapshot_index) {
+                const current_compacted_index = grp.raw_node.raft.log.firstIndex() - 1;
+                if (completed.metadata.index < current_compacted_index or
+                    completed.compact_index < current_compacted_index)
+                {
                     self.metrics.snapshot_compaction_stale_drops += 1;
                     self.clearSnapshotPublish(result);
                     return;
@@ -1299,12 +1305,13 @@ pub const MultiRaft = struct {
                     .bytes => |bytes| group_storage.compactSnapshot(completed.group_id, .{
                         .metadata = completed.metadata,
                         .data = bytes,
-                    }),
+                    }, completed.compact_index),
                     .artifact => |artifact| group_storage.compactSnapshotArtifact(
                         std.heap.page_allocator,
                         completed.group_id,
                         completed.metadata,
                         artifact,
+                        completed.compact_index,
                     ),
                 };
                 publish_result catch |err| {
@@ -1330,7 +1337,7 @@ pub const MultiRaft = struct {
                     }
                     return;
                 };
-                try grp.compactAppliedLogTo(completed.metadata.index);
+                try grp.compactAppliedLogTo(completed.compact_index);
                 self.metrics.snapshot_compaction_completions += 1;
                 self.metrics.snapshot_compaction_bytes += @intCast(completed.payload.len());
                 self.metrics.snapshot_compaction_build_ns += completed.build_ns;
@@ -1542,6 +1549,23 @@ fn approxReadStatesSize(read_states: []const core.ReadState) usize {
     var total: usize = 0;
     for (read_states) |read_state| total += 16 + read_state.request_ctx.len;
     return total;
+}
+
+test "snapshot candidate coalescing ignores later read-only apply work" {
+    var host = MultiRaft.init(std.testing.allocator, .{ .applied_log_retained_entries = 2 }, .{});
+    defer host.deinit();
+    try host.group_incarnations.put(std.testing.allocator, 7, 1);
+
+    var entries = [_]core.Entry{.{ .term = 1, .index = 5 }};
+    var read_states = [_]core.ReadState{.{ .index = 5, .request_ctx = &.{} }};
+    const tasks = [_]PendingApplyTask{
+        .{ .group_id = 7, .snapshot = null, .entries = &entries, .read_states = &.{}, .approx_bytes = 0 },
+        .{ .group_id = 7, .snapshot = null, .entries = &.{}, .read_states = &read_states, .approx_bytes = 0 },
+    };
+
+    try std.testing.expect(!host.scheduleAppliedLogCompaction(&tasks));
+    const candidate = host.snapshot_candidates.get(7) orelse return error.MissingSnapshotCandidate;
+    try std.testing.expectEqual(@as(core.types.Index, 5), candidate.applied_index);
 }
 
 const GroupBatchBuilder = struct {

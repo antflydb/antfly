@@ -18113,6 +18113,32 @@ test "replicated split destination seeds inherited doc identity before range pub
         try std.testing.expect(!reserved_marker.bootstrap_complete);
     }
 
+    // A source-leader retry may replay begin while the first worker's chunks
+    // are already durable. The identical reservation is a no-op so either
+    // worker can safely publish completion without losing transferred rows.
+    _ = try source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", .{
+        .split_replication = replication,
+        .split_checkpoint = .{
+            .kind = .destination_begin,
+            .transition_id = 7002,
+            .attempt_epoch = 1,
+            .source_group_id = 7001,
+            .destination_group_id = 7002,
+            .range_start = "doc:m",
+            .range_end = "doc:z",
+            .delta_sequence = 0,
+        },
+    });
+    {
+        var destination = (try source.leaseCachedTransitionGroupWriter(alloc, 7002, "docs", namespace)) orelse
+            return error.TestUnexpectedResult;
+        defer destination.deinit(alloc);
+        var doc = (try destination.db.lookup(alloc, "doc:m", .{})) orelse return error.TestUnexpectedResult;
+        defer doc.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, doc.json, "\"m\"") != null);
+        try std.testing.expect(!(try destination.db.getSplitBootstrapMarker(alloc)).?.bootstrap_complete);
+    }
+
     try std.testing.expectError(error.ConflictingSplitTransition, source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", .{
         .split_replication = .{
             .transition_id = 7003,

@@ -789,6 +789,7 @@ pub const TableManager = struct {
     }
 
     pub fn applyFinalizedSplit(self: *TableManager, record: transition_state.SplitTransitionRecord) !void {
+        if (!self.split_intents.contains(record.transition_id)) return;
         const split_key = record.split_key orelse return error.MissingSplitKey;
         const source = self.ranges.get(record.source_group_id) orelse return error.UnknownSourceRange;
         const identity_shard_id = rangeDocIdentityShardId(source);
@@ -822,6 +823,7 @@ pub const TableManager = struct {
     }
 
     pub fn applyFinalizedMerge(self: *TableManager, record: transition_state.MergeTransitionRecord) !void {
+        if (!self.merge_intents.contains(record.transition_id)) return;
         const donor = self.ranges.get(record.donor_group_id) orelse return error.UnknownDonorRange;
         const receiver = self.ranges.get(record.receiver_group_id) orelse return error.UnknownReceiverRange;
         const merged_start = if (std.mem.order(u8, donor.start_key, receiver.start_key) == .lt) donor.start_key else receiver.start_key;
@@ -1672,6 +1674,15 @@ test "table manager applies finalized split to desired topology" {
         .split_key = "doc:m",
         .source_range_end = "doc:z",
     });
+    try manager.applyFinalizedSplit(.{
+        .transition_id = 5003,
+        .attempt_epoch = 1,
+        .source_group_id = 101,
+        .destination_group_id = 102,
+        .phase = .finalized,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
+    });
 
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
@@ -1716,6 +1727,12 @@ test "table manager applies finalized merge preserving receiver range id" {
         .receiver_group_id = 101,
     });
 
+    try manager.applyFinalizedMerge(.{
+        .transition_id = 6003,
+        .donor_group_id = 102,
+        .receiver_group_id = 101,
+        .phase = .finalized,
+    });
     try manager.applyFinalizedMerge(.{
         .transition_id = 6003,
         .donor_group_id = 102,

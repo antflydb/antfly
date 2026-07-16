@@ -367,7 +367,7 @@ pub const TransitionService = struct {
     fn compactCompletedSplits(self: *TransitionService) usize {
         var write_index: usize = 0;
         var removed: usize = 0;
-        for (self.pending_split.items) |record| {
+        for (self.pending_split.items, 0..) |record, read_index| {
             if (record.phase == .finalized or record.phase == .rolled_back) {
                 _ = self.split_retries.remove(record.transition_id);
                 var doomed = record;
@@ -375,7 +375,7 @@ pub const TransitionService = struct {
                 removed += 1;
                 continue;
             }
-            if (write_index != removed) self.pending_split.items[write_index] = record;
+            if (write_index != read_index) self.pending_split.items[write_index] = record;
             write_index += 1;
         }
         self.pending_split.items.len = write_index;
@@ -385,7 +385,7 @@ pub const TransitionService = struct {
     fn compactCompletedMerges(self: *TransitionService) usize {
         var write_index: usize = 0;
         var removed: usize = 0;
-        for (self.pending_merge.items) |record| {
+        for (self.pending_merge.items, 0..) |record, read_index| {
             if (record.phase == .finalized or record.phase == .rolled_back) {
                 _ = self.merge_retries.remove(record.transition_id);
                 var doomed = record;
@@ -393,7 +393,7 @@ pub const TransitionService = struct {
                 removed += 1;
                 continue;
             }
-            if (write_index != removed) self.pending_merge.items[write_index] = record;
+            if (write_index != read_index) self.pending_merge.items[write_index] = record;
             write_index += 1;
         }
         self.pending_merge.items.len = write_index;
@@ -813,6 +813,68 @@ test "transition service queue replacement is allocation-failure safe" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
+test "transition service compaction preserves live records after terminal records" {
+    var svc = TransitionService.init(std.testing.allocator, .{});
+    defer svc.deinit();
+
+    try svc.submitSplit(.{
+        .transition_id = 1,
+        .attempt_epoch = 1,
+        .source_group_id = 11,
+        .destination_group_id = 12,
+        .split_key = "doc:b",
+    });
+    try svc.submitSplit(.{
+        .transition_id = 2,
+        .attempt_epoch = 1,
+        .source_group_id = 21,
+        .destination_group_id = 22,
+        .phase = .finalized,
+        .split_key = "doc:m",
+    });
+    try svc.submitSplit(.{
+        .transition_id = 3,
+        .attempt_epoch = 1,
+        .source_group_id = 31,
+        .destination_group_id = 32,
+        .phase = .replay_deltas,
+        .split_key = "doc:t",
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), svc.compactCompletedSplits());
+    try std.testing.expectEqual(@as(usize, 2), svc.pending_split.items.len);
+    try std.testing.expectEqual(@as(u64, 1), svc.pending_split.items[0].transition_id);
+    try std.testing.expectEqual(@as(u64, 3), svc.pending_split.items[1].transition_id);
+    try std.testing.expectEqualStrings("doc:t", svc.pending_split.items[1].split_key.?);
+
+    try svc.submitMerge(.{
+        .transition_id = 11,
+        .donor_group_id = 111,
+        .receiver_group_id = 112,
+        .rollback_reason = "keep-first",
+    });
+    try svc.submitMerge(.{
+        .transition_id = 12,
+        .donor_group_id = 121,
+        .receiver_group_id = 122,
+        .phase = .rolled_back,
+        .rollback_reason = "remove",
+    });
+    try svc.submitMerge(.{
+        .transition_id = 13,
+        .donor_group_id = 131,
+        .receiver_group_id = 132,
+        .phase = .replay_deltas,
+        .rollback_reason = "keep-last",
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), svc.compactCompletedMerges());
+    try std.testing.expectEqual(@as(usize, 2), svc.pending_merge.items.len);
+    try std.testing.expectEqual(@as(u64, 11), svc.pending_merge.items[0].transition_id);
+    try std.testing.expectEqual(@as(u64, 13), svc.pending_merge.items[1].transition_id);
+    try std.testing.expectEqualStrings("keep-last", svc.pending_merge.items[1].rollback_reason.?);
+}
+
 test "transition service clears completed observations on resubmit and remove" {
     var svc = TransitionService.init(std.testing.allocator, .{});
     defer svc.deinit();
@@ -869,7 +931,7 @@ test "transition service clears completed observations on resubmit and remove" {
 test "transition service clones queued transition record strings" {
     const RecordingSplit = struct {
         status: data.SplitTransitionStatus = .{
-            .phase = .rolled_back,
+            .phase = .prepare,
             .source_split_phase = null,
             .bootstrapped = false,
             .replay_required = false,

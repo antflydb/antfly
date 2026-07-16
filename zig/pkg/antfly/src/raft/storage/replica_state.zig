@@ -20,9 +20,9 @@ const snapshot_payload_store = @import("snapshot_payload_store.zig");
 const file_snapshot_artifact = @import("file_snapshot_artifact.zig");
 
 const magic: u32 = 0x41524654; // ARFT
-// Version 3 stores snapshot bytes in a checksummed sidecar. Older binaries
-// must reject metadata-only checkpoints instead of exposing empty snapshots.
-const version: u32 = 3;
+// Version 4 stores the Raft log compaction boundary separately from the
+// transferable state snapshot metadata.
+const version: u32 = 4;
 var state_publish_nonce = std.atomic.Value(u64).init(1);
 
 const SnapshotIdentity = struct { index: u64, term: u64 };
@@ -77,6 +77,7 @@ pub const PersistentReplicaState = struct {
         errdefer self.deinit();
         try fs_paths.createDirPathPortable(self.io_impl.io(), self.layout.snapshot_dir);
         try self.load();
+        try self.store.validate();
         try self.validateDurableSnapshotPayload();
         self.cleanupOrphanSnapshotPayloads();
         return self;
@@ -146,12 +147,12 @@ pub const PersistentReplicaState = struct {
         if (previous_snapshot) |previous| self.deleteSupersededSnapshotPayload(previous, snapshotIdentity(ready.snapshot.?.metadata));
     }
 
-    fn compactSnapshot(ptr: *anyopaque, group_id: u64, snapshot: raft_engine.core.types.Snapshot) !void {
+    fn compactSnapshot(ptr: *anyopaque, group_id: u64, snapshot: raft_engine.core.types.Snapshot, compact_index: u64) !void {
         _ = group_id;
         const self: *PersistentReplicaState = @ptrCast(@alignCast(ptr));
         const previous = snapshotIdentity(self.store.snapshot_state.metadata);
         try self.publishSnapshotPayload(snapshot);
-        try self.store.compactToSnapshot(metadataOnlySnapshot(snapshot));
+        try self.store.compactToSnapshot(metadataOnlySnapshot(snapshot), compact_index);
         try self.persist();
         self.deleteSupersededSnapshotPayload(previous, snapshotIdentity(snapshot.metadata));
     }
@@ -161,6 +162,7 @@ pub const PersistentReplicaState = struct {
         group_id: u64,
         metadata: raft_engine.core.types.SnapshotMetadata,
         artifact: raft_engine.runtime.storage_iface.SnapshotArtifact,
+        compact_index: u64,
     ) !void {
         _ = group_id;
         const self: *PersistentReplicaState = @ptrCast(@alignCast(ptr));
@@ -173,7 +175,7 @@ pub const PersistentReplicaState = struct {
             metadata.term,
             artifact,
         );
-        try self.store.compactToSnapshot(.{ .metadata = metadata, .data = &.{} });
+        try self.store.compactToSnapshot(.{ .metadata = metadata, .data = &.{} }, compact_index);
         try self.persist();
         self.deleteSupersededSnapshotPayload(previous, snapshotIdentity(metadata));
     }
@@ -301,6 +303,10 @@ pub const PersistentReplicaState = struct {
             try self.store.applySnapshot(snapshot);
         }
 
+        const compacted_index = try readInt(u64, bytes, &cursor);
+        const compacted_term = try readInt(u64, bytes, &cursor);
+        try self.store.restoreCompactionBoundary(compacted_index, compacted_term);
+
         const entry_count = try readInt(u32, bytes, &cursor);
         if (entry_count > 0) {
             const entries = try self.alloc.alloc(raft_engine.core.Entry, entry_count);
@@ -330,6 +336,8 @@ pub const PersistentReplicaState = struct {
         const has_snapshot = snapshot.metadata.index != 0 or snapshot.metadata.term != 0 or snapshot.data.len > 0 or snapshot.metadata.conf_state.voters.len > 0;
         try appendBool(self.alloc, buffer, has_snapshot);
         if (has_snapshot) try encodeSnapshot(self.alloc, buffer, snapshot);
+        try appendInt(u64, self.alloc, buffer, self.store.compactedIndex());
+        try appendInt(u64, self.alloc, buffer, self.store.compactedTerm());
 
         const entries = self.store.entries_state.items;
         try appendInt(u32, self.alloc, buffer, @intCast(entries.len));
@@ -730,10 +738,12 @@ test "persistent replica state publishes an artifact snapshot and reopens it" {
         var state = try PersistentReplicaState.init(std.testing.allocator, layout);
         defer state.deinit();
         try state.groupStorage().persistReady(90, .{
-            .hard_state = .{ .current_term = 3, .commit_index = 2 },
+            .hard_state = .{ .current_term = 3, .commit_index = 4 },
             .entries = &.{
                 .{ .index = 1, .term = 3, .data = @constCast("one") },
                 .{ .index = 2, .term = 3, .data = @constCast("two") },
+                .{ .index = 3, .term = 3, .data = @constCast("three") },
+                .{ .index = 4, .term = 3, .data = @constCast("four") },
             },
         });
 
@@ -748,16 +758,20 @@ test "persistent replica state publishes an artifact snapshot and reopens it" {
         );
         defer artifact.deinit();
         try state.groupStorage().compactSnapshotArtifact(std.testing.allocator, 90, .{
-            .index = 2,
+            .index = 4,
             .term = 3,
-        }, artifact);
+        }, artifact, 2);
     }
 
     var reopened = try PersistentReplicaState.init(std.testing.allocator, layout);
     defer reopened.deinit();
     var snapshot = try reopened.storage().snapshot(std.testing.allocator);
     defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 4), snapshot.metadata.index);
     try std.testing.expectEqualStrings("artifact-state", snapshot.data);
+    try std.testing.expectEqual(@as(u64, 3), try reopened.storage().firstIndex());
+    try std.testing.expectEqual(@as(u64, 4), try reopened.storage().lastIndex());
+    try std.testing.expectEqual(@as(u64, 3), try reopened.storage().term(2));
 }
 
 test "persistent replica state recovers both snapshot publication crash windows" {

@@ -22,9 +22,9 @@ const snapshot_payload_store = @import("snapshot_payload_store.zig");
 const storage_iface = raft_engine.runtime.storage_iface;
 
 const magic: u32 = 0x41524654; // ARFT
-// Version 3 checkpoints and deltas refer to checksummed external snapshot
-// payloads, preventing older binaries from accepting metadata-only snapshots.
-const version: u32 = 3;
+// Version 4 checkpoints persist the Raft log compaction boundary separately
+// from the transferable state snapshot metadata.
+const version: u32 = 4;
 const delta_magic: u32 = 0x4152444c; // ARDL
 const delta_version: u32 = 3;
 const applied_watermark_magic: u32 = 0x4152574d; // ARWM
@@ -162,6 +162,7 @@ pub const WalReplicaState = struct {
         wal_owned = false;
         errdefer self.deinit();
         try self.load();
+        try self.store.validate();
         try self.validateDurableSnapshotPayload();
         self.cleanupOrphanSnapshotPayloads();
         return self;
@@ -273,14 +274,14 @@ pub const WalReplicaState = struct {
         try self.persistReadyInternal(group_id, ready, diagnostics);
     }
 
-    fn compactSnapshot(ptr: *anyopaque, group_id: u64, snapshot: raft_engine.core.types.Snapshot) !void {
+    fn compactSnapshot(ptr: *anyopaque, group_id: u64, snapshot: raft_engine.core.types.Snapshot, compact_index: u64) !void {
         _ = group_id;
         const self: *WalReplicaState = @ptrCast(@alignCast(ptr));
         const started_ns = nowNs();
         const previous = snapshotIdentity(self.store.snapshot_state.metadata);
         try self.publishSnapshotPayload(snapshot);
-        try self.store.compactToSnapshot(metadataOnlySnapshot(snapshot));
-        self.last_compacted_index = snapshot.metadata.index;
+        try self.store.compactToSnapshot(metadataOnlySnapshot(snapshot), compact_index);
+        self.last_compacted_index = compact_index;
         self.stats.storage_compactions += 1;
         const elapsed = elapsedSince(started_ns);
         self.stats.storage_compaction_ns += elapsed;
@@ -296,6 +297,7 @@ pub const WalReplicaState = struct {
         group_id: u64,
         metadata: raft_engine.core.types.SnapshotMetadata,
         artifact: storage_iface.SnapshotArtifact,
+        compact_index: u64,
     ) !void {
         _ = group_id;
         const self: *WalReplicaState = @ptrCast(@alignCast(ptr));
@@ -309,8 +311,8 @@ pub const WalReplicaState = struct {
             metadata.term,
             artifact,
         );
-        try self.store.compactToSnapshot(.{ .metadata = metadata, .data = &.{} });
-        self.last_compacted_index = metadata.index;
+        try self.store.compactToSnapshot(.{ .metadata = metadata, .data = &.{} }, compact_index);
+        self.last_compacted_index = compact_index;
         self.stats.storage_compactions += 1;
         const elapsed = elapsedSince(started_ns);
         self.stats.storage_compaction_ns += elapsed;
@@ -516,6 +518,8 @@ pub const WalReplicaState = struct {
         const has_snapshot = snapshot.metadata.index != 0 or snapshot.metadata.term != 0 or snapshot.data.len > 0 or snapshot.metadata.conf_state.voters.len > 0;
         try appendBool(self.alloc, &buffer, has_snapshot);
         if (has_snapshot) try encodeSnapshot(self.alloc, &buffer, snapshot);
+        try appendInt(u64, self.alloc, &buffer, self.store.compactedIndex());
+        try appendInt(u64, self.alloc, &buffer, self.store.compactedTerm());
 
         const first_index = try self.store.storage().firstIndex();
         const last_index = try self.store.storage().lastIndex();
@@ -648,12 +652,7 @@ pub const WalReplicaState = struct {
     }
 
     fn refreshLastCompactedIndex(self: *WalReplicaState) !void {
-        const snapshot = try self.store.storage().snapshot(self.alloc);
-        defer {
-            var owned = snapshot;
-            owned.deinit(self.alloc);
-        }
-        self.last_compacted_index = snapshot.metadata.index;
+        self.last_compacted_index = self.store.compactedIndex();
     }
 
     fn decodeWalRecord(self: *WalReplicaState, bytes: []const u8) !void {
@@ -704,6 +703,10 @@ pub const WalReplicaState = struct {
             }
             try self.store.applySnapshot(snapshot);
         }
+
+        const compacted_index = try readInt(u64, bytes, &cursor);
+        const compacted_term = try readInt(u64, bytes, &cursor);
+        try self.store.restoreCompactionBoundary(compacted_index, compacted_term);
 
         const entry_count = try readInt(u32, bytes, &cursor);
         if (entry_count > 0) {
@@ -1463,15 +1466,15 @@ test "wal replica state persists semantic compaction snapshot and preserves suff
         }
 
         try std.testing.expectEqual(@as(u64, 1), try state.storage().firstIndex());
-        const snapshot_data = try std.testing.allocator.dupe(u8, "state-machine-6");
+        const snapshot_data = try std.testing.allocator.dupe(u8, "state-machine-8");
         defer std.testing.allocator.free(snapshot_data);
         try state.groupStorage().compactSnapshot(200, .{
             .metadata = .{
-                .index = 6,
+                .index = 8,
                 .term = 10,
             },
             .data = snapshot_data,
-        });
+        }, 6);
 
         const stats = state.statsSnapshot();
         try std.testing.expectEqual(@as(u64, 1), stats.storage_compactions);
@@ -1483,7 +1486,8 @@ test "wal replica state persists semantic compaction snapshot and preserves suff
         try std.testing.expectEqual(@as(usize, 0), state.store.snapshot_state.data.len);
         var snapshot = try state.storage().snapshot(std.testing.allocator);
         defer snapshot.deinit(std.testing.allocator);
-        try std.testing.expectEqualStrings("state-machine-6", snapshot.data);
+        try std.testing.expectEqual(@as(u64, 8), snapshot.metadata.index);
+        try std.testing.expectEqualStrings("state-machine-8", snapshot.data);
     }
 
     {
@@ -1496,7 +1500,8 @@ test "wal replica state persists semantic compaction snapshot and preserves suff
         try std.testing.expectEqual(@as(usize, 0), reopened.store.snapshot_state.data.len);
         var snapshot = try reopened.storage().snapshot(std.testing.allocator);
         defer snapshot.deinit(std.testing.allocator);
-        try std.testing.expectEqualStrings("state-machine-6", snapshot.data);
+        try std.testing.expectEqual(@as(u64, 8), snapshot.metadata.index);
+        try std.testing.expectEqualStrings("state-machine-8", snapshot.data);
 
         const stats = reopened.statsSnapshot();
         try std.testing.expectEqual(@as(u64, 6), stats.last_compacted_index);

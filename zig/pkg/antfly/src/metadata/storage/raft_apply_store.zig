@@ -580,6 +580,123 @@ pub const CommittedKeyListener = struct {
     }
 };
 
+pub const CommittedTransitionDelta = union(enum) {
+    upsert_split: metadata.SplitTransitionRecord,
+    remove_split: u64,
+    upsert_merge: metadata.MergeTransitionRecord,
+    remove_merge: u64,
+};
+
+const OwnedProjectionSignal = struct {
+    signal: ProjectionSignal,
+    table_name: ?[]u8 = null,
+
+    fn deinit(self: *OwnedProjectionSignal, alloc: std.mem.Allocator) void {
+        if (self.table_name) |name| alloc.free(name);
+        self.* = undefined;
+    }
+};
+
+const OwnedCommittedKeySignal = struct {
+    metadata_group_id: u64,
+    key: []u8,
+
+    fn deinit(self: *OwnedCommittedKeySignal, alloc: std.mem.Allocator) void {
+        alloc.free(self.key);
+        self.* = undefined;
+    }
+};
+
+pub const CommittedApplyOutcome = struct {
+    alloc: std.mem.Allocator,
+    collect_transition_deltas: bool = true,
+    projection_signals: std.ArrayListUnmanaged(OwnedProjectionSignal) = .empty,
+    committed_keys: std.ArrayListUnmanaged(OwnedCommittedKeySignal) = .empty,
+    transition_deltas: std.ArrayListUnmanaged(CommittedTransitionDelta) = .empty,
+    failure: ?anyerror = null,
+
+    pub fn deinit(self: *CommittedApplyOutcome) void {
+        for (self.projection_signals.items) |*signal| signal.deinit(self.alloc);
+        self.projection_signals.deinit(self.alloc);
+        for (self.committed_keys.items) |*signal| signal.deinit(self.alloc);
+        self.committed_keys.deinit(self.alloc);
+        for (self.transition_deltas.items) |*delta| deinitCommittedTransitionDelta(self.alloc, delta);
+        self.transition_deltas.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn appendProjection(self: *CommittedApplyOutcome, signal: ProjectionSignal) !void {
+        const table_name = if (signal.table_name) |name| try self.alloc.dupe(u8, name) else null;
+        errdefer if (table_name) |name| self.alloc.free(name);
+        var owned_signal = signal;
+        owned_signal.table_name = table_name;
+        try self.projection_signals.append(self.alloc, .{
+            .signal = owned_signal,
+            .table_name = table_name,
+        });
+    }
+
+    fn appendCommittedKey(self: *CommittedApplyOutcome, signal: CommittedKeySignal) !void {
+        const key = try self.alloc.dupe(u8, signal.key);
+        errdefer self.alloc.free(key);
+        try self.committed_keys.append(self.alloc, .{
+            .metadata_group_id = signal.metadata_group_id,
+            .key = key,
+        });
+    }
+
+    fn appendTransition(self: *CommittedApplyOutcome, delta: CommittedTransitionDelta) !void {
+        const owned = try cloneCommittedTransitionDelta(self.alloc, delta);
+        errdefer {
+            var doomed = owned;
+            deinitCommittedTransitionDelta(self.alloc, &doomed);
+        }
+        try self.transition_deltas.append(self.alloc, owned);
+    }
+
+    fn recordFailure(self: *CommittedApplyOutcome, err: anyerror) void {
+        if (self.failure == null) self.failure = err;
+    }
+};
+
+fn cloneCommittedTransitionDelta(alloc: std.mem.Allocator, delta: CommittedTransitionDelta) !CommittedTransitionDelta {
+    return switch (delta) {
+        .upsert_split => |record| .{ .upsert_split = try cloneCommittedSplitTransition(alloc, record) },
+        .remove_split => |transition_id| .{ .remove_split = transition_id },
+        .upsert_merge => |record| .{ .upsert_merge = try cloneCommittedMergeTransition(alloc, record) },
+        .remove_merge => |transition_id| .{ .remove_merge = transition_id },
+    };
+}
+
+fn cloneCommittedSplitTransition(alloc: std.mem.Allocator, record: metadata.SplitTransitionRecord) !metadata.SplitTransitionRecord {
+    var owned = record;
+    owned.split_key = null;
+    owned.source_range_end = null;
+    owned.rollback_reason = null;
+    errdefer metadata_table_manager.freeSplitTransitionRecord(alloc, owned);
+    if (record.split_key) |value| owned.split_key = try alloc.dupe(u8, value);
+    if (record.source_range_end) |value| owned.source_range_end = try alloc.dupe(u8, value);
+    if (record.rollback_reason) |value| owned.rollback_reason = try alloc.dupe(u8, value);
+    return owned;
+}
+
+fn cloneCommittedMergeTransition(alloc: std.mem.Allocator, record: metadata.MergeTransitionRecord) !metadata.MergeTransitionRecord {
+    var owned = record;
+    owned.rollback_reason = null;
+    errdefer metadata_table_manager.freeMergeTransitionRecord(alloc, owned);
+    if (record.rollback_reason) |value| owned.rollback_reason = try alloc.dupe(u8, value);
+    return owned;
+}
+
+fn deinitCommittedTransitionDelta(alloc: std.mem.Allocator, delta: *CommittedTransitionDelta) void {
+    switch (delta.*) {
+        .upsert_split => |record| metadata_table_manager.freeSplitTransitionRecord(alloc, record),
+        .upsert_merge => |record| metadata_table_manager.freeMergeTransitionRecord(alloc, record),
+        .remove_split, .remove_merge => {},
+    }
+    delta.* = undefined;
+}
+
 pub const RaftApplyStore = struct {
     alloc: std.mem.Allocator,
     io_impl: std.Io.Threaded,
@@ -592,6 +709,8 @@ pub const RaftApplyStore = struct {
     loaded_placement_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
     projection_listeners: std.ArrayListUnmanaged(ProjectionListener) = .empty,
     committed_key_listeners: std.ArrayListUnmanaged(CommittedKeyListener) = .empty,
+    apply_mutex: std.Io.Mutex = .init,
+    active_outcome: ?*CommittedApplyOutcome = null,
 
     const OwnedBatch = struct {
         commit_index: u64,
@@ -1466,6 +1585,15 @@ pub const RaftApplyStore = struct {
         defer freeMetadataSnapshotRows(alloc, rows);
         try validateMetadataSnapshotRows(alloc, group_id, rows);
 
+        const empty_entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{});
+        defer alloc.free(empty_entries);
+        const owned_entries = try self.alloc.dupe(u8, empty_entries);
+        errdefer self.alloc.free(owned_entries);
+        const io = self.io_impl.io();
+        self.apply_mutex.lockUncancelable(io);
+        defer self.apply_mutex.unlock(io);
+        try self.batches.ensureUnusedCapacity(self.alloc, 1);
+
         const existing = blk: {
             var read_txn = try self.store.beginReadTxn();
             defer read_txn.abort();
@@ -1473,8 +1601,6 @@ pub const RaftApplyStore = struct {
         };
         defer freeMetadataSnapshotRows(alloc, existing);
 
-        const empty_entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{});
-        defer alloc.free(empty_entries);
         const watermark = try alloc.alloc(u8, @sizeOf(u64) + empty_entries.len);
         defer alloc.free(watermark);
         std.mem.writeInt(u64, watermark[0..8], commit_index, .little);
@@ -1491,13 +1617,11 @@ pub const RaftApplyStore = struct {
         for (existing, 0..) |row, i| deletes[i] = row.key;
         try self.store.putBatch(writes, deletes);
 
-        const owned_entries = try self.alloc.dupe(u8, empty_entries);
-        errdefer self.alloc.free(owned_entries);
         if (self.batches.getPtr(group_id)) |batch| {
             self.alloc.free(batch.entries_bytes);
             batch.* = .{ .commit_index = commit_index, .entries_bytes = owned_entries };
         } else {
-            try self.batches.put(self.alloc, group_id, .{ .commit_index = commit_index, .entries_bytes = owned_entries });
+            self.batches.putAssumeCapacity(group_id, .{ .commit_index = commit_index, .entries_bytes = owned_entries });
         }
         self.invalidateProjectedPlacementGroup(group_id);
         self.notifyMetadataSnapshotInstalled(group_id);
@@ -1583,10 +1707,50 @@ pub const RaftApplyStore = struct {
     }
 
     fn writeBatch(self: *RaftApplyStore, group_id: u64, commit_index: u64, entries_bytes: []const u8) !void {
+        var outcome = try self.applyCommittedBatchInternal(group_id, commit_index, entries_bytes, false);
+        defer outcome.deinit();
+    }
+
+    /// Applies one committed Raft batch and returns only projection changes
+    /// that actually mutated durable state. Listener signals are dispatched
+    /// after commit and before this method returns.
+    pub fn applyCommittedBatch(
+        self: *RaftApplyStore,
+        group_id: u64,
+        commit_index: u64,
+        entries_bytes: []const u8,
+    ) !CommittedApplyOutcome {
+        return try self.applyCommittedBatchInternal(group_id, commit_index, entries_bytes, true);
+    }
+
+    fn applyCommittedBatchInternal(
+        self: *RaftApplyStore,
+        group_id: u64,
+        commit_index: u64,
+        entries_bytes: []const u8,
+        collect_transition_deltas: bool,
+    ) !CommittedApplyOutcome {
         var value = try self.alloc.alloc(u8, @sizeOf(u64) + entries_bytes.len);
         defer self.alloc.free(value);
         std.mem.writeInt(u64, value[0..8], commit_index, .little);
         @memcpy(value[8..], entries_bytes);
+
+        const owned_entries = try self.alloc.dupe(u8, entries_bytes);
+        errdefer self.alloc.free(owned_entries);
+
+        const io = self.io_impl.io();
+        self.apply_mutex.lockUncancelable(io);
+        var apply_locked = true;
+        defer if (apply_locked) self.apply_mutex.unlock(io);
+        try self.batches.ensureUnusedCapacity(self.alloc, 1);
+        std.debug.assert(self.active_outcome == null);
+        var outcome = CommittedApplyOutcome{
+            .alloc = self.alloc,
+            .collect_transition_deltas = collect_transition_deltas,
+        };
+        errdefer outcome.deinit();
+        self.active_outcome = &outcome;
+        defer self.active_outcome = null;
 
         var key_buf: [128]u8 = undefined;
         const key = try keyForGroup(&key_buf, group_id);
@@ -1594,22 +1758,26 @@ pub const RaftApplyStore = struct {
         errdefer txn.abort();
         try txn.put(key, value);
         try self.projectEntriesTxn(&txn, group_id, entries_bytes);
+        if (outcome.failure) |err| return err;
         try txn.commit();
 
-        const owned_entries = try self.alloc.dupe(u8, entries_bytes);
-        errdefer self.alloc.free(owned_entries);
         if (self.batches.getPtr(group_id)) |existing| {
             self.alloc.free(existing.entries_bytes);
             existing.* = .{
                 .commit_index = commit_index,
                 .entries_bytes = owned_entries,
             };
-            return;
+        } else {
+            self.batches.putAssumeCapacity(group_id, .{
+                .commit_index = commit_index,
+                .entries_bytes = owned_entries,
+            });
         }
-        try self.batches.put(self.alloc, group_id, .{
-            .commit_index = commit_index,
-            .entries_bytes = owned_entries,
-        });
+        self.active_outcome = null;
+        self.dispatchCommittedOutcome(&outcome);
+        self.apply_mutex.unlock(io);
+        apply_locked = false;
+        return outcome;
     }
 
     fn ensureLoaded(self: *RaftApplyStore, group_id: u64) !?*OwnedBatch {
@@ -2194,6 +2362,7 @@ pub const RaftApplyStore = struct {
             .metadata_group_id = group_id,
             .group_id = record.source_group_id,
         });
+        self.notifyCommittedTransition(.{ .upsert_split = record });
     }
 
     fn applySplitTransitionRemovalTxn(
@@ -2218,6 +2387,7 @@ pub const RaftApplyStore = struct {
             .kind = .split_transition,
             .metadata_group_id = group_id,
         });
+        self.notifyCommittedTransition(.{ .remove_split = transition_id });
     }
 
     fn applyMergeTransitionUpsertTxn(
@@ -2247,6 +2417,7 @@ pub const RaftApplyStore = struct {
             .metadata_group_id = group_id,
             .group_id = record.receiver_group_id,
         });
+        self.notifyCommittedTransition(.{ .upsert_merge = record });
     }
 
     fn applyMergeTransitionRemovalTxn(
@@ -2271,6 +2442,7 @@ pub const RaftApplyStore = struct {
             .kind = .merge_transition,
             .metadata_group_id = group_id,
         });
+        self.notifyCommittedTransition(.{ .remove_merge = transition_id });
     }
 
     /// Atomically reserves the next source-local split epoch and publishes its
@@ -2359,6 +2531,7 @@ pub const RaftApplyStore = struct {
             .metadata_group_id = group_id,
             .group_id = record.source_group_id,
         });
+        self.notifyCommittedTransition(.{ .upsert_split = record });
     }
 
     fn applyExtensionLifecycleDeltaTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, delta: ExtensionLifecycleDelta) !void {
@@ -2656,11 +2829,42 @@ pub const RaftApplyStore = struct {
     }
 
     fn notifyProjectionListeners(self: *RaftApplyStore, signal: ProjectionSignal) void {
+        if (self.active_outcome) |outcome| {
+            outcome.appendProjection(signal) catch |err| outcome.recordFailure(err);
+            return;
+        }
         for (self.projection_listeners.items) |listener| listener.onProjectionSignal(signal);
     }
 
     fn notifyCommittedKeyListeners(self: *RaftApplyStore, signal: CommittedKeySignal) void {
+        if (self.active_outcome) |outcome| {
+            outcome.appendCommittedKey(signal) catch |err| outcome.recordFailure(err);
+            return;
+        }
         for (self.committed_key_listeners.items) |listener| listener.onCommittedKey(signal);
+    }
+
+    fn notifyCommittedTransition(self: *RaftApplyStore, delta: CommittedTransitionDelta) void {
+        const outcome = self.active_outcome orelse {
+            std.debug.assert(false);
+            return;
+        };
+        if (!outcome.collect_transition_deltas) return;
+        outcome.appendTransition(delta) catch |err| outcome.recordFailure(err);
+    }
+
+    fn dispatchCommittedOutcome(self: *RaftApplyStore, outcome: *const CommittedApplyOutcome) void {
+        std.debug.assert(outcome.failure == null);
+        for (outcome.projection_signals.items) |owned| {
+            for (self.projection_listeners.items) |listener| listener.onProjectionSignal(owned.signal);
+        }
+        for (outcome.committed_keys.items) |owned| {
+            const signal = CommittedKeySignal{
+                .metadata_group_id = owned.metadata_group_id,
+                .key = owned.key,
+            };
+            for (self.committed_key_listeners.items) |listener| listener.onCommittedKey(signal);
+        }
     }
 
     fn lookupTableName(self: *RaftApplyStore, group_id: u64, table_id: u64) !?[]u8 {
@@ -5397,6 +5601,165 @@ test "metadata raft apply store fences transition identity and active removal" {
         try std.testing.expectEqual(@as(usize, 0), splits.len);
         try std.testing.expectEqual(@as(usize, 0), merges.len);
     }
+}
+
+test "metadata raft apply store returns only durable transition deltas" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-committed-transition-deltas", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+
+    const split = metadata.SplitTransitionRecord{
+        .transition_id = 701,
+        .attempt_epoch = 1,
+        .source_group_id = 71,
+        .destination_group_id = 72,
+        .phase = .prepare,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
+    };
+    const merge = metadata.MergeTransitionRecord{
+        .transition_id = 801,
+        .donor_group_id = 81,
+        .receiver_group_id = 80,
+        .phase = .prepare,
+    };
+
+    const split_upsert = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_split_transition = split });
+    defer std.testing.allocator.free(split_upsert);
+    const merge_upsert = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_merge_transition = merge });
+    defer std.testing.allocator.free(merge_upsert);
+    const initial_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = split_upsert },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = merge_upsert },
+    });
+    defer std.testing.allocator.free(initial_entries);
+    var initial = try store.applyCommittedBatch(41, 2, initial_entries);
+    defer initial.deinit();
+    try std.testing.expectEqual(@as(usize, 2), initial.transition_deltas.items.len);
+    try std.testing.expectEqual(@as(u64, 701), initial.transition_deltas.items[0].upsert_split.transition_id);
+    try std.testing.expectEqual(@as(u64, 801), initial.transition_deltas.items[1].upsert_merge.transition_id);
+
+    const split_remove = try encodeTransitionCommand(std.testing.allocator, .{ .remove_split_transition = .{ .transition_id = 701 } });
+    defer std.testing.allocator.free(split_remove);
+    const merge_remove = try encodeTransitionCommand(std.testing.allocator, .{ .remove_merge_transition = .{ .transition_id = 801 } });
+    defer std.testing.allocator.free(merge_remove);
+    const active_remove_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = split_remove },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = merge_remove },
+    });
+    defer std.testing.allocator.free(active_remove_entries);
+    var active_remove = try store.applyCommittedBatch(41, 4, active_remove_entries);
+    defer active_remove.deinit();
+    try std.testing.expectEqual(@as(usize, 0), active_remove.transition_deltas.items.len);
+    const active_splits = try store.listSplitTransitions(std.testing.allocator, 41);
+    defer store.freeSplitTransitions(std.testing.allocator, active_splits);
+    const active_merges = try store.listMergeTransitions(std.testing.allocator, 41);
+    defer store.freeMergeTransitions(std.testing.allocator, active_merges);
+    try std.testing.expectEqual(@as(usize, 1), active_splits.len);
+    try std.testing.expectEqual(@as(usize, 1), active_merges.len);
+
+    var rolled_back_split = split;
+    rolled_back_split.phase = .rolled_back;
+    rolled_back_split.rollback_reason = "operator cancel";
+    var rolled_back_merge = merge;
+    rolled_back_merge.phase = .rolled_back;
+    rolled_back_merge.rollback_reason = "operator cancel";
+    const split_terminal = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_split_transition = rolled_back_split });
+    defer std.testing.allocator.free(split_terminal);
+    const merge_terminal = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_merge_transition = rolled_back_merge });
+    defer std.testing.allocator.free(merge_terminal);
+    const terminal_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = split_terminal },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = merge_terminal },
+    });
+    defer std.testing.allocator.free(terminal_entries);
+    var terminal = try store.applyCommittedBatch(41, 6, terminal_entries);
+    defer terminal.deinit();
+    try std.testing.expectEqual(@as(usize, 2), terminal.transition_deltas.items.len);
+    try std.testing.expectEqual(metadata.TransitionPhase.rolled_back, terminal.transition_deltas.items[0].upsert_split.phase);
+    try std.testing.expectEqual(metadata.TransitionPhase.rolled_back, terminal.transition_deltas.items[1].upsert_merge.phase);
+
+    const terminal_remove_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = split_remove },
+        .{ .term = 1, .index = 8, .entry_type = .normal, .data = merge_remove },
+    });
+    defer std.testing.allocator.free(terminal_remove_entries);
+    var terminal_remove = try store.applyCommittedBatch(41, 8, terminal_remove_entries);
+    defer terminal_remove.deinit();
+    try std.testing.expectEqual(@as(usize, 2), terminal_remove.transition_deltas.items.len);
+    try std.testing.expectEqual(@as(u64, 701), terminal_remove.transition_deltas.items[0].remove_split);
+    try std.testing.expectEqual(@as(u64, 801), terminal_remove.transition_deltas.items[1].remove_merge);
+}
+
+test "metadata raft apply store publishes listeners only after commit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-post-commit-listeners", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const Capture = struct {
+        projections: usize = 0,
+        keys: usize = 0,
+
+        fn onProjection(ptr: *anyopaque, _: ProjectionSignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.projections += 1;
+        }
+
+        fn matchesKey(_: *anyopaque, _: CommittedKeySignal) bool {
+            return true;
+        }
+
+        fn onKey(ptr: *anyopaque, _: CommittedKeySignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.keys += 1;
+        }
+    };
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    var capture = Capture{};
+    try store.addProjectionListener(.{ .ptr = &capture, .vtable = &.{ .on_projection_signal = Capture.onProjection } });
+    try store.addCommittedKeyListener(.{
+        .ptr = &capture,
+        .vtable = &.{
+            .matches_key = Capture.matchesKey,
+            .on_committed_key = Capture.onKey,
+        },
+    });
+
+    const table = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_table = .{
+        .table_id = 91,
+        .name = "docs",
+    } });
+    defer std.testing.allocator.free(table);
+    const invalid_split = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_split_transition = .{
+        .transition_id = 901,
+        .attempt_epoch = 1,
+        .source_group_id = 91,
+        .destination_group_id = group_ids.main_metadata_group_id,
+        .phase = .prepare,
+    } });
+    defer std.testing.allocator.free(invalid_split);
+    const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = invalid_split },
+    });
+    defer std.testing.allocator.free(entries);
+
+    try std.testing.expectError(error.ReservedGroupId, store.applyCommittedBatch(41, 2, entries));
+    try std.testing.expectEqual(@as(usize, 0), capture.projections);
+    try std.testing.expectEqual(@as(usize, 0), capture.keys);
+    try std.testing.expectEqual(@as(?AppliedMetadataBatch, null), try store.latestBatch(41));
+    const tables = try store.listTables(std.testing.allocator, 41);
+    defer store.freeTables(std.testing.allocator, tables);
+    try std.testing.expectEqual(@as(usize, 0), tables.len);
 }
 
 test "metadata raft apply store resolves stale store drain intent at apply time" {

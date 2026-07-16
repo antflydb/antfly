@@ -11119,15 +11119,18 @@ pub const DB = struct {
                 existing.attempt_epoch == marker.attempt_epoch and
                 existing.source_group_id == marker.source_group_id and
                 existing.destination_group_id == marker.destination_group_id;
-            if (same_attempt and existing.bootstrap_complete) {
-                const completed_sequence = try self.getSplitDeltaFinalSeq(alloc);
-                if (base_delta_sequence < completed_sequence) return error.StaleSplitBootstrap;
-                if (base_delta_sequence > completed_sequence or
-                    !byteRangesEqual(self.core.byteRange(), byte_range))
-                {
-                    return error.SplitBootstrapComplete;
+            if (same_attempt) {
+                const reserved_sequence = try self.getSplitDeltaFinalSeq(alloc);
+                if (base_delta_sequence < reserved_sequence) return error.StaleSplitBootstrap;
+                if (!byteRangesEqual(self.core.byteRange(), byte_range)) return error.ConflictingSplitTransition;
+                if (existing.bootstrap_complete) {
+                    if (base_delta_sequence > reserved_sequence) return error.SplitBootstrapComplete;
+                    return false;
                 }
-                return false;
+                // Source leadership can change after an earlier worker has
+                // reserved and populated this exact transfer. Replaying begin
+                // must not erase those chunks beneath its pending completion.
+                if (base_delta_sequence == reserved_sequence) return false;
             }
             if (!same_attempt and
                 (existing.source_group_id != marker.source_group_id or
@@ -11231,13 +11234,12 @@ pub const DB = struct {
         {
             return error.ConflictingSplitTransition;
         }
+        const reserved_sequence = try self.getSplitDeltaFinalSeq(alloc);
+        if (base_delta_sequence != reserved_sequence) return error.StaleSplitBootstrap;
+        if (!byteRangesEqual(self.core.byteRange(), byte_range)) return error.ConflictingSplitTransition;
         if (existing.bootstrap_complete) {
-            const current_sequence = try self.getSplitDeltaFinalSeq(alloc);
-            if (base_delta_sequence < current_sequence) return error.StaleSplitBootstrap;
-            if (base_delta_sequence == current_sequence) {
-                try self.refreshSplitBootstrapRangeInMemory(byte_range);
-                return false;
-            }
+            try self.refreshSplitBootstrapRangeInMemory(byte_range);
+            return false;
         }
 
         var range_buf: [1024]u8 = undefined;
@@ -69008,7 +69010,7 @@ test "db split bootstrap replacement preserves overlapping incoming documents" {
     try std.testing.expect((try db.get(alloc, "doc:stale")) == null);
 }
 
-test "db completed split bootstrap rejects destructive begin retry" {
+test "db split bootstrap retries preserve reserved data and exact sequence" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -69031,8 +69033,17 @@ test "db completed split bootstrap rejects destructive begin retry" {
         17,
         incomplete,
     ));
+    try std.testing.expect(!try db.replaceSplitBootstrap(alloc, byte_range, &.{}, 17, incomplete));
+    const reserved = (try db.get(alloc, "doc:m")).?;
+    defer alloc.free(reserved);
+    try std.testing.expectEqualStrings("{\"version\":1}", reserved);
+
     var complete = incomplete;
     complete.bootstrap_complete = true;
+    try std.testing.expectError(
+        error.StaleSplitBootstrap,
+        db.completeSplitBootstrap(alloc, byte_range, 18, complete),
+    );
     try std.testing.expect(try db.completeSplitBootstrap(alloc, byte_range, 17, complete));
 
     try std.testing.expect(!try db.replaceSplitBootstrap(alloc, byte_range, &.{}, 17, incomplete));

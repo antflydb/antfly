@@ -3504,6 +3504,7 @@ pub fn build(b: *std.Build) void {
         "persistent replica state refuses a corrupt durable snapshot payload on reopen",
         "persistent replica state publishes an artifact snapshot and reopens it",
         "persistent replica state recovers both snapshot publication crash windows",
+        "wal replica state persists semantic compaction snapshot and preserves suffix",
         "wal replica state refuses a missing durable snapshot payload on reopen",
         "db merge coordinator opt-in applies configured receiver identity namespace",
         "db merge coordinator reapplies target namespace for persisted reassignment opt-in",

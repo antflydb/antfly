@@ -112,10 +112,10 @@ pub const PersistentReplicaProvider = struct {
         try state.groupStorage().persistReady(group_id, ready);
     }
 
-    fn compactSnapshot(ptr: *anyopaque, group_id: u64, snapshot: raft_engine.core.types.Snapshot) !void {
+    fn compactSnapshot(ptr: *anyopaque, group_id: u64, snapshot: raft_engine.core.types.Snapshot, compact_index: u64) !void {
         const self: *PersistentReplicaProvider = @ptrCast(@alignCast(ptr));
         const state = self.states.get(group_id) orelse return error.UnknownGroup;
-        try state.groupStorage().compactSnapshot(group_id, snapshot);
+        try state.groupStorage().compactSnapshot(group_id, snapshot, compact_index);
     }
 
     fn compactSnapshotArtifact(
@@ -123,10 +123,11 @@ pub const PersistentReplicaProvider = struct {
         group_id: u64,
         metadata: raft_engine.core.types.SnapshotMetadata,
         artifact: raft_engine.runtime.storage_iface.SnapshotArtifact,
+        compact_index: u64,
     ) !void {
         const self: *PersistentReplicaProvider = @ptrCast(@alignCast(ptr));
         const state = self.states.get(group_id) orelse return error.UnknownGroup;
-        try state.groupStorage().compactSnapshotArtifact(self.alloc, group_id, metadata, artifact);
+        try state.groupStorage().compactSnapshotArtifact(self.alloc, group_id, metadata, artifact, compact_index);
     }
 
     fn setAppliedIndex(

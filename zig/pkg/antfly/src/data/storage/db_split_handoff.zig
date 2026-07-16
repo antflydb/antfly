@@ -275,6 +275,8 @@ pub const Destination = struct {
         handoff: data_store.SplitHandoff,
         marker: range_state.SplitBootstrapMarker,
     ) !bool {
+        if (!marker.bootstrap_complete) return error.InvalidSplitBootstrapMarker;
+
         const writes = try alloc.alloc(db_types.BatchWrite, handoff.entries.len);
         defer alloc.free(writes);
         for (handoff.entries, 0..) |entry, i| {
@@ -283,13 +285,22 @@ pub const Destination = struct {
                 .value = entry.value,
             };
         }
-        return try self.db.replaceSplitBootstrap(
+        var reservation = marker;
+        reservation.bootstrap_complete = false;
+        const replaced = try self.db.replaceSplitBootstrap(
             alloc,
             handoff.byte_range,
             writes,
             handoff.base_delta_sequence,
+            reservation,
+        );
+        const completed = try self.db.completeSplitBootstrap(
+            alloc,
+            handoff.byte_range,
+            handoff.base_delta_sequence,
             marker,
         );
+        return replaced or completed;
     }
 
     pub fn applyMergeBootstrap(
@@ -606,6 +617,14 @@ pub const SyncCoordinator = struct {
         const source_phase = if (source_state) |state| state.phase else null;
         if (source_phase == null) return false;
         if (source_phase.? != .splitting and source_phase.? != .finalizing) return false;
+
+        if (try dest.db.getSplitBootstrapMarker(self.alloc)) |marker| {
+            const same_attempt = marker.transition_id == self.transition_id and
+                marker.attempt_epoch == self.attempt_epoch and
+                marker.source_group_id == self.source_group_id and
+                marker.destination_group_id == self.dest_group_id;
+            if (same_attempt and marker.bootstrap_complete) return false;
+        }
 
         const handoff = try source.captureSplitHandoff(self.alloc, self.source_group_id);
         defer shard_state_store.freeHandoff(self.alloc, handoff);
@@ -1854,6 +1873,7 @@ test "db split sync coordinator tracks explicit split transition phases" {
         try std.testing.expectEqual(SplitTransitionPhase.replay_deltas, status.phase);
         try std.testing.expect(!status.destination_ready_for_reads);
         const result = try coord.syncOnce();
+        try std.testing.expect(!result.bootstrapped);
         try std.testing.expectEqual(@as(usize, 1), result.applied_deltas);
         const post = try coord.status();
         try std.testing.expectEqual(SplitTransitionPhase.cutover_ready, post.phase);

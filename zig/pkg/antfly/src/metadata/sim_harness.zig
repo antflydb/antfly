@@ -1535,7 +1535,7 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
     try cluster.stepAll();
 
     const split_summary = try requireLeasedReconcile(cluster.node(leader_index), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), split_summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), split_summary.split_admissions);
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     const transitions = try cluster.node(query_index).listProjectedSplitTransitions(std.testing.allocator);
@@ -1562,10 +1562,8 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
     try std.testing.expect(try waitForSplitTransitionFinalized(&cluster, transition_id, transition_observer_index, query_index, cfg.finalize_rounds));
 
     const verification_index = transition_observer_index orelse (currentMetadataLeaderIndex(&cluster) orelse query_index);
-    const finalize_summary = try requireLeasedReconcile(cluster.node(verification_index), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 2), finalize_summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.split_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedSplitTransition(cluster.node(verification_index), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
 
     try verifySplitPublicTraffic(&cluster, &client, public_api.api_base_uris[0..], public_api.catalog_sources[verification_index].iface(), client_base, "docs", roots[0..], cfg.verify);
 }
@@ -1717,11 +1715,9 @@ fn runAutomaticMergePublicTrafficScenario(cfg: AutomaticMergePublicTrafficScenar
     try std.testing.expect(try waitForMergeTransitionFinalized(&cluster, transition_id, transition_observer_index, query_index, cfg.finalize_rounds));
 
     const verification_index = transition_observer_index orelse (currentMetadataLeaderIndex(&cluster) orelse query_index);
-    const finalize_summary = try requireLeasedReconcile(cluster.node(verification_index), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.range_removals);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.merge_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedMergeTransition(cluster.node(verification_index), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
 
     try verifyMergePublicTraffic(&cluster, &client, public_api.api_base_uris[0..], public_api.catalog_sources[verification_index].iface(), client_base, "docs", roots[0..], left_group_id, right_group_id, cfg.verify);
 }
@@ -2716,6 +2712,10 @@ pub const MetadataHttpNodeSimulation = struct {
             try commands.append(self.cluster.alloc, .{ .upsert_replica_intent = intent });
         }
         for (plan.table_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_table = record });
+        for (plan.split_admissions) |admission| try commands.append(self.cluster.alloc, .{ .admit_split_transition = .{
+            .expected_source_epoch = admission.expected_source_epoch,
+            .record = admission.record,
+        } });
         for (plan.range_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_range = record });
         for (plan.split_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_split_transition = record });
         for (plan.merge_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_merge_transition = record });
@@ -3969,6 +3969,46 @@ fn requireLeasedReconcile(
     return error.ReconcileLeaseNotHeld;
 }
 
+const SplitRetirementSummary = struct {
+    terminal: metadata_control_loop.ReconcileSummary,
+    removal: metadata_control_loop.ReconcileSummary,
+};
+
+fn retireFinalizedSplitTransition(
+    node: MetadataHttpNodeSimulation,
+    loop: *metadata_control_loop.MetadataControlLoop,
+) !SplitRetirementSummary {
+    const terminal = try requireLeasedReconcile(node, loop);
+    try std.testing.expectEqual(@as(usize, 1), terminal.split_upserts);
+    try std.testing.expectEqual(@as(usize, 0), terminal.split_removals);
+    try node.cluster.stepAll();
+
+    const removal = try requireLeasedReconcile(node, loop);
+    try std.testing.expectEqual(@as(usize, 1), removal.split_removals);
+    try node.cluster.stepAll();
+    return .{ .terminal = terminal, .removal = removal };
+}
+
+const MergeRetirementSummary = struct {
+    terminal: metadata_control_loop.ReconcileSummary,
+    removal: metadata_control_loop.ReconcileSummary,
+};
+
+fn retireFinalizedMergeTransition(
+    node: MetadataHttpNodeSimulation,
+    loop: *metadata_control_loop.MetadataControlLoop,
+) !MergeRetirementSummary {
+    const terminal = try requireLeasedReconcile(node, loop);
+    try std.testing.expectEqual(@as(usize, 1), terminal.merge_upserts);
+    try std.testing.expectEqual(@as(usize, 0), terminal.merge_removals);
+    try node.cluster.stepAll();
+
+    const removal = try requireLeasedReconcile(node, loop);
+    try std.testing.expectEqual(@as(usize, 1), removal.merge_removals);
+    try node.cluster.stepAll();
+    return .{ .terminal = terminal, .removal = removal };
+}
+
 fn bootstrapDesiredLoop(
     node: MetadataHttpNodeSimulation,
     loop: *metadata_control_loop.MetadataControlLoop,
@@ -5121,7 +5161,7 @@ fn metadataVoprRunSmokeLivenessWorkload(
         .destination_group_id = cfg.split_group_id,
         .split_key = "doc:m",
     });
-    try std.testing.expectEqual(@as(usize, 1), split_summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), split_summary.split_admissions);
     var split_ctx = MetadataSplitTransitionProgressContext{ .transition_id = cfg.split_transition_id };
     try cluster.assertProgress("metadata-vopr-smoke-split-progress", 48, &split_ctx, metadataSplitTransitionProgressPredicate);
 }
@@ -5240,7 +5280,7 @@ fn metadataVoprRunExpandedLivenessWorkload(
         .destination_group_id = cfg.split_group_id,
         .split_key = "doc:m",
     });
-    try std.testing.expectEqual(@as(usize, 1), split_summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), split_summary.split_admissions);
     try cluster.restartNode(split_leader_index);
     try metadataVoprHealAll(cluster, state);
     _ = try metadataVoprLeaderIndex(cluster);
@@ -6500,7 +6540,7 @@ test "metadata http cluster simulation drives split intent through the control l
         .destination_group_id = 4502,
         .split_key = "doc:m",
     });
-    try std.testing.expectEqual(@as(usize, 1), split_summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), split_summary.split_admissions);
 
     var split_ctx = MetadataSplitTransitionProgressContext{ .transition_id = 45001 };
     try cluster.assertProgress("split-intent-progress", 24, &split_ctx, metadataSplitTransitionProgressPredicate);
@@ -6698,10 +6738,8 @@ test "metadata http cluster simulation drives automatic split through the contro
     try std.testing.expect(try waitForSplitTransitionFinalized(&cluster, transition_id, null, query_index, 32));
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse query_index;
-    const finalize_summary = try requireLeasedReconcile(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 2), finalize_summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.split_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedSplitTransition(cluster.node(finalize_leader), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -6804,7 +6842,7 @@ test "metadata http cluster simulation uses live median key for automatic split 
     try cluster.stepAll();
 
     const split_summary = try requireLeasedReconcile(cluster.node(leader_index), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), split_summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), split_summary.split_admissions);
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     const transitions = try cluster.node(query_index).listProjectedSplitTransitions(std.testing.allocator);
@@ -6928,7 +6966,7 @@ test "metadata http cluster simulation uses remote live median key when metadata
     try cluster.stepAll();
 
     const split_summary = try requireLeasedReconcile(cluster.node(forced_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), split_summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), split_summary.split_admissions);
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse forced_leader;
     const transitions = try cluster.node(query_index).listProjectedSplitTransitions(std.testing.allocator);
@@ -7017,7 +7055,7 @@ test "metadata http cluster simulation completes automatic split after metadata 
     try cluster.stepAll();
 
     const split_summary = try requireLeasedReconcile(cluster.node(leader_index), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), split_summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), split_summary.split_admissions);
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     const transitions = try cluster.node(query_index).listProjectedSplitTransitions(std.testing.allocator);
@@ -7030,10 +7068,8 @@ test "metadata http cluster simulation completes automatic split after metadata 
     try std.testing.expect(try waitForSplitTransitionFinalized(&cluster, transition_id, null, leader_index, 48));
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse leader_index;
-    const finalize_summary = try requireLeasedReconcile(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 2), finalize_summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.split_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedSplitTransition(cluster.node(finalize_leader), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -7120,7 +7156,7 @@ test "metadata http cluster simulation completes automatic split after metadata 
     try cluster.stepAll();
 
     const split_summary = try requireLeasedReconcile(cluster.node(leader_index), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), split_summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), split_summary.split_admissions);
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     const transitions = try cluster.node(query_index).listProjectedSplitTransitions(std.testing.allocator);
@@ -7132,10 +7168,8 @@ test "metadata http cluster simulation completes automatic split after metadata 
     const new_leader = (try waitForMetadataLeaderExcluding(&cluster, query_index, 64)) orelse return error.TestExpectedEqual;
     try std.testing.expect(try waitForSplitTransitionFinalized(&cluster, transition_id, new_leader, new_leader, 64));
 
-    const finalize_summary = try requireLeasedReconcile(cluster.node(new_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 2), finalize_summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.split_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedSplitTransition(cluster.node(new_leader), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
 
     const ranges = try cluster.node(new_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(new_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -7229,7 +7263,7 @@ test "metadata http cluster simulation completes automatic split under delayed r
     try cluster.stepAll();
 
     const split_summary = try requireLeasedReconcile(cluster.node(leader_index), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), split_summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), split_summary.split_admissions);
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     const transitions = try cluster.node(query_index).listProjectedSplitTransitions(std.testing.allocator);
@@ -7239,10 +7273,8 @@ test "metadata http cluster simulation completes automatic split under delayed r
     try std.testing.expect(try waitForSplitTransitionFinalized(&cluster, transition_id, null, query_index, 128));
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse query_index;
-    const finalize_summary = try requireLeasedReconcile(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 2), finalize_summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.split_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedSplitTransition(cluster.node(finalize_leader), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -7336,7 +7368,7 @@ test "metadata http cluster simulation completes automatic split after leader re
     try cluster.stepAll();
 
     const split_summary = try requireLeasedReconcile(cluster.node(leader_index), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), split_summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), split_summary.split_admissions);
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     const transitions = try cluster.node(query_index).listProjectedSplitTransitions(std.testing.allocator);
@@ -7349,10 +7381,8 @@ test "metadata http cluster simulation completes automatic split after leader re
     try std.testing.expect(try waitForSplitTransitionFinalized(&cluster, transition_id, null, leader_index, 128));
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse leader_index;
-    const finalize_summary = try requireLeasedReconcile(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 2), finalize_summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.split_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedSplitTransition(cluster.node(finalize_leader), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -7439,7 +7469,7 @@ test "metadata http cluster simulation completes automatic split after source gr
     try cluster.stepAll();
 
     const split_summary = try requireLeasedReconcile(cluster.node(leader_index), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), split_summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), split_summary.split_admissions);
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     const transitions = try cluster.node(query_index).listProjectedSplitTransitions(std.testing.allocator);
@@ -7453,10 +7483,8 @@ test "metadata http cluster simulation completes automatic split after source gr
     try std.testing.expect(try waitForSplitTransitionFinalized(&cluster, transition_id, null, query_index, 64));
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse query_index;
-    const finalize_summary = try requireLeasedReconcile(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 2), finalize_summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.split_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedSplitTransition(cluster.node(finalize_leader), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -7549,7 +7577,7 @@ test "metadata http cluster simulation completes automatic split after destinati
     try cluster.stepAll();
 
     const split_summary = try requireLeasedReconcile(cluster.node(leader_index), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), split_summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), split_summary.split_admissions);
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     const transitions = try cluster.node(query_index).listProjectedSplitTransitions(std.testing.allocator);
@@ -7575,10 +7603,8 @@ test "metadata http cluster simulation completes automatic split after destinati
     }
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse query_index;
-    const finalize_summary = try requireLeasedReconcile(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 2), finalize_summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.split_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedSplitTransition(cluster.node(finalize_leader), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
 
     if (destination_progress.group_index == null) {
         const post_finalize_destination = (try waitForGroupLeaderIndex(&cluster, destination_group_id, 96)) orelse return error.TestExpectedEqual;
@@ -7673,7 +7699,7 @@ test "metadata http cluster simulation completes automatic split after leader pa
     try cluster.stepAll();
 
     const split_summary = try requireLeasedReconcile(cluster.node(leader_index), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), split_summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), split_summary.split_admissions);
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
     const transitions = try cluster.node(query_index).listProjectedSplitTransitions(std.testing.allocator);
@@ -7685,10 +7711,8 @@ test "metadata http cluster simulation completes automatic split after leader pa
     const new_leader = (try waitForMetadataLeaderExcluding(&cluster, query_index, 96)) orelse return error.TestExpectedEqual;
     try std.testing.expect(try waitForSplitTransitionFinalized(&cluster, transition_id, new_leader, new_leader, 160));
 
-    const finalize_summary = try requireLeasedReconcile(cluster.node(new_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 2), finalize_summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.split_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedSplitTransition(cluster.node(new_leader), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
 
     const ranges = try cluster.node(new_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(new_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -7900,11 +7924,9 @@ test "metadata http cluster simulation drives automatic merge through the contro
     try std.testing.expect(try waitForMergeTransitionFinalized(&cluster, transition_id, null, query_index, 32));
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse query_index;
-    const finalize_summary = try requireLeasedReconcile(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.range_removals);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.merge_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedMergeTransition(cluster.node(finalize_leader), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -8012,11 +8034,9 @@ test "metadata http cluster simulation completes automatic merge after metadata 
     try std.testing.expect(try waitForMergeTransitionFinalized(&cluster, transition_id, null, leader_index, 48));
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse leader_index;
-    const finalize_summary = try requireLeasedReconcile(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.range_removals);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.merge_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedMergeTransition(cluster.node(finalize_leader), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -8121,11 +8141,9 @@ test "metadata http cluster simulation completes automatic merge after donor gro
     try std.testing.expect(try waitForMergeTransitionFinalized(&cluster, transition_id, null, query_index, 64));
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse query_index;
-    const finalize_summary = try requireLeasedReconcile(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.range_removals);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.merge_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedMergeTransition(cluster.node(finalize_leader), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -8230,11 +8248,9 @@ test "metadata http cluster simulation completes automatic merge after receiver 
     try std.testing.expect(try waitForMergeTransitionFinalized(&cluster, transition_id, null, query_index, 64));
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse query_index;
-    const finalize_summary = try requireLeasedReconcile(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.range_removals);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.merge_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedMergeTransition(cluster.node(finalize_leader), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -8337,11 +8353,9 @@ test "metadata http cluster simulation completes automatic merge after metadata 
     const new_leader = (try waitForMetadataLeaderExcluding(&cluster, query_index, 64)) orelse return error.TestExpectedEqual;
     try std.testing.expect(try waitForMergeTransitionFinalized(&cluster, transition_id, new_leader, new_leader, 64));
 
-    const finalize_summary = try requireLeasedReconcile(cluster.node(new_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.range_removals);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.merge_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedMergeTransition(cluster.node(new_leader), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
 
     const ranges = try cluster.node(new_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(new_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -8449,11 +8463,9 @@ test "metadata http cluster simulation completes automatic merge under delayed r
     try std.testing.expect(try waitForMergeTransitionFinalized(&cluster, transition_id, null, query_index, 128));
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse query_index;
-    const finalize_summary = try requireLeasedReconcile(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.range_removals);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.merge_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedMergeTransition(cluster.node(finalize_leader), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -8564,11 +8576,9 @@ test "metadata http cluster simulation completes automatic merge after leader re
     try std.testing.expect(try waitForMergeTransitionFinalized(&cluster, transition_id, null, leader_index, 128));
 
     const finalize_leader = currentMetadataLeaderIndex(&cluster) orelse leader_index;
-    const finalize_summary = try requireLeasedReconcile(cluster.node(finalize_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.range_removals);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.merge_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedMergeTransition(cluster.node(finalize_leader), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
 
     const ranges = try cluster.node(finalize_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(finalize_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -8678,11 +8688,9 @@ test "metadata http cluster simulation completes automatic merge after leader pa
     const new_leader = (try waitForMetadataLeaderExcluding(&cluster, query_index, 96)) orelse return error.TestExpectedEqual;
     try std.testing.expect(try waitForMergeTransitionFinalized(&cluster, transition_id, new_leader, new_leader, 160));
 
-    const finalize_summary = try requireLeasedReconcile(cluster.node(new_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.range_removals);
-    try std.testing.expectEqual(@as(usize, 1), finalize_summary.merge_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedMergeTransition(cluster.node(new_leader), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
 
     const ranges = try cluster.node(new_leader).listProjectedRanges(std.testing.allocator);
     defer cluster.node(new_leader).freeProjectedRanges(std.testing.allocator, ranges);
@@ -8881,7 +8889,7 @@ test "metadata http cluster simulation survives leader restart before forced aut
     const new_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
 
     const summary = try requireLeasedReconcile(cluster.node(new_leader), &auto_loop);
-    try std.testing.expectEqual(@as(usize, 1), summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), summary.split_admissions);
     try std.testing.expect((try cluster.node(new_leader).getProjectedReallocationRequest()) == null);
 }
 
@@ -8962,10 +8970,8 @@ test "metadata http cluster simulation publishes split topology after finalize" 
     try std.testing.expect(try waitForSplitTransitionFinalized(&cluster, 47001, null, leader_index, 32));
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
-    const summary = try requireLeasedReconcile(cluster.node(query_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 2), summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.split_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedSplitTransition(cluster.node(query_index), workflow.controlLoop());
+    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
 
     const ranges = try cluster.node(query_index).listProjectedRanges(std.testing.allocator);
     defer cluster.node(query_index).freeProjectedRanges(std.testing.allocator, ranges);
@@ -9060,11 +9066,9 @@ test "metadata http cluster simulation publishes merge topology after finalize" 
     try std.testing.expect(try waitForMergeTransitionFinalized(&cluster, 48001, null, leader_index, 32));
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
-    const summary = try requireLeasedReconcile(cluster.node(query_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 1), summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.range_removals);
-    try std.testing.expectEqual(@as(usize, 1), summary.merge_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedMergeTransition(cluster.node(query_index), workflow.controlLoop());
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
 
     const ranges = try cluster.node(query_index).listProjectedRanges(std.testing.allocator);
     defer cluster.node(query_index).freeProjectedRanges(std.testing.allocator, ranges);
@@ -9153,10 +9157,8 @@ test "metadata http cluster simulation provisions split destination replicas acr
     try std.testing.expect(try waitForSplitTransitionFinalized(&cluster, 48101, null, leader_index, 40));
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
-    const summary = try requireLeasedReconcile(cluster.node(query_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 2), summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.split_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedSplitTransition(cluster.node(query_index), workflow.controlLoop());
+    try std.testing.expectEqual(@as(usize, 2), retirement.terminal.range_upserts);
 
     try std.testing.expect(try cluster.waitForGroupStatus(4811, .active, 40));
     try std.testing.expect(try cluster.waitForGroupStatus(4812, .active, 40));
@@ -9248,11 +9250,9 @@ test "metadata http cluster simulation retires merge donor replicas across nodes
     try std.testing.expect(try waitForMergeTransitionFinalized(&cluster, 48201, null, leader_index, 40));
 
     const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
-    const summary = try requireLeasedReconcile(cluster.node(query_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 1), summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.range_removals);
-    try std.testing.expectEqual(@as(usize, 1), summary.merge_removals);
-    try cluster.stepAll();
+    const retirement = try retireFinalizedMergeTransition(cluster.node(query_index), workflow.controlLoop());
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), retirement.terminal.range_removals);
 
     try std.testing.expect(try cluster.waitForGroupStatus(4821, .active, 40));
     try std.testing.expect(try cluster.waitForGroupStatus(4822, .absent, 40));

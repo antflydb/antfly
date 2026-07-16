@@ -1131,7 +1131,7 @@ test "internal group write routes map shard doc identity mismatch to conflict" {
     var split_resp = (try handle(ctx, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/shard-ops/observe-split",
-        .body = "{\"transition_id\":1,\"source_group_id\":7,\"destination_group_id\":8,\"split_key\":\"doc:m\"}",
+        .body = "{\"transition_id\":1,\"attempt_epoch\":1,\"source_group_id\":7,\"destination_group_id\":8,\"split_key\":\"doc:m\"}",
     }, "/internal/v1/groups/7/shard-ops/observe-split")).?;
     defer split_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), split_resp.status);

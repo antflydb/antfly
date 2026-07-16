@@ -68,7 +68,7 @@ const StorageRecorder = struct {
         }
     }
 
-    fn compactSnapshot(ptr: *anyopaque, group_id: core.types.GroupId, snapshot: core.types.Snapshot) !void {
+    fn compactSnapshot(ptr: *anyopaque, group_id: core.types.GroupId, snapshot: core.types.Snapshot, compact_index: core.types.Index) !void {
         const self: *StorageRecorder = @ptrCast(@alignCast(ptr));
         const store = self.stores.get(group_id) orelse return error.UnknownGroup;
         self.persist_calls += 1;
@@ -79,7 +79,7 @@ const StorageRecorder = struct {
             self.compact_failures_remaining -= 1;
             return error.InjectedSnapshotPublishFailure;
         }
-        try store.compactToSnapshot(snapshot);
+        try store.compactToSnapshot(snapshot, compact_index);
         if (self.compact_successes < self.compacted_groups.len) {
             self.compacted_groups[self.compact_successes] = group_id;
         }
@@ -863,7 +863,7 @@ test "multi raft compacts active applied log after retained entry window" {
     }
 
     const completion_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
-    while (host.metricsSnapshot().snapshot_compaction_completions == 0 and clock.monotonicNs() < completion_deadline) {
+    while (host.group(63).?.raw_node.raft.log.firstIndex() < 8 and clock.monotonicNs() < completion_deadline) {
         _ = try host.drainReady(0);
         std.Thread.sleep(std.time.ns_per_ms);
     }
@@ -872,7 +872,9 @@ test "multi raft compacts active applied log after retained entry window" {
     try std.testing.expectEqual(@as(core.types.Index, 9), apply_recorder.last_applied_index);
     try std.testing.expect(host.metricsSnapshot().snapshot_compaction_completions > 0);
     try std.testing.expect(apply_recorder.snapshot_materializations.load(.monotonic) > 0);
-    try std.testing.expect(grp.raw_node.raft.log.firstIndex() > 1);
+    try std.testing.expectEqual(@as(core.types.Index, 8), grp.raw_node.raft.log.firstIndex());
+    try std.testing.expectEqual(@as(core.types.Index, 8), try store.storage().firstIndex());
+    try std.testing.expectEqual(@as(core.types.Term, 1), try store.storage().term(7));
     try std.testing.expectEqual(@as(core.types.Index, 9), grp.raw_node.raft.log.lastIndex());
 }
 

@@ -930,13 +930,12 @@ pub const ManagedHostSimulation = struct {
     }
 };
 
-fn appliedChangeFromTransitionCommand(command: metadata_mod.TransitionCommand) !metadata_apply.AppliedMetadataChange {
-    return switch (command) {
-        .upsert_split_transition => |record| .{ .upsert_split_transition = record },
-        .remove_split_transition => |record| .{ .remove_split_transition = .{ .transition_id = record.transition_id } },
-        .upsert_merge_transition => |record| .{ .upsert_merge_transition = record },
-        .remove_merge_transition => |record| .{ .remove_merge_transition = .{ .transition_id = record.transition_id } },
-        else => error.UnsupportedCommittedTransitionCommand,
+fn appliedChangeFromCommittedTransitionDelta(delta: metadata_mod.storage.raft_apply_store.CommittedTransitionDelta) metadata_apply.AppliedMetadataChange {
+    return switch (delta) {
+        .upsert_split => |record| .{ .upsert_split_transition = record },
+        .remove_split => |transition_id| .{ .remove_split_transition = .{ .transition_id = transition_id } },
+        .upsert_merge => |record| .{ .upsert_merge_transition = record },
+        .remove_merge => |transition_id| .{ .remove_merge_transition = .{ .transition_id = transition_id } },
     };
 }
 
@@ -1070,16 +1069,47 @@ pub const ManagedHttpHostSimulation = struct {
 
         const entries_bytes = try raft_state_machine.encodeCommittedEntries(self.alloc, entries);
         defer self.alloc.free(entries_bytes);
-        try metadata_store.snapshotBuilder().applyBatch(.{
-            .group_id = group_id,
-            .commit_index = start_index + commands.len - 1,
-            .entries_bytes = entries_bytes,
-        });
+        var outcome = try metadata_store.applyCommittedBatch(
+            group_id,
+            start_index + commands.len - 1,
+            entries_bytes,
+        );
+        defer outcome.deinit();
 
-        var changes = try self.alloc.alloc(metadata_apply.AppliedMetadataChange, commands.len);
+        const changes = try self.alloc.alloc(metadata_apply.AppliedMetadataChange, outcome.transition_deltas.items.len);
         defer self.alloc.free(changes);
-        for (commands, 0..) |command, i| changes[i] = try appliedChangeFromTransitionCommand(command);
-        try self.applier.applyBatch(changes);
+        for (outcome.transition_deltas.items, 0..) |delta, i| changes[i] = appliedChangeFromCommittedTransitionDelta(delta);
+        if (changes.len > 0) try self.applier.applyBatch(changes);
+    }
+
+    fn retireRolledBackSplitTransition(
+        self: *ManagedHttpHostSimulation,
+        group_id: u64,
+        start_index: u64,
+        record: metadata_mod.SplitTransitionRecord,
+    ) !void {
+        std.debug.assert(record.rollback_reason != null);
+        var terminal = record;
+        terminal.phase = .rolled_back;
+        try self.applyCommittedTransitionCommands(group_id, start_index, &.{
+            .{ .upsert_split_transition = terminal },
+            .{ .remove_split_transition = .{ .transition_id = record.transition_id } },
+        });
+    }
+
+    fn retireRolledBackMergeTransition(
+        self: *ManagedHttpHostSimulation,
+        group_id: u64,
+        start_index: u64,
+        record: metadata_mod.MergeTransitionRecord,
+    ) !void {
+        std.debug.assert(record.rollback_reason != null);
+        var terminal = record;
+        terminal.phase = .rolled_back;
+        try self.applyCommittedTransitionCommands(group_id, start_index, &.{
+            .{ .upsert_merge_transition = terminal },
+            .{ .remove_merge_transition = .{ .transition_id = record.transition_id } },
+        });
     }
 
     pub fn stepOnce(self: *ManagedHttpHostSimulation) !runtime_loop.RuntimeStepResult {
@@ -1574,10 +1604,10 @@ const StorageRecorder = struct {
         if (ready.entries.len > 0) try store.append(ready.entries);
     }
 
-    fn compactSnapshot(ptr: *anyopaque, group_id: u64, snapshot: raft_engine.core.types.Snapshot) !void {
+    fn compactSnapshot(ptr: *anyopaque, group_id: u64, snapshot: raft_engine.core.types.Snapshot, compact_index: u64) !void {
         const self: *StorageRecorder = @ptrCast(@alignCast(ptr));
         const store = self.stores.get(group_id) orelse return error.UnknownGroup;
-        try store.compactToSnapshot(snapshot);
+        try store.compactToSnapshot(snapshot, compact_index);
     }
 };
 
@@ -5553,7 +5583,28 @@ test "cluster simulation resumes queued split transitions after node restart wit
     try std.testing.expectEqualStrings("{\"v\":\"right-0\"}", right);
 }
 
-test "cluster simulation removes queued split transition mid-flight across node restart" {
+test "cluster simulation ignores active split removal and rolls back explicitly across restart" {
+    const SplitProgress = struct {
+        node_index: usize,
+        transition_id: u64,
+
+        fn rolledBack(cluster: *ManagedHttpClusterSimulation, ptr: *anyopaque) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const metrics = cluster.node(self.node_index).serviceMetrics();
+            return metrics.queued_split_transitions == 0 and
+                metrics.completed_split_transitions == 1 and
+                splitTransitionInactive(try cluster.node(self.node_index).observeSplitTransition(self.transition_id));
+        }
+
+        fn absentAfterRestart(cluster: *ManagedHttpClusterSimulation, ptr: *anyopaque) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const metrics = cluster.node(self.node_index).serviceMetrics();
+            return metrics.queued_split_transitions == 0 and
+                metrics.completed_split_transitions == 0 and
+                (try cluster.node(self.node_index).observeSplitTransition(self.transition_id)) == null;
+        }
+    };
+
     var tmp_a = std.testing.tmpDir(.{});
     defer tmp_a.cleanup();
     var tmp_b = std.testing.tmpDir(.{});
@@ -5686,14 +5737,29 @@ test "cluster simulation removes queued split transition mid-flight across node 
     try cluster.node(0).applyCommittedTransitionCommands(1300, 2, &.{
         .{ .remove_split_transition = .{ .transition_id = 9501 } },
     });
-    try cluster.stepAll();
-    try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_split_transitions);
+    try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().queued_split_transitions);
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().completed_split_transitions);
+
+    const rollback_record = metadata_mod.SplitTransitionRecord{
+        .transition_id = 9501,
+        .attempt_epoch = 1,
+        .source_group_id = 1901,
+        .destination_group_id = 1902,
+        .phase = .prepare,
+        .rollback_reason = "operator abort",
+    };
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+        .{ .upsert_split_transition = rollback_record },
+    });
+    var progress = SplitProgress{ .node_index = 0, .transition_id = rollback_record.transition_id };
+    try cluster.assertProgress("split-rollback-before-cutover", 64, &progress, SplitProgress.rolledBack);
+    try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_split_transitions);
+    try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().completed_split_transitions);
+    try cluster.node(0).retireRolledBackSplitTransition(1300, 4, rollback_record);
 
     try cluster.restartNode(0);
 
-    rounds = 0;
-    while (rounds < 8) : (rounds += 1) try cluster.stepAll();
+    try cluster.assertProgress("retired-split-absent-after-restart", 64, &progress, SplitProgress.absentAfterRestart);
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_split_transitions);
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().completed_split_transitions);
     try std.testing.expectEqual(@as(?metadata_mod.SplitObservation, null), try cluster.node(0).observeSplitTransition(9501));
@@ -5703,9 +5769,6 @@ test "cluster simulation removes queued split transition mid-flight across node 
         try std.testing.expectEqual(@as(?[]u8, null), try dest.get(std.testing.allocator, "doc:t"));
     }
 
-    // Removing terminal metadata is not a cancellation protocol. Explicitly
-    // retire the source attempt before admitting its successor.
-    try std.testing.expect(try split.runtime().rollbackSource(9501, 1, 1901, 1902));
     split.deinit();
     split = try transition_runtime_mod.SplitCoordinatorRuntime.init(std.testing.allocator, .{
         .transition_id = 9502,
@@ -5716,7 +5779,7 @@ test "cluster simulation removes queued split transition mid-flight across node 
         .dest_group_id = 1902,
     });
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 6, &.{
         .{ .upsert_split_transition = .{
             .transition_id = 9502,
             .attempt_epoch = 2,
@@ -5907,6 +5970,14 @@ test "cluster simulation rolls back queued split transition mid-flight across no
     try std.testing.expectEqual(@as(usize, 0), metrics.queued_split_transitions);
     try std.testing.expectEqual(@as(usize, 1), metrics.completed_split_transitions);
     try expectSplitTransitionInactive(&cluster, 0, 9511);
+    try cluster.node(0).retireRolledBackSplitTransition(1300, 3, .{
+        .transition_id = 9511,
+        .attempt_epoch = 1,
+        .source_group_id = 1911,
+        .destination_group_id = 1912,
+        .phase = .prepare,
+        .rollback_reason = "operator abort",
+    });
 
     {
         var source = try data_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root, .read_only = true });
@@ -5945,7 +6016,7 @@ test "cluster simulation rolls back queued split transition mid-flight across no
         .dest_group_id = 1912,
     });
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 5, &.{
         .{ .upsert_split_transition = .{
             .transition_id = 9511,
             .attempt_epoch = 2,
@@ -6126,6 +6197,14 @@ test "cluster simulation survives repeated same-id split overwrites across resta
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_split_transitions);
     try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().completed_split_transitions);
     try expectSplitTransitionInactive(&cluster, 0, 9521);
+    try cluster.node(0).retireRolledBackSplitTransition(1300, 4, .{
+        .transition_id = 9521,
+        .attempt_epoch = 1,
+        .source_group_id = 1921,
+        .destination_group_id = 1922,
+        .phase = .prepare,
+        .rollback_reason = "operator abort 2",
+    });
 
     try cluster.restartNode(0);
 
@@ -6139,7 +6218,7 @@ test "cluster simulation survives repeated same-id split overwrites across resta
         .dest_group_id = 1922,
     });
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 4, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 6, &.{
         .{ .upsert_split_transition = .{
             .transition_id = 9521,
             .attempt_epoch = 2,
@@ -7286,6 +7365,13 @@ test "cluster simulation rolls back queued merge transition mid-flight across no
     try std.testing.expectEqual(@as(usize, 0), metrics.queued_merge_transitions);
     try std.testing.expectEqual(@as(usize, 1), metrics.completed_merge_transitions);
     try expectMergeTransitionInactive(&cluster, 0, 9601);
+    try cluster.node(0).retireRolledBackMergeTransition(1300, 3, .{
+        .transition_id = 9601,
+        .donor_group_id = 1951,
+        .receiver_group_id = 1952,
+        .phase = .prepare,
+        .rollback_reason = "operator abort",
+    });
 
     {
         var receiver = try data_mod.SplitDestination.initReadOnly(std.testing.allocator, receiver_root);
@@ -7304,7 +7390,7 @@ test "cluster simulation rolls back queued merge transition mid-flight across no
         .receiver_group_id = 1952,
     });
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 5, &.{
         .{ .upsert_merge_transition = .{
             .transition_id = 9601,
             .donor_group_id = 1951,
@@ -7486,6 +7572,13 @@ test "cluster simulation survives repeated same-id merge overwrites across resta
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_merge_transitions);
     try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().completed_merge_transitions);
     try expectMergeTransitionInactive(&cluster, 0, 9621);
+    try cluster.node(0).retireRolledBackMergeTransition(1300, 4, .{
+        .transition_id = 9621,
+        .donor_group_id = 1971,
+        .receiver_group_id = 1972,
+        .phase = .prepare,
+        .rollback_reason = "operator abort 2",
+    });
 
     try cluster.restartNode(0);
 
@@ -7497,7 +7590,7 @@ test "cluster simulation survives repeated same-id merge overwrites across resta
         .receiver_group_id = 1972,
     });
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 4, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 6, &.{
         .{ .upsert_merge_transition = .{
             .transition_id = 9621,
             .donor_group_id = 1971,
@@ -7716,7 +7809,14 @@ test "cluster simulation isolates concurrent split removal and merge retry acros
     try std.testing.expect(merge_before.tag == .bootstrapping_receiver or merge_before.tag == .ready_to_finalize);
 
     try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
-        .{ .remove_split_transition = .{ .transition_id = 9701 } },
+        .{ .upsert_split_transition = .{
+            .transition_id = 9701,
+            .attempt_epoch = 1,
+            .source_group_id = 1981,
+            .destination_group_id = 1982,
+            .phase = .prepare,
+            .rollback_reason = "operator abort concurrent",
+        } },
         .{
             .upsert_merge_transition = .{
                 .transition_id = 9702,
@@ -7744,6 +7844,21 @@ test "cluster simulation isolates concurrent split removal and merge retry acros
     try expectMergeTransitionInactive(&cluster, 0, 9702);
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_split_transitions);
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_merge_transitions);
+    try cluster.node(0).retireRolledBackSplitTransition(1300, 5, .{
+        .transition_id = 9701,
+        .attempt_epoch = 1,
+        .source_group_id = 1981,
+        .destination_group_id = 1982,
+        .phase = .prepare,
+        .rollback_reason = "operator abort concurrent",
+    });
+    try cluster.node(0).retireRolledBackMergeTransition(1300, 7, .{
+        .transition_id = 9702,
+        .donor_group_id = 1983,
+        .receiver_group_id = 1984,
+        .phase = .prepare,
+        .rollback_reason = "operator abort concurrent",
+    });
 
     try cluster.restartNode(0);
 
@@ -7761,7 +7876,7 @@ test "cluster simulation isolates concurrent split removal and merge retry acros
         .receiver_group_id = 1984,
     });
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 5, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 9, &.{
         .{ .upsert_merge_transition = .{
             .transition_id = 9702,
             .donor_group_id = 1983,
@@ -7791,7 +7906,7 @@ test "cluster simulation isolates concurrent split removal and merge retry acros
             std.testing.allocator.free(source_range.end);
         }
         try std.testing.expectEqualStrings("doc:a", source_range.start);
-        try std.testing.expectEqualStrings("doc:m", source_range.end);
+        try std.testing.expectEqualStrings("doc:z", source_range.end);
         const source_state = try source.groupState(std.testing.allocator, 1981);
         defer {
             for (source_state) |entry| {
@@ -8022,7 +8137,13 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
                 .rollback_reason = "operator abort concurrent reverse",
             },
         },
-        .{ .remove_merge_transition = .{ .transition_id = 9712 } },
+        .{ .upsert_merge_transition = .{
+            .transition_id = 9712,
+            .donor_group_id = 1993,
+            .receiver_group_id = 1994,
+            .phase = .prepare,
+            .rollback_reason = "operator abort concurrent reverse",
+        } },
     });
 
     rounds = 0;
@@ -8041,6 +8162,21 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
     try expectMergeTransitionInactive(&cluster, 0, 9712);
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_split_transitions);
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_merge_transitions);
+    try cluster.node(0).retireRolledBackSplitTransition(1300, 5, .{
+        .transition_id = 9711,
+        .attempt_epoch = 1,
+        .source_group_id = 1991,
+        .destination_group_id = 1992,
+        .phase = .prepare,
+        .rollback_reason = "operator abort concurrent reverse",
+    });
+    try cluster.node(0).retireRolledBackMergeTransition(1300, 7, .{
+        .transition_id = 9712,
+        .donor_group_id = 1993,
+        .receiver_group_id = 1994,
+        .phase = .prepare,
+        .rollback_reason = "operator abort concurrent reverse",
+    });
 
     try cluster.restartNode(0);
 
@@ -8060,7 +8196,7 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
         .dest_group_id = 1992,
     });
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 5, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 9, &.{
         .{ .upsert_split_transition = .{
             .transition_id = 9711,
             .attempt_epoch = 2,
@@ -8343,7 +8479,14 @@ test "cluster simulation drives multiple concurrent real transition ids through 
     }
 
     try cluster.node(0).applyCommittedTransitionCommands(1300, 4, &.{
-        .{ .remove_split_transition = .{ .transition_id = 9801 } },
+        .{ .upsert_split_transition = .{
+            .transition_id = 9801,
+            .attempt_epoch = 1,
+            .source_group_id = 2001,
+            .destination_group_id = 2002,
+            .phase = .prepare,
+            .rollback_reason = "operator abort multi",
+        } },
         .{
             .upsert_split_transition = .{
                 .transition_id = 9802,
@@ -8365,6 +8508,22 @@ test "cluster simulation drives multiple concurrent real transition ids through 
     }
     try expectSplitTransitionInactive(&cluster, 0, 9801);
     try expectSplitTransitionInactive(&cluster, 0, 9802);
+    try cluster.node(0).retireRolledBackSplitTransition(1300, 6, .{
+        .transition_id = 9801,
+        .attempt_epoch = 1,
+        .source_group_id = 2001,
+        .destination_group_id = 2002,
+        .phase = .prepare,
+        .rollback_reason = "operator abort multi",
+    });
+    try cluster.node(0).retireRolledBackSplitTransition(1300, 8, .{
+        .transition_id = 9802,
+        .attempt_epoch = 1,
+        .source_group_id = 2003,
+        .destination_group_id = 2004,
+        .phase = .prepare,
+        .rollback_reason = "operator abort multi",
+    });
 
     try cluster.restartNode(0);
 
@@ -8386,7 +8545,7 @@ test "cluster simulation drives multiple concurrent real transition ids through 
     });
     try multiplex.addSplit(9802, 2, 2003, 2004, split_b.runtime());
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 6, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 10, &.{
         .{ .upsert_split_transition = .{
             .transition_id = 9802,
             .attempt_epoch = 2,
@@ -8795,7 +8954,7 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
     try std.testing.expectEqualStrings("{\"v\":\"donor-2\"}", merged);
 }
 
-test "cluster simulation removes queued merge transition mid-flight across node restart" {
+test "cluster simulation ignores active merge removal and rolls back explicitly across restart" {
     var tmp_a = std.testing.tmpDir(.{});
     defer tmp_a.cleanup();
     var tmp_b = std.testing.tmpDir(.{});
@@ -8935,8 +9094,26 @@ test "cluster simulation removes queued merge transition mid-flight across node 
         .{ .remove_merge_transition = .{ .transition_id = 9611 } },
     });
     try cluster.stepAll();
-    try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_merge_transitions);
+    try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().queued_merge_transitions);
     try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().completed_merge_transitions);
+
+    const rollback_record = metadata_mod.MergeTransitionRecord{
+        .transition_id = 9611,
+        .donor_group_id = 1961,
+        .receiver_group_id = 1962,
+        .phase = .prepare,
+        .rollback_reason = "operator abort",
+    };
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+        .{ .upsert_merge_transition = rollback_record },
+    });
+    rounds = 0;
+    while (rounds < 16 and cluster.node(0).serviceMetrics().completed_merge_transitions == 0) : (rounds += 1) {
+        try cluster.stepAll();
+    }
+    try std.testing.expectEqual(@as(usize, 0), cluster.node(0).serviceMetrics().queued_merge_transitions);
+    try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().completed_merge_transitions);
+    try cluster.node(0).retireRolledBackMergeTransition(1300, 4, rollback_record);
 
     try cluster.restartNode(0);
 
@@ -8952,7 +9129,7 @@ test "cluster simulation removes queued merge transition mid-flight across node 
     try std.testing.expectEqualStrings("doc:m", range.end);
     try std.testing.expectEqual(@as(?[]u8, null), try receiver.get(std.testing.allocator, "doc:t"));
 
-    try cluster.node(0).applyCommittedTransitionCommands(1300, 3, &.{
+    try cluster.node(0).applyCommittedTransitionCommands(1300, 6, &.{
         .{ .upsert_merge_transition = .{
             .transition_id = 9612,
             .donor_group_id = 1961,

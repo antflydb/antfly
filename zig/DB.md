@@ -434,6 +434,36 @@ entry watermark and filters overlapping committed prefixes before producing
 effects, so a Raft applied watermark that temporarily lags another state
 machine cannot apply `prepare` twice while advancing to `start`.
 
+Metadata-Raft projection publication is commit-derived. The apply store stages
+owned projection signals, committed-key notifications, and split/merge deltas
+while the write transaction is open, then publishes them only after the batch
+and applied watermark commit. Allocation failure or transaction abort discards
+the complete staged outcome. A command rejected by monotonic identity or phase
+fencing is a durable no-op and therefore emits no runtime delta; production
+listeners and deterministic simulations consume this same committed outcome
+instead of reconstructing effects from requested commands. Batch apply,
+snapshot installation, and synchronous listener dispatch share one serialized
+publication lane, so consumers observe durable projection changes in commit
+order. The normal production apply path does not clone transition records when
+no caller requests the committed delta list.
+
+Removing an active split or merge record is intentionally a no-op, not a
+cancellation protocol. Cancellation first commits rollback intent on the same
+transition identity, lets the transition owner restore source/receiver state,
+then commits the `rolled_back` terminal phase. Only a terminal record may be
+removed. Restart can therefore recover either an actionable rollback intent or
+a terminal record, never an absent active transition whose storage side effects
+remain live.
+
+Distributed split bootstrap uses an exact destination reservation keyed by
+transition identity, attempt epoch, byte range, and source delta sequence. A
+replayed begin for that same reservation is idempotent and cannot erase chunks
+written by another source-leader attempt. A newer sequence may replace an
+incomplete reservation and fences older writes; completion publishes only the
+exact reserved sequence. The source acknowledgement is proposed only after
+destination completion, so metadata cutover cannot authorize an empty or
+partially replaced destination generation.
+
 A source group created before data-Raft projection has no apply watermark yet.
 Its first split preparation seeds the source snapshot and a synthetic index-zero
 watermark in one DocStore batch under the per-group apply lock. Index zero is
@@ -1390,9 +1420,16 @@ Snapshot compaction is asynchronous, fair, bounded-memory maintenance:
   and replica startup fails closed when the referenced payload is missing,
   truncated, has the wrong identity, or fails checksum validation;
 - WAL/checkpoint state retains snapshot metadata but does not retain or encode a
-  second full copy of the document image. Checkpoint and delta format v3 makes
-  external payload ownership explicit; current readers accept only the exact
-  current version, with no compatibility decoders or inline-payload fallback.
+  second full copy of the document image. Snapshot payload ownership is
+  explicit; current readers accept only the exact current format, with no
+  compatibility decoders or inline-payload fallback. WAL Ready deltas remain
+  v3 because their record shape is unchanged.
+- the transferable state snapshot index and Raft log compaction boundary are
+  distinct durable identities. A snapshot captures the latest applied state,
+  while the boundary retains the configured trailing log window and its term
+  for incremental follower catch-up. Checkpoint v4 persists both identities;
+  restart reconstructs the applied watermark from the state snapshot and the
+  replication suffix from the compacted index and term.
 
 The data and metadata point-in-time views share the same worker contract, but
 metadata remains an in-memory payload because its bounded control-plane state is

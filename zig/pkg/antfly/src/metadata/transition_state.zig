@@ -483,7 +483,7 @@ test "transition state prefers observed local split readiness over metadata phas
         replica_root_dir,
         132,
         &[_]SplitTransitionRecord{.{
-            .transition_id = 1001,
+            .transition_id = 132,
             .attempt_epoch = 1,
             .source_group_id = 131,
             .destination_group_id = 132,
