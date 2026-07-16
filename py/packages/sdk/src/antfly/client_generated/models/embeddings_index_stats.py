@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from ..models.embeddings_index_stats_hbc_posting import EmbeddingsIndexStatsHbcPosting
     from ..models.embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
     from ..models.embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
+    from ..models.index_repair_status import IndexRepairStatus
 
 
 T = TypeVar("T", bound="EmbeddingsIndexStats")
@@ -34,6 +35,8 @@ class EmbeddingsIndexStats:
         total_nodes (int | Unset): Total number of nodes in the index (dense only)
         total_terms (int | Unset): Number of unique terms in the inverted index (sparse only)
         rebuilding (bool | Unset): Whether the index enricher is currently backfilling
+        repair (IndexRepairStatus | Unset): Compact user-facing state for an automatic index repair. Detailed
+            diagnostics are available from the admin API and metrics.
         wal_backlog (int | Unset): Number of documents pending enrichment in the WAL
         backfill_active (bool | Unset): Whether the index is actively rebuilding, replaying, enriching, or catching up.
         backfill_progress (float | Unset): Backfill progress as a ratio from 0.0 to 1.0
@@ -102,6 +105,7 @@ class EmbeddingsIndexStats:
     total_nodes: int | Unset = UNSET
     total_terms: int | Unset = UNSET
     rebuilding: bool | Unset = UNSET
+    repair: IndexRepairStatus | Unset = UNSET
     wal_backlog: int | Unset = UNSET
     backfill_active: bool | Unset = UNSET
     backfill_progress: float | Unset = UNSET
@@ -169,6 +173,10 @@ class EmbeddingsIndexStats:
         total_terms = self.total_terms
 
         rebuilding = self.rebuilding
+
+        repair: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.repair, Unset):
+            repair = self.repair.to_dict()
 
         wal_backlog = self.wal_backlog
 
@@ -305,6 +313,8 @@ class EmbeddingsIndexStats:
             field_dict["total_terms"] = total_terms
         if rebuilding is not UNSET:
             field_dict["rebuilding"] = rebuilding
+        if repair is not UNSET:
+            field_dict["repair"] = repair
         if wal_backlog is not UNSET:
             field_dict["wal_backlog"] = wal_backlog
         if backfill_active is not UNSET:
@@ -419,6 +429,7 @@ class EmbeddingsIndexStats:
         from ..models.embeddings_index_stats_hbc_posting import EmbeddingsIndexStatsHbcPosting
         from ..models.embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
         from ..models.embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
+        from ..models.index_repair_status import IndexRepairStatus
 
         d = dict(src_dict)
         index_type = EmbeddingsIndexStatsIndexType(d.pop("index_type"))
@@ -434,6 +445,13 @@ class EmbeddingsIndexStats:
         total_terms = d.pop("total_terms", UNSET)
 
         rebuilding = d.pop("rebuilding", UNSET)
+
+        _repair = d.pop("repair", UNSET)
+        repair: IndexRepairStatus | Unset
+        if isinstance(_repair, Unset):
+            repair = UNSET
+        else:
+            repair = IndexRepairStatus.from_dict(_repair)
 
         wal_backlog = d.pop("wal_backlog", UNSET)
 
@@ -580,6 +598,7 @@ class EmbeddingsIndexStats:
             total_nodes=total_nodes,
             total_terms=total_terms,
             rebuilding=rebuilding,
+            repair=repair,
             wal_backlog=wal_backlog,
             backfill_active=backfill_active,
             backfill_progress=backfill_progress,
