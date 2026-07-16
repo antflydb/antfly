@@ -12446,6 +12446,36 @@ func TestReconcileStandaloneStatefulSetMountsSecretStore(t *testing.T) {
 	}))
 }
 
+func TestReconcileStandaloneStatefulSetPersistsExtensionPackageStoreOnPVC(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := baseStandaloneControllerCluster()
+	client := newHAControllerTestClient(t, s, cluster)
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	sts := &appsv1.StatefulSet{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{
+		Name: cluster.Name + "-standalone", Namespace: cluster.Namespace,
+	}, sts)).To(Succeed())
+
+	g.Expect(sts.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{
+		Name:  "ANTFLY_EXTENSION_PACKAGE_STORE",
+		Value: "/antflydb/extensions",
+	}))
+	g.Expect(sts.Spec.Template.Spec.InitContainers).To(HaveLen(1))
+	initScript := sts.Spec.Template.Spec.InitContainers[0].Args[0]
+	g.Expect(initScript).To(ContainSubstring(`extension_store=/antflydb/extensions`))
+	g.Expect(initScript).To(ContainSubstring(`mkdir -p "$extension_store"`))
+	g.Expect(initScript).To(ContainSubstring(`chown -R 10001:10001 "$extension_store"`))
+	g.Expect(initScript).To(ContainSubstring(`chmod -R ug+rwX "$extension_store"`))
+}
+
 func TestReconcileStandaloneStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	g := NewWithT(t)
 
@@ -13022,6 +13052,9 @@ func TestReconcileSplitStatefulSetsMountSecretStore(t *testing.T) {
 			Name:  antflySecretStoreEnvVar,
 			Value: "/run/antfly/secrets/secrets.json",
 		}))
+		for _, env := range container.Env {
+			g.Expect(env.Name).NotTo(Equal("ANTFLY_EXTENSION_PACKAGE_STORE"))
+		}
 		g.Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
 			Name:      antflySecretStoreVolumeName,
 			MountPath: "/run/antfly/secrets",

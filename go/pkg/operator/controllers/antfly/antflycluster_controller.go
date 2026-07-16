@@ -89,10 +89,12 @@ const (
 	antflyRuntimeUID int64 = 10001
 	antflyRuntimeGID int64 = 10001
 
-	antflySecretStoreVolumeName  = "secret-store"
-	antflySecretStoreDefaultKey  = "secrets.json"
-	antflySecretStoreDefaultPath = "/run/antfly/secrets/secrets.json" // #nosec G101 -- file path, not a credential
-	antflySecretStoreEnvVar      = "ANTFLY_SECRET_STORE_PATH"         // #nosec G101 -- environment variable name, not a credential
+	antflySecretStoreVolumeName           = "secret-store"
+	antflySecretStoreDefaultKey           = "secrets.json"
+	antflySecretStoreDefaultPath          = "/run/antfly/secrets/secrets.json" // #nosec G101 -- file path, not a credential
+	antflySecretStoreEnvVar               = "ANTFLY_SECRET_STORE_PATH"         // #nosec G101 -- environment variable name, not a credential
+	antflyExtensionPackageStoreEnvVar     = "ANTFLY_EXTENSION_PACKAGE_STORE"
+	antflyStandaloneExtensionPackageStore = "/antflydb/extensions"
 
 	haPrimaryRouteTargetAnnotation          = "antfly.io/ha-primary-route-target"
 	haPrimaryRouteFenceAuthorityAnnotation  = "antfly.io/ha-primary-route-fence-authority"
@@ -3181,7 +3183,13 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 						Image:           cluster.Spec.Image,
 						ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
 						EnvFrom:         envFromSources,
-						Env:             append(append(append(secretStoreEnv(cluster.Spec.SecretStore), haRuntimeAdminTokenEnv(cluster.Spec.HighAvailability)...), haPodUIDEnv()...), haRuntimeLeaseEnv(cluster)...),
+						Env: append(
+							append(append(append(secretStoreEnv(cluster.Spec.SecretStore), haRuntimeAdminTokenEnv(cluster.Spec.HighAvailability)...), haPodUIDEnv()...), haRuntimeLeaseEnv(cluster)...),
+							corev1.EnvVar{
+								Name:  antflyExtensionPackageStoreEnvVar,
+								Value: antflyStandaloneExtensionPackageStore,
+							},
+						),
 						Ports: []corev1.ContainerPort{
 							{
 								Name:          "metadata-api",
@@ -3876,6 +3884,11 @@ while [ $timeout -gt 0 ]; do
             chown %d:%d /antflydb
             chmod ug+rwX /antflydb
         fi
+        extension_store=%s
+        echo "Preparing durable extension package store at $extension_store"
+        mkdir -p "$extension_store"
+        chown -R %d:%d "$extension_store"
+        chmod -R ug+rwX "$extension_store"
         exit 0
     fi
     echo "Waiting for PVC mount... ($timeout seconds remaining)"
@@ -3891,6 +3904,9 @@ exit 1
 			antflyRuntimeGID,
 			antflyRuntimeUID,
 			antflyRuntimeGID,
+			antflyRuntimeUID,
+			antflyRuntimeGID,
+			antflyStandaloneExtensionPackageStore,
 			antflyRuntimeUID,
 			antflyRuntimeGID,
 		)},
