@@ -1204,12 +1204,17 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		runtimeOwnedSeed := haStandbyUsesRuntimeOwnedSeedCapture(standby)
 		runtimeOwnedSeedTargetLSN := uint64(0)
 		runtimeOwnedSeedActivated := false
+		runtimeOwnedSeedInFlight := false
+		runtimeOwnedSeedLifecycleCompleted := false
 		if runtimeOwnedSeed {
 			runtimeOwnedSeedTargetLSN = haRuntimeOwnedSeedTargetLSN(status, standby, slotName)
+			runtimeOwnedSeedInFlight = runtimeOwnedSeedTargetLSN > 0
 			runtimeOwnedSeedActivated = observed.Active ||
 				haRuntimeOwnedSeedActivationCompleted(status, standby, slotName, runtimeOwnedSeedTargetLSN)
+			runtimeOwnedSeedLifecycleCompleted = haRuntimeOwnedSeedLifecycleCompleted(status, standby, slotName, runtimeOwnedSeedTargetLSN)
 		}
-		if !ok || (runtimeOwnedSeed && !runtimeOwnedSeedActivated) {
+		if !ok || (runtimeOwnedSeed && (!runtimeOwnedSeedActivated ||
+			(runtimeOwnedSeedInFlight && !runtimeOwnedSeedLifecycleCompleted))) {
 			plan.UnhealthyStandbyCount++
 			seedTargetLSN := initialStandbyLSN(standby, status.PrimaryLSN)
 			if runtimeOwnedSeed {
@@ -1543,6 +1548,32 @@ func haRuntimeOwnedSeedActivationCompleted(
 	}
 	for _, action := range status.PlannedActions {
 		if haActionKind(action.Kind) != haActionActivateSeededSlot ||
+			strings.TrimSpace(action.StandbyName) != strings.TrimSpace(standby.Name) ||
+			strings.TrimSpace(action.SlotName) != strings.TrimSpace(slotName) ||
+			action.TargetLSN != targetLSN ||
+			strings.TrimSpace(action.SeedArtifactGeneration) != generation {
+			continue
+		}
+		return haAdminActionSucceededWithEvidence(action)
+	}
+	return false
+}
+
+func haRuntimeOwnedSeedLifecycleCompleted(
+	status *antflyv1.HAStatus,
+	standby antflyv1.HAStandbySpec,
+	slotName string,
+	targetLSN uint64,
+) bool {
+	if status == nil || targetLSN == 0 || !haStandbyUsesRuntimeOwnedSeedCapture(standby) {
+		return false
+	}
+	generation := haSeedArtifactGeneration(standby, slotName, targetLSN)
+	if generation == "" {
+		return false
+	}
+	for _, action := range status.PlannedActions {
+		if haActionKind(action.Kind) != haActionPruneSeedArtifacts ||
 			strings.TrimSpace(action.StandbyName) != strings.TrimSpace(standby.Name) ||
 			strings.TrimSpace(action.SlotName) != strings.TrimSpace(slotName) ||
 			action.TargetLSN != targetLSN ||

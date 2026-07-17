@@ -903,6 +903,12 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 		"standalone-storage-" + cluster.Name + "-standalone-",
 		"swarm-storage-" + cluster.Name + "-swarm-",
 	}
+	startupTargetPVCName := ""
+	startupTargetPVCUID := ""
+	if gate := haRuntimeStartupGate(cluster); gate != nil && gate.RequiredReceipt != nil {
+		startupTargetPVCName = strings.TrimSpace(gate.RequiredReceipt.TargetPVCName)
+		startupTargetPVCUID = strings.TrimSpace(gate.RequiredReceipt.TargetPVCUID)
+	}
 	var pvcList corev1.PersistentVolumeClaimList
 	if err := r.List(ctx, &pvcList, client.InNamespace(cluster.Namespace)); err != nil {
 		return nil, fmt.Errorf("failed to list PVCs: %w", err)
@@ -910,11 +916,14 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 	cleanupPVCs := make([]*corev1.PersistentVolumeClaim, 0)
 	for i := range pvcList.Items {
 		pvc := &pvcList.Items[i]
-		if !hasAnyPrefix(pvc.Name, discoveredClaimPrefixes) && !hasAnyPrefix(pvc.Name, canonicalClaimPrefixes) {
+		if pvc.Name != startupTargetPVCName && !hasAnyPrefix(pvc.Name, discoveredClaimPrefixes) && !hasAnyPrefix(pvc.Name, canonicalClaimPrefixes) {
 			continue
 		}
 		if err := validatePVCOwnership(cluster, pvc); err != nil {
 			return nil, err
+		}
+		if pvc.Name == startupTargetPVCName && startupTargetPVCUID != "" && string(pvc.UID) != startupTargetPVCUID {
+			return nil, fmt.Errorf("refusing HA startup target PVC cleanup for %s/%s: expected UID %q, got %q", pvc.Namespace, pvc.Name, startupTargetPVCUID, pvc.UID)
 		}
 		cleanupPVCs = append(cleanupPVCs, pvc)
 	}
@@ -3095,6 +3104,11 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 	var startupPVC *corev1.PersistentVolumeClaim
 	if startupGate != nil {
 		if activatedSeedGate {
+			if migrated, err := r.reconcileLegacyStandaloneStatefulSetStartupGate(ctx, cluster); err != nil {
+				return err
+			} else if migrated {
+				return nil
+			}
 			var err error
 			startupPVC, err = r.reconcileHAStartupTargetPVC(ctx, cluster, storageSize)
 			if err != nil {
@@ -3109,13 +3123,6 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 			if held, err := r.reconcileSuspendedStandaloneStatefulSet(ctx, cluster); err != nil {
 				return err
 			} else if held {
-				return nil
-			}
-		}
-		if activatedSeedGate {
-			if migrated, err := r.reconcileLegacyStandaloneStatefulSetStartupGate(ctx, cluster); err != nil {
-				return err
-			} else if migrated {
 				return nil
 			}
 		}
@@ -10859,15 +10866,15 @@ func (r *AntflyClusterReconciler) bindHAAdminJobToPVCConsumer(ctx context.Contex
 		slices.Contains(pvc.Spec.AccessModes, corev1.ReadOnlyMany)
 	readWriteOncePod := slices.Contains(pvc.Spec.AccessModes, corev1.ReadWriteOncePod)
 	readWriteOnce := slices.Contains(pvc.Spec.AccessModes, corev1.ReadWriteOnce)
-	if multiNode {
-		return nil
-	}
-	if !readWriteOnce && !readWriteOncePod {
-		return fmt.Errorf("PVC %s for HA admin Job %s has no supported access mode", claimName, job.Name)
-	}
 	actionKind := haActionKind(strings.TrimSpace(job.Annotations["antfly.io/ha-action-kind"]))
 	isPublishSource := actionKind == haActionPublishSeedArtifact || actionKind == haActionGCSourceSeedGenerations
 	isGatedTarget := actionKind == haActionRestoreSeedArtifact || actionKind == haActionActivateSeedArtifact || actionKind == haActionGCTargetSeedGenerations
+	if multiNode && !isGatedTarget {
+		return nil
+	}
+	if !multiNode && !readWriteOnce && !readWriteOncePod {
+		return fmt.Errorf("PVC %s for HA admin Job %s has no supported access mode", claimName, job.Name)
+	}
 
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods, client.InNamespace(job.Namespace)); err != nil {

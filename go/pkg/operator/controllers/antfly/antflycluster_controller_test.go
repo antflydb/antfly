@@ -138,6 +138,34 @@ func TestCleanupDeletesUIDBoundPVCFromOwnedStatefulSet(t *testing.T) {
 	}
 }
 
+func TestCleanupDeletesExactUIDBoundHAStartupTargetPVC(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cluster := startupGatedStandaloneControllerCluster(false)
+	cluster.UID = types.UID("cluster-uid")
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "standby-a-data", Namespace: "default", UID: types.UID("pvc-uid-1"),
+		Labels: map[string]string{
+			"app.kubernetes.io/instance": cluster.Name,
+			labelClusterUID:              string(cluster.UID),
+		},
+	}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, pvc).Build()
+	reconciler := &AntflyClusterReconciler{Client: client}
+	result, err := reconciler.cleanupStorageResources(context.Background(), cluster)
+	if err != nil || result != nil {
+		t.Fatalf("cleanup failed: result=%v err=%v", result, err)
+	}
+	err = client.Get(context.Background(), types.NamespacedName{Name: pvc.Name, Namespace: pvc.Namespace}, &corev1.PersistentVolumeClaim{})
+	if !errors.IsNotFound(err) {
+		t.Fatalf("expected exact HA startup target PVC to be deleted, got %v", err)
+	}
+}
+
 func TestCleanupDoesNotDeleteUnownedCanonicalNameStatefulSet(t *testing.T) {
 	scheme := runtime.NewScheme()
 	for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
@@ -5183,6 +5211,17 @@ func TestPortableArtifactJobHonorsPVCExclusivityAndConsumerLifecycle(t *testing.
 		g.Expect(corev1.AddToScheme(s)).To(Succeed())
 		r := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(
 			newPVC(corev1.ReadWriteOnce), newConsumer("standby-0"),
+		).Build()}
+		err := r.bindHAAdminJobToPVCConsumer(context.Background(), newJob(haActionRestoreSeedArtifact))
+		g.Expect(err).To(MatchError(ContainSubstring("refusing HA restore/activation")))
+	})
+
+	t.Run("RWX target restore still refuses a live consumer", func(t *testing.T) {
+		g := NewWithT(t)
+		s := runtime.NewScheme()
+		g.Expect(corev1.AddToScheme(s)).To(Succeed())
+		r := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(
+			newPVC(corev1.ReadWriteMany), newConsumer("standby-0"),
 		).Build()}
 		err := r.bindHAAdminJobToPVCConsumer(context.Background(), newJob(haActionRestoreSeedArtifact))
 		g.Expect(err).To(MatchError(ContainSubstring("refusing HA restore/activation")))
@@ -12866,7 +12905,7 @@ func TestReconcileStandaloneStatefulSetStartupGateSuspendsLegacyControllerBefore
 	g.Expect(observed.Spec.VolumeClaimTemplates).To(HaveLen(1))
 
 	pvc := &corev1.PersistentVolumeClaim{}
-	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "standby-a-data", Namespace: "default"}, pvc)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "standby-a-data", Namespace: "default"}, pvc)).To(MatchError(ContainSubstring("not found")))
 }
 
 func TestReconcileStandaloneStatefulSetStartupGateRequiresExactObservedReceipt(t *testing.T) {

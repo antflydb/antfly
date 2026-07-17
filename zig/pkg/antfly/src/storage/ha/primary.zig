@@ -251,6 +251,7 @@ pub const Primary = struct {
             if (state.timeline_id != self.identity.timeline_id) return error.WrongTimeline;
             if (!state.reseed_required) {
                 if (try self.existingBaseBackupStart(request, state)) |existing| return existing;
+                if (try self.recoverOrphanedBaseBackupStart(request, state)) |recovered| return recovered;
                 if (state.lifecycle == .seeding or state.active) return error.BaseBackupSlotInUse;
             }
         }
@@ -629,6 +630,29 @@ pub const Primary = struct {
             .manifest_id = request.manifest_id,
             .backup_lsn = start.backup_lsn,
             .start_record_lsn = entry.wal_lsn,
+        };
+    }
+
+    fn recoverOrphanedBaseBackupStart(self: *Primary, request: BaseBackupStart, state: slot_store.SlotState) !?BaseBackupStartResult {
+        const previous_lsn = self.lastLsn();
+        if (state.lifecycle != .seeding or state.active or state.reseed_required or
+            state.restart_lsn != previous_lsn +| 1 or
+            state.received_lsn != previous_lsn or state.applied_lsn != previous_lsn or state.safe_read_lsn != previous_lsn)
+            return null;
+
+        const payload = try backupStartPayload(self.alloc, self.identity, request.slot_name, request.manifest_id, state.restart_lsn);
+        defer self.alloc.free(payload);
+        const start_lsn = try self.append(.{
+            .kind = .backup_start,
+            .payload_codec = .json,
+            .payload = payload,
+        });
+        if (start_lsn != state.restart_lsn) return error.BackupStartMismatch;
+        return .{
+            .slot_name = request.slot_name,
+            .manifest_id = request.manifest_id,
+            .backup_lsn = state.restart_lsn,
+            .start_record_lsn = start_lsn,
         };
     }
 
@@ -1125,6 +1149,31 @@ test "storage.ha primary begins base backup with slot retention pin" {
     defer entry.deinit(alloc);
     try std.testing.expectEqual(replication_record.RecordKind.backup_start, entry.record.kind);
     try std.testing.expect(std.mem.indexOf(u8, entry.record.payload, "\"manifest_id\":\"manifest-1\"") != null);
+}
+
+test "storage.ha primary recovers reservation durable before backup start" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "backup-start-orphan");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "before-backup" });
+    try primary.reserveBaseBackupSlot("standby-a", 2, 1);
+
+    const recovered = try primary.beginBaseBackup(.{
+        .slot_name = "standby-a",
+        .manifest_id = "manifest-1",
+    });
+    try std.testing.expectEqual(@as(u64, 2), recovered.backup_lsn);
+    try std.testing.expectEqual(@as(u64, 2), recovered.start_record_lsn);
+    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+    const retried = try primary.beginBaseBackup(.{
+        .slot_name = "standby-a",
+        .manifest_id = "manifest-1",
+    });
+    try std.testing.expectEqual(recovered.backup_lsn, retried.backup_lsn);
 }
 
 test "storage.ha primary retention cap can expire an inactive seeding slot" {

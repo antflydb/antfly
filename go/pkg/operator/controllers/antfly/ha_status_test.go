@@ -1629,7 +1629,7 @@ func TestPlanHAInitialPortableSeedIgnoresSyntheticStandbyStatusUntilPrimarySlotO
 		}
 	})
 
-	t.Run("completed slot activation evidence permits an inactive slot to resume", func(t *testing.T) {
+	t.Run("completed slot activation retains cleanup tail before an inactive slot resumes", func(t *testing.T) {
 		cluster := newCluster(0)
 		(&AntflyClusterReconciler{}).updateHAStatusAndConditions(cluster)
 		activate := &cluster.Status.HAStatus.PlannedActions[5]
@@ -1654,8 +1654,22 @@ func TestPlanHAInitialPortableSeedIgnoresSyntheticStandbyStatusUntilPrimarySlotO
 		}
 		cluster.Status.HAStatus.Standbys[0].TimelineID = 4
 		plan := planHA(cluster)
+		if len(plan.Actions) != 8 || plan.Actions[6].Kind != haActionGCTargetSeedGenerations || plan.Actions[7].Kind != haActionPruneSeedArtifacts {
+			t.Fatalf("expected completed activation to retain target GC and prune tail, got %#v", plan.Actions)
+		}
+
+		prune := &cluster.Status.HAStatus.PlannedActions[7]
+		prune.AdminJobPhase = haAdminJobPhaseSucceeded
+		prune.SeedArtifactReceipt = &antflyv1.HASeedArtifactReceiptStatus{
+			FormatVersion: 1,
+			Generation:    prune.SeedArtifactGeneration,
+			SlotName:      prune.SlotName,
+			RetainedCount: 1,
+			DeletedCount:  0,
+		}
+		plan = planHA(cluster)
 		if len(plan.Actions) != 1 || plan.Actions[0].Kind != haActionResumeSlot {
-			t.Fatalf("expected a validated activated slot to resume, got %#v", plan.Actions)
+			t.Fatalf("expected a fully cleaned activated slot to resume, got %#v", plan.Actions)
 		}
 	})
 }

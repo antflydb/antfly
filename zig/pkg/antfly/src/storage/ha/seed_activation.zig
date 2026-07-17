@@ -418,25 +418,30 @@ fn activateMaterializedWithOptions(alloc: Allocator, request: ActivateRequest, o
     const active_path = try std.fs.path.join(alloc, &.{ request.target_root, active_receipt_name });
     defer alloc.free(active_path);
 
+    var replace_active = false;
     if (readOptionalFileAlloc(io, alloc, active_path, request.limits.max_receipt_bytes)) |existing_active| {
         defer alloc.free(existing_active);
-        try validateMaterializedActive(
-            alloc,
-            existing_active,
-            request,
-            &seed_receipt_sha256,
-            capture_receipt_sha256,
-            raw_relative_path,
-            live_relative_path,
-            raw_root,
-            live_root,
-        );
-        try recordLifecycleReceipt(alloc, request, existing_active);
-        return .{
-            .generation_path = try alloc.dupe(u8, live_root),
-            .active_receipt_json = try alloc.dupe(u8, existing_active),
-            .already_active = true,
-        };
+        if (activeReceiptGenerationMatches(alloc, existing_active, request.expected.generation)) {
+            try validateMaterializedActive(
+                alloc,
+                existing_active,
+                request,
+                &seed_receipt_sha256,
+                capture_receipt_sha256,
+                raw_relative_path,
+                live_relative_path,
+                raw_root,
+                live_root,
+            );
+            try recordLifecycleReceipt(alloc, request, existing_active);
+            return .{
+                .generation_path = try alloc.dupe(u8, live_root),
+                .active_receipt_json = try alloc.dupe(u8, existing_active),
+                .already_active = true,
+            };
+        }
+        try validateMaterializedHandoffAuthority(alloc, existing_active, request);
+        replace_active = true;
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
@@ -456,7 +461,7 @@ fn activateMaterializedWithOptions(alloc: Allocator, request: ActivateRequest, o
     defer alloc.free(raw_installing_name);
     const raw_installing_root = try std.fs.path.join(alloc, &.{ raw_generations_root, raw_installing_name });
     defer alloc.free(raw_installing_root);
-    try inspectGenerationsRoot(io, raw_generations_root, request.expected.generation, raw_installing_name);
+    try inspectGenerationsRoot(io, raw_generations_root, raw_installing_name);
 
     const raw_marker_json = try std.json.Stringify.valueAlloc(alloc, RawGenerationReceipt{
         .generation = request.expected.generation,
@@ -505,7 +510,7 @@ fn activateMaterializedWithOptions(alloc: Allocator, request: ActivateRequest, o
     defer alloc.free(live_installing_name);
     const live_installing_root = try std.fs.path.join(alloc, &.{ live_generations_root, live_installing_name });
     defer alloc.free(live_installing_root);
-    try inspectGenerationsRoot(io, live_generations_root, request.expected.generation, live_installing_name);
+    try inspectGenerationsRoot(io, live_generations_root, live_installing_name);
 
     var evidence: seed_materialization.PublishedEvidence = undefined;
     var evidence_owned = false;
@@ -568,7 +573,10 @@ fn activateMaterializedWithOptions(alloc: Allocator, request: ActivateRequest, o
         .target_pvc_uid = binding.target_pvc_uid,
     }, .{});
     errdefer alloc.free(activation_json);
-    const active_created = try writeImmutableFile(io, alloc, active_path, activation_json, error.ActiveGenerationConflict);
+    const active_created = if (replace_active)
+        try replaceActiveFile(io, alloc, active_path, activation_json, request)
+    else
+        try writeImmutableFile(io, alloc, active_path, activation_json, error.ActiveGenerationConflict);
     try failAt(options, .active_published);
     try recordLifecycleReceipt(alloc, request, activation_json);
     return .{
@@ -627,6 +635,36 @@ fn validateMaterializedActive(
         request.expected.generation,
         receipt.materialized_receipt_sha256,
     );
+}
+
+fn activeReceiptGenerationMatches(alloc: Allocator, raw: []const u8, generation: []const u8) bool {
+    var parsed = std.json.parseFromSlice(ActivationReceipt, alloc, raw, .{ .ignore_unknown_fields = false }) catch return false;
+    defer parsed.deinit();
+    return std.mem.eql(u8, parsed.value.generation, generation);
+}
+
+fn validateMaterializedHandoffAuthority(alloc: Allocator, raw: []const u8, request: ActivateRequest) !void {
+    var parsed = std.json.parseFromSlice(ActivationReceipt, alloc, raw, .{ .ignore_unknown_fields = false }) catch
+        return error.InvalidActiveReceipt;
+    defer parsed.deinit();
+    const current = parsed.value;
+    const binding = request.binding orelse return error.ActivationBindingMissing;
+    const target = request.materialization orelse return error.MaterializationTargetMissing;
+    if (current.format_version != format_version or
+        !std.mem.eql(u8, current.slot_name, request.expected.slot_name) or
+        current.cluster_id != request.expected.identity.cluster_id or
+        current.shard_id != request.expected.identity.shard_id or
+        current.table_id != request.expected.identity.table_id or
+        current.timeline_id != request.expected.identity.timeline_id or
+        current.epoch != request.expected.identity.epoch or
+        !std.mem.eql(u8, current.topology_id, binding.topology_id) or
+        current.topology_generation >= binding.topology_generation or
+        !std.mem.eql(u8, current.node_id, binding.node_id) or
+        !std.mem.eql(u8, current.target_pvc_name, binding.target_pvc_name) or
+        !std.mem.eql(u8, current.target_pvc_uid, binding.target_pvc_uid) or
+        current.target_local_node_id != target.target_local_node_id or
+        current.target_replica_id != target.target_replica_id)
+        return error.ActiveGenerationConflict;
 }
 
 fn rawMarkerForActiveAlloc(alloc: Allocator, receipt: ActivationReceipt) ![]u8 {
@@ -746,7 +784,7 @@ fn activateWithOptions(alloc: Allocator, request: ActivateRequest, options: Acti
             capture_receipt_sha256,
             generation_relative_path,
         );
-        try inspectGenerationsRoot(io, generations_root, request.expected.generation, installing_name);
+        try inspectGenerationsRoot(io, generations_root, installing_name);
         try validatePublishedGeneration(alloc, generation_path, request, activation_json);
         try recordLifecycleReceipt(alloc, request, existing_active);
         const active_receipt_copy = try alloc.dupe(u8, existing_active);
@@ -764,7 +802,7 @@ fn activateWithOptions(alloc: Allocator, request: ActivateRequest, options: Acti
     try fs_paths.createDirPathPortable(io, request.target_root);
     try fs_paths.createDirPathPortable(io, generations_root);
     try fs_paths.syncDirPortable(io, request.target_root);
-    try inspectGenerationsRoot(io, generations_root, request.expected.generation, installing_name);
+    try inspectGenerationsRoot(io, generations_root, installing_name);
 
     if (try directoryExists(io, generation_path)) {
         try validatePublishedGeneration(alloc, generation_path, request, activation_json);
@@ -888,7 +926,7 @@ fn inspectTargetRoot(io: std.Io, target_root: []const u8) !void {
     }
 }
 
-fn inspectGenerationsRoot(io: std.Io, generations_root: []const u8, generation: []const u8, installing_name: []const u8) !void {
+fn inspectGenerationsRoot(io: std.Io, generations_root: []const u8, installing_name: []const u8) !void {
     var dir = std.Io.Dir.cwd().openDir(io, generations_root, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         error.NotDir => return error.UnsafeActivationTarget,
@@ -898,7 +936,7 @@ fn inspectGenerationsRoot(io: std.Io, generations_root: []const u8, generation: 
     var iterator = dir.iterateAssumeFirstIteration();
     while (try iterator.next(io)) |entry| {
         if (entry.kind != .directory) return error.UnsafeActivationTarget;
-        if (std.mem.eql(u8, entry.name, generation) or std.mem.eql(u8, entry.name, installing_name)) continue;
+        if (std.mem.eql(u8, entry.name, installing_name) or validation.isIdentifier(entry.name)) continue;
         return error.UnsafeActivationTarget;
     }
 }
@@ -1157,6 +1195,24 @@ fn writeImmutableFile(io: std.Io, alloc: Allocator, path: []const u8, body: []co
     };
     const parent = std.fs.path.dirname(path) orelse return error.InvalidActivationPath;
     try fs_paths.syncDirPortable(io, parent);
+    return true;
+}
+
+fn replaceActiveFile(io: std.Io, alloc: Allocator, path: []const u8, body: []const u8, request: ActivateRequest) !bool {
+    const current = try readFileAlloc(io, alloc, path, request.limits.max_receipt_bytes);
+    defer alloc.free(current);
+    if (std.mem.eql(u8, current, body)) return false;
+    try validateMaterializedHandoffAuthority(alloc, current, request);
+
+    var atomic_file = try std.Io.Dir.cwd().createFileAtomic(io, path, .{
+        .make_path = false,
+        .replace = true,
+    });
+    defer atomic_file.deinit(io);
+    try atomic_file.file.writeStreamingAll(io, body);
+    try atomic_file.file.sync(io);
+    try atomic_file.replace(io);
+    try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse return error.InvalidActivationPath);
     return true;
 }
 
@@ -2063,6 +2119,78 @@ test "storage.ha seed activation rejects cross-identity and conflicting generati
             .identity = testIdentity(),
         },
     }));
+}
+
+test "storage.ha materialized activation advances the same target authority monotonically" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const target_root = try std.fs.path.join(alloc, &.{ root, "target-handoff" });
+    defer alloc.free(target_root);
+    const binding_a = ActivationBinding{
+        .topology_id = "topology-a",
+        .topology_generation = 3,
+        .node_id = "standby-a",
+        .target_pvc_name = "standby-a-data",
+        .target_pvc_uid = "pvc-uid-1",
+    };
+    var binding_b = binding_a;
+    binding_b.topology_generation = 4;
+    const prepared_a = try prepareMaterializedTestStaging(alloc, root, "gen-a", testIdentity(), binding_a);
+    defer alloc.free(prepared_a.root);
+    const prepared_b = try prepareMaterializedTestStaging(alloc, root, "gen-b", testIdentity(), binding_b);
+    defer alloc.free(prepared_b.root);
+
+    const request_a = ActivateRequest{
+        .staging_root = prepared_a.root,
+        .target_root = target_root,
+        .expected = .{
+            .generation = "gen-a",
+            .slot_name = "standby-a",
+            .identity = testIdentity(),
+            .minimum_checkpoint_lsn = 11,
+            .binding = binding_a,
+            .capture_receipt_sha256 = &prepared_a.capture_receipt_sha256,
+        },
+        .binding = binding_a,
+        .materialization = .{ .target_local_node_id = 7, .target_replica_id = 1 },
+    };
+    var first = try activate(alloc, request_a);
+    defer first.deinit(alloc);
+
+    const request_b = ActivateRequest{
+        .staging_root = prepared_b.root,
+        .target_root = target_root,
+        .expected = .{
+            .generation = "gen-b",
+            .slot_name = "standby-a",
+            .identity = testIdentity(),
+            .minimum_checkpoint_lsn = 11,
+            .binding = binding_b,
+            .capture_receipt_sha256 = &prepared_b.capture_receipt_sha256,
+        },
+        .binding = binding_b,
+        .materialization = .{ .target_local_node_id = 7, .target_replica_id = 1 },
+    };
+    var second = try activate(alloc, request_b);
+    defer second.deinit(alloc);
+    try std.testing.expect(!second.already_active);
+    var active = try std.json.parseFromSlice(ActivationReceipt, alloc, second.active_receipt_json, .{});
+    defer active.deinit();
+    try std.testing.expectEqualStrings("gen-b", active.value.generation);
+    try std.testing.expectEqual(@as(u64, 4), active.value.topology_generation);
+
+    var ledger = try lifecycle_receipt_ledger.Ledger.open(alloc, target_root, .{});
+    defer ledger.close();
+    var page = try ledger.readPage(alloc, .activation, .{ .limit = 10 }, .{ .authoritative_root = target_root });
+    defer page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), page.entries.len);
+    try std.testing.expectEqual(lifecycle_receipt_ledger.AuthoritativeState.missing, page.entries[0].authoritative_state);
+    try std.testing.expectEqual(lifecycle_receipt_ledger.AuthoritativeState.retained, page.entries[1].authoritative_state);
+
+    try std.testing.expectError(error.ActiveGenerationConflict, activate(alloc, request_a));
 }
 
 test "storage.ha seed activation recovers each publication crash boundary" {

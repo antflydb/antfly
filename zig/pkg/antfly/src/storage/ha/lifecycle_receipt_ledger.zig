@@ -504,7 +504,7 @@ fn ownedEntry(alloc: Allocator, cursor: u64, event: StoredEvent, authoritative_r
 fn authoritativeState(alloc: Allocator, root: []const u8, event: StoredEvent) !AuthoritativeState {
     const path = switch (event.kind) {
         .capture => try std.fs.path.join(alloc, &.{ root, "generations", event.generation, "COMPLETE.json" }),
-        .activation => try std.fs.path.join(alloc, &.{ root, "generations", event.generation, ".antfly-ha-active-generation.json" }),
+        .activation => try std.fs.path.join(alloc, &.{ root, "ACTIVE.json" }),
     };
     defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -514,7 +514,22 @@ fn authoritativeState(alloc: Allocator, root: []const u8, event: StoredEvent) !A
         else => return err,
     };
     defer alloc.free(raw);
-    if (!std.mem.eql(u8, raw, event.receipt_json)) return error.AuthoritativeLifecycleReceiptMismatch;
+    if (!std.mem.eql(u8, raw, event.receipt_json)) {
+        if (event.kind == .activation) {
+            var current = std.json.parseFromSlice(ActivationReceipt, alloc, raw, .{ .ignore_unknown_fields = false }) catch
+                return error.AuthoritativeLifecycleReceiptMismatch;
+            defer current.deinit();
+            validateActivationReceipt(current.value) catch return error.AuthoritativeLifecycleReceiptMismatch;
+            if (std.mem.eql(u8, current.value.slot_name, event.slot_name) and
+                std.mem.eql(u8, current.value.topology_id, event.topology_id) and
+                current.value.topology_generation > event.topology_generation and
+                std.mem.eql(u8, current.value.node_id, event.node_id) and
+                std.mem.eql(u8, current.value.target_pvc_name, event.target_pvc_name) and
+                std.mem.eql(u8, current.value.target_pvc_uid, event.target_pvc_uid))
+                return .missing;
+        }
+        return error.AuthoritativeLifecycleReceiptMismatch;
+    }
     return .retained;
 }
 
