@@ -887,10 +887,13 @@ def test_stateful_managed_embeddings_status_reports_partial_retrying_backfill_af
     assert partial["backfill_state"] == "retrying"
     assert partial["backfill_active"] is True
     assert partial["backfill_progress"] < 1.0
-    # The managed replay ledger is already current; retrying enrichment is a
-    # separate stage and must not manufacture index replay debt.
-    assert partial["replay_applied_sequence"] == partial["replay_target_sequence"]
-    assert partial["replay_catch_up_required"] is False
+    # Enrichment can become visibly retrying either just before or just after
+    # the real managed replay ledger catches up. The public replay flag must
+    # describe that ledger exactly rather than manufacture enrichment debt.
+    replay_applied = partial["replay_applied_sequence"]
+    replay_target = partial["replay_target_sequence"]
+    assert replay_applied <= replay_target
+    assert partial["replay_catch_up_required"] is (replay_applied < replay_target)
 
     enrichment = partial["enrichment_runtime"]
     assert enrichment["error_count"] >= 1
