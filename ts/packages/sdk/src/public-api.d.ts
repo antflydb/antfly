@@ -12738,6 +12738,7 @@ export interface operations {
             header?: never;
             path: {
                 connection_id: string;
+                /** @description Requires the connection capability `models.<operation>`. */
                 operation: "embed" | "generate" | "rerank" | "chunk" | "recognize" | "extract" | "rewrite" | "read" | "transcribe";
             };
             cookie?: never;
@@ -12770,6 +12771,13 @@ export interface operations {
             };
             /** @description Unauthorized - authentication required */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The connection does not declare the capability required by this operation */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
