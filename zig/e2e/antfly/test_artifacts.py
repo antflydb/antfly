@@ -484,6 +484,10 @@ def test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e(
         if any(image["kind"] == "png" for image in request["images"])
     ]
     assert png_requests
+    assert any(
+        sum(image["kind"] == "png" for image in request["images"]) > 1
+        for request in png_requests
+    ), reader_stats
     assert all(request["prompt"] == "<OCR>" for request in png_requests)
     assert all(
         "Render tables as Markdown" not in request["prompt"] for request in png_requests
