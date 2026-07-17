@@ -526,6 +526,72 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	return nil
 }
 
+// renewCurrentHAFencingLease advances only an unchanged current holder. It is
+// intentionally narrower than reconcileHAFencingLease: topology handoff,
+// bootstrap, and scope changes remain owned by the main cluster reconciler.
+// A dedicated controller calls this path so renewal scheduling is not queued
+// behind seed-capture reconciliation work. The runtime proof endpoint must
+// still remain responsive independently of the capture critical section.
+func (r *AntflyClusterReconciler) renewCurrentHAFencingLease(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	if cluster == nil || cluster.Spec.HighAvailability == nil || cluster.Status.HAStatus == nil {
+		return nil
+	}
+	ha := cluster.Spec.HighAvailability
+	if ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled || ha.Runtime == nil ||
+		ha.AutomaticFailover == nil || !ha.AutomaticFailover.Enabled ||
+		!haAutomaticFailoverExecutionEnabled(ha) ||
+		ha.AutomaticFailover.FencingAuthority != antflyv1.HAFencingAuthorityKubernetesLease {
+		return nil
+	}
+	localNodeID := strings.TrimSpace(ha.Runtime.NodeID)
+	if localNodeID == "" {
+		return nil
+	}
+
+	lease := &coordinationv1.Lease{}
+	if err := r.haBoundaryReader().Get(ctx, types.NamespacedName{
+		Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace,
+	}, lease); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if lease.Spec.HolderIdentity == nil || strings.TrimSpace(*lease.Spec.HolderIdentity) != localNodeID ||
+		lease.Spec.LeaseTransitions == nil || *lease.Spec.LeaseTransitions <= 0 || lease.Spec.RenewTime == nil ||
+		lease.Annotations[haFencingLeaseAnnotationTopologyID] != haFencingLeaseTopologyID(cluster) {
+		return nil
+	}
+	identity := haReplicationIdentity(ha)
+	if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) != localNodeID {
+		return nil
+	}
+	identityScope := haFencingLeaseScopeForIdentity(identity, 0)
+	for key, value := range identityScope.annotations() {
+		if key == haFencingLeaseAnnotationPrimaryLSN {
+			continue
+		}
+		if lease.Annotations[key] != value {
+			return nil
+		}
+	}
+
+	ready, err := r.haCurrentPrimaryRuntimeWatchdogReady(
+		ctx,
+		cluster,
+		localNodeID,
+		uint64(*lease.Spec.LeaseTransitions),
+		lease.Spec.RenewTime.Time,
+		true,
+	)
+	if err != nil || !ready {
+		return err
+	}
+	now := metav1.NewMicroTime(r.haNow())
+	lease.Spec.RenewTime = &now
+	return r.Update(ctx, lease)
+}
+
 func haFencingLeaseBootstrapReceipt(holder string, transition int32, processBootID string) string {
 	return fmt.Sprintf("%s:%d:%s", strings.TrimSpace(holder), transition, strings.TrimSpace(processBootID))
 }

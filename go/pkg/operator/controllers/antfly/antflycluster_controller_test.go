@@ -8000,6 +8000,12 @@ func TestParseHASeedArtifactReceiptRequiresMatchingTypedEvidence(t *testing.T) {
 	action.SeedArtifactReceipt = receipt
 	g.Expect(haAdminActionSucceededWithEvidence(action)).To(BeTrue())
 
+	// The Zig artifact CLI emits the complete per-file and per-chunk receipt.
+	// Keep strict unknown-field decoding, but model the actual cross-language
+	// wire contract rather than accepting only the older path-only fixture.
+	completeBody := fmt.Sprintf(`{"format_version":1,"generation":"seed-standby-a-10","slot_name":"standby-a","cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":4,"epoch":6,"manifest_id":"base-standby-a-10","backup_lsn":10,"checkpoint_lsn":12,"manifest_sha256":"%s","aggregate_sha256":"%s","total_bytes":42,"files":[{"path":"catalog/manifest","size_bytes":42,"crc32":1234,"sha256":"%s","chunks":[{"index":0,"size_bytes":42,"sha256":"%s"}]}]}`, strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64), strings.Repeat("d", 64))
+	g.Expect(parseHASeedArtifactReceipt(completeBody, action)).NotTo(BeNil())
+
 	wrongGeneration := strings.Replace(body, "seed-standby-a-10", "seed-standby-a-9", 1)
 	g.Expect(parseHASeedArtifactReceipt(wrongGeneration, action)).To(BeNil())
 

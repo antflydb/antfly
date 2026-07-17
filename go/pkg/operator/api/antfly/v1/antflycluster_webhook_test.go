@@ -2122,6 +2122,10 @@ func TestValidateCreate_HighAvailabilityAllowsPortableSeedArtifact(t *testing.T)
 				Location:             "s3://ha-seeds/cluster-a",
 				GenerationPrefix:     "prod",
 				StagingRoot:          "/antflydb/seed/staging",
+				TopologyID:           "cluster-a",
+				TopologyGeneration:   1,
+				NodeID:               "standby-a",
+				TargetPVCUID:         "standby-pvc-uid",
 				CredentialsSecretRef: &corev1.LocalObjectReference{Name: "ha-seed-credentials"},
 				RetainGenerations:    2,
 				SourcePVC:            &HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/antflydb/seed"},
@@ -2132,6 +2136,47 @@ func TestValidateCreate_HighAvailabilityAllowsPortableSeedArtifact(t *testing.T)
 
 	if err := cluster.ValidateCreate(); err != nil {
 		t.Fatalf("expected portable seed artifact configuration to be valid, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsNonExecutablePortableSeedArtifact(t *testing.T) {
+	base := baseStandaloneCluster()
+	base.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID: 100, TimelineID: 1, Epoch: 1, CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{Role: HARuntimeRolePrimary, NodeID: "primary-a"},
+		Standbys: []HAStandbySpec{{
+			Name: "standby-a", SeedManifestPath: "/source/manifest.afha", SeedContentRoot: "/source/content",
+			SeedArtifact: &HASeedArtifactSpec{
+				Location: "s3://ha-seeds/cluster-a", StagingRoot: "/target/staging",
+				TopologyID: "cluster-a", TopologyGeneration: 1, NodeID: "standby-a", TargetPVCUID: "target-pvc-uid",
+				SourcePVC: &HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+				TargetPVC: &HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+			},
+		}},
+	}
+	if err := base.ValidateCreate(); err != nil {
+		t.Fatalf("valid executable seed fixture: %v", err)
+	}
+
+	tests := map[string]func(*HASeedArtifactSpec){
+		"topology id":         func(a *HASeedArtifactSpec) { a.TopologyID = "" },
+		"topology generation": func(a *HASeedArtifactSpec) { a.TopologyGeneration = 0 },
+		"node id":             func(a *HASeedArtifactSpec) { a.NodeID = "" },
+		"target pvc uid":      func(a *HASeedArtifactSpec) { a.TargetPVCUID = "" },
+		"source pvc":          func(a *HASeedArtifactSpec) { a.SourcePVC = nil },
+		"target pvc":          func(a *HASeedArtifactSpec) { a.TargetPVC = nil },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			cluster := base.DeepCopy()
+			mutate(cluster.Spec.HighAvailability.Standbys[0].SeedArtifact)
+			if err := cluster.ValidateCreate(); err == nil {
+				t.Fatal("expected incomplete portable seed artifact to be rejected")
+			}
+		})
 	}
 }
 
@@ -2151,8 +2196,9 @@ func TestValidateCreate_HighAvailabilityAllowsRuntimeOwnedSeedCapture(t *testing
 			SeedArtifact: &HASeedArtifactSpec{
 				Location:    "s3://ha-seeds/cluster-a",
 				StagingRoot: "/target/.antfly-ha/staging",
-				SourcePVC:   &HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/antflydb"},
-				TargetPVC:   &HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+				TopologyID:  "cluster-a", TopologyGeneration: 1, NodeID: "standby-a", TargetPVCUID: "standby-pvc-uid",
+				SourcePVC: &HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/antflydb"},
+				TargetPVC: &HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
 			},
 		}},
 	}
@@ -2178,7 +2224,7 @@ func TestValidateCreate_HighAvailabilityAllowsExactActivatedSeedStartupGate(t *t
 				ReceiptMatchPolicy: HAReceiptMatchPolicyExact,
 				RequiredReceipt: &HARequiredSeedActivationReceipt{
 					TopologyID: "test-standalone-cluster", TopologyGeneration: 3, NodeID: "standby-a", SlotName: "standby-a",
-					Generation: "prod-standby-a-10", TargetPVCName: "standby-a-data",
+					Generation: "prod-standby-a-10", TargetPVCName: "standby-a-data", TargetPVCUID: "standby-pvc-uid",
 					ManifestSHA256: strings.Repeat("a", 64),
 				},
 			},
@@ -2188,8 +2234,9 @@ func TestValidateCreate_HighAvailabilityAllowsExactActivatedSeedStartupGate(t *t
 			SeedArtifact: &HASeedArtifactSpec{
 				Location: "s3://ha-seeds/cluster-a", Generation: "prod-standby-a-10",
 				StagingRoot: "/target/.antfly-ha/staging",
-				SourcePVC:   &HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
-				TargetPVC:   &HASeedArtifactPVCSpec{ClaimName: "standby-a-data", MountPath: "/target"},
+				TopologyID:  "test-standalone-cluster", TopologyGeneration: 3, NodeID: "standby-a", TargetPVCUID: "standby-pvc-uid",
+				SourcePVC: &HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+				TargetPVC: &HASeedArtifactPVCSpec{ClaimName: "standby-a-data", MountPath: "/target"},
 			},
 		}},
 	}

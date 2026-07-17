@@ -120,6 +120,31 @@ func candidateLeasePod(now time.Time, uid string) *corev1.Pod {
 	}
 }
 
+func TestDedicatedLeaseRenewalAdvancesUnchangedHolderFromFreshRuntimeProof(t *testing.T) {
+	now := time.Now().UTC()
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	proof := candidateLeaseProof(now, "primary-a", "primary-a", 1)
+	proof.AuthorityGranted = true
+	proof.AuthorityRemainingMS = 8_000
+	cluster.Status.HAStatus.PrimaryWatchdogProof = proof
+	lease := haFenceLease(cluster, now.Add(-time.Second), 10, 1, "primary-a")
+	reconciler := testHAReconciler(t, cluster, lease, candidateLeasePod(now, "primary-a-pod-uid"))
+	reconciler.Now = func() time.Time { return now }
+
+	if err := reconciler.renewCurrentHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("dedicated renewal: %v", err)
+	}
+	renewed := getOwnershipTestLease(t, reconciler)
+	if renewed.Spec.RenewTime == nil || !renewed.Spec.RenewTime.Time.Equal(now) {
+		t.Fatalf("expected dedicated path to publish strictly newer renewal %s, got %#v", now, renewed.Spec.RenewTime)
+	}
+	if renewed.Spec.HolderIdentity == nil || *renewed.Spec.HolderIdentity != "primary-a" ||
+		renewed.Spec.LeaseTransitions == nil || *renewed.Spec.LeaseTransitions != 1 {
+		t.Fatalf("dedicated renewal changed holder authority: %#v", renewed.Spec)
+	}
+}
+
 func getOwnershipTestLease(t *testing.T, reconciler *AntflyClusterReconciler) *coordinationv1.Lease {
 	t.Helper()
 	lease := &coordinationv1.Lease{}

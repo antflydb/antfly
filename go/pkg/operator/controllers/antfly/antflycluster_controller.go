@@ -7000,8 +7000,17 @@ func (r *AntflyClusterReconciler) updateHAAdminActionResultFromJobLogs(ctx conte
 }
 
 func parseHASeedArtifactReceipt(body string, action antflyv1.HAPlannedActionStatus) *antflyv1.HASeedArtifactReceiptStatus {
+	type chunkReceipt struct {
+		Index     uint64 `json:"index"`
+		SizeBytes uint64 `json:"size_bytes"`
+		SHA256    string `json:"sha256"`
+	}
 	type fileReceipt struct {
-		Path string `json:"path"`
+		Path      string         `json:"path"`
+		SizeBytes uint64         `json:"size_bytes"`
+		CRC32     uint32         `json:"crc32"`
+		SHA256    string         `json:"sha256"`
+		Chunks    []chunkReceipt `json:"chunks"`
 	}
 	type artifactReceipt struct {
 		FormatVersion               int32         `json:"format_version"`
@@ -12215,6 +12224,12 @@ func hasAnyPrefix(name string, prefixes []string) bool {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := ctrl.NewControllerManagedBy(mgr).
+		Named("antflycluster-ha-lease-renewal").
+		For(&antflyv1.AntflyCluster{}).
+		Complete(&haLeaseRenewalReconciler{parent: r}); err != nil {
+		return err
+	}
 	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&antflyv1.AntflyCluster{}).
 		Owns(&appsv1.StatefulSet{}).

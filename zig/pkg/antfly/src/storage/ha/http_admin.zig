@@ -162,6 +162,7 @@ pub const Server = struct {
         };
 
         bearer_token: ?[]const u8 = null,
+        require_bearer_token: bool = false,
         standby_status_extras: ?StandbyStatusExtras = null,
         state_mutex: ?*std.atomic.Mutex = null,
         seed_capture: ?SeedCaptureHook = null,
@@ -328,7 +329,7 @@ pub const Server = struct {
     }
 
     fn authorized(self: *const Server, req: http_common.HttpRequest) bool {
-        const raw_token = self.auth.bearer_token orelse return true;
+        const raw_token = self.auth.bearer_token orelse return !self.auth.require_bearer_token;
         const token = std.mem.trim(u8, raw_token, " \t\r\n");
         if (token.len == 0) return false;
         const authorization = req.authorization orelse req.header("authorization") orelse return false;
@@ -3560,6 +3561,20 @@ test "storage.ha http admin empty configured bearer token fails closed" {
         defer command.deinit(alloc);
         try std.testing.expectEqual(@as(u16, 401), command.status);
     }
+}
+
+test "storage.ha http admin required bearer token fails closed when unconfigured" {
+    const alloc = std.testing.allocator;
+    var server = Server.initWithOptions(alloc, .{}, .{ .require_bearer_token = true });
+    defer server.deinit();
+
+    var health = try server.handle(.{ .method = .GET, .uri = Routes.health });
+    defer health.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), health.status);
+
+    var admin = try server.handle(.{ .method = .GET, .uri = admin_api.routes.ha_primary_status });
+    defer admin.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), admin.status);
 }
 
 test "storage.ha http admin trims configured bearer token before comparing" {

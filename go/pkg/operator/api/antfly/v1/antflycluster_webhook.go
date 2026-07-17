@@ -1260,6 +1260,18 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 			hasManifest := strings.TrimSpace(standby.SeedManifestPath) != ""
 			hasContent := strings.TrimSpace(standby.SeedContentRoot) != ""
 			targetOnly := standbyLocalTargetOnlySeedArtifactBound(ha, standby, artifact)
+			if artifact.TargetPVC == nil {
+				errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedArtifact.targetPVC is required for executable portable seed handling", i))
+			}
+			if !targetOnly {
+				if artifact.SourcePVC == nil {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedArtifact.sourcePVC is required for executable seed publication", i))
+				}
+				if strings.TrimSpace(artifact.TopologyID) == "" || artifact.TopologyGeneration <= 0 ||
+					strings.TrimSpace(artifact.NodeID) == "" || strings.TrimSpace(artifact.TargetPVCUID) == "" {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedArtifact requires topologyID, topologyGeneration, nodeID, and targetPVCUID for an executable seed chain", i))
+				}
+			}
 			if hasManifest != hasContent {
 				errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedManifestPath and seedContentRoot must either both be set or both be omitted for runtime-owned capture", i))
 			}

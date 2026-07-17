@@ -12158,9 +12158,13 @@ pub const DB = struct {
             // watermark or a rebuilding checkpoint. A restore must not publish
             // its completion marker until both forms of debt converge.
             _ = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+            try self.completeRestoreDenseArtifactCounterRepairs(alloc);
             if (try self.hasPendingDenseArtifactRebuild(alloc) or
                 try self.denseArtifactWatermarkRepairNeeded(alloc))
             {
+                return error.RestoreRuntimeRepairIncomplete;
+            }
+            if (self.core.index_manager.hasRepairUnavailableIndexes()) {
                 return error.RestoreRuntimeRepairIncomplete;
             }
             try self.saveAllLiveIndexStatusSnapshots(alloc);
@@ -12195,28 +12199,36 @@ pub const DB = struct {
         self.core.index_manager.clearDenseHbcCaches();
     }
 
-    pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
+    fn setSchemaGuarded(self: *DB, table_schema: schema_mod.TableSchema) !void {
         try self.enforceHAWriteGate();
         try self.preflightHAMetadataSyncCommit();
         try self.core.setSchema(table_schema);
         try self.mirrorHASchemaMetadataCommit(table_schema);
     }
 
-    pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
+    pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
+        try self.setSchemaGuarded(table_schema);
+    }
+
+    fn setSchemaJsonGuarded(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
         var parsed_schema = try public_table_schema.parseValidatedTableSchema(alloc, schema_json);
         defer parsed_schema.deinit(alloc);
         const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_schema);
         defer schema_mod.freeSchema(alloc, runtime_schema);
 
-        try self.setSchema(runtime_schema);
+        try self.setSchemaGuarded(runtime_schema);
         try self.core.putStoreBatch(&.{.{
             .key = public_schema_json_key,
             .value = schema_json,
         }}, &.{});
+    }
+
+    pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.setSchemaJsonGuarded(alloc, schema_json);
     }
 
     pub fn getSchemaJson(self: *DB, alloc: Allocator) !?[]u8 {
@@ -15656,6 +15668,67 @@ pub const DB = struct {
 
     fn denseArtifactWatermarkRepairNeeded(self: *DB, alloc: Allocator) !bool {
         return (try self.repairDenseArtifactAppliedSequencesFromCoverage(alloc, false)) > 0;
+    }
+
+    /// Portable restore owns the complete logical corpus and rebuilds every
+    /// derived projection before publication. A missing artifact counter can
+    /// therefore be repaired from the final restored snapshot without waiting
+    /// for the ordinary background generation-repair worker. Clear only the
+    /// matching durable debt after counter coverage, replay, and checkpoint
+    /// identity all prove the active generation queryable.
+    fn completeRestoreDenseArtifactCounterRepairs(self: *DB, alloc: Allocator) !void {
+        var state = self.loadIndexRepairState(alloc) catch |err| switch (err) {
+            error.FileNotFound, error.DurableIndexRepairStateUnavailable => return,
+            else => return err,
+        };
+        defer state.deinit(alloc);
+
+        for (state.entries.items) |entry| {
+            if (entry.intent.trigger != .artifact_counter_missing) continue;
+            const cfg = self.core.index_manager.get(entry.intent.index_name) orelse
+                return error.RestoreRuntimeRepairIncomplete;
+            if (cfg.kind != .dense_vector or
+                types.indexConfigHash(cfg.*) != entry.intent.config_hash)
+            {
+                return error.RestoreRuntimeRepairIncomplete;
+            }
+
+            try self.ensureDenseArtifactTargetCounterForRepair(
+                alloc,
+                cfg.*,
+                entry.intent.repair_id,
+                null,
+            );
+            const expected = (try loadDenseArtifactTargetCounter(alloc, self.core.store, cfg.name)) orelse
+                return error.RestoreRuntimeRepairIncomplete;
+            const dense = self.core.index_manager.denseIndex(cfg.name) orelse
+                return error.RestoreRuntimeRepairIncomplete;
+            if (!denseCoverageMatchesTarget(dense.index.stats().active_count, expected)) {
+                return error.RestoreRuntimeRepairIncomplete;
+            }
+
+            const applied = try self.core.loadAppliedSequence(alloc, cfg.name);
+            const target = try self.probeDerivedReplayTargetSequence(
+                alloc,
+                self.core.replaySource(),
+                .{ .name = cfg.name, .kind = .dense_vector },
+                applied,
+            );
+            const checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
+            if (applied < target or
+                checkpoint.status != .clean or
+                checkpoint.applied_sequence < target or
+                checkpoint.config_hash != entry.intent.config_hash)
+            {
+                return error.RestoreRuntimeRepairIncomplete;
+            }
+
+            // This is restore-owned metadata debt, not a shadow-generation
+            // attempt, so there is no candidate phase chain to advance. Once
+            // the restored active generation has passed the full proof above,
+            // remove the stale discovery intent directly.
+            try self.removeIndexRepairIntentAndPin(alloc, entry.intent.repair_id);
+        }
     }
 
     fn repairDenseArtifactAppliedSequencesIfCovered(self: *DB, alloc: Allocator) !usize {
@@ -54435,6 +54508,95 @@ test "storage.ha seed capture barrier prevents local commit without matching wal
     const stored = (try db.get(alloc, "doc:b")) orelse return error.TestExpectedEqual;
     defer alloc.free(stored);
     try std.testing.expectEqualStrings("{\"title\":\"bravo\"}", stored);
+}
+
+test "storage.ha schema json mutation does not reacquire shared barrier behind queued capture" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 253,
+        .shard_id = 6,
+        .table_id = 12,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    var barrier: HAMutationBarrier = .{};
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var failures = std.atomic.Value(u64).init(0);
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .identity_namespace = .{ .shard_id = 6, .table_id = 12 },
+        .ha_async_metadata_mirror = .{
+            .primary = &primary,
+            .mutation_barrier = &barrier,
+            .last_lsn = &last_lsn,
+            .failure_count = &failures,
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const CaptureProbe = struct {
+        barrier: *HAMutationBarrier,
+        started: std.atomic.Value(u8) = .init(0),
+        acquired: std.atomic.Value(u8) = .init(0),
+        release: std.atomic.Value(u8) = .init(0),
+
+        fn run(self: *@This()) void {
+            self.started.store(1, .release);
+            var capture = self.barrier.acquireExclusive();
+            self.acquired.store(1, .release);
+            while (self.release.load(.acquire) == 0) std.Thread.yield() catch {};
+            capture.release();
+        }
+    };
+
+    var outer = barrier.acquireShared();
+    var probe = CaptureProbe{ .barrier = &barrier };
+    const capture_thread = try std.Thread.spawn(.{}, CaptureProbe.run, .{&probe});
+    errdefer {
+        outer.release();
+        probe.release.store(1, .release);
+        capture_thread.join();
+    }
+    try std.testing.expect(waitForAtomicFlag(&probe.started, 1, 10_000));
+    var capture_queued = false;
+    for (0..10_000) |_| {
+        if (barrier.tryAcquireShared()) |lease_value| {
+            var lease = lease_value;
+            lease.release();
+            std.Thread.yield() catch {};
+        } else {
+            capture_queued = true;
+            break;
+        }
+    }
+    try std.testing.expect(capture_queued);
+
+    const schema_json =
+        \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
+    ;
+    try db.setSchemaJsonGuarded(alloc, schema_json);
+    outer.release();
+    try std.testing.expect(waitForAtomicFlag(&probe.acquired, 1, 10_000));
+    probe.release.store(1, .release);
+    capture_thread.join();
+
+    const stored = (try db.getSchemaJson(alloc)) orelse return error.TestExpectedEqual;
+    defer alloc.free(stored);
+    try std.testing.expectEqualStrings(schema_json, stored);
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
 }
 
 test "storage.ha db evaluates sync commit gate for mirrored batch mutations" {

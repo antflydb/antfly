@@ -2987,6 +2987,7 @@ pub const DataServer = struct {
     /// Global primary mutation/capture ordering point. All DB/catalog writers
     /// share this instance through their HA mirror configuration.
     ha_mutation_barrier: antfly.db.HAMutationBarrier = .{},
+    ha_seed_capture_active: std.atomic.Value(bool) = .init(false),
     ha_public_gate_state: antfly.ha.public_gate_state.State = .{},
     ha_admin_server: ?antfly.ha.http_admin.Server = null,
     ha_internal_server: ?antfly.ha.http_internal.Server = null,
@@ -3850,9 +3851,13 @@ pub const DataServer = struct {
         var io_impl = std.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
+        // Prepared roots are staging state only. A process stop can leave a
+        // published generation or .building-* tree behind, so reset the
+        // provider-owned staging namespace before constructing the next exact
+        // generation. Canonical capture generations live under capture_root
+        // and are unaffected.
+        std.Io.Dir.cwd().deleteTree(io, snapshots_root) catch {};
         try fs_paths.createDirPathPortable(io, snapshots_root);
-        std.Io.Dir.cwd().deleteTree(io, building_root) catch {};
-        std.Io.Dir.cwd().deleteTree(io, published_root) catch {};
         try fs_paths.createDirPathPortable(io, building_root);
         errdefer std.Io.Dir.cwd().deleteTree(io, building_root) catch {};
 
@@ -4275,6 +4280,22 @@ pub const DataServer = struct {
         }
     }
 
+    fn cleanupHASeedPreparedSnapshot(
+        alloc: std.mem.Allocator,
+        capture_root: []const u8,
+        prepared_root: []const u8,
+    ) void {
+        const allowed_root = std.fmt.allocPrint(alloc, "{s}.runtime-snapshots", .{capture_root}) catch return;
+        defer alloc.free(allowed_root);
+        if (!antfly.ha.validation.isAbsoluteNormalizedPathWithinRoot(prepared_root, allowed_root) or
+            std.mem.eql(u8, prepared_root, allowed_root)) return;
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), prepared_root) catch |err| {
+            std.log.warn("failed to remove prepared HA seed snapshot root={s} err={s}", .{ prepared_root, @errorName(err) });
+        };
+    }
+
     fn captureHASeedCallback(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -4283,6 +4304,11 @@ pub const DataServer = struct {
         binding: antfly.ha.seed_artifact.LifecycleBinding,
     ) !antfly.ha.http_admin.Server.SeedCaptureResult {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
+
+        if (self.ha_seed_capture_active.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
+            return error.HASeedCaptureAlreadyInProgress;
+        }
+        defer self.ha_seed_capture_active.store(false, .release);
 
         // Global ordering is non-negotiable: capture excludes every durable
         // mutation before freezing the role pointer that keeps Primary alive.
@@ -4319,7 +4345,10 @@ pub const DataServer = struct {
             .generation = generation,
             .auth_artifact_json = auth_artifact_json,
         });
-        defer prepared.deinit(alloc);
+        defer {
+            cleanupHASeedPreparedSnapshot(alloc, capture_root, prepared.root);
+            prepared.deinit(alloc);
+        }
         try validateHASeedPreparedSnapshot(alloc, capture_root, generation, prepared.root);
 
         const sources = [_]antfly.ha.seed_capture.Source{.{ .tree = .{
@@ -4345,10 +4374,14 @@ pub const DataServer = struct {
     }
 
     fn attachHaExecutors(self: *DataServer, api_server_cfg: *antfly.public_api.http_server.ApiHttpServerConfig) void {
+        if (api_server_cfg.ha_admin_bearer_token == null) {
+            api_server_cfg.ha_admin_bearer_token = self.ha_cfg.admin_bearer_token;
+        }
         if (api_server_cfg.ha_admin_executor == null) {
             if (self.ha_cfg.admin_context) |ctx| {
                 self.ha_admin_server = antfly.ha.http_admin.Server.initWithOptions(platform.allocator.processAllocator(std.heap.smp_allocator), ctx, .{
                     .bearer_token = self.ha_cfg.admin_bearer_token,
+                    .require_bearer_token = true,
                     .state_mutex = if (ctx.primary != null or ctx.standby != null) &self.ha_state_mutex else null,
                     .seed_capture = if (ctx.primary != null and self.ha_cfg.seed_capture_root != null) .{
                         .ptr = self,
@@ -19346,6 +19379,27 @@ const TestHASeedSnapshotProvider = struct {
     }
 };
 
+test "storage.ha data runtime rejects concurrent seed capture before waiting on mutation barrier" {
+    var server: DataServer = undefined;
+    server.ha_seed_capture_active = .init(true);
+    try std.testing.expectError(
+        error.HASeedCaptureAlreadyInProgress,
+        DataServer.captureHASeedCallback(
+            &server,
+            std.testing.allocator,
+            "standby-a",
+            "seed-standby-a-1",
+            .{
+                .topology_id = "topology-a",
+                .topology_generation = 1,
+                .node_id = "standby-a",
+                .target_pvc_name = "standby-a-data",
+                .target_pvc_uid = "pvc-uid-1",
+            },
+        ),
+    );
+}
+
 test "storage.ha data runtime default seed snapshot derives standalone groups from metadata only" {
     const alloc = std.testing.allocator;
 
@@ -19745,6 +19799,16 @@ test "data server wires configured HA executors into API server" {
     try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"action_kind\":\"seed_capture\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"state\":\"applied\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"manifest_path\":") != null);
+    const prepared_generation_root = try std.fmt.allocPrint(
+        alloc,
+        "{s}.runtime-snapshots/{s}",
+        .{ seed_capture_root, "seed-standby-capture-3" },
+    );
+    defer alloc.free(prepared_generation_root);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().access(io_impl.io(), prepared_generation_root, .{}),
+    );
     const CaptureDigestResponse = struct { capture_receipt_sha256: []const u8 };
     var capture_response = try std.json.parseFromSlice(CaptureDigestResponse, alloc, capture_resp.body, .{ .ignore_unknown_fields = true });
     defer capture_response.deinit();
@@ -20809,6 +20873,7 @@ test "storage.ha data server rejects writes and owner jobs after primary promoti
                 .primary_node_id = "primary-a",
                 .fence_store = &fence_store,
             },
+            .admin_bearer_token = "runtime-secret-token",
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
     defer server.deinit();
@@ -20827,6 +20892,7 @@ test "storage.ha data server rejects writes and owner jobs after primary promoti
     var fence_response = try server.http_server.?.handle(.{
         .method = .POST,
         .uri = antfly.admin.routes.ha_fence,
+        .authorization = "Bearer runtime-secret-token",
         .content_type = "application/json",
         .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"force\":false,\"reason\":\"data-server-test\"}",
     });
@@ -20949,6 +21015,7 @@ test "data server applies routed HA replication records through standby write ga
                 .standby = &standby,
                 .standby_node_id = "standby-a",
             },
+            .admin_bearer_token = "runtime-secret-token",
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
     defer server.deinit();
@@ -21340,6 +21407,7 @@ test "data server HA replication network wait leaves state mutex available" {
                 .standby = &standby,
                 .standby_node_id = "standby-a",
             },
+            .admin_bearer_token = "runtime-secret-token",
             .standby_replication = .{
                 .upstream_base_uri = "http://primary.internal.test",
                 .slot_name = "standby-a",
@@ -22098,6 +22166,7 @@ test "data runtime records and backs off HA standby replication round failures" 
                 .standby = &standby,
                 .standby_node_id = "standby-a",
             },
+            .admin_bearer_token = "runtime-secret-token",
             .standby_replication = .{
                 .upstream_base_uri = "http://primary.internal.test",
                 .slot_name = "standby-a",
@@ -22119,6 +22188,7 @@ test "data runtime records and backs off HA standby replication round failures" 
     var admin_status = try server.http_server.?.handle(.{
         .method = .GET,
         .uri = antfly.admin.routes.ha_standby_status,
+        .authorization = "Bearer runtime-secret-token",
     });
     defer admin_status.deinit(server.http_server.?.alloc);
     try std.testing.expectEqual(@as(u16, 200), admin_status.status);
@@ -22258,6 +22328,7 @@ test "data runtime records HA standby apply failures without stopping run round"
                 .standby = &standby,
                 .standby_node_id = "standby-a",
             },
+            .admin_bearer_token = "runtime-secret-token",
             .standby_replication = .{
                 .upstream_base_uri = "http://primary.internal.test",
                 .slot_name = "standby-a",
@@ -22283,6 +22354,7 @@ test "data runtime records HA standby apply failures without stopping run round"
     var admin_status = try server.http_server.?.handle(.{
         .method = .GET,
         .uri = antfly.admin.routes.ha_standby_status,
+        .authorization = "Bearer runtime-secret-token",
     });
     defer admin_status.deinit(server.http_server.?.alloc);
     try std.testing.expectEqual(@as(u16, 200), admin_status.status);
