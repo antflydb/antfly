@@ -251,6 +251,11 @@ func (in *AntflyClusterSpec) DeepCopyInto(out *AntflyClusterSpec) {
 		*out = new(StandaloneSpec)
 		(*in).DeepCopyInto(*out)
 	}
+	if in.Swarm != nil {
+		in, out := &in.Swarm, &out.Swarm
+		*out = new(SwarmSpec)
+		(*in).DeepCopyInto(*out)
+	}
 	if in.Inference != nil {
 		in, out := &in.Inference, &out.Inference
 		*out = new(AntflyInferenceSpec)

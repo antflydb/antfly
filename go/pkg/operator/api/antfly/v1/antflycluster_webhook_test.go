@@ -1754,6 +1754,48 @@ func TestDefault_StandaloneDefaults(t *testing.T) {
 	}
 }
 
+func TestDefault_NormalizesLegacySwarmToStandaloneWithoutChangingResourceIdentity(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.Mode = ClusterModeSwarm
+	cluster.Spec.Swarm = cluster.Spec.Standalone
+	cluster.Spec.Standalone = nil
+	cluster.Spec.Storage.SwarmStorage = cluster.Spec.Storage.StandaloneStorage
+	cluster.Spec.Storage.StandaloneStorage = ""
+
+	cluster.Default()
+
+	if cluster.Spec.Mode != ClusterModeStandalone || cluster.Spec.Standalone == nil {
+		t.Fatalf("expected legacy Swarm shape to normalize to Standalone: %#v", cluster.Spec)
+	}
+	if cluster.Spec.Standalone.ResourceIdentity != StandaloneResourceIdentityLegacySwarm {
+		t.Fatalf("expected legacy resource identity, got %q", cluster.Spec.Standalone.ResourceIdentity)
+	}
+	if cluster.Spec.Storage.StandaloneStorage != "1Gi" || cluster.Spec.Swarm != nil {
+		t.Fatalf("expected storage migration without duplicate Swarm shape: %#v", cluster.Spec.Storage)
+	}
+}
+
+func TestValidateUpdate_AllowsOnlyLegacySwarmToStandaloneIdentityMigration(t *testing.T) {
+	old := baseStandaloneCluster()
+	old.Spec.Mode = ClusterModeSwarm
+	old.Spec.Swarm = old.Spec.Standalone
+	old.Spec.Standalone = nil
+	old.Spec.Storage.SwarmStorage = old.Spec.Storage.StandaloneStorage
+	old.Spec.Storage.StandaloneStorage = ""
+
+	next := old.DeepCopy()
+	next.Default()
+	if err := next.ValidateUpdate(old); err != nil {
+		t.Fatalf("expected one-way legacy migration to pass, got %v", err)
+	}
+
+	wrongIdentity := next.DeepCopy()
+	wrongIdentity.Spec.Standalone.ResourceIdentity = StandaloneResourceIdentityV1
+	if err := wrongIdentity.ValidateUpdate(old); err == nil {
+		t.Fatal("expected Swarm migration to current Standalone resource identity to fail")
+	}
+}
+
 func TestDefault_StandaloneLiteDefaultsFileName(t *testing.T) {
 	cluster := baseStandaloneCluster()
 	cluster.Spec.Storage.Engine = "lite"

@@ -12473,6 +12473,61 @@ func TestReconcileStandaloneStatefulSetMountsSecretStore(t *testing.T) {
 	}))
 }
 
+func TestReconcileLegacySwarmLayoutRunsStandaloneWithoutReplacingPVCIdentity(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := baseStandaloneControllerCluster()
+	cluster.UID = types.UID("cluster-uid")
+	cluster.Spec.Mode = antflyv1.ClusterModeSwarm
+	cluster.Spec.Swarm = cluster.Spec.Standalone
+	cluster.Spec.Standalone = nil
+	cluster.Spec.Storage.SwarmStorage = cluster.Spec.Storage.StandaloneStorage
+	cluster.Spec.Storage.StandaloneStorage = ""
+	cluster.NormalizeLegacySwarm()
+
+	controller := true
+	existing := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-standalone-swarm", Namespace: "default", UID: types.UID("legacy-sts-uid"),
+			Labels: map[string]string{"app.kubernetes.io/instance": cluster.Name},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: antflyv1.GroupVersion.String(), Kind: "AntflyCluster", Name: cluster.Name,
+				UID: cluster.UID, Controller: &controller,
+			}},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			ServiceName:          "test-standalone-swarm",
+			Selector:             &metav1.LabelSelector{MatchLabels: serviceSelectorLabels(cluster.Name, "swarm")},
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{ObjectMeta: metav1.ObjectMeta{Name: "swarm-storage"}}},
+		},
+	}
+	client := newHAControllerTestClient(t, s, cluster, existing)
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+	reconciler.applyDefaults(cluster)
+
+	g.Expect(reconciler.ensureTopologyResourcesMatchMode(context.Background(), cluster, topologyModeStandalone)).To(Succeed())
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+
+	observed := &appsv1.StatefulSet{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: existing.Name, Namespace: existing.Namespace}, observed)).To(Succeed())
+	g.Expect(observed.UID).To(Equal(existing.UID))
+	g.Expect(observed.Spec.ServiceName).To(Equal("test-standalone-swarm"))
+	g.Expect(observed.Spec.Selector.MatchLabels).To(HaveKeyWithValue("app.kubernetes.io/component", "swarm"))
+	g.Expect(observed.Spec.VolumeClaimTemplates).To(HaveLen(1))
+	g.Expect(observed.Spec.VolumeClaimTemplates[0].Name).To(Equal("swarm-storage"))
+	g.Expect(observed.Spec.Template.Spec.Containers[0].VolumeMounts).To(ContainElement(corev1.VolumeMount{Name: "swarm-storage", MountPath: "/antflydb"}))
+	g.Expect(observed.Spec.Template.Spec.Containers[0].Args[0]).To(ContainSubstring("exec /antfly standalone"))
+	g.Expect(observed.Annotations).To(HaveKeyWithValue(annotationStorageEngine, "local"))
+
+	currentLayout := &appsv1.StatefulSet{}
+	err := client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, currentLayout)
+	g.Expect(errors.IsNotFound(err)).To(BeTrue())
+}
+
 func TestReconcileStandaloneStatefulSetPersistsExtensionPackageStoreOnPVC(t *testing.T) {
 	g := NewWithT(t)
 

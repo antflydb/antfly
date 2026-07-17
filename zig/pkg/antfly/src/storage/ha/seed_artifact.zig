@@ -17,6 +17,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const fs_paths = @import("../../common/fs_paths.zig");
 const backup_manifest = @import("backup_manifest.zig");
 const object_storage = @import("../object_storage.zig");
+const seed_namespace_control = @import("seed_namespace_control.zig");
 const standby_mod = @import("standby.zig");
 const validation = @import("validation.zig");
 
@@ -306,6 +307,19 @@ fn publishWithOptions(alloc: Allocator, store: Store, request: PublishRequest, o
         return error.InvalidArtifactChunkSize;
     if (request.binding) |binding| try validateLifecycleBinding(binding);
 
+    var namespace_lease: ?seed_namespace_control.Lease = if (request.binding) |binding|
+        try seed_namespace_control.acquirePublish(alloc, .{
+            .client = store.client,
+            .bucket = store.bucket,
+            .prefix = store.prefix,
+        }, .{
+            .topology_id = binding.topology_id,
+            .topology_generation = binding.topology_generation,
+        }, request.generation)
+    else
+        null;
+    defer if (namespace_lease) |*lease| lease.deinit(alloc);
+
     const manifest = try backup_manifest.decodeAlloc(alloc, request.manifest_bytes);
     defer backup_manifest.freeDecoded(alloc, manifest);
     if (manifest.files.len > request.limits.max_files) return error.TooManyArtifactFiles;
@@ -325,6 +339,14 @@ fn publishWithOptions(alloc: Allocator, store: Store, request: PublishRequest, o
             request.binding,
             if (has_capture_authority) &capture_receipt_hex else null,
         );
+        if (request.binding) |binding| try seed_namespace_control.releasePublish(alloc, .{
+            .client = store.client,
+            .bucket = store.bucket,
+            .prefix = store.prefix,
+        }, .{
+            .topology_id = binding.topology_id,
+            .topology_generation = binding.topology_generation,
+        }, request.generation, namespace_lease.?);
         return .{ .receipt_json = try alloc.dupe(u8, existing), .already_available = true };
     } else |err| switch (err) {
         error.FileNotFound => {},
@@ -465,6 +487,14 @@ fn publishWithOptions(alloc: Allocator, store: Store, request: PublishRequest, o
     // no COMPLETE object and therefore can never be selected by a restore.
     if (options.fail_before_complete) return error.InjectedArtifactFailure;
     try putImmutable(alloc, store, complete_key, receipt_json, "application/json");
+    if (request.binding) |publish_binding| try seed_namespace_control.releasePublish(alloc, .{
+        .client = store.client,
+        .bucket = store.bucket,
+        .prefix = store.prefix,
+    }, .{
+        .topology_id = publish_binding.topology_id,
+        .topology_generation = publish_binding.topology_generation,
+    }, request.generation, namespace_lease.?);
     return .{ .receipt_json = receipt_json, .already_available = false };
 }
 

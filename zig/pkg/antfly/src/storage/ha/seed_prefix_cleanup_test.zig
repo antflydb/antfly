@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const cleanup = @import("seed_prefix_cleanup.zig");
+const namespace_control = @import("seed_namespace_control.zig");
 const object_storage = @import("../object_storage.zig");
 
 const location = "s3://ha-bucket/instances/instance-a/ha-seeds/";
@@ -128,4 +129,56 @@ test "storage.ha seed prefix cleanup fails closed on mutated authority and is id
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), result.deleted_generations);
     try std.testing.expectEqual(@as(usize, 0), result.deleted_objects);
+}
+
+test "storage.ha seed cleanup excludes publishers and leaves a durable tombstone" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("ha-bucket");
+
+    const binding = namespace_control.Binding{
+        .topology_id = "topology-a",
+        .topology_generation = 7,
+    };
+    const control_store = namespace_control.Store{
+        .client = &client,
+        .bucket = "ha-bucket",
+        .prefix = object_prefix,
+    };
+    var publishing = try namespace_control.acquirePublish(alloc, control_store, binding, "generation-live");
+    defer publishing.deinit(alloc);
+
+    const request = try requestAlloc(alloc);
+    defer freeRequest(alloc, request);
+    try std.testing.expectError(error.SeedPrefixCleanupWriterActive, cleanup.deleteAll(alloc, .{
+        .client = &client,
+        .bucket = "ha-bucket",
+        .prefix = object_prefix,
+    }, request, .{}));
+
+    try namespace_control.releasePublish(alloc, control_store, binding, "generation-live", publishing);
+    var result = try cleanup.deleteAll(alloc, .{
+        .client = &client,
+        .bucket = "ha-bucket",
+        .prefix = object_prefix,
+    }, request, .{ .completed_at_override = "2026-07-14T12:34:56Z" });
+    defer result.deinit(alloc);
+
+    try std.testing.expectError(error.SeedNamespaceUnavailable, namespace_control.acquirePublish(
+        alloc,
+        control_store,
+        binding,
+        "generation-after-delete",
+    ));
+
+    // A retried cleanup returns the exact receipt persisted in the tombstone.
+    var retry = try cleanup.deleteAll(alloc, .{
+        .client = &client,
+        .bucket = "ha-bucket",
+        .prefix = object_prefix,
+    }, request, .{ .completed_at_override = "2026-07-15T00:00:00Z" });
+    defer retry.deinit(alloc);
+    try std.testing.expectEqualStrings(result.receipt_json, retry.receipt_json);
 }

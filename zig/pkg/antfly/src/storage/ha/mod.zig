@@ -20,6 +20,7 @@ pub const primary = @import("primary.zig");
 pub const session = @import("session.zig");
 pub const backup_manifest = @import("backup_manifest.zig");
 pub const seed_artifact = @import("seed_artifact.zig");
+pub const seed_namespace_control = @import("seed_namespace_control.zig");
 pub const seed_prefix_cleanup = @import("seed_prefix_cleanup.zig");
 pub const seed_activation = @import("seed_activation.zig");
 pub const seed_materialization = @import("seed_materialization.zig");
@@ -64,6 +65,7 @@ test {
     _ = session;
     _ = backup_manifest;
     _ = seed_artifact;
+    _ = seed_namespace_control;
     _ = seed_prefix_cleanup;
     _ = seed_activation;
     _ = seed_materialization;

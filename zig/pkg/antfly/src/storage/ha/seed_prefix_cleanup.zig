@@ -16,6 +16,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const object_storage = @import("../object_storage.zig");
+const seed_namespace_control = @import("seed_namespace_control.zig");
 const validation = @import("validation.zig");
 
 pub const request_version: u16 = 1;
@@ -116,6 +117,30 @@ pub fn deleteAll(alloc: Allocator, store: Store, request: Request, options: Opti
     if (options.max_keys == 0 or options.max_quiescence_rounds == 0)
         return error.InvalidSeedPrefixCleanupLimits;
 
+    var acquisition = try seed_namespace_control.acquireDelete(alloc, .{
+        .client = store.client,
+        .bucket = store.bucket,
+        .prefix = store.prefix,
+    }, .{
+        .topology_id = request.topology_id,
+        .topology_generation = request.topology_generation,
+    }, request.request_sha256);
+    defer acquisition.deinit(alloc);
+    switch (acquisition) {
+        .complete => |receipt_json| {
+            var parsed = std.json.parseFromSlice(Receipt, alloc, receipt_json, .{ .ignore_unknown_fields = false }) catch
+                return error.InvalidSeedPrefixCleanupReceipt;
+            defer parsed.deinit();
+            try validateReceipt(alloc, parsed.value, request);
+            return .{
+                .receipt_json = try alloc.dupe(u8, receipt_json),
+                .deleted_generations = parsed.value.deleted_generations,
+                .deleted_objects = parsed.value.deleted_objects,
+            };
+        },
+        .lease => {},
+    }
+
     var deleted_keys = std.StringHashMapUnmanaged(void).empty;
     defer deinitOwnedSet(alloc, &deleted_keys);
     var deleted_generations = std.StringHashMapUnmanaged(void).empty;
@@ -179,6 +204,15 @@ pub fn deleteAll(alloc: Allocator, store: Store, request: Request, options: Opti
     defer alloc.free(receipt_sha256);
     receipt.receipt_sha256 = receipt_sha256;
     const receipt_json = try std.json.Stringify.valueAlloc(alloc, receipt, .{});
+    errdefer alloc.free(receipt_json);
+    try seed_namespace_control.finishDelete(alloc, .{
+        .client = store.client,
+        .bucket = store.bucket,
+        .prefix = store.prefix,
+    }, .{
+        .topology_id = request.topology_id,
+        .topology_generation = request.topology_generation,
+    }, request.request_sha256, acquisition.lease, receipt_json);
     return .{
         .receipt_json = receipt_json,
         .deleted_generations = receipt.deleted_generations,

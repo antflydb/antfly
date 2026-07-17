@@ -56,6 +56,7 @@ func (r *AntflyCluster) ValidateUpdate(old runtime.Object) error {
 
 // Default applies admission defaults to AntflyCluster.
 func (r *AntflyCluster) Default() {
+	r.NormalizeLegacySwarm()
 	if r.Spec.Mode == "" {
 		r.Spec.Mode = ClusterModeDistributed
 	}
@@ -64,6 +65,9 @@ func (r *AntflyCluster) Default() {
 
 	if r.Spec.Mode != ClusterModeStandalone || r.Spec.Standalone == nil {
 		return
+	}
+	if r.Spec.Standalone.ResourceIdentity == "" {
+		r.Spec.Standalone.ResourceIdentity = StandaloneResourceIdentityV1
 	}
 	if r.Spec.Storage.Engine == "" {
 		r.Spec.Storage.Engine = "local"
@@ -111,6 +115,30 @@ func (r *AntflyCluster) Default() {
 	if r.Spec.Standalone.Inference.APIURL == "" {
 		r.Spec.Standalone.Inference.APIURL = "http://0.0.0.0:11433"
 	}
+}
+
+// NormalizeLegacySwarm maps the deprecated single-node wire shape onto the
+// Standalone runtime while retaining its immutable StatefulSet/PVC identity.
+// Controllers use this on a working copy; admission persists the one-way shape
+// conversion when an old object is next updated.
+func (r *AntflyCluster) NormalizeLegacySwarm() {
+	if r.Spec.Mode != ClusterModeSwarm {
+		return
+	}
+	if r.Spec.Standalone == nil && r.Spec.Swarm != nil {
+		r.Spec.Standalone = r.Spec.Swarm
+	}
+	if r.Spec.Standalone != nil {
+		r.Spec.Standalone.ResourceIdentity = StandaloneResourceIdentityLegacySwarm
+	}
+	if r.Spec.Storage.StandaloneStorage == "" {
+		r.Spec.Storage.StandaloneStorage = r.Spec.Storage.SwarmStorage
+	}
+	if r.Spec.Storage.StorageAutoGrow != nil && r.Spec.Storage.StorageAutoGrow.MaxStandaloneStorage == "" {
+		r.Spec.Storage.StorageAutoGrow.MaxStandaloneStorage = r.Spec.Storage.StorageAutoGrow.MaxSwarmStorage
+	}
+	r.Spec.Mode = ClusterModeStandalone
+	r.Spec.Swarm = nil
 }
 
 // ValidateAntflyCluster performs all validation checks
@@ -632,7 +660,9 @@ func (r *AntflyCluster) ValidateImmutability(old *AntflyCluster) error {
 
 	oldMode := old.effectiveMode()
 	newMode := r.effectiveMode()
-	if newMode != oldMode {
+	legacySwarmMigration := oldMode == ClusterModeSwarm && newMode == ClusterModeStandalone &&
+		r.Spec.Standalone != nil && r.Spec.Standalone.ResourceIdentity == StandaloneResourceIdentityLegacySwarm
+	if newMode != oldMode && !legacySwarmMigration {
 		errors = append(errors, fmt.Sprintf(
 			`field 'spec.mode' is immutable after deployment
 
@@ -643,6 +673,26 @@ Solution: Delete and recreate the cluster to change this setting.
 Current value: "%s"
 Attempted change: "%s"`,
 			oldMode, newMode))
+	}
+	if oldMode == ClusterModeStandalone && newMode == ClusterModeStandalone && old.Spec.Standalone != nil && r.Spec.Standalone != nil {
+		oldIdentity := old.Spec.Standalone.ResourceIdentity
+		if oldIdentity == "" {
+			oldIdentity = StandaloneResourceIdentityV1
+		}
+		newIdentity := r.Spec.Standalone.ResourceIdentity
+		if newIdentity == "" {
+			newIdentity = StandaloneResourceIdentityV1
+		}
+		if oldIdentity != newIdentity {
+			errors = append(errors, "field 'spec.standalone.resourceIdentity' is immutable after deployment")
+		}
+	}
+	if legacySwarmMigration && old.Spec.Storage.SwarmStorage != "" && r.Spec.Storage.StandaloneStorage != "" {
+		oldQ, oldErr := resource.ParseQuantity(old.Spec.Storage.SwarmStorage)
+		newQ, newErr := resource.ParseQuantity(r.Spec.Storage.StandaloneStorage)
+		if oldErr != nil || newErr != nil || newQ.Cmp(oldQ) < 0 {
+			errors = append(errors, "legacy Swarm to Standalone migration must not decrease storage")
+		}
 	}
 
 	oldStorageEngine := effectiveStorageEngine(old.Spec.Storage)

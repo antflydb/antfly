@@ -315,13 +315,17 @@ const (
 
 	// ClusterModeStandalone is the single-node operator-managed standalone topology.
 	ClusterModeStandalone ClusterMode = "Standalone"
+
+	// ClusterModeSwarm is retained during the one-way migration from the legacy
+	// single-node resource layout to the Standalone API/runtime.
+	ClusterModeSwarm ClusterMode = "Swarm"
 )
 
 // AntflyClusterSpec defines the desired state of AntflyCluster
 type AntflyClusterSpec struct {
 	// Mode selects the runtime topology managed by the operator.
 	// +optional
-	// +kubebuilder:validation:Enum=Distributed;Standalone
+	// +kubebuilder:validation:Enum=Distributed;Standalone;Swarm
 	// +kubebuilder:default=Distributed
 	Mode ClusterMode `json:"mode,omitempty"`
 
@@ -334,6 +338,11 @@ type AntflyClusterSpec struct {
 	// Standalone defines the single-node standalone topology when Mode=Standalone.
 	// +optional
 	Standalone *StandaloneSpec `json:"standalone,omitempty"`
+
+	// Swarm is the deprecated single-node shape retained only for rolling
+	// compatibility. It is normalized to Standalone with LegacySwarmV1 layout.
+	// +optional
+	Swarm *SwarmSpec `json:"swarm,omitempty"`
 
 	// Inference configures inference pools used by this cluster.
 	// Pools may be owned by this cluster, referenced as customer-managed shared
@@ -1279,6 +1288,13 @@ type DataNodesSpec struct {
 
 // StandaloneSpec defines the configuration for operator-managed standalone mode.
 type StandaloneSpec struct {
+	// ResourceIdentity selects the immutable Kubernetes identity layout for the
+	// single-node workload. LegacySwarmV1 preserves pre-Standalone PVC names.
+	// +optional
+	// +kubebuilder:validation:Enum=StandaloneV1;LegacySwarmV1
+	// +kubebuilder:default=StandaloneV1
+	ResourceIdentity StandaloneResourceIdentity `json:"resourceIdentity,omitempty"`
+
 	// Replicas is the number of standalone replicas. MVP only supports 1.
 	Replicas int32 `json:"replicas,omitempty"`
 
@@ -1331,6 +1347,16 @@ type StandaloneSpec struct {
 	// +optional
 	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
 }
+
+// SwarmSpec is the deprecated wire-compatible predecessor of StandaloneSpec.
+type SwarmSpec = StandaloneSpec
+
+type StandaloneResourceIdentity string
+
+const (
+	StandaloneResourceIdentityV1          StandaloneResourceIdentity = "StandaloneV1"
+	StandaloneResourceIdentityLegacySwarm StandaloneResourceIdentity = "LegacySwarmV1"
+)
 
 // StandaloneInferenceSpec defines inference configuration for standalone mode.
 type StandaloneInferenceSpec struct {
@@ -1432,6 +1458,10 @@ type StorageSpec struct {
 	// +optional
 	StandaloneStorage string `json:"standaloneStorage,omitempty"`
 
+	// SwarmStorage is the deprecated name read during rolling migration.
+	// +optional
+	SwarmStorage string `json:"swarmStorage,omitempty"`
+
 	// Engine selects the persistence engine. Local stores a directory tree on
 	// PVCs. Lite stores the complete database in one .aflite file and is valid
 	// only with spec.mode=Standalone.
@@ -1470,6 +1500,10 @@ type StorageAutoGrowSpec struct {
 	// MaxStandaloneStorage is the maximum size for standalone PVC auto-grow. If omitted
 	// in standalone mode, MaxDataStorage is used as the limit.
 	MaxStandaloneStorage string `json:"maxStandaloneStorage,omitempty"`
+
+	// MaxSwarmStorage is the deprecated legacy-layout storage ceiling.
+	// +optional
+	MaxSwarmStorage string `json:"maxSwarmStorage,omitempty"`
 
 	// GrowThresholdPercent is the percent-used threshold that triggers growth.
 	// Defaults to 85 when omitted.

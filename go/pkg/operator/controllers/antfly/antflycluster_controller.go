@@ -248,7 +248,7 @@ func (r *AntflyClusterReconciler) reconcileHAStartupTargetPVC(ctx context.Contex
 			storageClassName = &cluster.Spec.Storage.StorageClass
 		}
 		created := &corev1.PersistentVolumeClaim{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace, Labels: persistentVolumeClaimLabels(cluster, "standalone")},
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace, Labels: persistentVolumeClaimLabels(cluster, standaloneComponent(cluster))},
 			Spec: corev1.PersistentVolumeClaimSpec{
 				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 				StorageClassName: storageClassName,
@@ -272,7 +272,7 @@ func (r *AntflyClusterReconciler) reconcileHAStartupTargetPVC(ctx context.Contex
 		return nil, fmt.Errorf("HA startup target PVC %s UID %s does not match required activation receipt UID %s", name, existing.UID, expectedUID)
 	}
 	changed := false
-	desiredLabels := persistentVolumeClaimLabels(cluster, "standalone")
+	desiredLabels := persistentVolumeClaimLabels(cluster, standaloneComponent(cluster))
 	if existing.Labels == nil {
 		existing.Labels = map[string]string{}
 	}
@@ -295,7 +295,7 @@ func (r *AntflyClusterReconciler) reconcileHAStartupTargetPVC(ctx context.Contex
 // stop, and only then recreating the controller around the deterministic claim.
 func (r *AntflyClusterReconciler) reconcileLegacyStandaloneStatefulSetStartupGate(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
 	existing := &appsv1.StatefulSet{}
-	key := types.NamespacedName{Name: cluster.Name + "-standalone", Namespace: cluster.Namespace}
+	key := types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}
 	if err := r.Get(ctx, key, existing); err != nil {
 		return false, client.IgnoreNotFound(err)
 	}
@@ -325,7 +325,7 @@ func (r *AntflyClusterReconciler) reconcileLegacyStandaloneStatefulSetStartupGat
 // StatefulSet/PVC handoff while it is being fenced and repaired.
 func (r *AntflyClusterReconciler) reconcileSuspendedStandaloneStatefulSet(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
 	existing := &appsv1.StatefulSet{}
-	key := types.NamespacedName{Name: cluster.Name + "-standalone", Namespace: cluster.Namespace}
+	key := types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}
 	if err := r.Get(ctx, key, existing); err != nil {
 		if errors.IsNotFound(err) {
 			return false, nil
@@ -874,7 +874,7 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 	// Include canonical owned workloads in the deletion set. Do not mutate them
 	// yet: every matching PVC must pass ownership validation first so an error or
 	// controller restart cannot erase the only source of a historical prefix.
-	for _, suffix := range []string{"-metadata", "-data", "-standalone"} {
+	for _, suffix := range []string{"-metadata", "-data", "-standalone", "-swarm"} {
 		sts := &appsv1.StatefulSet{}
 		stsName := cluster.Name + suffix
 		err := r.Get(ctx, types.NamespacedName{Name: stsName, Namespace: cluster.Namespace}, sts)
@@ -896,6 +896,7 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 		"metadata-storage-" + cluster.Name + "-metadata-",
 		"data-storage-" + cluster.Name + "-data-",
 		"standalone-storage-" + cluster.Name + "-standalone-",
+		"swarm-storage-" + cluster.Name + "-swarm-",
 	}
 	var pvcList corev1.PersistentVolumeClaimList
 	if err := r.List(ctx, &pvcList, client.InNamespace(cluster.Namespace)); err != nil {
@@ -1146,6 +1147,26 @@ func isStandaloneMode(cluster *antflyv1.AntflyCluster) bool {
 	return effectiveTopologyMode(cluster) == topologyModeStandalone
 }
 
+func standaloneUsesLegacySwarmIdentity(cluster *antflyv1.AntflyCluster) bool {
+	return cluster.Spec.Standalone != nil &&
+		cluster.Spec.Standalone.ResourceIdentity == antflyv1.StandaloneResourceIdentityLegacySwarm
+}
+
+func standaloneComponent(cluster *antflyv1.AntflyCluster) string {
+	if standaloneUsesLegacySwarmIdentity(cluster) {
+		return "swarm"
+	}
+	return "standalone"
+}
+
+func standaloneStatefulSetName(cluster *antflyv1.AntflyCluster) string {
+	return cluster.Name + "-" + standaloneComponent(cluster)
+}
+
+func standaloneStorageVolumeName(cluster *antflyv1.AntflyCluster) string {
+	return standaloneComponent(cluster) + "-storage"
+}
+
 func standaloneStorageIdentity(cluster *antflyv1.AntflyCluster) (engine, liteFileName string) {
 	engine = cluster.Spec.Storage.Engine
 	if engine == "" {
@@ -1165,7 +1186,11 @@ func validateAndSetStandaloneStorageIdentity(statefulSet *appsv1.StatefulSet, cl
 	if statefulSet.ResourceVersion != "" {
 		persistedEngine, ok := statefulSet.Annotations[annotationStorageEngine]
 		if !ok {
-			return fmt.Errorf("existing StatefulSet %s is missing storage identity annotation %q; refusing to guess its on-disk format", statefulSet.Name, annotationStorageEngine)
+			if standaloneUsesLegacySwarmIdentity(cluster) && engine == "local" && statefulSet.Name == cluster.Name+"-swarm" && metav1.IsControlledBy(statefulSet, cluster) {
+				persistedEngine = "local"
+			} else {
+				return fmt.Errorf("existing StatefulSet %s is missing storage identity annotation %q; refusing to guess its on-disk format", statefulSet.Name, annotationStorageEngine)
+			}
 		}
 		if persistedEngine != engine {
 			return fmt.Errorf("storage engine migration requires backup and restore: existing StatefulSet %s uses %q, requested %q", statefulSet.Name, persistedEngine, engine)
@@ -1237,7 +1262,7 @@ func (r *AntflyClusterReconciler) ensureTopologyResourcesMatchMode(ctx context.C
 
 	expected := map[string]struct{}{}
 	if mode == topologyModeStandalone {
-		expected[cluster.Name+"-standalone"] = struct{}{}
+		expected[standaloneStatefulSetName(cluster)] = struct{}{}
 	} else {
 		expected[cluster.Name+"-metadata"] = struct{}{}
 		expected[cluster.Name+"-data"] = struct{}{}
@@ -1316,6 +1341,9 @@ func (r *AntflyClusterReconciler) applyDefaults(cluster *antflyv1.AntflyCluster)
 	}
 
 	if standaloneMode && cluster.Spec.Standalone != nil {
+		if cluster.Spec.Standalone.ResourceIdentity == "" {
+			cluster.Spec.Standalone.ResourceIdentity = antflyv1.StandaloneResourceIdentityV1
+		}
 		if cluster.Spec.Standalone.Replicas == 0 {
 			cluster.Spec.Standalone.Replicas = 1
 		}
@@ -1767,14 +1795,13 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Apply defaults to a working copy, not the original
 	// this avoids an error from our caller `reconcileHandler` because of a version missmatch.
 	workingCluster := antflyCluster.DeepCopy()
+	workingCluster.NormalizeLegacySwarm()
+	r.applyDefaults(workingCluster) // Use workingCluster for all processing, keep original cluster for status updates
 	topologyMode := effectiveTopologyMode(workingCluster)
 	standaloneMode := topologyMode == topologyModeStandalone
-	if err := r.ensureTopologyResourcesMatchMode(ctx, &antflyCluster, topologyMode); err != nil {
+	if err := r.ensureTopologyResourcesMatchMode(ctx, workingCluster, topologyMode); err != nil {
 		return ctrl.Result{}, err
 	}
-
-	// Apply default values for ports
-	r.applyDefaults(workingCluster) // Use workingCluster for all processing, keep original cluster for status updates
 
 	// Per-reconcile cache for ConfigMap lookups used by buildPodAnnotations.
 	efCache := newEnvFromCache(r.Client)
@@ -1840,7 +1867,10 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err := r.reconcileServices(ctx, workingCluster); err != nil {
 			return ctrl.Result{}, err
 		}
-		workingCluster.Spec.Storage.StandaloneStorage = r.reconcileStorageAutoGrow(ctx, workingCluster, "standalone", "standalone-storage", workingCluster.Name+"-standalone", chooseStandaloneStorageSize(workingCluster), maxStandaloneAutoGrowSize(workingCluster))
+		component := standaloneComponent(workingCluster)
+		storageVolume := standaloneStorageVolumeName(workingCluster)
+		statefulSetName := standaloneStatefulSetName(workingCluster)
+		workingCluster.Spec.Storage.StandaloneStorage = r.reconcileStorageAutoGrow(ctx, workingCluster, component, storageVolume, statefulSetName, chooseStandaloneStorageSize(workingCluster), maxStandaloneAutoGrowSize(workingCluster))
 		if err := r.reconcileStandaloneStatefulSet(ctx, efCache, workingCluster); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1851,10 +1881,10 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 
 		r.setPVCExpansionCondition(workingCluster, []pvcExpansionResult{
-			r.reconcilePVCExpansion(ctx, workingCluster, "standalone", "standalone-storage", workingCluster.Name+"-standalone", chooseStandaloneStorageSize(workingCluster)),
+			r.reconcilePVCExpansion(ctx, workingCluster, component, storageVolume, statefulSetName, chooseStandaloneStorageSize(workingCluster)),
 		})
 
-		if err := r.reconcilePodDisruptionBudget(ctx, workingCluster, workingCluster.Name+"-standalone-pdb", "standalone"); err != nil {
+		if err := r.reconcilePodDisruptionBudget(ctx, workingCluster, statefulSetName+"-pdb", component); err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -2887,7 +2917,7 @@ func (r *AntflyClusterReconciler) createPublicAPIService(cluster *antflyv1.Antfl
 	component := "metadata"
 	if standaloneMode && cluster.Spec.Standalone != nil {
 		targetPort = cluster.Spec.Standalone.MetadataAPI.Port
-		component = "standalone"
+		component = standaloneComponent(cluster)
 	}
 
 	servicePort := corev1.ServicePort{
@@ -2996,13 +3026,13 @@ func (r *AntflyClusterReconciler) createStandaloneService(cluster *antflyv1.Antf
 
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cluster.Name + "-standalone",
+			Name:      standaloneStatefulSetName(cluster),
 			Namespace: cluster.Namespace,
 		},
 		Spec: corev1.ServiceSpec{
 			ClusterIP:                "None",
 			PublishNotReadyAddresses: true,
-			Selector:                 serviceSelectorLabels(cluster.Name, "standalone"),
+			Selector:                 serviceSelectorLabels(cluster.Name, standaloneComponent(cluster)),
 			Ports: []corev1.ServicePort{
 				{
 					Name:       "metadata-api",
@@ -3090,14 +3120,17 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 	if cluster.Spec.Storage.StorageClass != "" {
 		storageClassName = &cluster.Spec.Storage.StorageClass
 	}
+	component := standaloneComponent(cluster)
+	statefulSetName := standaloneStatefulSetName(cluster)
+	storageVolumeName := standaloneStorageVolumeName(cluster)
 
 	envFromSources := append([]corev1.EnvFromSource{}, standalone.EnvFrom...)
 
 	volumeClaimTemplates := []corev1.PersistentVolumeClaim{
 		{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:   "standalone-storage",
-				Labels: persistentVolumeClaimLabels(cluster, "standalone"),
+				Name:   storageVolumeName,
+				Labels: persistentVolumeClaimLabels(cluster, component),
 			},
 			Spec: corev1.PersistentVolumeClaimSpec{
 				AccessModes: []corev1.PersistentVolumeAccessMode{
@@ -3117,15 +3150,15 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 	}
 	statefulSet := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cluster.Name + "-standalone",
+			Name:      statefulSetName,
 			Namespace: cluster.Namespace,
 		},
 		Spec: appsv1.StatefulSetSpec{
-			ServiceName:         cluster.Name + "-standalone",
+			ServiceName:         statefulSetName,
 			Replicas:            &replicas,
 			PodManagementPolicy: appsv1.ParallelPodManagement,
 			Selector: &metav1.LabelSelector{
-				MatchLabels: serviceSelectorLabels(cluster.Name, "standalone"),
+				MatchLabels: serviceSelectorLabels(cluster.Name, component),
 			},
 			VolumeClaimTemplates: volumeClaimTemplates,
 		},
@@ -3153,7 +3186,7 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 			}
 		}
 		volumeMounts := []corev1.VolumeMount{
-			{Name: "standalone-storage", MountPath: "/antflydb"},
+			{Name: storageVolumeName, MountPath: "/antflydb"},
 			{Name: "config", MountPath: "/config"},
 		}
 		volumes := []corev1.Volume{
@@ -3167,7 +3200,7 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 		if activatedSeedGate {
 			required := *startupGate.RequiredReceipt
 			volumes = append(volumes,
-				corev1.Volume{Name: "standalone-storage", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: required.TargetPVCName}}},
+				corev1.Volume{Name: storageVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: required.TargetPVCName}}},
 				corev1.Volume{Name: haSeedGenerationVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: required.TargetPVCName}}},
 			)
 			volumeMounts = append(volumeMounts, corev1.VolumeMount{
@@ -3177,14 +3210,14 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 		}
 		statefulSet.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
-				Labels:      podLabels(cluster, "standalone"),
+				Labels:      podLabels(cluster, component),
 				Annotations: podAnnotations,
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: runtimeServiceAccountName,
 				SecurityContext:    antflyPodSecurityContext(),
 				InitContainers: []corev1.Container{
-					r.buildStorageInitContainer("standalone-storage"),
+					r.buildStorageInitContainer(storageVolumeName),
 				},
 				Containers: []corev1.Container{
 					{
@@ -3283,7 +3316,7 @@ exec /antfly standalone --id %d --config /config/config.json \
 		r.applyEKSPodSpec(&statefulSet.Spec.Template, cluster, false)
 
 		isGKEAutopilot := cluster.Spec.GKE != nil && cluster.Spec.GKE.Autopilot
-		applyDefaultZoneTopologySpread(statefulSet, &statefulSet.Spec.Template, "standalone", cluster.Name,
+		applyDefaultZoneTopologySpread(statefulSet, &statefulSet.Spec.Template, component, cluster.Name,
 			standalone.TopologySpreadConstraints, isGKEAutopilot)
 
 		return nil
@@ -4036,7 +4069,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		}
 
 		standaloneSts := &appsv1.StatefulSet{}
-		if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-standalone", Namespace: cluster.Namespace}, standaloneSts); err != nil && !errors.IsNotFound(err) {
+		if err := r.Get(ctx, types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}, standaloneSts); err != nil && !errors.IsNotFound(err) {
 			return err
 		}
 
@@ -4069,7 +4102,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		}
 
 		var podList corev1.PodList
-		if err := r.List(ctx, &podList, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, "standalone"))); err != nil {
+		if err := r.List(ctx, &podList, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, standaloneComponent(cluster)))); err != nil {
 			return err
 		}
 		for _, pod := range podList.Items {
@@ -11152,13 +11185,13 @@ func statefulSetRolloutAppearsBlocked(sts *appsv1.StatefulSet, replicas int32) b
 func (r *AntflyClusterReconciler) repairBlockedStatefulSetRollouts(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
 	if effectiveTopologyMode(cluster) == topologyModeStandalone {
 		standaloneSts := &appsv1.StatefulSet{}
-		if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-standalone", Namespace: cluster.Namespace}, standaloneSts); err != nil {
+		if err := r.Get(ctx, types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}, standaloneSts); err != nil {
 			if !errors.IsNotFound(err) {
 				return false, err
 			}
 			return false, nil
 		}
-		return r.repairBlockedStatefulSetRollout(ctx, cluster, standaloneSts, "standalone")
+		return r.repairBlockedStatefulSetRollout(ctx, cluster, standaloneSts, standaloneComponent(cluster))
 	}
 
 	metadataSts := &appsv1.StatefulSet{}
@@ -12158,7 +12191,7 @@ func (r *AntflyClusterReconciler) checkPVCTopologyHealth(ctx context.Context, cl
 	mode := effectiveTopologyMode(cluster)
 	components := []string{"metadata", "data"}
 	if mode == topologyModeStandalone {
-		components = []string{"standalone"}
+		components = []string{standaloneComponent(cluster)}
 	}
 
 	// Check pods for topology issues
@@ -12257,7 +12290,7 @@ func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 func (r *AntflyClusterReconciler) requestsForPod(ctx context.Context, obj client.Object) []reconcile.Request {
 	clusterName := obj.GetLabels()["app.kubernetes.io/instance"]
 	component := obj.GetLabels()["app.kubernetes.io/component"]
-	if clusterName == "" || (component != "metadata" && component != "data" && component != "standalone") {
+	if clusterName == "" || (component != "metadata" && component != "data" && component != "standalone" && component != "swarm") {
 		return nil
 	}
 	cluster := &antflyv1.AntflyCluster{}

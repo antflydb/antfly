@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
     // Server-side subcommands
     if (std.mem.eql(u8, subcommand, "data")) return try cmd.data.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "metadata")) return try cmd.metadata.runFromIterator(runtimeInit(init), argv0, &args);
-    if (std.mem.eql(u8, subcommand, "standalone")) return try cmd.standalone.runFromIterator(runtimeInit(init), argv0, &args);
+    if (isStandaloneSubcommand(subcommand)) return try cmd.standalone.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "inference")) return try cmd.inference.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "serverless")) return try cmd.serverless.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "lite")) return try cmd.lite.runFromIterator(runtimeInit(init), argv0, &args);
@@ -85,6 +85,16 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("unknown subcommand: {s}\n", .{subcommand});
     printUsage(argv0);
     return error.InvalidArguments;
+}
+
+fn isStandaloneSubcommand(subcommand: []const u8) bool {
+    return std.mem.eql(u8, subcommand, "standalone") or std.mem.eql(u8, subcommand, "swarm");
+}
+
+test "legacy swarm subcommand selects the standalone runtime" {
+    try std.testing.expect(isStandaloneSubcommand("standalone"));
+    try std.testing.expect(isStandaloneSubcommand("swarm"));
+    try std.testing.expect(!isStandaloneSubcommand("data"));
 }
 
 fn cliHelpRequested(args: *std.process.Args.Iterator) bool {
