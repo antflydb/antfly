@@ -18,7 +18,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
-const platform_clock = @import("../../../platform/clock.zig");
+const platform_clock = @import("antfly_platform").clock;
 const background_runtime_mod = @import("../../background_runtime.zig");
 
 pub const Config = struct {

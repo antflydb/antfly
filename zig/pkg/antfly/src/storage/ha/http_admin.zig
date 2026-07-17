@@ -883,7 +883,7 @@ pub const Server = struct {
                 .role = config.role,
                 .pod_uid = config.pod_uid,
                 .fenced = fenced,
-                .observed_at_unix_ns = @import("../../platform/time.zig").realtimeNs(),
+                .observed_at_unix_ns = @import("antfly_platform").time.realtimeNs(),
             },
         }) catch |err| return try textResponse(self.alloc, 500, @errorName(err));
         defer page.deinit(self.alloc);

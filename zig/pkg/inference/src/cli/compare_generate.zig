@@ -741,10 +741,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         defer allocator.free(onnx_first.text);
         print("onnx_first_token: id={d} text={s}\n", .{ onnx_first.token_id, onnx_first.text });
         return;
-    } else if (try ortgenai.prepareGenerativeModelPackage(allocator, opts.reference_model_dir)) |prepared_value| {
-        var prepared_package = prepared_value;
-        defer prepared_package.deinit();
-        const onnx_model_dir = prepared_package.path;
+    } else if (try ortgenai.prepareGenerativeModelPackage(allocator, opts.reference_model_dir)) |onnx_model_dir| {
+        defer allocator.free(onnx_model_dir);
         const onnx_prompt = try allocator.dupe(u8, native.prompt);
         defer allocator.free(onnx_prompt);
         print("native_prompt == onnx_prompt: {}\n", .{true});

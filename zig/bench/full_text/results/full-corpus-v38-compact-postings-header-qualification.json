@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "status": "accepted_compact_postings_header",
+  "comparison_boundary": "settled_persisted_search_index_only",
+  "corpus": {
+    "documents": 5032105,
+    "normalized_bytes": 8473678432,
+    "sha256": "9078d9ea4783ab764fe246046efdc8062692f07afdd7c8749a74ebfe05c51ff4"
+  },
+  "format": {
+    "wire_version": 38,
+    "accepted_reader_versions": [23, 38],
+    "branch_only_rejected_versions": "24_through_37",
+    "derived_header_fields": [
+      "posting_block_count_from_document_frequency_and_configured_block_size",
+      "compact_chunk_metadata_length_from_block_count_and_two_width_bytes",
+      "skip_length_from_block_count_and_fixed_checkpoint_stride"
+    ],
+    "single_block_omissions": [
+      "impact_count_is_one",
+      "impact_range_id_length_is_zero"
+    ],
+    "pruning_layout_changed": false,
+    "payload_layout_changed": false,
+    "position_layout_changed": false
+  },
+  "full_corpus": {
+    "segments": 10,
+    "completed_merges": 267,
+    "pending_failed_or_quarantined_merges": 0,
+    "v35_index_bytes": 3409369089,
+    "v38_index_bytes": 3385816859,
+    "bytes_saved": 23552230,
+    "percent_saved": 0.690809,
+    "v35_header_bytes": 78864502,
+    "v38_header_bytes": 55444699,
+    "header_bytes_saved": 23419803,
+    "tantivy_index_bytes": 3251494143,
+    "gap_to_tantivy_bytes": 134322716,
+    "ratio_to_tantivy": 1.041311
+  },
+  "indexing": {
+    "v35_wall_ns": 446541206000,
+    "v38_wall_ns": 421345216000,
+    "wall_change_percent": -5.642,
+    "v35_cpu_ns": 430531570000,
+    "v38_cpu_ns": 407516166000,
+    "cpu_change_percent": -5.346,
+    "v35_peak_rss_bytes": 1657978880,
+    "v38_peak_rss_bytes": 1924825088,
+    "rss_change_percent": 16.095,
+    "tantivy_peak_rss_bytes": 2810429440,
+    "v38_rss_advantage_vs_tantivy_percent": 31.511,
+    "rss_decision": "accepted_as_known_merge_residency_variance_below_the_tantivy_reference_not_claimed_as_an_rss_improvement"
+  },
+  "query_cpu_per_query_ns": {
+    "adjacent_v35_control": {
+      "term": 48770,
+      "union": 201578,
+      "intersection": 176655,
+      "phrase": 457047
+    },
+    "v38_runs": {
+      "term": [48576, 48778, 49589],
+      "union": [189182, 195474, 196824],
+      "intersection": [161956, 161827, 172000],
+      "phrase": [448422, 412431, 464917]
+    },
+    "v38_mean": {
+      "term": 48981,
+      "union": 193826.667,
+      "intersection": 165261,
+      "phrase": 441923.333
+    },
+    "change_percent_vs_adjacent_v35": {
+      "term": 0.433,
+      "union": -3.845,
+      "intersection": -6.450,
+      "phrase": -3.309
+    },
+    "peak_rss_bytes": 24264704
+  },
+  "correctness": {
+    "full_corpus_strict_matches": "5_of_5_for_each_v38_run",
+    "phrase_candidates": 3571,
+    "phrase_position_records_decoded": 7142,
+    "phrase_matches": 525,
+    "focused_release_tests": "58_of_58_zero_failures_zero_leaks",
+    "origin_main_v23_reopen": true
+  },
+  "projection_audit": {
+    "tool": "search-impact-layout-analyze",
+    "impact_records": 86011352,
+    "current_v35_impact_bytes": 141577404,
+    "exact_adaptive_column_projected_bytes": 123238361,
+    "exact_adaptive_column_net_saving_bytes": 18296976,
+    "adaptive_terms": 259540,
+    "raw_fallback_terms": 4521636,
+    "decision": "do_not_add_a_hot_path_adaptive_bound_codec_for_only_0.54_percent_total_index_saving_without_new_profile_evidence"
+  },
+  "artifacts": {
+    "v38_full": "/private/tmp/antfly-wiki-full-production-v38-compact-header",
+    "v38_repeat": "/private/tmp/antfly-wiki-full-production-v38-compact-header-repeat",
+    "v38_repeat_2": "/private/tmp/antfly-wiki-full-production-v38-compact-header-repeat2",
+    "v35_adjacent_control": "/private/tmp/antfly-wiki-full-production-v35-compact-header-adjacent-control",
+    "v38_index": "/private/tmp/antfly-wiki-full-production-v38-compact-header-index"
+  }
+}

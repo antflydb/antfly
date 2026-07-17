@@ -540,12 +540,6 @@ pub const PromptPrefixCache = struct {
         return self.config.enabled and self.pool_id != null;
     }
 
-    pub fn participatesInBudget(self: *PromptPrefixCache) bool {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
-        return self.config.enabled;
-    }
-
     fn findExact(self: *const PromptPrefixCache, namespace: []const u8, tokens: []const i64) ?usize {
         for (self.entries.items, 0..) |entry, idx| {
             if (std.mem.eql(u8, entry.namespace, namespace) and std.mem.eql(i64, entry.tokens, tokens)) return idx;

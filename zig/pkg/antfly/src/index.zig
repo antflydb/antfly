@@ -33,6 +33,15 @@ const roaring = @import("encoding/roaring.zig");
 const scorer_mod = @import("search/scorer.zig");
 const query_mod = @import("search/query.zig");
 const distributed_stats_mod = @import("search/distributed_stats.zig");
+const platform_time = @import("antfly_platform").time;
+const resource_manager_mod = @import("storage/resource_manager.zig");
+
+const mapped_residency_cold: u8 = 0;
+const mapped_residency_resident: u8 = 1;
+const mapped_residency_evicting: u8 = 2;
+const mapped_residency_check_interval_ns: u64 = std.time.ns_per_s;
+const mapped_residency_recent_ns: u64 = 30 * std.time.ns_per_s;
+const mapped_residency_hard_min_age_ns: u64 = 5 * std.time.ns_per_s;
 
 fn spinOrYield() void {
     if (@import("builtin").os.tag == .freestanding) {
@@ -123,6 +132,12 @@ pub const SegmentData = union(enum) {
 /// leaked snapshot pinned every future generation).
 pub const SegmentShared = struct {
     ref_count: u32,
+    /// Conservative per-mapping residency state. The virtual mapping remains
+    /// intact when this transitions to cold; only clean file-backed pages are
+    /// advised away. A subsequent query marks the segment resident again.
+    mapped_residency_state: std.atomic.Value(u8) = .init(mapped_residency_cold),
+    last_mapped_access_ns: std.atomic.Value(u64) = .init(0),
+    active_mapped_readers: std.atomic.Value(u32) = .init(0),
     /// Deletion bitmap shared by every snapshot referencing this segment.
     /// Mutated only under the writer mutex. Readers of older snapshots may
     /// observe deletions made after their snapshot was taken — acceptable
@@ -133,6 +148,11 @@ pub const SegmentShared = struct {
     /// Set when the segment is replaced/removed from the live index. Runs
     /// once the last reference dies, after resources are deinited.
     retired_cleanup: ?RetiredSegmentCleanup = null,
+
+    fn noteMappedAccess(self: *SegmentShared) void {
+        self.last_mapped_access_ns.store(platform_time.monotonicNs(), .release);
+        self.mapped_residency_state.store(mapped_residency_resident, .release);
+    }
 };
 
 pub const SegmentEntry = struct {
@@ -141,6 +161,30 @@ pub const SegmentEntry = struct {
     reader: segment_mod.SegmentReader,
     layout_stats: segment_mod.SegmentLayoutStats = .{},
     shared: *SegmentShared,
+
+    fn initShared(shared: *SegmentShared, data: SegmentData) void {
+        shared.* = .{ .ref_count = 1 };
+        if (data.isFileBacked()) {
+            // Opening a segment reads headers and dictionaries. Count the
+            // whole mapping conservatively until the owner advises it cold.
+            shared.mapped_residency_state.store(mapped_residency_resident, .release);
+        }
+    }
+
+    pub fn noteAccess(self: *const SegmentEntry) void {
+        if (self.data.isFileBacked()) self.shared.noteMappedAccess();
+    }
+
+    pub fn beginAccess(self: *const SegmentEntry) void {
+        if (!self.data.isFileBacked()) return;
+        _ = self.shared.active_mapped_readers.fetchAdd(1, .acq_rel);
+        self.shared.noteMappedAccess();
+    }
+
+    pub fn endAccess(self: *const SegmentEntry) void {
+        if (!self.data.isFileBacked()) return;
+        _ = self.shared.active_mapped_readers.fetchSub(1, .acq_rel);
+    }
 
     fn retain(self: *const SegmentEntry) void {
         _ = @atomicRmw(u32, &self.shared.ref_count, .Add, 1, .monotonic);
@@ -205,6 +249,10 @@ const LiveDocCollector = struct {
 
     pub fn minCompetitiveScore(self: *const LiveDocCollector) f32 {
         return self.base.minCompetitiveScore();
+    }
+
+    pub fn worstCompetitiveDocId(self: *const LiveDocCollector) ?u32 {
+        return self.base.worstCompetitiveDocId();
     }
 
     pub fn markLowerBound(self: *LiveDocCollector) void {
@@ -277,6 +325,15 @@ const TermDocFreqCache = std.HashMapUnmanaged(
     std.hash_map.default_max_load_percentage,
 );
 
+const BM25BoundTableKey = struct {
+    avg_doc_len_bits: u32,
+    k1_bits: u32,
+    b_bits: u32,
+};
+
+const BM25BoundTableCache = std.AutoHashMapUnmanaged(BM25BoundTableKey, *inverted.BM25BoundTable);
+const max_bm25_bound_tables_per_snapshot: usize = 4;
+
 /// Immutable, ref-counted snapshot of the index state.
 ///
 /// Snapshots obtained via `acquireSnapshot()` must be released via `release()`.
@@ -298,6 +355,8 @@ pub const IndexSnapshot = struct {
     term_doc_freq_cache: TermDocFreqCache,
     term_doc_freq_cache_hits: u64,
     term_doc_freq_cache_misses: u64,
+    bm25_bound_table_cache_mu: std.atomic.Mutex,
+    bm25_bound_table_cache: BM25BoundTableCache,
     /// Increment reference count. Returns self for chaining.
     pub fn retain(self: *IndexSnapshot) *IndexSnapshot {
         _ = @atomicRmw(u32, &self.ref_count, .Add, 1, .monotonic);
@@ -334,8 +393,41 @@ pub const IndexSnapshot = struct {
             while (cache_it.next()) |key| alloc.free(key.storage);
             self.term_doc_freq_cache.deinit(alloc);
         }
+        {
+            const cache_mu = &self.bm25_bound_table_cache_mu;
+            while (!cache_mu.tryLock()) spinOrYield();
+            defer cache_mu.unlock();
+            var table_it = self.bm25_bound_table_cache.valueIterator();
+            while (table_it.next()) |table| alloc.destroy(table.*);
+            self.bm25_bound_table_cache.deinit(alloc);
+        }
         self.global_total_field_len.deinit(alloc);
         alloc.destroy(self);
+    }
+
+    fn bm25BoundTable(
+        self: *const IndexSnapshot,
+        avg_doc_len: f32,
+        config: inverted.BM25Config,
+    ) !?*const inverted.BM25BoundTable {
+        const key = BM25BoundTableKey{
+            .avg_doc_len_bits = @bitCast(avg_doc_len),
+            .k1_bits = @bitCast(config.k1),
+            .b_bits = @bitCast(config.b),
+        };
+        const mutable = @constCast(self);
+        const cache_mu = &mutable.bm25_bound_table_cache_mu;
+        while (!cache_mu.tryLock()) spinOrYield();
+        defer cache_mu.unlock();
+
+        if (mutable.bm25_bound_table_cache.get(key)) |table| return table;
+        if (mutable.bm25_bound_table_cache.count() >= max_bm25_bound_tables_per_snapshot) return null;
+
+        const table = try self.alloc.create(inverted.BM25BoundTable);
+        errdefer self.alloc.destroy(table);
+        table.* = inverted.BM25BoundTable.init(avg_doc_len, config);
+        try mutable.bm25_bound_table_cache.put(self.alloc, key, table);
+        return table;
     }
 
     /// Search across all segments for the given terms in a field.
@@ -350,6 +442,29 @@ pub const IndexSnapshot = struct {
         return self.searchWithOverride(alloc, field, terms, k, null);
     }
 
+    pub fn searchWithConfig(
+        self: *const IndexSnapshot,
+        alloc: Allocator,
+        field: []const u8,
+        terms: []const []const u8,
+        k: u32,
+        bm25_config: inverted.BM25Config,
+    ) !scorer_mod.SearchResults {
+        return self.searchWithOverrideAndConfig(alloc, field, terms, k, null, bm25_config);
+    }
+
+    pub fn searchWithConfigDiagnostics(
+        self: *const IndexSnapshot,
+        alloc: Allocator,
+        field: []const u8,
+        terms: []const []const u8,
+        k: u32,
+        bm25_config: inverted.BM25Config,
+        diagnostics: *scorer_mod.SearchDiagnostics,
+    ) !scorer_mod.SearchResults {
+        return self.searchInternal(alloc, field, terms, k, null, bm25_config, diagnostics);
+    }
+
     pub fn searchWithOverride(
         self: *const IndexSnapshot,
         alloc: Allocator,
@@ -358,13 +473,43 @@ pub const IndexSnapshot = struct {
         k: u32,
         override: ?distributed_stats_mod.TextFieldStats,
     ) !scorer_mod.SearchResults {
+        return self.searchWithOverrideAndConfig(alloc, field, terms, k, override, .{});
+    }
+
+    pub fn searchWithOverrideAndConfig(
+        self: *const IndexSnapshot,
+        alloc: Allocator,
+        field: []const u8,
+        terms: []const []const u8,
+        k: u32,
+        override: ?distributed_stats_mod.TextFieldStats,
+        bm25_config: inverted.BM25Config,
+    ) !scorer_mod.SearchResults {
+        return self.searchInternal(alloc, field, terms, k, override, bm25_config, null);
+    }
+
+    fn searchInternal(
+        self: *const IndexSnapshot,
+        alloc: Allocator,
+        field: []const u8,
+        terms: []const []const u8,
+        k: u32,
+        override: ?distributed_stats_mod.TextFieldStats,
+        bm25_config: inverted.BM25Config,
+        diagnostics: ?*scorer_mod.SearchDiagnostics,
+    ) !scorer_mod.SearchResults {
         if (self.global_doc_count == 0 or terms.len == 0) return .{ .hits = try alloc.alloc(scorer_mod.ScoredHit, 0), .total_count = 0 };
 
         const global_doc_count = if (override) |stats| stats.global_doc_count else self.global_doc_count;
         if (global_doc_count == 0) return .{ .hits = try alloc.alloc(scorer_mod.ScoredHit, 0), .total_count = 0 };
         const avg_dl = if (override) |stats| stats.avgDocLen() else self.avgDocLen(field);
-        const term_doc_freqs = try alloc.alloc(u32, terms.len);
-        defer alloc.free(term_doc_freqs);
+        const bound_table = try self.bm25BoundTable(avg_dl, bm25_config);
+        var term_doc_freq_stack: [16]u32 = undefined;
+        const term_doc_freqs = if (terms.len <= term_doc_freq_stack.len)
+            term_doc_freq_stack[0..terms.len]
+        else
+            try alloc.alloc(u32, terms.len);
+        defer if (terms.len > term_doc_freq_stack.len) alloc.free(term_doc_freqs);
         for (terms, 0..) |term, i| {
             term_doc_freqs[i] = if (override) |stats|
                 stats.termDocFreq(term) orelse try self.termDocFreq(alloc, field, term)
@@ -377,16 +522,83 @@ pub const IndexSnapshot = struct {
         var collector = scorer_mod.TopKCollector.init(alloc, k);
         defer collector.deinit();
 
+        // Computing query-specific bounds opens every segment dictionary and
+        // walks each term's block-max table before opening them again for
+        // scoring. On a healthy tiered index (normally <= 10 segments), that
+        // fixed work costs more than it saves. Reserve global segment ordering
+        // for genuinely fragmented snapshots where pruning can amortize the
+        // prepass; WAND still performs block-level pruning inside every
+        // segment in the normal production state.
+        const use_segment_bound_planning = self.segments.len > 16;
+
+        const SegmentPlan = struct {
+            segment_idx: usize,
+            doc_offset: u32,
+            score_upper_bound: f32,
+        };
+        var single_plan_storage: [1]SegmentPlan = undefined;
+        const plans = if (self.segments.len <= single_plan_storage.len)
+            single_plan_storage[0..self.segments.len]
+        else
+            try alloc.alloc(SegmentPlan, self.segments.len);
+        defer if (self.segments.len > single_plan_storage.len) alloc.free(plans);
         var doc_offset: u32 = 0;
-        for (self.segments) |*seg| {
+        for (self.segments, 0..) |*seg, segment_idx| {
+            var upper_bound: f32 = std.math.inf(f32);
+            if (use_segment_bound_planning) {
+                upper_bound = 0;
+                if (try seg.reader.invertedIndex(field)) |inv_reader| {
+                    for (terms, 0..) |term, term_idx| {
+                        const lookup_result = inv_reader.lookup(term) orelse continue;
+                        const df = if (term_doc_freqs[term_idx] != 0) term_doc_freqs[term_idx] else lookup_result.docFreq();
+                        upper_bound += switch (lookup_result) {
+                            .postings => |p| if (p.block_max) |block_max|
+                                block_max.maxImpactAll(global_doc_count, df, avg_dl, bm25_config)
+                            else
+                                inverted.bm25MaxScore(global_doc_count, df, bm25_config),
+                            .one_hit => |hit| inverted.bm25Score(1, hit.norm_bits, global_doc_count, df, avg_dl, bm25_config),
+                        };
+                    }
+                }
+            }
+            plans[segment_idx] = .{
+                .segment_idx = segment_idx,
+                .doc_offset = doc_offset,
+                .score_upper_bound = upper_bound,
+            };
+            doc_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch return error.CountOverflow;
+        }
+        if (use_segment_bound_planning) {
+            std.mem.sort(SegmentPlan, plans, {}, struct {
+                fn lessThan(_: void, a: SegmentPlan, b: SegmentPlan) bool {
+                    if (a.score_upper_bound == b.score_upper_bound) return a.segment_idx < b.segment_idx;
+                    return a.score_upper_bound > b.score_upper_bound;
+                }
+            }.lessThan);
+        }
+        if (diagnostics) |diag| diag.segments_considered +|= @intCast(plans.len);
+
+        for (plans) |plan| {
+            const seg = &self.segments[plan.segment_idx];
+            // Strict inequality preserves deterministic tie-breaking: a
+            // segment whose bound equals the threshold may still contain a
+            // lower document ID at the cutoff.
+            const threshold = collector.minCompetitiveScore();
+            if (threshold > 0 and plan.score_upper_bound < threshold) {
+                collector.markLowerBound();
+                if (diagnostics) |diag| diag.segments_pruned +|= 1;
+                continue;
+            }
+            seg.beginAccess();
+            defer seg.endAccess();
             const inv_reader = (try seg.reader.invertedIndex(field)) orelse {
-                doc_offset += seg.reader.doc_count;
                 continue;
             };
 
             {
-                var wand = scorer_mod.WANDScorer.init(alloc, k, global_doc_count, avg_dl, .{});
+                var wand = scorer_mod.WANDScorer.init(alloc, k, global_doc_count, avg_dl, bm25_config);
                 defer wand.deinit();
+                if (bound_table) |table| wand.setBoundTable(table);
                 var added_terms: usize = 0;
 
                 for (terms, 0..) |term, term_idx| {
@@ -398,7 +610,7 @@ pub const IndexSnapshot = struct {
                         .one_hit => null,
                     };
                     const chunk_size: u32 = switch (lookup_result) {
-                        .postings => |p| p.chunk_size,
+                        .postings => |p| p.scoringChunkSize(),
                         .one_hit => 1024,
                     };
 
@@ -407,26 +619,26 @@ pub const IndexSnapshot = struct {
                         if (term_doc_freqs[term_idx] != 0) term_doc_freqs[term_idx] else lookup_result.docFreq(),
                         block_max,
                         chunk_size,
-                        doc_offset,
+                        plan.doc_offset,
                     );
                     added_terms += 1;
                 }
 
                 if (added_terms == 0) {
-                    doc_offset += seg.reader.doc_count;
                     continue;
                 }
+                if (diagnostics) |diag| diag.segments_searched +|= 1;
 
                 var live_collector = LiveDocCollector{
                     .base = &collector,
-                    .doc_offset = doc_offset,
+                    .doc_offset = plan.doc_offset,
                 };
                 if (seg.shared.deleted) |*deleted| {
                     live_collector.deleted = deleted;
                 }
                 try wand.executeInto(&live_collector);
+                if (diagnostics) |diag| diag.addWand(&wand);
             }
-            doc_offset += seg.reader.doc_count;
         }
 
         return collector.finishOwned();
@@ -435,6 +647,11 @@ pub const IndexSnapshot = struct {
     /// Execute a filter across all segments, returning matching global doc IDs.
     pub fn executeFilter(self: *const IndexSnapshot, alloc: Allocator, filter: query_mod.Filter) ![]u32 {
         return query_mod.executeFilter(alloc, self, filter);
+    }
+
+    /// Count filter matches without materializing global document IDs.
+    pub fn countFilter(self: *const IndexSnapshot, alloc: Allocator, filter: query_mod.Filter) !usize {
+        return query_mod.countFilter(alloc, self, filter);
     }
 
     /// Map a global doc ID back to the segment and local doc ID.
@@ -453,11 +670,13 @@ pub const IndexSnapshot = struct {
     /// Get a stored document by global doc ID.
     pub fn storedDoc(self: *const IndexSnapshot, global_id: u32) ?segment_mod.SegmentReader.StoredDocRef {
         const resolved = self.resolveDocId(global_id) orelse return null;
+        self.segments[resolved.seg_idx].noteAccess();
         return self.segments[resolved.seg_idx].reader.storedDoc(resolved.local_id);
     }
 
     pub fn docOrdinal(self: *const IndexSnapshot, global_id: u32) !?u32 {
         const resolved = self.resolveDocId(global_id) orelse return null;
+        self.segments[resolved.seg_idx].noteAccess();
         return try self.segments[resolved.seg_idx].reader.docOrdinal(resolved.local_id);
     }
 
@@ -467,6 +686,7 @@ pub const IndexSnapshot = struct {
 
     pub fn storedDocDecompressed(self: *const IndexSnapshot, alloc: Allocator, global_id: u32) !?DecompressedDoc {
         const resolved = self.resolveDocId(global_id) orelse return null;
+        self.segments[resolved.seg_idx].noteAccess();
         const result = (try self.segments[resolved.seg_idx].reader.storedDocDecompressed(alloc, resolved.local_id)) orelse return null;
         return DecompressedDoc{ .id = result.id, .data = result.data };
     }
@@ -583,11 +803,63 @@ pub const IndexSnapshot = struct {
         return self.avgDocLen(field);
     }
 
+    /// Return the exact scoring inputs for one term/document pair. This is a
+    /// read-only engineering diagnostic used by the correctness-gated search
+    /// kernel benchmark; production search does not call it.
+    pub fn textTermStats(
+        self: *const IndexSnapshot,
+        alloc: Allocator,
+        field: []const u8,
+        term: []const u8,
+        doc_ordinal: u32,
+    ) !?TextTermStats {
+        const doc_nums = try self.docNumsForOrdinalsAlloc(alloc, &.{doc_ordinal});
+        defer alloc.free(doc_nums);
+        if (doc_nums.len != 1) return null;
+
+        const resolved = self.resolveDocId(doc_nums[0]) orelse return null;
+        const inv_reader = (try self.segments[resolved.seg_idx].reader.invertedIndex(field)) orelse return null;
+        const lookup = inv_reader.lookup(term) orelse return null;
+        var postings = try lookup.iterator(alloc);
+        defer postings.deinit();
+        const hit = (try postings.advanceTo(resolved.local_id)) orelse return null;
+        if (hit.doc_id != resolved.local_id) return null;
+
+        const total_field_len = self.global_total_field_len.get(field) orelse 0;
+        const document_frequency = try self.termDocFreq(alloc, field, term);
+        return .{
+            .global_doc_count = self.global_doc_count,
+            .total_field_len = total_field_len,
+            .average_doc_length = self.avgDocLen(field),
+            .document_frequency = document_frequency,
+            .document_length = hit.norm,
+            .term_frequency = hit.freq,
+            .score = inverted.bm25Score(
+                hit.freq,
+                hit.norm,
+                self.global_doc_count,
+                document_frequency,
+                self.avgDocLen(field),
+                .{},
+            ),
+        };
+    }
+
     fn avgDocLen(self: *const IndexSnapshot, field: []const u8) f32 {
         if (self.global_doc_count == 0) return 0;
         const total = self.global_total_field_len.get(field) orelse 0;
         return @as(f32, @floatFromInt(total)) / @as(f32, @floatFromInt(self.global_doc_count));
     }
+};
+
+pub const TextTermStats = struct {
+    global_doc_count: u32,
+    total_field_len: u64,
+    average_doc_length: f32,
+    document_frequency: u32,
+    document_length: u32,
+    term_frequency: u32,
+    score: f32,
 };
 
 fn containsOrdinal(ordinals: []const u32, expected: u32) bool {
@@ -638,6 +910,11 @@ pub const IndexWriter = struct {
     next_segment_id: u64,
     next_epoch: u64,
     retired_segment_cleanup: ?RetiredSegmentCleanup = null,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    mapped_residency_mu: std.atomic.Mutex,
+    mapped_residency_accounted_bytes: u64,
+    mapped_residency_next_check_ns: std.atomic.Value(u64),
+    mapped_residency_evictions: u64,
 
     pub fn lockMutex(self: *IndexWriter) void {
         while (!self.mu.tryLock()) {
@@ -671,6 +948,8 @@ pub const IndexWriter = struct {
             .term_doc_freq_cache = .empty,
             .term_doc_freq_cache_hits = 0,
             .term_doc_freq_cache_misses = 0,
+            .bm25_bound_table_cache_mu = .unlocked,
+            .bm25_bound_table_cache = .empty,
         };
         return .{
             .alloc = alloc,
@@ -680,7 +959,23 @@ pub const IndexWriter = struct {
             .next_segment_id = 1,
             .next_epoch = 1,
             .retired_segment_cleanup = null,
+            .resource_manager = null,
+            .mapped_residency_mu = .unlocked,
+            .mapped_residency_accounted_bytes = 0,
+            .mapped_residency_next_check_ns = .init(0),
+            .mapped_residency_evictions = 0,
         };
+    }
+
+    pub fn attachResourceManager(self: *IndexWriter, manager: *resource_manager_mod.ResourceManager) void {
+        self.lockMappedResidencyMutex();
+        self.resource_manager = manager;
+        self.mapped_residency_next_check_ns.store(0, .release);
+        self.mapped_residency_mu.unlock();
+
+        const snap = self.acquireSnapshotRaw();
+        defer snap.release();
+        self.maybeMaintainMappedResidency(snap, platform_time.monotonicNs());
     }
 
     pub fn setRetiredSegmentCleanup(self: *IndexWriter, cleanup: ?RetiredSegmentCleanup) void {
@@ -688,6 +983,17 @@ pub const IndexWriter = struct {
     }
 
     pub fn deinit(self: *IndexWriter) void {
+        self.lockMappedResidencyMutex();
+        if (self.resource_manager) |manager| {
+            manager.observeUsage(
+                .full_text_segment_residency,
+                &self.mapped_residency_accounted_bytes,
+                0,
+            );
+        }
+        self.resource_manager = null;
+        self.mapped_residency_mu.unlock();
+
         // Releases the writer's reference; with no outstanding readers this
         // frees the snapshot and drops the final reference on every live
         // segment (whose cells carry no retired cleanup, so closing an index
@@ -708,9 +1014,138 @@ pub const IndexWriter = struct {
     /// Load+retain happens under snapshot_mu so a concurrent publish cannot
     /// release the loaded snapshot to zero before we retain it.
     pub fn acquireSnapshot(self: *IndexWriter) *IndexSnapshot {
+        const snap = self.acquireSnapshotRaw();
+        self.maybeMaintainMappedResidency(snap, platform_time.monotonicNs());
+        return snap;
+    }
+
+    fn acquireSnapshotRaw(self: *IndexWriter) *IndexSnapshot {
         self.lockSnapshotMutex();
         defer self.snapshot_mu.unlock();
         return @atomicLoad(*IndexSnapshot, &self.current, .acquire).retain();
+    }
+
+    fn lockMappedResidencyMutex(self: *IndexWriter) void {
+        while (!self.mapped_residency_mu.tryLock()) spinOrYield();
+    }
+
+    pub const MappedResidencyStats = struct {
+        virtual_mapped_bytes: u64 = 0,
+        estimated_resident_bytes: u64 = 0,
+        recently_touched_bytes: u64 = 0,
+        cold_mapped_bytes: u64 = 0,
+        eviction_count: u64 = 0,
+    };
+
+    fn mappedResidencyStatsForSnapshot(self: *const IndexWriter, snap: *const IndexSnapshot, now_ns: u64) MappedResidencyStats {
+        var stats = MappedResidencyStats{ .eviction_count = self.mapped_residency_evictions };
+        for (snap.segments) |*seg| {
+            if (!seg.data.isFileBacked()) continue;
+            const bytes: u64 = @intCast(seg.data.bytes().len);
+            stats.virtual_mapped_bytes +|= bytes;
+            if (seg.shared.mapped_residency_state.load(.acquire) != mapped_residency_cold) {
+                stats.estimated_resident_bytes +|= bytes;
+            } else {
+                stats.cold_mapped_bytes +|= bytes;
+            }
+            const last_access_ns = seg.shared.last_mapped_access_ns.load(.acquire);
+            if (last_access_ns != 0 and now_ns -| last_access_ns <= mapped_residency_recent_ns) {
+                stats.recently_touched_bytes +|= bytes;
+            }
+        }
+        return stats;
+    }
+
+    pub fn mappedResidencyStats(self: *IndexWriter) MappedResidencyStats {
+        const snap = self.acquireSnapshotRaw();
+        defer snap.release();
+        self.lockMappedResidencyMutex();
+        defer self.mapped_residency_mu.unlock();
+        return self.mappedResidencyStatsForSnapshot(snap, platform_time.monotonicNs());
+    }
+
+    fn maybeMaintainMappedResidency(self: *IndexWriter, snap: *IndexSnapshot, now_ns: u64) void {
+        const scheduled_ns = self.mapped_residency_next_check_ns.load(.acquire);
+        if (scheduled_ns != 0 and now_ns < scheduled_ns) return;
+        if (self.mapped_residency_next_check_ns.cmpxchgStrong(
+            scheduled_ns,
+            now_ns +| mapped_residency_check_interval_ns,
+            .acq_rel,
+            .acquire,
+        ) != null) return;
+        self.maintainMappedResidencyAt(snap, now_ns);
+    }
+
+    fn maintainMappedResidencyAt(self: *IndexWriter, snap: *IndexSnapshot, now_ns: u64) void {
+        self.lockMappedResidencyMutex();
+        defer self.mapped_residency_mu.unlock();
+
+        const manager = self.resource_manager orelse return;
+        var stats = self.mappedResidencyStatsForSnapshot(snap, now_ns);
+        manager.observeUsage(
+            .full_text_segment_residency,
+            &self.mapped_residency_accounted_bytes,
+            stats.estimated_resident_bytes,
+        );
+
+        var decision = manager.pressureDecision(.full_text_segment_residency);
+        if (decision.action != .shrink_cache or decision.pressure == .normal) return;
+        const min_age_ns = if (decision.pressure == .hard)
+            mapped_residency_hard_min_age_ns
+        else
+            mapped_residency_recent_ns;
+
+        // The manager only returns a decision. The index owner selects and
+        // advises its own clean mappings after the manager mutex is released.
+        // Re-evaluate aggregate pressure after each segment so one index does
+        // not evict more than is needed when several writers share a manager.
+        while (decision.action == .shrink_cache and decision.pressure != .normal) {
+            var candidate: ?*SegmentEntry = null;
+            var candidate_access_ns: u64 = std.math.maxInt(u64);
+            for (snap.segments) |*seg| {
+                if (!seg.data.isFileBacked()) continue;
+                if (seg.shared.mapped_residency_state.load(.acquire) != mapped_residency_resident) continue;
+                if (seg.shared.active_mapped_readers.load(.acquire) != 0) continue;
+                const last_access_ns = seg.shared.last_mapped_access_ns.load(.acquire);
+                if (last_access_ns != 0 and now_ns -| last_access_ns < min_age_ns) continue;
+                if (candidate == null or last_access_ns < candidate_access_ns) {
+                    candidate = seg;
+                    candidate_access_ns = last_access_ns;
+                }
+            }
+            const coldest = candidate orelse break;
+            if (coldest.shared.mapped_residency_state.cmpxchgStrong(
+                mapped_residency_resident,
+                mapped_residency_evicting,
+                .acq_rel,
+                .acquire,
+            ) != null) continue;
+
+            coldest.data.madviseDiscardCleanPages();
+            if (coldest.shared.last_mapped_access_ns.load(.acquire) == candidate_access_ns) {
+                _ = coldest.shared.mapped_residency_state.cmpxchgStrong(
+                    mapped_residency_evicting,
+                    mapped_residency_cold,
+                    .acq_rel,
+                    .acquire,
+                );
+            } else {
+                _ = coldest.shared.mapped_residency_state.cmpxchgStrong(
+                    mapped_residency_evicting,
+                    mapped_residency_resident,
+                    .acq_rel,
+                    .acquire,
+                );
+            }
+            self.mapped_residency_evictions +|= 1;
+            stats = self.mappedResidencyStatsForSnapshot(snap, now_ns);
+            manager.observeUsage(
+                .full_text_segment_residency,
+                &self.mapped_residency_accounted_bytes,
+                stats.estimated_resident_bytes,
+            );
+            decision = manager.pressureDecision(.full_text_segment_residency);
+        }
     }
 
     /// Add a pre-built segment to the index.
@@ -735,7 +1170,7 @@ pub const IndexWriter = struct {
         errdefer self.alloc.free(new_segments);
         @memcpy(new_segments[0..old.segments.len], old.segments);
         const shared = try self.alloc.create(SegmentShared);
-        shared.* = .{ .ref_count = 1 };
+        SegmentEntry.initShared(shared, data);
         errdefer self.alloc.destroy(shared);
         new_segments[old.segments.len] = .{
             .id = seg_id,
@@ -793,6 +1228,8 @@ pub const IndexWriter = struct {
             .term_doc_freq_cache = .empty,
             .term_doc_freq_cache_hits = 0,
             .term_doc_freq_cache_misses = 0,
+            .bm25_bound_table_cache_mu = .unlocked,
+            .bm25_bound_table_cache = .empty,
         };
         self.next_epoch += 1;
 
@@ -902,7 +1339,7 @@ pub const IndexWriter = struct {
         errdefer self.alloc.free(new_segments);
         @memcpy(new_segments[0..old.segments.len], old.segments);
         const shared = try self.alloc.create(SegmentShared);
-        shared.* = .{ .ref_count = 1 };
+        SegmentEntry.initShared(shared, owned.?);
         errdefer self.alloc.destroy(shared);
         new_segments[old.segments.len] = .{
             .id = seg_id,
@@ -931,6 +1368,8 @@ pub const IndexWriter = struct {
             .term_doc_freq_cache = .empty,
             .term_doc_freq_cache_hits = 0,
             .term_doc_freq_cache_misses = 0,
+            .bm25_bound_table_cache_mu = .unlocked,
+            .bm25_bound_table_cache = .empty,
         };
         self.next_epoch += 1;
 
@@ -1036,7 +1475,7 @@ pub const IndexWriter = struct {
         errdefer for (new_segments[keep_count .. keep_count + cells_created]) |*seg| self.alloc.destroy(seg.shared);
         for (replacements, 0..) |replacement, i| {
             const shared = try self.alloc.create(SegmentShared);
-            shared.* = .{ .ref_count = 1 };
+            SegmentEntry.initShared(shared, replacement.data);
             new_segments[idx] = .{
                 .id = replacement.id,
                 .data = replacement.data,
@@ -1180,8 +1619,21 @@ pub const IndexWriter = struct {
     /// Delete every live copy of a document and return one updated deletion
     /// bitmap per affected segment for atomic persistence by the caller.
     pub fn deleteAllByIdTracked(self: *IndexWriter, alloc: Allocator, doc_id: []const u8) ![]DeleteInfo {
+        return self.deleteAllByIdsTracked(alloc, &.{doc_id});
+    }
+
+    /// Delete every live copy of a set of external document IDs with one
+    /// traversal of each segment. Returning one bitmap per affected segment
+    /// lets persistent callers commit the complete batch atomically.
+    pub fn deleteAllByIdsTracked(self: *IndexWriter, alloc: Allocator, doc_ids: []const []const u8) ![]DeleteInfo {
         self.lockMutex();
         defer self.mu.unlock();
+
+        var wanted = std.StringHashMapUnmanaged(void).empty;
+        defer wanted.deinit(alloc);
+        for (doc_ids) |doc_id| {
+            if (doc_id.len > 0) try wanted.put(alloc, doc_id, {});
+        }
 
         const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
         var delete_infos = std.ArrayListUnmanaged(DeleteInfo).empty;
@@ -1199,7 +1651,7 @@ pub const IndexWriter = struct {
             defer local_ids.deinit(alloc);
             for (0..seg.reader.doc_count) |local_id| {
                 const stored = seg.reader.storedDoc(@intCast(local_id)) orelse continue;
-                if (std.mem.eql(u8, stored.id, doc_id)) {
+                if (wanted.contains(stored.id)) {
                     if (seg.shared.deleted) |d| {
                         if (d.contains(@intCast(local_id))) continue;
                     }
@@ -1266,6 +1718,88 @@ fn buildTestSegment(alloc: Allocator, docs: []const struct { terms: []const inve
     return seg_writer.build();
 }
 
+fn mapTestSegment(segment_bytes: []const u8) !SegmentData {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const mapped = try std.heap.page_allocator.alignedAlloc(
+        u8,
+        std.mem.Alignment.fromByteUnits(std.heap.page_size_min),
+        segment_bytes.len,
+    );
+    @memcpy(mapped, segment_bytes);
+    return SegmentData.fromMapped(mapped);
+}
+
+test "resource-managed mapped residency evicts cold segments and preserves hot mappings" {
+    const alloc = std.testing.allocator;
+    const seg_bytes = try buildTestSegment(alloc, &.{
+        .{ .terms = &.{.{ .term = "resident", .freq = 1, .norm = 8 }} },
+    });
+    defer alloc.free(seg_bytes);
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.full_text_segment_residency)] = .{
+        .soft_limit_bytes = @intCast(seg_bytes.len),
+        .hard_limit_bytes = @intCast(seg_bytes.len * 8),
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var writer = try IndexWriter.init(alloc);
+    var writer_live = true;
+    defer if (writer_live) writer.deinit();
+
+    try writer.addSegmentWithIdData(1, try mapTestSegment(seg_bytes));
+    try writer.addSegmentWithIdData(2, try mapTestSegment(seg_bytes));
+    writer.snapshot().segments[1].noteAccess();
+    writer.attachResourceManager(&manager);
+
+    var stats = writer.mappedResidencyStats();
+    try std.testing.expectEqual(@as(u64, @intCast(seg_bytes.len * 2)), stats.virtual_mapped_bytes);
+    try std.testing.expectEqual(@as(u64, @intCast(seg_bytes.len)), stats.estimated_resident_bytes);
+    try std.testing.expectEqual(@as(u64, @intCast(seg_bytes.len)), stats.recently_touched_bytes);
+    try std.testing.expectEqual(@as(u64, @intCast(seg_bytes.len)), stats.cold_mapped_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.eviction_count);
+    try std.testing.expectEqual(
+        @as(u64, @intCast(seg_bytes.len)),
+        manager.sliceStats(.full_text_segment_residency).used_bytes,
+    );
+
+    // A query faults the cold mapping back into the conservative estimate.
+    // Both mappings are then inside the soft-pressure recent-access window,
+    // so the controller reports pressure but does not churn either mapping.
+    writer.snapshot().segments[0].noteAccess();
+    const now_ns = platform_time.monotonicNs();
+    writer.maintainMappedResidencyAt(writer.snapshot(), now_ns);
+    stats = writer.mappedResidencyStats();
+    try std.testing.expectEqual(@as(u64, @intCast(seg_bytes.len * 2)), stats.estimated_resident_bytes);
+    try std.testing.expectEqual(resource_manager_mod.Pressure.soft, manager.sliceStats(.full_text_segment_residency).pressure);
+
+    // Once the older mapping ages beyond the hysteresis window, it is the
+    // sole eviction candidate. An active reader still pins it until that
+    // access completes, even under pressure.
+    const old_segment = &writer.snapshot().segments[0];
+    old_segment.beginAccess();
+    old_segment.shared.last_mapped_access_ns.store(1, .release);
+    const aged_now_ns = @max(now_ns, mapped_residency_recent_ns + std.time.ns_per_s);
+    writer.maintainMappedResidencyAt(writer.snapshot(), aged_now_ns);
+    stats = writer.mappedResidencyStats();
+    try std.testing.expectEqual(@as(u64, @intCast(seg_bytes.len * 2)), stats.estimated_resident_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.eviction_count);
+
+    old_segment.endAccess();
+    writer.maintainMappedResidencyAt(writer.snapshot(), aged_now_ns);
+    stats = writer.mappedResidencyStats();
+    try std.testing.expectEqual(@as(u64, @intCast(seg_bytes.len)), stats.estimated_resident_bytes);
+    try std.testing.expectEqual(@as(u64, 2), stats.eviction_count);
+
+    writer.deinit();
+    writer_live = false;
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        manager.sliceStats(.full_text_segment_residency).used_bytes,
+    );
+}
+
 test "single segment search" {
     const alloc = std.testing.allocator;
 
@@ -1323,6 +1857,24 @@ test "multi-segment search" {
     try std.testing.expect(results.hits[1].score >= results.hits[2].score);
 }
 
+test "snapshot BM25 bound table cache is reused and bounded" {
+    const alloc = std.testing.allocator;
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+    const snap = writer.snapshot();
+
+    const first = (try snap.bm25BoundTable(100.0, .{})) orelse return error.TestExpectedEqual;
+    const same = (try snap.bm25BoundTable(100.0, .{})) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(first, same);
+
+    for (1..max_bm25_bound_tables_per_snapshot) |i| {
+        const config = inverted.BM25Config{ .k1 = 1.2 + @as(f32, @floatFromInt(i)) * 0.1 };
+        try std.testing.expect((try snap.bm25BoundTable(100.0, config)) != null);
+    }
+    try std.testing.expect((try snap.bm25BoundTable(100.0, .{ .k1 = 9.0 })) == null);
+    try std.testing.expectEqual(max_bm25_bound_tables_per_snapshot, snap.bm25_bound_table_cache.count());
+}
+
 test "multi-segment search merges per-segment top-k globally" {
     const alloc = std.testing.allocator;
 
@@ -1354,6 +1906,38 @@ test "multi-segment search merges per-segment top-k globally" {
     try std.testing.expectEqual(@as(u32, 0), results.hits[0].doc_id);
     try std.testing.expectEqual(@as(u32, 2), results.hits[1].doc_id);
     try std.testing.expect(results.hits[0].score >= results.hits[1].score);
+}
+
+test "fragmented snapshot retains segment bound pruning" {
+    const alloc = std.testing.allocator;
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+
+    for (0..17) |segment_idx| {
+        const freq: u32 = if (segment_idx == 0) 100 else 1;
+        const norm: u32 = if (segment_idx == 0) 1 else 100;
+        const segment = try buildTestSegment(alloc, &.{
+            .{ .terms = &.{.{ .term = "rare", .freq = freq, .norm = norm }} },
+        });
+        defer alloc.free(segment);
+        try writer.addSegment(segment);
+    }
+
+    var diagnostics: scorer_mod.SearchDiagnostics = .{};
+    const results = try writer.snapshot().searchWithConfigDiagnostics(
+        alloc,
+        "body",
+        &.{"rare"},
+        1,
+        .{},
+        &diagnostics,
+    );
+    defer alloc.free(results.hits);
+
+    try std.testing.expectEqual(@as(usize, 1), results.hits.len);
+    try std.testing.expectEqual(@as(u32, 0), results.hits[0].doc_id);
+    try std.testing.expectEqual(@as(u64, 17), diagnostics.segments_considered);
+    try std.testing.expect(diagnostics.segments_pruned > 0);
 }
 
 test "retained snapshot remains readable after segment replacement" {
@@ -1563,6 +2147,36 @@ test "tracked multi-segment deletion can roll back before persistence" {
     const current_results = try writer.snapshot().search(alloc, "body", &.{"current"}, 10);
     defer alloc.free(current_results.hits);
     try std.testing.expectEqual(@as(usize, 1), current_results.hits.len);
+}
+
+test "tracked batch deletion removes many IDs with one result per affected segment" {
+    const alloc = std.testing.allocator;
+    const first = try buildTestSegmentWithIds(alloc, &.{
+        .{ .id = "doc:a", .terms = &.{.{ .term = "x", .freq = 1, .norm = 10 }} },
+        .{ .id = "doc:b", .terms = &.{.{ .term = "x", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(first);
+    const second = try buildTestSegmentWithIds(alloc, &.{
+        .{ .id = "doc:b", .terms = &.{.{ .term = "x", .freq = 1, .norm = 10 }} },
+        .{ .id = "doc:c", .terms = &.{.{ .term = "x", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(second);
+
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(first);
+    try writer.addSegment(second);
+
+    const delete_infos = try writer.deleteAllByIdsTracked(alloc, &.{ "doc:b", "missing", "doc:a", "doc:b" });
+    defer IndexWriter.freeDeleteInfos(alloc, delete_infos);
+    try std.testing.expectEqual(@as(usize, 2), delete_infos.len);
+    try std.testing.expectEqual(@as(u32, 1), writer.snapshot().global_doc_count);
+
+    const results = try writer.snapshot().search(alloc, "body", &.{"x"}, 10);
+    defer alloc.free(results.hits);
+    try std.testing.expectEqual(@as(usize, 1), results.hits.len);
+    const remaining = writer.snapshot().storedDoc(results.hits[0].doc_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("doc:c", remaining.id);
 }
 
 test "index writer removeSegments frees staged segment list when retired allocation fails" {

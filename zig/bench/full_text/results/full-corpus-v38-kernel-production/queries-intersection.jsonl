@@ -1,0 +1,5 @@
+{"elapsed_ns": 178042, "engine": "antfly-zig", "operation": "top_k", "query": "V1 INTERSECTION text alpha beta", "query_index": 3, "repetition": 0, "schema_version": 1}
+{"elapsed_ns": 170125, "engine": "antfly-zig", "operation": "top_k", "query": "V1 INTERSECTION text alpha beta", "query_index": 3, "repetition": 1, "schema_version": 1}
+{"elapsed_ns": 168125, "engine": "antfly-zig", "operation": "top_k", "query": "V1 INTERSECTION text alpha beta", "query_index": 3, "repetition": 2, "schema_version": 1}
+{"elapsed_ns": 169167, "engine": "antfly-zig", "operation": "top_k", "query": "V1 INTERSECTION text alpha beta", "query_index": 3, "repetition": 3, "schema_version": 1}
+{"elapsed_ns": 230625, "engine": "antfly-zig", "operation": "top_k", "query": "V1 INTERSECTION text alpha beta", "query_index": 3, "repetition": 4, "schema_version": 1}

@@ -227,8 +227,7 @@ fn loadBundle(allocator: std.mem.Allocator, io: std.Io, opts: Options) !LoadedBu
     errdefer model_manager.deinit();
 
     const model = try model_manager.loadFromDir(opts.model_dir);
-    try model.ensureEmbeddingAssetsWithIo(
-        io,
+    try model.ensureEmbeddingAssets(
         opts.texts.items.len > 0,
         opts.image_paths.items.len > 0,
         opts.audio_paths.items.len > 0,

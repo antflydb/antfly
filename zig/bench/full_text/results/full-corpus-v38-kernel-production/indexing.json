@@ -1,0 +1,15 @@
+{
+  "antfly-zig": {
+    "cpu_ns": 407516166000,
+    "database_bytes": 3385969070,
+    "elapsed_ns": 421345216000,
+    "peak_rss_bytes": 1924825088,
+    "text_index_bytes": 3385816859
+  },
+  "comparator": {
+    "cpu_ns": null,
+    "elapsed_ns": 550184738333,
+    "index_bytes": 3251494143,
+    "peak_rss_bytes": null
+  }
+}

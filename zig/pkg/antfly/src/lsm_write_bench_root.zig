@@ -14,5 +14,5 @@
 
 pub const bloom = @import("bloom");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
-pub const platform_time = @import("platform/time.zig");
+pub const platform_time = @import("antfly_platform").time;
 pub const storage_backend = @import("storage/backend_types.zig");

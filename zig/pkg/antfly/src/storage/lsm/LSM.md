@@ -476,8 +476,18 @@ Large-ingest guardrails:
    - Persisted forward scans use prefix blooms to skip block loads when the
      scan upper bound proves the cursor cannot leave the extracted prefix.
    - Read stats and read-bench JSON now split whole-run prefix-bloom negatives
-     from block-level prefix-bloom negatives, so before/after comparisons can
-     verify useful prefix skips separately from exact-key bloom negatives.
+   from block-level prefix-bloom negatives, so before/after comparisons can
+   verify useful prefix skips separately from exact-key bloom negatives.
+10. [x] Pack persisted entry offsets at block granularity.
+   - Table codec version 10 stores one `u16` block-local offset per entry
+     instead of one `u32` table-global offset. Logical blocks are capped at
+     32 KiB; an oversized entry occupies a singleton block at offset zero.
+   - Footer-only readers dispatch from an explicit metadata marker, so they do
+     not need an extra header read. Full readers accept the shipped v9 layout
+     and validate that v10 headers carry packed metadata.
+   - Readers expand offsets once into the existing global `u32` lookup array,
+     preserving point/range CPU behavior. Streaming writers retain `u16`
+     offsets, halving that portion of builder memory.
 
 ### Point Read Work
 
@@ -1690,7 +1700,7 @@ Implemented in this pass:
   run tables now require footer-backed metadata.
 - The current run-table format uses a fixed footer at EOF. The footer points to
   one contiguous metadata bundle containing entry offsets, bloom bytes, block
-  bounds, hash slots, compression metadata, and prefix filters.
+  bounds, legacy hash-slot framing, compression metadata, and prefix filters.
 - New table files now load indexes via:
   - one fixed-size footer trailer read
   - one contiguous metadata read
@@ -1700,7 +1710,11 @@ Implemented in this pass:
 - Added a small backend-local run-block cache for no-shared-cache readers so repeated point reads in the same backend can reuse the previously fetched data block without additional file I/O.
 - Added a new v5 table format that stores per-block upper-bound metadata in the footer bundle. Point reads now use that metadata to jump directly to a single candidate data block instead of binary-searching across entry offsets and potentially touching multiple blocks.
 - Added per-block bloom filters to the footer metadata. If a point lookup survives the run-level bloom filter but is still absent from the candidate block, the reader now rejects it before issuing any data-block read.
-- Added per-block hash slots to the footer metadata. Once a candidate block is loaded, exact point lookups now use a block-local hash index instead of binary-searching inside the block.
+- v9 added per-block hash slots to the footer metadata, but no production read
+  path consulted them: exact point lookup binary-searches the candidate block's
+  entry offsets. New writers preserve the framing with zero slots, and the v9
+  compatibility reader validates and skips old slot arrays without allocating
+  them.
 - The raw-table seek path now uses block bounds to jump `lowerBound` and `seekAtOrAfter` directly to the first candidate block instead of searching the full table entry space.
 - Cursor/range iteration now stays table-backed for persisted runs in more places:
   - reverse cursor paths (`last`, `prev`, `seekAtOrBefore`) now use table-backed helpers instead of forcing run-state materialization
@@ -1770,7 +1784,7 @@ Expected cost:
 ## Suggested Order From Here
 
 1. Keep the current Phase 1-3 changes and benchmark them under miss-heavy point-lookups and reopen-heavy workloads.
-2. Benchmark v9 footer metadata and prefix-compressed direct point lookup under
+2. Benchmark v10 footer metadata and prefix-compressed direct point lookup under
    reopen-heavy point-lookups.
 3. Use the measurements to decide whether the next format revision should add
    richer block property collectors or a shared-cache physical-block policy.
@@ -1780,8 +1794,8 @@ Expected cost:
 - Pending load coordination is now keyed and blocking instead of scan-plus-yield.
 - The native fd cache is now sharded and hashed, and it no longer holds the hot lock across `openat`.
 - The block cache now evicts from maintained shard-local LRU state instead of globally rescanning the cache.
-- New run tables now use a footer-backed v9 metadata layout and legacy table
-  versions are intentionally rejected.
+- New run tables use the footer-backed v10 packed-offset layout. The shipped v9
+  layout remains readable; older table versions are intentionally rejected.
 
 ## Validation
 

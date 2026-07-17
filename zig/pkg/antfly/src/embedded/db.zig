@@ -214,6 +214,24 @@ pub const DB = struct {
         try self.inner.forceCompactTextIndexes();
     }
 
+    pub fn textIndexLayoutStats(self: *DB, alloc: Allocator, index_name: []const u8) !types.TextIndexLayoutStats {
+        return try self.inner.textIndexLayoutStats(alloc, index_name);
+    }
+
+    pub fn searchTextKernel(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        text_query: types.TextQuery,
+        options: types.TextKernelSearchOptions,
+    ) !types.TextKernelResult {
+        return try self.inner.searchTextKernel(alloc, index_name, text_query, options);
+    }
+
+    pub fn countTextKernel(self: *DB, alloc: Allocator, index_name: []const u8, text_query: types.TextQuery) !u32 {
+        return try self.inner.countTextKernel(alloc, index_name, text_query);
+    }
+
     pub fn bestEffortForceCompactTextIndexes(self: *DB) !void {
         try self.inner.bestEffortForceCompactTextIndexes();
     }

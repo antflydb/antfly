@@ -59,15 +59,10 @@ func runServer(cmd *cobra.Command, args []string) error {
 	logger.Info("Running as termite")
 
 	// Build termite config from viper/env
-	configuredPriority := viper.GetStringSlice("backend_priority")
-	backendPriority := make([]termite.ConfigBackendPriority, len(configuredPriority))
-	for i, backend := range configuredPriority {
-		backendPriority[i] = termite.ConfigBackendPriority(backend)
-	}
 	cfg := termite.Config{
 		ApiUrl:          viper.GetString("api_url"),
 		ModelsDir:       modelsDir, // Set from --models-dir flag (defaults to ~/.termite/models)
-		BackendPriority: backendPriority,
+		BackendPriority: viper.GetStringSlice("backend_priority"),
 		KeepAlive:       viper.GetString("keep_alive"),
 		MaxLoadedModels: viper.GetInt("max_loaded_models"),
 		MaxMemoryMb:     viper.GetInt("max_memory_mb"),

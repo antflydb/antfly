@@ -17,8 +17,8 @@ const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../../common/fs_paths.zig");
-const process_memory = @import("../../../platform/process_memory.zig");
-const platform_time = @import("../../../platform/time.zig");
+const process_memory = @import("antfly_platform").process_memory;
+const platform_time = @import("antfly_platform").time;
 const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
 const backend_types = @import("../../backend_types.zig");
 const backend_erased = @import("../../backend_erased.zig");
@@ -71,16 +71,12 @@ const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
     pub const sim = struct {};
 };
 
-pub const max_artifact_sources = 64;
-
 fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     if (!builtin.link_libc) return null;
     return std.c.getenv(name);
 }
 
 const index_catalog_key = "\x00\x00__metadata__:indexes";
-const index_admission_catalog_key = "\x00\x00__metadata__:index_admissions";
-pub const retired_graph_generation_prefix = "\x00\x00__metadata__:retired_graph_generation:";
 const enrichment_catalog_key = "\x00\x00__metadata__:enrichments";
 const resolver_catalog_key = "\x00\x00__metadata__:resolvers";
 const text_field_analyzers_prefix = "\x00\x00__metadata__:text_field_analyzers:";
@@ -112,6 +108,8 @@ var bench_text_metrics_cache: std.atomic.Value(u8) = .init(0);
 var bench_text_profile_cache: std.atomic.Value(u8) = .init(0);
 var bench_memory_attribution_cache: std.atomic.Value(u8) = .init(0);
 var bench_memory_layout_detail_cache: std.atomic.Value(u8) = .init(0);
+var bench_memory_attribution_every_cache: std.atomic.Value(usize) = .init(0);
+var bench_memory_attribution_counter: platform.atomic.Value(u64) = .init(0);
 var text_build_memory_target_bytes_cache: std.atomic.Value(usize) = .init(0);
 var text_doc_scratch_retained_bytes_cache: std.atomic.Value(usize) = .init(0);
 var text_segment_build_target_bytes_cache: std.atomic.Value(usize) = .init(0);
@@ -122,7 +120,32 @@ const default_merge_policy = merger_mod.MergePolicy{
     .max_segment_size = 5 * 1024 * 1024 * 1024,
     .floor_segment_size = 16 * 1024 * 1024,
 };
+var benchmark_text_merge_policy_override: ?merger_mod.MergePolicy = null;
+
+/// Process-local benchmark override. Production callers never set this; it
+/// exists so the isolated index/query adapters can measure policy tradeoffs on
+/// identical corpora without recompiling different constants.
+pub fn setBenchmarkTextMergePolicyOverride(policy: ?merger_mod.MergePolicy) void {
+    benchmark_text_merge_policy_override = policy;
+}
+
+fn activeTextMergePolicy() merger_mod.MergePolicy {
+    return benchmark_text_merge_policy_override orelse default_merge_policy;
+}
+
 pub const default_text_merge_max_segments_per_tier = default_merge_policy.max_segments_per_tier;
+pub fn defaultTextMergePolicyStats() types.TextMergePolicyStats {
+    const policy = activeTextMergePolicy();
+    return .{
+        .max_segments_per_tier = policy.max_segments_per_tier,
+        .max_merge_at_once = policy.max_merge_at_once,
+        .max_segment_size = policy.max_segment_size,
+        .floor_segment_size = policy.floor_segment_size,
+        .skew_weight = policy.skew_weight,
+        .size_weight = policy.size_weight,
+        .delete_reclaim_weight = policy.delete_reclaim_weight,
+    };
+}
 const default_text_segment_build_target_bytes: usize = 16 * 1024 * 1024;
 const default_text_projection_source_build_target_bytes: usize = 8 * 1024 * 1024;
 const default_text_build_memory_target_bytes: usize = 96 * 1024 * 1024;
@@ -138,13 +161,16 @@ const TextSegmentSinkBuildContext = struct {
 
 fn buildTextSegmentIntoSink(ctx_any: *anyopaque, sink: *segment_mod.SegmentSink) !void {
     const ctx: *TextSegmentSinkBuildContext = @ptrCast(@alignCast(ctx_any));
-    try mapper.writeTextSegmentFromProjectionBatchToSink(
+    mapper.writeTextSegmentFromProjectionBatchToSink(
         ctx.alloc,
         ctx.projection_batch,
         ctx.text_analysis,
         ctx.build_options,
         sink,
-    );
+    ) catch |err| {
+        if (builtin.os.tag != .freestanding) std.log.err("text segment sink build failed: {s}", .{@errorName(err)});
+        return err;
+    };
 }
 
 fn textIndexSortFieldsForSegmentAlloc(
@@ -171,7 +197,16 @@ fn withTextIndexSort(
     return out;
 }
 
-const text_backfill_batch_size: usize = 1024;
+// Backfill is a bulk build. Bound the retained source set by bytes first, while
+// retaining a document-count ceiling for very small documents. The former
+// 1,024-document limit produced thousands of undersized immutable segments on
+// large schema rebuilds and left more merge debt than the online scheduler
+// could retire.
+const text_backfill_batch_size: usize = 64 * 1024;
+// An unpublished rebuild does not need to be policy-settled after every 8 MiB
+// page. Allow one bounded extra tier of immutable segments, then compact in a
+// larger policy batch. Completion still settles the index before publication.
+const text_backfill_compact_segment_threshold: usize = default_text_merge_max_segments_per_tier * 2;
 const text_merge_scheduler_default_steps: usize = 1;
 const text_merge_quarantine_backoff_ns: u64 = 30 * std.time.ns_per_s;
 pub var test_text_backfill_batch_size: ?usize = null;
@@ -192,7 +227,7 @@ pub const IndexBatchOptions = struct {
     defer_text_compaction: bool = false,
 };
 
-const max_text_projection_docs_per_segment_build: usize = 4 * 1024;
+const max_text_projection_docs_per_segment_build: usize = 64 * 1024;
 
 const PhaseAllocStats = struct {
     current_bytes: usize = 0,
@@ -227,9 +262,26 @@ const PhaseAllocStats = struct {
 const PhaseTrackingAllocator = struct {
     backing: Allocator,
     stats: *PhaseAllocStats,
+    max_current_bytes: ?usize = null,
+    limit_exceeded: bool = false,
 
     fn init(backing: Allocator, stats: *PhaseAllocStats) PhaseTrackingAllocator {
         return .{ .backing = backing, .stats = stats };
+    }
+
+    fn initBounded(backing: Allocator, stats: *PhaseAllocStats, max_current_bytes: usize) PhaseTrackingAllocator {
+        return .{
+            .backing = backing,
+            .stats = stats,
+            .max_current_bytes = max_current_bytes,
+        };
+    }
+
+    fn permitsGrowth(self: *PhaseTrackingAllocator, additional_bytes: usize) bool {
+        const limit = self.max_current_bytes orelse return true;
+        if (additional_bytes <= limit -| self.stats.current_bytes) return true;
+        self.limit_exceeded = true;
+        return false;
     }
 
     fn allocator(self: *PhaseTrackingAllocator) Allocator {
@@ -246,6 +298,7 @@ const PhaseTrackingAllocator = struct {
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *PhaseTrackingAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.permitsGrowth(len)) return null;
         const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
         self.stats.noteAlloc(len);
         return ptr;
@@ -253,6 +306,7 @@ const PhaseTrackingAllocator = struct {
 
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *PhaseTrackingAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and !self.permitsGrowth(new_len - memory.len)) return false;
         if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
         self.stats.noteResize(memory.len, new_len);
         return true;
@@ -260,6 +314,7 @@ const PhaseTrackingAllocator = struct {
 
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         const self: *PhaseTrackingAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and !self.permitsGrowth(new_len - memory.len)) return null;
         const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
         self.stats.noteResize(memory.len, new_len);
         return ptr;
@@ -271,6 +326,24 @@ const PhaseTrackingAllocator = struct {
         self.stats.noteFree(memory.len);
     }
 };
+
+test "text merge bounded task allocator enforces live reservation" {
+    var stats = PhaseAllocStats{};
+    var tracking = PhaseTrackingAllocator.initBounded(std.testing.allocator, &stats, 64);
+    const alloc = tracking.allocator();
+
+    const first = try alloc.alloc(u8, 40);
+    defer alloc.free(first);
+    try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 25));
+    try std.testing.expect(tracking.limit_exceeded);
+    try std.testing.expectEqual(@as(usize, 40), stats.current_bytes);
+    try std.testing.expectEqual(@as(usize, 40), stats.peak_bytes);
+
+    const second = try alloc.alloc(u8, 24);
+    alloc.free(second);
+    try std.testing.expectEqual(@as(usize, 40), stats.current_bytes);
+    try std.testing.expectEqual(@as(usize, 64), stats.peak_bytes);
+}
 
 pub const TextMemoryAttributionStats = struct {
     text_indexes: u64 = 0,
@@ -296,12 +369,21 @@ pub const TextMemoryAttributionStats = struct {
     inverted_positions_bytes: u64 = 0,
     inverted_skip_bytes: u64 = 0,
     inverted_one_hit_terms: u64 = 0,
+    inverted_single_doc_postings_terms: u64 = 0,
     inverted_postings_terms: u64 = 0,
+    inverted_postings_doc_frequency_total: u64 = 0,
+    inverted_projected_posting_count_blocks_64: u64 = 0,
+    inverted_projected_posting_count_blocks_128: u64 = 0,
+    inverted_projected_posting_count_blocks_256: u64 = 0,
     typed_doc_values_bytes: u64 = 0,
     doc_ordinals_bytes: u64 = 0,
     section_index_bytes: u64 = 0,
     configured_lmdb_main_map_bytes: u64 = 0,
     configured_lmdb_wal_map_bytes: u64 = 0,
+    text_segment_estimated_resident_bytes: u64 = 0,
+    text_segment_recently_touched_bytes: u64 = 0,
+    text_segment_cold_mapped_bytes: u64 = 0,
+    text_segment_residency_evictions: u64 = 0,
 };
 
 const TextBatchMutationStats = struct {
@@ -368,10 +450,14 @@ const TextMergeScheduler = struct {
     merge_input_bytes_total: u64 = 0,
     merge_output_segments_total: u64 = 0,
     merge_output_bytes_total: u64 = 0,
+    merge_elapsed_ns_total: u64 = 0,
+    merge_peak_task_alloc_bytes: u64 = 0,
     last_merge_input_segments: u64 = 0,
     last_merge_input_bytes: u64 = 0,
     last_merge_output_segments: u64 = 0,
     last_merge_output_bytes: u64 = 0,
+    last_merge_elapsed_ns: u64 = 0,
+    last_merge_peak_task_alloc_bytes: u64 = 0,
     deferred_for_pressure: u64 = 0,
 
     fn deinit(self: *TextMergeScheduler, alloc: Allocator) void {
@@ -657,16 +743,22 @@ const TextMergeScheduler = struct {
         input_bytes: u64,
         output_segments: u64,
         output_bytes: u64,
+        elapsed_ns: u64,
+        peak_task_alloc_bytes: u64,
     ) void {
         self.completed_merges +|= 1;
         self.merge_input_segments_total +|= input_segments;
         self.merge_input_bytes_total +|= input_bytes;
         self.merge_output_segments_total +|= output_segments;
         self.merge_output_bytes_total +|= output_bytes;
+        self.merge_elapsed_ns_total +|= elapsed_ns;
+        self.merge_peak_task_alloc_bytes = @max(self.merge_peak_task_alloc_bytes, peak_task_alloc_bytes);
         self.last_merge_input_segments = input_segments;
         self.last_merge_input_bytes = input_bytes;
         self.last_merge_output_segments = output_segments;
         self.last_merge_output_bytes = output_bytes;
+        self.last_merge_elapsed_ns = elapsed_ns;
+        self.last_merge_peak_task_alloc_bytes = peak_task_alloc_bytes;
     }
 };
 
@@ -801,6 +893,11 @@ pub const IndexManager = struct {
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
     /// 0 = idle, 1 = queued/running, 2 = rerun requested while active.
     repair_cleanup_state: std.atomic.Value(u8) = .init(0),
+    // Bulk text backfill performs its own policy compaction at durable batch
+    // boundaries. Keep the asynchronous scheduler from competing with it (or
+    // compacting an older schema generation) for CPU, mmap residency, and the
+    // shared text-merge resource budget.
+    text_backfill_active: std.atomic.Value(u32) = .init(0),
     load_parallelism: ?usize = null,
     full_text_pending_bytes_accounted: u64 = 0,
     text_indexes: std.ArrayListUnmanaged(TextIndex),
@@ -825,10 +922,6 @@ pub const IndexManager = struct {
     // intent is still in activating/validating; queries must remain closed
     // until DB validation publishes a clean checkpoint.
     repair_unavailable_indexes: std.StringHashMapUnmanaged(void) = .empty,
-    // Index admission is a distinct, durable reason for unavailability. It is
-    // persisted atomically with the index catalog so a process stop can never
-    // expose a catalog entry whose initial generation was not proven complete.
-    admission_rebuilding_indexes: std.StringHashMapUnmanaged(void) = .empty,
     index_load_states: std.StringHashMapUnmanaged(IndexLoadState) = .empty,
 
     pub const FailedIndexLoad = struct {
@@ -848,7 +941,6 @@ pub const IndexManager = struct {
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
         chunk_name: ?[]u8,
-        source_artifact_names: [][]u8 = &.{},
         text_analysis: introducer_mod.TextAnalysisConfig,
         observed_field_analyzers: []mapper.ObservedFieldAnalyzer = &.{},
         runtime_schema: ?schema_mod.TableSchema,
@@ -915,6 +1007,10 @@ pub const IndexManager = struct {
         segments: [][]u8 = &.{},
         prepared_segments: []persistent_mod.PreparedMergeSegment = &.{},
         prepared_owner: ?*persistent_mod.PersistentIndex = null,
+        elapsed_ns: u64 = 0,
+        /// Peak bytes allocated through the merge task allocator. File-backed
+        /// and heap-backed builders both run through this allocator.
+        peak_task_alloc_bytes: u64 = 0,
 
         pub fn deinit(self: *TextMergeResult, alloc: Allocator) void {
             merger_mod.freeMergedSegments(alloc, self.segments);
@@ -947,7 +1043,6 @@ pub const IndexManager = struct {
         managed_direct_field: bool = false,
         chunk_name: ?[]u8,
         embedding_name: ?[]u8,
-        embedding_names: [][]u8 = &.{},
         index: hbc_mod.HBCIndex,
         vector_loader_context: ?*DenseVectorLoadContext = null,
         ordinal_vector_ids: std.AutoHashMapUnmanaged(doc_identity.DocOrdinal, u64) = .empty,
@@ -1261,7 +1356,6 @@ pub const IndexManager = struct {
         managed_direct_field: bool = false,
         chunk_name: ?[]u8,
         embedding_name: ?[]u8,
-        embedding_names: [][]u8 = &.{},
         rebuild_root_path: []u8,
         index: sparse_mod.SparseIndex,
     };
@@ -1284,7 +1378,7 @@ pub const IndexManager = struct {
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
         edge_type_configs: []graph_mod.EdgeTypeConfig,
-        artifact_sources: []GraphArtifactSource = &.{},
+        artifact_source: ?GraphArtifactSource = null,
         rebuild_root_path: []u8,
         index: graph_mod.GraphIndex,
     };
@@ -1572,8 +1666,6 @@ pub const IndexManager = struct {
         entry.persistent.close();
         self.destroyIndexApplyMutex(entry.apply_mutex);
         if (entry.chunk_name) |chunk_name| self.alloc.free(chunk_name);
-        for (entry.source_artifact_names) |name| self.alloc.free(name);
-        if (entry.source_artifact_names.len > 0) self.alloc.free(entry.source_artifact_names);
         introducer_mod.freeTextAnalysisConfig(self.alloc, entry.text_analysis);
         for (entry.observed_field_analyzers) |item| {
             self.alloc.free(item.field_name);
@@ -1601,8 +1693,6 @@ pub const IndexManager = struct {
         self.alloc.free(entry.field_name);
         if (entry.chunk_name) |chunk_name| self.alloc.free(chunk_name);
         if (entry.embedding_name) |embedding_name| self.alloc.free(embedding_name);
-        for (entry.embedding_names) |embedding_name| self.alloc.free(embedding_name);
-        if (entry.embedding_names.len > 0) self.alloc.free(entry.embedding_names);
         entry.config.deinit(self.alloc);
     }
 
@@ -1771,7 +1861,7 @@ pub const IndexManager = struct {
         );
 
         const rebuilt = entry.persistent.snapshot().global_doc_count;
-        entry.compaction_pending = try self.textIndexNeedsMerge(&entry.persistent, default_merge_policy);
+        entry.compaction_pending = try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy());
         if (entry.compaction_pending) {
             TextMergeScheduler.schedule(entry);
         } else {
@@ -1811,8 +1901,6 @@ pub const IndexManager = struct {
         self.alloc.free(entry.field_name);
         if (entry.chunk_name) |chunk_name| self.alloc.free(chunk_name);
         if (entry.embedding_name) |embedding_name| self.alloc.free(embedding_name);
-        for (entry.embedding_names) |embedding_name| self.alloc.free(embedding_name);
-        if (entry.embedding_names.len > 0) self.alloc.free(entry.embedding_names);
         self.alloc.free(entry.rebuild_root_path);
         entry.config.deinit(self.alloc);
     }
@@ -1825,8 +1913,7 @@ pub const IndexManager = struct {
             if (cfg.field_name) |field_name| self.alloc.free(field_name);
         }
         self.alloc.free(entry.edge_type_configs);
-        for (entry.artifact_sources) |*source| source.deinit(self.alloc);
-        if (entry.artifact_sources.len > 0) self.alloc.free(entry.artifact_sources);
+        if (entry.artifact_source) |*source| source.deinit(self.alloc);
         self.alloc.free(entry.rebuild_root_path);
         entry.config.deinit(self.alloc);
     }
@@ -1854,8 +1941,6 @@ pub const IndexManager = struct {
         self.failed_index_loads.deinit(self.alloc);
         self.clearRepairUnavailableIndexes();
         self.repair_unavailable_indexes.deinit(self.alloc);
-        self.clearAdmissionRebuildingIndexes();
-        self.admission_rebuilding_indexes.deinit(self.alloc);
         self.clearIndexLoadStates();
         self.index_load_states.deinit(self.alloc);
         for (self.enrichments.items) |*entry| entry.deinit(self.alloc);
@@ -1918,100 +2003,34 @@ pub const IndexManager = struct {
     pub fn markRepairUnavailable(self: *IndexManager, name: []const u8) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        try self.markRepairUnavailableNoLock(name);
-    }
-
-    fn markRepairUnavailableNoLock(self: *IndexManager, name: []const u8) !void {
         if (self.repair_unavailable_indexes.contains(name)) return;
         const owned = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(owned);
         try self.repair_unavailable_indexes.put(self.alloc, owned, {});
     }
 
-    fn clearRepairUnavailableNoLock(self: *IndexManager, name: []const u8) void {
-        if (self.repair_unavailable_indexes.fetchRemove(name)) |entry| self.alloc.free(entry.key);
-    }
-
     pub fn clearRepairUnavailable(self: *IndexManager, name: []const u8) void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        self.clearRepairUnavailableNoLock(name);
+        if (self.repair_unavailable_indexes.fetchRemove(name)) |entry| self.alloc.free(entry.key);
     }
 
     pub fn repairUnavailable(self: *IndexManager, name: []const u8) bool {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
-        return self.repair_unavailable_indexes.contains(name) or
-            self.admission_rebuilding_indexes.contains(name);
+        return self.repair_unavailable_indexes.contains(name);
     }
 
     pub fn hasRepairUnavailableIndexes(self: *IndexManager) bool {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
-        return self.repair_unavailable_indexes.count() != 0 or
-            self.admission_rebuilding_indexes.count() != 0;
+        return self.repair_unavailable_indexes.count() != 0;
     }
 
     fn clearRepairUnavailableIndexes(self: *IndexManager) void {
         var it = self.repair_unavailable_indexes.keyIterator();
         while (it.next()) |key| self.alloc.free(key.*);
         self.repair_unavailable_indexes.clearRetainingCapacity();
-    }
-
-    fn markAdmissionRebuildingNoLock(self: *IndexManager, name: []const u8) !void {
-        if (self.admission_rebuilding_indexes.contains(name)) return;
-        const owned = try self.alloc.dupe(u8, name);
-        errdefer self.alloc.free(owned);
-        try self.admission_rebuilding_indexes.put(self.alloc, owned, {});
-    }
-
-    fn clearAdmissionRebuildingNoLock(self: *IndexManager, name: []const u8) void {
-        if (self.admission_rebuilding_indexes.fetchRemove(name)) |entry| self.alloc.free(entry.key);
-    }
-
-    fn clearAdmissionRebuildingIndexes(self: *IndexManager) void {
-        var it = self.admission_rebuilding_indexes.keyIterator();
-        while (it.next()) |key| self.alloc.free(key.*);
-        self.admission_rebuilding_indexes.clearRetainingCapacity();
-    }
-
-    /// Removes the durable admission gate only after the replacement has a
-    /// clean checkpoint. Repair intent removal subsequently releases the
-    /// independent repair gate, preserving fail-closed ordering across stops.
-    pub fn completeAdmissionRebuild(self: *IndexManager, store: anytype, name: []const u8) !void {
-        self.catalog_mutex.lockExclusive();
-        defer self.catalog_mutex.unlockExclusive();
-        if (!self.admission_rebuilding_indexes.contains(name)) return;
-        const owned = try self.alloc.dupe(u8, name);
-        self.clearAdmissionRebuildingNoLock(name);
-        self.persistCatalog(store) catch |err| {
-            self.admission_rebuilding_indexes.put(self.alloc, owned, {}) catch self.alloc.free(owned);
-            return err;
-        };
-        self.alloc.free(owned);
-    }
-
-    pub fn admissionRebuilding(self: *IndexManager, name: []const u8) bool {
-        self.catalog_mutex.lockShared();
-        defer self.catalog_mutex.unlockShared();
-        return self.admission_rebuilding_indexes.contains(name);
-    }
-
-    pub fn admissionRebuildingIndexesAlloc(self: *IndexManager, alloc: Allocator) ![][]u8 {
-        self.catalog_mutex.lockShared();
-        defer self.catalog_mutex.unlockShared();
-        const result = try alloc.alloc([]u8, self.admission_rebuilding_indexes.count());
-        var initialized: usize = 0;
-        errdefer {
-            for (result[0..initialized]) |name| alloc.free(name);
-            alloc.free(result);
-        }
-        var it = self.admission_rebuilding_indexes.keyIterator();
-        while (it.next()) |name| {
-            result[initialized] = try alloc.dupe(u8, name.*);
-            initialized += 1;
-        }
-        return result;
     }
 
     fn clearFailedIndexLoads(self: *IndexManager) void {
@@ -2572,13 +2591,28 @@ pub const IndexManager = struct {
     }
 
     pub fn snapshotTextMemoryAttribution(self: *IndexManager) TextMemoryAttributionStats {
+        return self.snapshotTextMemoryAttributionWithDetail(false);
+    }
+
+    /// Detailed inverted-layout attribution walks every term and posting in
+    /// every segment. Keep it off the periodic health-metrics path: on a
+    /// corpus-sized index that turns observability into a recurring full-index
+    /// scan and faults clean mmaps into RSS. Explicit benchmark diagnostics can
+    /// opt in at a controlled sampling cadence.
+    fn snapshotTextMemoryAttributionWithDetail(
+        self: *IndexManager,
+        detailed_inverted_layout: bool,
+    ) TextMemoryAttributionStats {
         var stats = TextMemoryAttributionStats{};
-        const detailed_inverted_layout = memoryLayoutDetailEnabled();
         stats.text_indexes = @intCast(self.text_indexes.items.len);
         for (self.text_indexes.items) |*entry| {
             const persistent_memory = entry.persistent.memoryStatsSnapshot();
             stats.configured_lmdb_main_map_bytes +|= persistent_memory.configured_lmdb_main_map_bytes;
             stats.configured_lmdb_wal_map_bytes +|= persistent_memory.configured_lmdb_wal_map_bytes;
+            stats.text_segment_estimated_resident_bytes +|= persistent_memory.segment_estimated_resident_bytes;
+            stats.text_segment_recently_touched_bytes +|= persistent_memory.segment_recently_touched_bytes;
+            stats.text_segment_cold_mapped_bytes +|= persistent_memory.segment_cold_mapped_bytes;
+            stats.text_segment_residency_evictions +|= persistent_memory.segment_residency_evictions;
 
             const snap = entry.persistent.acquireSnapshot();
             defer snap.release();
@@ -2610,7 +2644,12 @@ pub const IndexManager = struct {
                 stats.inverted_positions_bytes +|= layout.inverted_positions_bytes;
                 stats.inverted_skip_bytes +|= layout.inverted_skip_bytes;
                 stats.inverted_one_hit_terms +|= layout.inverted_one_hit_terms;
+                stats.inverted_single_doc_postings_terms +|= layout.inverted_single_doc_postings_terms;
                 stats.inverted_postings_terms +|= layout.inverted_postings_terms;
+                stats.inverted_postings_doc_frequency_total +|= layout.inverted_postings_doc_frequency_total;
+                stats.inverted_projected_posting_count_blocks_64 +|= layout.inverted_projected_posting_count_blocks_64;
+                stats.inverted_projected_posting_count_blocks_128 +|= layout.inverted_projected_posting_count_blocks_128;
+                stats.inverted_projected_posting_count_blocks_256 +|= layout.inverted_projected_posting_count_blocks_256;
                 stats.typed_doc_values_bytes +|= layout.typed_doc_values_bytes;
                 stats.doc_ordinals_bytes +|= layout.doc_ordinals_bytes;
                 stats.section_index_bytes +|= layout.section_index_bytes;
@@ -2626,10 +2665,10 @@ pub const IndexManager = struct {
         projection_docs: usize,
         batch_segments: usize,
     ) void {
-        if (!memoryAttributionEnabled()) return;
+        if (!memoryAttributionSampleDue()) return;
 
         const memory = process_memory.snapshot();
-        const text_stats = self.snapshotTextMemoryAttribution();
+        const text_stats = self.snapshotTextMemoryAttributionWithDetail(memoryLayoutDetailEnabled());
         const text_merge_stats = self.textMergeStatsSnapshot();
         const lsm_stats = self.snapshotLsmMaintenanceStats();
         const lsm_cache_stats: lsm_backend_mod.cache.Stats = if (self.lsm_cache) |cache| cache.snapshotStats() else .{};
@@ -2637,6 +2676,8 @@ pub const IndexManager = struct {
         var ft_pending_peak: u64 = 0;
         var ft_build_used: u64 = 0;
         var ft_build_peak: u64 = 0;
+        var ft_residency_used: u64 = 0;
+        var ft_residency_peak: u64 = 0;
         var text_merge_used: u64 = 0;
         var text_merge_peak: u64 = 0;
         var lsm_cache_used: u64 = 0;
@@ -2653,10 +2694,13 @@ pub const IndexManager = struct {
         var lsm_wal_retention_peak: u64 = 0;
         var lsm_recovery_used: u64 = 0;
         var lsm_recovery_peak: u64 = 0;
+        var derived_backlog_used: u64 = 0;
+        var derived_backlog_peak: u64 = 0;
         if (self.resource_manager) |manager| {
             const resource_stats = manager.snapshot();
             const ft_pending = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)];
             const ft_build = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)];
+            const ft_residency = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_segment_residency)];
             const text_merge = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)];
             const lsm_cache = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
             const lsm_compaction = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)];
@@ -2665,10 +2709,13 @@ pub const IndexManager = struct {
             const lsm_wal_write = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_wal_write_working_set)];
             const lsm_wal_retention = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_wal_retention)];
             const lsm_recovery = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_recovery_working_set)];
+            const derived_backlog = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)];
             ft_pending_used = ft_pending.used_bytes;
             ft_pending_peak = ft_pending.peak_bytes;
             ft_build_used = ft_build.used_bytes;
             ft_build_peak = ft_build.peak_bytes;
+            ft_residency_used = ft_residency.used_bytes;
+            ft_residency_peak = ft_residency.peak_bytes;
             text_merge_used = text_merge.used_bytes;
             text_merge_peak = text_merge.peak_bytes;
             lsm_cache_used = lsm_cache.used_bytes;
@@ -2685,14 +2732,19 @@ pub const IndexManager = struct {
             lsm_wal_retention_peak = lsm_wal_retention.peak_bytes;
             lsm_recovery_used = lsm_recovery.used_bytes;
             lsm_recovery_peak = lsm_recovery.peak_bytes;
+            derived_backlog_used = derived_backlog.used_bytes;
+            derived_backlog_peak = derived_backlog.peak_bytes;
         }
-        const lsm_resource_used = lsm_cache_used +| lsm_compaction_used +| lsm_table_builder_used +| lsm_state_used +| lsm_wal_write_used +| lsm_wal_retention_used +| lsm_recovery_used;
-        const lsm_resource_peak = lsm_cache_peak +| lsm_compaction_peak +| lsm_table_builder_peak +| lsm_state_peak +| lsm_wal_write_peak +| lsm_wal_retention_peak +| lsm_recovery_peak;
+        // WAL retention is physical log-file size, not resident memory. Keep it
+        // visible as its own disk-pressure signal, but do not subtract it from
+        // RSS/footprint attribution.
+        const lsm_resource_used = lsm_cache_used +| lsm_compaction_used +| lsm_table_builder_used +| lsm_state_used +| lsm_wal_write_used +| lsm_recovery_used;
+        const lsm_resource_peak = lsm_cache_peak +| lsm_compaction_peak +| lsm_table_builder_peak +| lsm_state_peak +| lsm_wal_write_peak +| lsm_recovery_peak;
         const rss_after_lsm_resource_gap = memory.resident_bytes -| lsm_resource_used;
         const footprint_after_lsm_resource_gap = memory.footprint_bytes -| lsm_resource_used;
 
         std.log.info(
-            "antfly_bench_memory_attribution label={s} source_docs={d} projection_docs={d} batch_segments={d} rss_bytes={d} footprint_bytes={d} malloc_available={any} malloc_allocated_bytes={d} malloc_zone_bytes={d} text_indexes={d} text_segments={d} text_segment_bytes={d} mapped_segment_bytes={d} text_mmap_segment_bytes={d} text_heap_segment_bytes={d} text_max_segment_bytes={d} configured_lmdb_main_map_bytes={d} configured_lmdb_wal_map_bytes={d}",
+            "antfly_bench_memory_attribution label={s} source_docs={d} projection_docs={d} batch_segments={d} rss_bytes={d} footprint_bytes={d} peak_footprint_bytes={d} malloc_available={any} malloc_allocated_bytes={d} malloc_zone_bytes={d} text_indexes={d} text_segments={d} text_segment_bytes={d} mapped_segment_bytes={d} text_mmap_segment_bytes={d} text_heap_segment_bytes={d} text_max_segment_bytes={d} text_segment_estimated_resident_bytes={d} text_segment_recently_touched_bytes={d} text_segment_cold_mapped_bytes={d} text_segment_residency_evictions={d} configured_lmdb_main_map_bytes={d} configured_lmdb_wal_map_bytes={d}",
             .{
                 label,
                 source_docs,
@@ -2700,6 +2752,7 @@ pub const IndexManager = struct {
                 batch_segments,
                 memory.resident_bytes,
                 memory.footprint_bytes,
+                memory.peak_footprint_bytes,
                 memory.malloc_available,
                 memory.malloc_allocated_bytes,
                 memory.malloc_zone_bytes,
@@ -2710,6 +2763,10 @@ pub const IndexManager = struct {
                 text_stats.text_mmap_segment_bytes,
                 text_stats.text_heap_segment_bytes,
                 text_stats.text_max_segment_bytes,
+                text_stats.text_segment_estimated_resident_bytes,
+                text_stats.text_segment_recently_touched_bytes,
+                text_stats.text_segment_cold_mapped_bytes,
+                text_stats.text_segment_residency_evictions,
                 text_stats.configured_lmdb_main_map_bytes,
                 text_stats.configured_lmdb_wal_map_bytes,
             },
@@ -2742,15 +2799,19 @@ pub const IndexManager = struct {
             },
         );
         std.log.info(
-            "antfly_bench_memory_resources label={s} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} text_merge_used_bytes={d} text_merge_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_table_builder_used_bytes={d} lsm_table_builder_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_wal_write_used_bytes={d} lsm_wal_write_peak_bytes={d} lsm_wal_retention_used_bytes={d} lsm_wal_retention_peak_bytes={d} lsm_recovery_used_bytes={d} lsm_recovery_peak_bytes={d} lsm_resource_used_bytes={d} lsm_resource_peak_bytes={d} rss_after_lsm_resource_gap_bytes={d} footprint_after_lsm_resource_gap_bytes={d}",
+            "antfly_bench_memory_resources label={s} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} full_text_residency_used_bytes={d} full_text_residency_peak_bytes={d} text_merge_used_bytes={d} text_merge_peak_bytes={d} derived_backlog_used_bytes={d} derived_backlog_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_table_builder_used_bytes={d} lsm_table_builder_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_wal_write_used_bytes={d} lsm_wal_write_peak_bytes={d} lsm_wal_retention_disk_bytes={d} lsm_wal_retention_peak_disk_bytes={d} lsm_recovery_used_bytes={d} lsm_recovery_peak_bytes={d} lsm_resource_used_bytes={d} lsm_resource_peak_bytes={d} rss_after_lsm_resource_gap_bytes={d} footprint_after_lsm_resource_gap_bytes={d}",
             .{
                 label,
                 ft_pending_used,
                 ft_pending_peak,
                 ft_build_used,
                 ft_build_peak,
+                ft_residency_used,
+                ft_residency_peak,
                 text_merge_used,
                 text_merge_peak,
+                derived_backlog_used,
+                derived_backlog_peak,
                 lsm_cache_used,
                 lsm_cache_peak,
                 lsm_compaction_used,
@@ -2807,7 +2868,7 @@ pub const IndexManager = struct {
             },
         );
         std.log.info(
-            "antfly_bench_memory_text_merge label={s} pending_indexes={d} pending_segments={d} pending_bytes={d} pending_heap_bytes={d} pending_mmap_bytes={d} in_flight_merges={d} in_flight_segments={d} completed_merges={d} skipped_stale_merges={d} failed_merges={d} merge_input_segments_total={d} merge_input_bytes_total={d} merge_output_segments_total={d} merge_output_bytes_total={d} last_merge_input_segments={d} last_merge_input_bytes={d} last_merge_output_segments={d} last_merge_output_bytes={d} quarantined_merges={d} quarantined_segments={d} deferred_for_pressure={d} backpressure_events={d} backpressure_ns={d}",
+            "antfly_bench_memory_text_merge label={s} pending_indexes={d} pending_segments={d} pending_bytes={d} pending_heap_bytes={d} pending_mmap_bytes={d} in_flight_merges={d} in_flight_segments={d} completed_merges={d} skipped_stale_merges={d} failed_merges={d} merge_input_segments_total={d} merge_input_bytes_total={d} merge_output_segments_total={d} merge_output_bytes_total={d} merge_elapsed_ns_total={d} merge_peak_task_alloc_bytes={d} last_merge_input_segments={d} last_merge_input_bytes={d} last_merge_output_segments={d} last_merge_output_bytes={d} last_merge_elapsed_ns={d} last_merge_peak_task_alloc_bytes={d} quarantined_merges={d} quarantined_segments={d} deferred_for_pressure={d} backpressure_events={d} backpressure_ns={d}",
             .{
                 label,
                 text_merge_stats.pending_indexes,
@@ -2824,10 +2885,14 @@ pub const IndexManager = struct {
                 text_merge_stats.merge_input_bytes_total,
                 text_merge_stats.merge_output_segments_total,
                 text_merge_stats.merge_output_bytes_total,
+                text_merge_stats.merge_elapsed_ns_total,
+                text_merge_stats.merge_peak_task_alloc_bytes,
                 text_merge_stats.last_merge_input_segments,
                 text_merge_stats.last_merge_input_bytes,
                 text_merge_stats.last_merge_output_segments,
                 text_merge_stats.last_merge_output_bytes,
+                text_merge_stats.last_merge_elapsed_ns,
+                text_merge_stats.last_merge_peak_task_alloc_bytes,
                 text_merge_stats.quarantined_merges,
                 text_merge_stats.quarantined_segments,
                 text_merge_stats.deferred_for_pressure,
@@ -3038,7 +3103,6 @@ pub const IndexManager = struct {
         defer txn.abort();
         const data = txn.get(index_catalog_key) catch |err| switch (err) {
             error.NotFound => {
-                self.clearAdmissionRebuildingIndexes();
                 self.storeGeneratedEnrichmentTargetCache(try self.computeGeneratedEnrichmentTargetCache());
                 return;
             },
@@ -3050,7 +3114,6 @@ pub const IndexManager = struct {
             for (configs) |*cfg| cfg.deinit(self.alloc);
             self.alloc.free(configs);
         }
-        try self.loadAdmissionCatalogFromTxn(&txn, configs);
 
         var parallelism: usize = 1;
         if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) {
@@ -3108,7 +3171,6 @@ pub const IndexManager = struct {
         defer txn.abort();
         const data = txn.get(index_catalog_key) catch |err| switch (err) {
             error.NotFound => {
-                self.clearAdmissionRebuildingIndexes();
                 self.clearStatusOnlyIndexConfigs();
                 return;
             },
@@ -3120,7 +3182,6 @@ pub const IndexManager = struct {
             for (configs) |*cfg| cfg.deinit(self.alloc);
             self.alloc.free(configs);
         }
-        try self.loadAdmissionCatalogFromTxn(&txn, configs);
         self.clearStatusOnlyIndexConfigs();
         self.status_only_index_configs = configs;
     }
@@ -3245,29 +3306,10 @@ pub const IndexManager = struct {
     }
 
     pub fn add(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
-        return try self.addWithReadiness(store, cfg, false);
-    }
-
-    /// Publishes a new index behind the same availability barrier used by
-    /// shadow repair. The barrier is installed while the catalog write lock is
-    /// held, so no query can observe the index between publication and the
-    /// caller beginning its bootstrap/replay work.
-    pub fn addRebuilding(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
-        return try self.addWithReadiness(store, cfg, true);
-    }
-
-    fn addWithReadiness(self: *IndexManager, store: anytype, cfg: types.IndexConfig, rebuilding: bool) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         self.bindPrimaryStore(store);
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
-
-        if (rebuilding) {
-            try self.markRepairUnavailableNoLock(cfg.name);
-            errdefer self.clearRepairUnavailableNoLock(cfg.name);
-            try self.markAdmissionRebuildingNoLock(cfg.name);
-            errdefer self.clearAdmissionRebuildingNoLock(cfg.name);
-        }
 
         var stored_cfg = try indexConfigWithCoverageGeneration(self.alloc, cfg);
         defer stored_cfg.deinit(self.alloc);
@@ -3381,31 +3423,6 @@ pub const IndexManager = struct {
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
         try self.openConfiguredIndex(store, cfg, false, false);
         errdefer self.removeInMemory(cfg.name);
-        try self.refreshGeneratedEnrichmentTargetCache();
-    }
-
-    /// Snapshot the table enrichment catalog into an isolated replacement
-    /// manager. Shadow generations must resolve the same artifact sources as
-    /// the active manager, but must never persist or mutate that catalog while
-    /// they are still candidates. The source read lock makes the snapshot
-    /// internally consistent with concurrent enrichment administration.
-    pub fn inheritEnrichmentCatalog(self: *IndexManager, source: *const IndexManager) !void {
-        if (self == source) return;
-        const mutable_source: *IndexManager = @constCast(source);
-        mutable_source.catalog_mutex.lockShared();
-        defer mutable_source.catalog_mutex.unlockShared();
-
-        self.catalog_mutex.lockExclusive();
-        defer self.catalog_mutex.unlockExclusive();
-        if (self.enrichments.items.len != 0) return error.EnrichmentCatalogAlreadyInitialized;
-
-        const checkpoint = self.enrichments.items.len;
-        errdefer self.truncateEnrichments(checkpoint);
-        try self.enrichments.ensureTotalCapacity(self.alloc, source.enrichments.items.len);
-        for (source.enrichments.items) |cfg| {
-            self.enrichments.appendAssumeCapacity(try enrichment_catalog.EnrichmentConfig.clone(self.alloc, cfg));
-        }
-        try self.validateEnrichmentCatalogGraph();
         try self.refreshGeneratedEnrichmentTargetCache();
     }
 
@@ -3618,25 +3635,14 @@ pub const IndexManager = struct {
     }
 
     pub fn remove(self: *IndexManager, store: anytype, name: []const u8) !bool {
-        return try self.removeWithGraphRetirement(store, name, null);
-    }
-
-    pub fn removeWithGraphRetirement(
-        self: *IndexManager,
-        store: anytype,
-        name: []const u8,
-        retired_graph_generation: ?u64,
-    ) !bool {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        if (try self.removeStatusOnlyConfig(store, name, retired_graph_generation)) {
+        if (try self.removeStatusOnlyConfig(store, name)) {
             // Quarantined (failed-to-load) indexes live in the status-only
             // list; removing one must also clear its recorded load error so a
             // subsequent recreate starts clean.
             self.dropFailedIndexLoad(name);
             self.dropIndexLoadStateNoLock(name);
-            self.clearRepairUnavailableNoLock(name);
-            self.clearAdmissionRebuildingNoLock(name);
             return true;
         }
         for (self.text_indexes.items, 0..) |*entry, i| {
@@ -3651,8 +3657,6 @@ pub const IndexManager = struct {
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 self.deleteIndexRootForName(name, index_path);
-                self.clearRepairUnavailableNoLock(name);
-                self.clearAdmissionRebuildingNoLock(name);
                 return true;
             }
         }
@@ -3680,8 +3684,6 @@ pub const IndexManager = struct {
                 try self.deleteDenseIndexMetadata(store, name);
                 try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
                 self.deleteIndexRootForName(name, index_path);
-                self.clearRepairUnavailableNoLock(name);
-                self.clearAdmissionRebuildingNoLock(name);
                 return true;
             }
         }
@@ -3708,8 +3710,6 @@ pub const IndexManager = struct {
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
                 self.deleteIndexRootForName(name, index_path);
-                self.clearRepairUnavailableNoLock(name);
-                self.clearAdmissionRebuildingNoLock(name);
                 return true;
             }
         }
@@ -3721,15 +3721,10 @@ pub const IndexManager = struct {
                 self.freeGraphIndexEntry(entry);
                 _ = self.graph_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
-                try self.persistCatalogWithGraphRetirement(store, if (retired_graph_generation) |generation| .{
-                    .index_name = name,
-                    .generation = generation,
-                } else null);
+                try self.persistCatalog(store);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 self.deleteIndexRootForName(name, index_path);
-                self.clearRepairUnavailableNoLock(name);
-                self.clearAdmissionRebuildingNoLock(name);
                 return true;
             }
         }
@@ -3745,8 +3740,6 @@ pub const IndexManager = struct {
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 self.deleteIndexRootForName(name, index_path);
-                self.clearRepairUnavailableNoLock(name);
-                self.clearAdmissionRebuildingNoLock(name);
                 return true;
             }
         }
@@ -3999,7 +3992,7 @@ pub const IndexManager = struct {
         }
     }
 
-    fn removeStatusOnlyConfig(self: *IndexManager, store: anytype, name: []const u8, retired_graph_generation: ?u64) !bool {
+    fn removeStatusOnlyConfig(self: *IndexManager, store: anytype, name: []const u8) !bool {
         for (self.status_only_index_configs, 0..) |cfg, i| {
             if (!std.mem.eql(u8, cfg.name, name)) continue;
 
@@ -4036,10 +4029,7 @@ pub const IndexManager = struct {
             defer self.dropIndexLoadStateNoLock(name);
 
             const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
-            try self.persistCatalogWithGraphRetirement(store, if (removed.kind == .graph) if (retired_graph_generation) |generation| .{
-                .index_name = name,
-                .generation = generation,
-            } else null else null);
+            try self.persistCatalog(store);
             self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
             try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
             if (removed.kind == .dense_vector) try self.deleteDenseIndexMetadata(store, name);
@@ -4052,74 +4042,15 @@ pub const IndexManager = struct {
     }
 
     pub fn requiresEnrichmentReplay(self: *const IndexManager, name: []const u8) !bool {
-        const cfg = self.get(name) orelse return false;
-        return try self.configRequiresEnrichmentReplay(cfg.*);
-    }
-
-    /// Returns the generated artifact closure consumed by one index. Keeping
-    /// admission replay scoped to this set prevents an unrelated index from
-    /// re-planning every enrichment pipeline registered on a large table.
-    pub fn generatedEnrichmentTargetsForIndexAlloc(
-        self: *const IndexManager,
-        alloc: Allocator,
-        name: []const u8,
-    ) ![][]u8 {
-        var targets = std.ArrayListUnmanaged([]u8).empty;
-        errdefer {
-            for (targets.items) |target| alloc.free(target);
-            targets.deinit(alloc);
+        for (self.dense_indexes.items) |entry| {
+            if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            return try self.configRequiresEnrichmentReplay(entry.config);
         }
-
-        const cfg = self.get(name) orelse return try targets.toOwnedSlice(alloc);
-        switch (cfg.kind) {
-            .full_text => {
-                const parsed = try parseTextConfig(alloc, cfg.config_json);
-                defer parsed.deinit(alloc);
-                if (parsed.source_artifact_name) |target| try appendUniqueOwnedString(alloc, &targets, target);
-                for (parsed.source_artifact_names) |target| try appendUniqueOwnedString(alloc, &targets, target);
-            },
-            .dense_vector => {
-                const parsed = try parseDenseConfig(alloc, cfg.config_json);
-                defer parsed.deinit(alloc);
-                if (parsed.embedding_name) |target| try appendUniqueOwnedString(alloc, &targets, target);
-                for (parsed.embedding_names) |target| try appendUniqueOwnedString(alloc, &targets, target);
-                if (try parseDenseGeneratorConfig(alloc, cfg.config_json)) |generator| {
-                    defer generator.deinit(alloc);
-                    try appendUniqueOwnedString(alloc, &targets, generator.artifact_name);
-                    try appendUniqueOwnedString(alloc, &targets, generator.embedding_name orelse cfg.name);
-                }
-            },
-            .sparse_vector => {
-                const parsed = try parseSparseConfig(alloc, cfg.config_json);
-                defer parsed.deinit(alloc);
-                for (parsed.embedding_names) |target| try appendUniqueOwnedString(alloc, &targets, target);
-                if (try parseSparseGeneratorConfig(alloc, cfg.config_json)) |generator| {
-                    defer generator.deinit(alloc);
-                    try appendUniqueOwnedString(alloc, &targets, generator.artifact_name);
-                    try appendUniqueOwnedString(alloc, &targets, generator.embedding_name orelse cfg.name);
-                }
-            },
-            .graph => {
-                var parsed = try parseGraphConfig(alloc, cfg.config_json);
-                defer parsed.deinit(alloc);
-                for (parsed.artifact_sources) |source| try appendUniqueOwnedString(alloc, &targets, source.artifact_name);
-            },
-            .algebraic => {},
+        for (self.sparse_indexes.items) |entry| {
+            if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            return try self.configRequiresEnrichmentReplay(entry.config);
         }
-
-        // Enrichments form a validated DAG. Walk upstream so a terminal
-        // embedding also selects the chunk/asset requests needed to produce it.
-        var cursor: usize = 0;
-        while (cursor < targets.items.len) : (cursor += 1) {
-            const target = targets.items[cursor];
-            const enrichment = self.getEnrichment(.embedding, target) orelse
-                self.getEnrichment(.chunk, target) orelse
-                self.getEnrichment(.asset, target) orelse continue;
-            if (enrichment.source_artifact_name.len > 0) {
-                try appendUniqueOwnedString(alloc, &targets, enrichment.source_artifact_name);
-            }
-        }
-        return try targets.toOwnedSlice(alloc);
+        return false;
     }
 
     const ExcludedEnrichment = struct {
@@ -4147,9 +4078,6 @@ pub const IndexManager = struct {
             if (entry.embedding_name) |embedding_name| {
                 if (self.getEnrichmentExcluding(.embedding, embedding_name, excluded_enrichment) != null) return true;
             }
-            for (entry.embedding_names) |embedding_name| {
-                if (self.getEnrichmentExcluding(.embedding, embedding_name, excluded_enrichment) != null) return true;
-            }
         }
         for (self.sparse_indexes.items) |entry| {
             if (excluded_index_name) |index_name| {
@@ -4158,9 +4086,6 @@ pub const IndexManager = struct {
             if (try parseSparseGeneratorConfig(self.alloc, entry.config.config_json)) |generator| {
                 generator.deinit(self.alloc);
                 return true;
-            }
-            for (entry.embedding_names) |embedding_name| {
-                if (self.getEnrichmentExcluding(.embedding, embedding_name, excluded_enrichment) != null) return true;
             }
         }
         for (self.text_indexes.items) |entry| {
@@ -4417,7 +4342,6 @@ pub const IndexManager = struct {
         doc_value: []const u8,
         explicit_dense: []const mapper.DenseEmbeddingWrite,
         explicit_sparse: []const mapper.SparseEmbeddingWrite,
-        target_artifact_names: []const []const u8,
     ) ![]enrichment_types.GeneratedEnrichmentRequest {
         var requests = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
         errdefer {
@@ -4427,7 +4351,6 @@ pub const IndexManager = struct {
 
         for (self.enrichments.items) |entry| {
             if (entry.kind != .asset) continue;
-            if (!generatedArtifactTargetSelected(target_artifact_names, entry.name)) continue;
             try requests.append(alloc, .{
                 .kind = .asset,
                 .index_name = try alloc.dupe(u8, entry.name),
@@ -4444,7 +4367,6 @@ pub const IndexManager = struct {
 
         for (self.text_indexes.items) |entry| {
             const chunk_name = entry.chunk_name orelse continue;
-            if (!generatedArtifactTargetSelected(target_artifact_names, chunk_name)) continue;
             const chunk_cfg = self.getEnrichment(.chunk, chunk_name) orelse continue;
             if (chunk_cfg.source_artifact_name.len > 0) continue;
             if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
@@ -4465,13 +4387,6 @@ pub const IndexManager = struct {
         }
 
         for (self.dense_indexes.items) |entry| {
-            if (!generatedVectorIndexTargetSelected(
-                target_artifact_names,
-                entry.config.name,
-                entry.chunk_name,
-                entry.embedding_name,
-                entry.embedding_names,
-            )) continue;
             if (hasExplicitDenseEmbedding(explicit_dense, entry.config.name)) continue;
             if (try mapper.extractDenseVectorField(alloc, doc_value, entry.field_name, entry.dims)) |vector| {
                 alloc.free(vector);
@@ -4498,7 +4413,6 @@ pub const IndexManager = struct {
                     });
                 }
                 if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name, embedding_name)) {
-                    const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
                     try requests.append(alloc, .{
                         .kind = .dense_embedding,
                         .index_name = try alloc.dupe(u8, entry.config.name),
@@ -4512,84 +4426,65 @@ pub const IndexManager = struct {
                         .chunk_overlap = chunk_cfg.chunk_overlap,
                         .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                         .full_text_index = chunk_cfg.full_text_index,
-                        .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
                         .execution_json = if (chunk_cfg.embedding_execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.embedding_execution_json) else "",
                     });
                 }
-            } else {
-                var single_embedding_name: [1][]const u8 = undefined;
-                const embedding_names: []const []const u8 = if (entry.embedding_names.len > 0)
-                    entry.embedding_names
-                else if (entry.embedding_name) |embedding_name| blk: {
-                    single_embedding_name[0] = embedding_name;
-                    break :blk single_embedding_name[0..];
-                } else &.{};
-                for (embedding_names) |embedding_name| {
-                    const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse continue;
-                    if (embedding_cfg.expected_dims > 0 and embedding_cfg.expected_dims != entry.dims) continue;
-                    if (embedding_cfg.source_artifact_name.len > 0) {
-                        const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                        if (chunk_cfg.source_artifact_name.len == 0 and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
-                            try requests.append(alloc, .{
-                                .kind = .chunk_text,
-                                .index_name = try alloc.dupe(u8, entry.config.name),
-                                .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
-                                .doc_key = try alloc.dupe(u8, doc_key),
-                                .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
-                                .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
-                                .chunk_size = chunk_cfg.chunk_size,
-                                .chunk_overlap = chunk_cfg.chunk_overlap,
-                                .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
-                                .full_text_index = chunk_cfg.full_text_index,
-                                .execution_json = if (chunk_cfg.execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.execution_json) else "",
-                            });
-                        }
-                        if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
-                            try requests.append(alloc, .{
-                                .kind = .dense_embedding,
-                                .index_name = try alloc.dupe(u8, entry.config.name),
-                                .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
-                                .embedding_name = try alloc.dupe(u8, embedding_name),
-                                .doc_key = try alloc.dupe(u8, doc_key),
-                                .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
-                                .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
-                                .expected_dims = entry.dims,
-                                .chunk_size = chunk_cfg.chunk_size,
-                                .chunk_overlap = chunk_cfg.chunk_overlap,
-                                .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
-                                .full_text_index = chunk_cfg.full_text_index,
-                                .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
-                                .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
-                            });
-                        }
-                    } else {
-                        if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name)) {
-                            try requests.append(alloc, .{
-                                .kind = .dense_embedding,
-                                .index_name = try alloc.dupe(u8, entry.config.name),
-                                .artifact_name = "",
-                                .embedding_name = try alloc.dupe(u8, embedding_name),
-                                .doc_key = try alloc.dupe(u8, doc_key),
-                                .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
-                                .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
-                                .expected_dims = entry.dims,
-                                .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
-                                .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
-                            });
-                        }
+            } else if (entry.embedding_name) |embedding_name| {
+                const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse continue;
+                if (embedding_cfg.expected_dims > 0 and embedding_cfg.expected_dims != entry.dims) continue;
+                if (embedding_cfg.source_artifact_name.len > 0) {
+                    const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
+                    if (chunk_cfg.source_artifact_name.len == 0 and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
+                        try requests.append(alloc, .{
+                            .kind = .chunk_text,
+                            .index_name = try alloc.dupe(u8, entry.config.name),
+                            .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
+                            .doc_key = try alloc.dupe(u8, doc_key),
+                            .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
+                            .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
+                            .chunk_size = chunk_cfg.chunk_size,
+                            .chunk_overlap = chunk_cfg.chunk_overlap,
+                            .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                            .full_text_index = chunk_cfg.full_text_index,
+                            .execution_json = if (chunk_cfg.execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.execution_json) else "",
+                        });
+                    }
+                    if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
+                        try requests.append(alloc, .{
+                            .kind = .dense_embedding,
+                            .index_name = try alloc.dupe(u8, entry.config.name),
+                            .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
+                            .embedding_name = try alloc.dupe(u8, embedding_name),
+                            .doc_key = try alloc.dupe(u8, doc_key),
+                            .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
+                            .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
+                            .expected_dims = entry.dims,
+                            .chunk_size = chunk_cfg.chunk_size,
+                            .chunk_overlap = chunk_cfg.chunk_overlap,
+                            .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                            .full_text_index = chunk_cfg.full_text_index,
+                            .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
+                        });
+                    }
+                } else {
+                    if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name)) {
+                        try requests.append(alloc, .{
+                            .kind = .dense_embedding,
+                            .index_name = try alloc.dupe(u8, entry.config.name),
+                            .artifact_name = "",
+                            .embedding_name = try alloc.dupe(u8, embedding_name),
+                            .doc_key = try alloc.dupe(u8, doc_key),
+                            .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
+                            .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
+                            .expected_dims = entry.dims,
+                            .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
+                        });
                     }
                 }
             }
         }
 
         for (self.sparse_indexes.items) |entry| {
-            if (!generatedVectorIndexTargetSelected(
-                target_artifact_names,
-                entry.config.name,
-                entry.chunk_name,
-                entry.embedding_name,
-                entry.embedding_names,
-            )) continue;
             if (hasExplicitSparseEmbedding(explicit_sparse, entry.config.name)) continue;
             if (try mapper.extractSparseVectorField(alloc, doc_value, entry.field_name)) |sparse_vec| {
                 var vec = sparse_vec;
@@ -4615,13 +4510,11 @@ pub const IndexManager = struct {
                         .execution_json = if (chunk_cfg.chunking_execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunking_execution_json) else "",
                     });
                 }
-                const embedding_name = if (chunk_cfg.embedding_name) |name| name else entry.config.name;
-                const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
                 try requests.append(alloc, .{
                     .kind = .sparse_embedding,
                     .index_name = try alloc.dupe(u8, entry.config.name),
                     .artifact_name = try alloc.dupe(u8, chunk_cfg.artifact_name),
-                    .embedding_name = try alloc.dupe(u8, embedding_name),
+                    .embedding_name = if (chunk_cfg.embedding_name) |embedding_name| try alloc.dupe(u8, embedding_name) else try alloc.dupe(u8, entry.config.name),
                     .doc_key = try alloc.dupe(u8, doc_key),
                     .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
                     .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
@@ -4629,67 +4522,55 @@ pub const IndexManager = struct {
                     .chunk_overlap = chunk_cfg.chunk_overlap,
                     .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                     .full_text_index = chunk_cfg.full_text_index,
-                    .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
                     .execution_json = if (chunk_cfg.embedding_execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.embedding_execution_json) else "",
                 });
-            } else {
-                var single_embedding_name: [1][]const u8 = undefined;
-                const embedding_names: []const []const u8 = if (entry.embedding_names.len > 0)
-                    entry.embedding_names
-                else if (entry.embedding_name) |embedding_name| blk: {
-                    single_embedding_name[0] = embedding_name;
-                    break :blk single_embedding_name[0..];
-                } else &.{};
-                for (embedding_names) |embedding_name| {
-                    const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse continue;
-                    if (embedding_cfg.expected_dims != 0) continue;
-                    if (embedding_cfg.source_artifact_name.len > 0) {
-                        const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                        if (chunk_cfg.source_artifact_name.len == 0 and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
-                            try requests.append(alloc, .{
-                                .kind = .chunk_text,
-                                .index_name = try alloc.dupe(u8, entry.config.name),
-                                .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
-                                .doc_key = try alloc.dupe(u8, doc_key),
-                                .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
-                                .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
-                                .chunk_size = chunk_cfg.chunk_size,
-                                .chunk_overlap = chunk_cfg.chunk_overlap,
-                                .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
-                                .full_text_index = chunk_cfg.full_text_index,
-                                .execution_json = if (chunk_cfg.execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.execution_json) else "",
-                            });
-                        }
-                        if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
-                            try requests.append(alloc, .{
-                                .kind = .sparse_embedding,
-                                .index_name = try alloc.dupe(u8, entry.config.name),
-                                .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
-                                .embedding_name = try alloc.dupe(u8, embedding_name),
-                                .doc_key = try alloc.dupe(u8, doc_key),
-                                .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
-                                .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
-                                .chunk_size = chunk_cfg.chunk_size,
-                                .chunk_overlap = chunk_cfg.chunk_overlap,
-                                .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
-                                .full_text_index = chunk_cfg.full_text_index,
-                                .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
-                                .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
-                            });
-                        }
-                    } else if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name)) {
+            } else if (entry.embedding_name) |embedding_name| {
+                const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse continue;
+                if (embedding_cfg.expected_dims != 0) continue;
+                if (embedding_cfg.source_artifact_name.len > 0) {
+                    const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
+                    if (chunk_cfg.source_artifact_name.len == 0 and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
+                        try requests.append(alloc, .{
+                            .kind = .chunk_text,
+                            .index_name = try alloc.dupe(u8, entry.config.name),
+                            .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
+                            .doc_key = try alloc.dupe(u8, doc_key),
+                            .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
+                            .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
+                            .chunk_size = chunk_cfg.chunk_size,
+                            .chunk_overlap = chunk_cfg.chunk_overlap,
+                            .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                            .full_text_index = chunk_cfg.full_text_index,
+                            .execution_json = if (chunk_cfg.execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.execution_json) else "",
+                        });
+                    }
+                    if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
                         try requests.append(alloc, .{
                             .kind = .sparse_embedding,
                             .index_name = try alloc.dupe(u8, entry.config.name),
-                            .artifact_name = "",
+                            .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
                             .embedding_name = try alloc.dupe(u8, embedding_name),
                             .doc_key = try alloc.dupe(u8, doc_key),
                             .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
                             .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
-                            .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
+                            .chunk_size = chunk_cfg.chunk_size,
+                            .chunk_overlap = chunk_cfg.chunk_overlap,
+                            .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                            .full_text_index = chunk_cfg.full_text_index,
                             .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
                         });
                     }
+                } else if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name)) {
+                    try requests.append(alloc, .{
+                        .kind = .sparse_embedding,
+                        .index_name = try alloc.dupe(u8, entry.config.name),
+                        .artifact_name = "",
+                        .embedding_name = try alloc.dupe(u8, embedding_name),
+                        .doc_key = try alloc.dupe(u8, doc_key),
+                        .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
+                        .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
+                        .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
+                    });
                 }
             }
         }
@@ -4752,7 +4633,7 @@ pub const IndexManager = struct {
         }
 
         for (self.dense_indexes.items) |entry| {
-            if (entry.external or entry.chunk_name != null or entry.embedding_name != null or entry.embedding_names.len > 0) continue;
+            if (entry.external or entry.chunk_name != null or entry.embedding_name != null) continue;
             if (containsOwnedString(fields.items, entry.field_name)) continue;
             try fields.append(alloc, try alloc.dupe(u8, entry.field_name));
         }
@@ -5314,7 +5195,6 @@ pub const IndexManager = struct {
             if (entry.chunk_name) |configured| {
                 if (std.mem.eql(u8, configured, chunk_name)) return true;
             }
-            if (containsOwnedString(entry.source_artifact_names, chunk_name)) return true;
         }
         for (self.dense_indexes.items) |entry| {
             if (std.mem.eql(u8, entry.config.name, exclude_index_name)) continue;
@@ -5340,16 +5220,12 @@ pub const IndexManager = struct {
             if (entry.embedding_name) |configured| {
                 if (std.mem.eql(u8, configured, embedding_name)) return true;
             }
-            for (entry.embedding_names) |configured| {
-                if (std.mem.eql(u8, configured, embedding_name)) return true;
-            }
         }
         for (self.sparse_indexes.items) |entry| {
             if (std.mem.eql(u8, entry.config.name, exclude_index_name)) continue;
             if (entry.embedding_name) |configured| {
                 if (std.mem.eql(u8, configured, embedding_name)) return true;
             }
-            if (containsOwnedString(entry.embedding_names, embedding_name)) return true;
         }
         return false;
     }
@@ -5425,10 +5301,7 @@ pub const IndexManager = struct {
                 var graph_cfg = try parseGraphConfig(self.alloc, cfg.config_json);
                 defer graph_cfg.deinit(self.alloc);
                 return .{
-                    .asset_name = if (graph_cfg.artifact_sources.len == 1)
-                        try self.alloc.dupe(u8, graph_cfg.artifact_sources[0].artifact_name)
-                    else
-                        null,
+                    .asset_name = if (graph_cfg.artifact_source) |source| try self.alloc.dupe(u8, source.artifact_name) else null,
                 };
             },
             .algebraic => return .{},
@@ -5678,7 +5551,7 @@ pub const IndexManager = struct {
         else
             null;
         const resolved = entry orelse return false;
-        if (resolved.chunk_name != null or resolved.source_artifact_names.len > 0) return true;
+        if (resolved.chunk_name != null) return true;
 
         for (self.enrichments.items) |cfg| {
             if (cfg.kind == .asset and cfg.full_text_index) return true;
@@ -6072,8 +5945,6 @@ pub const IndexManager = struct {
                 if (std.mem.eql(u8, configured, chunk_name)) {
                     try names.append(alloc, try alloc.dupe(u8, entry.config.name));
                 }
-            } else if (containsOwnedString(entry.source_artifact_names, chunk_name)) {
-                try names.append(alloc, try alloc.dupe(u8, entry.config.name));
             } else if (include_default_full_text) {
                 try names.append(alloc, try alloc.dupe(u8, entry.config.name));
             }
@@ -6101,27 +5972,6 @@ pub const IndexManager = struct {
         return null;
     }
 
-    fn denseEntryConsumesEmbedding(entry: *const DenseIndex, embedding_name: []const u8) bool {
-        if (entry.embedding_name) |configured| {
-            if (std.mem.eql(u8, configured, embedding_name)) return true;
-        }
-        for (entry.embedding_names) |configured| {
-            if (std.mem.eql(u8, configured, embedding_name)) return true;
-        }
-        return false;
-    }
-
-    pub fn denseIndexConsumesEmbedding(self: *IndexManager, index_name: []const u8, embedding_name: []const u8) bool {
-        const entry = self.denseIndex(index_name) orelse return false;
-        if (denseEntryConsumesEmbedding(entry, embedding_name)) return true;
-        return entry.embedding_name == null and entry.embedding_names.len == 0 and
-            std.mem.eql(u8, entry.config.name, embedding_name);
-    }
-
-    fn denseEntryArtifactBacked(entry: *const DenseIndex) bool {
-        return entry.external or entry.chunk_name != null or entry.embedding_name != null or entry.embedding_names.len > 0;
-    }
-
     pub fn selectedDenseEmbeddingName(self: *const IndexManager, name: ?[]const u8) ?[]const u8 {
         if (name) |index_name| return self.denseEmbeddingName(index_name);
         if (self.dense_indexes.items.len == 1) return self.dense_indexes.items[0].embedding_name;
@@ -6135,9 +5985,8 @@ pub const IndexManager = struct {
             names.deinit(alloc);
         }
         for (self.dense_indexes.items) |entry| {
-            const consumes = denseEntryConsumesEmbedding(&entry, embedding_name) or
-                (entry.external and std.mem.eql(u8, entry.config.name, embedding_name));
-            if (!consumes) continue;
+            const configured = entry.embedding_name orelse if (entry.external) entry.config.name else continue;
+            if (!std.mem.eql(u8, configured, embedding_name)) continue;
             if (entry.dims != dims) return error.ConflictingEnrichmentConfig;
             try names.append(alloc, try alloc.dupe(u8, entry.config.name));
         }
@@ -6170,23 +6019,13 @@ pub const IndexManager = struct {
         }
         for (self.dense_indexes.items) |entry| {
             const depends = (if (entry.chunk_name) |name| dependent_artifacts.contains(name) else false) or
-                (if (entry.embedding_name) |name| dependent_artifacts.contains(name) else false) or blk: {
-                for (entry.embedding_names) |name| {
-                    if (dependent_artifacts.contains(name)) break :blk true;
-                }
-                break :blk false;
-            };
+                (if (entry.embedding_name) |name| dependent_artifacts.contains(name) else false);
             if (!depends) continue;
             try names.append(alloc, try alloc.dupe(u8, entry.config.name));
         }
         for (self.sparse_indexes.items) |entry| {
             const depends = (if (entry.chunk_name) |name| dependent_artifacts.contains(name) else false) or
-                (if (entry.embedding_name) |name| dependent_artifacts.contains(name) else false) or blk: {
-                for (entry.embedding_names) |name| {
-                    if (dependent_artifacts.contains(name)) break :blk true;
-                }
-                break :blk false;
-            };
+                (if (entry.embedding_name) |name| dependent_artifacts.contains(name) else false);
             if (!depends) continue;
             if (containsOwnedString(names.items, entry.config.name)) continue;
             try names.append(alloc, try alloc.dupe(u8, entry.config.name));
@@ -6273,7 +6112,7 @@ pub const IndexManager = struct {
 
     pub fn sparseTokenAccessPath(self: *IndexManager, name: ?[]const u8) ?algebraic_mod.ir.PhysicalAccessPath {
         const entry = self.sparseIndex(name) orelse return null;
-        const token_space = if (entry.embedding_names.len > 0) entry.config.name else entry.embedding_name orelse entry.config.name;
+        const token_space = entry.embedding_name orelse entry.config.name;
         return algebraic_mod.ir.sparseTokenAccessPath(entry.config.name, entry.config.name, entry.field_name, token_space, "u32", false);
     }
 
@@ -6284,16 +6123,6 @@ pub const IndexManager = struct {
         return null;
     }
 
-    pub fn sparseIndexConsumesEmbedding(self: *IndexManager, index_name: []const u8, embedding_name: []const u8) bool {
-        const entry = self.sparseIndex(index_name) orelse return false;
-        if (entry.embedding_name) |configured| {
-            if (std.mem.eql(u8, configured, embedding_name)) return true;
-        }
-        if (containsOwnedString(entry.embedding_names, embedding_name)) return true;
-        return entry.embedding_name == null and entry.embedding_names.len == 0 and
-            std.mem.eql(u8, entry.config.name, embedding_name);
-    }
-
     pub fn sparseIndexesForEmbedding(self: *const IndexManager, alloc: Allocator, embedding_name: []const u8) ![][]u8 {
         var names = std.ArrayListUnmanaged([]u8).empty;
         errdefer {
@@ -6301,11 +6130,8 @@ pub const IndexManager = struct {
             names.deinit(alloc);
         }
         for (self.sparse_indexes.items) |entry| {
-            const consumes = if (entry.embedding_name) |configured|
-                std.mem.eql(u8, configured, embedding_name)
-            else
-                containsOwnedString(entry.embedding_names, embedding_name);
-            if (!consumes) continue;
+            const configured = entry.embedding_name orelse continue;
+            if (!std.mem.eql(u8, configured, embedding_name)) continue;
             try names.append(alloc, try alloc.dupe(u8, entry.config.name));
         }
         return try names.toOwnedSlice(alloc);
@@ -6322,26 +6148,17 @@ pub const IndexManager = struct {
         return null;
     }
 
-    pub fn graphArtifactSources(self: *const IndexManager, name: []const u8) []const GraphArtifactSource {
-        for (self.graph_indexes.items) |*entry| {
+    pub fn graphArtifactSource(self: *const IndexManager, name: []const u8) ?GraphArtifactSource {
+        for (self.graph_indexes.items) |entry| {
             if (!std.mem.eql(u8, entry.config.name, name)) continue;
-            return entry.artifact_sources;
-        }
-        return &.{};
-    }
-
-    pub fn graphArtifactSourceForArtifact(self: *const IndexManager, index_name: []const u8, artifact_name: []const u8) ?GraphArtifactSource {
-        for (self.graphArtifactSources(index_name)) |source| {
-            if (std.mem.eql(u8, source.artifact_name, artifact_name)) return source;
+            return entry.artifact_source;
         }
         return null;
     }
 
     pub fn graphIndexConsumesAssetArtifact(self: *const IndexManager, index_name: []const u8, artifact_name: []const u8) bool {
-        for (self.graphArtifactSources(index_name)) |source| {
-            if (std.mem.eql(u8, source.artifact_name, artifact_name)) return true;
-        }
-        return false;
+        const source = self.graphArtifactSource(index_name) orelse return false;
+        return std.mem.eql(u8, source.artifact_name, artifact_name);
     }
 
     pub fn graphTraversalAccessPath(self: *IndexManager, name: ?[]const u8) ?algebraic_mod.ir.PhysicalAccessPath {
@@ -6501,13 +6318,61 @@ pub const IndexManager = struct {
 
     pub fn compactAllTextIndexes(self: *IndexManager) !void {
         for (self.text_indexes.items) |*entry| {
-            if (!try self.textIndexNeedsMerge(&entry.persistent, default_merge_policy)) {
+            if (!try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy())) {
                 TextMergeScheduler.noteComplete(entry);
                 continue;
             }
-            try self.compactTextIndex(&entry.persistent, default_merge_policy);
+            try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
             TextMergeScheduler.noteComplete(entry);
         }
+    }
+
+    /// Publish already-projected documents directly into the production text
+    /// index. This is an internal search-kernel benchmark boundary: it uses the
+    /// normal analyzer, segment writer, persistent publisher, ordinal sidecar,
+    /// and merge scheduler, but deliberately does not write the source bodies
+    /// through the primary document store.
+    pub fn indexTextKernelDocuments(
+        self: *IndexManager,
+        index_name: []const u8,
+        docs: []const introducer_mod.TextDocument,
+    ) !usize {
+        if (docs.len == 0) return 0;
+        const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        const target_segment_bytes = @max(@as(usize, 1), textSegmentBuildTargetBytes());
+        const target_build_memory_bytes = @max(@as(usize, 1), textBuildMemoryTargetBytes());
+        const doc_scratch_retained_bytes = textDocScratchRetainedBytes();
+        var segment_count: usize = 0;
+        var start: usize = 0;
+        while (start < docs.len) {
+            const split = introducer_mod.splitTextDocumentsForBuildBudget(docs, start, .{
+                .target_build_memory_bytes = target_build_memory_bytes,
+                .target_segment_bytes = target_segment_bytes,
+            });
+            var segment_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer segment_arena_state.deinit();
+            var build_ctx = TextSegmentSinkBuildContext{
+                .alloc = segment_arena_state.allocator(),
+                .projection_batch = .{
+                    .docs = docs[start..split.end],
+                    .observed_field_analyzers = &.{},
+                },
+                .text_analysis = entry.text_analysis,
+                .build_options = .{
+                    .resource_manager = self.resource_manager,
+                    .build_memory_target_bytes = target_build_memory_bytes,
+                    .doc_scratch_retained_bytes = doc_scratch_retained_bytes,
+                    .profile_timings = false,
+                    .profile_working_set = false,
+                    .store_documents = false,
+                },
+            };
+            _ = try entry.persistent.indexSegmentFromSinkBuilder(&build_ctx, buildTextSegmentIntoSink);
+            segment_count += 1;
+            start = split.end;
+        }
+        try self.finalizeTextBatchMutations(entry, .{ .defer_text_compaction = true }, .{ .indexed_any = true });
+        return segment_count;
     }
 
     pub fn drainScheduledTextMerges(self: *IndexManager) !void {
@@ -6536,10 +6401,14 @@ pub const IndexManager = struct {
             .merge_input_bytes_total = self.text_merge_scheduler.merge_input_bytes_total,
             .merge_output_segments_total = self.text_merge_scheduler.merge_output_segments_total,
             .merge_output_bytes_total = self.text_merge_scheduler.merge_output_bytes_total,
+            .merge_elapsed_ns_total = self.text_merge_scheduler.merge_elapsed_ns_total,
+            .merge_peak_task_alloc_bytes = self.text_merge_scheduler.merge_peak_task_alloc_bytes,
             .last_merge_input_segments = self.text_merge_scheduler.last_merge_input_segments,
             .last_merge_input_bytes = self.text_merge_scheduler.last_merge_input_bytes,
             .last_merge_output_segments = self.text_merge_scheduler.last_merge_output_segments,
             .last_merge_output_bytes = self.text_merge_scheduler.last_merge_output_bytes,
+            .last_merge_elapsed_ns = self.text_merge_scheduler.last_merge_elapsed_ns,
+            .last_merge_peak_task_alloc_bytes = self.text_merge_scheduler.last_merge_peak_task_alloc_bytes,
             .quarantined_merges = self.text_merge_scheduler.activeQuarantineCount(now_ns),
             .quarantined_segments = self.text_merge_scheduler.quarantinedSegmentCount(now_ns),
             .last_merge_error = self.text_merge_scheduler.lastMergeError(now_ns),
@@ -6588,10 +6457,14 @@ pub const IndexManager = struct {
             .merge_input_bytes_total = self.text_merge_scheduler.merge_input_bytes_total,
             .merge_output_segments_total = self.text_merge_scheduler.merge_output_segments_total,
             .merge_output_bytes_total = self.text_merge_scheduler.merge_output_bytes_total,
+            .merge_elapsed_ns_total = self.text_merge_scheduler.merge_elapsed_ns_total,
+            .merge_peak_task_alloc_bytes = self.text_merge_scheduler.merge_peak_task_alloc_bytes,
             .last_merge_input_segments = self.text_merge_scheduler.last_merge_input_segments,
             .last_merge_input_bytes = self.text_merge_scheduler.last_merge_input_bytes,
             .last_merge_output_segments = self.text_merge_scheduler.last_merge_output_segments,
             .last_merge_output_bytes = self.text_merge_scheduler.last_merge_output_bytes,
+            .last_merge_elapsed_ns = self.text_merge_scheduler.last_merge_elapsed_ns,
+            .last_merge_peak_task_alloc_bytes = self.text_merge_scheduler.last_merge_peak_task_alloc_bytes,
             .quarantined_merges = self.text_merge_scheduler.activeQuarantineCountForIndex(index_name, now_ns),
             .quarantined_segments = self.text_merge_scheduler.quarantinedSegmentCountForIndex(index_name, now_ns),
             .last_merge_error = self.text_merge_scheduler.lastMergeErrorForIndex(index_name, now_ns),
@@ -6625,6 +6498,7 @@ pub const IndexManager = struct {
             errdefer self.cancelTextMergeTask(&task);
             var result = executeTextMergeTask(self.alloc, &task) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => {
+                    self.text_merge_scheduler.deferred_for_pressure += 1;
                     self.cancelTextMergeTask(&task);
                     break;
                 },
@@ -6682,10 +6556,10 @@ pub const IndexManager = struct {
 
     fn forceCompactAllTextIndexesWithOptions(self: *IndexManager, options: ForceTextCompactOptions) !void {
         for (self.text_indexes.items) |*entry| {
-            if (!try self.textIndexNeedsMerge(&entry.persistent, default_merge_policy)) {
-                TextMergeScheduler.noteComplete(entry);
-                continue;
-            }
+            // An explicit force-compact request is stronger than the normal
+            // tier policy. A healthy production layout can be policy-settled
+            // at (for example) ten segments and still need a deliberate 10→1
+            // merge for maintenance or the single-segment benchmark mode.
             const fully_compacted = try self.forceCompactTextIndexWithOptions(entry, options);
             if (fully_compacted) {
                 TextMergeScheduler.noteComplete(entry);
@@ -6947,10 +6821,9 @@ pub const IndexManager = struct {
                     const artifact_name = entry.embedding_name orelse entry.config.name;
                     try self.writeDenseEmbeddingArtifactTxn(store_txn, write.doc_key, write.doc_key, artifact_name, "_embeddings", null, write.vector);
                 }
-                const member_key = if (entry.embedding_names.len > 0) write.artifact_key orelse write.doc_key else write.doc_key;
-                const assignment = try self.ensureDenseVectorIdTxn(store_txn, write.index_name, member_key, write.parent_doc_key);
+                const assignment = try self.ensureDenseVectorIdTxn(store_txn, write.index_name, write.doc_key, write.parent_doc_key);
                 all_vector_ids_new = all_vector_ids_new and assignment.can_assume_absent;
-                try items.appendBorrowed(self.alloc, assignment.vector_id, write.vector, member_key);
+                try items.appendBorrowed(self.alloc, assignment.vector_id, write.vector, write.doc_key);
                 try pending_mappings.append(self.alloc, .{
                     .doc_key = items.items.items[items.items.items.len - 1].metadata,
                     .parent_doc_key = write.parent_doc_key,
@@ -7167,7 +7040,7 @@ pub const IndexManager = struct {
 
         const keep_write = try self.alloc.alloc(bool, writes.len);
         defer self.alloc.free(keep_write);
-        try computeDenseReplayKeepMask(self.alloc, writes, keep_write, entry.embedding_names.len > 0);
+        try computeDenseReplayKeepMask(self.alloc, writes, keep_write);
 
         const out_vectors = try self.alloc.alloc(?[]const f32, writes.len);
         defer self.alloc.free(out_vectors);
@@ -7262,7 +7135,27 @@ pub const IndexManager = struct {
         }
     }
 
+    fn beginTextBackfill(self: *IndexManager) void {
+        const prior = self.text_backfill_active.fetchAdd(1, .acq_rel);
+        if (prior != 0) return;
+
+        // A schema-generation rebuild supersedes useful merge work on the
+        // currently opened generation. Invalidate already-dispatched work so
+        // it cannot publish after the bulk builder has started, and leave the
+        // pending bit intact so a still-live index can resume afterwards.
+        for (self.text_indexes.items) |*existing| {
+            self.text_merge_scheduler.supersedeInFlightForIndex(self.alloc, existing.config.name);
+        }
+    }
+
+    fn endTextBackfill(self: *IndexManager) void {
+        const prior = self.text_backfill_active.fetchSub(1, .acq_rel);
+        std.debug.assert(prior > 0);
+    }
+
     fn backfillTextIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *TextIndex, resume_from: ?[]const u8) !void {
+        self.beginTextBackfill();
+        defer self.endTextBackfill();
         const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
@@ -7296,18 +7189,14 @@ pub const IndexManager = struct {
                 last_doc_key: []const u8,
                 flush_count: *usize,
             ) !void {
-                var built = try mapper.buildTextSegmentsFromDocumentsWithMetadata(manager.alloc, docs_buf.items, text_entry.text_analysis, text_entry.runtime_schema, .{
-                    .target_segment_bytes = default_text_segment_build_target_bytes,
-                });
-                defer built.deinit(manager.alloc);
-                if (built.observed_field_analyzers.len > 0) {
-                    try mergeObservedTextFieldAnalyzers(manager, doc_store, text_entry, built.observed_field_analyzers);
-                }
-                for (built.segments) |*seg| {
-                    const owned = seg.*;
-                    seg.* = &.{};
-                    try text_entry.persistent.indexSegmentOwned(owned);
-                }
+                const stats = try manager.indexTextProjectionDocsMaybeChunked(doc_store, text_entry, docs_buf.items);
+                // Bound fanout without forcing a merge-policy walk after every
+                // page. Larger policy batches reduce incremental merge/write
+                // amplification while the target generation is unpublished.
+                try manager.finalizeTextBatchMutations(text_entry, .{
+                    .compact_text = false,
+                    .compact_text_segment_threshold = text_backfill_compact_segment_threshold,
+                }, stats);
                 try rebuild.update(last_doc_key);
                 for (docs_buf.items) |doc| {
                     manager.alloc.free(@constCast(doc.key));
@@ -7325,26 +7214,27 @@ pub const IndexManager = struct {
 
         var scan_lower_buf: ?[]u8 = if (resume_from) |buf| try self.alloc.dupe(u8, buf) else null;
         defer if (scan_lower_buf) |buf| self.alloc.free(buf);
-        const scan_budget_per_page = @max(text_backfill_batch_size * 32, 256);
+        const backfill_doc_limit = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
+        const backfill_source_target_bytes = textProjectionSourceBuildTargetBytes();
+        const scan_budget_per_page = @max(backfill_doc_limit * 2, 256);
         var reached_end = false;
 
         while (!reached_end) {
-            var identity_txn = try runtime_store.store.beginProbe();
-            var identity_txn_open = true;
-            errdefer if (identity_txn_open) identity_txn.abort();
             var page_last_seen_key: ?[]u8 = null;
             defer if (page_last_seen_key) |buf| self.alloc.free(buf);
 
             const ScanState = struct {
                 manager: *IndexManager,
                 text_entry: *TextIndex,
-                identity_txn: *@TypeOf(identity_txn),
                 lower_exclusive: ?[]const u8,
                 mapped_docs: *std.ArrayListUnmanaged(mapper.MapperDoc),
                 batch_last_doc_key: *?[]const u8,
                 page_last_seen_key: *?[]u8,
                 saw_visible_doc: *bool,
                 scan_budget: usize,
+                doc_limit: usize,
+                source_target_bytes: usize,
+                source_bytes: usize = 0,
                 scanned: usize = 0,
                 stopped_early: bool = false,
 
@@ -7358,9 +7248,9 @@ pub const IndexManager = struct {
                     if (state.lower_exclusive) |exclusive| {
                         if (std.mem.order(u8, key, exclusive) != .gt) return .@"continue";
                     }
-                    try state.rememberKey(key);
                     state.scanned += 1;
                     if (isMetadataKey(key) or !state.manager.keyInRange(key) or !try textIndexShouldConsumeDoc(state.manager, state.text_entry, key)) {
+                        try state.rememberKey(key);
                         if (state.scanned >= state.scan_budget) {
                             state.stopped_early = true;
                             return .stop;
@@ -7379,19 +7269,41 @@ pub const IndexManager = struct {
                     var doc_value_owned = true;
                     errdefer if (doc_value_owned) state.manager.alloc.free(doc_value);
 
+                    const doc_bytes = @sizeOf(mapper.MapperDoc) + doc_id.len + doc_value.len;
+                    if (state.mapped_docs.items.len > 0 and state.source_bytes +| doc_bytes > state.source_target_bytes) {
+                        // Do not consume this key. The next page resumes after
+                        // page_last_seen_key and visits it again. Including the
+                        // crossing document here created a one-document tail
+                        // segment for almost every rebuild page.
+                        state.manager.alloc.free(doc_id);
+                        state.manager.alloc.free(doc_value);
+                        doc_id_owned = false;
+                        doc_value_owned = false;
+                        state.stopped_early = true;
+                        return .stop;
+                    }
+
                     try state.mapped_docs.append(state.manager.alloc, .{
                         .key = doc_id,
                         .value = doc_value,
-                        .doc_ordinal = try doc_identity.lookupOrdinalTxn(state.manager.alloc, state.identity_txn, doc_id),
+                        // Resolve ordinals as one sorted batch in
+                        // textProjectionSourceDocsWithOrdinals. A point lookup
+                        // here turns a full rebuild into millions of sparse LSM
+                        // reads and repeatedly reacquires the backend lock.
+                        .doc_ordinal = null,
                     });
                     doc_id_owned = false;
                     doc_value_owned = false;
+                    state.source_bytes +|= doc_bytes;
+                    try state.rememberKey(key);
 
                     if (state.batch_last_doc_key.*) |old| state.manager.alloc.free(old);
                     state.batch_last_doc_key.* = try state.manager.alloc.dupe(u8, key);
 
-                    const backfill_batch_size = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
-                    if (state.mapped_docs.items.len >= backfill_batch_size or state.scanned >= state.scan_budget) {
+                    if (state.mapped_docs.items.len >= state.doc_limit or
+                        state.source_bytes >= state.source_target_bytes or
+                        state.scanned >= state.scan_budget)
+                    {
                         state.stopped_early = true;
                         return .stop;
                     }
@@ -7402,17 +7314,16 @@ pub const IndexManager = struct {
             var scan_state = ScanState{
                 .manager = self,
                 .text_entry = entry,
-                .identity_txn = &identity_txn,
                 .lower_exclusive = scan_lower_buf,
                 .mapped_docs = &mapped_docs,
                 .batch_last_doc_key = &batch_last_doc_key,
                 .page_last_seen_key = &page_last_seen_key,
                 .saw_visible_doc = &saw_visible_doc,
                 .scan_budget = scan_budget_per_page,
+                .doc_limit = backfill_doc_limit,
+                .source_target_bytes = backfill_source_target_bytes,
             };
             try backend_scan.scanWithContext(&runtime_store.store, if (scan_lower_buf) |buf| buf else lower, if (upper) |buf| buf else "", .{}, &scan_state, ScanState.scanEntry);
-            identity_txn.abort();
-            identity_txn_open = false;
             reached_end = !scan_state.stopped_early or page_last_seen_key == null;
 
             if (page_last_seen_key) |seen| {
@@ -7427,6 +7338,7 @@ pub const IndexManager = struct {
             }
         }
 
+        if (flushed_batches > 0) try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
         if (flushed_batches > 0) try entry.persistent.checkpointLsmWalAfterDurableBoundary();
     }
@@ -7440,6 +7352,8 @@ pub const IndexManager = struct {
         cancel_check: ?types.RepairCancelCheck,
         capacity_check: ?types.RepairCapacityCheck,
     ) !void {
+        self.beginTextBackfill();
+        defer self.endTextBackfill();
         const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
 
         const lower = try internal_keys.documentRangeLowerAlloc(self.alloc, self.byte_range.start);
@@ -7470,23 +7384,27 @@ pub const IndexManager = struct {
                 docs_buf: *std.ArrayListUnmanaged(mapper.MapperDoc),
                 last_doc_key: []const u8,
                 flush_count: *usize,
+                identity_txn: *docstore_mod.DocStore.Txn,
                 check: ?types.RepairCancelCheck,
                 capacity: ?types.RepairCapacityCheck,
             ) !void {
                 try checkRepairCancelled(check);
                 if (capacity) |admission| try admission.boundary();
-                var built = try mapper.buildTextSegmentsFromDocumentsWithMetadata(manager.alloc, docs_buf.items, text_entry.text_analysis, text_entry.runtime_schema, .{
-                    .target_segment_bytes = default_text_segment_build_target_bytes,
-                });
-                defer built.deinit(manager.alloc);
-                if (built.observed_field_analyzers.len > 0) {
-                    try mergeObservedTextFieldAnalyzers(manager, doc_store, text_entry, built.observed_field_analyzers);
-                }
-                for (built.segments) |*seg| {
-                    const owned = seg.*;
-                    seg.* = &.{};
-                    try text_entry.persistent.indexSegmentOwned(owned);
-                }
+
+                // Keep repair/backfill generation consistency while replacing
+                // per-document point reads with one sorted LSM batch lookup.
+                const doc_ids = try manager.alloc.alloc([]const u8, docs_buf.items.len);
+                defer manager.alloc.free(doc_ids);
+                for (docs_buf.items, 0..) |doc, i| doc_ids[i] = doc.key;
+                const ordinals = try doc_identity.lookupOrdinalsTxnAlloc(manager.alloc, identity_txn, doc_ids);
+                defer manager.alloc.free(ordinals);
+                for (docs_buf.items, ordinals) |*doc, ordinal| doc.doc_ordinal = ordinal;
+
+                const stats = try manager.indexTextProjectionDocsMaybeChunked(doc_store, text_entry, docs_buf.items);
+                try manager.finalizeTextBatchMutations(text_entry, .{
+                    .compact_text = false,
+                    .compact_text_segment_threshold = text_backfill_compact_segment_threshold,
+                }, stats);
                 try rebuild.update(last_doc_key);
                 for (docs_buf.items) |doc| {
                     manager.alloc.free(@constCast(doc.key));
@@ -7504,7 +7422,9 @@ pub const IndexManager = struct {
 
         var scan_lower_buf: ?[]u8 = if (resume_from) |buf| try self.alloc.dupe(u8, buf) else null;
         defer if (scan_lower_buf) |buf| self.alloc.free(buf);
-        const scan_budget_per_page = @max(text_backfill_batch_size * 32, 256);
+        const backfill_doc_limit = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
+        const backfill_source_target_bytes = textProjectionSourceBuildTargetBytes();
+        const scan_budget_per_page = @max(backfill_doc_limit * 2, 256);
         var reached_end = false;
 
         while (!reached_end) {
@@ -7515,13 +7435,15 @@ pub const IndexManager = struct {
             const ScanState = struct {
                 manager: *IndexManager,
                 text_entry: *TextIndex,
-                identity_txn: *docstore_mod.DocStore.Txn,
                 lower_exclusive: ?[]const u8,
                 mapped_docs: *std.ArrayListUnmanaged(mapper.MapperDoc),
                 batch_last_doc_key: *?[]const u8,
                 page_last_seen_key: *?[]u8,
                 saw_visible_doc: *bool,
                 scan_budget: usize,
+                doc_limit: usize,
+                source_target_bytes: usize,
+                source_bytes: usize = 0,
                 scanned: usize = 0,
                 stopped_early: bool = false,
 
@@ -7535,9 +7457,9 @@ pub const IndexManager = struct {
                     if (state.lower_exclusive) |exclusive| {
                         if (std.mem.order(u8, key, exclusive) != .gt) return .@"continue";
                     }
-                    try state.rememberKey(key);
                     state.scanned += 1;
                     if (isMetadataKey(key) or !state.manager.keyInRange(key) or !try textIndexShouldConsumeDoc(state.manager, state.text_entry, key)) {
+                        try state.rememberKey(key);
                         if (state.scanned >= state.scan_budget) {
                             state.stopped_early = true;
                             return .stop;
@@ -7556,19 +7478,36 @@ pub const IndexManager = struct {
                     var doc_value_owned = true;
                     errdefer if (doc_value_owned) state.manager.alloc.free(doc_value);
 
+                    const doc_bytes = @sizeOf(mapper.MapperDoc) + doc_id.len + doc_value.len;
+                    if (state.mapped_docs.items.len > 0 and state.source_bytes +| doc_bytes > state.source_target_bytes) {
+                        state.manager.alloc.free(doc_id);
+                        state.manager.alloc.free(doc_value);
+                        doc_id_owned = false;
+                        doc_value_owned = false;
+                        state.stopped_early = true;
+                        return .stop;
+                    }
+
                     try state.mapped_docs.append(state.manager.alloc, .{
                         .key = doc_id,
                         .value = doc_value,
-                        .doc_ordinal = try doc_identity.lookupOrdinalTxn(state.manager.alloc, state.identity_txn, doc_id),
+                        // Resolve the whole page with getManySorted when the
+                        // projection batch is built. The identity mapping is
+                        // stable for the lifetime of a document ordinal.
+                        .doc_ordinal = null,
                     });
                     doc_id_owned = false;
                     doc_value_owned = false;
+                    state.source_bytes +|= doc_bytes;
+                    try state.rememberKey(key);
 
                     if (state.batch_last_doc_key.*) |old| state.manager.alloc.free(old);
                     state.batch_last_doc_key.* = try state.manager.alloc.dupe(u8, key);
 
-                    const backfill_batch_size = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
-                    if (state.mapped_docs.items.len >= backfill_batch_size or state.scanned >= state.scan_budget) {
+                    if (state.mapped_docs.items.len >= state.doc_limit or
+                        state.source_bytes >= state.source_target_bytes or
+                        state.scanned >= state.scan_budget)
+                    {
                         state.stopped_early = true;
                         return .stop;
                     }
@@ -7579,13 +7518,14 @@ pub const IndexManager = struct {
             var scan_state = ScanState{
                 .manager = self,
                 .text_entry = entry,
-                .identity_txn = read_txn,
                 .lower_exclusive = scan_lower_buf,
                 .mapped_docs = &mapped_docs,
                 .batch_last_doc_key = &batch_last_doc_key,
                 .page_last_seen_key = &page_last_seen_key,
                 .saw_visible_doc = &saw_visible_doc,
                 .scan_budget = scan_budget_per_page,
+                .doc_limit = backfill_doc_limit,
+                .source_target_bytes = backfill_source_target_bytes,
             };
             try store.scanReadTxnWithContext(read_txn, if (scan_lower_buf) |buf| buf else lower, if (upper) |buf| buf else "", .{}, &scan_state, ScanState.scanEntry);
             reached_end = !scan_state.stopped_early or page_last_seen_key == null;
@@ -7604,6 +7544,7 @@ pub const IndexManager = struct {
                     &mapped_docs,
                     batch_last_doc_key.?,
                     &flushed_batches,
+                    read_txn,
                     cancel_check,
                     capacity_check,
                 );
@@ -7612,6 +7553,7 @@ pub const IndexManager = struct {
             }
         }
 
+        if (flushed_batches > 0) try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
         if (flushed_batches > 0) try entry.persistent.checkpointLsmWalAfterDurableBoundary();
     }
@@ -7827,17 +7769,6 @@ pub const IndexManager = struct {
 
     fn configRequiresEnrichmentReplay(self: *const IndexManager, cfg: types.IndexConfig) !bool {
         switch (cfg.kind) {
-            .full_text => {
-                const text_cfg = try parseTextConfig(self.alloc, cfg.config_json);
-                defer text_cfg.deinit(self.alloc);
-                if (text_cfg.source_artifact_name) |name| {
-                    if (self.artifactSourceHasGeneratedEnrichment(name)) return true;
-                }
-                for (text_cfg.source_artifact_names) |name| {
-                    if (self.artifactSourceHasGeneratedEnrichment(name)) return true;
-                }
-                return false;
-            },
             .dense_vector => {
                 if (try parseDenseGeneratorConfig(self.alloc, cfg.config_json)) |generator| {
                     defer generator.deinit(self.alloc);
@@ -7845,7 +7776,6 @@ pub const IndexManager = struct {
                 }
                 const dense_cfg = try parseDenseConfig(self.alloc, cfg.config_json);
                 defer dense_cfg.deinit(self.alloc);
-                if (dense_cfg.embedding_names.len > 0) return true;
                 return dense_cfg.embedding_name != null and !dense_cfg.external and self.getEnrichment(.embedding, dense_cfg.embedding_name.?) != null;
             },
             .sparse_vector => {
@@ -7853,26 +7783,10 @@ pub const IndexManager = struct {
                     defer generator.deinit(self.alloc);
                     return true;
                 }
-                const sparse_cfg = try parseSparseConfig(self.alloc, cfg.config_json);
-                defer sparse_cfg.deinit(self.alloc);
-                return sparse_cfg.embedding_names.len > 0;
-            },
-            .graph => {
-                var graph_cfg = try parseGraphConfig(self.alloc, cfg.config_json);
-                defer graph_cfg.deinit(self.alloc);
-                for (graph_cfg.artifact_sources) |source| {
-                    if (self.artifactSourceHasGeneratedEnrichment(source.artifact_name)) return true;
-                }
                 return false;
             },
-            .algebraic => return false,
+            else => return false,
         }
-    }
-
-    fn artifactSourceHasGeneratedEnrichment(self: *const IndexManager, name: []const u8) bool {
-        return self.getEnrichment(.chunk, name) != null or
-            self.getEnrichment(.asset, name) != null or
-            self.getEnrichment(.embedding, name) != null;
     }
 
     fn saveBackfilledAppliedSequence(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
@@ -8064,6 +7978,7 @@ pub const IndexManager = struct {
                     });
                     return err;
                 };
+                if (self.resource_manager) |manager| persistent.attachResourceManager(manager);
                 var persistent_moved = false;
                 errdefer if (!persistent_moved) persistent.close();
                 const runtime_schema = loadRuntimeSchemaForTextIndex(self.alloc, store, cfg.name) catch |err| {
@@ -8105,7 +8020,6 @@ pub const IndexManager = struct {
                     .apply_mutex = apply_mutex,
                     .config = try types.IndexConfig.clone(self.alloc, cfg),
                     .chunk_name = if (text_cfg.source_artifact_name) |name| try self.alloc.dupe(u8, name) else null,
-                    .source_artifact_names = try cloneOwnedStrings(self.alloc, text_cfg.source_artifact_names),
                     .text_analysis = text_analysis,
                     .observed_field_analyzers = observed_field_analyzers,
                     .runtime_schema = runtime_schema,
@@ -8159,7 +8073,7 @@ pub const IndexManager = struct {
                     backfill_ns += elapsedSince(backfill_started_ns);
                 }
 
-                entry.compaction_pending = try self.textIndexNeedsMerge(&entry.persistent, default_merge_policy);
+                entry.compaction_pending = try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy());
                 if (openProfileEnabled()) {
                     logOpenIndexProfile(.{
                         .kind = cfg.kind,
@@ -8190,39 +8104,6 @@ pub const IndexManager = struct {
                         return error.InvalidIndexConfig;
                     }
                 }
-                var first_multi_source_embedding: ?*const enrichment_catalog.EnrichmentConfig = null;
-                var multi_source_vector_space: ?[]const u8 = null;
-                var multi_source_has_implicit_vector_space = false;
-                var multi_source_implicit_producer: ?[]const u8 = null;
-                for (dense_cfg.embedding_names) |embedding_name| {
-                    const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
-                    if (embedding_cfg.expected_dims > 0 and embedding_cfg.expected_dims != dense_cfg.dims) return error.InvalidIndexConfig;
-                    if (dense_cfg.embedding_names.len > 1) {
-                        if (embedding_cfg.vector_space.len == 0) {
-                            multi_source_has_implicit_vector_space = true;
-                            if (embedding_cfg.producer_json.len == 0) return error.InvalidIndexConfig;
-                            if (multi_source_implicit_producer) |expected| {
-                                if (!std.mem.eql(u8, expected, embedding_cfg.producer_json)) return error.InvalidIndexConfig;
-                            } else {
-                                multi_source_implicit_producer = embedding_cfg.producer_json;
-                            }
-                        } else {
-                            if (multi_source_vector_space) |expected| {
-                                if (!std.mem.eql(u8, expected, embedding_cfg.vector_space)) return error.InvalidIndexConfig;
-                            } else {
-                                multi_source_vector_space = embedding_cfg.vector_space;
-                            }
-                        }
-                    }
-                    if (first_multi_source_embedding == null and embedding_cfg.source_artifact_name.len > 0) {
-                        first_multi_source_embedding = embedding_cfg;
-                    }
-                }
-                // Compatibility is either fully automatic (all vector_space
-                // values omitted) or an explicit assertion shared by every
-                // source. Mixing the two modes would make the contract
-                // ambiguous and is rejected.
-                if (multi_source_has_implicit_vector_space and multi_source_vector_space != null) return error.InvalidIndexConfig;
 
                 const path = try self.activeIndexPathForConfig(cfg);
                 defer self.alloc.free(path);
@@ -8298,12 +8179,10 @@ pub const IndexManager = struct {
                     .dims = dense_cfg.dims,
                     .metric = dense_cfg.metric,
                     .external = dense_cfg.external,
-                    .managed_direct_field = !dense_cfg.external and dense_generator == null and referenced_embedding == null and dense_cfg.embedding_names.len == 0,
+                    .managed_direct_field = !dense_cfg.external and dense_generator == null and referenced_embedding == null,
                     .chunk_name = if (dense_generator) |generator|
                         if (generatorHasChunking(generator)) try self.alloc.dupe(u8, generator.artifact_name) else null
                     else if (referenced_embedding) |embedding_cfg|
-                        if (embedding_cfg.source_artifact_name.len > 0) try self.alloc.dupe(u8, embedding_cfg.source_artifact_name) else null
-                    else if (first_multi_source_embedding) |embedding_cfg|
                         if (embedding_cfg.source_artifact_name.len > 0) try self.alloc.dupe(u8, embedding_cfg.source_artifact_name) else null
                     else
                         null,
@@ -8313,7 +8192,6 @@ pub const IndexManager = struct {
                         try self.alloc.dupe(u8, embedding_name)
                     else
                         null,
-                    .embedding_names = try cloneOwnedStrings(self.alloc, dense_cfg.embedding_names),
                     .index = index,
                     .vector_loader_context = vector_loader_context,
                 };
@@ -8344,39 +8222,10 @@ pub const IndexManager = struct {
                 defer sparse_cfg.deinit(self.alloc);
                 const sparse_generator = try parseSparseGeneratorConfig(self.alloc, cfg.config_json);
                 defer if (sparse_generator) |generator| generator.deinit(self.alloc);
-                const referenced_embedding = if (sparse_generator == null and sparse_cfg.embedding_names.len == 0)
+                const referenced_embedding = if (sparse_generator == null)
                     self.getEnrichment(.embedding, cfg.name)
                 else
                     null;
-                var first_multi_source_embedding: ?*const enrichment_catalog.EnrichmentConfig = null;
-                var multi_source_vector_space: ?[]const u8 = null;
-                var multi_source_has_implicit_vector_space = false;
-                var multi_source_implicit_producer: ?[]const u8 = null;
-                for (sparse_cfg.embedding_names) |embedding_name| {
-                    const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
-                    if (embedding_cfg.expected_dims != 0) return error.InvalidIndexConfig;
-                    if (sparse_cfg.embedding_names.len > 1) {
-                        if (embedding_cfg.vector_space.len == 0) {
-                            multi_source_has_implicit_vector_space = true;
-                            if (embedding_cfg.producer_json.len == 0) return error.InvalidIndexConfig;
-                            if (multi_source_implicit_producer) |expected| {
-                                if (!std.mem.eql(u8, expected, embedding_cfg.producer_json)) return error.InvalidIndexConfig;
-                            } else {
-                                multi_source_implicit_producer = embedding_cfg.producer_json;
-                            }
-                        } else {
-                            if (multi_source_vector_space) |expected| {
-                                if (!std.mem.eql(u8, expected, embedding_cfg.vector_space)) return error.InvalidIndexConfig;
-                            } else {
-                                multi_source_vector_space = embedding_cfg.vector_space;
-                            }
-                        }
-                    }
-                    if (first_multi_source_embedding == null and embedding_cfg.source_artifact_name.len > 0) {
-                        first_multi_source_embedding = embedding_cfg;
-                    }
-                }
-                if (multi_source_has_implicit_vector_space and multi_source_vector_space != null) return error.InvalidIndexConfig;
 
                 const path = try self.activeIndexPathForConfig(cfg);
                 defer self.alloc.free(path);
@@ -8404,25 +8253,20 @@ pub const IndexManager = struct {
                     .config = try types.IndexConfig.clone(self.alloc, cfg),
                     .field_name = try self.alloc.dupe(u8, sparse_cfg.field_name),
                     .external = sparse_cfg.external,
-                    .managed_direct_field = !sparse_cfg.external and sparse_generator == null and referenced_embedding == null and sparse_cfg.embedding_names.len == 0,
+                    .managed_direct_field = !sparse_cfg.external and sparse_generator == null and referenced_embedding == null,
                     .chunk_name = if (sparse_generator) |generator| blk: {
                         const chunk_cfg = resolveChunkGenerator(self, generator);
                         break :blk if (generatorHasChunking(chunk_cfg)) try self.alloc.dupe(u8, chunk_cfg.artifact_name) else null;
                     } else if (referenced_embedding) |embedding_cfg|
                         if (embedding_cfg.source_artifact_name.len > 0) try self.alloc.dupe(u8, embedding_cfg.source_artifact_name) else null
-                    else if (first_multi_source_embedding) |embedding_cfg|
-                        if (embedding_cfg.source_artifact_name.len > 0) try self.alloc.dupe(u8, embedding_cfg.source_artifact_name) else null
                     else
                         null,
-                    .embedding_name = if (sparse_cfg.embedding_names.len > 0)
-                        null
-                    else if (sparse_generator) |generator| blk: {
+                    .embedding_name = if (sparse_generator) |generator| blk: {
                         break :blk if (generator.embedding_name) |embedding_name|
                             try self.alloc.dupe(u8, embedding_name)
                         else
                             try self.alloc.dupe(u8, cfg.name);
                     } else try self.alloc.dupe(u8, cfg.name),
-                    .embedding_names = try cloneOwnedStrings(self.alloc, sparse_cfg.embedding_names),
                     .rebuild_root_path = try self.alloc.dupe(u8, path),
                     .index = index,
                 };
@@ -8458,7 +8302,7 @@ pub const IndexManager = struct {
                 var graph_cfg = try parseGraphConfig(self.alloc, cfg.config_json);
                 var graph_cfg_moved = false;
                 errdefer if (!graph_cfg_moved) graph_cfg.deinit(self.alloc);
-                for (graph_cfg.artifact_sources) |source| {
+                if (graph_cfg.artifact_source) |source| {
                     if (self.getEnrichment(.asset, source.artifact_name) == null and
                         self.getEnrichment(.chunk, source.artifact_name) == null)
                     {
@@ -8469,6 +8313,7 @@ pub const IndexManager = struct {
                     asset.deinit(self.alloc);
                     graph_cfg.shorthand_asset = null;
                 }
+
                 const path = try self.activeIndexPathForConfig(cfg);
                 defer self.alloc.free(path);
 
@@ -8517,7 +8362,7 @@ pub const IndexManager = struct {
                     .apply_mutex = apply_mutex,
                     .config = cloned_cfg,
                     .edge_type_configs = graph_cfg.edge_type_configs,
-                    .artifact_sources = graph_cfg.artifact_sources,
+                    .artifact_source = graph_cfg.artifact_source,
                     .rebuild_root_path = try self.alloc.dupe(u8, path),
                     .index = index,
                 };
@@ -8583,118 +8428,15 @@ pub const IndexManager = struct {
         }
     }
 
-    const GraphRetirement = struct {
-        index_name: []const u8,
-        generation: u64,
-    };
-
-    pub fn retiredGraphGenerationKeyAlloc(alloc: Allocator, index_name: []const u8, generation: u64) ![]u8 {
-        if (index_name.len > std.math.maxInt(u32)) return error.IndexNameTooLong;
-        const key = try alloc.alloc(u8, retired_graph_generation_prefix.len + 4 + index_name.len + 8);
-        @memcpy(key[0..retired_graph_generation_prefix.len], retired_graph_generation_prefix);
-        var offset = retired_graph_generation_prefix.len;
-        std.mem.writeInt(u32, key[offset..][0..4], @intCast(index_name.len), .big);
-        offset += 4;
-        @memcpy(key[offset..][0..index_name.len], index_name);
-        offset += index_name.len;
-        std.mem.writeInt(u64, key[offset..][0..8], generation, .big);
-        return key;
-    }
-
-    pub fn decodeRetiredGraphGenerationKey(key: []const u8) !struct { index_name: []const u8, generation: u64 } {
-        if (!std.mem.startsWith(u8, key, retired_graph_generation_prefix)) return error.InvalidRetiredGraphGenerationKey;
-        var offset = retired_graph_generation_prefix.len;
-        if (offset + 4 > key.len) return error.InvalidRetiredGraphGenerationKey;
-        const name_len = std.mem.readInt(u32, key[offset..][0..4], .big);
-        offset += 4;
-        if (offset + name_len + 8 != key.len) return error.InvalidRetiredGraphGenerationKey;
-        const name = key[offset..][0..name_len];
-        offset += name_len;
-        const generation = std.mem.readInt(u64, key[offset..][0..8], .big);
-        if (!coverage_identity.isValid(generation)) return error.InvalidRetiredGraphGenerationKey;
-        return .{ .index_name = name, .generation = generation };
-    }
-
     fn persistCatalog(self: *IndexManager, store: anytype) !void {
-        return try self.persistCatalogWithGraphRetirement(store, null);
-    }
-
-    fn persistCatalogWithGraphRetirement(self: *IndexManager, store: anytype, retirement: ?GraphRetirement) !void {
         const data = try serializeCatalog(self.alloc, self);
         defer self.alloc.free(data);
-        const admission_data = try self.serializeAdmissionCatalogAlloc();
-        defer self.alloc.free(admission_data);
-        const retirement_key = if (retirement) |item|
-            try retiredGraphGenerationKeyAlloc(self.alloc, item.index_name, item.generation)
-        else
-            null;
-        defer if (retirement_key) |key| self.alloc.free(key);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
         try txn.put(index_catalog_key, data);
-        try txn.put(index_admission_catalog_key, admission_data);
-        if (retirement_key) |key| try txn.put(key, "");
         try txn.commit();
-    }
-
-    fn serializeAdmissionCatalogAlloc(self: *IndexManager) ![]u8 {
-        var names = std.ArrayListUnmanaged([]const u8).empty;
-        defer names.deinit(self.alloc);
-        var it = self.admission_rebuilding_indexes.keyIterator();
-        while (it.next()) |name| {
-            // Stale in-memory entries are deliberately excluded. This makes
-            // index deletion and admission-marker removal one catalog commit.
-            if (self.has(name.*)) try names.append(self.alloc, name.*);
-        }
-        std.mem.sort([]const u8, names.items, {}, struct {
-            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-                return std.mem.lessThan(u8, a, b);
-            }
-        }.lessThan);
-        if (names.items.len > std.math.maxInt(u32)) return error.IndexCatalogTooLarge;
-        var out = std.ArrayListUnmanaged(u8).empty;
-        errdefer out.deinit(self.alloc);
-        try out.appendSlice(self.alloc, "AIA1");
-        var buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &buf, @intCast(names.items.len), .little);
-        try out.appendSlice(self.alloc, &buf);
-        for (names.items) |name| {
-            if (name.len > std.math.maxInt(u32)) return error.IndexNameTooLong;
-            std.mem.writeInt(u32, &buf, @intCast(name.len), .little);
-            try out.appendSlice(self.alloc, &buf);
-            try out.appendSlice(self.alloc, name);
-        }
-        return try out.toOwnedSlice(self.alloc);
-    }
-
-    fn loadAdmissionCatalogFromTxn(self: *IndexManager, txn: anytype, configs: []const types.IndexConfig) !void {
-        self.clearAdmissionRebuildingIndexes();
-        const data = txn.get(index_admission_catalog_key) catch |err| switch (err) {
-            error.NotFound => return,
-            else => return err,
-        };
-        if (data.len < 8 or !std.mem.eql(u8, data[0..4], "AIA1")) return error.InvalidIndexAdmissionCatalog;
-        var offset: usize = 4;
-        const entry_count = std.mem.readInt(u32, data[offset..][0..4], .little);
-        offset += 4;
-        var i: u32 = 0;
-        while (i < entry_count) : (i += 1) {
-            if (offset + 4 > data.len) return error.InvalidIndexAdmissionCatalog;
-            const len = std.mem.readInt(u32, data[offset..][0..4], .little);
-            offset += 4;
-            if (offset + len > data.len) return error.InvalidIndexAdmissionCatalog;
-            const name = data[offset..][0..len];
-            offset += len;
-            for (configs) |cfg| {
-                if (std.mem.eql(u8, cfg.name, name)) {
-                    try self.markAdmissionRebuildingNoLock(name);
-                    break;
-                }
-            }
-        }
-        if (offset != data.len) return error.InvalidIndexAdmissionCatalog;
     }
 
     fn loadEnrichmentCatalog(self: *IndexManager, store: anytype) !void {
@@ -8780,8 +8522,6 @@ pub const IndexManager = struct {
             .dense_vector => {
                 const dense_cfg = try parseDenseConfig(self.alloc, cfg.config_json);
                 defer dense_cfg.deinit(self.alloc);
-                const semantic_producer = try parseEmbeddingSemanticProducerAlloc(self.alloc, cfg.config_json);
-                defer if (semantic_producer) |value| self.alloc.free(value);
                 if (try parseDenseGeneratorConfig(self.alloc, cfg.config_json)) |generator| {
                     defer generator.deinit(self.alloc);
                     const chunk_cfg = resolveChunkGenerator(self, generator);
@@ -8805,7 +8545,6 @@ pub const IndexManager = struct {
                         .source_template = if (chunk_cfg.source_template.len > 0) chunk_cfg.source_template else "",
                         .source_artifact_name = if (generatorHasChunking(chunk_cfg)) chunk_cfg.artifact_name else "",
                         .expected_dims = dense_cfg.dims,
-                        .producer_json = semantic_producer orelse "",
                         .chunk_size = chunk_cfg.chunk_size,
                         .chunk_overlap = chunk_cfg.chunk_overlap,
                         .execution_json = if (chunk_cfg.embedding_execution_json.len > 0) chunk_cfg.embedding_execution_json else "",
@@ -8813,8 +8552,6 @@ pub const IndexManager = struct {
                 }
             },
             .sparse_vector => {
-                const semantic_producer = try parseEmbeddingSemanticProducerAlloc(self.alloc, cfg.config_json);
-                defer if (semantic_producer) |value| self.alloc.free(value);
                 if (try parseSparseGeneratorConfig(self.alloc, cfg.config_json)) |generator| {
                     defer generator.deinit(self.alloc);
                     const chunk_cfg = resolveChunkGenerator(self, generator);
@@ -8831,17 +8568,6 @@ pub const IndexManager = struct {
                             .full_text_index = chunk_cfg.full_text_index,
                         })) or changed;
                     }
-                    changed = (try self.ensureEmbeddingEnrichment(.{
-                        .name = if (chunk_cfg.embedding_name) |embedding_name| embedding_name else cfg.name,
-                        .kind = .embedding,
-                        .source_field = chunk_cfg.source_field,
-                        .source_template = if (chunk_cfg.source_template.len > 0) chunk_cfg.source_template else "",
-                        .source_artifact_name = if (generatorHasChunking(chunk_cfg)) chunk_cfg.artifact_name else "",
-                        .producer_json = semantic_producer orelse "",
-                        .chunk_size = chunk_cfg.chunk_size,
-                        .chunk_overlap = chunk_cfg.chunk_overlap,
-                        .execution_json = if (chunk_cfg.embedding_execution_json.len > 0) chunk_cfg.embedding_execution_json else "",
-                    })) or changed;
                 }
             },
             .graph => {
@@ -8850,7 +8576,7 @@ pub const IndexManager = struct {
                 if (graph_cfg.shorthand_asset) |asset| {
                     changed = (try self.ensureAssetEnrichment(asset)) or changed;
                 }
-                for (graph_cfg.artifact_sources) |source| {
+                if (graph_cfg.artifact_source) |source| {
                     if (graph_cfg.shorthand_asset) |asset| {
                         if (!std.mem.eql(u8, asset.name, source.artifact_name)) return error.InvalidIndexConfig;
                     }
@@ -8892,8 +8618,6 @@ pub const IndexManager = struct {
                 !std.mem.eql(u8, existing.source_template, cfg.source_template) or
                 !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 existing.expected_dims != cfg.expected_dims or
-                !std.mem.eql(u8, existing.vector_space, cfg.vector_space) or
-                !std.mem.eql(u8, existing.producer_json, cfg.producer_json) or
                 !std.mem.eql(u8, existing.execution_json, cfg.execution_json))
             {
                 return error.ConflictingEnrichmentConfig;
@@ -8957,11 +8681,6 @@ pub const IndexManager = struct {
             if (entry.chunk_name) |chunk_name| {
                 if (self.getEnrichment(.chunk, chunk_name) == null) return error.InvalidEnrichmentConfig;
             }
-            for (entry.source_artifact_names) |artifact_name| {
-                if (self.getEnrichment(.chunk, artifact_name) == null and self.getEnrichment(.asset, artifact_name) == null) {
-                    return error.InvalidEnrichmentConfig;
-                }
-            }
         }
         for (self.dense_indexes.items) |entry| {
             if (entry.chunk_name) |chunk_name| {
@@ -8970,23 +8689,16 @@ pub const IndexManager = struct {
             if (entry.embedding_name) |embedding_name| {
                 if (!entry.external and self.getEnrichment(.embedding, embedding_name) == null) return error.InvalidEnrichmentConfig;
             }
-            for (entry.embedding_names) |embedding_name| {
-                if (self.getEnrichment(.embedding, embedding_name) == null) return error.InvalidEnrichmentConfig;
-            }
         }
         for (self.sparse_indexes.items) |entry| {
             if (entry.chunk_name) |chunk_name| {
                 if (self.getEnrichment(.chunk, chunk_name) == null) return error.InvalidEnrichmentConfig;
             }
-            for (entry.embedding_names) |embedding_name| {
-                const enrichment = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidEnrichmentConfig;
-                if (enrichment.expected_dims != 0) return error.InvalidEnrichmentConfig;
-            }
         }
         for (self.graph_indexes.items) |entry| {
             var graph_cfg = try parseGraphConfig(self.alloc, entry.config.config_json);
             defer graph_cfg.deinit(self.alloc);
-            for (graph_cfg.artifact_sources) |source| {
+            if (graph_cfg.artifact_source) |source| {
                 if (self.getEnrichment(.asset, source.artifact_name) == null and
                     self.getEnrichment(.chunk, source.artifact_name) == null)
                 {
@@ -9003,7 +8715,6 @@ pub const IndexManager = struct {
                     if (entry.chunk_name) |chunk_name| {
                         if (std.mem.eql(u8, chunk_name, name)) return true;
                     }
-                    if (containsOwnedString(entry.source_artifact_names, name)) return true;
                 }
                 for (self.dense_indexes.items) |entry| {
                     if (entry.chunk_name) |chunk_name| {
@@ -9018,11 +8729,6 @@ pub const IndexManager = struct {
                         if (generatorHasChunking(chunk_cfg) and std.mem.eql(u8, chunk_cfg.artifact_name, name)) return true;
                     }
                 }
-                for (self.graph_indexes.items) |entry| {
-                    for (entry.artifact_sources) |source| {
-                        if (std.mem.eql(u8, source.artifact_name, name)) return true;
-                    }
-                }
                 for (self.enrichments.items) |entry| {
                     if (entry.kind == .embedding and std.mem.eql(u8, entry.source_artifact_name, name)) return true;
                 }
@@ -9032,21 +8738,11 @@ pub const IndexManager = struct {
                     if (entry.embedding_name) |embedding_name| {
                         if (std.mem.eql(u8, embedding_name, name)) return true;
                     }
-                    if (containsOwnedString(entry.embedding_names, name)) return true;
-                }
-                for (self.sparse_indexes.items) |entry| {
-                    if (entry.embedding_name) |embedding_name| {
-                        if (std.mem.eql(u8, embedding_name, name)) return true;
-                    }
-                    if (containsOwnedString(entry.embedding_names, name)) return true;
                 }
             },
             .asset => {
-                for (self.text_indexes.items) |entry| {
-                    if (containsOwnedString(entry.source_artifact_names, name)) return true;
-                }
                 for (self.graph_indexes.items) |entry| {
-                    for (entry.artifact_sources) |source| {
+                    if (entry.artifact_source) |source| {
                         if (std.mem.eql(u8, source.artifact_name, name)) return true;
                     }
                 }
@@ -9063,7 +8759,7 @@ pub const IndexManager = struct {
             const snap = index.snapshot();
             const planned = (try text_index_maintenance.planPolicyMergeAlloc(self.alloc, snap, policy)) orelse return;
             defer self.alloc.free(planned);
-            var reservation = try self.reserveTextMergeBuffers(index, snap, planned);
+            var reservation = try self.reserveTextMergeBuffers(index, snap, planned, .strict);
             defer if (reservation) |*active| active.release();
 
             if (!try text_index_maintenance.applyPlannedMerge(
@@ -9079,6 +8775,7 @@ pub const IndexManager = struct {
     }
 
     pub fn beginTextMergeTask(self: *IndexManager) !?TextMergeTask {
+        if (self.text_backfill_active.load(.acquire) != 0) return null;
         const now_ns = platform_time.monotonicNs();
         self.text_merge_scheduler.pruneExpiredQuarantines(self.alloc, now_ns);
         _ = self.textMergeStats();
@@ -9096,6 +8793,9 @@ pub const IndexManager = struct {
                     self.text_merge_scheduler.deferred_for_pressure += 1;
                     return null;
                 },
+                // Replay owns this index right now. Keep its pending bit set
+                // and give another index a chance in this scheduler pass.
+                error.IndexApplyBusy => continue,
                 else => return err,
             };
             if (maybe_task) |task| return task;
@@ -9105,16 +8805,47 @@ pub const IndexManager = struct {
     }
 
     pub fn executeTextMergeTask(alloc: Allocator, task: *const TextMergeTask) !TextMergeResult {
+        const started_ns = platform_time.monotonicNs();
         defer task.discardSourceCleanPages();
-        if (task.persistent.prepareMergedSegmentToFile(task.snapshot, task.merge_indices)) |prepared| {
+        logTextMergeTaskMemory("before", task, 0);
+        var alloc_stats = PhaseAllocStats{};
+        const file_backed_merge = task.persistent.supportsFileBackedSegmentArtifacts();
+        var tracking = if (file_backed_merge and task.buffer_reservation != null)
+            PhaseTrackingAllocator.initBounded(
+                alloc,
+                &alloc_stats,
+                std.math.cast(usize, task.buffer_reservation.?.bytes) orelse std.math.maxInt(usize),
+            )
+        else
+            PhaseTrackingAllocator.init(alloc, &alloc_stats);
+        const task_alloc = tracking.allocator();
+        const deleted_docs = task_alloc.alloc(?roaring.RoaringBitmap, task.source.len) catch |err| {
+            if (tracking.limit_exceeded) return error.ResourceBudgetExceeded;
+            return err;
+        };
+        defer task_alloc.free(deleted_docs);
+        for (task.source, 0..) |source, i| deleted_docs[i] = source.deleted;
+
+        if (task.persistent.prepareMergedSegmentToFileWithAllocatorAndDeletes(task_alloc, task.snapshot, task.merge_indices, deleted_docs)) |prepared| {
+            var output_bytes: u64 = 0;
+            for (prepared) |*segment| output_bytes +|= @intCast(segment.data.bytes().len);
+            logTextMergeTaskMemory("after_build", task, output_bytes);
+            task.discardSourceCleanPages();
+            logTextMergeTaskMemory("after_source_discard", task, output_bytes);
             return .{
                 .prepared_segments = prepared,
                 .prepared_owner = task.persistent,
+                .elapsed_ns = platform_time.monotonicNs() -| started_ns,
+                .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
             };
         } else |err| switch (err) {
-            error.EmptySegment => return .{ .segments = &.{} },
+            error.EmptySegment => return .{
+                .segments = &.{},
+                .elapsed_ns = platform_time.monotonicNs() -| started_ns,
+            },
             error.Unsupported => {},
             else => {
+                if (tracking.limit_exceeded) return error.ResourceBudgetExceeded;
                 if (builtin.os.tag != .freestanding) {
                     std.log.err("scheduled text merge file-backed build failed index={s}: {s}", .{ task.index_name, @errorName(err) });
                 }
@@ -9122,16 +8853,49 @@ pub const IndexManager = struct {
             },
         }
 
-        const merged = merger_mod.mergeSegmentsBounded(alloc, task.snapshot, task.merge_indices, .{
-            .target_segment_bytes = @intCast(default_merge_policy.max_segment_size),
+        const merged = merger_mod.mergeSegmentsBounded(tracking.allocator(), task.snapshot, task.merge_indices, .{
+            .target_segment_bytes = @intCast(activeTextMergePolicy().max_segment_size),
+            .deleted_docs = deleted_docs,
         }) catch |err| {
-            if (err == error.EmptySegment) return .{};
+            if (tracking.limit_exceeded) return error.ResourceBudgetExceeded;
+            if (err == error.EmptySegment) return .{
+                .elapsed_ns = platform_time.monotonicNs() -| started_ns,
+                .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
+            };
             if (builtin.os.tag != .freestanding) {
                 std.log.err("scheduled text merge failed index={s}: {s}", .{ task.index_name, @errorName(err) });
             }
             return err;
         };
-        return .{ .segments = merged };
+        var output_bytes: u64 = 0;
+        for (merged) |segment| output_bytes +|= @intCast(segment.len);
+        logTextMergeTaskMemory("after_heap_build", task, output_bytes);
+        return .{
+            .segments = merged,
+            .elapsed_ns = platform_time.monotonicNs() -| started_ns,
+            .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
+        };
+    }
+
+    fn logTextMergeTaskMemory(label: []const u8, task: *const TextMergeTask, output_bytes: u64) void {
+        if (!memoryAttributionEnabled()) return;
+        const memory = process_memory.snapshot();
+        std.log.info(
+            "antfly_bench_text_merge_memory label={s} input_segments={d} input_bytes={d} output_bytes={d} rss_bytes={d} peak_rss_bytes={d} footprint_bytes={d} peak_footprint_bytes={d} malloc_available={any} malloc_allocated_bytes={d} malloc_zone_bytes={d}",
+            .{
+                label,
+                task.merge_indices.len,
+                textMergeTaskInputBytes(task),
+                output_bytes,
+                memory.resident_bytes,
+                memory.peak_resident_bytes,
+                memory.footprint_bytes,
+                memory.peak_footprint_bytes,
+                memory.malloc_available,
+                memory.malloc_allocated_bytes,
+                memory.malloc_zone_bytes,
+            },
+        );
     }
 
     pub fn finishTextMergeTask(self: *IndexManager, task: *const TextMergeTask, result: *TextMergeResult) !bool {
@@ -9140,21 +8904,31 @@ pub const IndexManager = struct {
         const entry = self.textIndexEntry(task.index_name) orelse return false;
         if (!self.text_merge_scheduler.sourceInFlight(task.index_name, task.source)) {
             self.text_merge_scheduler.skipped_stale_merges += 1;
-            if (try self.textIndexNeedsMerge(&entry.persistent, default_merge_policy)) {
+            if (try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy())) {
                 TextMergeScheduler.schedule(entry);
             } else {
                 TextMergeScheduler.noteComplete(entry);
             }
             return false;
         }
+
+        const old_ids = try textMergeSourceIds(self.alloc, task.source);
+        defer self.alloc.free(old_ids);
+
+        // Replay mutates SegmentShared.deleted while holding this same
+        // per-index mutex. Reacquire it only for validation and publication;
+        // executeTextMergeTask uses the task-owned clones and runs unlocked.
+        lockAtomicWithBackoff(entry.apply_mutex);
+        var index_apply_locked = true;
+        defer if (index_apply_locked) entry.apply_mutex.unlock();
         if (!try self.textMergeSourceStillCurrent(entry, task)) {
+            entry.apply_mutex.unlock();
+            index_apply_locked = false;
             self.text_merge_scheduler.skipped_stale_merges += 1;
             TextMergeScheduler.schedule(entry);
             return false;
         }
 
-        const old_ids = try textMergeSourceIds(self.alloc, task.source);
-        defer self.alloc.free(old_ids);
         const input_bytes = textMergeTaskInputBytes(task);
         const output_stats = textMergeResultOutputStats(result);
         const applied = if (result.prepared_segments.len == 0 and result.segments.len == 0) blk: {
@@ -9185,8 +8959,10 @@ pub const IndexManager = struct {
                 },
             };
         };
+        entry.apply_mutex.unlock();
+        index_apply_locked = false;
 
-        if (applied and !try self.textIndexNeedsMerge(&entry.persistent, default_merge_policy)) {
+        if (applied and !try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy())) {
             TextMergeScheduler.noteComplete(entry);
         } else {
             TextMergeScheduler.schedule(entry);
@@ -9197,6 +8973,8 @@ pub const IndexManager = struct {
                 input_bytes,
                 output_stats.segments,
                 output_stats.bytes,
+                result.elapsed_ns,
+                result.peak_task_alloc_bytes,
             );
         }
         return applied;
@@ -9220,6 +8998,17 @@ pub const IndexManager = struct {
     }
 
     fn beginTextMergeTaskForEntry(self: *IndexManager, entry: *TextIndex) !?TextMergeTask {
+        // Full-text replay holds this mutex while changing the shared deletion
+        // bitmap. Keep planning and cloning in one short critical section so a
+        // task can never observe RoaringBitmap.add() between its key and
+        // container insertions. The returned task owns the clones, so the
+        // expensive merge itself does not retain the mutex.
+        // The background runtime reaches this point while holding the DB apply
+        // lock. Do not wait there behind an active replay batch: leave the
+        // index scheduled and let replay's completion notification retry it.
+        if (!entry.apply_mutex.tryLock()) return error.IndexApplyBusy;
+        defer entry.apply_mutex.unlock();
+
         const snap = entry.persistent.acquireSnapshot();
         defer snap.release();
         if (snap.segments.len < 2) return null;
@@ -9240,11 +9029,30 @@ pub const IndexManager = struct {
         }
         if (infos.items.len < 2) return null;
 
-        const planned = (try default_merge_policy.plan(self.alloc, infos.items)) orelse return null;
+        const planned = (try activeTextMergePolicy().plan(self.alloc, infos.items)) orelse return null;
         defer self.alloc.free(planned);
         if (planned.len < 2) return null;
 
-        var task = try self.copyTextMergeTask(entry.config.name, &entry.persistent, snap, planned);
+        // The tier policy optimizes write amplification by selecting a wider
+        // group, but that group may exceed the merge-buffer slice even though
+        // a smaller merge can make forward progress. Adapt admission down to
+        // a pair before reporting pressure; otherwise a synchronous
+        // `full_index` drain can mistake one oversized plan for no merge debt.
+        var admitted_len = planned.len;
+        var task = while (true) {
+            break self.copyTextMergeTask(entry.config.name, &entry.persistent, snap, planned[0..admitted_len]) catch |err| switch (err) {
+                error.ResourceBudgetExceeded => {
+                    if (admitted_len == 2) return err;
+                    // Reservation cost is monotonic for this size-sorted
+                    // prefix. Walk down to the widest admissible group rather
+                    // than jumping from (for example) five sources to two and
+                    // paying avoidable pairwise write amplification.
+                    admitted_len -= 1;
+                    continue;
+                },
+                else => return err,
+            };
+        };
         errdefer task.deinit(self.alloc);
         try self.text_merge_scheduler.registerSource(self.alloc, task.index_name, task.source);
         return task;
@@ -9254,7 +9062,7 @@ pub const IndexManager = struct {
         const owned_index_name = try self.alloc.dupe(u8, index_name);
         errdefer self.alloc.free(owned_index_name);
 
-        var buffer_reservation = try self.reserveTextMergeBuffers(persistent, snap, planned);
+        var buffer_reservation = try self.reserveTextMergeBuffers(persistent, snap, planned, .bounded_task);
         errdefer if (buffer_reservation) |*reservation| reservation.release();
 
         const source = try self.alloc.alloc(TextMergeSourceSegment, planned.len);
@@ -9292,33 +9100,64 @@ pub const IndexManager = struct {
         persistent: *const persistent_mod.PersistentIndex,
         snap: *const index_mod.IndexSnapshot,
         planned: []const usize,
+        mode: enum { strict, bounded_task },
     ) !?resource_manager_mod.Reservation {
         const manager = self.resource_manager orelse return null;
 
         var source_bytes: u64 = 0;
-        var section_heap_bytes: u64 = 0;
+        var file_merge_working_set_bytes: u64 = 8 * 1024 * 1024;
         const file_backed_merge = persistent.supportsFileBackedSegmentArtifacts();
         for (planned) |seg_idx| {
             const seg = &snap.segments[seg_idx];
             source_bytes = std.math.add(u64, source_bytes, @as(u64, @intCast(seg.data.bytes().len))) catch return error.ResourceBudgetExceeded;
             if (file_backed_merge) {
-                section_heap_bytes = std.math.add(u64, section_heap_bytes, estimateFileBackedMergeSectionHeapBytes(seg)) catch return error.ResourceBudgetExceeded;
+                file_merge_working_set_bytes = std.math.add(
+                    u64,
+                    file_merge_working_set_bytes,
+                    estimateFileBackedMergeWorkingSetBytes(seg) catch return error.ResourceBudgetExceeded,
+                ) catch return error.ResourceBudgetExceeded;
             }
         }
 
         const segment_overhead = std.math.mul(u64, @as(u64, @intCast(planned.len)), 1024) catch return error.ResourceBudgetExceeded;
-        const reservation_base = if (file_backed_merge) section_heap_bytes else source_bytes;
-        const reservation_bytes = std.math.add(u64, reservation_base, segment_overhead) catch return error.ResourceBudgetExceeded;
-        return try manager.reserve(.text_merge_buffers, reservation_bytes);
-    }
-
-    fn estimateFileBackedMergeSectionHeapBytes(seg: *const index_mod.SegmentEntry) u64 {
-        var bytes: u64 = 0;
-        for (seg.reader.fields) |*field| {
-            for (field.sections) |*section| {
-                bytes +|= section.length;
+        const reservation_base = if (file_backed_merge) file_merge_working_set_bytes else source_bytes;
+        var reservation_bytes = std.math.add(u64, reservation_base, segment_overhead) catch return error.ResourceBudgetExceeded;
+        if (file_backed_merge) {
+            const hard_limit = manager.sliceStats(.text_merge_buffers).hard_limit_bytes;
+            if (hard_limit > 0) {
+                const enforced_cap = std.math.mul(u64, hard_limit, 2) catch std.math.maxInt(u64);
+                reservation_bytes = @min(reservation_bytes, enforced_cap);
             }
         }
+        return switch (mode) {
+            // Synchronous compaction executes with the manager allocator, so
+            // its estimate must fit the ordinary hard limit. Granting it the
+            // oversized exception would account the estimate without actually
+            // bounding the live working set.
+            .strict => try manager.reserve(.text_merge_buffers, reservation_bytes),
+            // Scheduled tasks execute through PhaseTrackingAllocator. Permit
+            // one task up to 2x the normal hard limit: ResourceManager keeps it
+            // exclusive and the task allocator enforces the same live cap.
+            .bounded_task => try manager.reserveBoundedOversizedSingle(.text_merge_buffers, reservation_bytes, 2),
+        };
+    }
+
+    fn estimateFileBackedMergeWorkingSetBytes(seg: *const index_mod.SegmentEntry) !u64 {
+        const layout = seg.layoutStats(false);
+
+        // File-backed merges stream postings and stored fields directly to the
+        // atomic output file. Their live heap is driven by doc renumbering,
+        // the largest term accumulator, and compact dictionary/value builders;
+        // charging every serialized postings and positions byte rejected work
+        // that never becomes resident. Keep generous capacity/headroom factors
+        // here and enforce the reservation with the bounded task allocator.
+        const per_doc_bytes: u64 = if (layout.index_sort_bytes > 0) 128 else 64;
+        var bytes = try std.math.mul(u64, seg.reader.doc_count, per_doc_bytes);
+        bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.inverted_term_dict_bytes, 3));
+        bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.inverted_bloom_bytes, 3));
+        bytes = try std.math.add(u64, bytes, layout.inverted_norm_bytes);
+        bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.typed_doc_values_bytes, 2));
+        bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.doc_ordinals_bytes, 2));
         return bytes;
     }
 
@@ -9402,7 +9241,7 @@ pub const IndexManager = struct {
 
             const planned = try text_index_maintenance.planForceCompactAlloc(self.alloc, snap, force_merge_max_segments_at_once);
             defer self.alloc.free(planned);
-            var reservation = self.reserveTextMergeBuffers(&entry.persistent, snap, planned) catch |err| switch (err) {
+            var reservation = self.reserveTextMergeBuffers(&entry.persistent, snap, planned, .strict) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => if (options.mode == .best_effort) return false else return err,
             };
             defer if (reservation) |*active| active.release();
@@ -9412,7 +9251,7 @@ pub const IndexManager = struct {
                 &entry.persistent,
                 snap,
                 planned,
-                default_merge_policy.max_segment_size,
+                activeTextMergePolicy().max_segment_size,
                 "force compact text index merge failed",
                 "force compact text index apply merge failed",
             ) catch |err| switch (err) {
@@ -9677,36 +9516,6 @@ pub const IndexManager = struct {
 
         const backfill_batch_size = if (builtin.is_test) test_sparse_backfill_batch_size orelse sparse_backfill_batch_size else sparse_backfill_batch_size;
         for (docs) |doc| {
-            if (entry.embedding_names.len > 0) {
-                var matches_source = false;
-                for (entry.embedding_names) |embedding_name| {
-                    if ((internal_keys.isEmbeddingArtifactKey(doc.key) and internal_keys.matchesEmbeddingArtifactName(doc.key, embedding_name)) or
-                        (internal_keys.isDerivedEmbeddingArtifactKey(doc.key) and internal_keys.matchesDerivedEmbeddingArtifactName(doc.key, embedding_name)))
-                    {
-                        matches_source = true;
-                        break;
-                    }
-                }
-                if (!matches_source) continue;
-                if (resume_from) |resume_key| {
-                    if (resume_key.len > 0 and std.mem.order(u8, doc.key, resume_key) != .gt) continue;
-                }
-                if (!self.keyInRange(doc.key)) continue;
-                var sparse_vec = try enrichment_artifact_codec.decodeSparseEmbeddingAlloc(self.alloc, doc.value);
-                var sparse_vec_owned = true;
-                errdefer if (sparse_vec_owned) sparse_vec.deinit(self.alloc);
-                saw_visible_doc = true;
-                if (max_flushed_key == null or std.mem.order(u8, doc.key, max_flushed_key.?) == .gt) max_flushed_key = doc.key;
-                try writes.append(self.alloc, .{
-                    .doc_id = try self.alloc.dupe(u8, doc.key),
-                    .vec = .{ .indices = sparse_vec.indices, .values = sparse_vec.values },
-                });
-                sparse_vec_owned = false;
-                if (writes.items.len >= backfill_batch_size) {
-                    try flush_batch(self, store, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
-                }
-                continue;
-            }
             if (!internal_keys.isPrimaryDocumentKey(doc.key)) continue;
             if (resume_from) |resume_key| {
                 if (resume_key.len > 0 and std.mem.order(u8, doc.key, resume_key) != .gt) continue;
@@ -10459,6 +10268,7 @@ pub const IndexManager = struct {
                         .doc_scratch_retained_bytes = doc_scratch_retained_bytes,
                         .profile_timings = metrics_enabled,
                         .profile_working_set = detailed_profile_enabled,
+                        .store_document_source = false,
                     };
                     var segment_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                     defer segment_arena_state.deinit();
@@ -10560,12 +10370,13 @@ pub const IndexManager = struct {
                 const lsm_wal_write = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_wal_write_working_set)];
                 const lsm_wal_retention = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_wal_retention)];
                 const lsm_recovery = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_recovery_working_set)];
+                const derived_backlog = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)];
                 const lsm_stats = self.snapshotLsmMaintenanceStats();
                 const lsm_cache_stats: lsm_backend_mod.cache.Stats = if (self.lsm_cache) |cache| cache.snapshotStats() else .{};
-                const lsm_resource_used = lsm_cache.used_bytes +| lsm_compaction.used_bytes +| lsm_table_builder.used_bytes +| lsm_state.used_bytes +| lsm_wal_write.used_bytes +| lsm_wal_retention.used_bytes +| lsm_recovery.used_bytes;
-                const lsm_resource_peak = lsm_cache.peak_bytes +| lsm_compaction.peak_bytes +| lsm_table_builder.peak_bytes +| lsm_state.peak_bytes +| lsm_wal_write.peak_bytes +| lsm_wal_retention.peak_bytes +| lsm_recovery.peak_bytes;
+                const lsm_resource_used = lsm_cache.used_bytes +| lsm_compaction.used_bytes +| lsm_table_builder.used_bytes +| lsm_state.used_bytes +| lsm_wal_write.used_bytes +| lsm_recovery.used_bytes;
+                const lsm_resource_peak = lsm_cache.peak_bytes +| lsm_compaction.peak_bytes +| lsm_table_builder.peak_bytes +| lsm_state.peak_bytes +| lsm_wal_write.peak_bytes +| lsm_recovery.peak_bytes;
                 std.log.info(
-                    "antfly_bench_text_resources index={s} source_docs={d} projection_docs={d} segments={d} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_table_builder_used_bytes={d} lsm_table_builder_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_wal_write_used_bytes={d} lsm_wal_write_peak_bytes={d} lsm_wal_retention_used_bytes={d} lsm_wal_retention_peak_bytes={d} lsm_recovery_used_bytes={d} lsm_recovery_peak_bytes={d} lsm_resource_used_bytes={d} lsm_resource_peak_bytes={d}",
+                    "antfly_bench_text_resources index={s} source_docs={d} projection_docs={d} segments={d} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} derived_backlog_used_bytes={d} derived_backlog_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_table_builder_used_bytes={d} lsm_table_builder_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_wal_write_used_bytes={d} lsm_wal_write_peak_bytes={d} lsm_wal_retention_disk_bytes={d} lsm_wal_retention_peak_disk_bytes={d} lsm_recovery_used_bytes={d} lsm_recovery_peak_bytes={d} lsm_resource_used_bytes={d} lsm_resource_peak_bytes={d}",
                     .{
                         entry.config.name,
                         source_docs.len,
@@ -10575,6 +10386,8 @@ pub const IndexManager = struct {
                         ft_pending.peak_bytes,
                         ft_build.used_bytes,
                         ft_build.peak_bytes,
+                        derived_backlog.used_bytes,
+                        derived_backlog.peak_bytes,
                         lsm_cache.used_bytes,
                         lsm_cache.peak_bytes,
                         lsm_compaction.used_bytes,
@@ -10767,11 +10580,7 @@ pub const IndexManager = struct {
     }
 
     fn deleteTextBatchEntry(_: *IndexManager, entry: *TextIndex, keys: []const []const u8) !TextBatchMutationStats {
-        var deleted_any = false;
-        for (keys) |key| {
-            deleted_any = (try entry.persistent.deleteById(key)) or deleted_any;
-        }
-        return .{ .deleted_any = deleted_any };
+        return .{ .deleted_any = try entry.persistent.deleteByIds(keys) };
     }
 
     fn finalizeTextBatchMutations(
@@ -10784,7 +10593,7 @@ pub const IndexManager = struct {
         const compaction_due = stats.deleted_any or textCompactionDue(&entry.persistent, opts) or opts.defer_text_compaction;
         if (!compaction_due) return;
         if (opts.defer_text_compaction and entry.compaction_pending) return;
-        if (!try self.textIndexNeedsMerge(&entry.persistent, default_merge_policy)) {
+        if (!try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy())) {
             TextMergeScheduler.noteComplete(entry);
             return;
         }
@@ -10792,7 +10601,7 @@ pub const IndexManager = struct {
             TextMergeScheduler.schedule(entry);
             return;
         }
-        try self.compactTextIndex(&entry.persistent, default_merge_policy);
+        try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
         TextMergeScheduler.noteComplete(entry);
     }
 
@@ -10879,7 +10688,7 @@ pub const IndexManager = struct {
             defer read_txn.abort();
             for (keys) |key| {
                 const vector_id = (try self.resolveDenseVectorIdForDeleteTxn(&read_txn, entry.config.name, key)) orelse continue;
-                const ordinal = if (entry.chunk_name == null and entry.embedding_names.len == 0)
+                const ordinal = if (entry.chunk_name == null)
                     (try doc_identity.lookupOrdinalTxn(self.alloc, &read_txn, key)) orelse
                         try self.lookupDenseVectorOrdinalTxn(&read_txn, entry.config.name, vector_id)
                 else
@@ -11045,7 +10854,7 @@ pub const IndexManager = struct {
         entry: *SparseIndex,
         writes: []sparse_mod.SparseWrite,
     ) !void {
-        if (entry.chunk_name != null or entry.embedding_names.len > 0 or writes.len == 0) return;
+        if (entry.chunk_name != null or writes.len == 0) return;
 
         var txn = try store.beginProbeTxn();
         defer txn.abort();
@@ -11138,7 +10947,7 @@ pub const IndexManager = struct {
         defer sparse_txn.abort();
         if (bench_profile) sparse_txn_ns = platform_time.monotonicNs() - sparse_txn_start_ns;
 
-        if (entry.chunk_name == null and entry.embedding_names.len == 0) {
+        if (entry.chunk_name == null) {
             var fast_lookup = try entry.index.docNumsForOrdinalDocNumsAlloc(alloc, &sparse_txn, ordinals);
             defer fast_lookup.deinit(alloc);
             if (fast_lookup.missing_ordinals.len == 0) {
@@ -11213,28 +11022,14 @@ pub const IndexManager = struct {
         for (ordinals) |ordinal| {
             const parent_doc_id = (try doc_identity.lookupDocIdTxn(self.alloc, &txn, ordinal)) orelse continue;
             defer self.alloc.free(parent_doc_id);
-            const prefix = if (entry.embedding_names.len > 0)
-                try internal_keys.documentExactPrefixAlloc(self.alloc, parent_doc_id)
-            else
-                try internal_keys.artifactNamedPrefixAlloc(self.alloc, parent_doc_id, "chunk", entry.chunk_name.?);
+            const prefix = try internal_keys.artifactNamedPrefixAlloc(self.alloc, parent_doc_id, "chunk", entry.chunk_name.?);
             defer self.alloc.free(prefix);
             const upper = try internal_keys.nextPrefixAlloc(self.alloc, prefix);
             defer if (upper) |buf| self.alloc.free(buf);
             const chunk_rows = try backend_scan.scanRange(alloc, &runtime_store.store, prefix, if (upper) |buf| buf else "");
             defer backend_scan.freeResults(alloc, chunk_rows);
             for (chunk_rows) |row| {
-                if (entry.embedding_names.len > 0) {
-                    var matches_source = false;
-                    for (entry.embedding_names) |embedding_name| {
-                        if ((internal_keys.isEmbeddingArtifactKey(row.key) and internal_keys.matchesEmbeddingArtifactName(row.key, embedding_name)) or
-                            (internal_keys.isDerivedEmbeddingArtifactKey(row.key) and internal_keys.matchesDerivedEmbeddingArtifactName(row.key, embedding_name)))
-                        {
-                            matches_source = true;
-                            break;
-                        }
-                    }
-                    if (!matches_source) continue;
-                } else if (!internal_keys.isChunkArtifactRecordKey(row.key)) continue;
+                if (!internal_keys.isChunkArtifactRecordKey(row.key)) continue;
                 const doc_num = (entry.index.debugDocNumForDocId(row.key) catch |err| switch (err) {
                     error.DocNumOverflow => continue,
                     else => return err,
@@ -11365,7 +11160,7 @@ pub const IndexManager = struct {
     ) !void {
         const keep_write = try self.alloc.alloc(bool, writes.len);
         defer self.alloc.free(keep_write);
-        try computeDenseReplayKeepMask(self.alloc, writes, keep_write, entry.embedding_names.len > 0);
+        try computeDenseReplayKeepMask(self.alloc, writes, keep_write);
 
         var dense_apply_working_bytes: u64 = 0;
         defer self.observeDenseApplyWorkingBytes(&dense_apply_working_bytes, 0);
@@ -11445,7 +11240,6 @@ pub const IndexManager = struct {
             for (writes, 0..) |write, write_index| {
                 if (!keep_write[write_index]) continue;
                 if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
-                const member_key = if (entry.embedding_names.len > 0) write.artifact_key orelse write.doc_key else write.doc_key;
 
                 if (write.vector.len > 0) {
                     if (entry.dims != write.vector.len) return error.InvalidVectorDimensions;
@@ -11453,16 +11247,16 @@ pub const IndexManager = struct {
                         store_txn,
                         entry,
                         write.index_name,
-                        member_key,
+                        write.doc_key,
                         write.parent_doc_key,
                         &replacement_deletes,
                         &metadata_presence_memo,
                     );
                     const artifact_name = entry.embedding_name orelse entry.config.name;
                     try self.writeDenseEmbeddingArtifactTxn(store_txn, write.doc_key, write.doc_key, artifact_name, "_embeddings", null, write.vector);
-                    if (try self.denseVectorWriteIsNoOp(entry, &existing_index_write_txn, assignment.vector_id, member_key, write.vector, existing_vector_scratch, &metadata_presence_memo)) continue;
+                    if (try self.denseVectorWriteIsNoOp(entry, &existing_index_write_txn, assignment.vector_id, write.doc_key, write.vector, existing_vector_scratch, &metadata_presence_memo)) continue;
                     all_vector_ids_new = all_vector_ids_new and assignment.can_assume_absent;
-                    try items.appendBorrowed(self.alloc, assignment.vector_id, write.vector, member_key);
+                    try items.appendBorrowed(self.alloc, assignment.vector_id, write.vector, write.doc_key);
                     if (assignment.can_assume_absent) {
                         try new_items.append(self.alloc, items.items.items[items.items.items.len - 1]);
                     } else {
@@ -11482,14 +11276,14 @@ pub const IndexManager = struct {
                         store_txn,
                         entry,
                         write.index_name,
-                        member_key,
+                        write.doc_key,
                         write.parent_doc_key,
                         &replacement_deletes,
                         &metadata_presence_memo,
                     );
-                    if (try self.denseVectorWriteIsNoOp(entry, &existing_index_write_txn, assignment.vector_id, member_key, vector, existing_vector_scratch, &metadata_presence_memo)) continue;
+                    if (try self.denseVectorWriteIsNoOp(entry, &existing_index_write_txn, assignment.vector_id, write.doc_key, vector, existing_vector_scratch, &metadata_presence_memo)) continue;
                     all_vector_ids_new = all_vector_ids_new and assignment.can_assume_absent;
-                    try items.appendBorrowedVectorOwnedMetadata(self.alloc, assignment.vector_id, vector, member_key);
+                    try items.appendBorrowedVectorOwnedMetadata(self.alloc, assignment.vector_id, vector, write.doc_key);
                     if (assignment.can_assume_absent) {
                         try new_items.append(self.alloc, items.items.items[items.items.items.len - 1]);
                     } else {
@@ -11834,7 +11628,7 @@ pub const IndexManager = struct {
         }
     };
 
-    fn computeDenseReplayKeepMask(alloc: Allocator, writes: []const mapper.DenseEmbeddingWrite, keep_write: []bool, use_artifact_identity: bool) !void {
+    fn computeDenseReplayKeepMask(alloc: Allocator, writes: []const mapper.DenseEmbeddingWrite, keep_write: []bool) !void {
         @memset(keep_write, true);
         if (writes.len <= 1) return;
 
@@ -11846,7 +11640,7 @@ pub const IndexManager = struct {
             i -= 1;
             const key: DenseReplayKey = .{
                 .index_name = writes[i].index_name,
-                .doc_key = if (use_artifact_identity) writes[i].artifact_key orelse writes[i].doc_key else writes[i].doc_key,
+                .doc_key = writes[i].doc_key,
             };
             if (seen.contains(key)) {
                 keep_write[i] = false;
@@ -11960,7 +11754,7 @@ pub const IndexManager = struct {
         entry: *DenseIndex,
         updates: []const DenseOrdinalVectorCacheUpdate,
     ) !void {
-        if (entry.chunk_name != null or entry.embedding_names.len > 0) return;
+        if (entry.chunk_name != null) return;
         for (updates) |update| {
             try entry.ordinal_vector_ids.put(self.alloc, update.ordinal, update.vector_id);
             try entry.vector_ordinals.put(self.alloc, update.vector_id, update.ordinal);
@@ -11981,7 +11775,7 @@ pub const IndexManager = struct {
         pending: []const PendingDenseVectorMapping,
     ) !void {
         _ = index_name;
-        if (entry.chunk_name != null or entry.embedding_names.len > 0 or pending.len == 0) return;
+        if (entry.chunk_name != null or pending.len == 0) return;
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginRead();
@@ -12241,6 +12035,24 @@ pub const IndexManager = struct {
             std.ascii.eqlIgnoreCase(raw, "no"));
         bench_memory_attribution_cache.store(if (enabled) 2 else 1, .monotonic);
         return enabled;
+    }
+
+    fn memoryAttributionSampleDue() bool {
+        if (!memoryAttributionEnabled()) return false;
+        const sample_number = bench_memory_attribution_counter.fetchAdd(1, .monotonic) + 1;
+        const every = memoryAttributionEvery();
+        return sample_number == 1 or sample_number % @as(u64, @intCast(every)) == 0;
+    }
+
+    fn memoryAttributionEvery() usize {
+        const cached = bench_memory_attribution_every_cache.load(.monotonic);
+        if (cached != 0) return cached;
+        const every = @max(
+            @as(usize, 1),
+            stressEnvUsize("ANTFLY_BENCH_MEMORY_ATTRIBUTION_EVERY", 64),
+        );
+        bench_memory_attribution_every_cache.store(every, .monotonic);
+        return every;
     }
 
     fn memoryLayoutDetailEnabled() bool {
@@ -12770,12 +12582,6 @@ pub const IndexManager = struct {
         }
 
         const vector = blk: {
-            if (entry.embedding_names.len > 0) {
-                break :blk manager.loadDenseEmbeddingArtifactVectorWithSession(store, metadata, load_session) catch |err| {
-                    if (isRecoverableEmbeddingArtifactError(err)) return error.NotFound;
-                    return err;
-                };
-            }
             if (entry.embedding_name) |embedding_name| {
                 break :blk try manager.loadDenseVectorArtifactForHbc(alloc, store, metadata, embedding_name, load_session);
             }
@@ -12812,14 +12618,6 @@ pub const IndexManager = struct {
             if (session.getVector(vector_id)) |cached| return cached;
         }
 
-        if (entry.embedding_names.len > 0) {
-            const vector = manager.loadDenseEmbeddingArtifactVectorWithSessionIntoScratch(store, metadata, load_session, scratch) catch |err| {
-                if (isRecoverableEmbeddingArtifactError(err)) return error.NotFound;
-                return err;
-            };
-            if (load_session) |session| try session.cacheVector(vector_id, vector);
-            return vector;
-        }
         if (entry.embedding_name) |embedding_name| {
             const vector = try manager.loadDenseVectorArtifactForHbcIntoScratch(store, metadata, embedding_name, load_session, scratch);
             if (load_session) |session| try session.cacheVector(vector_id, vector);
@@ -12864,9 +12662,7 @@ pub const IndexManager = struct {
         const scratch_floats = std.math.mul(usize, dims, vector_ids.len) catch return error.BufferTooSmall;
         if (batch_scratch.len < scratch_floats) return error.BufferTooSmall;
 
-        const multi_source = entry.embedding_names.len > 0;
         const artifact_name = entry.embedding_name orelse blk: {
-            if (multi_source) break :blk "";
             if (!entry.external) return error.Unsupported;
             break :blk entry.config.name;
         };
@@ -12902,9 +12698,7 @@ pub const IndexManager = struct {
                 continue;
             }
             const doc_key = maybe_doc_key orelse continue;
-            const artifact_key = if (multi_source)
-                try manager.alloc.dupe(u8, doc_key)
-            else if (internal_keys.isInternalUserKey(doc_key))
+            const artifact_key = if (internal_keys.isInternalUserKey(doc_key))
                 try internal_keys.derivedEmbeddingArtifactKeyAlloc(manager.alloc, doc_key, artifact_name)
             else
                 try internal_keys.embeddingArtifactKeyForDocumentAlloc(manager.alloc, doc_key, artifact_name);
@@ -12976,9 +12770,7 @@ pub const IndexManager = struct {
         if (dims == 0) return error.InvalidVectorDimensions;
         if (scratch.len < dims) return error.BufferTooSmall;
 
-        const multi_source = entry.embedding_names.len > 0;
         const artifact_name = entry.embedding_name orelse blk: {
-            if (multi_source) break :blk "";
             if (!entry.external) return error.Unsupported;
             break :blk entry.config.name;
         };
@@ -13016,9 +12808,7 @@ pub const IndexManager = struct {
                 continue;
             }
             const doc_key = maybe_doc_key orelse return error.NotFound;
-            const artifact_key = if (multi_source)
-                try manager.alloc.dupe(u8, doc_key)
-            else if (internal_keys.isInternalUserKey(doc_key))
+            const artifact_key = if (internal_keys.isInternalUserKey(doc_key))
                 try internal_keys.derivedEmbeddingArtifactKeyAlloc(manager.alloc, doc_key, artifact_name)
             else
                 try internal_keys.embeddingArtifactKeyForDocumentAlloc(manager.alloc, doc_key, artifact_name);
@@ -13100,9 +12890,7 @@ pub const IndexManager = struct {
         if (scratch.artifact_keys.len < vector_ids.len) return error.InvalidArgument;
         if (scratch.raw_values.len < vector_ids.len) return error.InvalidArgument;
 
-        const multi_source = entry.embedding_names.len > 0;
         const artifact_name = entry.embedding_name orelse blk: {
-            if (multi_source) break :blk "";
             if (!entry.external) return error.Unsupported;
             break :blk entry.config.name;
         };
@@ -13147,9 +12935,7 @@ pub const IndexManager = struct {
                 continue;
             }
             const doc_key = maybe_doc_key orelse continue;
-            const artifact_key = if (multi_source)
-                try key_alloc.dupe(u8, doc_key)
-            else if (internal_keys.isInternalUserKey(doc_key))
+            const artifact_key = if (internal_keys.isInternalUserKey(doc_key))
                 try internal_keys.derivedEmbeddingArtifactKeyAlloc(key_alloc, doc_key, artifact_name)
             else
                 try internal_keys.embeddingArtifactKeyForDocumentAlloc(key_alloc, doc_key, artifact_name);
@@ -13391,19 +13177,18 @@ pub const IndexManager = struct {
         const scan_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         for (writes) |write| {
             if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
-            const member_key = if (entry.embedding_names.len > 0) write.artifact_key orelse write.doc_key else write.doc_key;
             const indices = write.indices;
             const values = write.values;
             if (write.artifact_key != null and indices.len == 0) {
                 try pending_artifact_loads.append(self.alloc, .{
-                    .doc_key = member_key,
+                    .doc_key = write.doc_key,
                     .artifact_key = write.artifact_key.?,
                 });
                 continue;
             }
-            try delete_keys.append(self.alloc, member_key);
+            try delete_keys.append(self.alloc, write.doc_key);
             try sparse_writes.append(self.alloc, .{
-                .doc_id = member_key,
+                .doc_id = write.doc_key,
                 .vec = .{
                     .indices = indices,
                     .values = values,
@@ -13603,7 +13388,7 @@ pub const IndexManager = struct {
         errdefer batch.abort();
         const txn = batch.asTxn();
         const ordinal = if (self.denseIndex(index_name)) |entry|
-            if (entry.chunk_name == null and entry.embedding_names.len == 0) try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key) else null
+            if (entry.chunk_name == null) try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key) else null
         else
             null;
         try self.clearDenseVectorMappingTxn(txn, index_name, doc_key, vector_id);
@@ -13724,7 +13509,7 @@ pub const IndexManager = struct {
         index_name: []const u8,
         ordinals: []const doc_identity.DocOrdinal,
     ) ![]u64 {
-        const prefer_primary_mapping = if (self.denseIndex(index_name)) |entry| entry.chunk_name == null and entry.embedding_names.len == 0 else false;
+        const prefer_primary_mapping = if (self.denseIndex(index_name)) |entry| entry.chunk_name == null else false;
         if (prefer_primary_mapping) {
             const entry = self.denseIndex(index_name) orelse return try alloc.alloc(u64, 0);
             if (try self.lookupPrimaryDenseCachedVectorIdsForOrdinalsAlloc(alloc, entry, ordinals)) |cached| {
@@ -13793,7 +13578,7 @@ pub const IndexManager = struct {
         for (missing.items) |item| {
             const ordinal = (try self.lookupDenseVectorOrdinalTxn(&txn, index_name, item.vector_id)) orelse continue;
             out[item.source_index] = ordinal;
-            if (entry.chunk_name == null and entry.embedding_names.len == 0) {
+            if (entry.chunk_name == null) {
                 try entry.vector_ordinals.put(self.alloc, item.vector_id, ordinal);
                 try entry.ordinal_vector_ids.put(self.alloc, ordinal, item.vector_id);
             }
@@ -14075,6 +13860,7 @@ fn buildSplitSegment(
     config_json: ?[]const u8,
     collect_doc_keys: bool,
 ) !SplitRebuiltSegment {
+    _ = config_json;
     var reader = try segment_mod.SegmentReader.init(alloc, segment_bytes);
     defer reader.deinit();
 
@@ -14087,64 +13873,101 @@ fn buildSplitSegment(
         deleted = try roaring.RoaringBitmap.fromBytes(alloc, bytes);
     }
 
-    var docs = std.ArrayListUnmanaged(mapper.MapperDoc).empty;
-    defer {
-        for (docs.items) |doc| {
-            alloc.free(@constCast(doc.key));
-            alloc.free(@constCast(doc.value));
-        }
-        docs.deinit(alloc);
-    }
-
     var doc_keys = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
         for (doc_keys.items) |key| alloc.free(key);
         doc_keys.deinit(alloc);
     }
 
+    var excluded = roaring.RoaringBitmap.init(alloc);
+    defer excluded.deinit();
+    var live_docs: u32 = 0;
     for (0..reader.doc_count) |doc_idx_usize| {
         const doc_idx: u32 = @intCast(doc_idx_usize);
         if (deleted) |bitmap| {
-            if (bitmap.contains(doc_idx)) continue;
+            if (bitmap.contains(doc_idx)) {
+                try excluded.add(doc_idx);
+                continue;
+            }
         }
 
-        const stored = (try reader.storedDocDecompressed(alloc, doc_idx)) orelse continue;
-        errdefer alloc.free(stored.data);
-
+        const stored = reader.storedDoc(doc_idx) orelse return error.InvalidSegment;
         const keep = switch (side) {
             .left => std.mem.order(u8, stored.id, split_key) == .lt,
             .right => std.mem.order(u8, stored.id, split_key) != .lt,
         };
         if (!keep) {
-            alloc.free(stored.data);
+            try excluded.add(doc_idx);
             continue;
         }
-
-        const key = try alloc.dupe(u8, stored.id);
-        try docs.append(alloc, .{
-            .key = key,
-            .value = stored.data,
-            .doc_ordinal = try reader.docOrdinal(doc_idx),
-        });
+        live_docs += 1;
         if (collect_doc_keys) {
             try doc_keys.append(alloc, try alloc.dupe(u8, stored.id));
         }
     }
 
-    if (docs.items.len == 0) {
+    if (live_docs == 0) {
         return .{
             .segment_bytes = null,
             .doc_keys = try doc_keys.toOwnedSlice(alloc),
         };
     }
 
-    const split_text_analysis = try introducer_mod.parseTextAnalysisConfig(alloc, config_json);
-    defer introducer_mod.freeTextAnalysisConfig(alloc, split_text_analysis);
-    const rebuilt = try mapper.buildTextSegmentFromDocuments(alloc, docs.items, split_text_analysis, null);
+    // Preserve postings, positions, norms, typed doc values, and stored-field
+    // mode directly. Reanalysis would require a duplicate source body in every
+    // text segment and could silently change results after analyzer upgrades.
+    const rebuilt = try segment_mod.mergeSegmentInputs(alloc, &.{.{
+        .reader = &reader,
+        .deleted = excluded,
+    }});
     return .{
         .segment_bytes = rebuilt,
         .doc_keys = try doc_keys.toOwnedSlice(alloc),
     };
+}
+
+test "split preserves postings when text segments omit source bodies" {
+    const alloc = std.testing.allocator;
+    const source = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(
+        alloc,
+        &.{
+            .{
+                .id = "doc:a",
+                .stored_data = "{\"body\":\"alpha\"}",
+                .text_fields = &.{.{ .field_name = "body", .text = "alpha" }},
+            },
+            .{
+                .id = "doc:z",
+                .stored_data = "{\"body\":\"beta\"}",
+                .text_fields = &.{.{ .field_name = "body", .text = "beta" }},
+            },
+        },
+        &@import("../../../search/analysis.zig").default_analyzer,
+        .{},
+        .{ .store_document_source = false },
+    );
+    defer alloc.free(source);
+
+    const split = try buildSplitSegment(alloc, source, null, "doc:m", .left, null, true);
+    defer {
+        if (split.segment_bytes) |bytes| alloc.free(bytes);
+        for (split.doc_keys) |key| alloc.free(key);
+        alloc.free(split.doc_keys);
+    }
+    try std.testing.expectEqual(@as(usize, 1), split.doc_keys.len);
+    try std.testing.expectEqualStrings("doc:a", split.doc_keys[0]);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, split.segment_bytes.?);
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(u32, 1), reader.doc_count);
+    const stored = (try reader.storedDocDecompressed(alloc, 0)).?;
+    defer alloc.free(stored.data);
+    try std.testing.expectEqualStrings("doc:a", stored.id);
+    try std.testing.expectEqualStrings("{}", stored.data);
+
+    var inverted = (try reader.invertedIndex("body")).?;
+    try std.testing.expectEqual(@as(u32, 1), inverted.lookup("alpha").?.docFreq());
+    try std.testing.expect(inverted.lookup("beta") == null);
 }
 
 fn findTextSplitHandoff(handoffs: []const TextSplitHandoff, index_name: []const u8) ?*const TextSplitHandoff {
@@ -14180,11 +14003,6 @@ fn textIndexShouldConsumeDoc(self: *const IndexManager, entry: *const IndexManag
         return internal_keys.matchesChunkArtifactName(key, artifact_name) or
             internal_keys.matchesAssetArtifactName(key, artifact_name);
     }
-    for (entry.source_artifact_names) |artifact_name| {
-        if (internal_keys.matchesChunkArtifactName(key, artifact_name) or
-            internal_keys.matchesAssetArtifactName(key, artifact_name)) return true;
-    }
-    if (entry.source_artifact_names.len > 0) return false;
     if (isPrimaryDocumentCandidate(key)) return true;
     if (!internal_keys.isChunkArtifactRecordKey(key)) return false;
     return try self.textIndexIsChunkBacked(self.alloc, entry.config.name);
@@ -14506,7 +14324,6 @@ const DenseConfig = struct {
     metric: vector_mod.DistanceMetric,
     split_algo: vector_mod.ClustAlgorithm = .kmeans,
     embedding_name: ?[]u8 = null,
-    embedding_names: [][]u8 = &.{},
     external: bool = false,
     search_width: u32 = 2 * 3 * 7 * 24,
     epsilon: f32 = 7,
@@ -14528,8 +14345,6 @@ const DenseConfig = struct {
     fn deinit(self: *const DenseConfig, alloc: Allocator) void {
         alloc.free(self.field_name);
         if (self.embedding_name) |embedding_name| alloc.free(embedding_name);
-        for (self.embedding_names) |embedding_name| alloc.free(embedding_name);
-        if (self.embedding_names.len > 0) alloc.free(self.embedding_names);
     }
 };
 
@@ -14542,7 +14357,7 @@ pub fn denseConfigRequiresArtifactCoverage(alloc: Allocator, cfg: types.IndexCon
     defer dense_cfg.deinit(alloc);
     const generator = try parseDenseGeneratorConfig(alloc, cfg.config_json);
     defer if (generator) |value| value.deinit(alloc);
-    return dense_cfg.external or dense_cfg.embedding_name != null or dense_cfg.embedding_names.len > 0 or generator != null;
+    return dense_cfg.external or dense_cfg.embedding_name != null or generator != null;
 }
 
 pub fn denseConfigDimensions(alloc: Allocator, cfg: types.IndexConfig) !u32 {
@@ -14552,39 +14367,21 @@ pub fn denseConfigDimensions(alloc: Allocator, cfg: types.IndexConfig) !u32 {
     return dense_cfg.dims;
 }
 
-pub fn denseConfigArtifactNamesAlloc(alloc: Allocator, cfg: types.IndexConfig) ![][]u8 {
+pub fn denseConfigArtifactNameAlloc(alloc: Allocator, cfg: types.IndexConfig) ![]u8 {
     if (cfg.kind != .dense_vector) return error.InvalidIndexConfiguration;
     const dense_cfg = try parseDenseConfig(alloc, cfg.config_json);
     defer dense_cfg.deinit(alloc);
     const generator = try parseDenseGeneratorConfig(alloc, cfg.config_json);
     defer if (generator) |value| value.deinit(alloc);
-    const source_names: []const []const u8 = if (dense_cfg.embedding_names.len > 0)
-        dense_cfg.embedding_names
-    else if (generator) |value|
-        &.{value.embedding_name orelse cfg.name}
-    else
-        &.{dense_cfg.embedding_name orelse cfg.name};
-    const names = try alloc.alloc([]u8, source_names.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (names[0..initialized]) |name| alloc.free(name);
-        alloc.free(names);
-    }
-    for (source_names, 0..) |name, i| {
-        names[i] = try alloc.dupe(u8, name);
-        initialized += 1;
-    }
-    return names;
+    if (generator) |value| return try alloc.dupe(u8, value.embedding_name orelse cfg.name);
+    return try alloc.dupe(u8, dense_cfg.embedding_name orelse cfg.name);
 }
 
 const TextConfig = struct {
     source_artifact_name: ?[]u8 = null,
-    source_artifact_names: [][]u8 = &.{},
 
     fn deinit(self: *const TextConfig, alloc: Allocator) void {
         if (self.source_artifact_name) |source_artifact_name| alloc.free(source_artifact_name);
-        for (self.source_artifact_names) |name| alloc.free(name);
-        if (self.source_artifact_names.len > 0) alloc.free(self.source_artifact_names);
     }
 };
 
@@ -14614,12 +14411,9 @@ const GeneratorConfig = struct {
 const SparseConfig = struct {
     field_name: []u8,
     external: bool = false,
-    embedding_names: [][]u8 = &.{},
 
     fn deinit(self: *const SparseConfig, alloc: Allocator) void {
         alloc.free(self.field_name);
-        for (self.embedding_names) |name| alloc.free(name);
-        if (self.embedding_names.len > 0) alloc.free(self.embedding_names);
     }
 };
 
@@ -14643,7 +14437,7 @@ pub const GraphArtifactMapping = struct {
     context_doc_fields: []const []u8 = &.{},
 
     pub fn clone(alloc: Allocator, mapping: GraphArtifactMapping) !GraphArtifactMapping {
-        const context_doc_fields: [][]u8 = if (mapping.context_doc_fields.len > 0)
+        const context_doc_fields = if (mapping.context_doc_fields.len > 0)
             try alloc.alloc([]u8, mapping.context_doc_fields.len)
         else
             &.{};
@@ -14711,9 +14505,7 @@ pub const GraphArtifactSource = struct {
 
 const GraphConfig = struct {
     edge_type_configs: []graph_mod.EdgeTypeConfig,
-    artifact_sources: []GraphArtifactSource = &.{},
-    // Engine-owned shorthand used after public enrichments have been
-    // normalized. This is not part of the public graph index schema.
+    artifact_source: ?GraphArtifactSource = null,
     shorthand_asset: ?enrichment_catalog.EnrichmentConfig = null,
     algebraic_semiring_traversal: bool = false,
 
@@ -14723,8 +14515,7 @@ const GraphConfig = struct {
             if (cfg.field_name) |field_name| alloc.free(field_name);
         }
         alloc.free(self.edge_type_configs);
-        for (self.artifact_sources) |*source| source.deinit(alloc);
-        if (self.artifact_sources.len > 0) alloc.free(self.artifact_sources);
+        if (self.artifact_source) |*source| source.deinit(alloc);
         if (self.shorthand_asset) |*asset| asset.deinit(alloc);
     }
 };
@@ -14752,7 +14543,6 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         .source_template = if (cfg.template.len > 0) try alloc.dupe(u8, cfg.template) else "",
         .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
         .expected_dims = cfg.expected_dims,
-        .vector_space = if (cfg.vector_space.len > 0) try alloc.dupe(u8, cfg.vector_space) else "",
         .chunk_size = cfg.chunk_size,
         .chunk_overlap = cfg.chunk_overlap,
         .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
@@ -14770,7 +14560,6 @@ fn internalEnrichmentConfigsEqual(a: enrichment_catalog.EnrichmentConfig, b: enr
         std.mem.eql(u8, a.source_template, b.source_template) and
         std.mem.eql(u8, a.source_artifact_name, b.source_artifact_name) and
         a.expected_dims == b.expected_dims and
-        std.mem.eql(u8, a.vector_space, b.vector_space) and
         a.chunk_size == b.chunk_size and
         a.chunk_overlap == b.chunk_overlap and
         std.mem.eql(u8, a.chunker_json, b.chunker_json) and
@@ -14800,7 +14589,6 @@ fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentConfig
         .template = if (cfg.source_template.len > 0) try alloc.dupe(u8, cfg.source_template) else "",
         .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
         .expected_dims = cfg.expected_dims,
-        .vector_space = if (cfg.vector_space.len > 0) try alloc.dupe(u8, cfg.vector_space) else "",
         .chunk_size = cfg.chunk_size,
         .chunk_overlap = cfg.chunk_overlap,
         .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
@@ -14851,78 +14639,6 @@ fn isIndexExecutionNamespace(name: []const u8) bool {
         std.mem.eql(u8, name, "embedding");
 }
 
-fn parseArtifactSourcesAlloc(alloc: Allocator, root: std.json.ObjectMap) ![][]u8 {
-    const sources_value = root.get("sources") orelse return &.{};
-    if (sources_value != .array or sources_value.array.items.len == 0 or sources_value.array.items.len > max_artifact_sources) return error.InvalidIndexConfig;
-    const sources = try alloc.alloc([]u8, sources_value.array.items.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (sources[0..initialized]) |name| alloc.free(name);
-        alloc.free(sources);
-    }
-    for (sources_value.array.items, 0..) |source_value, i| {
-        if (source_value != .object) return error.InvalidIndexConfig;
-        if (!objectHasOnlyFields(source_value.object, &.{"artifact"})) return error.InvalidIndexConfig;
-        const artifact = source_value.object.get("artifact") orelse return error.InvalidIndexConfig;
-        if (artifact != .string or artifact.string.len == 0) return error.InvalidIndexConfig;
-        for (sources[0..i]) |previous| {
-            if (std.mem.eql(u8, previous, artifact.string)) return error.InvalidIndexConfig;
-        }
-        sources[i] = try alloc.dupe(u8, artifact.string);
-        initialized += 1;
-    }
-    return sources;
-}
-
-fn objectHasOnlyFields(object: std.json.ObjectMap, allowed: []const []const u8) bool {
-    var iter = object.iterator();
-    while (iter.next()) |entry| {
-        var found = false;
-        for (allowed) |field| {
-            if (std.mem.eql(u8, entry.key_ptr.*, field)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) return false;
-    }
-    return true;
-}
-
-fn cloneOwnedStrings(alloc: Allocator, values: []const []const u8) ![][]u8 {
-    if (values.len == 0) return &.{};
-    const cloned = try alloc.alloc([]u8, values.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (cloned[0..initialized]) |value| alloc.free(value);
-        alloc.free(cloned);
-    }
-    for (values, 0..) |value, i| {
-        cloned[i] = try alloc.dupe(u8, value);
-        initialized += 1;
-    }
-    return cloned;
-}
-
-fn appendUniqueOwnedString(
-    alloc: Allocator,
-    strings: *std.ArrayListUnmanaged([]u8),
-    value: []const u8,
-) !void {
-    if (value.len == 0 or containsOwnedString(strings.items, value)) return;
-    try strings.append(alloc, try alloc.dupe(u8, value));
-}
-
-fn parseEmbeddingSemanticProducerAlloc(alloc: Allocator, raw: []const u8) !?[]u8 {
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidIndexConfig;
-
-    const value = parsed.value.object.get("semantic_producer") orelse return null;
-    if (value != .string or value.string.len == 0) return error.InvalidIndexConfig;
-    return try alloc.dupe(u8, value.string);
-}
-
 fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
@@ -14933,13 +14649,6 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
     const dims = root.object.get("dims") orelse return error.InvalidIndexConfig;
     const metric = root.object.get("metric");
 
-    const embedding_names = try parseArtifactSourcesAlloc(alloc, root.object);
-    errdefer {
-        for (embedding_names) |name| alloc.free(name);
-        if (embedding_names.len > 0) alloc.free(embedding_names);
-    }
-    if (embedding_names.len > 0 and root.object.get("embedding_name") != null) return error.InvalidIndexConfig;
-
     return .{
         .field_name = try alloc.dupe(u8, field.string),
         .dims = std.math.cast(u32, dims.integer) orelse return error.InvalidIndexConfig,
@@ -14949,7 +14658,6 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
             try alloc.dupe(u8, value.string)
         else
             null,
-        .embedding_names = embedding_names,
         .external = if (root.object.get("external")) |value|
             switch (value) {
                 .bool => value.bool,
@@ -15036,17 +14744,6 @@ fn parseTextConfig(alloc: Allocator, raw: []const u8) !TextConfig {
     const root = parsed.value;
     if (root != .object) return error.InvalidIndexConfig;
 
-    const source_artifact_names = try parseArtifactSourcesAlloc(alloc, root.object);
-    errdefer {
-        for (source_artifact_names) |name| alloc.free(name);
-        if (source_artifact_names.len > 0) alloc.free(source_artifact_names);
-    }
-    if (source_artifact_names.len > 0 and
-        (root.object.get("artifact_name") != null or root.object.get("chunk_name") != null))
-    {
-        return error.InvalidIndexConfig;
-    }
-
     return .{
         .source_artifact_name = if (root.object.get("artifact_name")) |value|
             try alloc.dupe(u8, value.string)
@@ -15054,7 +14751,6 @@ fn parseTextConfig(alloc: Allocator, raw: []const u8) !TextConfig {
             try alloc.dupe(u8, value.string)
         else
             null,
-        .source_artifact_names = source_artifact_names,
     };
 }
 
@@ -15320,15 +15016,8 @@ fn parseSparseConfig(alloc: Allocator, raw: []const u8) !SparseConfig {
     if (root != .object) return error.InvalidIndexConfig;
 
     const field = root.object.get("field") orelse return error.InvalidIndexConfig;
-    const embedding_names = try parseArtifactSourcesAlloc(alloc, root.object);
-    errdefer {
-        for (embedding_names) |name| alloc.free(name);
-        if (embedding_names.len > 0) alloc.free(embedding_names);
-    }
-    if (embedding_names.len > 0 and root.object.get("embedding_name") != null) return error.InvalidIndexConfig;
     return .{
         .field_name = try alloc.dupe(u8, field.string),
-        .embedding_names = embedding_names,
         .external = if (root.object.get("external")) |value|
             if (value == .bool) value.bool else return error.InvalidIndexConfig
         else
@@ -15507,24 +15196,6 @@ fn containsOwnedString(items: []const []const u8, value: []const u8) bool {
     return false;
 }
 
-fn generatedArtifactTargetSelected(targets: []const []const u8, artifact_name: []const u8) bool {
-    return targets.len == 0 or containsOwnedString(targets, artifact_name);
-}
-
-fn generatedVectorIndexTargetSelected(
-    targets: []const []const u8,
-    index_name: []const u8,
-    chunk_name: ?[]const u8,
-    embedding_name: ?[]const u8,
-    embedding_names: []const []const u8,
-) bool {
-    if (targets.len == 0 or containsOwnedString(targets, index_name)) return true;
-    if (chunk_name) |name| if (containsOwnedString(targets, name)) return true;
-    if (embedding_name) |name| if (containsOwnedString(targets, name)) return true;
-    for (embedding_names) |name| if (containsOwnedString(targets, name)) return true;
-    return false;
-}
-
 fn hasGeneratedChunkRequest(
     requests: []const enrichment_types.GeneratedEnrichmentRequest,
     doc_key: []const u8,
@@ -15618,19 +15289,20 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     const root = parsed.value;
     if (root != .object) return error.InvalidIndexConfig;
     if (root.object.get("execution") != null) return error.InvalidIndexConfig;
-    if (root.object.get("source") != null) return error.InvalidIndexConfig;
     const algebraic_semiring_traversal = try parseGraphAlgebraicSemiringTraversal(root);
-    const artifact_sources = try parseGraphArtifactSources(alloc, root);
-    errdefer {
-        for (artifact_sources) |*source| source.deinit(alloc);
-        if (artifact_sources.len > 0) alloc.free(artifact_sources);
-    }
+    var artifact_source = try parseGraphArtifactSource(alloc, root);
+    errdefer if (artifact_source) |*source| {
+        source.deinit(alloc);
+    };
     var shorthand_asset = try parseGraphShorthandAsset(alloc, root);
-    errdefer if (shorthand_asset) |*asset| asset.deinit(alloc);
+    errdefer if (shorthand_asset) |*asset| {
+        asset.deinit(alloc);
+    };
+
     const edge_types = root.object.get("edge_types") orelse {
         return .{
             .edge_type_configs = try alloc.alloc(graph_mod.EdgeTypeConfig, 0),
-            .artifact_sources = artifact_sources,
+            .artifact_source = artifact_source,
             .shorthand_asset = shorthand_asset,
             .algebraic_semiring_traversal = algebraic_semiring_traversal,
         };
@@ -15660,7 +15332,7 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
         } else graph_mod.TopologyMode.graph;
 
         const field_name = if (item.object.get("field")) |value| blk: {
-            if (artifact_sources.len > 0) return error.InvalidIndexConfig;
+            if (artifact_source != null) return error.InvalidIndexConfig;
             if (value != .string) return error.InvalidIndexConfig;
             break :blk try alloc.dupe(u8, value.string);
         } else null;
@@ -15675,75 +15347,53 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
 
     return .{
         .edge_type_configs = configs,
-        .artifact_sources = artifact_sources,
+        .artifact_source = artifact_source,
         .shorthand_asset = shorthand_asset,
         .algebraic_semiring_traversal = algebraic_semiring_traversal,
     };
 }
 
-fn parseGraphArtifactSources(alloc: Allocator, root: std.json.Value) ![]GraphArtifactSource {
-    const sources_value = root.object.get("sources") orelse return &.{};
-    if (sources_value != .array or sources_value.array.items.len == 0 or sources_value.array.items.len > max_artifact_sources) return error.InvalidIndexConfig;
-    if (root.object.get("path") != null or root.object.get("format") != null or root.object.get("mention_edge_type") != null or
-        root.object.get("nodes") != null or root.object.get("edge") != null or root.object.get("context") != null)
-    {
+fn parseGraphArtifactSource(alloc: Allocator, root: std.json.Value) !?GraphArtifactSource {
+    const source = root.object.get("source") orelse return null;
+    if (source != .object) return error.InvalidIndexConfig;
+    const kind = source.object.get("kind") orelse return error.InvalidIndexConfig;
+    if (kind != .string) return error.InvalidIndexConfig;
+    if (std.mem.eql(u8, kind.string, "document_field")) {
+        const field = source.object.get("field") orelse return error.InvalidIndexConfig;
+        if (field != .string or field.string.len == 0) return error.InvalidIndexConfig;
+        if (!std.mem.eql(u8, field.string, "_edges")) return error.InvalidIndexConfig;
+        return null;
+    }
+    if (!std.mem.eql(u8, kind.string, "artifact")) return error.InvalidIndexConfig;
+
+    const artifact = source.object.get("artifact") orelse return error.InvalidIndexConfig;
+    if (artifact != .string or artifact.string.len == 0) return error.InvalidIndexConfig;
+    const path = if (source.object.get("path")) |value| blk: {
+        if (value != .string) return error.InvalidIndexConfig;
+        try validateGraphArtifactPath(value.string);
+        break :blk value.string;
+    } else "";
+    const format = if (source.object.get("format")) |value| blk: {
+        if (value != .string) return error.InvalidIndexConfig;
+        if (std.mem.eql(u8, value.string, "extraction_relation")) break :blk GraphArtifactFormat.extraction_relation;
+        if (std.mem.eql(u8, value.string, "extraction_graph")) break :blk GraphArtifactFormat.extraction_graph;
         return error.InvalidIndexConfig;
-    }
+    } else GraphArtifactFormat.extraction_relation;
 
-    const sources = try alloc.alloc(GraphArtifactSource, sources_value.array.items.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (sources[0..initialized]) |*source| source.deinit(alloc);
-        alloc.free(sources);
-    }
-    for (sources_value.array.items, 0..) |source_value, i| {
-        if (source_value != .object) return error.InvalidIndexConfig;
-        if (!objectHasOnlyFields(source_value.object, &.{ "artifact", "path", "format", "mention_edge_type", "nodes", "edge", "context" })) return error.InvalidIndexConfig;
-        const artifact = source_value.object.get("artifact") orelse return error.InvalidIndexConfig;
-        if (artifact != .string or artifact.string.len == 0) return error.InvalidIndexConfig;
-        for (sources[0..i]) |previous| {
-            if (std.mem.eql(u8, previous.artifact_name, artifact.string)) return error.InvalidIndexConfig;
-        }
-        const path = if (source_value.object.get("path")) |value| blk: {
-            if (value != .string) return error.InvalidIndexConfig;
-            try validateGraphArtifactPath(value.string);
-            break :blk value.string;
-        } else "";
-        const format = if (source_value.object.get("format")) |value| blk: {
-            if (value != .string) return error.InvalidIndexConfig;
-            if (std.mem.eql(u8, value.string, "extraction_relation")) break :blk GraphArtifactFormat.extraction_relation;
-            if (std.mem.eql(u8, value.string, "extraction_graph")) break :blk GraphArtifactFormat.extraction_graph;
-            return error.InvalidIndexConfig;
-        } else GraphArtifactFormat.extraction_relation;
-        const mention_edge_type = if (source_value.object.get("mention_edge_type")) |value| blk: {
-            if (value != .string) return error.InvalidIndexConfig;
-            break :blk value.string;
-        } else "";
-        const mapping = try parseGraphArtifactMapping(alloc, source_value);
-        defer {
-            var owned_mapping = mapping;
-            owned_mapping.deinit(alloc);
-        }
-        sources[i] = try initGraphArtifactSource(alloc, artifact.string, path, format, mapping, mention_edge_type);
-        initialized += 1;
-    }
-    return sources;
-}
+    const mention_edge_type = if (source.object.get("mention_edge_type")) |value| blk: {
+        if (value != .string) return error.InvalidIndexConfig;
+        break :blk value.string;
+    } else "";
 
-fn initGraphArtifactSource(
-    alloc: Allocator,
-    name: []const u8,
-    path: []const u8,
-    format: GraphArtifactFormat,
-    mapping: GraphArtifactMapping,
-    mention_edge_type: []const u8,
-) !GraphArtifactSource {
-    var source = GraphArtifactSource{ .artifact_name = try alloc.dupe(u8, name), .format = format };
-    errdefer source.deinit(alloc);
-    source.path = if (path.len > 0) try alloc.dupe(u8, path) else "";
-    source.mapping = try GraphArtifactMapping.clone(alloc, mapping);
-    source.mention_edge_type = if (mention_edge_type.len > 0) try alloc.dupe(u8, mention_edge_type) else "";
-    return source;
+    var out = GraphArtifactSource{
+        .artifact_name = try alloc.dupe(u8, artifact.string),
+        .path = if (path.len > 0) try alloc.dupe(u8, path) else "",
+        .format = format,
+        .mention_edge_type = if (mention_edge_type.len > 0) try alloc.dupe(u8, mention_edge_type) else "",
+    };
+    errdefer out.deinit(alloc);
+    out.mapping = try parseGraphArtifactMapping(alloc, root);
+    return out;
 }
 
 fn validateGraphArtifactPath(path: []const u8) !void {
@@ -15767,7 +15417,6 @@ fn parseGraphArtifactMapping(alloc: Allocator, root: std.json.Value) !GraphArtif
 
     if (root.object.get("nodes")) |nodes| {
         if (nodes != .object) return error.InvalidIndexConfig;
-        if (!objectHasOnlyFields(nodes.object, &.{ "model", "source", "target" })) return error.InvalidIndexConfig;
         if (nodes.object.get("model")) |model| {
             if (model != .string) return error.InvalidIndexConfig;
             if (std.mem.eql(u8, model.string, "document")) {
@@ -15784,18 +15433,15 @@ fn parseGraphArtifactMapping(alloc: Allocator, root: std.json.Value) !GraphArtif
 
     if (root.object.get("edge")) |edge| {
         if (edge != .object) return error.InvalidIndexConfig;
-        if (!objectHasOnlyFields(edge.object, &.{ "type", "weight", "metadata" })) return error.InvalidIndexConfig;
         mapping.edge_type_template = try parseOptionalGraphTemplate(alloc, edge, "type");
         mapping.weight_template = try parseOptionalGraphTemplate(alloc, edge, "weight");
         if (edge.object.get("metadata")) |metadata| {
-            if (metadata != .object) return error.InvalidIndexConfig;
             mapping.metadata_template_json = try std.json.Stringify.valueAlloc(alloc, metadata, .{});
         }
     }
 
     if (root.object.get("context")) |context| {
         if (context != .object) return error.InvalidIndexConfig;
-        if (!objectHasOnlyFields(context.object, &.{"doc_fields"})) return error.InvalidIndexConfig;
         mapping.context_doc_fields = try parseGraphContextDocFields(alloc, context);
     }
 
@@ -15823,9 +15469,6 @@ fn parseGraphContextDocFields(alloc: Allocator, context: std.json.Value) ![]cons
     }
     for (value.array.items, 0..) |item, i| {
         if (item != .string or item.string.len == 0) return error.InvalidIndexConfig;
-        for (fields[0..i]) |previous| {
-            if (std.mem.eql(u8, previous, item.string)) return error.InvalidIndexConfig;
-        }
         fields[i] = try alloc.dupe(u8, item.string);
         initialized += 1;
     }
@@ -15950,40 +15593,28 @@ test "graph config declares algebraic provenance semiring traversal law" {
     ));
 }
 
-test "graph config rejects removed singular source paths" {
-    const alloc = std.testing.allocator;
-    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"source":{"kind":"artifact","artifact":"relations_v1"}}
-    ));
-    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"source":{"kind":"document_field","field":"_edges"}}
-    ));
-}
-
-test "graph config parses multiple artifact sources with per-source consumption settings" {
+test "graph config parses artifact source and shorthand asset enrichment" {
     const alloc = std.testing.allocator;
     var cfg = try parseGraphConfig(alloc,
-        \\{"sources":[{"artifact":"title_relations_v1","path":"$.relations[*]","format":"extraction_relation"},{"artifact":"body_graph_v1","path":"$.graph","format":"extraction_graph"}]}
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"antfly"}},"execution":{"batch_items":8,"batch_bytes":262144}}
+        \\}
     );
     defer cfg.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 2), cfg.artifact_sources.len);
-    try std.testing.expectEqualStrings("title_relations_v1", cfg.artifact_sources[0].artifact_name);
-    try std.testing.expectEqualStrings("$.relations[*]", cfg.artifact_sources[0].path);
-    try std.testing.expectEqual(GraphArtifactFormat.extraction_relation, cfg.artifact_sources[0].format);
-    try std.testing.expectEqualStrings("body_graph_v1", cfg.artifact_sources[1].artifact_name);
-    try std.testing.expectEqualStrings("$.graph", cfg.artifact_sources[1].path);
-    try std.testing.expectEqual(GraphArtifactFormat.extraction_graph, cfg.artifact_sources[1].format);
-
-    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"source":{"kind":"artifact","artifact":"legacy"},"sources":[{"artifact":"current"}]}
-    ));
-    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"sources":[{"artifact":"current"}],"path":"$.relations[*]"}
-    ));
-    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"sources":[{"artifact":"current","field":"body"}]}
-    ));
+    try std.testing.expect(cfg.artifact_source != null);
+    try std.testing.expectEqualStrings("relations_v1", cfg.artifact_source.?.artifact_name);
+    try std.testing.expectEqualStrings("$.relations[*]", cfg.artifact_source.?.path);
+    try std.testing.expectEqual(GraphArtifactFormat.extraction_relation, cfg.artifact_source.?.format);
+    try std.testing.expect(cfg.shorthand_asset != null);
+    try std.testing.expectEqualStrings("relations_v1", cfg.shorthand_asset.?.name);
+    try std.testing.expectEqual(enrichment_catalog.EnrichmentType.asset, cfg.shorthand_asset.?.kind);
+    try std.testing.expectEqualStrings("body", cfg.shorthand_asset.?.source_field);
+    try std.testing.expectEqualStrings("application/json", cfg.shorthand_asset.?.content_type);
+    try std.testing.expect(std.mem.indexOf(u8, cfg.shorthand_asset.?.producer_json, "\"type\":\"extractor\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cfg.shorthand_asset.?.execution_json, "\"batch_items\":8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cfg.shorthand_asset.?.execution_json, "\"batch_bytes\":262144") != null);
 }
 
 test "graph config rejects invalid execution policy" {
@@ -15996,51 +15627,76 @@ test "graph config rejects invalid execution policy" {
     ));
 }
 
-test "graph config keeps consumption settings on each source" {
+test "graph shorthand asset uses artifact execution only" {
     const alloc = std.testing.allocator;
     var cfg = try parseGraphConfig(alloc,
-        \\{"sources":[{"artifact":"relations_v1","path":"$.items[*]","format":"extraction_relation","mention_edge_type":"mentions"}]}
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"pages_v1","path":"$.pages[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"pages_v1","kind":"asset","field":"image","producer_json":{"type":"reader","config":{"provider":"antfly"}},"execution":{"batch_items":3}}
+        \\}
     );
     defer cfg.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), cfg.artifact_sources.len);
-    try std.testing.expectEqualStrings("$.items[*]", cfg.artifact_sources[0].path);
-    try std.testing.expectEqualStrings("mentions", cfg.artifact_sources[0].mention_edge_type);
+    try std.testing.expect(cfg.shorthand_asset != null);
+    try std.testing.expect(std.mem.indexOf(u8, cfg.shorthand_asset.?.execution_json, "\"batch_items\":3") != null);
 }
 
-test "graph config rejects unsupported source paths and top-level source mappings" {
+test "graph config parses artifact mapping templates and context fields" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.items[*]","format":"extraction_relation"},
+        \\  "nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.to }}"},
+        \\  "edge":{"type":"{{ _item.rel }}","weight":"{{ default _item.score 1.0 }}","metadata":{"evidence":"{{ _item.evidence }}","tenant":"{{ _doc.value.tenant_id }}"}},
+        \\  "context":{"doc_fields":["tenant_id"]}
+        \\}
+    );
+    defer cfg.deinit(alloc);
+
+    const mapping = cfg.artifact_source.?.mapping;
+    try std.testing.expectEqual(GraphNodeModel.document, mapping.node_model);
+    try std.testing.expectEqualStrings("{{ _doc.key }}", mapping.source_template);
+    try std.testing.expectEqualStrings("{{ _item.to }}", mapping.target_template);
+    try std.testing.expectEqualStrings("{{ _item.rel }}", mapping.edge_type_template);
+    try std.testing.expectEqualStrings("{{ default _item.score 1.0 }}", mapping.weight_template);
+    try std.testing.expectEqual(@as(usize, 1), mapping.context_doc_fields.len);
+    try std.testing.expectEqualStrings("tenant_id", mapping.context_doc_fields[0]);
+    try std.testing.expect(std.mem.indexOf(u8, mapping.metadata_template_json, "_item.evidence") != null);
+}
+
+test "graph config rejects undeclared doc value template fields and unsupported paths" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"sources":[{"artifact":"relations_v1"}],"edge":{"type":"{{ _doc.value.tenant_id }}"}}
+        \\{"source":{"kind":"artifact","artifact":"relations_v1"},"edge":{"type":"{{ _doc.value.tenant_id }}"}}
     ));
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"sources":[{"artifact":"relations_v1","path":"$.relations[0]"}]}
+        \\{"source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[0]"}}
     ));
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"sources":[{"artifact":"relations_v1"}],"nodes":{"source":"{{ _item.source.document_id }}"}}
-    ));
-    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"sources":[{"artifact":"relations_v1","nodes":{"source":"{{ _artifact.value.source }}","unknown":true}}]}
-    ));
-    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"sources":[{"artifact":"relations_v1","edge":{"metadata":[]}}]}
-    ));
-    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"sources":[{"artifact":"relations_v1","context":{"doc_fields":["tenant_id","tenant_id"]}}]}
+        \\{"source":{"kind":"artifact","artifact":"relations_v1"},"nodes":{"source":"{{ _item.source.document_id }}"}}
     ));
 }
 
 test "graph config rejects artifact source combined with document field edge types" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"sources":[{"artifact":"relations_v1"}],"edge_types":[{"name":"mentions","field":"edges"}]}
+        \\{"source":{"kind":"artifact","artifact":"relations_v1"},"edge_types":[{"name":"mentions","field":"edges"}]}
     ));
 }
 
-test "graph config rejects removed document field source shape" {
+test "graph config validates document field source shape" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+    var cfg = try parseGraphConfig(alloc,
         \\{"source":{"kind":"document_field","field":"_edges"}}
+    );
+    defer cfg.deinit(alloc);
+    try std.testing.expect(cfg.artifact_source == null);
+
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"source":{"kind":"document_field"}}
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"source":{"kind":"document_field","field":"links"}}
     ));
 }
 
@@ -17978,54 +17634,11 @@ test "parseDenseConfig accepts external embedding indexes" {
     try std.testing.expect(cfg.external);
 }
 
-test "parseDenseConfig accepts multiple embedding artifact sources" {
-    const alloc = std.testing.allocator;
-    const cfg = try parseDenseConfig(alloc,
-        \\{"field":"embedding","dims":384,"metric":"cosine","sources":[{"artifact":"title_dense_v1"},{"artifact":"body_dense_v1"}]}
-    );
-    defer cfg.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 2), cfg.embedding_names.len);
-    try std.testing.expectEqualStrings("title_dense_v1", cfg.embedding_names[0]);
-    try std.testing.expectEqualStrings("body_dense_v1", cfg.embedding_names[1]);
-    try std.testing.expect(cfg.embedding_name == null);
-
-    try std.testing.expectError(error.InvalidIndexConfig, parseDenseConfig(alloc,
-        \\{"field":"embedding","dims":384,"sources":[{"artifact":"body_dense_v1"},{"artifact":"body_dense_v1"}]}
-    ));
-    try std.testing.expectError(error.InvalidIndexConfig, parseDenseConfig(alloc,
-        \\{"field":"embedding","dims":384,"embedding_name":"legacy","sources":[{"artifact":"body_dense_v1"}]}
-    ));
-}
-
 test "parseSparseConfig accepts external embedding indexes" {
     const cfg = try parseSparseConfig(std.testing.allocator, "{\"field\":\"sparse\",\"external\":true}");
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("sparse", cfg.field_name);
     try std.testing.expect(cfg.external);
-}
-
-test "text and sparse configs accept shared artifact source shape" {
-    const alloc = std.testing.allocator;
-    const text_cfg = try parseTextConfig(alloc,
-        \\{"sources":[{"artifact":"title_chunks_v1"},{"artifact":"body_assets_v1"}]}
-    );
-    defer text_cfg.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), text_cfg.source_artifact_names.len);
-    try std.testing.expectEqualStrings("title_chunks_v1", text_cfg.source_artifact_names[0]);
-    try std.testing.expectEqualStrings("body_assets_v1", text_cfg.source_artifact_names[1]);
-
-    const sparse_cfg = try parseSparseConfig(alloc,
-        \\{"field":"embedding","sources":[{"artifact":"title_sparse_v1"},{"artifact":"body_sparse_v1"}]}
-    );
-    defer sparse_cfg.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), sparse_cfg.embedding_names.len);
-    try std.testing.expectEqualStrings("title_sparse_v1", sparse_cfg.embedding_names[0]);
-    try std.testing.expectEqualStrings("body_sparse_v1", sparse_cfg.embedding_names[1]);
-
-    try std.testing.expectError(error.InvalidIndexConfig, parseTextConfig(alloc,
-        \\{"sources":[{"artifact":"body_assets_v1","path":"$.body"}]}
-    ));
 }
 
 test "parseDenseGeneratorConfig parses source_template" {
@@ -18151,7 +17764,6 @@ test "shorthand chunk and embedding enrichment compatibility includes source_tem
         .source_template = "{{title}} {{body}}",
         .source_artifact_name = "body_chunks",
         .expected_dims = 384,
-        .producer_json = "{\"model\":\"embed-v1\"}",
     }));
     try std.testing.expect(!try manager.ensureEmbeddingEnrichment(.{
         .name = "body_embedding",
@@ -18160,7 +17772,6 @@ test "shorthand chunk and embedding enrichment compatibility includes source_tem
         .source_template = "{{title}} {{body}}",
         .source_artifact_name = "body_chunks",
         .expected_dims = 384,
-        .producer_json = "{\"model\":\"embed-v1\"}",
     }));
     try std.testing.expectError(error.ConflictingEnrichmentConfig, manager.ensureEmbeddingEnrichment(.{
         .name = "body_embedding",
@@ -18169,16 +17780,6 @@ test "shorthand chunk and embedding enrichment compatibility includes source_tem
         .source_template = "{{body}}",
         .source_artifact_name = "body_chunks",
         .expected_dims = 384,
-        .producer_json = "{\"model\":\"embed-v1\"}",
-    }));
-    try std.testing.expectError(error.ConflictingEnrichmentConfig, manager.ensureEmbeddingEnrichment(.{
-        .name = "body_embedding",
-        .kind = .embedding,
-        .source_field = "body",
-        .source_template = "{{title}} {{body}}",
-        .source_artifact_name = "body_chunks",
-        .expected_dims = 384,
-        .producer_json = "{\"model\":\"embed-v2\"}",
     }));
 }
 
@@ -18210,56 +17811,6 @@ test "generated enrichment request identity includes source_template" {
 
     try std.testing.expect(hasGeneratedDenseEmbeddingRequest(requests[0..], "doc:1", "body", "{{title}} {{body}}", "body_chunks", "body_embedding"));
     try std.testing.expect(!hasGeneratedDenseEmbeddingRequest(requests[0..], "doc:1", "body", "{{body}}", "body_chunks", "body_embedding"));
-}
-
-test "generated embedding requests carry semantic producer identity" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
-    defer alloc.free(path_z);
-
-    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
-    defer store.close();
-    var manager = try IndexManager.init(alloc, path);
-    defer manager.deinit();
-
-    const dense_producer = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"dense-v1\"}";
-    const sparse_producer = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"sparse-v1\"}";
-    try manager.addAllNoBackfill(&store, &.{
-        .{
-            .name = "dense_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"dense\",\"dims\":3,\"metric\":\"cosine\",\"semantic_producer\":\"{\\\"version\\\":1,\\\"provider\\\":\\\"antfly\\\",\\\"model\\\":\\\"dense-v1\\\"}\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"artifact_name\":\"dense_chunks\",\"chunk_size\":64}}",
-        },
-        .{
-            .name = "sparse_v1",
-            .kind = .sparse_vector,
-            .config_json = "{\"field\":\"sparse\",\"semantic_producer\":\"{\\\"version\\\":1,\\\"provider\\\":\\\"antfly\\\",\\\"model\\\":\\\"sparse-v1\\\"}\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"artifact_name\":\"sparse_chunks\",\"chunk_size\":64}}",
-        },
-    });
-
-    const requests = try manager.planGeneratedEnrichments(alloc, "doc:1", "{\"body\":\"hello\"}", &.{}, &.{}, &.{});
-    defer enrichment_types.deinitGeneratedRequests(alloc, requests);
-
-    var saw_dense = false;
-    var saw_sparse = false;
-    for (requests) |request| switch (request.kind) {
-        .dense_embedding => {
-            try std.testing.expectEqualStrings(dense_producer, request.producer_json);
-            saw_dense = true;
-        },
-        .sparse_embedding => {
-            try std.testing.expectEqualStrings(sparse_producer, request.producer_json);
-            saw_sparse = true;
-        },
-        else => {},
-    };
-    try std.testing.expect(saw_dense);
-    try std.testing.expect(saw_sparse);
 }
 
 test "parseTextConfig prefers source artifact name and accepts legacy chunk name" {
@@ -18643,121 +18194,6 @@ test "dense index manager accepts explicit embedding writes after addAllNoBackfi
 
     const entry = manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
     try std.testing.expectEqual(@as(u64, 1), entry.index.stats().active_count);
-}
-
-test "dense index unions multiple embedding artifact sources without overwriting members" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
-    defer alloc.free(path_z);
-
-    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
-    defer store.close();
-
-    var manager = try IndexManager.init(alloc, path);
-    defer manager.deinit();
-    manager.updateRange(.{ .start = "", .end = "" });
-
-    try manager.addEnrichment(&store, .{
-        .name = "title_dense_v1",
-        .kind = .embedding,
-        .field = "title",
-        .expected_dims = 3,
-        .producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"test\",\"dimensions\":3}",
-    });
-    try manager.addEnrichment(&store, .{
-        .name = "body_dense_v1",
-        .kind = .embedding,
-        .field = "body",
-        .expected_dims = 3,
-        .producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"test\",\"dimensions\":3}",
-    });
-    try manager.addAllNoBackfill(&store, &.{.{
-        .name = "document_vectors",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"sources\":[{\"artifact\":\"title_dense_v1\"},{\"artifact\":\"body_dense_v1\"}]}",
-    }});
-
-    const title_routes = try manager.denseIndexesForEmbedding(alloc, "title_dense_v1", 3);
-    defer {
-        for (title_routes) |name| alloc.free(name);
-        alloc.free(title_routes);
-    }
-    const body_routes = try manager.denseIndexesForEmbedding(alloc, "body_dense_v1", 3);
-    defer {
-        for (body_routes) |name| alloc.free(name);
-        alloc.free(body_routes);
-    }
-    try std.testing.expectEqual(@as(usize, 1), title_routes.len);
-    try std.testing.expectEqual(@as(usize, 1), body_routes.len);
-    try std.testing.expectEqualStrings("document_vectors", title_routes[0]);
-    try std.testing.expectEqualStrings("document_vectors", body_routes[0]);
-    try std.testing.expect(manager.denseIndexConsumesEmbedding("document_vectors", "title_dense_v1"));
-    try std.testing.expect(manager.denseIndexConsumesEmbedding("document_vectors", "body_dense_v1"));
-    try std.testing.expect(!manager.denseIndexConsumesEmbedding("document_vectors", "other_dense_v1"));
-
-    const doc_key = "doc:multi";
-    const stored_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
-    defer alloc.free(stored_key);
-    try store.put(stored_key, "{\"title\":\"multi\",\"body\":\"source\"}");
-
-    const title_artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_key, "title_dense_v1");
-    defer alloc.free(title_artifact);
-    const body_artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_key, "body_dense_v1");
-    defer alloc.free(body_artifact);
-    const title_payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &[_]f32{ 1, 0, 0 });
-    defer alloc.free(title_payload);
-    const body_payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &[_]f32{ 0, 1, 0 });
-    defer alloc.free(body_payload);
-    try store.put(title_artifact, title_payload);
-    try store.put(body_artifact, body_payload);
-
-    var writes = [_]mapper.DenseEmbeddingWrite{
-        .{
-            .index_name = try alloc.dupe(u8, "document_vectors"),
-            .doc_key = try alloc.dupe(u8, doc_key),
-            .artifact_key = try alloc.dupe(u8, title_artifact),
-            .vector = &.{},
-        },
-        .{
-            .index_name = try alloc.dupe(u8, "document_vectors"),
-            .doc_key = try alloc.dupe(u8, doc_key),
-            .artifact_key = try alloc.dupe(u8, body_artifact),
-            .vector = &.{},
-        },
-    };
-    defer {
-        for (writes) |write| {
-            alloc.free(write.index_name);
-            alloc.free(write.doc_key);
-            alloc.free(write.artifact_key.?);
-        }
-    }
-    try manager.applyDenseEmbeddingWritesByName(&store, "document_vectors", &writes);
-
-    const entry = manager.denseIndex("document_vectors") orelse return error.IndexNotFound;
-    try std.testing.expectEqual(@as(u64, 2), entry.index.stats().active_count);
-    const title_metadata = (try entry.index.getMetadata(deterministicDenseVectorId(title_artifact))) orelse return error.TestUnexpectedResult;
-    defer alloc.free(title_metadata);
-    const body_metadata = (try entry.index.getMetadata(deterministicDenseVectorId(body_artifact))) orelse return error.TestUnexpectedResult;
-    defer alloc.free(body_metadata);
-    try std.testing.expectEqualStrings(title_artifact, title_metadata);
-    try std.testing.expectEqualStrings(body_artifact, body_metadata);
-
-    entry.index.setCacheEnabled(false);
-    entry.index.setCacheEnabled(true);
-    var results = try entry.index.searchWithRequest(.{
-        .query = &[_]f32{ 1, 0, 0 },
-        .k = 2,
-    });
-    defer results.deinit();
-    const hits = results.getHits();
-    try std.testing.expectEqual(@as(usize, 2), hits.len);
-    try std.testing.expectEqualStrings(title_artifact, hits[0].metadata.?);
 }
 
 test "index manager advertises typed tensor access paths for vector and graph indexes" {
@@ -21588,6 +21024,13 @@ test "text merge task skips stale source after concurrent delete" {
     try std.testing.expect(pending_stats.pending_segments >= 12);
     try std.testing.expect(pending_stats.pending_bytes > 0);
 
+    const text_entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
+    try std.testing.expect(text_entry.apply_mutex.tryLock());
+    const busy_task = try manager.beginTextMergeTask();
+    text_entry.apply_mutex.unlock();
+    try std.testing.expect(busy_task == null);
+    try std.testing.expect(text_entry.compaction_pending);
+
     var task = (try manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
     defer task.deinit(alloc);
     const in_flight_stats = manager.textMergeStats();
@@ -21596,10 +21039,29 @@ test "text merge task skips stale source after concurrent delete" {
 
     const stale_segment = &task.snapshot.segments[task.merge_indices[0]];
     const stale_doc = stale_segment.reader.storedDoc(0) orelse return error.TestUnexpectedResult;
+    var frozen_live_docs: u32 = 0;
+    for (task.source, task.merge_indices) |source, seg_idx| {
+        const deleted_count: u32 = if (source.deleted) |deleted| @intCast(deleted.cardinality()) else 0;
+        frozen_live_docs += task.snapshot.segments[seg_idx].reader.doc_count - deleted_count;
+    }
     try manager.deleteTextBatchByNameWithOptions("ft_v1", &.{stale_doc.id}, opts);
 
     var result = try IndexManager.executeTextMergeTask(alloc, &task);
     defer result.deinit(alloc);
+    var merged_docs: u32 = 0;
+    for (result.prepared_segments) |*prepared| {
+        var reader = try segment_mod.SegmentReader.init(alloc, prepared.data.bytes());
+        defer reader.deinit();
+        merged_docs += reader.doc_count;
+    }
+    for (result.segments) |segment_bytes| {
+        var reader = try segment_mod.SegmentReader.init(alloc, segment_bytes);
+        defer reader.deinit();
+        merged_docs += reader.doc_count;
+    }
+    // The build ran after the live bitmap changed, but it consumed the frozen
+    // task view. Publication must reject that now-stale view below.
+    try std.testing.expectEqual(frozen_live_docs, merged_docs);
     const applied = try manager.finishTextMergeTask(&task, &result);
     try std.testing.expect(!applied);
     const stale_stats = manager.textMergeStats();
@@ -21607,9 +21069,8 @@ test "text merge task skips stale source after concurrent delete" {
     try std.testing.expectEqual(@as(u64, 0), stale_stats.in_flight_segments);
     try std.testing.expectEqual(@as(u64, 1), stale_stats.skipped_stale_merges);
 
-    const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
-    try std.testing.expect(entry.compaction_pending);
-    try std.testing.expect(entry.persistent.snapshot().segments.len >= 12);
+    try std.testing.expect(text_entry.compaction_pending);
+    try std.testing.expect(text_entry.persistent.snapshot().segments.len >= 12);
 }
 
 test "text merge task retires all-deleted file-backed inputs" {
@@ -21822,6 +21283,11 @@ test "text merge task records input and output bytes" {
     try std.testing.expectEqual(expected_input_bytes, stats.merge_input_bytes_total);
     try std.testing.expectEqual(expected_output.segments, stats.merge_output_segments_total);
     try std.testing.expectEqual(expected_output.bytes, stats.merge_output_bytes_total);
+    try std.testing.expectEqual(result.elapsed_ns, stats.last_merge_elapsed_ns);
+    try std.testing.expectEqual(result.elapsed_ns, stats.merge_elapsed_ns_total);
+    try std.testing.expect(result.peak_task_alloc_bytes > 0);
+    try std.testing.expectEqual(result.peak_task_alloc_bytes, stats.last_merge_peak_task_alloc_bytes);
+    try std.testing.expectEqual(result.peak_task_alloc_bytes, stats.merge_peak_task_alloc_bytes);
 }
 
 test "text delete clears handed-off stale docs outside current range" {
@@ -21946,6 +21412,10 @@ test "text merge resource manager accounts pending bytes and active buffers" {
         .soft_action = .report,
         .hard_action = .report,
     };
+    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+        .soft_action = .report,
+        .hard_action = .report,
+    };
     var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets, .policies = policies });
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -21975,7 +21445,9 @@ test "text merge resource manager accounts pending bytes and active buffers" {
         .compact_text_segment_threshold = 2,
         .defer_text_compaction = true,
     };
-    for (0..12) |i| {
+    // Enough same-tier segments to make the policy select a wide backlog
+    // merge rather than its normal two-segment minimum.
+    for (0..32) |i| {
         var key_buf: [64]u8 = undefined;
         const key = try alloc.dupe(u8, std.fmt.bufPrint(&key_buf, "doc:{d:0>8}", .{i}) catch unreachable);
         defer alloc.free(key);
@@ -21995,17 +21467,65 @@ test "text merge resource manager accounts pending bytes and active buffers" {
         try std.testing.expect(resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)].soft_limit_events > 0);
     }
 
+    var wide_source_count: usize = 0;
+    var wide_reservation_bytes: u64 = 0;
     {
-        var task = (try manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
+        var task = (try manager.beginTextMergeTask()) orelse return error.WideMergeAdmissionMissing;
         defer task.deinit(alloc);
 
         resource_stats = resource_manager.snapshot();
         try std.testing.expect(resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].used_bytes > 0);
         try std.testing.expect(resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].soft_limit_events > 0);
+        wide_source_count = task.source.len;
+        wide_reservation_bytes = (task.buffer_reservation orelse return error.MissingWideMergeReservation).bytes;
+        manager.cancelTextMergeTask(&task);
     }
 
     resource_stats = resource_manager.snapshot();
     try std.testing.expectEqual(@as(u64, 0), resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].used_bytes);
+
+    // Reconfigure the same manager address so the policy-selected wide task
+    // is above the normal hard limit but within the bounded 2x allowance. It
+    // should remain wide rather than degrading to pairwise compaction.
+    try std.testing.expect(wide_reservation_bytes > 1);
+    var bounded_budgets = budgets;
+    bounded_budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_bytes =
+        (wide_reservation_bytes + 1) / 2;
+    resource_manager = resource_manager_mod.ResourceManager.init(.{
+        .budgets = bounded_budgets,
+        .policies = policies,
+    });
+    {
+        var task = (try manager.beginTextMergeTask()) orelse return error.BoundedWideMergeAdmissionMissing;
+        defer task.deinit(alloc);
+        try std.testing.expectEqual(wide_source_count, task.source.len);
+        manager.cancelTextMergeTask(&task);
+    }
+    resource_stats = resource_manager.snapshot();
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].oversized_single_grants,
+    );
+
+    // Restore the original budget for the concurrent-pressure case below.
+    resource_manager = resource_manager_mod.ResourceManager.init(.{
+        .budgets = budgets,
+        .policies = policies,
+    });
+
+    // A capped file-backed merge owns the working-set envelope exclusively.
+    // Even one byte of concurrent usage must reject another merge rather than
+    // multiplying the bounded allocator cap.
+    try std.testing.expect(wide_source_count > 2);
+    const hard_limit = budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_bytes;
+    try std.testing.expect(wide_reservation_bytes <= hard_limit * 2);
+    var tracked_merge_usage: u64 = 0;
+    resource_manager.observeUsage(.text_merge_buffers, &tracked_merge_usage, 1);
+    defer resource_manager.observeUsage(.text_merge_buffers, &tracked_merge_usage, 0);
+
+    try std.testing.expect((try manager.beginTextMergeTask()) == null);
+    resource_stats = resource_manager.snapshot();
+    try std.testing.expect(resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_rejections > 0);
 }
 
 test "text merge resource pressure defers background merges" {
@@ -22150,7 +21670,10 @@ test "force compact accounts text merge buffers via resource manager" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
-        .hard_limit_bytes = 1024 * 1024,
+        // File-backed merges reserve an 8 MiB baseline plus measured segment
+        // working set. Keep the hard limit above that baseline so this test
+        // exercises accounting and release rather than admission rejection.
+        .hard_limit_bytes = 64 * 1024 * 1024,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
     policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
@@ -22507,7 +22030,7 @@ test "dense replay keep mask keeps only the last write per doc and index" {
         },
     };
     var keep_write: [writes.len]bool = undefined;
-    try IndexManager.computeDenseReplayKeepMask(std.testing.allocator, &writes, &keep_write, false);
+    try IndexManager.computeDenseReplayKeepMask(std.testing.allocator, &writes, &keep_write);
     try std.testing.expectEqualSlices(bool, &.{ false, true, true, true }, &keep_write);
 }
 
@@ -22527,7 +22050,7 @@ test "dense replay keep mask does not collide on embedded nul bytes" {
         },
     };
     var keep_write: [writes.len]bool = undefined;
-    try IndexManager.computeDenseReplayKeepMask(std.testing.allocator, &writes, &keep_write, false);
+    try IndexManager.computeDenseReplayKeepMask(std.testing.allocator, &writes, &keep_write);
     try std.testing.expectEqualSlices(bool, &.{ true, true }, &keep_write);
 }
 const StoreBatchOptions = backend_types.BatchOptions;

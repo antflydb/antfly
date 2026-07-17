@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "status": "tuning_evidence_not_release_baseline",
+  "corpus": {
+    "documents": 120000,
+    "sha256": "b0d244fbc80a50a6b8794cc04865b9c4fcb5a5ac736400ed70f31e8c8d10ae25"
+  },
+  "format_contract": {
+    "origin_main_wire_version": 23,
+    "candidate_wire_version": 28,
+    "accepted_reader_versions": [23, 28],
+    "branch_only_rejected_versions": [24, 25, 26, 27],
+    "postings_per_block": 128
+  },
+  "correctness": {
+    "ok": true,
+    "queries": 5,
+    "strict_matches": 0,
+    "tie_aware_matches": 5
+  },
+  "index_size": {
+    "antfly_v27_bytes": 12723381,
+    "antfly_v28_bytes": 9773605,
+    "tantivy_bytes": 3124851,
+    "v28_reduction_bytes": 2949776,
+    "v28_reduction_percent": 23.183900568567427,
+    "v28_over_v27_ratio": 0.7681609943143257,
+    "v28_over_tantivy_ratio": 3.1277027288661126,
+    "v28_gap_to_tantivy_bytes": 6648754
+  },
+  "median_query_latency_ns": {
+    "antfly_v28": {
+      "term": 22958,
+      "union": 37584,
+      "intersection": 38167,
+      "phrase": 1666166
+    },
+    "tantivy": {
+      "term": 129208,
+      "union": 46625,
+      "intersection": 540292,
+      "phrase": 1837041
+    }
+  },
+  "query_resources": {
+    "minimum_wall_seconds_per_class": 3,
+    "antfly_v28_cpu_per_query_ns": {
+      "term": 15989,
+      "union": 33342,
+      "intersection": 34294,
+      "phrase": 1629834
+    },
+    "tantivy_cpu_per_query_ns": {
+      "term": 127274,
+      "union": 39418,
+      "intersection": 529304,
+      "phrase": 1784855
+    },
+    "antfly_over_tantivy_cpu_ratio": {
+      "term": 0.12562660087684838,
+      "union": 0.845857222588665,
+      "intersection": 0.06479074407145988,
+      "phrase": 0.9131464460698488
+    },
+    "antfly_peak_rss_bytes": 10895360,
+    "tantivy_peak_rss_bytes": 6619136,
+    "antfly_over_tantivy_rss_ratio": 1.646039603960396
+  },
+  "union_wand_diagnostic": {
+    "pre_fix_median_ns": 1847250,
+    "post_fix_median_ns": 37584,
+    "speedup": 49.15096849723287,
+    "post_fix_chunks_skipped": 1136,
+    "post_fix_pivots_scored": 15,
+    "post_fix_pivots_advanced": 7
+  },
+  "indexing": {
+    "matched_fresh_run": {
+      "antfly_v28": {
+        "elapsed_ns": 1166757792,
+        "cpu_ns": 1140000000,
+        "peak_rss_bytes": 53805056,
+        "index_bytes": 9773605
+      },
+      "tantivy": {
+        "elapsed_ns": 11593466500,
+        "cpu_ns": 1860000000,
+        "peak_rss_bytes": 297025536,
+        "index_bytes": 3123952
+      },
+      "antfly_over_tantivy_elapsed_ratio": 0.10063925159916579,
+      "antfly_over_tantivy_cpu_ratio": 0.6129032258064516,
+      "antfly_over_tantivy_peak_rss_ratio": 0.18114622979756193
+    }
+  },
+  "resource_note": "The 120K process counters were sampled with ps every 10 ms. They are tuning evidence only; full-corpus resource qualification remains required because builder and merge working sets scale differently.",
+  "source_artifacts": {
+    "v27": "/private/tmp/antfly-search-v27-120k-production",
+    "v28_index_build": "/private/tmp/antfly-search-v28e-128-120k-production",
+    "v28_post_wand": "/private/tmp/antfly-search-v28f-128-wand-120k-production",
+    "v28_query_resources": "/private/tmp/antfly-search-v28g-128-resources-120k-production",
+    "matched_index_resources": "/private/tmp/antfly-search-v28i-128-both-index-resources-120k-production",
+    "tantivy_index": "/private/tmp/antfly-search-direct-runner-tantivy-120k"
+  }
+}

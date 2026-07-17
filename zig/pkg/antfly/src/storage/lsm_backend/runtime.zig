@@ -26,7 +26,7 @@ const cache_mod = @import("cache.zig");
 const repository_mod = @import("repository.zig");
 const state_mod = @import("state.zig");
 const storage_io = @import("storage_io.zig");
-const platform_time = @import("../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 const Run = repository_mod.Run;
 const State = state_mod.State;
@@ -208,6 +208,12 @@ fn shouldRetainActiveMutableValueReader(backend: anytype) bool {
 
 fn prepareMutableForWrite(backend: anytype) !void {
     if (@hasDecl(@TypeOf(backend.*), "prepareMutableForWrite")) try backend.prepareMutableForWrite();
+}
+
+fn enforceMutableWriteAdmission(backend: anytype, incoming: *const ActiveMemTable) !void {
+    if (@hasDecl(@TypeOf(backend.*), "enforceMutableWriteAdmission")) {
+        try backend.enforceMutableWriteAdmission(incoming);
+    }
 }
 
 fn notePotentialMaintenanceDebtLocked(backend: anytype) void {
@@ -571,7 +577,13 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         };
         const cursor_storage_alignment = @max(
             @max(@alignOf(?usize), @alignOf(?SourceEntry)),
-            @max(@alignOf(SourceBlockLease), @max(@alignOf(?*const lsm_table_file.TableIndex), @alignOf(usize))),
+            @max(
+                @alignOf(SourceBlockLease),
+                @max(
+                    @alignOf(?*const lsm_table_file.TableIndex),
+                    @max(@alignOf(?cache_mod.Handle), @alignOf(usize)),
+                ),
+            ),
         );
         const default_max_retained_mutable_source_entry_scratch: usize = 1 * 1024 * 1024;
         const min_retained_mutable_source_entry_scratch: usize = 4096;
@@ -589,6 +601,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         source_blocks: []SourceBlockLease,
         source_block_indices: []?usize,
         source_table_indices: []?*const lsm_table_file.TableIndex,
+        source_table_index_handles: []?cache_mod.Handle,
         advance_sources: []usize,
         source_heap: []usize,
         source_heap_positions: []?usize,
@@ -609,6 +622,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             cursorStorageAdvance(SourceBlockLease, &offset, source_count);
             cursorStorageAdvance(?usize, &offset, source_count);
             cursorStorageAdvance(?*const lsm_table_file.TableIndex, &offset, source_count);
+            cursorStorageAdvance(?cache_mod.Handle, &offset, source_count);
             cursorStorageAdvance(usize, &offset, source_count);
             cursorStorageAdvance(usize, &offset, source_count);
             cursorStorageAdvance(?usize, &offset, source_count);
@@ -665,6 +679,8 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             @memset(source_block_indices, null);
             const source_table_indices = cursorStorageSlice(?*const lsm_table_file.TableIndex, storage, &offset, source_count);
             @memset(source_table_indices, null);
+            const source_table_index_handles = cursorStorageSlice(?cache_mod.Handle, storage, &offset, source_count);
+            @memset(source_table_index_handles, null);
             const advance_sources = cursorStorageSlice(usize, storage, &offset, source_count);
             const source_heap = cursorStorageSlice(usize, storage, &offset, source_count);
             const source_heap_positions = cursorStorageSlice(?usize, storage, &offset, source_count);
@@ -684,6 +700,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 .source_blocks = source_blocks,
                 .source_block_indices = source_block_indices,
                 .source_table_indices = source_table_indices,
+                .source_table_index_handles = source_table_index_handles,
                 .advance_sources = advance_sources,
                 .source_heap = source_heap,
                 .source_heap_positions = source_heap_positions,
@@ -694,6 +711,10 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
 
         pub fn close(self: *@This()) void {
             for (0..self.source_blocks.len) |source_index| self.clearSourceBlock(source_index);
+            for (self.source_table_index_handles) |*maybe_handle| {
+                if (maybe_handle.*) |*handle| handle.release();
+                maybe_handle.* = null;
+            }
             self.clearVisibleEntryBytes();
             self.clearMutableSourceEntryBytes();
             if (self.cursor_storage.len > 0) {
@@ -704,6 +725,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 self.allocator.free(self.source_entries);
                 self.allocator.free(self.positions);
                 self.allocator.free(self.source_table_indices);
+                self.allocator.free(self.source_table_index_handles);
                 self.allocator.free(self.advance_sources);
                 self.allocator.free(self.source_heap);
                 self.allocator.free(self.source_heap_positions);
@@ -1007,7 +1029,13 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 recordCursorTableIndexHit(self.backend);
                 return index;
             }
-            const index = try indexForRunNoCacheMaybeLocked(self.backend, run, self.backend_locked);
+            const index = if (self.backend.options.cache != null) blk: {
+                var handle = try loadRunTableIndexHandle(self.backend, run);
+                errdefer handle.release();
+                const retained_index = handle.runTableIndex();
+                self.source_table_index_handles[source_index] = handle;
+                break :blk retained_index;
+            } else try indexForRunNoCacheMaybeLocked(self.backend, run, self.backend_locked);
             self.source_table_indices[source_index] = index;
             recordCursorTableIndexMiss(self.backend);
             return index;
@@ -1458,7 +1486,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             const block_index = index.findBlockIndexForEntry(entry_index) orelse return error.InvalidTableFile;
             const window = index.blockWindow(block_index);
             const bytes = try self.ensureSourceBlockLoaded(source_index, run, index, window, block_index);
-            const relative_offset: usize = @intCast(index.entryStart(entry_index) - window.relative_offset);
+            const relative_offset: usize = @intCast(index.entryStartInBlock(entry_index, block_index) - window.relative_offset);
             const entry = try parseEntryAtWithStats(self.backend, bytes, relative_offset);
             return .{
                 .namespace_name = entry.namespace_name,
@@ -1665,7 +1693,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 const bytes = try self.ensureSourceBlockLoaded(source_index, run, index, window, block_index);
                 var probe = idx;
                 while (probe <= block.lastEntryIndex()) : (probe += 1) {
-                    const relative_offset: usize = @intCast(index.entryStart(probe) - window.relative_offset);
+                    const relative_offset: usize = @intCast(index.entryStartInBlock(probe, block_index) - window.relative_offset);
                     const entry = try parseEntryAtWithStats(self.backend, bytes, relative_offset);
                     const order = compareNamespace(.{ .name = entry.namespace_name }, self.namespace);
                     if (order == .eq) {
@@ -2063,11 +2091,6 @@ fn getCurrentPointRetainedLocked(
     if (backend.mutable.findIndex(namespace, key)) |idx| {
         const entry = backend.mutable.entries.items[idx];
         if (entry.tombstone) return error.NotFound;
-        if (canBorrowActiveMutableValues(backend)) {
-            recordPointValueBorrow(backend);
-            backend.recordMutableHit();
-            return entry.value;
-        }
         const owned = try allocator.dupe(u8, entry.value);
         errdefer allocator.free(owned);
         try held_values.append(allocator, owned);
@@ -2083,11 +2106,6 @@ fn getCurrentPointRetainedLocked(
         if (immutable.findIndex(namespace, key)) |idx| {
             const entry = immutable.entries.items[idx];
             if (entry.tombstone) return error.NotFound;
-            if (canBorrowReaderRetainedState(backend)) {
-                recordPointValueBorrow(backend);
-                backend.recordMutableHit();
-                return entry.value;
-            }
             const owned = try allocator.dupe(u8, entry.value);
             errdefer allocator.free(owned);
             try held_values.append(allocator, owned);
@@ -2147,11 +2165,6 @@ fn getFromRunPointRetainedLocked(
     if (state.findIndex(namespace, key)) |idx| {
         const entry = state.entries.items[idx];
         if (entry.tombstone) return error.NotFound;
-        if (canBorrowReaderRetainedState(backend)) {
-            recordPointValueBorrow(backend);
-            if (run.level == 0) backend.recordL0Hit() else backend.recordLevelHit();
-            return entry.value;
-        }
         const owned = try value_allocator.dupe(u8, entry.value);
         errdefer value_allocator.free(owned);
         try held_values.append(value_allocator, owned);
@@ -2210,13 +2223,6 @@ fn readManyCurrentSortedPointByRunLocked(
                 if (entry.tombstone) {
                     result.misses += 1;
                 } else {
-                    if (canBorrowReaderRetainedState(backend)) {
-                        values[i] = entry.value;
-                        recordPointValueBorrow(backend);
-                        result.hits += 1;
-                        backend.recordMutableHit();
-                        continue;
-                    }
                     const owned = try allocator.dupe(u8, entry.value);
                     errdefer allocator.free(owned);
                     try held_values.append(allocator, owned);
@@ -2309,13 +2315,6 @@ fn readManyCurrentSortedPointByRunLocked(
                     if (entry.tombstone) {
                         result.misses += 1;
                     } else {
-                        if (canBorrowReaderRetainedState(backend)) {
-                            values[key_index] = entry.value;
-                            recordPointValueBorrow(backend);
-                            result.hits += 1;
-                            if (run.level == 0) backend.recordL0Hit() else backend.recordLevelHit();
-                            continue;
-                        }
                         const owned = try allocator.dupe(u8, entry.value);
                         errdefer allocator.free(owned);
                         try held_values.append(allocator, owned);
@@ -2378,8 +2377,8 @@ fn CurrentReadLayout(comptime BackendType: type) type {
 
         fn init(backend: *BackendType, allocator: Allocator) !@This() {
             const metadata_allocator = runtimeScratchAllocator(allocator);
-            const runs = try borrowRunSnapshotList(metadata_allocator, backend.runs.items);
-            errdefer freeRunSnapshotList(metadata_allocator, runs);
+            const runs = try borrowRunSnapshotList(BackendType, backend, metadata_allocator, backend.runs.items);
+            errdefer freeRunSnapshotList(BackendType, backend, metadata_allocator, runs);
             const l0_groups = try buildL0RunGroupsWithStats(backend, metadata_allocator, runs);
             errdefer deinitRunGroups(metadata_allocator, l0_groups);
             const levels = try buildLowerLevels(metadata_allocator, runs);
@@ -2388,7 +2387,7 @@ fn CurrentReadLayout(comptime BackendType: type) type {
                 try backend.snapshotImmutableMemtables()
             else
                 &.{};
-            errdefer if (immutable_memtables.len > 0) backend.allocator.free(immutable_memtables);
+            errdefer releaseImmutableMemtableSnapshotList(BackendType, backend, immutable_memtables);
             return .{
                 .backend = backend,
                 .metadata_allocator = metadata_allocator,
@@ -2402,8 +2401,8 @@ fn CurrentReadLayout(comptime BackendType: type) type {
         fn deinit(self: *@This()) void {
             deinitRunGroups(self.metadata_allocator, self.l0_groups);
             self.metadata_allocator.free(self.levels);
-            freeRunSnapshotList(self.metadata_allocator, self.runs);
-            if (self.immutable_memtables.len > 0) self.backend.allocator.free(self.immutable_memtables);
+            freeRunSnapshotList(BackendType, self.backend, self.metadata_allocator, self.runs);
+            releaseImmutableMemtableSnapshotList(BackendType, self.backend, self.immutable_memtables);
             self.* = undefined;
         }
     };
@@ -2499,8 +2498,8 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
-            const runs = try borrowRunSnapshotList(metadata_allocator, backend.runs.items);
-            errdefer freeRunSnapshotList(metadata_allocator, runs);
+            const runs = try borrowRunSnapshotList(BackendType, backend, metadata_allocator, backend.runs.items);
+            errdefer freeRunSnapshotList(BackendType, backend, metadata_allocator, runs);
             const l0_groups = try buildL0RunGroupsWithStats(backend, metadata_allocator, runs);
             errdefer deinitRunGroups(metadata_allocator, l0_groups);
             const levels = try buildLowerLevels(metadata_allocator, runs);
@@ -2512,13 +2511,17 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                 try backend.snapshotImmutableMemtables()
             else
                 &.{};
-            errdefer if (immutable_memtables.len > 0) backend.allocator.free(immutable_memtables);
+            errdefer releaseImmutableMemtableSnapshotList(BackendType, backend, immutable_memtables);
             const mutable_snapshot = try snapshotReadMutable(BackendType, backend, .bound_read_txn);
-            errdefer if (mutable_snapshot.owned) {
-                var owned = @constCast(mutable_snapshot.state);
-                owned.deinit(backend.allocator);
-                backend.allocator.destroy(owned);
-            };
+            errdefer {
+                if (mutable_snapshot.owned) {
+                    var owned = @constCast(mutable_snapshot.state);
+                    owned.deinit(backend.allocator);
+                    backend.allocator.destroy(owned);
+                } else {
+                    releaseMutableReadSnapshot(BackendType, backend, mutable_snapshot.state, false);
+                }
+            }
             return .{
                 .allocator = backend.allocator,
                 .metadata_allocator = metadata_allocator,
@@ -2542,13 +2545,13 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             }
             deinitRunGroups(self.metadata_allocator, self.l0_groups);
             self.metadata_allocator.free(self.levels);
-            freeRunSnapshotList(self.metadata_allocator, self.runs);
-            if (self.immutable_memtables.len > 0) self.allocator.free(self.immutable_memtables);
+            freeRunSnapshotList(BackendType, backend, self.metadata_allocator, self.runs);
             releaseHeldBlocks(&self.held_blocks, backend.allocator);
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
-            releaseBorrowedMutableReadSnapshot(BackendType, backend, self.mutable_snapshot, self.owns_mutable_snapshot);
+            releaseMutableReadSnapshot(BackendType, backend, self.mutable_snapshot, self.owns_mutable_snapshot);
+            releaseImmutableMemtableSnapshotList(BackendType, backend, self.immutable_memtables);
             releaseReadReader(BackendType, backend, .bound_read_txn);
             self.* = undefined;
         }
@@ -2598,6 +2601,48 @@ fn retainReadReader(comptime BackendType: type, backend: *BackendType, kind: any
     }
 }
 
+/// Releases both the snapshot pointer array and the exact immutable-generation
+/// pins represented by it. Callers must hold the backend lock when the backend
+/// implements generation pinning.
+fn releaseImmutableMemtableSnapshotList(
+    comptime BackendType: type,
+    backend: *BackendType,
+    snapshot: []const *const State,
+) void {
+    if (@hasDecl(BackendType, "releaseImmutableMemtableSnapshot")) {
+        backend.releaseImmutableMemtableSnapshot(snapshot);
+    } else if (snapshot.len > 0) {
+        backend.allocator.free(snapshot);
+    }
+}
+
+fn releaseImmutableMemtablePins(
+    comptime BackendType: type,
+    backend: *BackendType,
+    snapshot: []const *const State,
+) void {
+    if (@hasDecl(BackendType, "releaseImmutableMemtablePins")) {
+        backend.releaseImmutableMemtablePins(snapshot);
+    }
+}
+
+/// Release the exact shared mutable generation returned by
+/// `snapshotMutableStateWithReason`. Fallback backends return owned snapshots
+/// and do not implement this hook.
+fn releaseMutableReadSnapshot(
+    comptime BackendType: type,
+    backend: *BackendType,
+    snapshot: *const State,
+    owned: bool,
+) void {
+    if (owned) return;
+    if (@hasDecl(BackendType, "releaseMutableReadSnapshot")) {
+        backend.releaseMutableReadSnapshot(snapshot);
+    } else if (@hasDecl(BackendType, "releaseMutableStateSnapshot")) {
+        backend.releaseMutableStateSnapshot(snapshot);
+    }
+}
+
 fn releaseReadReader(comptime BackendType: type, backend: *BackendType, kind: anytype) void {
     if (@hasDecl(BackendType, "finalizeReadReaderReleaseKind")) {
         backend.finalizeReadReaderReleaseKind(kind);
@@ -2641,11 +2686,6 @@ fn snapshotReadMutable(comptime BackendType: type, backend: *BackendType, reason
     return .{ .state = snapshot, .owned = true };
 }
 
-fn releaseBorrowedMutableReadSnapshot(comptime BackendType: type, backend: *BackendType, snapshot: *const State, owned: bool) void {
-    if (owned) return;
-    if (@hasDecl(BackendType, "releaseMutableReadSnapshot")) backend.releaseMutableReadSnapshot(snapshot);
-}
-
 pub fn BoundProbeTxn(comptime BackendType: type) type {
     return struct {
         allocator: Allocator,
@@ -2654,7 +2694,6 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         namespace: backend_types.Namespace,
         stable_point_view: bool = false,
         stable_point_view_loaded: bool = false,
-        active_mutable_value_reader_retained: bool = false,
         empty_state: State = .{},
         runs: []Run = &.{},
         l0_groups: []RunGroup = &.{},
@@ -2671,15 +2710,12 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             errdefer releaseReadReader(BackendType, backend, .probe_txn);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
             const stable_point_view = backend.mutable.entries.items.len == 0 and backend.immutable_memtables.items.len == backend.immutable_head;
-            const active_mutable_value_reader_retained = if (!stable_point_view and shouldRetainActiveMutableValueReader(backend)) retainActiveMutableValueReader(backend) else false;
-            errdefer releaseActiveMutableValueReader(backend, active_mutable_value_reader_retained);
             return .{
                 .allocator = runtimeScratchAllocator(backend.allocator),
                 .metadata_allocator = metadata_allocator,
                 .backend = backend,
                 .namespace = namespace,
                 .stable_point_view = stable_point_view,
-                .active_mutable_value_reader_retained = active_mutable_value_reader_retained,
             };
         }
 
@@ -2688,23 +2724,36 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             if (self.stable_point_view_loaded) {
                 deinitRunGroups(self.metadata_allocator, self.l0_groups);
                 self.metadata_allocator.free(self.levels);
-                freeRunSnapshotList(self.metadata_allocator, self.runs);
+                freeRunSnapshotList(BackendType, backend, self.metadata_allocator, self.runs);
             }
             releaseHeldBlocks(&self.held_blocks, backend.allocator);
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
-            releaseActiveMutableValueReader(backend, self.active_mutable_value_reader_retained);
             releaseReadReader(BackendType, backend, .probe_txn);
             self.* = undefined;
+        }
+
+        fn ownValue(self: *@This(), value: []const u8) ![]const u8 {
+            const owned = try self.allocator.dupe(u8, value);
+            errdefer self.allocator.free(owned);
+            try self.held_values.append(self.allocator, owned);
+            return owned;
+        }
+
+        fn ownValues(self: *@This(), values: []?[]const u8) !void {
+            for (values) |*value| {
+                const present = value.* orelse continue;
+                value.* = try self.ownValue(present);
+            }
         }
 
         fn ensureStablePointViewLoaded(self: *@This()) !void {
             if (!self.stable_point_view or self.stable_point_view_loaded) return;
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
-            const runs = try borrowRunSnapshotList(self.metadata_allocator, self.backend.runs.items);
-            errdefer freeRunSnapshotList(self.metadata_allocator, runs);
+            const runs = try borrowRunSnapshotList(BackendType, self.backend, self.metadata_allocator, self.backend.runs.items);
+            errdefer freeRunSnapshotList(BackendType, self.backend, self.metadata_allocator, runs);
             const l0_groups = try buildL0RunGroupsWithStats(self.backend, self.metadata_allocator, runs);
             errdefer deinitRunGroups(self.metadata_allocator, l0_groups);
             const levels = try buildLowerLevels(self.metadata_allocator, runs);
@@ -2720,25 +2769,28 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                 try self.ensureStablePointViewLoaded();
                 self.backend.recordPointGet();
                 switch (try getFromStableCachedPointView(self.backend, self.metadata_allocator, self.runs, self.l0_groups, self.levels, &self.last_l0_group_index, self.namespace, key)) {
-                    .hit => |value| return value,
+                    .hit => |value| return try self.ownValue(value),
                     .miss => return error.NotFound,
-                    .unavailable => return try getFromSnapshotRuns(
-                        self.backend,
-                        &self.empty_state,
-                        &.{},
-                        self.runs,
-                        self.l0_groups,
-                        self.levels,
-                        &self.last_l0_group_index,
-                        &self.read_hint,
-                        &self.held_blocks,
-                        &self.held_values,
-                        self.allocator,
-                        self.namespace,
-                        key,
-                        false,
-                        null,
-                    ),
+                    .unavailable => {
+                        const value = try getFromSnapshotRuns(
+                            self.backend,
+                            &self.empty_state,
+                            &.{},
+                            self.runs,
+                            self.l0_groups,
+                            self.levels,
+                            &self.last_l0_group_index,
+                            &self.read_hint,
+                            &self.held_blocks,
+                            &self.held_values,
+                            self.allocator,
+                            self.namespace,
+                            key,
+                            false,
+                            null,
+                        );
+                        return try self.ownValue(value);
+                    },
                 }
             }
             const locked = lockBackend(BackendType, self.backend);
@@ -2747,7 +2799,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             var values = [_]?[]const u8{null};
             const result = try readManyCurrentPointLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_blocks, &self.held_values, &keys, &values);
             if (result.hits == 0) return error.NotFound;
-            return values[0].?;
+            return try self.ownValue(values[0].?);
         }
 
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
@@ -2799,6 +2851,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     result.add(chunk_result);
                     offset = end;
                 }
+                try self.ownValues(values);
             } else {
                 const locked = lockBackend(BackendType, self.backend);
                 defer unlockBackend(BackendType, self.backend, locked);
@@ -2832,6 +2885,9 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     result.add(chunk_result);
                     offset = end;
                 }
+                // Own every result before CurrentReadLayout releases its exact
+                // immutable-generation pins at the end of this scope.
+                try self.ownValues(values);
             }
             self.backend.recordGetManySortedResults(result.hits, result.misses);
         }
@@ -2922,6 +2978,13 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             };
         }
 
+        fn borrowedPtr(self: *@This()) ?*const State {
+            return switch (self.*) {
+                .borrowed => |state| state,
+                else => null,
+            };
+        }
+
         fn deinitOwned(self: *@This(), allocator: Allocator) void {
             switch (self.*) {
                 .owned => |state| {
@@ -2950,8 +3013,8 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
-            const runs = try borrowRunSnapshotList(metadata_allocator, backend.runs.items);
-            errdefer freeRunSnapshotList(metadata_allocator, runs);
+            const runs = try borrowRunSnapshotList(BackendType, backend, metadata_allocator, backend.runs.items);
+            errdefer freeRunSnapshotList(BackendType, backend, metadata_allocator, runs);
             const l0_groups = try buildL0RunGroupsWithStats(backend, metadata_allocator, runs);
             errdefer deinitRunGroups(metadata_allocator, l0_groups);
             const levels = try buildLowerLevels(metadata_allocator, runs);
@@ -2976,6 +3039,9 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
                 if (mutable_snapshot_is_bulk_current_scan_clone and @hasDecl(BackendType, "releaseCurrentScanMutableStateForBulkIngest")) {
                     if (mutable_snapshot.ownedPtr()) |snapshot| backend.releaseCurrentScanMutableStateForBulkIngest(snapshot);
                 }
+                if (mutable_snapshot.borrowedPtr()) |snapshot| {
+                    releaseMutableReadSnapshot(BackendType, backend, snapshot, false);
+                }
                 mutable_snapshot.deinitOwned(backend.allocator);
             }
             if (mutable_snapshot.ptr() == null) {
@@ -2994,7 +3060,7 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
                 try backend.snapshotImmutableMemtables()
             else
                 &.{};
-            errdefer if (immutable_memtables.len > 0) backend.allocator.free(immutable_memtables);
+            errdefer releaseImmutableMemtableSnapshotList(BackendType, backend, immutable_memtables);
             return .{
                 .allocator = backend.allocator,
                 .metadata_allocator = metadata_allocator,
@@ -3013,16 +3079,16 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             const backend = self.backend;
             deinitRunGroups(self.metadata_allocator, self.l0_groups);
             self.metadata_allocator.free(self.levels);
-            freeRunSnapshotList(self.metadata_allocator, self.runs);
-            if (self.immutable_memtables.len > 0) self.allocator.free(self.immutable_memtables);
+            freeRunSnapshotList(BackendType, backend, self.metadata_allocator, self.runs);
             {
                 const locked = lockBackend(BackendType, backend);
                 defer unlockBackend(BackendType, backend, locked);
+                releaseImmutableMemtableSnapshotList(BackendType, backend, self.immutable_memtables);
                 if (self.mutable_snapshot_is_bulk_current_scan_clone and @hasDecl(BackendType, "releaseCurrentScanMutableStateForBulkIngest")) {
                     if (self.mutable_snapshot.ownedPtr()) |snapshot| backend.releaseCurrentScanMutableStateForBulkIngest(snapshot);
                 }
-                if (self.mutable_snapshot.ptr()) |snapshot| {
-                    releaseBorrowedMutableReadSnapshot(BackendType, backend, snapshot, self.mutable_snapshot.ownedPtr() != null);
+                if (self.mutable_snapshot.borrowedPtr()) |snapshot| {
+                    releaseMutableReadSnapshot(BackendType, backend, snapshot, false);
                 }
                 releaseReadReader(BackendType, backend, .current_scan);
             }
@@ -3092,8 +3158,8 @@ pub fn BoundProbeCursor(comptime BackendType: type) type {
             defer unlockBackend(BackendType, self.backend, locked);
 
             const metadata_allocator = runtimeScratchAllocator(self.allocator);
-            const runs = try borrowRunSnapshotList(metadata_allocator, self.backend.runs.items);
-            defer freeRunSnapshotList(metadata_allocator, runs);
+            const runs = try borrowRunSnapshotList(BackendType, self.backend, metadata_allocator, self.backend.runs.items);
+            defer freeRunSnapshotList(BackendType, self.backend, metadata_allocator, runs);
             const l0_groups = try buildL0RunGroupsWithStats(self.backend, metadata_allocator, runs);
             defer deinitRunGroups(metadata_allocator, l0_groups);
             const levels = try buildLowerLevels(metadata_allocator, runs);
@@ -3102,7 +3168,7 @@ pub fn BoundProbeCursor(comptime BackendType: type) type {
                 try self.backend.snapshotImmutableMemtables()
             else
                 &.{};
-            defer if (immutable_memtables.len > 0) self.allocator.free(immutable_memtables);
+            defer releaseImmutableMemtableSnapshotList(BackendType, self.backend, immutable_memtables);
 
             var cursor = try MergeCursor(BackendType, ActiveMemTable).init(metadata_allocator, self.backend, &self.backend.mutable, immutable_memtables, runs, l0_groups, levels, self.namespace, true);
             defer cursor.close();
@@ -3216,7 +3282,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 self.mutable = .{};
                 self.bulk_appends.deinit(self.allocator);
                 self.bulk_appends = .{};
-                self.invalidateCursorSnapshot();
+                self.invalidateCursorSnapshotLocked();
                 releaseHeldValues(&self.held_values, self.allocator);
                 self.backend.finishBatchMode(self.batch_options);
                 if (self.cursor_reader_retained) releaseWriteReader(BackendType, self.backend, .current_scan);
@@ -3226,7 +3292,10 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             const direct_ingested_bulk_appends = try self.tryCommitDirectBulkAppends();
             if (!try self.tryCommitDirectBulkIngest()) {
                 const mutated = self.mutable.entries.items.len > 0;
-                if (mutated) try prepareMutableForWrite(self.backend);
+                if (mutated) {
+                    try enforceMutableWriteAdmission(self.backend, &self.mutable);
+                    try prepareMutableForWrite(self.backend);
+                }
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
                     try self.backend.appendWalForMutable(&self.mutable);
                     if (@hasDecl(BackendType, "invalidateMutableReadSnapshot")) self.backend.invalidateMutableReadSnapshot();
@@ -3254,7 +3323,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             try self.backend.finalizeExitedBatchMode(self.batch_options);
             release_on_error = false;
             self.closed = true;
-            self.invalidateCursorSnapshot();
+            self.invalidateCursorSnapshotLocked();
             releaseHeldValues(&self.held_values, self.allocator);
             var finalize_err: ?anyerror = null;
             if (self.cursor_reader_retained) {
@@ -3609,14 +3678,20 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 try self.backend.snapshotImmutableMemtables()
             else
                 &.{};
-            defer if (backend_immutable.len > 0) self.allocator.free(backend_immutable);
+            var backend_immutable_pins_transferred = false;
+            defer if (backend_immutable.len > 0) {
+                if (backend_immutable_pins_transferred)
+                    self.allocator.free(backend_immutable)
+                else
+                    releaseImmutableMemtableSnapshotList(BackendType, self.backend, backend_immutable);
+            };
 
             const immutable = try self.allocator.alloc(*const State, 1 + backend_immutable.len);
             errdefer self.allocator.free(immutable);
             for (backend_immutable, 0..) |state, i| immutable[i + 1] = state;
 
-            const runs = try borrowRunSnapshotList(self.metadata_allocator, self.backend.runs.items);
-            errdefer freeRunSnapshotList(self.metadata_allocator, runs);
+            const runs = try borrowRunSnapshotList(BackendType, self.backend, self.metadata_allocator, self.backend.runs.items);
+            errdefer freeRunSnapshotList(BackendType, self.backend, self.metadata_allocator, runs);
             const l0_groups = try buildL0RunGroupsWithStats(self.backend, self.metadata_allocator, runs);
             errdefer deinitRunGroups(self.metadata_allocator, l0_groups);
             const levels = try buildLowerLevels(self.metadata_allocator, runs);
@@ -3625,6 +3700,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             self.cursor_overlay = overlay;
             self.cursor_base_mutable = base_mutable;
             immutable[0] = &self.cursor_base_mutable.?;
+            backend_immutable_pins_transferred = true;
             self.cursor_immutable_memtables = immutable;
             self.cursor_runs = runs;
             self.cursor_l0_groups = l0_groups;
@@ -3632,6 +3708,12 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         fn invalidateCursorSnapshot(self: *@This()) void {
+            const locked = lockBackend(BackendType, self.backend);
+            defer unlockBackend(BackendType, self.backend, locked);
+            self.invalidateCursorSnapshotLocked();
+        }
+
+        fn invalidateCursorSnapshotLocked(self: *@This()) void {
             if (self.cursor_overlay) |*state| {
                 state.deinit(self.allocator);
                 self.cursor_overlay = null;
@@ -3641,6 +3723,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 self.cursor_base_mutable = null;
             }
             if (self.cursor_immutable_memtables.len > 0) {
+                releaseImmutableMemtablePins(BackendType, self.backend, self.cursor_immutable_memtables[1..]);
                 self.allocator.free(self.cursor_immutable_memtables);
                 self.cursor_immutable_memtables = &.{};
             }
@@ -3653,7 +3736,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 self.cursor_levels = &.{};
             }
             if (self.cursor_runs.len > 0) {
-                freeRunSnapshotList(self.metadata_allocator, self.cursor_runs);
+                freeRunSnapshotList(BackendType, self.backend, self.metadata_allocator, self.cursor_runs);
                 self.cursor_runs = &.{};
             }
         }
@@ -3682,8 +3765,8 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
-            const runs = try borrowRunSnapshotList(metadata_allocator, backend.runs.items);
-            errdefer freeRunSnapshotList(metadata_allocator, runs);
+            const runs = try borrowRunSnapshotList(BackendType, backend, metadata_allocator, backend.runs.items);
+            errdefer freeRunSnapshotList(BackendType, backend, metadata_allocator, runs);
             const l0_groups = try buildL0RunGroupsWithStats(backend, metadata_allocator, runs);
             errdefer deinitRunGroups(metadata_allocator, l0_groups);
             const levels = try buildLowerLevels(metadata_allocator, runs);
@@ -3695,13 +3778,17 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
                 try backend.snapshotImmutableMemtables()
             else
                 &.{};
-            errdefer if (immutable_memtables.len > 0) backend.allocator.free(immutable_memtables);
+            errdefer releaseImmutableMemtableSnapshotList(BackendType, backend, immutable_memtables);
             const mutable_snapshot = try snapshotReadMutable(BackendType, backend, .namespace_read_txn);
-            errdefer if (mutable_snapshot.owned) {
-                var owned = @constCast(mutable_snapshot.state);
-                owned.deinit(backend.allocator);
-                backend.allocator.destroy(owned);
-            };
+            errdefer {
+                if (mutable_snapshot.owned) {
+                    var owned = @constCast(mutable_snapshot.state);
+                    owned.deinit(backend.allocator);
+                    backend.allocator.destroy(owned);
+                } else {
+                    releaseMutableReadSnapshot(BackendType, backend, mutable_snapshot.state, false);
+                }
+            }
             return .{
                 .allocator = backend.allocator,
                 .metadata_allocator = metadata_allocator,
@@ -3724,14 +3811,14 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
             }
             deinitRunGroups(self.metadata_allocator, self.l0_groups);
             self.metadata_allocator.free(self.levels);
-            freeRunSnapshotList(self.metadata_allocator, self.runs);
-            if (self.immutable_memtables.len > 0) self.allocator.free(self.immutable_memtables);
+            freeRunSnapshotList(BackendType, self.backend, self.metadata_allocator, self.runs);
             if (self.snapshot) |*snapshot| snapshot.deinit(self.allocator);
             releaseHeldBlocks(&self.held_blocks, self.allocator);
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
-            releaseBorrowedMutableReadSnapshot(BackendType, backend, self.mutable_snapshot, self.owns_mutable_snapshot);
+            releaseMutableReadSnapshot(BackendType, backend, self.mutable_snapshot, self.owns_mutable_snapshot);
+            releaseImmutableMemtableSnapshotList(BackendType, backend, self.immutable_memtables);
             releaseReadReader(BackendType, backend, .namespace_read_txn);
             self.* = undefined;
         }
@@ -3767,11 +3854,14 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
     };
 }
 
-fn borrowRunSnapshotList(allocator: Allocator, source: []const Run) ![]Run {
+fn borrowRunSnapshotList(comptime BackendType: type, backend: *BackendType, allocator: Allocator, source: []const Run) ![]Run {
     const runs = try allocator.alloc(Run, source.len);
     var initialized: usize = 0;
     errdefer {
         for (runs[0..initialized]) |*run| {
+            if (@hasDecl(BackendType, "releaseRunSnapshotRef")) {
+                backend.releaseRunSnapshotRef(run);
+            }
             if (run.owns_bloom_filter) {
                 if (run.bloom_filter) |*filter| filter.deinit(allocator);
             }
@@ -3785,6 +3875,7 @@ fn borrowRunSnapshotList(allocator: Allocator, source: []const Run) ![]Run {
         runs[i] = run;
         runs[i].owns_metadata = false;
         runs[i].owns_bloom_filter = false;
+        runs[i].version_ref_pinned = false;
         runs[i].state = null;
         runs[i].bloom_filter = null;
         runs[i].table_index = null;
@@ -3797,13 +3888,19 @@ fn borrowRunSnapshotList(allocator: Allocator, source: []const Run) ![]Run {
         if (run.bloom_filter) |filter| {
             runs[i].bloom_filter = filter;
         }
+        if (@hasDecl(BackendType, "retainRunSnapshotRef")) {
+            try backend.retainRunSnapshotRef(&runs[i]);
+        }
         initialized = i + 1;
     }
     return runs;
 }
 
-fn freeRunSnapshotList(allocator: Allocator, runs: []Run) void {
+fn freeRunSnapshotList(comptime BackendType: type, backend: *BackendType, allocator: Allocator, runs: []Run) void {
     for (runs) |*run| {
+        if (@hasDecl(BackendType, "releaseRunSnapshotRef")) {
+            backend.releaseRunSnapshotRef(run);
+        }
         if (run.owns_bloom_filter) {
             if (run.bloom_filter) |*filter| filter.deinit(allocator);
         }
@@ -5610,14 +5707,15 @@ fn materializeRunBloomFilterForRead(backend: anytype, run: *Run, backend_locked:
     if (run.bloom_filter) |filter| return filter;
     if (run.path == null) return null;
 
-    const filter = if (backend.options.cache != null) blk: {
-        var handle = try loadRunTableIndexHandle(backend, run);
-        defer handle.release();
-        break :blk try handle.runTableIndex().borrowFilter().clone(backend.allocator);
-    } else blk: {
-        const index = try indexForRunNoCacheMaybeLocked(backend, run, backend_locked);
-        break :blk try index.borrowFilter().clone(backend.allocator);
-    };
+    // A shared-cache index already owns this filter. Cloning it into Run made
+    // the duplicate live for the backend lifetime, outside cache eviction and
+    // ResourceManager accounting. Cache-backed point-read paths retain an
+    // index handle while probing the borrowed filter; cached full-state paths
+    // may safely proceed without the optional Bloom precheck.
+    if (backend.options.cache != null) return null;
+
+    const index = try indexForRunNoCacheMaybeLocked(backend, run, backend_locked);
+    const filter = try index.borrowFilter().clone(backend.allocator);
     run.bloom_filter = filter;
     run.owns_bloom_filter = true;
     return run.bloom_filter.?;
@@ -5826,7 +5924,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 self.mutable = .{};
                 self.bulk_appends.deinit(self.allocator);
                 self.bulk_appends = .{};
-                self.invalidateCursorSnapshot();
+                self.invalidateCursorSnapshotLocked();
                 releaseHeldValues(&self.held_values, self.allocator);
                 self.backend.finishBatchMode(self.batch_options);
                 if (self.cursor_reader_retained) releaseWriteReader(BackendType, self.backend, .current_scan);
@@ -5836,7 +5934,10 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             const direct_ingested_bulk_appends = try self.tryCommitDirectBulkAppends();
             if (!try self.tryCommitDirectBulkIngest()) {
                 const mutated = self.mutable.entries.items.len > 0;
-                if (mutated) try prepareMutableForWrite(self.backend);
+                if (mutated) {
+                    try enforceMutableWriteAdmission(self.backend, &self.mutable);
+                    try prepareMutableForWrite(self.backend);
+                }
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
                     try self.backend.appendWalForMutable(&self.mutable);
                     if (@hasDecl(BackendType, "invalidateMutableReadSnapshot")) self.backend.invalidateMutableReadSnapshot();
@@ -5864,7 +5965,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             try self.backend.finalizeExitedBatchMode(self.batch_options);
             release_on_error = false;
             self.closed = true;
-            self.invalidateCursorSnapshot();
+            self.invalidateCursorSnapshotLocked();
             releaseHeldValues(&self.held_values, self.allocator);
             var finalize_err: ?anyerror = null;
             if (self.cursor_reader_retained) {
@@ -6102,14 +6203,20 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 try self.backend.snapshotImmutableMemtables()
             else
                 &.{};
-            defer if (backend_immutable.len > 0) self.allocator.free(backend_immutable);
+            var backend_immutable_pins_transferred = false;
+            defer if (backend_immutable.len > 0) {
+                if (backend_immutable_pins_transferred)
+                    self.allocator.free(backend_immutable)
+                else
+                    releaseImmutableMemtableSnapshotList(BackendType, self.backend, backend_immutable);
+            };
 
             const immutable = try self.allocator.alloc(*const State, 1 + backend_immutable.len);
             errdefer self.allocator.free(immutable);
             for (backend_immutable, 0..) |state, i| immutable[i + 1] = state;
 
-            const runs = try borrowRunSnapshotList(self.metadata_allocator, self.backend.runs.items);
-            errdefer freeRunSnapshotList(self.metadata_allocator, runs);
+            const runs = try borrowRunSnapshotList(BackendType, self.backend, self.metadata_allocator, self.backend.runs.items);
+            errdefer freeRunSnapshotList(BackendType, self.backend, self.metadata_allocator, runs);
             const l0_groups = try buildL0RunGroupsWithStats(self.backend, self.metadata_allocator, runs);
             errdefer deinitRunGroups(self.metadata_allocator, l0_groups);
             const levels = try buildLowerLevels(self.metadata_allocator, runs);
@@ -6118,6 +6225,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             self.cursor_overlay = overlay;
             self.cursor_base_mutable = base_mutable;
             immutable[0] = &self.cursor_base_mutable.?;
+            backend_immutable_pins_transferred = true;
             self.cursor_immutable_memtables = immutable;
             self.cursor_runs = runs;
             self.cursor_l0_groups = l0_groups;
@@ -6125,6 +6233,12 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         }
 
         fn invalidateCursorSnapshot(self: *@This()) void {
+            const locked = lockBackend(BackendType, self.backend);
+            defer unlockBackend(BackendType, self.backend, locked);
+            self.invalidateCursorSnapshotLocked();
+        }
+
+        fn invalidateCursorSnapshotLocked(self: *@This()) void {
             if (self.cursor_overlay) |*state| {
                 state.deinit(self.allocator);
                 self.cursor_overlay = null;
@@ -6134,6 +6248,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 self.cursor_base_mutable = null;
             }
             if (self.cursor_immutable_memtables.len > 0) {
+                releaseImmutableMemtablePins(BackendType, self.backend, self.cursor_immutable_memtables[1..]);
                 self.allocator.free(self.cursor_immutable_memtables);
                 self.cursor_immutable_memtables = &.{};
             }
@@ -6146,7 +6261,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 self.cursor_levels = &.{};
             }
             if (self.cursor_runs.len > 0) {
-                freeRunSnapshotList(self.metadata_allocator, self.cursor_runs);
+                freeRunSnapshotList(BackendType, self.backend, self.metadata_allocator, self.cursor_runs);
                 self.cursor_runs = &.{};
             }
         }
@@ -6325,6 +6440,7 @@ test "lsm merge cursor frees loaded blocks with backend allocator" {
         .source_blocks = source_blocks,
         .source_block_indices = source_block_indices,
         .source_table_indices = source_table_indices,
+        .source_table_index_handles = &.{},
         .advance_sources = advance_sources,
         .source_heap = source_heap,
         .source_heap_positions = source_heap_positions,

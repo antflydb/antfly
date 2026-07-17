@@ -16,7 +16,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("../backend_erased.zig");
 const lsm_backend = @import("../lsm_backend.zig");
-const platform_time = @import("../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const docstore_mod = @import("../docstore.zig");
 const mem_backend = @import("../mem_backend.zig");
 

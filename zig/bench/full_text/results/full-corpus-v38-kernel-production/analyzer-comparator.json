@@ -1,0 +1,189 @@
+[
+  {
+    "analysis": {
+      "analyzer": "simple",
+      "schema_version": 1,
+      "tokens": [
+        {
+          "end_byte": 5,
+          "position": 0,
+          "start_byte": 0,
+          "term": "hello"
+        },
+        {
+          "end_byte": 12,
+          "position": 1,
+          "start_byte": 7,
+          "term": "world"
+        }
+      ]
+    },
+    "name": "punctuation",
+    "text": "Hello, world!"
+  },
+  {
+    "analysis": {
+      "analyzer": "simple",
+      "schema_version": 1,
+      "tokens": [
+        {
+          "end_byte": 5,
+          "position": 0,
+          "start_byte": 0,
+          "term": "mixed"
+        },
+        {
+          "end_byte": 11,
+          "position": 1,
+          "start_byte": 6,
+          "term": "caf\u00c9"
+        },
+        {
+          "end_byte": 17,
+          "position": 2,
+          "start_byte": 12,
+          "term": "caf\u00e9"
+        }
+      ]
+    },
+    "name": "mixed_case_non_ascii",
+    "text": "MiXeD CAF\u00c9 caf\u00e9"
+  },
+  {
+    "analysis": {
+      "analyzer": "simple",
+      "schema_version": 1,
+      "tokens": [
+        {
+          "end_byte": 13,
+          "position": 0,
+          "start_byte": 0,
+          "term": "alpha\ud83d\ude42beta"
+        },
+        {
+          "end_byte": 18,
+          "position": 1,
+          "start_byte": 14,
+          "term": "\ud83d\ude80"
+        },
+        {
+          "end_byte": 24,
+          "position": 2,
+          "start_byte": 19,
+          "term": "gamma"
+        }
+      ]
+    },
+    "name": "emoji_boundaries",
+    "text": "alpha\ud83d\ude42beta \ud83d\ude80 gamma"
+  },
+  {
+    "analysis": {
+      "analyzer": "simple",
+      "schema_version": 1,
+      "tokens": [
+        {
+          "end_byte": 6,
+          "position": 0,
+          "start_byte": 0,
+          "term": "cafe\u0301"
+        },
+        {
+          "end_byte": 12,
+          "position": 1,
+          "start_byte": 7,
+          "term": "caf\u00e9"
+        }
+      ]
+    },
+    "name": "combining_characters",
+    "text": "cafe\u0301 caf\u00e9"
+  },
+  {
+    "analysis": {
+      "analyzer": "simple",
+      "schema_version": 1,
+      "tokens": [
+        {
+          "end_byte": 2,
+          "position": 0,
+          "start_byte": 0,
+          "term": "v2"
+        },
+        {
+          "end_byte": 6,
+          "position": 1,
+          "start_byte": 3,
+          "term": "123"
+        },
+        {
+          "end_byte": 9,
+          "position": 2,
+          "start_byte": 7,
+          "term": "12"
+        },
+        {
+          "end_byte": 12,
+          "position": 3,
+          "start_byte": 10,
+          "term": "34"
+        }
+      ]
+    },
+    "name": "numbers",
+    "text": "v2 123 12.34"
+  },
+  {
+    "analysis": {
+      "analyzer": "simple",
+      "schema_version": 1,
+      "tokens": [
+        {
+          "end_byte": 128,
+          "position": 0,
+          "start_byte": 0,
+          "term": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    },
+    "name": "long_token",
+    "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  {
+    "analysis": {
+      "analyzer": "simple",
+      "schema_version": 1,
+      "tokens": [
+        {
+          "end_byte": 4,
+          "position": 0,
+          "start_byte": 0,
+          "term": "echo"
+        },
+        {
+          "end_byte": 9,
+          "position": 1,
+          "start_byte": 5,
+          "term": "echo"
+        },
+        {
+          "end_byte": 14,
+          "position": 2,
+          "start_byte": 10,
+          "term": "echo"
+        }
+      ]
+    },
+    "name": "repeated_terms",
+    "text": "echo echo echo"
+  },
+  {
+    "analysis": {
+      "analyzer": "simple",
+      "schema_version": 1,
+      "tokens": []
+    },
+    "name": "empty",
+    "text": ""
+  }
+]

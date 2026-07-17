@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "status": "accepted_primary_cache_memory_qualification",
+  "engine": "antfly-v38-shared-packed-primary-cache",
+  "boundary": "persistent_http_read_only_full_corpus",
+  "corpus": {
+    "documents": 5032105,
+    "full_text_segments": 10,
+    "full_text_segment_bytes": 3599479982,
+    "primary_run_bytes": 6542840767
+  },
+  "cache": {
+    "policy": "detected_node_or_cgroup_memory_divided_by_16_clamped_64_to_512_mib",
+    "soft_limit_bytes": 402653184,
+    "hard_limit_bytes": 536870912,
+    "before": {
+      "used_bytes": 742543361,
+      "entries": 93
+    },
+    "accepted_startup": {
+      "used_bytes": 399905718,
+      "entries": 39
+    },
+    "accepted_post_query": {
+      "used_bytes": 366714513,
+      "entries": 57
+    },
+    "first_query_logical_heap_delta_before_bytes": 848000000,
+    "first_query_logical_heap_delta_after_bytes": 35000000
+  },
+  "accepted_no_allocator_relief": {
+    "source_artifact": "/private/tmp/antfly-memory-no-relief-load",
+    "manifest_sha256": "f8c76ba16054c1d736d694d885f35cfcf66ba10ef87ecdb66f50b8a3c6c48838",
+    "summary_sha256": "4aeee7c0880e87117d54f741cb4237a31a92384462d6846ab587ec4d0315402a",
+    "concurrency": 64,
+    "offered_rps": 1200,
+    "achieved_rps": 1199.904107663396,
+    "requests": 18000,
+    "errors": 0,
+    "latency_ns": {
+      "p50": 718459,
+      "p95": 836834,
+      "p99": 1066417,
+      "max": 4150001
+    },
+    "service_ns": {
+      "p50": 529958,
+      "p95": 644666,
+      "p99": 818083
+    },
+    "server_cpu_mean_percent": 47.86206896551724,
+    "peak_rss_bytes": 1421524992,
+    "sampled_footprint_at_peak_bytes": 197365144,
+    "lifetime_peak_footprint_bytes": 651167424,
+    "peak_malloc_allocated_bytes": 458609152,
+    "cold_query_seconds": 0.265675,
+    "warm_query_seconds": [0.001991, 0.001959, 0.001294, 0.001202, 0.001100]
+  },
+  "rejected_allocator_relief": {
+    "source_artifact": "/private/tmp/antfly-memory-relief-load",
+    "manifest_sha256": "22cfbeff267cad4b78bf25c6e5b7cc4cfb42809a202010f4cdf6213679bbddb1",
+    "summary_sha256": "70ca60b7813ab98f53b324b6939008cadcab075335221daf274c8f9152f0a528",
+    "operation": "malloc_zone_pressure_relief_null_zone_zero_goal_after_32_mib_batched_eviction",
+    "calls": 22,
+    "reported_released_bytes": 0,
+    "peak_rss_bytes": 920125440,
+    "sampled_footprint_at_peak_bytes": 281250864,
+    "lifetime_peak_footprint_bytes": 995935984,
+    "decision": "rejected_lower_rss_did_not_reduce_physical_memory_pressure"
+  },
+  "correctness_and_regression_gates": {
+    "lsm_backend": "259_passed_1_platform_skip_0_failed_0_leaked",
+    "full_text_performance": "58_passed_0_failed_0_leaked",
+    "release_install": "passed",
+    "origin_main_lsm_table_format": 9,
+    "current_lsm_table_format": 10,
+    "intermediate_branch_formats_are_compatibility_contracts": false
+  },
+  "notes": [
+    "This 15-second read-only gate validates memory and recurring query cost; it does not replace the accepted mixed-write server matrix.",
+    "RSS includes clean reclaimable allocator and file-backed pages, so physical footprint and live malloc are co-primary memory metrics.",
+    "Native LSM run files use bounded range reads and are not mmap-eviction candidates."
+  ]
+}

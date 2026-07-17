@@ -31,7 +31,7 @@ const docstore = @import("docstore.zig");
 const DocStore = docstore.DocStore;
 const internal_keys = @import("internal_keys.zig");
 const lmdb = @import("lmdb.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 pub const TtlConfig = struct {
     /// TTL duration in nanoseconds.

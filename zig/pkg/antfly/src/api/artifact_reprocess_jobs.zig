@@ -15,7 +15,7 @@
 const std = @import("std");
 const docstore_mod = @import("../storage/docstore.zig");
 const db_mod = @import("../storage/db/mod.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 pub const StoreConfig = struct {
     artifact_reprocess_job_store_path: ?[]const u8 = null,

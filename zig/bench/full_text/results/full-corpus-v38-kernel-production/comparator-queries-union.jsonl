@@ -1,0 +1,5 @@
+{"elapsed_ns": 234792, "engine": "comparator", "operation": "top_k", "query": "V1 UNION text alpha beta", "query_index": 2, "repetition": 0, "schema_version": 1}
+{"elapsed_ns": 224417, "engine": "comparator", "operation": "top_k", "query": "V1 UNION text alpha beta", "query_index": 2, "repetition": 1, "schema_version": 1}
+{"elapsed_ns": 239334, "engine": "comparator", "operation": "top_k", "query": "V1 UNION text alpha beta", "query_index": 2, "repetition": 2, "schema_version": 1}
+{"elapsed_ns": 248959, "engine": "comparator", "operation": "top_k", "query": "V1 UNION text alpha beta", "query_index": 2, "repetition": 3, "schema_version": 1}
+{"elapsed_ns": 246541, "engine": "comparator", "operation": "top_k", "query": "V1 UNION text alpha beta", "query_index": 2, "repetition": 4, "schema_version": 1}

@@ -1,0 +1,11 @@
+{
+  "engine_version": "0.8.2",
+  "storage": "local bind-mounted Quickwit data directory",
+  "ingest_api": "v1",
+  "acknowledgement": "document persisted to the Quickwit ingest write-ahead log before acknowledgement",
+  "search_commit": "automatic; index commit_timeout_secs=60",
+  "freshness_write_commit": "auto",
+  "load_final_commit": "force",
+  "scope": "acknowledged writes must survive a Quickwit process/container restart; host or volume loss is out of scope",
+  "machine_durability_claimed": false
+}

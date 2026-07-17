@@ -24,6 +24,7 @@ from .algebraic_index_stats_planner_last_decision import AlgebraicIndexStatsPlan
 from .algebraic_index_stats_promotion import AlgebraicIndexStatsPromotion
 from .algebraic_index_stats_resolution import AlgebraicIndexStatsResolution
 from .algebraic_index_stats_resolver_replay import AlgebraicIndexStatsResolverReplay
+from .algebraic_index_stats_source_artifact import AlgebraicIndexStatsSourceArtifact
 from .analyses import Analyses
 from .analyses_result import AnalysesResult
 from .answer_agent_result import AnswerAgentResult
@@ -38,7 +39,6 @@ from .anthropic_generator_config import AnthropicGeneratorConfig
 from .api_key import ApiKey
 from .api_key_row_filter_type_0 import ApiKeyRowFilterType0
 from .api_key_with_secret import ApiKeyWithSecret
-from .artifact_index_source import ArtifactIndexSource
 from .artifact_repair_kind import ArtifactRepairKind
 from .artifact_repair_reason import ArtifactRepairReason
 from .audio_chunk_options import AudioChunkOptions
@@ -256,13 +256,6 @@ from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDe
 from .google_embedder_config import GoogleEmbedderConfig
 from .google_generator_config import GoogleGeneratorConfig
 from .graph_index_config import GraphIndexConfig
-from .graph_index_source import GraphIndexSource
-from .graph_index_source_context import GraphIndexSourceContext
-from .graph_index_source_edge import GraphIndexSourceEdge
-from .graph_index_source_edge_metadata import GraphIndexSourceEdgeMetadata
-from .graph_index_source_format import GraphIndexSourceFormat
-from .graph_index_source_nodes import GraphIndexSourceNodes
-from .graph_index_source_nodes_model import GraphIndexSourceNodesModel
 from .graph_index_stats import GraphIndexStats
 from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
 from .graph_index_stats_algebraic_graph_traversal import GraphIndexStatsAlgebraicGraphTraversal
@@ -272,6 +265,7 @@ from .graph_index_stats_index_type import GraphIndexStatsIndexType
 from .graph_index_stats_promotion import GraphIndexStatsPromotion
 from .graph_index_stats_resolution import GraphIndexStatsResolution
 from .graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
+from .graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
 from .graph_node_selector import GraphNodeSelector
 from .graph_query import GraphQuery
 from .graph_query_params import GraphQueryParams
@@ -281,8 +275,6 @@ from .graph_query_type import GraphQueryType
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
-from .graph_source_artifact_status import GraphSourceArtifactStatus
-from .graph_source_artifact_status_format import GraphSourceArtifactStatusFormat
 from .ground_truth import GroundTruth
 from .image_url import ImageURL
 from .image_url_content_part import ImageURLContentPart
@@ -296,7 +288,6 @@ from .index_status import IndexStatus
 from .index_status_shard_status import IndexStatusShardStatus
 from .index_type import IndexType
 from .inference_audio_chunk_config import InferenceAudioChunkConfig
-from .inference_backend_priority_entry import InferenceBackendPriorityEntry
 from .inference_backend_runtimes import InferenceBackendRuntimes
 from .inference_binary_content import InferenceBinaryContent
 from .inference_chat_message import InferenceChatMessage
@@ -308,6 +299,8 @@ from .inference_chunk_request import InferenceChunkRequest
 from .inference_chunk_response import InferenceChunkResponse
 from .inference_chunk_response_object import InferenceChunkResponseObject
 from .inference_config import InferenceConfig
+from .inference_config_model_strategies import InferenceConfigModelStrategies
+from .inference_config_model_strategies_additional_property import InferenceConfigModelStrategiesAdditionalProperty
 from .inference_connection import InferenceConnection
 from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
@@ -365,6 +358,7 @@ from .inference_model_backend import InferenceModelBackend
 from .inference_model_format import InferenceModelFormat
 from .inference_model_info import InferenceModelInfo
 from .inference_model_kind import InferenceModelKind
+from .inference_model_quantization import InferenceModelQuantization
 from .inference_model_ref import InferenceModelRef
 from .inference_models_response import InferenceModelsResponse
 from .inference_models_response_chunkers import InferenceModelsResponseChunkers
@@ -702,6 +696,7 @@ __all__ = (
     "AlgebraicIndexStatsPromotion",
     "AlgebraicIndexStatsResolution",
     "AlgebraicIndexStatsResolverReplay",
+    "AlgebraicIndexStatsSourceArtifact",
     "Analyses",
     "AnalysesResult",
     "AnswerAgentResult",
@@ -716,7 +711,6 @@ __all__ = (
     "ApiKey",
     "ApiKeyRowFilterType0",
     "ApiKeyWithSecret",
-    "ArtifactIndexSource",
     "ArtifactRepairKind",
     "ArtifactRepairReason",
     "AudioChunkOptions",
@@ -932,13 +926,6 @@ __all__ = (
     "GoogleEmbedderConfig",
     "GoogleGeneratorConfig",
     "GraphIndexConfig",
-    "GraphIndexSource",
-    "GraphIndexSourceContext",
-    "GraphIndexSourceEdge",
-    "GraphIndexSourceEdgeMetadata",
-    "GraphIndexSourceFormat",
-    "GraphIndexSourceNodes",
-    "GraphIndexSourceNodesModel",
     "GraphIndexStats",
     "GraphIndexStatsAlgebraicGraph",
     "GraphIndexStatsAlgebraicGraphTraversal",
@@ -948,6 +935,7 @@ __all__ = (
     "GraphIndexStatsPromotion",
     "GraphIndexStatsResolution",
     "GraphIndexStatsResolverReplay",
+    "GraphIndexStatsSourceArtifact",
     "GraphNodeSelector",
     "GraphQuery",
     "GraphQueryParams",
@@ -957,8 +945,6 @@ __all__ = (
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
-    "GraphSourceArtifactStatus",
-    "GraphSourceArtifactStatusFormat",
     "GroundTruth",
     "ImageURL",
     "ImageURLContentPart",
@@ -972,7 +958,6 @@ __all__ = (
     "IndexStatusShardStatus",
     "IndexType",
     "InferenceAudioChunkConfig",
-    "InferenceBackendPriorityEntry",
     "InferenceBackendRuntimes",
     "InferenceBinaryContent",
     "InferenceChatMessage",
@@ -984,6 +969,8 @@ __all__ = (
     "InferenceChunkResponse",
     "InferenceChunkResponseObject",
     "InferenceConfig",
+    "InferenceConfigModelStrategies",
+    "InferenceConfigModelStrategiesAdditionalProperty",
     "InferenceConnection",
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
@@ -1041,6 +1028,7 @@ __all__ = (
     "InferenceModelFormat",
     "InferenceModelInfo",
     "InferenceModelKind",
+    "InferenceModelQuantization",
     "InferenceModelRef",
     "InferenceModelsResponse",
     "InferenceModelsResponseChunkers",

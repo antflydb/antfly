@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const platform_clock = @import("../platform/clock.zig");
+const platform_clock = @import("antfly_platform").clock;
 
 pub const ReconcileLeaseRecord = struct {
     owner_node_id: u64,

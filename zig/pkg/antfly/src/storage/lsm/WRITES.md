@@ -136,6 +136,8 @@ Current status:
 - Derived dense replay now threads `.bulk_ingest` into the HBC insert choice: empty indexes use the HBC bulk builder, and replay batches whose vector IDs were newly allocated skip per-vector existence probes.
 - HBC leaf-write coalescing is implemented behind `BatchInsertOptions.coalesce_leaf_writes`. It reduces bytes but can be slower than the absent-id path, so production only enables it for bulk replay batches where vector IDs are known-new.
 - Online DB writes now split from true bulk ingest. Normal API/VectorDBBench writes use ordinary storage write mode; provisioned API writes no longer consult auto-bulk policy or open automatic long-lived bulk sessions for normal upload. Flush, L0 pressure, and maintenance remain storage-owned. Detached LSM maintenance jobs now drain a bounded batch of steps per wake instead of one step, matching the internal worker budget and giving background flush/compaction more room to catch up before hard write pressure reaches the HTTP caller. Backends without an external maintenance waker also schedule through this detached path when writes, snapshots, or obsolete-file tracking note possible maintenance debt. A 50k run with an automatic per-batch `.bulk_ingest` hint improved final query shape but regressed insert; a 1M follow-up reached a 17G root before completion and timed out inserts in foreground `enforceWritePressure` compaction. That hint is not the known-best online-write default. The later bounded-maintenance 1M run uploaded faster but still exposed stale status publication and long compaction/obsolete-file debt; dense catch-up now releases its tracked session before status-hook notification, and managed `.publish_consistent` uses the bounded best-effort status publisher while leaving the table dirty for a later consistent refresh. Current scans now reuse cached mutable read snapshots up to each document-data profile's read-snapshot byte threshold instead of forcing tiny mutable rotations; bulk current scans keep the bounded clone path. A follow-up 1M run uploaded in 516.661s and reclaimed obsolete files on shutdown, but exposed a terminal publish bug where status reached ready at 987,500 visible docs while HBC had reached 1,000,000 cache entries. Successful dense catch-up finish now blocks on the applied-sequence/status flush before marking catch-up inactive and notifying query visibility.
+- Obsolete run lifetime is now generation-scoped instead of backend-reader-scoped. Read snapshots retain the exact path-backed runs they borrow in a hash-indexed registry; compaction releases active-version ownership at publish and drops each retired run's metadata, local cache handles, and physical file as soon as that generation's last snapshot exits, even while readers of newer generations remain active. Open-manifest handle pins remain an independent registry. A queued obsolete path is manifest-dirty only until its current state is published; a pin or future retention deadline remains scheduled work but does not repeatedly rewrite an identical manifest. Focused regressions cover overlapping old/new readers, independent handles, reopen stress, prompt deletion, and no-progress scheduler passes without manifest churn.
+- Primary document LSMs opt into a bounded foreground WAL soft-pressure fallback. Background maintenance remains preferred, but after the existing 512 MiB / 8-segment soft boundary the commit path performs at most one checkpoint-producing immutable flush per 250 ms enforcement interval. It does not wait for the 2 GiB / 32-segment hard boundary or drain all accumulated generations in one request, and it preserves manifest-first checkpoint durability and crash replay.
 - LSM bulk-ingest exit keeps the elevated mutable threshold instead of flushing at every `.bulk_ingest` transaction boundary. Explicit backend bulk-ingest sessions remain available for rebuild/import paths that can publish true bulk state, not for ordinary random API upload.
 - Bulk-ingest sessions have two finish modes: the default compacts on session close for normal backend use, while `finishBulkIngestSessionWithOptions(.{ .compact = false })` flushes remaining mutable state, publishes the manifest once, and leaves compaction to a later maintenance window.
 - Dense derived replay now opens an LSM bulk-ingest session around each index catch-up window. It closes with `.compact = false` and a deferred-L0 guardrail, so normal replay gets the one-manifest behavior from the benchmark while still compacting if L0 run count grows past the safety limit.
@@ -146,6 +148,7 @@ Current status:
 - `lsm-write-bench` wraps random `.bulk_ingest` loads in an outer no-compaction session. On the 100k native smoke run, random bulk ingest wrote 20 table files and 1 manifest, performed 0 flushes/compactions, and issued 0 reads; before the outer publish window it still wrote a manifest per 5k replay batch, and before no-compaction finish it also compacted across batches at session close.
 - `lsm-write-bench --workload-set ingest_compact` measures random ingest plus a full maintenance drain as one timed region, which keeps shape and policy experiments out of end-to-end benchmark harnesses until they have isolated storage evidence.
 - Document-data LSM profiles now pin a shallower leveled shape instead of inheriting the global tiny-store defaults: primary, text main/WAL, sparse, and graph reverse stores use a 128 MiB L1 byte target with a 10x multiplier, while dense HBC uses a 256 MiB L1 byte target with the same multiplier. This keeps raft/WAL-like internal defaults small, but avoids dragging large document stores through many 1 MiB-based levels during compaction.
+- Compaction candidates are now ranked by normalized `current / target` level pressure instead of absolute run/byte debt. The old units let 47 L0 runs outrank an L1 that was 1.179 GiB over its 128 MiB target, so each L0-to-L1 job could rewrite the oversized L1 before L1-to-L2 promotion ran. The ratio picker promotes the proportionally more overfull downstream level and has a regression fixture matching the 39-L0/1.36-GiB-L1 production failure shape.
 - HBC replay now enables the existing grouped leaf-write path for bulk batches whose vector IDs are known-new and defers quantized rebuilds to the end of each HBC write batch. This is not the final mutation-batch design, but it moves the coalescing path out of benchmark-only status.
 - HBC grouped mutation batching now handles no-split leaf groups with two or more inserts, writes changed leaf ranges during mutation, batch-refreshes unique ancestor range chains after split candidates settle, and defers bounded overflow leaf splits until the batch-end split-candidate phase. The split phase recursively requeues left/right leaves until they fit under `leaf_size`. Very large routed groups still fall back to the existing online path until the recursive split budget is proven under larger replay workloads.
 - `HBCIndex.WriteProfile` and `hbc-write-bench` now expose grouped-path guardrail counters: grouped leaf groups, grouped items, fallback items, split candidates, recursive splits, leaf range writes, ancestor range refreshes/nodes, grouped node body writes, and vec-leaf mapping writes.
@@ -156,7 +159,7 @@ Current status:
 - On 100k native HBC smoke runs after bounded recursive split batching, coalesced online batches consistently wrote fewer bytes, about 715 MB versus default/assume-absent at about 738 MB, but timing is not consistently faster. A later 100k run measured coalesced at 68.4 us/vector versus default and assume-absent at about 66.8 us/vector. A deferred sorted leaf-range publication experiment was rolled back because it worsened timing while preserving the same byte reduction.
 - Deferred quantized rebuild now tracks the HBC nodes whose bodies changed during the write transaction and refreshes only that touched-node set at finish. This replaces the full-tree `rebuildAllQuantized()` behavior for adapters that provide the touched-node tracker. A 10k native smoke run with 5k batches moved coalesced deferred quantized puts to 182 versus 6,419 for non-deferred coalesced and 10,354 for default/assume-absent online batches.
 - The true mutation-batch work is partly implemented, not a clean win yet. The successful pieces are sorted raw-vector/metadata pre-store, no-split leaf grouping, bounded batch-end split handling, ancestor range refresh coalescing, and touched-node quantized rebuild. The rolled-back pieces were narrower experiments: final-only vec-leaf mapping and deferred sorted leaf-range publication both preserved byte reductions but worsened timing/storage behavior. The next safe HBC slice avoids writing an oversized temporary leaf before splitting a grouped overflow leaf; instead the grouped path now splits directly from the in-memory mutated leaf and queues the resulting leaves only for recursive overflow checks.
-- `zig build lsm-backend-test` is a focused LSM backend unit-test step; the current LSM backend bucket passes 56/56 tests.
+- `zig build lsm-backend-test` is a focused LSM backend unit-test step; the current bucket passes 244 tests with one platform-specific skip, zero failures, and zero allocator leaks.
 - The bench can run against host-backed in-memory persistence, native filesystem storage, or memory-only storage.
 - `Backend.WriteStats` now exposes flush, table-file, manifest, and compaction timing/byte counters via `snapshotWriteStats()`.
 
@@ -1110,3 +1113,143 @@ entire large runs.
        500-doc batch `192775000ns`.
      - Dense LSM remained bounded at about 62 MB active run bytes and two L0
        runs; status probes stayed under 15 us.
+
+13. Production ingestion amplification and compaction memory.
+   - Status: wide L0 closure, global pressure ordering, sequential compaction
+     indexes, bounded WAL fallback, and background-job reclamation implemented;
+     fresh full-server qualification is in progress.
+   - A compaction source window is no longer capped at twice the L0 run-count
+     trigger. Maintenance drains toward half the trigger in one overlap closure,
+     still bounded by `max_compaction_input_bytes`. This prevents a hard L0
+     backlog from requiring many publications and repeatedly rewriting the same
+     overlapping lower-level bytes.
+   - Maintenance now compares every eligible source with the same normalized
+     `current / target` pressure. The soft L0 limit is the pressure denominator;
+     the smaller overlap threshold remains only an eligibility rule. A fixture
+     matching 102 L0 runs plus four 284 MB L1 runs verifies that the 8.5x-overfull
+     L1 is promoted before the 3.2x-overfull L0 is rewritten.
+   - Compaction cursors no longer retain the point-query `TableIndex` for every
+     input run. A sequential index keeps only encoded block windows, codecs, and
+     entry counts, and validates records while advancing within each decoded
+     block. Entry-offset arrays, global/block blooms, point hash slots, bounds,
+     and prefix filters are skipped. The table wire format is unchanged.
+   - The first wide-fan-in implementation reached about 6.4 GB physical memory
+     because every input cursor retained those point-query structures. With the
+     sequential cursor, the primary-compaction resource peak fell to about 1.70
+     GB in the next 980,610-document run. Active primary state settled at five
+     runs / 1.490 GB with 52.1 MB WAL and zero obsolete or untracked run files.
+   - That run then exposed an independent server-runtime backlog: completed
+     durable jobs were reaped only 32 at a time every 50 ms and removed with
+     `orderedRemove`. At corpus scale this retained finished job payloads for
+     minutes and spent most of a core shifting the remaining pointer array.
+     Reaping now partitions up to 4096 completed entries in one pass, removes
+     them with O(1) swaps, and drains continuously while completion debt exists.
+     A fresh 980,610-document gate proved the pointer-shift hotspot was gone but
+     still peaked at 4.20 GB physical memory before falling from 3.71 GB to 315
+     MB when the reaper caught up. Job payloads can be much larger than their
+     future/queue shell, so the worker now calls an atomic once-only payload
+     destructor immediately after `job.run`; owner drains and the reaper only
+     join and free the small entry shell.
+   - Periodic health metrics now use cached, constant-per-segment layout totals.
+     Detailed term/posting attribution is explicit sampled diagnostics rather
+     than a recurring full-index scan. Process metrics expose the OS lifetime
+     peak physical footprint so benchmark reports distinguish allocator pressure
+     from clean mapped RSS.
+   - Guardrails: `lsm-backend-test` passes 244 tests with one platform skip,
+     zero failures, and zero leaks; `root-test` passes 193 tests with zero
+     failures or leaks. The next fresh 1M server gate must validate the final
+     planner and worker-lifetime changes together before this item is complete.
+   - The worker-lifetime fix passed a 300K gate with a 680.6 MB lifetime
+     physical-footprint peak, but two subsequent 980,610-document gates exposed
+     separate failures during final derived catch-up. Adding `.write` to the
+     derived-backlog pressure policy improved the corrected 300K end-to-end
+     result to 96.511 seconds and a 922.6 MB footprint peak, but the next full
+     gate still peaked at 6.075 GB despite only 921 MB of resource-accounted LSM
+     memory. It was stopped and rejected.
+   - The residual allocation was native mutable state, not mapped run files.
+     LSM tables use FD-backed range reads and bounded decoded-block caches, so
+     the full-text segment `madvise` eviction mechanism has no LSM mapping to
+     target. File-cache advice after compaction is intentionally deferred unless
+     system-wide page-cache measurements justify the warm-read tradeoff.
+   - `ActiveMemTable` no longer allocates an `ArrayList` backing buffer for the
+     common one-entry hash bucket. The primary map stores `hash -> entry index`;
+     a separate map and list exist only for actual 64-bit hash collisions.
+     Mutable byte estimates now include entry capacity, exact
+     `ArenaAllocator.queryCapacity()`, primary/collision hash allocations, and
+     collision-list capacity. This both reduces the allocation count and makes
+     flush, snapshot, direct-ingest, and resource limits see the real retained
+     memory, including variable-size overwrite garbage held by the arena.
+   - Logical live-entry bytes are maintained incrementally and remain the
+     normal flush/run-sizing and serialized-I/O measure. Actual entry, arena,
+     and index capacity is used for resource accounting and a separate 2x
+     memory guard. This avoids both repeated O(n) write-path scans and the
+     severe run fragmentation caused by treating allocator capacity as disk
+     geometry.
+   - A guarded million-document follow-up reached all 980,610 uploads in
+     232.325 seconds but was stopped at 2.647 GB physical footprint during
+     final synchronization. `lsm.in_memory_state` alone was 1.073 GB: eight
+     count-admitted immutable generations accumulated while an unlocked flush
+     build was in flight. The root was 2.443 GB, including 1.987 GB primary
+     runs, 444.5 MB text segments, and only 11.5 MB WAL, so this peak was not
+     mapped-run residency or unresolved WAL retention.
+   - Immutable queues now have aggregate local byte limits in addition to count
+     limits: 256 MiB primary, 512 MiB dense, and 128 MiB for text, sparse, and
+     graph stores. Those are per-backend fairness bounds, not a replacement for
+     global policy.
+   - `ResourceManager` governs global LSM state admission. It evaluates the
+     incoming mutable batch against the shared `lsm.in_memory_state` budget
+     before WAL append. The DB layer waits on the shared usage-change epoch
+     before acquiring its apply lock; this wait is not a reservation, so the
+     backend repeats the projected check immediately before WAL append.
+     Configured rejection occurs before durability/apply. The backend drains
+     local state at soft pressure but never sleeps on aggregate state while its
+     caller may hold a higher-level lock; hard pressure is a non-blocking
+     `ResourceBudgetExceeded`. A writer behind an unlocked immutable build
+     releases the backend mutex and waits on a completion condition because
+     that local flush can progress independently.
+   - The first local-cap/admission gate completed 300K in 121.914 seconds with
+     1.328 GB lifetime physical footprint, 331.7 MB peak LSM state, 1.084 GB
+     peak disk, and 843.9 MB final disk. It was bounded but still regressed
+     physical footprint versus the 920.9 MB comparison run.
+   - The guarded million gate was stopped at 3.402 GB physical footprint. Stop
+     latency allowed upload to reach 934,931 documents / 156.451 seconds. The
+     last resource sample was dominated by 881.1 MB LSM state; disk was 2.618
+     GB, including 1.895 GB primary runs, 488.8 MB WAL, and 234.4 MB text
+     segments. Provisioning had scaled the slice to 1.5/2.0 GB, so no pressure
+     action fired. Local fairness caps alone did not solve aggregate admission.
+   - Adaptive provisioning now caps `lsm.in_memory_state` at 768 MiB and uses
+     its 576 MiB soft boundary to throttle proactively. Smaller hosts retain
+     adaptive down-scaling. The raw non-adaptive ResourceManager default remains
+     512/768 MiB.
+   - The guarded follow-up with that policy proved the ownership boundary:
+     aggregate LSM state peaked at 601.9 MB, immediately below the 604.0 MB
+     soft admission limit, and later drained to 186.9 MB. Stop latency allowed
+     775,886 documents to upload in 159.804 seconds before the 2.5 GB guard
+     disconnected the client. Lifetime physical footprint nevertheless reached
+     3.004 GB before falling to 771.4 MB, so the gate remains rejected. The
+     remaining transient is not fixable by another immutable-queue limit: it
+     requires peak-time attribution across allocator zones, compaction/build
+     scratch, completed job payloads, and file-backed full-text residency.
+   - Coherent attribution then found backend-wide reader retention outside that
+     accounting. A flushed immutable generation was retained while any reader
+     existed, so continuously overlapping readers accumulated allocator-backed
+     generations that were neither active nor ResourceManager-accounted.
+     Read/scan snapshots now pin only their captured immutable generations;
+     retired generations and bytes remain in `lsm.in_memory_state` until the
+     final exact pin releases. Probe transactions copy point results into
+     transaction-owned storage and therefore require no conservative
+     backend-wide generation fallback.
+   - Release validation caught both remaining boundary errors. Waiting inside
+     backend admission while the DB apply lock was held deadlocked progress at
+     the soft limit; removing that wait without adding a safe upper wait caused
+     a prompt hard-limit rejection. After two-level admission was installed, a
+     production probe fallback still retained 62 generations / 495.1 MB. The
+     owned-probe fix eliminated that state.
+   - The final fresh 650K gate completed in 409.261 seconds, compared with
+     542.442 seconds for the previous coherent run. Peak physical footprint
+     fell from 3.107 GB to 1.486 GB, peak RSS from 3.452 GB to 2.804 GB, peak
+     live malloc allocation from 2.884 GB to 1.909 GB, and peak
+     `lsm.in_memory_state` from 607.0 MB to 355.8 MB. Retired immutable bytes,
+     exact pins, and probe readers were zero at peak RSS. This accepts the LSM
+     generation-lifetime and admission fix; the remaining RSS is separately
+     attributable to full-text mmap residency and allocator retention.

@@ -1,0 +1,10 @@
+{
+  "errors": [],
+  "left": "/private/tmp/antfly-wiki-full-production-v38-cross-engine-final/correctness-antfly.jsonl",
+  "ok": true,
+  "queries": 5,
+  "right": "/private/tmp/antfly-wiki-full-production-v38-cross-engine-final/correctness-comparator.jsonl",
+  "schema_version": 1,
+  "strict_matches": 5,
+  "tie_aware_matches": 0
+}

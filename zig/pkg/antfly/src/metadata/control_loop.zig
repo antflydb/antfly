@@ -17,7 +17,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const metadata_state = @import("state.zig");
 const metadata_table_manager = @import("table_manager.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const transition_state = @import("transition_state.zig");
 
 pub const ReconcileSummary = struct {

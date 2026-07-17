@@ -19,7 +19,7 @@ const tables_api = @import("../api/tables.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_storage = @import("../metadata/storage/mod.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 pub fn installOnService(
     service: anytype,

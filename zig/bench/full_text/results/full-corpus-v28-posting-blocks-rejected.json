@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "status": "rejected_selective_query_cpu",
+  "comparison_boundary": "settled_persisted_search_index_only",
+  "corpus": {
+    "documents": 5032105,
+    "normalized_bytes": 8473678432,
+    "sha256": "9078d9ea4783ab764fe246046efdc8062692f07afdd7c8749a74ebfe05c51ff4"
+  },
+  "format": {
+    "wire_version": 28,
+    "postings_layout": "fixed_posting_count",
+    "postings_per_block": 128,
+    "accepted_reader_versions": [23, 28],
+    "branch_only_rejected_versions": [24, 25, 26, 27]
+  },
+  "correctness": {
+    "ok": true,
+    "queries": 5,
+    "strict_matches": 5,
+    "tie_aware_matches": 0
+  },
+  "settled_layout": {
+    "segments": 10,
+    "completed_merges": 267,
+    "pending_segments": 0,
+    "in_flight_merges": 0,
+    "failed_merges": 0,
+    "quarantined_merges": 0
+  },
+  "index_size": {
+    "antfly_v27_bytes": 5065897930,
+    "antfly_v28_bytes": 4088444648,
+    "tantivy_bytes": 3251494143,
+    "v28_reduction_bytes": 977453282,
+    "v28_reduction_percent": 19.29476857817386,
+    "v28_over_tantivy_ratio": 1.257404893932174,
+    "v28_gap_to_tantivy_bytes": 836950505
+  },
+  "indexing": {
+    "antfly_v28_elapsed_ns": 545885724208,
+    "antfly_v27_elapsed_ns": 611371550375,
+    "tantivy_elapsed_ns": 550244512584,
+    "v28_over_v27_elapsed_ratio": 0.8928870240579029,
+    "v28_over_tantivy_elapsed_ratio": 0.9920784518949026,
+    "antfly_v28_peak_rss_bytes": 4292116480,
+    "antfly_v27_peak_rss_bytes": 4601970688,
+    "tantivy_peak_rss_bytes": 2810429440,
+    "v28_peak_rss_reduction_bytes": 309854208,
+    "v28_peak_rss_reduction_percent": 6.733076523237513,
+    "v28_over_tantivy_peak_rss_ratio": 1.5272101903401638,
+    "v28_peak_rss_gap_to_tantivy_bytes": 1481687040,
+    "cpu_ns": null,
+    "cpu_note": "The full-run sampler returned an invalid zero terminal CPU counter; wall time and peak RSS are valid."
+  },
+  "query_resources": {
+    "minimum_wall_seconds_per_engine_class": 3,
+    "antfly_v28_cpu_per_query_ns": {
+      "term": 185785,
+      "union": 679702,
+      "intersection": 407904,
+      "phrase": 476269
+    },
+    "antfly_v27_cpu_per_query_ns": {
+      "term": 71206,
+      "union": 198214,
+      "intersection": 213610,
+      "phrase": 1084870
+    },
+    "tantivy_cpu_per_query_ns": {
+      "term": 38964,
+      "union": 231303,
+      "intersection": 248730,
+      "phrase": 346450
+    },
+    "v28_over_v27_cpu_ratio": {
+      "term": 2.6091200179760135,
+      "union": 3.4291321501003966,
+      "intersection": 1.9095735218388652,
+      "phrase": 0.43901020398757457
+    },
+    "v28_over_tantivy_cpu_ratio": {
+      "term": 4.768119289600657,
+      "union": 2.9385784014906853,
+      "intersection": 1.6399469304064649,
+      "phrase": 1.3747120796651753
+    },
+    "antfly_v28_peak_rss_bytes": 23003136,
+    "tantivy_peak_rss_bytes": 21725184,
+    "antfly_over_tantivy_peak_rss_ratio": 1.058825
+  },
+  "selectivity_diagnostics": {
+    "term_alpha": {
+      "v27_chunks_skipped": 4141,
+      "v28_chunks_skipped": 8,
+      "v27_pivots_scored": 1654,
+      "v28_pivots_scored": 15250
+    },
+    "union_alpha_beta": {
+      "v27_chunks_skipped": 4829,
+      "v28_chunks_skipped": 177,
+      "v27_pivots_scored": 710,
+      "v28_pivots_scored": 3609,
+      "v27_pivots_advanced": 1260,
+      "v28_pivots_advanced": 12312
+    },
+    "interpretation": "Posting-count compression blocks span document ranges too wide for selective WAND bounds. A separate finer document-range impact index is required."
+  },
+  "decision": {
+    "production_default": "reject",
+    "retain_experiment": true,
+    "next_candidate": "128-posting compression blocks plus compact finer document-range impact metadata",
+    "acceptance_requirement": "Preserve most of the size saving while restoring v27-level selective term/union/intersection CPU and maintaining v23 backward compatibility."
+  },
+  "source_artifact": "/private/tmp/antfly-wiki-full-production-v28"
+}
