@@ -238,6 +238,7 @@ pub const ListConnectionsParams = struct {
 /// Invoke an Antfly-compatible inference connection
 pub const InvokeInferenceConnectionPathParams = struct {
     connection_id: []const u8,
+    /// Requires the connection capability `models.<operation>`.
     operation: []const u8,
 };
 
