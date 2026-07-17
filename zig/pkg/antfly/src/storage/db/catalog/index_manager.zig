@@ -8813,7 +8813,10 @@ pub const IndexManager = struct {
         else
             PhaseTrackingAllocator.init(alloc, &alloc_stats);
         const task_alloc = tracking.allocator();
-        const deleted_docs = try task_alloc.alloc(?roaring.RoaringBitmap, task.source.len);
+        const deleted_docs = task_alloc.alloc(?roaring.RoaringBitmap, task.source.len) catch |err| {
+            if (tracking.limit_exceeded) return error.ResourceBudgetExceeded;
+            return err;
+        };
         defer task_alloc.free(deleted_docs);
         for (task.source, 0..) |source, i| deleted_docs[i] = source.deleted;
 
