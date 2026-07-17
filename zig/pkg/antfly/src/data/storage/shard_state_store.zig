@@ -62,6 +62,7 @@ pub const DataOperation = union(enum) {
 };
 
 pub const SplitAcknowledgement = struct {
+    transition_id: u64,
     destination_group_id: u64,
     delta_sequence: u64,
 };
@@ -208,10 +209,11 @@ pub fn currentSplitAcknowledgement(store: *docstore.DocStore, alloc: std.mem.All
         else => return err,
     };
     defer alloc.free(raw);
-    if (raw.len != 16) return error.InvalidSplitAcknowledgement;
+    if (raw.len != 24) return error.InvalidSplitAcknowledgement;
     return .{
-        .destination_group_id = std.mem.readInt(u64, raw[0..8], .little),
-        .delta_sequence = std.mem.readInt(u64, raw[8..16], .little),
+        .transition_id = std.mem.readInt(u64, raw[0..8], .little),
+        .destination_group_id = std.mem.readInt(u64, raw[8..16], .little),
+        .delta_sequence = std.mem.readInt(u64, raw[16..24], .little),
     };
 }
 
@@ -637,10 +639,11 @@ pub fn appendOperationEffects(
             errdefer alloc.free(acknowledgement_key);
             removeOwnedWriteByKey(alloc, writes, acknowledgement_key);
             removeDeleteByKey(alloc, deletes, acknowledgement_key);
-            const value = try alloc.alloc(u8, 16);
+            const value = try alloc.alloc(u8, 24);
             errdefer alloc.free(value);
-            std.mem.writeInt(u64, value[0..8], acknowledgement.destination_group_id, .little);
-            std.mem.writeInt(u64, value[8..16], acknowledgement.delta_sequence, .little);
+            std.mem.writeInt(u64, value[0..8], acknowledgement.transition_id, .little);
+            std.mem.writeInt(u64, value[8..16], acknowledgement.destination_group_id, .little);
+            std.mem.writeInt(u64, value[16..24], acknowledgement.delta_sequence, .little);
             try writes.append(alloc, .{ .key = acknowledgement_key, .value = value });
         },
         .finalize_split => {

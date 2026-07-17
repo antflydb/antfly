@@ -123,6 +123,15 @@ startup or serving cache keeps the identity alive until it also evicts the
 table. Memory therefore scales with the bounded union of cache working sets,
 not with historical writes, while a draining lease that mutates after eviction
 re-marks itself through the normal visibility hook.
+Runtime-status ordering separates structure from content. Whole-cache refreshes
+capture a structural revision that advances only for clear or table
+invalidation; routine status publications do not invalidate a scan. Live DB
+publishers capture a per-table epoch plus the clear epoch, so invalidating one
+table cannot reject an unrelated table's observation. Observation generations
+order concurrent content for one table/group, and refresh publication merges a
+newer live observation instead of replacing it with the older scanned value.
+This keeps refresh progress independent of write rate while still fencing
+retired storage generations.
 Writer ownership configuration is published under one ordered transition lock
 set: cache-open locks by address, then the source mutation lock, then cache
 lifecycle locks by address. Gate or mirror changes reserve both serving and
@@ -320,13 +329,24 @@ retired and closed before replacement; an active mismatch blocks the new open
 until its existing lease drains. This prevents a pre-publication destination
 open from becoming the serving writer for a differently namespaced range.
 Every destination bootstrap and catch-up batch carries a typed split replication
-context containing the source group, destination group, and inherited identity
-namespace. The context is encoded in the internal HTTP command and the data-Raft
-entry, validated against the catalog-visible source range on every replica, and
-used for the destination's first physical DB open. It is separate from the final
-checkpoint: write chunks cannot advertise bootstrap completion, while they also
-cannot race an ordinary catalog-derived open before the destination range is
-published. Public batch parsing rejects this internal context.
+context containing the metadata transition ID, source group, destination group,
+inherited identity namespace, operation kind, and source delta sequence where
+applicable. The context is encoded in the internal HTTP command and the
+data-Raft entry, validated against the catalog-visible source range on every
+replica, and used for the destination's first physical DB open. Public batch
+parsing rejects this internal context.
+
+The destination stores the completed bootstrap identity and highest applied
+delta sequence in the document store. A completed bootstrap fences late chunk
+proposals; delta retries at or below the durable sequence are no-ops; and a
+forward sequence gap is rejected. Empty source deltas are sent as sequence
+barriers, so a gap can never be mistaken for an empty mutation. Document writes,
+range publication, bootstrap identity, and sequence advancement share the same
+DB apply lock and backend batch. The source acknowledges only after that commit,
+and its durable acknowledgement includes the same transition ID. Range buffers
+are prepared before commit and installed into the open DB allocation-free after
+success, leaving no post-commit error path that can split durable and in-memory
+ownership state.
 
 Placement changes must also make stale leadership self-healing. If a local
 voter still observes a leader that is draining or no longer appears in the

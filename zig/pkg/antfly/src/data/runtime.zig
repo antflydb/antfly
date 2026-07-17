@@ -5117,7 +5117,7 @@ pub const DataServer = struct {
         if (self.data_raft != null) {
             lockAtomic(&self.local_transition_mutex);
             defer self.local_transition_mutex.unlock();
-            return .{ .status = try self.observeReplicatedSplit(record.source_group_id, record.destination_group_id) };
+            return .{ .status = try self.observeReplicatedSplit(record.transition_id, record.source_group_id, record.destination_group_id) };
         }
         lockAtomic(&self.local_transition_mutex);
         defer self.local_transition_mutex.unlock();
@@ -5187,6 +5187,7 @@ pub const DataServer = struct {
             lockAtomic(&self.local_transition_mutex);
             defer self.local_transition_mutex.unlock();
             try self.replicateSplitBootstrap(
+                op.transition_id,
                 op.source_group_id,
                 op.destination_group_id,
                 op.destination_base_uri orelse return error.MissingDestinationRoute,
@@ -5209,6 +5210,7 @@ pub const DataServer = struct {
             lockAtomic(&self.local_transition_mutex);
             defer self.local_transition_mutex.unlock();
             try self.replicateSplitCatchUp(
+                op.transition_id,
                 op.source_group_id,
                 op.destination_group_id,
                 op.destination_base_uri orelse return error.MissingDestinationRoute,
@@ -5227,6 +5229,7 @@ pub const DataServer = struct {
 
     fn replicateSplitBootstrap(
         self: *DataServer,
+        transition_id: u64,
         source_group_id: u64,
         destination_group_id: u64,
         destination_base_uri: []const u8,
@@ -5239,7 +5242,7 @@ pub const DataServer = struct {
         defer antfly.data.storage.shard_state_store.freeHandoff(self.alloc, handoff);
         const table_name = (try self.tableNameForLocalGroupAlloc(source_group_id)) orelse return error.UnknownGroup;
         defer self.alloc.free(table_name);
-        const replication = try self.splitReplicationContext(source_group_id, destination_group_id);
+        const replication = try self.splitReplicationContext(transition_id, source_group_id, destination_group_id);
 
         const max_writes_per_batch: usize = 128;
         var offset: usize = 0;
@@ -5305,6 +5308,7 @@ pub const DataServer = struct {
 
     fn replicateSplitCatchUp(
         self: *DataServer,
+        transition_id: u64,
         source_group_id: u64,
         destination_group_id: u64,
         destination_base_uri: []const u8,
@@ -5314,9 +5318,9 @@ pub const DataServer = struct {
         defer self.alloc.free(table_name);
         const source_state = (try source_store.currentSplitState(self.alloc, source_group_id)) orelse return error.SplitInProgress;
         defer antfly.data.storage.shard_state_store.freeSplitState(self.alloc, source_state);
-        const replication = try self.splitReplicationContext(source_group_id, destination_group_id);
+        const replication = try self.splitReplicationContext(transition_id, source_group_id, destination_group_id);
         const source_seq = try source_store.currentSplitDeltaSequence(self.alloc, source_group_id);
-        const source_ack = try self.splitProgressForSource(source_group_id, destination_group_id);
+        const source_ack = try self.splitProgressForSource(transition_id, source_group_id, destination_group_id);
         const after_seq = if (source_ack) |ack| ack else 0;
         const deltas = try source_store.listSplitDeltasAfter(self.alloc, source_group_id, after_seq);
         defer antfly.shard.freeDeltas(self.alloc, deltas);
@@ -5342,13 +5346,17 @@ pub const DataServer = struct {
             for (delta.deletes) |raw_key| {
                 try deletes.append(self.alloc, try decodeSplitDeltaDocumentKeyAlloc(self.alloc, raw_key));
             }
-            if (writes.items.len > 0 or deletes.items.len > 0) {
-                try self.sendSplitDestinationBatch(destination_base_uri, destination_group_id, table_name, replication, .{
-                    .writes = writes.items,
-                    .deletes = deletes.items,
-                    .sync_level = .write,
-                });
-            }
+            var delta_replication = replication;
+            delta_replication.operation = .delta;
+            delta_replication.sequence = delta.sequence;
+            // Empty deltas are still durable sequence barriers. Sending them
+            // keeps gap detection exact instead of making a missing mutation
+            // indistinguishable from an intentionally empty source delta.
+            try self.sendSplitDestinationBatch(destination_base_uri, destination_group_id, table_name, delta_replication, .{
+                .writes = writes.items,
+                .deletes = deletes.items,
+                .sync_level = .write,
+            });
         }
         try self.replicateSplitCheckpoint(destination_base_uri, source_group_id, destination_group_id, table_name, replication, .{
             .start = source_state.split_key,
@@ -5366,10 +5374,14 @@ pub const DataServer = struct {
         byte_range: antfly.db.types.ByteRange,
         delta_sequence: u64,
     ) !void {
-        try self.sendSplitDestinationBatch(destination_base_uri, destination_group_id, table_name, replication, .{
+        var checkpoint_replication = replication;
+        checkpoint_replication.operation = .checkpoint;
+        checkpoint_replication.sequence = delta_sequence;
+        try self.sendSplitDestinationBatch(destination_base_uri, destination_group_id, table_name, checkpoint_replication, .{
             .sync_level = .write,
             .split_checkpoint = .{
                 .kind = .destination,
+                .transition_id = replication.transition_id,
                 .source_group_id = source_group_id,
                 .destination_group_id = destination_group_id,
                 .range_start = byte_range.start,
@@ -5381,6 +5393,7 @@ pub const DataServer = struct {
             .sync_level = .write,
             .split_checkpoint = .{
                 .kind = .source_ack,
+                .transition_id = replication.transition_id,
                 .source_group_id = source_group_id,
                 .destination_group_id = destination_group_id,
                 .delta_sequence = delta_sequence,
@@ -5412,11 +5425,13 @@ pub const DataServer = struct {
 
     fn splitReplicationContext(
         self: *DataServer,
+        transition_id: u64,
         source_group_id: u64,
         destination_group_id: u64,
     ) !antfly.db.types.SplitReplicationContext {
         if (source_group_id == destination_group_id) return error.InvalidBatchRequest;
         return .{
+            .transition_id = transition_id,
             .source_group_id = source_group_id,
             .destination_group_id = destination_group_id,
             .identity_namespace = (try self.identityNamespaceForLocalGroup(source_group_id)) orelse
@@ -5501,7 +5516,7 @@ pub const DataServer = struct {
         });
     }
 
-    fn observeReplicatedSplit(self: *DataServer, source_group_id: u64, destination_group_id: u64) !antfly.data.SplitTransitionStatus {
+    fn observeReplicatedSplit(self: *DataServer, transition_id: u64, source_group_id: u64, destination_group_id: u64) !antfly.data.SplitTransitionStatus {
         const source_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, source_group_id);
         defer self.alloc.free(source_root_dir);
         try self.ensureSplitSourceApplyStoreSeeded(source_root_dir, source_group_id);
@@ -5509,7 +5524,10 @@ pub const DataServer = struct {
         const source_state = try source_store.currentSplitState(self.alloc, source_group_id);
         defer if (source_state) |state| antfly.data.storage.shard_state_store.freeSplitState(self.alloc, state);
         const acknowledgement = try source_store.currentSplitAcknowledgement(self.alloc, source_group_id);
-        const bootstrapped = if (acknowledgement) |ack| ack.destination_group_id == destination_group_id else false;
+        const bootstrapped = if (acknowledgement) |ack|
+            ack.transition_id == transition_id and ack.destination_group_id == destination_group_id
+        else
+            false;
         return antfly.data.storage.range_transition.deriveSplitStatus(
             if (source_state) |state| state.phase else null,
             bootstrapped,
@@ -5518,12 +5536,12 @@ pub const DataServer = struct {
         );
     }
 
-    fn splitProgressForSource(self: *DataServer, source_group_id: u64, destination_group_id: u64) !?u64 {
+    fn splitProgressForSource(self: *DataServer, transition_id: u64, source_group_id: u64, destination_group_id: u64) !?u64 {
         const namespace = try self.identityNamespaceForLocalGroup(source_group_id);
         const lease = (try self.leaseTransitionDbForTableGroup(source_group_id, source_group_id, namespace)) orelse return null;
         defer lease.release();
         const marker = (try lease.db.getSplitBootstrapMarker(self.alloc)) orelse return null;
-        if (marker.source_group_id != source_group_id or marker.destination_group_id != destination_group_id) return null;
+        if (marker.transition_id != transition_id or marker.source_group_id != source_group_id or marker.destination_group_id != destination_group_id) return null;
         return try lease.db.getSplitDeltaFinalSeq(self.alloc);
     }
 
@@ -12115,6 +12133,7 @@ test "data raft source split lifecycle commands bypass document db apply" {
     try std.testing.expect(batchRequiresDocumentDbApply(.{
         .split_checkpoint = .{
             .kind = .source_ack,
+            .transition_id = 7000,
             .source_group_id = 7001,
             .destination_group_id = 7002,
             .delta_sequence = 1,

@@ -612,6 +612,7 @@ pub const RaftApplyStore = struct {
         if (decoded.batch.req.split_checkpoint) |checkpoint| {
             if (checkpoint.kind == .source_ack) {
                 try operations.append(alloc, .{ .acknowledge_split = .{
+                    .transition_id = checkpoint.transition_id,
                     .destination_group_id = checkpoint.destination_group_id,
                     .delta_sequence = checkpoint.delta_sequence,
                 } });
@@ -1062,6 +1063,7 @@ test "data raft apply store persists split destination acknowledgements" {
     const batch = try data_raft_batch.encode(std.testing.allocator, "docs", .{
         .split_checkpoint = .{
             .kind = .source_ack,
+            .transition_id = 200,
             .source_group_id = 201,
             .destination_group_id = 202,
             .delta_sequence = 9,

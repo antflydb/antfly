@@ -42,6 +42,7 @@ pub const BorrowedDestinationDb = struct {
 };
 
 pub const SyncConfig = struct {
+    transition_id: u64 = 1,
     source_root_dir: []const u8,
     dest_root_dir: []const u8,
     source_group_id: u64,
@@ -79,7 +80,8 @@ pub fn observeSplitStatus(alloc: std.mem.Allocator, cfg: SyncConfig) !SplitSyncS
     const progress_db = cfg.progress_db orelse dest_db orelse return error.MissingSplitProgressStore;
     const bootstrap_marker = try progress_db.getSplitBootstrapMarker(alloc);
     const bootstrapped = if (bootstrap_marker) |marker|
-        marker.source_group_id == cfg.source_group_id and marker.destination_group_id == cfg.dest_group_id
+        marker.transition_id == cfg.transition_id and
+            marker.source_group_id == cfg.source_group_id and marker.destination_group_id == cfg.dest_group_id
     else
         false;
     const source_state = try source.currentSplitState(alloc, cfg.source_group_id);
@@ -433,6 +435,7 @@ pub const SyncCoordinator = struct {
     dest_root_dir: []u8,
     source_group_id: u64,
     dest_group_id: u64,
+    transition_id: u64,
     source_cfg: data_store.RaftApplyStoreConfig,
     dest_cfg: DestinationConfig,
     source: *data_store.RaftApplyStore,
@@ -478,6 +481,7 @@ pub const SyncCoordinator = struct {
             .dest_root_dir = dest_root_dir,
             .source_group_id = cfg.source_group_id,
             .dest_group_id = cfg.dest_group_id,
+            .transition_id = cfg.transition_id,
             .source_cfg = source_cfg,
             .dest_cfg = dest_cfg,
             .source = source,
@@ -517,12 +521,13 @@ pub const SyncCoordinator = struct {
         if (source_phase.? != .splitting and source_phase.? != .finalizing) return false;
 
         if (try self.dest.db.getSplitBootstrapMarker(self.alloc)) |marker| {
-            if (marker.source_group_id == self.source_group_id and marker.destination_group_id == self.dest_group_id) return false;
+            if (marker.transition_id == self.transition_id and marker.source_group_id == self.source_group_id and marker.destination_group_id == self.dest_group_id) return false;
         }
         const handoff = try self.source.captureSplitHandoff(self.alloc, self.source_group_id);
         defer shard_state_store.freeHandoff(self.alloc, handoff);
         try self.dest.applyHandoff(self.alloc, handoff);
         try self.dest.db.setSplitBootstrapMarker(.{
+            .transition_id = self.transition_id,
             .source_group_id = self.source_group_id,
             .destination_group_id = self.dest_group_id,
         });
@@ -596,7 +601,8 @@ pub const SyncCoordinator = struct {
     pub fn status(self: *SyncCoordinator) !SplitSyncStatus {
         const bootstrap_marker = try self.dest.db.getSplitBootstrapMarker(self.alloc);
         const bootstrapped = if (bootstrap_marker) |marker|
-            marker.source_group_id == self.source_group_id and marker.destination_group_id == self.dest_group_id
+            marker.transition_id == self.transition_id and
+                marker.source_group_id == self.source_group_id and marker.destination_group_id == self.dest_group_id
         else
             false;
         const source_state = try self.source.currentSplitState(self.alloc, self.source_group_id);
@@ -1518,6 +1524,7 @@ test "db split status uses source acknowledgement without opening destination" {
     var progress = try db_mod.DB.open(std.testing.allocator, progress_root, .{});
     defer progress.close();
     try progress.setSplitBootstrapMarker(.{
+        .transition_id = 1,
         .source_group_id = 7001,
         .destination_group_id = 7002,
     });

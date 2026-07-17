@@ -118,6 +118,7 @@ pub const SplitReplicationCheckpoint = struct {
     };
 
     kind: Kind,
+    transition_id: u64,
     source_group_id: u64,
     destination_group_id: u64,
     range_start: []const u8 = "",
@@ -129,9 +130,19 @@ pub const SplitReplicationCheckpoint = struct {
 /// destination batch carries this context so all replicas create the physical
 /// DB with the same namespace before the destination range is catalog-visible.
 pub const SplitReplicationContext = struct {
+    pub const Operation = enum {
+        bootstrap_chunk,
+        delta,
+        checkpoint,
+    };
+
+    transition_id: u64,
     source_group_id: u64,
     destination_group_id: u64,
     identity_namespace: doc_identity_mod.Namespace,
+    operation: Operation = .bootstrap_chunk,
+    /// Source split-delta sequence. Zero for bootstrap chunks.
+    sequence: u64 = 0,
 };
 
 pub const SplitTransitionMutation = struct {

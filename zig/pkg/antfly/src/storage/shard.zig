@@ -462,6 +462,14 @@ pub const ShardManager = struct {
         };
     }
 
+    pub fn adoptOwnedByteRange(self: *ShardManager, start: []u8, end: []u8) void {
+        self.alloc.free(self.owned_range_start);
+        self.alloc.free(self.owned_range_end);
+        self.owned_range_start = start;
+        self.owned_range_end = end;
+        self.byte_range = .{ .start = start, .end = end };
+    }
+
     pub fn getSplitState(self: *const ShardManager) ?SplitState {
         return self.split_state;
     }

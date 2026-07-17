@@ -19,11 +19,12 @@ const docstore_mod = @import("../docstore.zig");
 const lsm_backend = @import("../lsm_backend.zig");
 const mem_backend = @import("../mem_backend.zig");
 
-const range_key = "\x00\x00__metadata__:range";
-const split_delta_final_seq_key = "\x00\x00__metadata__:split_delta_final_seq";
-const split_bootstrap_marker_key = "\x00\x00__metadata__:split_bootstrap_marker";
+pub const range_key = "\x00\x00__metadata__:range";
+pub const split_delta_final_seq_key = "\x00\x00__metadata__:split_delta_final_seq";
+pub const split_bootstrap_marker_key = "\x00\x00__metadata__:split_bootstrap_marker";
 
 pub const SplitBootstrapMarker = struct {
+    transition_id: u64,
     source_group_id: u64,
     destination_group_id: u64,
 };
@@ -150,23 +151,35 @@ pub fn loadSplitBootstrapMarker(alloc: Allocator, store: anytype) !?SplitBootstr
         error.NotFound => return null,
         else => return err,
     };
-    if (borrowed.len != 2 * @sizeOf(u64)) return error.InvalidSplitBootstrapMarker;
+    if (borrowed.len != 3 * @sizeOf(u64)) return error.InvalidSplitBootstrapMarker;
     return .{
-        .source_group_id = std.mem.readInt(u64, borrowed[0..8], .little),
-        .destination_group_id = std.mem.readInt(u64, borrowed[8..16], .little),
+        .transition_id = std.mem.readInt(u64, borrowed[0..8], .little),
+        .source_group_id = std.mem.readInt(u64, borrowed[8..16], .little),
+        .destination_group_id = std.mem.readInt(u64, borrowed[16..24], .little),
     };
 }
 
 pub fn saveSplitBootstrapMarker(store: anytype, marker: SplitBootstrapMarker) !void {
-    var buf: [2 * @sizeOf(u64)]u8 = undefined;
-    std.mem.writeInt(u64, buf[0..8], marker.source_group_id, .little);
-    std.mem.writeInt(u64, buf[8..16], marker.destination_group_id, .little);
+    var buf: [3 * @sizeOf(u64)]u8 = undefined;
+    const encoded = encodeSplitBootstrapMarker(marker, &buf);
     var runtime = try initRuntimeStore(std.heap.page_allocator, store);
     defer runtime.deinit();
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
-    try txn.put(split_bootstrap_marker_key, &buf);
+    try txn.put(split_bootstrap_marker_key, encoded);
     try txn.commit();
+}
+
+pub fn encodeSplitDeltaFinalSeq(seq: u64, buf: *[8]u8) []const u8 {
+    std.mem.writeInt(u64, buf, seq, .little);
+    return buf;
+}
+
+pub fn encodeSplitBootstrapMarker(marker: SplitBootstrapMarker, buf: *[3 * @sizeOf(u64)]u8) []const u8 {
+    std.mem.writeInt(u64, buf[0..8], marker.transition_id, .little);
+    std.mem.writeInt(u64, buf[8..16], marker.source_group_id, .little);
+    std.mem.writeInt(u64, buf[16..24], marker.destination_group_id, .little);
+    return buf;
 }
 
 pub fn clearSplitBootstrapMarker(store: anytype) !void {

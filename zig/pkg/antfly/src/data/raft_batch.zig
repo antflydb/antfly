@@ -99,6 +99,7 @@ test "raft batch round trips internal split checkpoint" {
     const encoded = try encode(std.testing.allocator, "docs", .{
         .split_checkpoint = .{
             .kind = .destination,
+            .transition_id = 40,
             .source_group_id = 41,
             .destination_group_id = 42,
             .range_start = "doc:m",
@@ -124,6 +125,7 @@ test "raft batch round trips internal split replication identity" {
     const encoded = try encode(std.testing.allocator, "docs", .{
         .writes = &.{.{ .key = "doc:m", .value = "{}" }},
         .split_replication = .{
+            .transition_id = 40,
             .source_group_id = 41,
             .destination_group_id = 42,
             .identity_namespace = namespace,

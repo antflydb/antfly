@@ -4798,6 +4798,73 @@ pub const DB = struct {
         });
     }
 
+    fn splitMarkerMatches(marker: range_state_mod.SplitBootstrapMarker, transition_id: u64, source_group_id: u64, destination_group_id: u64) bool {
+        return marker.transition_id == transition_id and
+            marker.source_group_id == source_group_id and
+            marker.destination_group_id == destination_group_id;
+    }
+
+    /// Runs under the DB apply lock. False means the replicated operation was
+    /// already durably applied and must not produce another document replay.
+    fn shouldApplySplitReplicationLocked(self: *DB, req: types.BatchRequest) !bool {
+        if (req.split_replication) |replication| {
+            if (replication.transition_id == 0 or
+                replication.source_group_id == replication.destination_group_id)
+            {
+                return error.InvalidBatchRequest;
+            }
+            const marker = try self.core.loadSplitBootstrapMarker(self.alloc);
+            switch (replication.operation) {
+                .bootstrap_chunk => {
+                    if (marker) |complete| {
+                        if (!splitMarkerMatches(complete, replication.transition_id, replication.source_group_id, replication.destination_group_id)) {
+                            return error.ConflictingSplitTransition;
+                        }
+                        return false;
+                    }
+                },
+                .delta => {
+                    const complete = marker orelse return error.SplitBootstrapIncomplete;
+                    if (!splitMarkerMatches(complete, replication.transition_id, replication.source_group_id, replication.destination_group_id)) {
+                        return error.ConflictingSplitTransition;
+                    }
+                    if (replication.sequence == 0) return error.InvalidBatchRequest;
+                    const applied = try self.core.loadSplitDeltaFinalSeq(self.alloc);
+                    if (replication.sequence <= applied) return false;
+                    if (replication.sequence != applied + 1) return error.SplitReplicationSequenceGap;
+                },
+                .checkpoint => {
+                    const checkpoint = req.split_checkpoint orelse return error.MissingSplitReplicationCheckpoint;
+                    if (checkpoint.kind != .destination or
+                        checkpoint.transition_id != replication.transition_id or
+                        checkpoint.source_group_id != replication.source_group_id or
+                        checkpoint.destination_group_id != replication.destination_group_id or
+                        checkpoint.delta_sequence != replication.sequence)
+                    {
+                        return error.InvalidBatchRequest;
+                    }
+                    if (marker) |complete| {
+                        if (!splitMarkerMatches(complete, replication.transition_id, replication.source_group_id, replication.destination_group_id)) {
+                            return error.ConflictingSplitTransition;
+                        }
+                        const applied = try self.core.loadSplitDeltaFinalSeq(self.alloc);
+                        if (checkpoint.delta_sequence > applied) return error.SplitReplicationSequenceGap;
+                        return false;
+                    }
+                },
+            }
+        } else if (req.split_checkpoint) |checkpoint| {
+            if (checkpoint.kind != .source_ack or checkpoint.transition_id == 0) return error.MissingSplitReplicationContext;
+            if (try self.core.loadSplitBootstrapMarker(self.alloc)) |marker| {
+                if (!splitMarkerMatches(marker, checkpoint.transition_id, checkpoint.source_group_id, checkpoint.destination_group_id)) {
+                    return error.ConflictingSplitTransition;
+                }
+                if (checkpoint.delta_sequence <= try self.core.loadSplitDeltaFinalSeq(self.alloc)) return false;
+            }
+        }
+        return true;
+    }
+
     fn setSchemaReplicatedApplyWithMarker(self: *DB, table_schema: schema_mod.TableSchema, applied_lsn_marker: ?u64) anyerror!void {
         try self.core.setSchema(table_schema);
         if (applied_lsn_marker) |lsn| try self.markHAReplicationRecordApplied(lsn);
@@ -5052,6 +5119,11 @@ pub const DB = struct {
                 lockApply(self);
                 apply_mutex_held = true;
             }
+        }
+
+        if (!try self.shouldApplySplitReplicationLocked(req)) {
+            self.core.unlockApply();
+            return;
         }
 
         const resolve_transforms_start_ns = monotonicTimeNs();
@@ -5583,6 +5655,45 @@ pub const DB = struct {
                 try store_writes.append(self.alloc, haAppliedReplicationLsnWrite(lsn, &ha_applied_lsn_value_buf));
             }
         }
+        var split_range_buf: [1024]u8 = undefined;
+        var split_sequence_buf: [8]u8 = undefined;
+        var split_marker_buf: [3 * @sizeOf(u64)]u8 = undefined;
+        var persisted_range: ?types.ByteRange = null;
+        var persisted_range_start_owned: ?[]u8 = null;
+        defer if (persisted_range_start_owned) |value| self.alloc.free(value);
+        var persisted_range_end_owned: ?[]u8 = null;
+        defer if (persisted_range_end_owned) |value| self.alloc.free(value);
+        if (req.split_replication) |replication| {
+            if (replication.operation == .delta) {
+                try store_writes.append(self.alloc, .{
+                    .key = range_state_mod.split_delta_final_seq_key,
+                    .value = range_state_mod.encodeSplitDeltaFinalSeq(replication.sequence, &split_sequence_buf),
+                });
+            }
+        }
+        if (req.split_checkpoint) |checkpoint| {
+            if (checkpoint.kind == .destination) {
+                persisted_range = .{ .start = checkpoint.range_start, .end = checkpoint.range_end };
+                persisted_range_start_owned = try self.alloc.dupe(u8, checkpoint.range_start);
+                persisted_range_end_owned = try self.alloc.dupe(u8, checkpoint.range_end);
+                try store_writes.append(self.alloc, .{
+                    .key = range_state_mod.range_key,
+                    .value = try range_state_mod.encodeRange(persisted_range.?, &split_range_buf),
+                });
+            }
+            try store_writes.append(self.alloc, .{
+                .key = range_state_mod.split_delta_final_seq_key,
+                .value = range_state_mod.encodeSplitDeltaFinalSeq(checkpoint.delta_sequence, &split_sequence_buf),
+            });
+            try store_writes.append(self.alloc, .{
+                .key = range_state_mod.split_bootstrap_marker_key,
+                .value = range_state_mod.encodeSplitBootstrapMarker(.{
+                    .transition_id = checkpoint.transition_id,
+                    .source_group_id = checkpoint.source_group_id,
+                    .destination_group_id = checkpoint.destination_group_id,
+                }, &split_marker_buf),
+            });
+        }
         try appendDenseArtifactCounterMutations(
             self.alloc,
             self.core.store,
@@ -5607,6 +5718,11 @@ pub const DB = struct {
             replay_append,
             store_batch_options,
         );
+        if (persisted_range != null) {
+            self.core.adoptPersistedRangeOwned(persisted_range_start_owned.?, persisted_range_end_owned.?);
+            persisted_range_start_owned = null;
+            persisted_range_end_owned = null;
+        }
         if (!opts.bypass_ha_write_gate) {
             try self.mirrorHABatchMutationCommit(effective_req);
             try self.mirrorHAReplayPayloadCommit(replay_payload);
@@ -5621,7 +5737,11 @@ pub const DB = struct {
             active_profile.store_write_count += @intCast(store_writes.items.len);
             active_profile.store_delete_count += @intCast(delete_keys.items.len);
         }
-        if (shouldAppendSplitDelta(self)) {
+        const is_split_progress_checkpoint = if (req.split_checkpoint) |checkpoint|
+            checkpoint.kind == .source_ack
+        else
+            false;
+        if (shouldAppendSplitDelta(self) and !is_split_progress_checkpoint) {
             const split_delta_start_ns = monotonicTimeNs();
             try self.core.appendSplitDelta(batch_timestamp_ns, store_writes.items, delete_keys.items);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.split_delta_ns, split_delta_start_ns);
