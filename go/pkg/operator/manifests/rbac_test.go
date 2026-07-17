@@ -67,6 +67,9 @@ func TestHAAdminTokenSecretInjectionManifestsAreAligned(t *testing.T) {
 	if deployment.Namespace != OperatorNamespace {
 		t.Fatalf("deployment namespace = %q, want %q", deployment.Namespace, OperatorNamespace)
 	}
+	if !containerHasArg(deployment.Spec.Template.Spec.Containers, "antfly-operator-manager", "--enable-hot-standby-ha=false") {
+		t.Fatal("deployment must keep hot-standby HA release-gated off by default")
+	}
 
 	tokenEnv, ok := findContainerEnv(deployment.Spec.Template.Spec.Containers, "antfly-operator-manager", "ANTFLY_HA_ADMIN_TOKEN")
 	if !ok {
@@ -137,6 +140,15 @@ func TestStorageAutoGrowRBACGrantsNodeProxyOnly(t *testing.T) {
 	if subject.Kind != "ServiceAccount" || subject.Name != ServiceAccountName || subject.Namespace != OperatorNamespace {
 		t.Fatalf("StorageAutoGrowClusterRoleBinding subject = %#v", subject)
 	}
+}
+
+func containerHasArg(containers []corev1.Container, containerName, arg string) bool {
+	for _, container := range containers {
+		if container.Name == containerName && containsString(container.Args, arg) {
+			return true
+		}
+	}
+	return false
 }
 
 func findContainerEnv(containers []corev1.Container, containerName string, envName string) (corev1.EnvVar, bool) {
