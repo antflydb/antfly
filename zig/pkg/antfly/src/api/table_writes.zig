@@ -9191,6 +9191,12 @@ pub const ProvisionedTableWriteSource = struct {
                 return err;
             };
             cache.publishCachedLeaseGeneration(&cached, lsm_root_generation);
+            // The structural metadata publication can advance the visible
+            // root immediately after this operation returns. The resident DB
+            // already contains the reconciled schema, so allow the next lease
+            // to adopt that publication instead of leaving a permanently
+            // mismatched writer that returns ReadUnavailable.
+            if (cached.entry) |entry| entry.allow_generation_adoption = true;
             return false;
         }
 
