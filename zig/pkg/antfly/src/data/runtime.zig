@@ -9935,11 +9935,13 @@ fn nodeIdInSlice(node_ids: []const u64, node_id: u64) bool {
 const PlacementTopologyIndex = struct {
     const Group = struct {
         peers: std.ArrayListUnmanaged(u64) = .empty,
+        member_rows: std.ArrayListUnmanaged(u64) = .empty,
         transition_voters: std.ArrayListUnmanaged(u64) = .empty,
         pristine: bool = true,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.peers.deinit(alloc);
+            self.member_rows.deinit(alloc);
             self.transition_voters.deinit(alloc);
             self.* = undefined;
         }
@@ -9959,6 +9961,7 @@ const PlacementTopologyIndex = struct {
             if (!entry.found_existing) entry.value_ptr.* = .{};
             const group = entry.value_ptr;
             try appendUniqueNodeId(alloc, &group.peers, intent.record.local_node_id);
+            try appendUniqueNodeId(alloc, &group.member_rows, intent.record.local_node_id);
             for (intent.peer_node_ids) |node_id| try appendUniqueNodeId(alloc, &group.peers, node_id);
             group.pristine = group.pristine and
                 intent.serving_state == .serving and
@@ -9973,6 +9976,7 @@ const PlacementTopologyIndex = struct {
         var it = self.groups.valueIterator();
         while (it.next()) |group| {
             std.mem.sort(u64, group.peers.items, {}, comptime std.sort.asc(u64));
+            std.mem.sort(u64, group.member_rows.items, {}, comptime std.sort.asc(u64));
             std.mem.sort(u64, group.transition_voters.items, {}, comptime std.sort.asc(u64));
         }
         return self;
@@ -9992,7 +9996,13 @@ const PlacementTopologyIndex = struct {
 
     fn initialVoters(self: *const @This(), group_id: u64) ?[]const u64 {
         const group = self.groups.get(group_id) orelse return null;
-        return if (group.pristine) group.peers.items else group.transition_voters.items;
+        if (group.pristine) return group.peers.items;
+        // Transition peer lists intentionally include non-voting targets. A
+        // partially projected transition cannot prove the complete incumbent
+        // voter set, so an empty replica must wait for every member row rather
+        // than seed a smaller, incompatible cluster.
+        if (group.member_rows.items.len != group.peers.items.len) return null;
+        return group.transition_voters.items;
     }
 };
 
@@ -10004,6 +10014,25 @@ test "placement peer collection preserves complete intent peers during partial p
     var topology = try PlacementTopologyIndex.init(std.testing.allocator, &intents);
     defer topology.deinit();
     try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, topology.peers(703).?);
+}
+
+test "placement topology refuses partial transition bootstrap voters" {
+    const partial = [_]antfly.raft.PlacementIntent{
+        .{
+            .record = .{ .group_id = 704, .replica_id = 1, .local_node_id = 1 },
+            .peer_node_ids = &.{ 1, 2, 3, 4 },
+            .serving_state = .serving,
+        },
+        .{
+            .record = .{ .group_id = 704, .replica_id = 4, .local_node_id = 4 },
+            .peer_node_ids = &.{ 1, 2, 3, 4 },
+            .serving_state = .bootstrapping,
+            .relocation_generation = 9,
+        },
+    };
+    var topology = try PlacementTopologyIndex.init(std.testing.allocator, &partial);
+    defer topology.deinit();
+    try std.testing.expect(topology.initialVoters(704) == null);
 }
 
 fn appendOwnedPeerRouteUpsert(

@@ -167,7 +167,7 @@ pub const PlacementPlanner = struct {
                 candidate_node_ids,
                 candidate_domains,
                 table.placement_role,
-                std.sort.binarySearch(u64, protected_group_ids, range.group_id, comptime std.sort.asc(u64)) != null,
+                std.sort.binarySearch(u64, protected_group_ids, range.group_id, compareNodeId) != null,
             );
             defer self.alloc.free(preserved);
             for (preserved) |node_id| {
@@ -586,6 +586,10 @@ fn candidateLoadPressure(candidate_domains: []const CandidateDomain, node_id: u6
         if (candidate.node_id == node_id) return candidate.read_load + candidate.write_load;
     }
     return 0;
+}
+
+fn compareNodeId(expected: u64, candidate: u64) std.math.Order {
+    return std.math.order(expected, candidate);
 }
 
 fn candidateRetentionAllowed(candidate_domains: []const CandidateDomain, node_id: u64, protect_current_member: bool) bool {

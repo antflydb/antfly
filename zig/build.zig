@@ -3405,6 +3405,7 @@ pub fn build(b: *std.Build) void {
         "data descriptor factory separates bootstrap voters from transport peers",
         "data descriptor factory bootstraps pristine group from complete intent peer set",
         "placement peer collection preserves complete intent peers during partial projection",
+        "placement topology refuses partial transition bootstrap voters",
         "data runtime local group status reflects active transition readiness",
         "data runtime local group status uses metadata transition observation when local pair is absent",
         "data runtime local group status prefers merged snapshot readiness fallback",
