@@ -21853,7 +21853,7 @@ fn completeDocumentExtractionGeneratedText(
     const active_runtime = runtime orelse return;
     const producer = active_runtime.config.asset_producer orelse return;
     for (extraction.units) |*unit| {
-        if (config.ocr_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_ocr")) {
+        if (document_extraction_mod.ocrEnabledForRoute(config, extraction.route_type) and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_ocr")) {
             var rendered_page: ?[]u8 = null;
             defer if (rendered_page) |png| alloc.free(png);
             if (std.mem.eql(u8, extraction.route_type, "pdf")) {
@@ -21875,17 +21875,21 @@ fn completeDocumentExtractionGeneratedText(
                 .source_text = if (rendered_page != null) "" else source_url,
                 .source_parts_json = parts_json,
                 .content_type = "text/plain",
-            }) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => {
+            }) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                if (isUnavailableGeneratedTextModelError(.ocr, err)) {
                     try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, err);
                     continue;
-                },
+                }
+                if (isRetryableAssetProducerError(err)) return err;
+                try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, err);
+                continue;
             };
             errdefer alloc.free(produced);
-            applyGeneratedUnitText(alloc, unit, produced, "ocr_text", "completed", .ocr) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, err),
+            applyGeneratedUnitText(alloc, unit, produced, "ocr_text", "completed", .ocr) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                if (isRetryableAssetProducerError(err)) return err;
+                try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, err);
             };
             continue;
         }
@@ -21906,6 +21910,38 @@ fn completeDocumentExtractionGeneratedText(
 }
 
 const GeneratedUnitTextKind = enum { ocr, transcript };
+
+fn isUnavailableGeneratedTextModelError(kind: GeneratedUnitTextKind, err: anyerror) bool {
+    if (kind != .ocr) return false;
+    return switch (err) {
+        error.ModelNotFound,
+        error.ModelNotSpecified,
+        error.UnsupportedReaderProvider,
+        => true,
+        else => false,
+    };
+}
+
+test "precompute OCR error policy distinguishes unavailable models from transient inference failures" {
+    try std.testing.expect(isUnavailableGeneratedTextModelError(.ocr, error.ModelNotFound));
+    try std.testing.expect(isUnavailableGeneratedTextModelError(.ocr, error.ModelNotSpecified));
+    try std.testing.expect(isUnavailableGeneratedTextModelError(.ocr, error.UnsupportedReaderProvider));
+    try std.testing.expect(!isUnavailableGeneratedTextModelError(.ocr, error.ConnectionTimedOut));
+    try std.testing.expect(isRetryableAssetProducerError(error.ConnectionTimedOut));
+    try std.testing.expect(isRetryableAssetProducerError(error.EmbedRateLimited));
+}
+
+test "db document extraction OCR default is scoped to PDF routes" {
+    const alloc = std.testing.allocator;
+    var defaults = try document_extraction_mod.parseConfig(alloc, "{}");
+    defer defaults.deinit(alloc);
+    try std.testing.expect(document_extraction_mod.ocrEnabledForRoute(defaults, "pdf"));
+    try std.testing.expect(!document_extraction_mod.ocrEnabledForRoute(defaults, "image"));
+
+    var explicit_image = try document_extraction_mod.parseConfig(alloc, "{\"ocr\":true}");
+    defer explicit_image.deinit(alloc);
+    try std.testing.expect(document_extraction_mod.ocrEnabledForRoute(explicit_image, "image"));
+}
 
 fn applyGeneratedUnitText(
     alloc: Allocator,

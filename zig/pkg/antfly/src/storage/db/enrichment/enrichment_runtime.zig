@@ -2729,7 +2729,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     kind: RuntimeGeneratedUnitTextKind,
 ) !void {
     const enabled = switch (kind) {
-        .ocr => config.ocr_enabled,
+        .ocr => document_extraction_mod.ocrEnabledForRoute(config, route_type),
         .transcript => config.transcription_enabled,
     };
     if (!enabled) return;
@@ -3289,13 +3289,13 @@ fn replaceDocumentExtractionUnitWithClone(alloc: Allocator, dst: *document_extra
     dst.* = cloned;
 }
 
-fn runtimeGeneratedTextNeeded(config: document_extraction_mod.Config, unit: document_extraction_mod.Unit) bool {
-    return runtimeGeneratedTextKind(config, unit) != null;
+fn runtimeGeneratedTextNeeded(config: document_extraction_mod.Config, route_type: []const u8, unit: document_extraction_mod.Unit) bool {
+    return runtimeGeneratedTextKind(config, route_type, unit) != null;
 }
 
-fn runtimeGeneratedTextKind(config: document_extraction_mod.Config, unit: document_extraction_mod.Unit) ?RuntimeGeneratedUnitTextKind {
+fn runtimeGeneratedTextKind(config: document_extraction_mod.Config, route_type: []const u8, unit: document_extraction_mod.Unit) ?RuntimeGeneratedUnitTextKind {
     const status = unit.extraction_status orelse return null;
-    if (config.ocr_enabled and std.mem.eql(u8, status, "pending_ocr")) return .ocr;
+    if (document_extraction_mod.ocrEnabledForRoute(config, route_type) and std.mem.eql(u8, status, "pending_ocr")) return .ocr;
     if (config.transcription_enabled and std.mem.eql(u8, status, "pending_transcription")) return .transcript;
     return null;
 }
@@ -3341,7 +3341,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
 
     fn onUnit(ptr: *anyopaque, unit: *document_extraction_mod.Unit) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (runtimeGeneratedTextKind(self.config, unit.*)) |kind| {
+        if (runtimeGeneratedTextKind(self.config, self.info.route_type, unit.*)) |kind| {
             if (self.pending_generated_kind != null and self.pending_generated_kind.? != kind) {
                 try self.flushPendingGeneratedText();
             }
@@ -3606,7 +3606,7 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
 
     fn onUnit(ptr: *anyopaque, unit: *document_extraction_mod.Unit) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (runtimeGeneratedTextNeeded(self.config, unit.*)) {
+        if (runtimeGeneratedTextNeeded(self.config, self.info.route_type, unit.*)) {
             const cached = self.generated_units.get(unit.unit_id) orelse return error.MissingGeneratedUnitCache;
             try replaceDocumentExtractionUnitWithClone(self.runtime.alloc, unit, cached.*);
         }
