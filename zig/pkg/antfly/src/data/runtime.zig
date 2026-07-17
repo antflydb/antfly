@@ -2116,14 +2116,6 @@ fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
         error.BrokenPipe,
         error.EndOfStream,
         error.UnexpectedHttpStatus,
-        // The upstream can reject one final fetch/status update while a
-        // durably promoted standby is adopting its primary resources. These
-        // HTTP status mappings must leave the process available and fail
-        // closed until the next round observes the completed handoff.
-        error.InvalidInternalReplicationRequest,
-        error.InternalReplicationEndpointNotFound,
-        error.InternalReplicationConflict,
-        error.InternalReplicationEndpointNotReady,
         error.NotListening,
         error.UnsupportedReplicationFormat,
         error.InternalReplicationDidNotAdvance,
@@ -2166,13 +2158,6 @@ fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
         => true,
         else => false,
     };
-}
-
-test "HA standby HTTP status errors do not terminate the runtime loop" {
-    try std.testing.expect(isNonFatalHAStandbyReplicationError(error.InvalidInternalReplicationRequest));
-    try std.testing.expect(isNonFatalHAStandbyReplicationError(error.InternalReplicationEndpointNotFound));
-    try std.testing.expect(isNonFatalHAStandbyReplicationError(error.InternalReplicationConflict));
-    try std.testing.expect(isNonFatalHAStandbyReplicationError(error.InternalReplicationEndpointNotReady));
 }
 
 fn isRetryableMetadataBootstrapError(err: anyerror) bool {
