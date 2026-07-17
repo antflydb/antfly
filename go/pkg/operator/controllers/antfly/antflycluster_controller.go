@@ -4652,11 +4652,18 @@ func (r *AntflyClusterReconciler) updateHAStartupGateStatus(ctx context.Context,
 				!haAdminActionSucceededWithEvidence(action) {
 				continue
 			}
+			matchesCurrentTarget, err := r.haActivationReceiptMatchesCurrentTarget(ctx, cluster, action)
+			if err != nil {
+				status.Reason = "ActivationReceiptSourceLookupFailed"
+				return
+			}
+			if !matchesCurrentTarget {
+				continue
+			}
 			receipt := action.SeedArtifactReceipt
 			if receipt.ClusterID != identity.ClusterID || receipt.ShardID != identity.ShardID ||
 				receipt.TableID != identity.TableID || receipt.TimelineID != identity.TimelineID || receipt.Epoch != identity.Epoch {
-				status.Reason = "ActivationReceiptReplicationIdentityMismatch"
-				return
+				continue
 			}
 			status.ActivationReceipt = &antflyv1.HASeedActivationReceiptStatus{
 				TopologyID:                  receipt.TopologyID,

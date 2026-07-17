@@ -469,6 +469,11 @@ const RuntimeLeaseWatchdog = struct {
                 data_server.ha_public_gate_state.publishExternalAuthorityUntil(true, self.watchdog.local_deadline_ns);
             },
             .fence => {
+                // Fence transitions wait for every mutation that passed the
+                // preflight authority gate to finish its local commit and HA
+                // append before freezing the durable tail.
+                var mutation_lease = data_server.ha_mutation_barrier.acquireExclusive();
+                defer mutation_lease.release();
                 platform_sync.lockYielding(&data_server.ha_state_mutex);
                 defer data_server.ha_state_mutex.unlock();
                 self.proof_active.store(false, .release);

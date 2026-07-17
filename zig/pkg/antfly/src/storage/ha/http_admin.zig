@@ -33,6 +33,7 @@ const backup_manifest = @import("backup_manifest.zig");
 const commit_gate = @import("commit_gate.zig");
 const fencing = @import("fencing.zig");
 const lifecycle_receipt_ledger = @import("lifecycle_receipt_ledger.zig");
+const mutation_barrier = @import("mutation_barrier.zig");
 const owner_job_gate = @import("owner_job_gate.zig");
 const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");
@@ -169,6 +170,7 @@ pub const Server = struct {
         lifecycle_receipts: ?LifecycleReceipts = null,
         lease_watchdog_proof: ?LeaseWatchdogProofSource = null,
         repair_receipt: ?RepairReceiptSink = null,
+        primary_fence_barrier: ?*mutation_barrier.MutationBarrier = null,
         primary_fence_started: ?StateChangedHook = null,
         state_changed: ?StateChangedHook = null,
     };
@@ -218,6 +220,13 @@ pub const Server = struct {
             if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
             return try self.handleAdminWatchdogProof();
         }
+        var primary_fence_lease: ?mutation_barrier.MutationBarrier.ExclusiveLease = null;
+        if (req.method == .POST and std.mem.eql(u8, path, admin_api.routes.ha_fence)) {
+            if (self.auth.primary_fence_barrier) |barrier| {
+                primary_fence_lease = barrier.acquireExclusive();
+            }
+        }
+        defer if (primary_fence_lease) |*lease| lease.release();
         const state_mutex = self.auth.state_mutex;
         if (state_mutex) |mutex| platform_sync.lockYielding(mutex);
         defer if (state_mutex) |mutex| mutex.unlock();

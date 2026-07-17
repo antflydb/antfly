@@ -4435,6 +4435,7 @@ pub const DataServer = struct {
                     } else null,
                     .lease_watchdog_proof = self.ha_cfg.lease_watchdog_proof,
                     .repair_receipt = self.ha_cfg.repair_receipt,
+                    .primary_fence_barrier = &self.ha_mutation_barrier,
                     .primary_fence_started = .{
                         .ptr = self,
                         .run_fn = DataServer.haPrimaryFenceStartedCallback,
@@ -21582,6 +21583,7 @@ test "data server promotion rewires live HTTP internal HA executor" {
     try std.testing.expect(server.ha_cfg.admin_context.?.standby == null);
     try std.testing.expect(server.ha_cfg.admin_context.?.promoted_standby_handoff != null);
     try std.testing.expect(server.ha_admin_server.?.auth.state_mutex == &server.ha_state_mutex);
+    try std.testing.expect(server.ha_admin_server.?.auth.primary_fence_barrier == &server.ha_mutation_barrier);
     try std.testing.expect(server.ha_internal_server.?.state_mutex == &server.ha_state_mutex);
     const public_read_gate_after = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
     const public_write_gate_after = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;

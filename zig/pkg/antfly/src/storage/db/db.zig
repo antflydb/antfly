@@ -27232,7 +27232,9 @@ fn mirrorHAReplayPayloadCommitContext(ctx: *const BatchExecutionContext, payload
     if (transition_mutex) |mutex| lockAtomic(mutex);
     var transition_locked = transition_mutex != null;
     defer if (transition_locked) transition_mutex.?.unlock();
-    try enforceHAWriteGateOptional(ctx.ha_write_gate);
+    // The local store has already committed. Always represent that mutation in
+    // the HA tail; a fence that arrived after the preflight gate may reject the
+    // client acknowledgement below, but must not create an unlogged local fork.
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
@@ -27290,7 +27292,9 @@ fn mirrorHABatchMutationCommitContext(ctx: *const BatchExecutionContext, request
     if (transition_mutex) |mutex| lockAtomic(mutex);
     var transition_locked = transition_mutex != null;
     defer if (transition_locked) transition_mutex.?.unlock();
-    try enforceHAWriteGateOptional(ctx.ha_write_gate);
+    // The local store has already committed. Always append before applying the
+    // final authority check so rejoin cannot mistake local divergence for an
+    // exact fork boundary.
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
@@ -27342,7 +27346,8 @@ fn mirrorHASchemaMetadataCommitContext(ctx: *const BatchExecutionContext, table_
     if (transition_mutex) |mutex| lockAtomic(mutex);
     var transition_locked = transition_mutex != null;
     defer if (transition_locked) transition_mutex.?.unlock();
-    try enforceHAWriteGateOptional(ctx.ha_write_gate);
+    // As with document batches, committed metadata must remain represented in
+    // the HA tail even when authority expires before acknowledgement.
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
@@ -52778,6 +52783,79 @@ test "storage.ha seed capture barrier prevents local commit without matching wal
     write_thread.join();
     try std.testing.expectEqual(@as(u8, 0), write_probe.failed.load(.monotonic));
     try std.testing.expectEqual(@as(u8, 1), write_probe.done.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    const stored = (try db.get(alloc, "doc:b")) orelse return error.TestExpectedEqual;
+    defer alloc.free(stored);
+    try std.testing.expectEqualStrings("{\"title\":\"bravo\"}", stored);
+}
+
+test "storage.ha fence cannot strand a local commit beyond the HA tail" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.heap.c_allocator;
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 251,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    var public_gate = ha_public_gate_state_mod.State{};
+    public_gate.configurePrimary(&primary, false);
+    var transition_mutex: std.atomic.Mutex = .unlocked;
+    var barrier: HAMutationBarrier = .{};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .mutation_barrier = &barrier,
+            .transition_mutex = &transition_mutex,
+        },
+        .ha_write_gate = .{ .shared = .{ .state = &public_gate } },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    lockAtomic(&transition_mutex);
+    var transition_locked = true;
+    var write_probe = ConcurrentWriteProbe{ .db = &db };
+    const write_thread = try std.Thread.spawn(.{}, ConcurrentWriteProbe.runBatch, .{&write_probe});
+    var thread_joined = false;
+    errdefer {
+        if (transition_locked) transition_mutex.unlock();
+        if (!thread_joined) write_thread.join();
+    }
+    try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
+    var local_commit_observed = false;
+    for (0..10_000) |_| {
+        if (try db.get(alloc, "doc:b")) |stored| {
+            alloc.free(stored);
+            local_commit_observed = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(local_commit_observed);
+    try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
+
+    public_gate.publishPrimaryFence(true);
+    transition_mutex.unlock();
+    transition_locked = false;
+    write_thread.join();
+    thread_joined = true;
+
+    try std.testing.expectEqual(@as(u8, 1), write_probe.failed.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
     const stored = (try db.get(alloc, "doc:b")) orelse return error.TestExpectedEqual;
     defer alloc.free(stored);

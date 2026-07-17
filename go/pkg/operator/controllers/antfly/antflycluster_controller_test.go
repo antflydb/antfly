@@ -13058,6 +13058,50 @@ func TestUpdateHAStartupGateStatusObservesActivationReceiptFromPrimaryCR(t *test
 	g.Expect(target.Status.HAStatus.StartupGate.ActivationReceipt.TargetPVCUID).To(Equal("pvc-uid-1"))
 }
 
+func TestUpdateHAStartupGateStatusSkipsUnrelatedReceiptCollision(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	target := startupGatedStandaloneControllerCluster(true)
+	target.Name = "z-standby"
+	target.Status.HAStatus = &antflyv1.HAStatus{}
+	digest := strings.Repeat("a", 64)
+	action := antflyv1.HAPlannedActionStatus{
+		Kind: string(haActionActivateSeedArtifact), StandbyName: "standby-a", SlotName: "standby-a",
+		TargetLSN: 10, SeedArtifactGeneration: "prod-standby-a-10", AdminJobName: "activation-job", AdminJobPhase: haAdminJobPhaseSucceeded,
+		SeedCaptureReceiptSHA256: strings.Repeat("d", 64), TargetLocalNodeID: 1, TargetReplicaID: 1,
+		SeedArtifactReceipt: &antflyv1.HASeedArtifactReceiptStatus{
+			FormatVersion: 2, Generation: "prod-standby-a-10", SlotName: "standby-a", TopologyID: "test-standalone", TopologyGeneration: 3,
+			NodeID: "standby-a", TargetPVCName: "standby-a-data", TargetPVCUID: "pvc-uid-1", ClusterID: 100, TimelineID: 1, Epoch: 1,
+			ManifestID: "prod-standby-a-10", BackupLSN: 10, CheckpointLSN: 10, ManifestSHA256: digest, AggregateSHA256: strings.Repeat("b", 64),
+			SeedReceiptSHA256: strings.Repeat("c", 64), CaptureReceiptSHA256: strings.Repeat("d", 64), MaterializedReceiptSHA256: strings.Repeat("e", 64),
+			MaterializedAggregateSHA256: strings.Repeat("f", 64), TargetLocalNodeID: 1, TargetReplicaID: 1,
+			GenerationPath: "live-generations/prod-standby-a-10", RawGenerationPath: "generations/prod-standby-a-10",
+		},
+	}
+	correct := target.DeepCopy()
+	correct.Name = "z-primary"
+	correct.Spec.HighAvailability.Runtime.StartupGate = nil
+	correct.Spec.HighAvailability.Runtime.Role = antflyv1.HARuntimeRolePrimary
+	correct.Spec.HighAvailability.Runtime.NodeID = "primary-a"
+	correct.Status.HAStatus = &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{action}}
+	unrelated := correct.DeepCopy()
+	unrelated.Name = "a-unrelated-primary"
+	unrelated.Spec.HighAvailability.Identity.ClusterID = 999
+	unrelated.Status.HAStatus.PlannedActions[0].SeedArtifactReceipt.ClusterID = 999
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "standby-a-data", Namespace: "default", UID: types.UID("pvc-uid-1")}}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(target, unrelated, correct, pvc).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	reconciler.updateHAStartupGateStatus(context.Background(), target)
+	g.Expect(target.Status.HAStatus.StartupGate).NotTo(BeNil())
+	g.Expect(target.Status.HAStatus.StartupGate.RuntimeEligible).To(BeTrue())
+	g.Expect(target.Status.HAStatus.StartupGate.ActivationReceipt).NotTo(BeNil())
+	g.Expect(target.Status.HAStatus.StartupGate.ActivationReceipt.ClusterID).To(Equal(uint64(100)))
+}
+
 func startupGatedStandaloneControllerCluster(runtimeEligible bool) *antflyv1.AntflyCluster {
 	cluster := baseStandaloneControllerCluster()
 	digest := strings.Repeat("a", 64)
