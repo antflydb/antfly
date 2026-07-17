@@ -2882,16 +2882,20 @@ fn deleteDocumentExtractionForRuntime(
     try storePutBatchWithRetry(runtime, &.{}, deletes.items);
 }
 
-fn completeRuntimeDocumentExtractionGeneratedText(
+/// Complete OCR/transcription for the synchronous document-extraction path
+/// using the same batching, fallback isolation, validation, and provenance
+/// machinery as replay-driven extraction.
+pub fn completeDocumentExtractionGeneratedTextForRequest(
     runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
     config: document_extraction_mod.Config,
-    batch_policy: GeneratedTextBatchPolicy,
     source_url: []const u8,
     source_bytes: []const u8,
     source_content_type: []const u8,
     extraction: *document_extraction_mod.Result,
 ) !void {
     const producer = runtime.config.asset_producer orelse return;
+    const batch_policy = requestGeneratedTextBatchPolicy(runtime.alloc, request);
     try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .ocr, null);
     try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .transcript, null);
 }
@@ -9376,7 +9380,7 @@ fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
 // Tests
 // ============================================================================
 
-test "document extraction generated OCR batches honor execution item cap" {
+test "synchronous document extraction OCR batches honor request execution item cap" {
     const alloc = std.testing.allocator;
 
     const FakeProducer = struct {
@@ -9452,18 +9456,26 @@ test "document extraction generated OCR batches honor execution item cap" {
     };
     defer for (&units) |*unit| unit.deinit(alloc);
 
-    try completeRuntimeDocumentExtractionGeneratedTextBatch(
+    var extraction = document_extraction_mod.Result{
+        .content_type = @constCast("image/png"),
+        .route_type = @constCast("image"),
+        .units = units[0..],
+    };
+    try completeDocumentExtractionGeneratedTextForRequest(
         &runtime,
-        producer,
+        .{
+            .kind = .asset,
+            .index_name = "document_units_v1",
+            .artifact_name = "document_units_v1",
+            .doc_key = "doc:sync-batch",
+            .source_field = "source",
+            .execution_json = "{\"batch_items\":2,\"batch_bytes\":1048576}",
+        },
         .{ .ocr_enabled = true },
-        .{ .max_items = 2, .max_bytes = 1024 * 1024 },
-        "data:application/pdf;base64,AA==",
+        "data:image/png;base64,AA==",
         "",
-        "ocr",
-        "application/pdf",
-        units[0..],
-        .ocr,
-        null,
+        "image/png",
+        &extraction,
     );
 
     try std.testing.expectEqual(@as(usize, 2), fake.batch_count);
