@@ -5531,6 +5531,20 @@ pub const DataServer = struct {
             handoff.base_delta_sequence,
         );
 
+        // Reserve the exact destination generation before streaming data. The
+        // begin checkpoint is idempotent, and makes a later completion marker
+        // impossible to apply without the corresponding bootstrap identity.
+        try self.requireLocalDataRaftLeader(source_group_id);
+        try self.replicateSplitDestinationCheckpoint(
+            destination_base_uri,
+            destination_group_id,
+            table_name,
+            replication,
+            handoff.byte_range,
+            handoff.base_delta_sequence,
+            .destination_begin,
+        );
+
         const max_writes_per_batch: usize = 128;
         var offset: usize = 0;
         while (offset < handoff.entries.len) {
@@ -8700,6 +8714,7 @@ pub const DataServer = struct {
         var stats: RuntimeStatusRefreshStats = .{};
         var budget: RuntimeStatusRefreshBudget = .{ .max_db_opens = max_db_opens };
         var pending_runtime_work = false;
+        var refresh_retry_pending = false;
         var startup_catch_up_debt_present = false;
         defer self.runtime_status_refresh_last_table_count.store(stats.table_count, .monotonic);
         defer self.runtime_status_refresh_last_group_count.store(stats.group_count, .monotonic);
@@ -8770,17 +8785,17 @@ pub const DataServer = struct {
             defer retry_result.deinit();
             if (retry.snapshots.len > 0) self.alloc.free(retry.snapshots);
             retry.snapshots = &.{};
-            if (retry_result.hasRejectedTables()) self.runtime_status_dirty.store(true, .release);
+            refresh_retry_pending = retry_result.hasRejectedTables();
         }
-        if (publish_result.removals_deferred) {
-            self.runtime_status_dirty.store(true, .release);
-        }
+        refresh_retry_pending = refresh_retry_pending or publish_result.removals_deferred;
         self.provisioned_startup_catch_up_dirty.store(startup_catch_up_debt_present, .release);
         self.runtime_status_last_refresh_at_ms.store(
             @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms)),
             .monotonic,
         );
-        self.runtime_status_dirty.store(pending_runtime_work, .release);
+        // A lifecycle race needs another observation even when the statuses
+        // accepted by this pass contain no active background work.
+        self.runtime_status_dirty.store(pending_runtime_work or refresh_retry_pending, .release);
         self.store_status_dirty.store(true, .release);
         _ = self.runtime_status_refresh_completed.fetchAdd(1, .monotonic);
         return stats;

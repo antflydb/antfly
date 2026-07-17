@@ -4828,12 +4828,15 @@ pub const DB = struct {
             const marker = try self.core.loadSplitBootstrapMarker(self.alloc);
             switch (replication.operation) {
                 .bootstrap_chunk => {
-                    if (marker) |existing| {
-                        if (!splitMarkerMatches(existing, replication.transition_id, replication.attempt_epoch, replication.source_group_id, replication.destination_group_id)) {
-                            return error.ConflictingSplitTransition;
-                        }
-                        if (existing.bootstrap_complete) return false;
+                    const bootstrap_sequence = replication.bootstrap_sequence orelse
+                        return error.InvalidBatchRequest;
+                    const existing = marker orelse return error.SplitBootstrapIncomplete;
+                    if (!splitMarkerMatches(existing, replication.transition_id, replication.attempt_epoch, replication.source_group_id, replication.destination_group_id)) {
+                        return error.ConflictingSplitTransition;
                     }
+                    if (existing.bootstrap_complete) return false;
+                    if (bootstrap_sequence != try self.core.loadSplitDeltaFinalSeq(self.alloc))
+                        return error.StaleSplitBootstrap;
                 },
                 .delta => {
                     const complete = marker orelse return error.SplitBootstrapIncomplete;
@@ -4855,6 +4858,11 @@ pub const DB = struct {
                         checkpoint.destination_group_id != replication.destination_group_id or
                         checkpoint.delta_sequence != replication.sequence)
                     {
+                        return error.InvalidBatchRequest;
+                    }
+                    if (replication.bootstrap_sequence) |bootstrap_sequence| {
+                        if (bootstrap_sequence != checkpoint.delta_sequence) return error.StaleSplitBootstrap;
+                    } else if (checkpoint.kind == .destination_begin) {
                         return error.InvalidBatchRequest;
                     }
                     if (marker) |existing| {
@@ -69790,6 +69798,108 @@ test "db split bootstrap retries preserve reserved data and exact sequence" {
         error.SplitBootstrapComplete,
         db.replaceSplitBootstrap(alloc, byte_range, &.{}, 18, incomplete),
     );
+}
+
+test "db replicated split bootstrap requires and preserves begin barrier" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const identity_namespace: DocIdentityNamespace = .{
+        .table_id = 71,
+        .shard_id = 72,
+        .range_id = 73,
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .identity_namespace = identity_namespace,
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const base_replication: types.SplitReplicationContext = .{
+        .transition_id = 7001,
+        .attempt_epoch = 3,
+        .source_group_id = 71,
+        .destination_group_id = 72,
+        .identity_namespace = identity_namespace,
+        .bootstrap_sequence = 9,
+    };
+    var completion_replication = base_replication;
+    completion_replication.operation = .checkpoint;
+    completion_replication.sequence = 9;
+    const completion: types.SplitReplicationCheckpoint = .{
+        .kind = .destination_complete,
+        .transition_id = 7001,
+        .attempt_epoch = 3,
+        .source_group_id = 71,
+        .destination_group_id = 72,
+        .range_start = "doc:m",
+        .range_end = "",
+        .delta_sequence = 9,
+    };
+
+    try std.testing.expectError(error.SplitBootstrapIncomplete, db.batchReplicatedApply(.{
+        .writes = &.{.{ .key = "doc:z", .value = "{\"v\":0}" }},
+        .split_replication = base_replication,
+    }));
+    try std.testing.expectError(error.SplitBootstrapIncomplete, db.batchReplicatedApply(.{
+        .split_replication = completion_replication,
+        .split_checkpoint = completion,
+    }));
+
+    var begin_replication = base_replication;
+    begin_replication.operation = .checkpoint;
+    begin_replication.sequence = 9;
+    try db.batchReplicatedApply(.{
+        .split_replication = begin_replication,
+        .split_checkpoint = .{
+            .kind = .destination_begin,
+            .transition_id = 7001,
+            .attempt_epoch = 3,
+            .source_group_id = 71,
+            .destination_group_id = 72,
+            .range_start = "doc:m",
+            .range_end = "",
+            .delta_sequence = 9,
+        },
+    });
+    // Raft replay and source retries may repeat the begin checkpoint.
+    try db.batchReplicatedApply(.{
+        .split_replication = begin_replication,
+        .split_checkpoint = .{
+            .kind = .destination_begin,
+            .transition_id = 7001,
+            .attempt_epoch = 3,
+            .source_group_id = 71,
+            .destination_group_id = 72,
+            .range_start = "doc:m",
+            .range_end = "",
+            .delta_sequence = 9,
+        },
+    });
+    var stale_replication = base_replication;
+    stale_replication.bootstrap_sequence = 8;
+    try std.testing.expectError(error.StaleSplitBootstrap, db.batchReplicatedApply(.{
+        .writes = &.{.{ .key = "doc:z", .value = "{\"v\":0}" }},
+        .split_replication = stale_replication,
+    }));
+    try db.batchReplicatedApply(.{
+        .writes = &.{.{ .key = "doc:z", .value = "{\"v\":1}" }},
+        .split_replication = base_replication,
+    });
+    try db.batchReplicatedApply(.{
+        .split_replication = completion_replication,
+        .split_checkpoint = completion,
+    });
+
+    const marker = (try db.getSplitBootstrapMarker(alloc)) orelse return error.TestExpectedEqual;
+    try std.testing.expect(marker.bootstrap_complete);
+    try std.testing.expectEqual(@as(u64, 9), try db.getSplitDeltaFinalSeq(alloc));
+    var found = (try db.lookup(alloc, "doc:z", .{})) orelse return error.TestExpectedEqual;
+    defer found.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"v\":1}", found.json);
 }
 
 test "db split cutover fences enrichment to the owning range with durable lsm primary backend" {
