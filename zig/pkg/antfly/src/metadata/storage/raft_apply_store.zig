@@ -803,11 +803,32 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn addProjectionListener(self: *RaftApplyStore, listener: ProjectionListener) !void {
+        const io = self.io_impl.io();
+        self.apply_mutex.lockUncancelable(io);
+        defer self.apply_mutex.unlock(io);
         try self.projection_listeners.append(self.alloc, listener);
     }
 
     pub fn addCommittedKeyListener(self: *RaftApplyStore, listener: CommittedKeyListener) !void {
+        const io = self.io_impl.io();
+        self.apply_mutex.lockUncancelable(io);
+        defer self.apply_mutex.unlock(io);
         try self.committed_key_listeners.append(self.alloc, listener);
+    }
+
+    pub fn addLifecycleListeners(
+        self: *RaftApplyStore,
+        projection_listener: ProjectionListener,
+        committed_key_listener: CommittedKeyListener,
+    ) !void {
+        const io = self.io_impl.io();
+        self.apply_mutex.lockUncancelable(io);
+        defer self.apply_mutex.unlock(io);
+
+        try self.projection_listeners.ensureUnusedCapacity(self.alloc, 1);
+        try self.committed_key_listeners.ensureUnusedCapacity(self.alloc, 1);
+        self.projection_listeners.appendAssumeCapacity(projection_listener);
+        self.committed_key_listeners.appendAssumeCapacity(committed_key_listener);
     }
 
     pub fn getMetadataIncarnation(

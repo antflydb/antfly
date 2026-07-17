@@ -1221,6 +1221,56 @@ test "group state range scan is allocation-failure safe" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{&store});
 }
 
+fn allocPreparedSplitState(
+    alloc: std.mem.Allocator,
+    original_range_end: []const u8,
+    transition: SplitTransition,
+) !AppliedSplitState {
+    const split_key = try alloc.dupe(u8, transition.split_key);
+    errdefer alloc.free(split_key);
+    const range_end = try alloc.dupe(u8, original_range_end);
+    errdefer alloc.free(range_end);
+    return .{
+        .phase = .prepare,
+        .transition_id = transition.transition_id,
+        .attempt_epoch = transition.attempt_epoch,
+        .split_key = split_key,
+        .new_shard_id = transition.new_shard_id,
+        .original_range_end = range_end,
+    };
+}
+
+fn appendSplitStateWrite(
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    state: AppliedSplitState,
+    writes: *std.ArrayListUnmanaged(docstore.OwnedKVPair),
+    deletes: *std.ArrayListUnmanaged([]u8),
+) !void {
+    const key = try groupSplitStateKeyAlloc(alloc, group_id);
+    errdefer alloc.free(key);
+    var split_buf: [1024]u8 = undefined;
+    const encoded = try encodeSplitState(state, &split_buf);
+    const value = try alloc.dupe(u8, encoded);
+    errdefer alloc.free(value);
+    removeOwnedWriteByKey(alloc, writes, key);
+    removeDeleteByKey(alloc, deletes, key);
+    try writes.append(alloc, .{ .key = key, .value = value });
+}
+
+fn appendSplitAcknowledgementClear(
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    writes: *std.ArrayListUnmanaged(docstore.OwnedKVPair),
+    deletes: *std.ArrayListUnmanaged([]u8),
+) !void {
+    const key = try groupSplitAcknowledgementKeyAlloc(alloc, group_id);
+    defer alloc.free(key);
+    removeOwnedWriteByKey(alloc, writes, key);
+    removeDeleteByKey(alloc, deletes, key);
+    try deletes.append(alloc, try alloc.dupe(u8, key));
+}
+
 pub fn appendOperationEffects(
     store: *docstore.DocStore,
     alloc: std.mem.Allocator,
@@ -1359,33 +1409,10 @@ pub fn appendOperationEffects(
                 split_state = null;
             }
 
-            const owned_split_key = try alloc.dupe(u8, prepare.split_key);
-            errdefer alloc.free(owned_split_key);
-            const owned_original_end = try alloc.dupe(u8, byte_range.end);
-            errdefer alloc.free(owned_original_end);
-            split_state = .{
-                .phase = .prepare,
-                .transition_id = prepare.transition_id,
-                .attempt_epoch = prepare.attempt_epoch,
-                .split_key = owned_split_key,
-                .new_shard_id = prepare.new_shard_id,
-                .original_range_end = owned_original_end,
-            };
-            const split_state_key = try groupSplitStateKeyAlloc(alloc, group_id);
-            errdefer alloc.free(split_state_key);
-            removeOwnedWriteByKey(alloc, writes, split_state_key);
-            removeDeleteByKey(alloc, deletes, split_state_key);
-            var split_buf: [1024]u8 = undefined;
-            const encoded_split_state = try encodeSplitState(split_state.?, &split_buf);
-            const split_state_value = try alloc.dupe(u8, encoded_split_state);
-            errdefer alloc.free(split_state_value);
-            try writes.append(alloc, .{ .key = split_state_key, .value = split_state_value });
+            split_state = try allocPreparedSplitState(alloc, byte_range.end, prepare);
+            try appendSplitStateWrite(alloc, group_id, split_state.?, writes, deletes);
 
-            const acknowledgement_key = try groupSplitAcknowledgementKeyAlloc(alloc, group_id);
-            defer alloc.free(acknowledgement_key);
-            removeOwnedWriteByKey(alloc, writes, acknowledgement_key);
-            removeDeleteByKey(alloc, deletes, acknowledgement_key);
-            try deletes.append(alloc, try alloc.dupe(u8, acknowledgement_key));
+            try appendSplitAcknowledgementClear(alloc, group_id, writes, deletes);
             split_acknowledgement = null;
         },
         .start_split => |start| {
@@ -1408,6 +1435,17 @@ pub fn appendOperationEffects(
                 if (already_started) continue;
                 if (state.phase == .splitting or state.phase == .finalizing)
                     return error.ConflictingSplitTransition;
+            }
+            if (split_state == null) {
+                // A replacement generation can inherit a Raft applied index
+                // just ahead of its projected state. Start carries the full
+                // transition identity, so recover the missing prepare only
+                // while the unsplit range still validates it. Conflicting or
+                // already-narrowed generations remain rejected below.
+                try shard_mod.validatePrepareSplit(byte_range, null, start.split_key);
+                split_state = try allocPreparedSplitState(alloc, byte_range.end, start);
+                try appendSplitAcknowledgementClear(alloc, group_id, writes, deletes);
+                split_acknowledgement = null;
             }
             const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
                 .phase = state.phase,
@@ -1439,15 +1477,7 @@ pub fn appendOperationEffects(
             errdefer alloc.free(range_value);
             try writes.append(alloc, .{ .key = range_key, .value = range_value });
 
-            const split_state_key = try groupSplitStateKeyAlloc(alloc, group_id);
-            errdefer alloc.free(split_state_key);
-            removeOwnedWriteByKey(alloc, writes, split_state_key);
-            removeDeleteByKey(alloc, deletes, split_state_key);
-            var split_buf: [1024]u8 = undefined;
-            const encoded_split_state = try encodeSplitState(split_state.?, &split_buf);
-            const split_state_value = try alloc.dupe(u8, encoded_split_state);
-            errdefer alloc.free(split_state_value);
-            try writes.append(alloc, .{ .key = split_state_key, .value = split_state_value });
+            try appendSplitStateWrite(alloc, group_id, split_state.?, writes, deletes);
 
             const split_delta_seq_key = try groupSplitDeltaSeqKeyAlloc(alloc, group_id);
             errdefer alloc.free(split_delta_seq_key);

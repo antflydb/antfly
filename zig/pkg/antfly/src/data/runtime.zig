@@ -750,6 +750,8 @@ test "data descriptor factory separates bootstrap voters from transport peers" {
     };
     var topology = try PlacementTopologyIndex.init(std.testing.allocator, &intents);
     defer topology.deinit();
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, topology.initialVoters(701).?);
+    try std.testing.expectEqualSlices(u64, &.{4}, topology.learners(701).?);
     try factory.replacePeerSets(&intents, &topology);
 
     var desc = try factory.iface().buildDescriptor(.{
@@ -760,6 +762,18 @@ test "data descriptor factory separates bootstrap voters from transport peers" {
     defer factory.iface().freeDescriptor(std.testing.allocator, &desc);
     try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3, 4 }, desc.group.raft_config.peers);
     try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, desc.initial_voters.?);
+}
+
+test "placement topology promotes cutover-ready learners to voters" {
+    const intents = [_]antfly.raft.PlacementIntent{
+        .{ .record = .{ .group_id = 705, .replica_id = 1, .local_node_id = 1 }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .serving },
+        .{ .record = .{ .group_id = 705, .replica_id = 2, .local_node_id = 2 }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .draining },
+        .{ .record = .{ .group_id = 705, .replica_id = 3, .local_node_id = 3 }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .cutover_ready },
+    };
+    var topology = try PlacementTopologyIndex.init(std.testing.allocator, &intents);
+    defer topology.deinit();
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, topology.initialVoters(705).?);
+    try std.testing.expectEqual(@as(usize, 0), topology.learners(705).?.len);
 }
 
 test "data descriptor factory bootstraps pristine group from complete intent peer set" {
@@ -2190,7 +2204,7 @@ const OwnedInferredSnapshotLeadershipSource = struct {
     }
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        for (self.placement_intents) |intent| if (intent.peer_node_ids.len > 0) alloc.free(intent.peer_node_ids);
+        for (self.placement_intents) |intent| antfly.raft.reconciler.freeIntentOwned(alloc, intent);
         alloc.free(self.placement_intents);
         self.* = undefined;
     }
@@ -3008,6 +3022,12 @@ const TransitionDbLeaseContext = struct {
 };
 
 pub const DataServer = struct {
+    const SplitProjectionReconcileResult = union(enum) {
+        advanced,
+        reconciled,
+        handoff: antfly.data.storage.raft_apply_store.SplitHandoff,
+    };
+
     alloc: std.mem.Allocator,
     remote_metadata: ?*RemoteMetadataSource = null,
     metadata_service: ?*antfly.metadata_service.MetadataService = null,
@@ -5643,15 +5663,21 @@ pub const DataServer = struct {
         const source_store = self.localTransitionApplyStore() orelse return error.MissingSplitSourceStore;
         // A relocated leader may inherit the authoritative DB after its Raft
         // projection already received split control entries. Repair document
-        // projection at an exact watermark before deriving the handoff.
-        try self.reconcileSplitSourceApplyStoreDocuments(source_store, source_root_dir, source_group_id);
-        const source_state = (try source_store.currentSplitState(self.alloc, source_group_id)) orelse return error.SplitInProgress;
-        defer antfly.data.storage.shard_state_store.freeSplitState(self.alloc, source_state);
-        try validateReplicatedSplitTransfer(source_state, transition_id, attempt_epoch, destination_group_id);
-
-        const handoff = try source_store.captureSplitHandoff(self.alloc, source_group_id);
+        // projection and derive the handoff under one exact watermark.
+        const handoff = try self.captureReconciledSplitSourceHandoff(
+            source_store,
+            source_root_dir,
+            source_group_id,
+        );
         defer antfly.data.storage.shard_state_store.freeHandoff(self.alloc, handoff);
         try validateReplicatedSplitTransfer(handoff.split_state, transition_id, attempt_epoch, destination_group_id);
+        std.log.info("split bootstrap captured transition_id={} source_group_id={} destination_group_id={} entries={} watermark={}", .{
+            transition_id,
+            source_group_id,
+            destination_group_id,
+            handoff.entries.len,
+            handoff.base_delta_sequence,
+        });
         const table_name = (try self.tableNameForLocalGroupAlloc(source_group_id)) orelse return error.UnknownGroup;
         defer self.alloc.free(table_name);
         const replication = try self.splitReplicationContext(
@@ -6199,12 +6225,46 @@ pub const DataServer = struct {
                         return error.SplitSourceProjectionNotReady;
                 }
             }
-            if (try self.reconcileSplitSourceApplyStoreFromAuthoritativeDb(
+            switch (try self.reconcileSplitSourceApplyStoreFromAuthoritativeDb(
                 source_store,
                 source_root_dir,
                 source_group_id,
                 watermark,
-            )) return;
+                false,
+            )) {
+                .advanced => continue,
+                .reconciled => return,
+                .handoff => unreachable,
+            }
+        }
+        return error.SplitSourceProjectionAdvanced;
+    }
+
+    fn captureReconciledSplitSourceHandoff(
+        self: *DataServer,
+        source_store: *antfly.data.RaftApplyStore,
+        source_root_dir: []const u8,
+        source_group_id: u64,
+    ) !antfly.data.storage.raft_apply_store.SplitHandoff {
+        const max_reconcile_attempts: usize = 4;
+        for (0..max_reconcile_attempts) |_| {
+            const watermark = (try source_store.latestBatchForTransition(source_group_id)) orelse
+                return error.SplitSourceProjectionNotReady;
+            if (self.data_raft_apply) |apply_sm| {
+                if (apply_sm.appliedIndex(source_group_id) < watermark.last_entry_index)
+                    return error.SplitSourceProjectionNotReady;
+            }
+            switch (try self.reconcileSplitSourceApplyStoreFromAuthoritativeDb(
+                source_store,
+                source_root_dir,
+                source_group_id,
+                watermark,
+                true,
+            )) {
+                .advanced => continue,
+                .reconciled => unreachable,
+                .handoff => |handoff| return handoff,
+            }
         }
         return error.SplitSourceProjectionAdvanced;
     }
@@ -6215,13 +6275,25 @@ pub const DataServer = struct {
         source_root_dir: []const u8,
         source_group_id: u64,
         watermark: ?antfly.data.AppliedDataBatch,
-    ) !bool {
+        capture_handoff: bool,
+    ) !SplitProjectionReconcileResult {
         if (try self.tableNameForLocalGroupAlloc(source_group_id)) |table_name| {
             defer self.alloc.free(table_name);
-            if (try self.liveRuntimeWriteSource().leaseCachedGroupWriter(self.alloc, source_group_id, table_name)) |cached_db| {
+            const live_source = self.liveRuntimeWriteSource();
+            try live_source.finishManagedWriterAutoBulkForTransition(source_group_id, table_name);
+            if (live_source != &self.write_source) {
+                try self.write_source.finishManagedWriterAutoBulkForTransition(source_group_id, table_name);
+            }
+            if (try live_source.leaseCachedGroupWriter(self.alloc, source_group_id, table_name)) |cached_db| {
                 var cached = cached_db;
                 defer cached.deinit(self.alloc);
-                return try self.reconcileSplitSourceApplyStoreFromDb(source_store, source_group_id, cached.db, watermark);
+                return try self.reconcileSplitSourceApplyStoreFromDb(
+                    source_store,
+                    source_group_id,
+                    cached.db,
+                    watermark,
+                    capture_handoff,
+                );
             }
         }
 
@@ -6233,7 +6305,13 @@ pub const DataServer = struct {
             else => return err,
         };
         defer db.close();
-        return try self.reconcileSplitSourceApplyStoreFromDb(source_store, source_group_id, &db, watermark);
+        return try self.reconcileSplitSourceApplyStoreFromDb(
+            source_store,
+            source_group_id,
+            &db,
+            watermark,
+            capture_handoff,
+        );
     }
 
     fn reconcileSplitSourceApplyStoreFromDb(
@@ -6242,7 +6320,8 @@ pub const DataServer = struct {
         source_group_id: u64,
         db: *antfly.db.DB,
         watermark: ?antfly.data.AppliedDataBatch,
-    ) !bool {
+        capture_handoff: bool,
+    ) !SplitProjectionReconcileResult {
         var entries = std.ArrayListUnmanaged(antfly.data.AppliedDataKV).empty;
         defer {
             for (entries.items) |entry| {
@@ -6273,6 +6352,8 @@ pub const DataServer = struct {
         const upper = if (byte_range.end.len > 0) try antfly.internal_keys.documentRangeLowerAlloc(self.alloc, byte_range.end) else null;
         defer if (upper) |owned| self.alloc.free(owned);
 
+        db.core.lockApplyShared();
+        defer db.core.unlockApplyShared();
         const scanned = try db.core.store.scanRange(self.alloc, lower, if (upper) |owned| owned else "");
         defer antfly.docstore.DocStore.freeResults(self.alloc, scanned);
         for (scanned) |entry| {
@@ -6284,15 +6365,31 @@ pub const DataServer = struct {
             });
         }
         if (watermark) |expected| {
-            return try source_store.reconcileGroupSnapshotAtWatermark(
+            if (capture_handoff) {
+                const handoff = (try source_store.reconcileAndCaptureSplitHandoffAtWatermark(
+                    self.alloc,
+                    source_group_id,
+                    expected,
+                    byte_range,
+                    entries.items,
+                )) orelse return .advanced;
+                return .{ .handoff = handoff };
+            }
+            return if (try source_store.reconcileGroupSnapshotAtWatermark(
                 self.alloc,
                 source_group_id,
                 expected,
                 byte_range,
                 entries.items,
-            );
+            )) .reconciled else .advanced;
         }
-        return try source_store.seedGroupSnapshotIfAbsent(self.alloc, source_group_id, byte_range, entries.items);
+        if (capture_handoff) return error.SplitSourceProjectionNotReady;
+        return if (try source_store.seedGroupSnapshotIfAbsent(
+            self.alloc,
+            source_group_id,
+            byte_range,
+            entries.items,
+        )) .reconciled else .advanced;
     }
 
     fn localAcceptMergeReceiver(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "accept_merge_receiver")) !void {
@@ -7080,21 +7177,34 @@ pub const DataServer = struct {
         const factory = self.data_raft_factory orelse return;
         const registration = self.store_registration orelse return;
 
-        var placement_topology = try PlacementTopologyIndex.init(self.alloc, snapshot.placement_intents);
+        var placement_topology = try PlacementTopologyIndex.initForSnapshot(
+            self.alloc,
+            snapshot.placement_intents,
+            snapshot.split_transitions,
+        );
         defer placement_topology.deinit();
 
         var local_intents = std.ArrayListUnmanaged(antfly.raft.PlacementIntent).empty;
         defer {
-            for (local_intents.items) |intent| if (intent.peer_node_ids.len > 0) self.alloc.free(intent.peer_node_ids);
+            for (local_intents.items) |intent| {
+                if (intent.peer_node_ids.len > 0) self.alloc.free(intent.peer_node_ids);
+                if (intent.learner_node_ids.len > 0) self.alloc.free(intent.learner_node_ids);
+            }
             local_intents.deinit(self.alloc);
         }
         for (snapshot.placement_intents) |intent| {
             if (intent.record.local_node_id != registration.node_id and intent.store_id != registration.store_id) continue;
-            const peers = placement_topology.peers(intent.record.group_id) orelse
-                return error.MissingPlacementPeerSet;
-            const peer_node_ids = try self.alloc.dupe(u64, peers);
+            const voter_node_ids = placement_topology.initialVoters(intent.record.group_id) orelse
+                return error.MissingAuthoritativeBootstrapVoters;
+            const learner_node_ids = placement_topology.learners(intent.record.group_id) orelse
+                return error.MissingAuthoritativeBootstrapVoters;
+            const owned_voters = try self.alloc.dupe(u64, voter_node_ids);
+            errdefer self.alloc.free(owned_voters);
+            const owned_learners = try self.alloc.dupe(u64, learner_node_ids);
+            errdefer self.alloc.free(owned_learners);
             var local_intent = intent;
-            local_intent.peer_node_ids = peer_node_ids;
+            local_intent.peer_node_ids = owned_voters;
+            local_intent.learner_node_ids = owned_learners;
             try local_intents.append(self.alloc, local_intent);
         }
         const placement_fingerprint = dataRaftPlacementIntentsFingerprint(local_intents.items);
@@ -7112,9 +7222,11 @@ pub const DataServer = struct {
             updates.deinit(self.alloc);
         }
         for (local_intents.items) |intent| {
+            const transport_peers = placement_topology.peers(intent.record.group_id) orelse
+                return error.MissingPlacementPeerSet;
             for (snapshot.stores) |peer| {
                 if (peer.node_id == 0 or peer.node_id == registration.node_id) continue;
-                if (!nodeIdInSlice(intent.peer_node_ids, peer.node_id)) {
+                if (!nodeIdInSlice(transport_peers, peer.node_id)) {
                     try updates.append(self.alloc, .{
                         .peer_route = .{
                             .remove = .{
@@ -9937,12 +10049,15 @@ const PlacementTopologyIndex = struct {
         peers: std.ArrayListUnmanaged(u64) = .empty,
         member_rows: std.ArrayListUnmanaged(u64) = .empty,
         transition_voters: std.ArrayListUnmanaged(u64) = .empty,
+        transition_learners: std.ArrayListUnmanaged(u64) = .empty,
         pristine: bool = true,
+        bootstrap_generation: bool = false,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.peers.deinit(alloc);
             self.member_rows.deinit(alloc);
             self.transition_voters.deinit(alloc);
+            self.transition_learners.deinit(alloc);
             self.* = undefined;
         }
     };
@@ -9953,6 +10068,14 @@ const PlacementTopologyIndex = struct {
     fn init(
         alloc: std.mem.Allocator,
         placement_intents: []const antfly.raft.PlacementIntent,
+    ) !@This() {
+        return initForSnapshot(alloc, placement_intents, &.{});
+    }
+
+    fn initForSnapshot(
+        alloc: std.mem.Allocator,
+        placement_intents: []const antfly.raft.PlacementIntent,
+        split_transitions: []const antfly.metadata.SplitTransitionRecord,
     ) !@This() {
         var self: @This() = .{ .alloc = alloc };
         errdefer self.deinit();
@@ -9969,8 +10092,16 @@ const PlacementTopologyIndex = struct {
                 intent.relocation_source_node_id == 0 and
                 intent.relocation_source_store_id == 0;
             switch (intent.serving_state) {
-                .serving, .draining => try appendUniqueNodeId(alloc, &group.transition_voters, intent.record.local_node_id),
-                .planned, .bootstrapping, .replaying, .cutover_ready => {},
+                .serving, .draining, .cutover_ready => try appendUniqueNodeId(alloc, &group.transition_voters, intent.record.local_node_id),
+                .planned, .bootstrapping, .replaying => try appendUniqueNodeId(alloc, &group.transition_learners, intent.record.local_node_id),
+            }
+        }
+        for (split_transitions) |transition| {
+            if (self.groups.getPtr(transition.destination_group_id)) |group| {
+                // A split destination is a new Raft generation. Its placements
+                // remain non-serving until data bootstrap completes, but they
+                // must form a voter quorum before that bootstrap can run.
+                group.bootstrap_generation = true;
             }
         }
         var it = self.groups.valueIterator();
@@ -9978,6 +10109,7 @@ const PlacementTopologyIndex = struct {
             std.mem.sort(u64, group.peers.items, {}, comptime std.sort.asc(u64));
             std.mem.sort(u64, group.member_rows.items, {}, comptime std.sort.asc(u64));
             std.mem.sort(u64, group.transition_voters.items, {}, comptime std.sort.asc(u64));
+            std.mem.sort(u64, group.transition_learners.items, {}, comptime std.sort.asc(u64));
         }
         return self;
     }
@@ -9996,7 +10128,7 @@ const PlacementTopologyIndex = struct {
 
     fn initialVoters(self: *const @This(), group_id: u64) ?[]const u64 {
         const group = self.groups.get(group_id) orelse return null;
-        if (group.pristine) return group.peers.items;
+        if (group.pristine or group.bootstrap_generation) return group.peers.items;
         // Transition peer lists intentionally include non-voting targets. A
         // partially projected transition cannot prove the complete incumbent
         // voter set, so an empty replica must wait for every member row rather
@@ -10004,7 +10136,50 @@ const PlacementTopologyIndex = struct {
         if (group.member_rows.items.len != group.peers.items.len) return null;
         return group.transition_voters.items;
     }
+
+    fn learners(self: *const @This(), group_id: u64) ?[]const u64 {
+        const group = self.groups.get(group_id) orelse return null;
+        if (group.pristine or group.bootstrap_generation) return &.{};
+        if (group.member_rows.items.len != group.peers.items.len) return null;
+        return group.transition_learners.items;
+    }
 };
+
+test "placement topology bootstraps active split destination as a new voter generation" {
+    const intents = [_]antfly.raft.PlacementIntent{
+        .{ .record = .{ .group_id = 706, .replica_id = 1, .local_node_id = 1 }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .bootstrapping },
+        .{ .record = .{ .group_id = 706, .replica_id = 2, .local_node_id = 2 }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .bootstrapping },
+        .{ .record = .{ .group_id = 706, .replica_id = 3, .local_node_id = 3 }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .bootstrapping },
+    };
+    const splits = [_]antfly.metadata.SplitTransitionRecord{.{
+        .transition_id = 7006,
+        .attempt_epoch = 1,
+        .source_group_id = 705,
+        .destination_group_id = 706,
+    }};
+    var topology = try PlacementTopologyIndex.initForSnapshot(std.testing.allocator, &intents, &splits);
+    defer topology.deinit();
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, topology.initialVoters(706).?);
+    try std.testing.expectEqual(@as(usize, 0), topology.learners(706).?.len);
+}
+
+test "placement topology uses authoritative split peer set during partial projection" {
+    const intents = [_]antfly.raft.PlacementIntent{.{
+        .record = .{ .group_id = 708, .replica_id = 1, .local_node_id = 1 },
+        .peer_node_ids = &.{ 1, 2, 3 },
+        .serving_state = .bootstrapping,
+    }};
+    const splits = [_]antfly.metadata.SplitTransitionRecord{.{
+        .transition_id = 7008,
+        .attempt_epoch = 1,
+        .source_group_id = 707,
+        .destination_group_id = 708,
+    }};
+    var topology = try PlacementTopologyIndex.initForSnapshot(std.testing.allocator, &intents, &splits);
+    defer topology.deinit();
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, topology.initialVoters(708).?);
+    try std.testing.expectEqual(@as(usize, 0), topology.learners(708).?.len);
+}
 
 test "placement peer collection preserves complete intent peers during partial projection" {
     const intents = [_]antfly.raft.PlacementIntent{.{
@@ -11861,6 +12036,8 @@ fn dataRaftPlacementIntentsFingerprint(intents: []const antfly.raft.PlacementInt
         hashU64(&hasher, intent.relocation_applied_sequence);
         hashU64(&hasher, intent.peer_node_ids.len);
         for (intent.peer_node_ids) |peer_node_id| hashU64(&hasher, peer_node_id);
+        hashU64(&hasher, intent.learner_node_ids.len);
+        for (intent.learner_node_ids) |learner_node_id| hashU64(&hasher, learner_node_id);
         if (intent.record.snapshot_bootstrap) |snapshot| {
             hashU64(&hasher, 1);
             hashU64(&hasher, snapshot.from_node_id);
@@ -12119,13 +12296,14 @@ fn cloneStoresOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.t
 
 fn clonePlacementIntentsOwned(alloc: std.mem.Allocator, intents: []const antfly.raft.reconciler.PlacementIntent) ![]antfly.raft.reconciler.PlacementIntent {
     const out = try alloc.alloc(antfly.raft.reconciler.PlacementIntent, intents.len);
-    errdefer alloc.free(out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |intent| antfly.raft.reconciler.freeIntentOwned(alloc, intent);
+        alloc.free(out);
+    }
     for (intents, 0..) |intent, i| {
-        out[i] = .{
-            .record = intent.record,
-            .store_id = intent.store_id,
-            .peer_node_ids = try alloc.dupe(u64, intent.peer_node_ids),
-        };
+        out[i] = try antfly.raft.reconciler.cloneIntentOwned(alloc, intent);
+        initialized += 1;
     }
     return out;
 }
@@ -12457,7 +12635,13 @@ pub fn runFromIterator(
         .nsec = @intCast((tick_ms % std.time.ms_per_s) * std.time.ns_per_ms),
     };
     while (true) {
-        try data_server.runRound();
+        data_server.runRound() catch |err| {
+            // Report the fatal round error before deferred listener shutdown.
+            // A shutdown failure must not hide the storage/Raft error that
+            // caused this process to leave its serving loop.
+            std.log.err("data server round failed err={s}", .{@errorName(err)});
+            return err;
+        };
         const err = std.posix.errno(std.posix.system.nanosleep(&req, &req));
         switch (err) {
             .SUCCESS => {},
@@ -14077,8 +14261,9 @@ test "data runtime split apply store seeding reuses cached source writer" {
     server.write_source.write_cache = &write_cache;
     defer server.deinit();
 
-    var held = (try server.write_source.leaseCachedGroupWriter(alloc, 180, "docs")) orelse return error.TestUnexpectedResult;
-    defer held.deinit(alloc);
+    var held: ?antfly.public_api.ProvisionedTableWriteCache.CachedDb =
+        (try server.write_source.leaseCachedGroupWriter(alloc, 180, "docs")) orelse return error.TestUnexpectedResult;
+    defer if (held) |*cached| cached.deinit(alloc);
 
     const namespace = (try server.identityNamespaceForSplitDestination(180, 181)) orelse return error.TestUnexpectedResult;
     try std.testing.expect(namespace.eql(source_namespace));
@@ -14106,6 +14291,11 @@ test "data runtime split apply store seeding reuses cached source writer" {
         });
     }
 
+    // Lifecycle reconciliation intentionally refuses to flush beneath an
+    // active writer lease; releasing the lease keeps the cached owner while
+    // proving transition admission is quiescent.
+    held.?.deinit(alloc);
+    held = null;
     try server.ensureSplitSourceApplyStoreSeeded(source_db_path, 180);
 
     var source_store = try antfly.data.RaftApplyStore.init(alloc, .{ .root_dir = source_db_path });

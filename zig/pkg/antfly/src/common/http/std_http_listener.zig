@@ -197,7 +197,8 @@ pub const StdHttpListener = struct {
         if (self.thread) |thread| {
             if (bound_addr) |addr| {
                 const wake_io = std.Io.Threaded.global_single_threaded.io();
-                if (addr.connect(wake_io, .{ .mode = .stream })) |stream| {
+                const wake_addr = listenerWakeAddress(addr);
+                if (wake_addr.connect(wake_io, .{ .mode = .stream })) |stream| {
                     var wake_stream = stream;
                     wake_stream.close(wake_io);
                 } else |_| {}
@@ -214,6 +215,19 @@ pub const StdHttpListener = struct {
             server.deinit(io);
             self.server = null;
         }
+    }
+
+    fn listenerWakeAddress(bound: std.Io.net.IpAddress) std.Io.net.IpAddress {
+        return switch (bound) {
+            .ip4 => |addr| if (std.mem.allEqual(u8, &addr.bytes, 0))
+                .{ .ip4 = std.Io.net.Ip4Address.loopback(addr.port) }
+            else
+                bound,
+            .ip6 => |addr| if (std.mem.allEqual(u8, &addr.bytes, 0))
+                .{ .ip6 = std.Io.net.Ip6Address.loopback(addr.port) }
+            else
+                bound,
+        };
     }
 
     pub fn boundAddress(self: *const StdHttpListener) ?std.Io.net.IpAddress {
@@ -736,6 +750,41 @@ pub const StdHttpListener = struct {
         };
     }
 };
+
+test "std http listener wake address maps wildcard binds to loopback" {
+    const expected4 = std.Io.net.Ip4Address.loopback(4200);
+    const wake4 = StdHttpListener.listenerWakeAddress(try std.Io.net.IpAddress.parse("0.0.0.0", 4200));
+    switch (wake4) {
+        .ip4 => |addr| {
+            try std.testing.expectEqualSlices(u8, &expected4.bytes, &addr.bytes);
+            try std.testing.expectEqual(@as(u16, 4200), addr.port);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const expected6 = std.Io.net.Ip6Address.loopback(4201);
+    const wake6 = StdHttpListener.listenerWakeAddress(try std.Io.net.IpAddress.parse("::", 4201));
+    switch (wake6) {
+        .ip6 => |addr| {
+            try std.testing.expectEqualSlices(u8, &expected6.bytes, &addr.bytes);
+            try std.testing.expectEqual(@as(u16, 4201), addr.port);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const bound = try std.Io.net.IpAddress.parse("127.0.0.2", 4202);
+    const unchanged = StdHttpListener.listenerWakeAddress(bound);
+    switch (unchanged) {
+        .ip4 => |addr| switch (bound) {
+            .ip4 => |expected| {
+                try std.testing.expectEqualSlices(u8, &expected.bytes, &addr.bytes);
+                try std.testing.expectEqual(expected.port, addr.port);
+            },
+            else => unreachable,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
 
 test "std http listener and executor round-trip raft batch route" {
     const raft_engine = @import("raft_engine");

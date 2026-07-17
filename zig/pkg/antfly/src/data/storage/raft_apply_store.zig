@@ -605,6 +605,26 @@ pub const RaftApplyStore = struct {
         shard.generation_preparations.putAssumeCapacity(group_id, {});
     }
 
+    fn beginSnapshotGenerationPreparation(
+        self: *RaftApplyStore,
+        group_id: u64,
+        snapshot_index: u64,
+    ) !bool {
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
+        if (try self.ensureLoaded(shard, group_id)) |current| {
+            if (current.commit_index > snapshot_index or current.last_entry_index > snapshot_index)
+                return false;
+        }
+        try shard.generation_preparations.ensureUnusedCapacity(self.alloc, 1);
+        if (shard.batches.getPtr(group_id) == null) try shard.batches.ensureUnusedCapacity(self.alloc, 1);
+        shard.generation_preparations.putAssumeCapacity(group_id, {});
+        return true;
+    }
+
     fn finishGenerationPreparationLocked(self: *RaftApplyStore, shard: *BatchShard, group_id: u64) void {
         std.debug.assert(shard.generation_preparations.remove(group_id));
         self.closeRetiredGroupIfDrainedLocked(shard, group_id);
@@ -713,7 +733,7 @@ pub const RaftApplyStore = struct {
         std.mem.writeInt(u64, value[0..8], commit_index, .little);
         @memcpy(value[8..], empty_batch);
 
-        try self.beginGenerationPreparation(group_id);
+        if (!try self.beginSnapshotGenerationPreparation(group_id, commit_index)) return;
         var preparation_active = true;
         defer if (preparation_active) self.cancelGenerationPreparation(group_id);
         if (builtin.is_test and test_block_snapshot_staging.load(.acquire)) {
@@ -845,6 +865,55 @@ pub const RaftApplyStore = struct {
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
+        return try self.reconcileGroupSnapshotAtWatermarkLocked(
+            shard,
+            alloc,
+            group_id,
+            expected,
+            byte_range,
+            entries,
+        );
+    }
+
+    /// Publishes an authoritative document projection and derives its split
+    /// handoff under the same apply-store lock and Raft watermark. A caller can
+    /// therefore never acknowledge a handoff from a different projection
+    /// generation than the one it just validated.
+    pub fn reconcileAndCaptureSplitHandoffAtWatermark(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        expected: AppliedDataBatch,
+        byte_range: AppliedDataRange,
+        entries: []const AppliedDataKV,
+    ) !?SplitHandoff {
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        if (!try self.reconcileGroupSnapshotAtWatermarkLocked(
+            shard,
+            alloc,
+            group_id,
+            expected,
+            byte_range,
+            entries,
+        )) return null;
+
+        const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse
+            return error.AppliedDataRangeNotFound;
+        return try shard_state_store.captureSplitHandoff(&group_store.store, alloc, group_id);
+    }
+
+    fn reconcileGroupSnapshotAtWatermarkLocked(
+        self: *RaftApplyStore,
+        shard: *BatchShard,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        expected: AppliedDataBatch,
+        byte_range: AppliedDataRange,
+        entries: []const AppliedDataKV,
+    ) !bool {
         try self.requireTransitionReadyLocked(shard, group_id);
         const current = (try self.ensureLoaded(shard, group_id)) orelse return false;
         if (current.commit_index != expected.commit_index or
@@ -2170,6 +2239,65 @@ test "data raft apply store skips persisted split commands in overlapping replay
     try std.testing.expectEqualStrings("doc:m", split_state.split_key);
 }
 
+test "data raft apply store recovers committed split start after projection generation gap" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-split-generation-gap", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+
+    const initial = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={}") },
+    });
+    defer std.testing.allocator.free(initial);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 231,
+        .commit_index = 2,
+        .entries_bytes = initial,
+    });
+
+    const start = try data_raft_batch.encode(std.testing.allocator, "docs", .{
+        .split_transition = .{
+            .kind = .start,
+            .transition_id = 231,
+            .attempt_epoch = 1,
+            .destination_group_id = 232,
+            .split_key = "doc:m",
+        },
+    });
+    defer std.testing.allocator.free(start);
+    const suffix = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{.{
+        .term = 1,
+        .index = 4,
+        .entry_type = .normal,
+        .data = start,
+    }});
+    defer std.testing.allocator.free(suffix);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 231,
+        .commit_index = 4,
+        .entries_bytes = suffix,
+    });
+
+    const state = (try store.currentSplitState(std.testing.allocator, 231)) orelse
+        return error.MissingSplitState;
+    defer shard_state_store.freeSplitState(std.testing.allocator, state);
+    try std.testing.expectEqual(shard_mod.SplitPhase.splitting, state.phase);
+    try std.testing.expectEqual(@as(u64, 231), state.transition_id);
+    try std.testing.expectEqual(@as(u64, 232), state.new_shard_id);
+    try std.testing.expectEqualStrings("doc:m", state.split_key);
+    try std.testing.expectEqualStrings("doc:z", state.original_range_end);
+    const byte_range = try store.currentRange(std.testing.allocator, 231);
+    defer range_state.freeRange(std.testing.allocator, byte_range);
+    try std.testing.expectEqualStrings("doc:a", byte_range.start);
+    try std.testing.expectEqualStrings("doc:m", byte_range.end);
+    const batch = (try store.latestBatch(231)) orelse return error.MissingDataBatch;
+    try std.testing.expectEqual(@as(u64, 4), batch.last_entry_index);
+}
+
 test "data raft apply store recovers exact split replay after injected projection corruption" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2462,7 +2590,7 @@ test "data raft apply store reconciles inherited documents while preserving acti
     });
     const watermark = (try store.latestBatch(314)) orelse return error.MissingDataBatch;
 
-    try std.testing.expect(try store.reconcileGroupSnapshotAtWatermark(
+    const handoff = (try store.reconcileAndCaptureSplitHandoffAtWatermark(
         std.testing.allocator,
         314,
         watermark,
@@ -2472,7 +2600,8 @@ test "data raft apply store reconciles inherited documents while preserving acti
             .{ .key = "doc:024", .value = "boundary" },
             .{ .key = "doc:047", .value = "right" },
         },
-    ));
+    )) orelse return error.TestExpectedEqual;
+    defer shard_state_store.freeHandoff(std.testing.allocator, handoff);
 
     const state = (try store.currentSplitState(std.testing.allocator, 314)) orelse
         return error.MissingSplitState;
@@ -2485,8 +2614,6 @@ test "data raft apply store reconciles inherited documents while preserving acti
     try std.testing.expectEqualStrings("", source_range.start);
     try std.testing.expectEqualStrings("doc:024", source_range.end);
 
-    const handoff = try store.captureSplitHandoff(std.testing.allocator, 314);
-    defer shard_state_store.freeHandoff(std.testing.allocator, handoff);
     try std.testing.expectEqual(@as(usize, 2), handoff.entries.len);
     try std.testing.expectEqualStrings("doc:024", handoff.entries[0].key);
     try std.testing.expectEqualStrings("doc:047", handoff.entries[1].key);
@@ -2651,6 +2778,60 @@ test "data raft apply store installs snapshot watermark atomically" {
         try std.testing.expectEqual(@as(u64, 51), advanced.commit_index);
         try std.testing.expectEqual(@as(u64, 51), advanced.last_entry_index);
     }
+}
+
+test "data raft apply store refuses stale snapshot projection regression" {
+    var source_tmp = std.testing.tmpDir(.{});
+    defer source_tmp.cleanup();
+    var target_tmp = std.testing.tmpDir(.{});
+    defer target_tmp.cleanup();
+    const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/stale-snapshot-source", .{source_tmp.sub_path});
+    defer std.testing.allocator.free(source_root);
+    const target_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/stale-snapshot-target", .{target_tmp.sub_path});
+    defer std.testing.allocator.free(target_root);
+
+    const initial = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={}") },
+    });
+    defer std.testing.allocator.free(initial);
+    var source = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
+    defer source.deinit();
+    try source.snapshotBuilder().applyBatch(.{ .group_id = 241, .commit_index = 2, .entries_bytes = initial });
+    const stale_snapshot = try source.snapshotBuilder().buildSnapshot(std.testing.allocator, 241);
+    defer std.testing.allocator.free(stale_snapshot);
+
+    var target = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = target_root });
+    defer target.deinit();
+    try target.snapshotBuilder().applyBatch(.{ .group_id = 241, .commit_index = 2, .entries_bytes = initial });
+    const prepare = try data_raft_batch.encode(std.testing.allocator, "docs", .{
+        .split_transition = .{
+            .kind = .prepare,
+            .transition_id = 241,
+            .attempt_epoch = 1,
+            .destination_group_id = 242,
+            .split_key = "doc:m",
+        },
+    });
+    defer std.testing.allocator.free(prepare);
+    const prepare_entry = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{.{
+        .term = 1,
+        .index = 3,
+        .entry_type = .normal,
+        .data = prepare,
+    }});
+    defer std.testing.allocator.free(prepare_entry);
+    try target.snapshotBuilder().applyBatch(.{ .group_id = 241, .commit_index = 3, .entries_bytes = prepare_entry });
+
+    try target.installSnapshot(std.testing.allocator, 241, 2, stale_snapshot);
+    const batch = (try target.latestBatch(241)) orelse return error.MissingDataBatch;
+    try std.testing.expectEqual(@as(u64, 3), batch.commit_index);
+    try std.testing.expectEqual(@as(u64, 3), batch.last_entry_index);
+    const state = (try target.currentSplitState(std.testing.allocator, 241)) orelse
+        return error.MissingSplitState;
+    defer shard_state_store.freeSplitState(std.testing.allocator, state);
+    try std.testing.expectEqual(shard_mod.SplitPhase.prepare, state.phase);
+    try std.testing.expectEqualStrings("doc:m", state.split_key);
 }
 
 test "data raft snapshot staging blocks only the target group" {

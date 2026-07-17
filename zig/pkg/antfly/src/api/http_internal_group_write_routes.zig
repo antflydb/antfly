@@ -251,6 +251,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             error.LeaderUnavailable,
             error.GroupLeaderUnavailable,
             error.SplitSourceProjectionNotReady,
+            error.AutoBulkIngestBusy,
             error.ApplyStoreGroupRetired,
             error.ApplyStoreShuttingDown,
             => return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable"),
@@ -299,6 +300,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             error.MetadataSnapshotUnavailable,
             error.SplitSourceProjectionNotReady,
             error.SplitSourceProjectionAdvanced,
+            error.AutoBulkIngestBusy,
             error.ApplyStoreGroupRetired,
             error.ApplyStoreShuttingDown,
             => {

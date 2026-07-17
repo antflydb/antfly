@@ -2170,6 +2170,14 @@ pub const ProvisionedTableWriteCache = struct {
         self.removeInactiveBulkIngestSessionLocked(table_name);
     }
 
+    fn autoBulkIngestIdleLocked(self: *const ProvisionedTableWriteCache, group_id: u64, table_name: []const u8) bool {
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (self.entryActiveLeasesLocked(entry) != 0) return false;
+        }
+        return true;
+    }
+
     pub fn finishExpiredAutoBulkIngestLocked(self: *ProvisionedTableWriteCache, now_ns: u64) !bool {
         return self.finishExpiredAutoBulkIngestLockedWithStatusLeases(now_ns, std.heap.page_allocator, null);
     }
@@ -7617,6 +7625,34 @@ pub const ProvisionedTableWriteSource = struct {
         defer self.local_db_mutex.unlock();
 
         return self.finishExpiredAutoBulkIngestLocked();
+    }
+
+    /// Publishes any primary-store bulk window before a lifecycle operation
+    /// snapshots the group's authoritative DB. This runs through the cache
+    /// owner so both DB state and cache session bookkeeping transition
+    /// atomically with respect to writer admission.
+    pub fn finishManagedWriterAutoBulkForTransition(
+        self: *ProvisionedTableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+    ) !void {
+        lockAtomic(&self.local_db_mutex);
+        defer self.local_db_mutex.unlock();
+        // CachedDb.deinit() takes local_db_mutex before dropping its cache
+        // lease. Waiting for DB publication while a lease is active would
+        // therefore deadlock the transition against the lease release. Fail
+        // closed and let the metadata transition retry after writers drain.
+        if (self.write_cache) |cache| {
+            if (!cache.autoBulkIngestIdleLocked(group_id, table_name)) return error.AutoBulkIngestBusy;
+        }
+        if (self.startup_write_cache) |cache| {
+            if (cache != self.write_cache and !cache.autoBulkIngestIdleLocked(group_id, table_name))
+                return error.AutoBulkIngestBusy;
+        }
+        if (self.write_cache) |cache| try cache.finishAutoBulkIngestLocked(group_id, table_name);
+        if (self.startup_write_cache) |cache| {
+            if (cache != self.write_cache) try cache.finishAutoBulkIngestLocked(group_id, table_name);
+        }
     }
 
     fn finishExpiredAutoBulkIngestLocked(self: *ProvisionedTableWriteSource) bool {
@@ -28588,7 +28624,69 @@ test "provisioned table write source runtime status does not lease writer during
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(@as(u64, 9), statuses.items[0].stats.doc_count);
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items[0].active_leases);
-    try write_cache.finishAutoBulkIngestLocked(7001, "docs");
+    try source.finishManagedWriterAutoBulkForTransition(7001, "docs");
+    try std.testing.expect(!write_cache.entries.items[0].auto_bulk_ingest_session_open);
+}
+
+test "split transition auto bulk publication retries while a writer lease is active" {
+    const alloc = std.testing.allocator;
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/split-auto-bulk-active-lease", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    source.write_cache = &write_cache;
+
+    var writer = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default_async, null, null);
+    try write_cache.ensureAutoBulkIngestLocked(7001, "docs", platform_time.monotonicNs());
+    try std.testing.expect(write_cache.entries.items[0].auto_bulk_ingest_session_open);
+    try std.testing.expectError(
+        error.AutoBulkIngestBusy,
+        source.finishManagedWriterAutoBulkForTransition(7001, "docs"),
+    );
+    try std.testing.expect(write_cache.entries.items[0].auto_bulk_ingest_session_open);
+
+    writer.deinit(alloc);
+    try source.finishManagedWriterAutoBulkForTransition(7001, "docs");
+    try std.testing.expect(!write_cache.entries.items[0].auto_bulk_ingest_session_open);
 }
 
 test "read preparation keeps write cache dirty while auto bulk ingest is active" {

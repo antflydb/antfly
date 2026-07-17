@@ -1107,6 +1107,7 @@ pub const MetadataService = struct {
     lifecycle_reconcile_hook: ?LifecycleReconcileHook = null,
     local_replica_root_reconcile_hook: ?LocalReplicaRootReconcileHook = null,
     local_replica_root_reconcile_permit_hook: ?LocalReplicaRootReconcilePermitHook = null,
+    lifecycle_listener_mutex: std.Io.Mutex = .init,
     lifecycle_listener_registered: bool = false,
     local_group_status_provider: ?LocalGroupStatusProvider = null,
     local_shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
@@ -1161,10 +1162,12 @@ pub const MetadataService = struct {
     }
 
     pub fn deinit(self: *MetadataService) void {
+        // Projection listeners retain `self`; stop and drain their Raft apply
+        // producer before releasing any callback-owned service state.
+        self.raft.deinit();
         self.store_status_backfill_marker_cache.deinit(self.alloc);
         self.cdc_backfill_registry.deinit(self.alloc);
         self.lifecycle_signal.deinit();
-        self.raft.deinit();
         if (self.replica_root_dir) |replica_root_dir| {
             api_table_writes.closeHostedManagedDbCacheForRoot(replica_root_dir);
         }
@@ -1227,21 +1230,25 @@ pub const MetadataService = struct {
     }
 
     fn ensureLifecycleListenerRegistered(self: *MetadataService) !void {
+        self.lifecycle_listener_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.lifecycle_listener_mutex.unlock(std.Options.debug_io);
         if (self.lifecycle_listener_registered) return;
         const store = self.projectedStore() orelse return;
-        try store.addProjectionListener(.{
-            .ptr = self,
-            .vtable = &.{
-                .on_projection_signal = metadataServiceProjectionSignal,
+        try store.addLifecycleListeners(
+            .{
+                .ptr = self,
+                .vtable = &.{
+                    .on_projection_signal = metadataServiceProjectionSignal,
+                },
             },
-        });
-        try store.addCommittedKeyListener(.{
-            .ptr = self,
-            .vtable = &.{
-                .matches_key = metadataServiceLifecycleKeyMatches,
-                .on_committed_key = metadataServiceCommittedKeySignal,
+            .{
+                .ptr = self,
+                .vtable = &.{
+                    .matches_key = metadataServiceLifecycleKeyMatches,
+                    .on_committed_key = metadataServiceCommittedKeySignal,
+                },
             },
-        });
+        );
         self.lifecycle_listener_registered = true;
     }
 
@@ -2367,6 +2374,7 @@ pub const MetadataHttpService = struct {
     lifecycle_reconcile_hook: ?LifecycleReconcileHook = null,
     local_replica_root_reconcile_hook: ?LocalReplicaRootReconcileHook = null,
     local_replica_root_reconcile_permit_hook: ?LocalReplicaRootReconcilePermitHook = null,
+    lifecycle_listener_mutex: std.Io.Mutex = .init,
     lifecycle_listener_registered: bool = false,
     cdc_write_source_override: ?api_table_writes.TableWriteSource = null,
     local_group_status_provider: ?LocalGroupStatusProvider = null,
@@ -2453,11 +2461,13 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn deinit(self: *MetadataHttpService) void {
+        // Projection listeners retain `self`; stop and drain their Raft apply
+        // producer before releasing any callback-owned service state.
+        self.raft.deinit();
         self.projected_core_snapshot_cache.deinit(self.alloc);
         self.store_status_backfill_marker_cache.deinit(self.alloc);
         self.cdc_backfill_registry.deinit(self.alloc);
         self.lifecycle_signal.deinit();
-        self.raft.deinit();
         self.linearizable_read_tracker.deinit();
         self.alloc.destroy(self.linearizable_read_tracker);
         if (self.replica_root_dir) |replica_root_dir| {
@@ -2527,21 +2537,25 @@ pub const MetadataHttpService = struct {
     }
 
     fn ensureLifecycleListenerRegistered(self: *MetadataHttpService) !void {
+        self.lifecycle_listener_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.lifecycle_listener_mutex.unlock(std.Options.debug_io);
         if (self.lifecycle_listener_registered) return;
         const store = self.projectedStore() orelse return;
-        try store.addProjectionListener(.{
-            .ptr = self,
-            .vtable = &.{
-                .on_projection_signal = metadataHttpServiceProjectionSignal,
+        try store.addLifecycleListeners(
+            .{
+                .ptr = self,
+                .vtable = &.{
+                    .on_projection_signal = metadataHttpServiceProjectionSignal,
+                },
             },
-        });
-        try store.addCommittedKeyListener(.{
-            .ptr = self,
-            .vtable = &.{
-                .matches_key = metadataHttpServiceLifecycleKeyMatches,
-                .on_committed_key = metadataHttpServiceCommittedKeySignal,
+            .{
+                .ptr = self,
+                .vtable = &.{
+                    .matches_key = metadataHttpServiceLifecycleKeyMatches,
+                    .on_committed_key = metadataHttpServiceCommittedKeySignal,
+                },
             },
-        });
+        );
         self.lifecycle_listener_registered = true;
     }
 

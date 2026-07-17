@@ -21,7 +21,10 @@ const peer_resolver = @import("peer_resolver.zig");
 pub const PlacementIntent = struct {
     record: catalog.ReplicaRecord,
     store_id: u64 = 0,
+    /// Desired voting members. Relocation learners are represented
+    /// separately so they can receive state without being able to campaign.
     peer_node_ids: []const u64 = &.{},
+    learner_node_ids: []const u64 = &.{},
     serving_state: PlacementServingState = .serving,
     relocation_generation: u64 = 0,
     relocation_source_node_id: u64 = 0,
@@ -306,8 +309,10 @@ pub const Reconciler = struct {
         const changes = try allocMembershipChanges(
             self.alloc,
             status.conf_state.voters,
+            status.conf_state.learners,
             intent.record.local_node_id,
             intent.peer_node_ids,
+            intent.learner_node_ids,
         );
         defer self.alloc.free(changes);
         if (changes.len == 0) return false;
@@ -333,24 +338,48 @@ fn localNodeCanProposeMembership(status: raft_engine.core.Status) bool {
 fn allocMembershipChanges(
     alloc: std.mem.Allocator,
     current_voters: []const u64,
+    current_learners: []const u64,
     local_node_id: u64,
-    peer_node_ids: []const u64,
+    voter_node_ids: []const u64,
+    learner_node_ids: []const u64,
 ) ![]raft_engine.core.ConfChangeSingle {
-    var desired = std.ArrayListUnmanaged(u64).empty;
-    defer desired.deinit(alloc);
-    try appendUniqueNodeId(alloc, &desired, local_node_id);
-    for (peer_node_ids) |node_id| try appendUniqueNodeId(alloc, &desired, node_id);
-    std.mem.sort(u64, desired.items, {}, std.sort.asc(u64));
+    var desired_voters = std.ArrayListUnmanaged(u64).empty;
+    defer desired_voters.deinit(alloc);
+    var desired_learners = std.ArrayListUnmanaged(u64).empty;
+    defer desired_learners.deinit(alloc);
+    for (learner_node_ids) |node_id| try appendUniqueNodeId(alloc, &desired_learners, node_id);
+    if (!containsNodeId(desired_learners.items, local_node_id))
+        try appendUniqueNodeId(alloc, &desired_voters, local_node_id);
+    for (voter_node_ids) |node_id| {
+        if (!containsNodeId(desired_learners.items, node_id))
+            try appendUniqueNodeId(alloc, &desired_voters, node_id);
+    }
+    std.mem.sort(u64, desired_voters.items, {}, std.sort.asc(u64));
+    std.mem.sort(u64, desired_learners.items, {}, std.sort.asc(u64));
 
     var changes = std.ArrayListUnmanaged(raft_engine.core.ConfChangeSingle).empty;
     errdefer changes.deinit(alloc);
-    for (desired.items) |node_id| {
+    for (desired_voters.items) |node_id| {
         if (!containsNodeId(current_voters, node_id)) {
             try changes.append(alloc, .{ .change_type = .add_node, .node_id = node_id });
         }
     }
+    for (desired_learners.items) |node_id| {
+        if (!containsNodeId(current_learners, node_id)) {
+            try changes.append(alloc, .{ .change_type = .add_learner_node, .node_id = node_id });
+        }
+    }
     for (current_voters) |node_id| {
-        if (!containsNodeId(desired.items, node_id)) {
+        if (!containsNodeId(desired_voters.items, node_id) and
+            !containsNodeId(desired_learners.items, node_id))
+        {
+            try changes.append(alloc, .{ .change_type = .remove_node, .node_id = node_id });
+        }
+    }
+    for (current_learners) |node_id| {
+        if (!containsNodeId(desired_voters.items, node_id) and
+            !containsNodeId(desired_learners.items, node_id))
+        {
             try changes.append(alloc, .{ .change_type = .remove_node, .node_id = node_id });
         }
     }
@@ -386,6 +415,8 @@ fn hashIntent(intent: PlacementIntent) u64 {
     hashU64(&hasher, intent.relocation_applied_sequence);
     hashU64(&hasher, @intCast(intent.peer_node_ids.len));
     for (intent.peer_node_ids) |node_id| hashU64(&hasher, node_id);
+    hashU64(&hasher, @intCast(intent.learner_node_ids.len));
+    for (intent.learner_node_ids) |node_id| hashU64(&hasher, node_id);
     if (intent.record.snapshot_bootstrap) |snapshot| {
         hashU64(&hasher, 1);
         hashU64(&hasher, snapshot.from_node_id);
@@ -414,10 +445,15 @@ fn hashU64(hasher: *std.hash.Wyhash, value: u64) void {
 fn cloneIntent(alloc: std.mem.Allocator, intent: PlacementIntent) !PlacementIntent {
     var cloned_record = try intent.record.clone(alloc);
     errdefer cloned_record.deinit(alloc);
+    const peer_node_ids = if (intent.peer_node_ids.len == 0) &.{} else try alloc.dupe(u64, intent.peer_node_ids);
+    errdefer if (peer_node_ids.len > 0) alloc.free(peer_node_ids);
+    const learner_node_ids = if (intent.learner_node_ids.len == 0) &.{} else try alloc.dupe(u64, intent.learner_node_ids);
+    errdefer if (learner_node_ids.len > 0) alloc.free(learner_node_ids);
     return .{
         .record = cloned_record,
         .store_id = intent.store_id,
-        .peer_node_ids = if (intent.peer_node_ids.len == 0) &.{} else try alloc.dupe(u64, intent.peer_node_ids),
+        .peer_node_ids = peer_node_ids,
+        .learner_node_ids = learner_node_ids,
         .serving_state = intent.serving_state,
         .relocation_generation = intent.relocation_generation,
         .relocation_source_node_id = intent.relocation_source_node_id,
@@ -437,6 +473,7 @@ fn freeIntent(alloc: std.mem.Allocator, intent: PlacementIntent) void {
     var record = intent.record;
     record.deinit(alloc);
     if (intent.peer_node_ids.len > 0) alloc.free(intent.peer_node_ids);
+    if (intent.learner_node_ids.len > 0) alloc.free(intent.learner_node_ids);
 }
 
 pub fn freeIntentOwned(alloc: std.mem.Allocator, intent: PlacementIntent) void {
@@ -666,8 +703,10 @@ test "membership reconciliation expands before removing obsolete voters" {
     const changes = try allocMembershipChanges(
         std.testing.allocator,
         &.{ 1, 2, 5 },
+        &.{},
         1,
         &.{ 1, 2, 3, 4 },
+        &.{},
     );
     defer std.testing.allocator.free(changes);
 
@@ -682,12 +721,42 @@ test "membership reconciliation normalizes duplicate and missing local voters" {
     const changes = try allocMembershipChanges(
         std.testing.allocator,
         &.{ 7, 8 },
+        &.{},
         7,
         &.{ 8, 8 },
+        &.{},
     );
     defer std.testing.allocator.free(changes);
 
     try std.testing.expectEqual(@as(usize, 0), changes.len);
+}
+
+test "membership reconciliation hydrates learners before voter promotion" {
+    const hydrate = try allocMembershipChanges(
+        std.testing.allocator,
+        &.{ 1, 2 },
+        &.{},
+        1,
+        &.{ 1, 2 },
+        &.{3},
+    );
+    defer std.testing.allocator.free(hydrate);
+    try std.testing.expectEqualSlices(raft_engine.core.ConfChangeSingle, &.{
+        .{ .change_type = .add_learner_node, .node_id = 3 },
+    }, hydrate);
+
+    const promote = try allocMembershipChanges(
+        std.testing.allocator,
+        &.{ 1, 2 },
+        &.{3},
+        1,
+        &.{ 1, 2, 3 },
+        &.{},
+    );
+    defer std.testing.allocator.free(promote);
+    try std.testing.expectEqualSlices(raft_engine.core.ConfChangeSingle, &.{
+        .{ .change_type = .add_node, .node_id = 3 },
+    }, promote);
 }
 
 test "membership reconciliation requires a local voter" {
@@ -787,6 +856,7 @@ test "cloneIntentOwned deep clones backup restore metadata" {
         },
         .store_id = 21,
         .peer_node_ids = try std.testing.allocator.dupe(u64, &.{ 9, 10 }),
+        .learner_node_ids = try std.testing.allocator.dupe(u64, &.{11}),
     };
     defer freeIntentOwned(std.testing.allocator, original);
 
@@ -798,4 +868,5 @@ test "cloneIntentOwned deep clones backup restore metadata" {
     try std.testing.expect(cloned.record.backup_restore_bootstrap.?.location.ptr != original.record.backup_restore_bootstrap.?.location.ptr);
     try std.testing.expect(cloned.record.backup_restore_bootstrap.?.snapshot_path.ptr != original.record.backup_restore_bootstrap.?.snapshot_path.ptr);
     try std.testing.expect(cloned.peer_node_ids.ptr != original.peer_node_ids.ptr);
+    try std.testing.expect(cloned.learner_node_ids.ptr != original.learner_node_ids.ptr);
 }
