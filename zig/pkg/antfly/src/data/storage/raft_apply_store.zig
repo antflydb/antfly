@@ -806,8 +806,9 @@ pub const RaftApplyStore = struct {
     /// generation-handoff counterpart to `seedGroupSnapshotIfAbsent`: replica
     /// replacement may inherit a document root while its new Raft generation
     /// starts with only a bootstrap entry. Normal-entry history and the apply
-    /// watermark are preserved. Once a split starts, only replicated split
-    /// deltas may mutate the projection.
+    /// watermark are preserved. Reconciliation replaces only projected
+    /// document keys, so active split controls and delta history remain
+    /// durable while a relocated generation imports its inherited root.
     pub fn reconcileGroupSnapshotAtWatermark(
         self: *RaftApplyStore,
         alloc: std.mem.Allocator,
@@ -829,22 +830,23 @@ pub const RaftApplyStore = struct {
             return false;
         }
         const group_store = try self.writableGroupStoreLocked(shard, group_id);
-        if (try shard_state_store.currentSplitState(&group_store.store, alloc, group_id)) |state| {
-            shard_state_store.freeSplitState(alloc, state);
-            return error.SplitInProgress;
-        }
-
+        const active_split = try shard_state_store.currentSplitState(&group_store.store, alloc, group_id);
+        defer if (active_split) |state| shard_state_store.freeSplitState(alloc, state);
         const current_range = try shard_state_store.currentRange(&group_store.store, alloc, group_id);
         defer range_state.freeRange(alloc, current_range);
+        // Split start narrows the projected serving range while deliberately
+        // retaining right-hand documents for handoff. Import documents from
+        // the authoritative DB without widening that serving range again.
+        const replacement_range = if (active_split != null) current_range else byte_range;
         const current_entries = try shard_state_store.groupState(&group_store.store, alloc, group_id);
         defer shard_state_store.freeGroupStateEntries(alloc, current_entries);
-        if (std.mem.eql(u8, current_range.start, byte_range.start) and
-            std.mem.eql(u8, current_range.end, byte_range.end) and
+        if (std.mem.eql(u8, current_range.start, replacement_range.start) and
+            std.mem.eql(u8, current_range.end, replacement_range.end) and
             groupSnapshotsEqual(current_entries, entries))
         {
             return true;
         }
-        try shard_state_store.replaceGroupSnapshot(&group_store.store, alloc, group_id, byte_range, entries);
+        try shard_state_store.replaceGroupSnapshot(&group_store.store, alloc, group_id, replacement_range, entries);
         return true;
     }
 
@@ -2404,6 +2406,58 @@ test "data raft apply store reconciles an inherited document root at an exact wa
     defer shard_state_store.freeGroupStateEntries(std.testing.allocator, after_stale_attempt);
     try std.testing.expectEqual(@as(usize, 3), after_stale_attempt.len);
     try std.testing.expectEqualStrings("doc:u", after_stale_attempt[2].key);
+}
+
+test "data raft apply store reconciles inherited documents while preserving active split control" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-active-split-reconcile", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+
+    const setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range::") },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("split_prepare:314:1:315:doc:024") },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("split_start:314:1:315:doc:024") },
+    });
+    defer std.testing.allocator.free(setup);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 314,
+        .commit_index = 3,
+        .entries_bytes = setup,
+    });
+    const watermark = (try store.latestBatch(314)) orelse return error.MissingDataBatch;
+
+    try std.testing.expect(try store.reconcileGroupSnapshotAtWatermark(
+        std.testing.allocator,
+        314,
+        watermark,
+        .{ .start = "", .end = "" },
+        &.{
+            .{ .key = "doc:000", .value = "left" },
+            .{ .key = "doc:024", .value = "boundary" },
+            .{ .key = "doc:047", .value = "right" },
+        },
+    ));
+
+    const state = (try store.currentSplitState(std.testing.allocator, 314)) orelse
+        return error.MissingSplitState;
+    defer shard_state_store.freeSplitState(std.testing.allocator, state);
+    try std.testing.expectEqual(shard_mod.SplitPhase.splitting, state.phase);
+    try std.testing.expectEqualStrings("doc:024", state.split_key);
+    try std.testing.expectEqual(watermark, (try store.latestBatch(314)).?);
+    const source_range = try store.currentRange(std.testing.allocator, 314);
+    defer range_state.freeRange(std.testing.allocator, source_range);
+    try std.testing.expectEqualStrings("", source_range.start);
+    try std.testing.expectEqualStrings("doc:024", source_range.end);
+
+    const handoff = try store.captureSplitHandoff(std.testing.allocator, 314);
+    defer shard_state_store.freeHandoff(std.testing.allocator, handoff);
+    try std.testing.expectEqual(@as(usize, 2), handoff.entries.len);
+    try std.testing.expectEqualStrings("doc:024", handoff.entries[0].key);
+    try std.testing.expectEqualStrings("doc:047", handoff.entries[1].key);
 }
 
 test "data raft apply store transition reads fail fast during generation staging" {

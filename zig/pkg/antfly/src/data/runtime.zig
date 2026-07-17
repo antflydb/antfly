@@ -53,6 +53,7 @@ const resource_manager_mod = @import("../storage/resource_manager.zig");
 const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
+const range_state_mod = @import("../storage/db/range_state.zig");
 const data_raft_batch = @import("raft_batch.zig");
 const platform_clock = @import("antfly_platform").clock;
 const process_memory_mod = @import("antfly_platform").process_memory;
@@ -5514,6 +5515,10 @@ pub const DataServer = struct {
         defer self.alloc.free(source_root_dir);
         try self.ensureSplitSourceApplyStoreSeeded(source_root_dir, source_group_id);
         const source_store = self.localTransitionApplyStore() orelse return error.MissingSplitSourceStore;
+        // A relocated leader may inherit the authoritative DB after its Raft
+        // projection already received split control entries. Repair document
+        // projection at an exact watermark before deriving the handoff.
+        try self.reconcileSplitSourceApplyStoreDocuments(source_store, source_root_dir, source_group_id);
         const source_state = (try source_store.currentSplitState(self.alloc, source_group_id)) orelse return error.SplitInProgress;
         defer antfly.data.storage.shard_state_store.freeSplitState(self.alloc, source_state);
         try validateReplicatedSplitTransfer(source_state, transition_id, attempt_epoch, destination_group_id);
@@ -6044,6 +6049,15 @@ pub const DataServer = struct {
         if (initial_observation.state != null) {
             return;
         }
+        try self.reconcileSplitSourceApplyStoreDocuments(source_store, source_root_dir, source_group_id);
+    }
+
+    fn reconcileSplitSourceApplyStoreDocuments(
+        self: *DataServer,
+        source_store: *antfly.data.RaftApplyStore,
+        source_root_dir: []const u8,
+        source_group_id: u64,
+    ) !void {
         // Replica replacement can preserve the authoritative document root
         // while starting a fresh Raft generation at its bootstrap entry. A
         // non-null apply watermark therefore does not prove that the split
@@ -6111,10 +6125,25 @@ pub const DataServer = struct {
             entries.deinit(self.alloc);
         }
 
-        const byte_range = db.getRange();
+        const active_split = try source_store.currentSplitState(self.alloc, source_group_id);
+        defer if (active_split) |state| antfly.data.storage.shard_state_store.freeSplitState(self.alloc, state);
+        var projected_range: ?antfly.db.types.ByteRange = null;
+        defer if (projected_range) |range| range_state_mod.freeRange(self.alloc, range);
+
+        const byte_range = if (active_split) |state| blk: {
+            // A serving DB may already expose the narrowed source range while
+            // the projection still needs the retained right half for handoff.
+            // Split state is the durable owner of that pre-cutover boundary.
+            const current = try source_store.currentRange(self.alloc, source_group_id);
+            projected_range = current;
+            break :blk antfly.db.types.ByteRange{
+                .start = current.start,
+                .end = state.original_range_end,
+            };
+        } else db.getRange();
         const lower = try antfly.internal_keys.documentRangeLowerAlloc(self.alloc, byte_range.start);
         defer self.alloc.free(lower);
-        const upper = if (byte_range.end.len > 0) try antfly.internal_keys.documentRangeUpperAlloc(self.alloc, byte_range.end) else null;
+        const upper = if (byte_range.end.len > 0) try antfly.internal_keys.documentRangeLowerAlloc(self.alloc, byte_range.end) else null;
         defer if (upper) |owned| self.alloc.free(owned);
 
         const scanned = try db.core.store.scanRange(self.alloc, lower, if (upper) |owned| owned else "");

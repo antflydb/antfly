@@ -1200,9 +1200,10 @@ test "group state range scan is allocation-failure safe" {
         deletes.deinit(std.testing.allocator);
     }
     const operations = [_]DataOperation{
-        .{ .set_range = .{ .start = @constCast("doc:a"), .end = @constCast("doc:z") } },
+        .{ .set_range = .{ .start = @constCast("doc:a"), .end = @constCast("") } },
         .{ .put = .{ .key = @constCast("doc:n"), .value = @constCast("one") } },
         .{ .put = .{ .key = @constCast("doc:t"), .value = @constCast("two") } },
+        .{ .put = .{ .key = @constCast("doc:z"), .value = @constCast("exclusive-end") } },
     };
     try appendOperationEffects(&store, std.testing.allocator, 61, &operations, &writes, &deletes);
     try putOwnedBatch(&store, std.testing.allocator, writes.items, deletes.items);
@@ -1805,7 +1806,9 @@ fn groupDocumentUpperBoundAlloc(alloc: std.mem.Allocator, group_id: u64, key: []
     if (key.len == 0) return null;
     const logical = try groupDocumentLogicalKeyAlloc(alloc, group_id, key);
     defer alloc.free(logical);
-    return try internal_keys.documentRangeUpperAlloc(alloc, logical);
+    // Byte ranges are [start, end), while documentRangeUpperAlloc is a
+    // prefix upper bound and would include the document exactly at `end`.
+    return try internal_keys.documentRangeLowerAlloc(alloc, logical);
 }
 
 fn stripGroupDocumentPrefixAlloc(alloc: std.mem.Allocator, logical_key: []const u8, group_id: u64) ![]u8 {

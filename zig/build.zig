@@ -3485,6 +3485,7 @@ pub fn build(b: *std.Build) void {
         "data raft apply store admits one writable owner per root",
         "data raft apply store skips persisted split commands in overlapping replay",
         "data raft apply store recovers exact split replay after injected projection corruption",
+        "data raft apply store reconciles inherited documents while preserving active split control",
         "data raft apply store rejects mismatched terminal split identity",
         "data raft apply store persists split destination acknowledgements",
         "data raft apply store seeds pre-raft snapshots once at reserved index zero",
