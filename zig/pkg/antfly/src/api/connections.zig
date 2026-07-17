@@ -157,9 +157,10 @@ pub fn invokeInferenceConnection(
     operation: []const u8,
     body: []const u8,
 ) !InvokeResult {
-    if (!validInferenceOperation(operation)) return error.UnsupportedInferenceOperation;
+    const required_capability = inferenceCapability(operation) orelse return error.UnsupportedInferenceOperation;
     const connection = node_config.connections.get(connection_id) orelse return error.ConnectionNotFound;
     if (connection.kind != .inference) return error.ConnectionNotInference;
+    try requireInferenceCapability(connection.capabilities, required_capability);
     const cfg = connection.inference orelse return error.InvalidConfig;
     if (!std.mem.eql(u8, cfg.provider, "antfly")) return error.ProviderNotAntflyCompatible;
     const raw_url = cfg.url orelse return error.ConnectionURLMissing;
@@ -170,7 +171,7 @@ pub fn invokeInferenceConnection(
     const url = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, operation });
     defer alloc.free(url);
 
-    const resolved_key = if (cfg.api_key) |raw| try common_secrets.resolveReferenceOwned(alloc, secret_store, raw) else null;
+    const resolved_key = try resolveInferenceApiKey(alloc, secret_store, cfg.api_key);
     defer if (resolved_key) |key| alloc.free(key);
     const auth = if (resolved_key) |key| try std.fmt.allocPrint(alloc, "Bearer {s}", .{key}) else null;
     defer if (auth) |value| alloc.free(value);
@@ -187,11 +188,33 @@ pub fn invokeInferenceConnection(
     };
 }
 
-fn validInferenceOperation(operation: []const u8) bool {
-    inline for (&.{ "embed", "generate", "rerank", "chunk", "recognize", "extract", "rewrite", "read", "transcribe" }) |allowed| {
-        if (std.mem.eql(u8, operation, allowed)) return true;
+fn inferenceCapability(operation: []const u8) ?[]const u8 {
+    inline for (&.{
+        .{ "embed", "models.embed" },
+        .{ "generate", "models.generate" },
+        .{ "rerank", "models.rerank" },
+        .{ "chunk", "models.chunk" },
+        .{ "recognize", "models.recognize" },
+        .{ "extract", "models.extract" },
+        .{ "rewrite", "models.rewrite" },
+        .{ "read", "models.read" },
+        .{ "transcribe", "models.transcribe" },
+    }) |mapping| {
+        if (std.mem.eql(u8, operation, mapping[0])) return mapping[1];
     }
-    return false;
+    return null;
+}
+
+fn resolveInferenceApiKey(
+    alloc: Allocator,
+    secret_store: ?*common_secrets.FileStore,
+    raw: ?[]const u8,
+) !?[]u8 {
+    return if (raw) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null;
+}
+
+fn requireInferenceCapability(capabilities: []const []const u8, required: []const u8) !void {
+    if (!containsString(capabilities, required)) return error.ConnectionCapabilityMissing;
 }
 
 fn validInferenceURL(raw_url: []const u8) bool {
@@ -464,8 +487,8 @@ fn appendLocalInferenceConnection(
     try instance.sources.append(arena, "runtime:local-inference");
 
     var connection = Connection{
-        .id = "local-inference",
-        .name = "local-inference",
+        .id = common_config.local_inference_connection_id,
+        .name = common_config.local_inference_connection_id,
         .display_name = "Local inference",
         .kind = .inference,
         .status = .configured,
@@ -917,12 +940,17 @@ fn resolveModels(
             }
         }
 
+        const api_key = resolveInferenceApiKey(arena, sources.secret_store, instance.api_key) catch |err| {
+            outcomes[i] = .{ .ok = false, .err_name = @errorName(err) };
+            continue;
+        };
+
         const job = try arena.create(ModelsJob);
         job.* = .{
             .ep = .{
                 .provider = instance.provider,
                 .url = instance.url,
-                .api_key = instance.api_key,
+                .api_key = api_key,
                 .region = instance.region,
                 .project_id = instance.project_id,
                 .location = instance.location,
@@ -1417,8 +1445,43 @@ test "build response exposes embedded inference as a local connection" {
 }
 
 test "inference connection operations are allowlisted" {
-    try std.testing.expect(validInferenceOperation("generate"));
-    try std.testing.expect(!validInferenceOperation("../models"));
+    try std.testing.expectEqualStrings("models.generate", inferenceCapability("generate").?);
+    try std.testing.expectEqualStrings("models.embed", inferenceCapability("embed").?);
+    try std.testing.expect(inferenceCapability("../models") == null);
+
+    const embed_only = &.{"models.embed"};
+    try requireInferenceCapability(embed_only, inferenceCapability("embed").?);
+    try std.testing.expectError(error.ConnectionCapabilityMissing, requireInferenceCapability(embed_only, inferenceCapability("generate").?));
+
+    const alloc = std.testing.allocator;
+    var cfg = try common_config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "connections": {
+        \\    "embed-only": {
+        \\      "kind": "inference",
+        \\      "capabilities": ["models.embed"],
+        \\      "inference": { "provider": "antfly", "url": "https://platform.antfly.io" }
+        \\    }
+        \\  }
+        \\}
+    );
+    defer cfg.deinit();
+    try std.testing.expectError(error.ConnectionCapabilityMissing, invokeInferenceConnection(alloc, undefined, &cfg, null, "embed-only", "generate", "{}"));
+
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-connection-secrets-{d}.json", .{platform_time.monotonicNs()});
+    defer alloc.free(store_path);
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
+
+    var secret_store = try common_secrets.FileStore.init(alloc, store_path);
+    defer secret_store.deinit();
+    var stored = try secret_store.put(alloc, "openai.api_key", "resolved-key");
+    defer stored.deinit(alloc);
+
+    const resolved = (try resolveInferenceApiKey(alloc, &secret_store, "${secret:openai.api_key}")).?;
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings("resolved-key", resolved);
 }
 
 test "inference connection URLs require an HTTP origin" {

@@ -420,6 +420,7 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "request body required");
         const result = self.api_server.invokeInferenceConnection(ctx.allocator, connection_id, operation, body) catch |err| switch (err) {
+            error.ConnectionCapabilityMissing => return textResponse(ctx, 403, @errorName(err)),
             error.ConnectionNotFound, error.ConnectionNotInference, error.InvalidConfig, error.ConnectionURLMissing, error.InvalidConnectionURL, error.ProviderNotAntflyCompatible, error.UnsupportedInferenceOperation => return textResponse(ctx, 400, @errorName(err)),
             else => return textResponse(ctx, 502, @errorName(err)),
         };

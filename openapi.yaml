@@ -2225,6 +2225,7 @@ paths:
         - name: operation
           in: path
           required: true
+          description: Requires the connection capability `models.<operation>`.
           schema:
             type: string
             enum:
@@ -2256,6 +2257,8 @@ paths:
           description: Invalid connection or operation
         '401':
           description: Unauthorized - authentication required
+        '403':
+          description: The connection does not declare the capability required by this operation
         '502':
           description: Inference provider request failed
       security:
