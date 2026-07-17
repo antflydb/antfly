@@ -54,6 +54,7 @@ func main() {
 	var probeAddr string
 	var skipCRDInstall bool
 	var enableInferenceControllers bool
+	var enableHotStandbyHA bool
 	var inferenceAntflyImage string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -64,6 +65,8 @@ func main() {
 		"Skip automatic CRD installation (use if CRDs managed externally)")
 	flag.BoolVar(&enableInferenceControllers, "enable-inference-controllers", true,
 		"Enable InferencePool and InferenceProxy controllers and AntflyCluster.spec.inference management. CRD installation remains unconditional unless --skip-crd-install is set.")
+	flag.BoolVar(&enableHotStandbyHA, "enable-hot-standby-ha", false,
+		"Enable admission and reconciliation of AntflyCluster.spec.highAvailability.mode=HotStandby.")
 	flag.StringVar(&inferenceAntflyImage, "inference-antfly-image", defaultInferenceOmniImage,
 		"Default omni Antfly image for InferencePool pods. The image must provide the /antfly inference runtime contract.")
 	opts := zap.Options{
@@ -105,6 +108,7 @@ func main() {
 
 	setupLog.Info("operator configuration",
 		"enableInferenceControllers", enableInferenceControllers,
+		"enableHotStandbyHA", enableHotStandbyHA,
 		"inferenceAntflyImage", inferenceAntflyImage,
 		"skipCRDInstall", skipCRDInstall,
 		"webhooksEnabled", webhooksEnabled(),
@@ -120,6 +124,7 @@ func main() {
 		KubeClient:            k8sClient,
 		Recorder:              mgr.GetEventRecorder("antfly-operator"),
 		ManageInferencePools:  enableInferenceControllers,
+		EnableHotStandbyHA:    &enableHotStandbyHA,
 		DefaultInferenceImage: inferenceAntflyImage,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "AntflyCluster")
@@ -167,7 +172,7 @@ func main() {
 
 	// Setup webhooks
 	if webhooksEnabled() {
-		if err := webhookv1.SetupWithManager(mgr); err != nil {
+		if err := webhookv1.SetupWithManager(mgr, enableHotStandbyHA); err != nil {
 			setupLog.Error(err, "unable to create webhooks")
 			os.Exit(1)
 		}

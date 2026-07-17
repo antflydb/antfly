@@ -16,6 +16,9 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-cache
   ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-global-cache
+  # Required PR/push/scheduled aggregates skip the gated HA suites. Manual
+  # dispatch retains the full HA test surface until PRs #346/#347 land.
+  ZIG_BUILD_FLAGS: ${{ github.event_name == 'workflow_dispatch' && '-Dha-tests=true' || '-Dha-tests=false' }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
@@ -460,7 +463,7 @@ jobs:
 
       - name: Run Zig chaos tests
         working-directory: zig
-        run: taskset -c ${{ steps.cpus.outputs.list }} zig build chaos-test
+        run: taskset -c ${{ steps.cpus.outputs.list }} zig build chaos-test ${ZIG_BUILD_FLAGS}
 
   e2e-base:
     name: e2e-base
