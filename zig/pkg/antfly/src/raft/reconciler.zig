@@ -42,12 +42,15 @@ pub const PlacementServingState = enum(u8) {
     cutover_ready,
     serving,
     draining,
+    /// The replica remains hosted so it can observe and report the committed
+    /// final configuration, but it is excluded from membership and routing.
+    retiring,
 };
 
 pub fn placementMayServeClientReads(intent: PlacementIntent) bool {
     return switch (intent.serving_state) {
         .serving, .draining => true,
-        .planned, .bootstrapping, .replaying, .cutover_ready => false,
+        .planned, .bootstrapping, .replaying, .cutover_ready, .retiring => false,
     };
 }
 
@@ -65,7 +68,7 @@ pub fn placementReadableWithPeers(intents: []const PlacementIntent, intent: Plac
             }
             return true;
         },
-        .planned, .bootstrapping, .replaying, .cutover_ready => return false,
+        .planned, .bootstrapping, .replaying, .cutover_ready, .retiring => return false,
     }
 }
 
@@ -306,13 +309,14 @@ pub const Reconciler = struct {
             return true;
         }
 
-        const changes = try allocMembershipChanges(
+        const changes = try allocMembershipChangesWithLocalPolicy(
             self.alloc,
             status.conf_state.voters,
             status.conf_state.learners,
             intent.record.local_node_id,
             intent.peer_node_ids,
             intent.learner_node_ids,
+            intent.serving_state != .retiring,
         );
         defer self.alloc.free(changes);
         if (changes.len == 0) return false;
@@ -343,12 +347,32 @@ fn allocMembershipChanges(
     voter_node_ids: []const u64,
     learner_node_ids: []const u64,
 ) ![]raft_engine.core.ConfChangeSingle {
+    return allocMembershipChangesWithLocalPolicy(
+        alloc,
+        current_voters,
+        current_learners,
+        local_node_id,
+        voter_node_ids,
+        learner_node_ids,
+        true,
+    );
+}
+
+fn allocMembershipChangesWithLocalPolicy(
+    alloc: std.mem.Allocator,
+    current_voters: []const u64,
+    current_learners: []const u64,
+    local_node_id: u64,
+    voter_node_ids: []const u64,
+    learner_node_ids: []const u64,
+    retain_local_voter: bool,
+) ![]raft_engine.core.ConfChangeSingle {
     var desired_voters = std.ArrayListUnmanaged(u64).empty;
     defer desired_voters.deinit(alloc);
     var desired_learners = std.ArrayListUnmanaged(u64).empty;
     defer desired_learners.deinit(alloc);
     for (learner_node_ids) |node_id| try appendUniqueNodeId(alloc, &desired_learners, node_id);
-    if (!containsNodeId(desired_learners.items, local_node_id))
+    if (retain_local_voter and !containsNodeId(desired_learners.items, local_node_id))
         try appendUniqueNodeId(alloc, &desired_voters, local_node_id);
     for (voter_node_ids) |node_id| {
         if (!containsNodeId(desired_learners.items, node_id))
@@ -729,6 +753,23 @@ test "membership reconciliation normalizes duplicate and missing local voters" {
     defer std.testing.allocator.free(changes);
 
     try std.testing.expectEqual(@as(usize, 0), changes.len);
+}
+
+test "membership reconciliation removes a hosted retiring local voter" {
+    const changes = try allocMembershipChangesWithLocalPolicy(
+        std.testing.allocator,
+        &.{ 7, 8 },
+        &.{},
+        7,
+        &.{8},
+        &.{},
+        false,
+    );
+    defer std.testing.allocator.free(changes);
+
+    try std.testing.expectEqualSlices(raft_engine.core.ConfChangeSingle, &.{
+        .{ .change_type = .remove_node, .node_id = 7 },
+    }, changes);
 }
 
 test "membership reconciliation hydrates learners before voter promotion" {

@@ -23,6 +23,12 @@ The serving-layer target shape is:
 - short-lived maintenance DB opens only while an exclusive table/group
   transition lease is held
 
+Split/merge projection work uses a group-exclusive transition lease. It queues
+ahead of later writers, briefly drains reads while managed auto-bulk state is
+published, then reopens reads from the published generation for snapshot scan
+and repair. Sustained traffic therefore cannot starve a transition, and an
+instantaneous cache-idle probe is not used as quiescence.
+
 The important restriction is that "read profile" must not create a second cached
 DB identity over the same table-group root. Lookup, scan, query, and status may
 use different methods or lazy capabilities, but they should share the same read
@@ -508,14 +514,31 @@ documents.
 
 Split preparation reconciles an inherited generation only at an exact durable
 apply watermark. It first waits until the document state machine has applied
-through that watermark, scans the generation-owned writer, and then compares and
-replaces only the projected range and documents while holding the per-group
-apply lock. Normal-entry history and the watermark remain unchanged. If Raft
-advances during the scan, the compare fails and preparation retries from a new
-snapshot; once split control state exists, reconciliation is forbidden and only
-replicated split deltas may mutate the projection. This keeps steady-state apply
-authoritative while making replica handoff complete without discarding
-concurrent history or opening a competing writer.
+through that watermark, acquires group-exclusive write admission, finishes
+managed bulk state, and scans one point-in-time transaction from the
+generation-owned writer. It does not hold the DB apply lock during the scan.
+Existing projected values are compared through a cursor instead of being
+materialized, and atomic replacement writes directly through one transaction
+instead of constructing another shard-sized write list.
+
+Successful reconciliation records the authoritative DB root generation beside
+the projection. Later split handoffs use an O(1) durable fast-path check: both
+that root generation and the complete Raft watermark identity must match before
+the apply-store projection can be captured without rescanning the DB. Snapshot
+installation naturally drops the marker with the replaced group generation.
+Normal-entry history and the watermark remain unchanged. If Raft advances
+during repair, publication fails and preparation retries from a new snapshot;
+only replicated split deltas may mutate an active projection.
+
+Replica relocation and replica-count shrink use two committed membership
+phases. A `draining` source remains a voter while replacement learners hydrate
+and the expanded voter set stabilizes. Once a surviving replica owns leadership,
+metadata publishes the final peer set and marks removed replicas `retiring`.
+A retiring replica remains hosted and reports Raft status but is excluded from
+membership and client routing. Its placement row can be deleted only after the
+source reports that it is no longer a voter and every survivor reports the same
+stable final voter set. This prevents filesystem/cache retirement from racing a
+still-committed Raft member, including replication-factor-one moves.
 
 Transition observation reads the source phase, terminal fence,
 acknowledgement, and delta sequence atomically under one apply-store shard lock.

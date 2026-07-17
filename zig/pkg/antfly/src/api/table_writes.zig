@@ -4516,6 +4516,9 @@ pub const ProvisionedTableWriteSource = struct {
         table_request_active: usize = 0,
         read_request_active: usize = 0,
         operation_active: bool = false,
+        // Reserved before a transition waits so newly arriving writers cannot
+        // repeatedly win the idle handoff and starve structural progress.
+        transition_waiters: usize = 0,
         // A schema/index backfill mutates only its unpublished target index.
         // Reads routed to the retained read-schema generation may therefore
         // share the resident DB while that operation is active. Ordinary
@@ -5097,7 +5100,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn pruneTableActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: ?u64) void {
         const index = self.findTableActivityLocked(table_name, group_id) orelse return;
         const entry = self.active_table_activities.items[index];
-        if (entry.table_request_active > 0 or entry.read_request_active > 0 or entry.operation_active or entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0 or entry.generation_preparation_active) return;
+        if (entry.table_request_active > 0 or entry.read_request_active > 0 or entry.operation_active or entry.transition_waiters > 0 or entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0 or entry.generation_preparation_active) return;
         const removed = self.active_table_activities.swapRemove(index);
         std.heap.page_allocator.free(removed.table_name);
         if (self.active_table_activities.items.len == 0) {
@@ -5329,7 +5332,7 @@ pub const ProvisionedTableWriteSource = struct {
             }
             if (self.findTableActivityLocked(table_name, group_id)) |index| {
                 const entry = self.active_table_activities.items[index];
-                if (entry.operation_active or entry.generation_preparation_active) {
+                if (entry.operation_active or entry.transition_waiters > 0 or entry.generation_preparation_active) {
                     self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                     continue;
                 }
@@ -5348,7 +5351,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         if (self.findTableActivityLocked(table_name, group_id)) |index| {
             const entry = self.active_table_activities.items[index];
-            if (entry.operation_active or entry.generation_preparation_active) return false;
+            if (entry.operation_active or entry.transition_waiters > 0 or entry.generation_preparation_active) return false;
         }
         const entry = self.activityEntryLocked(table_name, group_id);
         entry.operation_active = true;
@@ -5362,12 +5365,40 @@ pub const ProvisionedTableWriteSource = struct {
             if (entry.structural_active or entry.restore_preparations > 0) return false;
         }
         if (self.findTableActivityLocked(table_name, group_id)) |index| {
-            if (self.active_table_activities.items[index].operation_active) return false;
+            const entry = self.active_table_activities.items[index];
+            if (entry.operation_active or entry.transition_waiters > 0 or entry.generation_preparation_active) return false;
         }
         const entry = self.activityEntryLocked(table_name, group_id);
         entry.operation_active = true;
         entry.operation_allows_reads = true;
         return true;
+    }
+
+    fn beginGroupTransitionOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
+        const io = self.table_activity_threaded.io();
+        self.activityEntryLocked(table_name, group_id).transition_waiters += 1;
+        while (true) {
+            if (self.findTableActivityLocked(table_name, null)) |index| {
+                const entry = self.active_table_activities.items[index];
+                if (entry.structural_active or entry.restore_preparations > 0 or entry.read_request_active > 0) {
+                    self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                    continue;
+                }
+            }
+            if (self.findTableActivityLocked(table_name, group_id)) |index| {
+                const entry = self.active_table_activities.items[index];
+                if (entry.operation_active or entry.generation_preparation_active) {
+                    self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                    continue;
+                }
+            }
+            const entry = self.activityEntryLocked(table_name, group_id);
+            std.debug.assert(entry.transition_waiters > 0);
+            entry.transition_waiters -= 1;
+            entry.operation_active = true;
+            entry.operation_allows_reads = false;
+            return;
+        }
     }
 
     fn endGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
@@ -5602,6 +5633,15 @@ pub const ProvisionedTableWriteSource = struct {
         entry.operation_active = true;
     }
 
+    pub fn testingGroupTransitionWaiterCount(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) usize {
+        if (!builtin.is_test) @compileError("testingGroupTransitionWaiterCount is test-only");
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const index = self.findTableActivityLocked(table_name, group_id) orelse return 0;
+        return self.active_table_activities.items[index].transition_waiters;
+    }
+
     fn tryBeginGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
@@ -5614,6 +5654,24 @@ pub const ProvisionedTableWriteSource = struct {
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id);
+    }
+
+    fn beginGroupTransitionOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        self.beginGroupTransitionOperationLocked(table_name, group_id);
+    }
+
+    fn allowGroupOperationReads(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const index = self.findTableActivityLocked(table_name, group_id) orelse unreachable;
+        const entry = &self.active_table_activities.items[index];
+        std.debug.assert(entry.operation_active);
+        entry.operation_allows_reads = true;
+        self.table_activity_ready.broadcast(io);
     }
 
     fn endGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
@@ -5642,6 +5700,39 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
     ) GroupRefreshActivity {
         self.beginGroupOperation(table_name, group_id);
+        return .{
+            .source = self,
+            .table_name = table_name,
+            .group_id = group_id,
+        };
+    }
+
+    pub const GroupTransitionActivity = struct {
+        source: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+        active: bool = true,
+
+        pub fn deinit(self: *GroupTransitionActivity) void {
+            if (!self.active) return;
+            self.source.endGroupOperation(self.table_name, self.group_id);
+            self.active = false;
+        }
+
+        pub fn allowReads(self: *GroupTransitionActivity) void {
+            if (!self.active) return;
+            self.source.allowGroupOperationReads(self.table_name, self.group_id);
+        }
+    };
+
+    /// Acquires exclusive write admission for a group while preserving reads
+    /// from the currently published generation.
+    pub fn beginGroupTransitionActivity(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+    ) GroupTransitionActivity {
+        self.beginGroupTransitionOperation(table_name, group_id);
         return .{
             .source = self,
             .table_name = table_name,
@@ -25391,6 +25482,75 @@ test "provisioned table write source serializes same-table same-group operations
     defer source.endGroupOperation("docs", 7001);
 
     try std.testing.expect(!source.tryBeginGroupOperation("docs", 7001));
+}
+
+test "provisioned table transition activity excludes writers but preserves reads" {
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-group-transition", NoCatalog.iface());
+    var transition = source.beginGroupTransitionActivity("docs", 7001);
+    defer transition.deinit();
+
+    try std.testing.expect(!source.tryBeginGroupOperation("docs", 7001));
+    try std.testing.expect(source.hasReadBlockingActivityBestEffort("docs", 7001));
+    transition.allowReads();
+    try std.testing.expect(!source.hasReadBlockingActivityBestEffort("docs", 7001));
+    var read = source.readPreparation().beginRead("docs", .general).?;
+    read.deinit();
+}
+
+test "provisioned table transition waiter queues ahead of later writers" {
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const Worker = struct {
+        source: *ProvisionedTableWriteSource,
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var transition = self.source.beginGroupTransitionActivity("docs", 7001);
+            defer transition.deinit();
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    };
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-group-transition-fairness", NoCatalog.iface());
+    source.beginGroupOperation("docs", 7001);
+    var operation_active = true;
+    defer if (operation_active) source.endGroupOperation("docs", 7001);
+
+    var worker = Worker{ .source = &source };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    defer {
+        worker.release.store(true, .release);
+        thread.join();
+    }
+    while (source.testingGroupTransitionWaiterCount("docs", 7001) == 0) std.atomic.spinLoopHint();
+
+    source.endGroupOperation("docs", 7001);
+    operation_active = false;
+    try std.testing.expect(!source.tryBeginGroupOperation("docs", 7001));
+    while (!worker.entered.load(.acquire)) std.atomic.spinLoopHint();
 }
 
 test "table write source restore acquires lifecycle unless caller reserves it" {

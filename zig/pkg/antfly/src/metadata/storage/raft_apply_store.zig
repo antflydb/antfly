@@ -7155,6 +7155,7 @@ test "metadata raft apply store projects placement intents from committed entrie
             },
             .store_id = 44,
             .peer_node_ids = &.{ 7, 8, 9 },
+            .serving_state = .retiring,
         },
     });
     defer std.testing.allocator.free(intent_cmd);
@@ -7184,6 +7185,7 @@ test "metadata raft apply store projects placement intents from committed entrie
         try std.testing.expectEqual(@as(u64, 7), intents[0].record.local_node_id);
         try std.testing.expectEqual(@as(u64, 44), intents[0].store_id);
         try std.testing.expectEqual(@as(usize, 3), intents[0].peer_node_ids.len);
+        try std.testing.expectEqual(raft_reconciler.PlacementServingState.retiring, intents[0].serving_state);
         try std.testing.expectEqual(raft_catalog.ReplicaBootstrapMode.fetch_snapshot, intents[0].record.bootstrap_mode);
         try std.testing.expect(intents[0].record.snapshot_bootstrap != null);
         try std.testing.expectEqual(@as(u64, 3), intents[0].record.snapshot_bootstrap.?.from_node_id);

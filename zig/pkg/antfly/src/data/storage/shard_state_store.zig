@@ -180,42 +180,82 @@ fn replaceGroupSnapshotWithMetadataAndDeletes(
         for (existing) |key| alloc.free(key);
         alloc.free(existing);
     }
-    var deletes = try alloc.alloc([]const u8, existing.len + metadata_deletes.len);
-    defer alloc.free(deletes);
-    for (existing, 0..) |key, i| deletes[i] = key;
-    for (metadata_deletes, existing.len..) |key, i| deletes[i] = key;
+    var txn = try store.beginWriteTxn();
+    errdefer txn.abort();
+    for (existing) |key| try txn.delete(key);
+    for (metadata_deletes) |key| try txn.delete(key);
 
-    var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
-    defer {
-        for (writes.items) |write| alloc.free(@constCast(write.key));
-        writes.deinit(alloc);
-    }
     var range_buf: [1024]u8 = undefined;
     {
         const range_key = try groupRangeKeyAlloc(alloc, group_id);
-        errdefer alloc.free(range_key);
-        try writes.append(alloc, .{
-            .key = range_key,
-            .value = try range_state.encodeRange(byte_range, &range_buf),
-        });
+        defer alloc.free(range_key);
+        try txn.put(range_key, try range_state.encodeRange(byte_range, &range_buf));
     }
     for (entries) |entry| {
         const document_key = try groupDocumentStoreKeyAlloc(alloc, group_id, entry.key);
-        errdefer alloc.free(document_key);
-        try writes.append(alloc, .{
-            .key = document_key,
-            .value = entry.value,
-        });
+        defer alloc.free(document_key);
+        try txn.put(document_key, entry.value);
     }
-    for (metadata_writes) |write| {
-        const metadata_key = try alloc.dupe(u8, write.key);
-        errdefer alloc.free(metadata_key);
-        try writes.append(alloc, .{
-            .key = metadata_key,
-            .value = write.value,
-        });
+    for (metadata_writes) |write| try txn.put(write.key, write.value);
+    try txn.commit();
+}
+
+pub const GroupSnapshotComparison = struct {
+    contains_projected_keys: bool,
+    equal: bool,
+};
+
+/// Compares a sorted candidate with the durable projection without copying
+/// projected values. The read transaction pins one coherent store generation.
+pub fn compareGroupSnapshot(
+    store: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    byte_range: AppliedDataRange,
+    candidate: []const AppliedDataKV,
+) !GroupSnapshotComparison {
+    const logical_prefix = try groupDocumentPrefixAlloc(alloc, group_id);
+    defer alloc.free(logical_prefix);
+    const lower = try internal_keys.documentRangeLowerAlloc(alloc, logical_prefix);
+    defer alloc.free(lower);
+    const upper = (try internal_keys.documentRangeUpperAlloc(alloc, logical_prefix)) orelse
+        return .{ .contains_projected_keys = candidate.len == 0, .equal = candidate.len == 0 };
+    defer alloc.free(upper);
+
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    cursor.setUpperBound(upper);
+
+    var equal = true;
+    var equal_index: usize = 0;
+    var contains_index: usize = 0;
+    var entry = try cursor.seekAtOrAfter(lower);
+    while (entry) |kv| : (entry = try cursor.next()) {
+        if (std.mem.order(u8, kv.key, upper) != .lt) break;
+        const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse continue;
+        defer alloc.free(logical_key);
+        if (!std.mem.startsWith(u8, logical_key, logical_prefix)) continue;
+        const key = logical_key[logical_prefix.len..];
+
+        if (equal_index >= candidate.len or
+            !std.mem.eql(u8, candidate[equal_index].key, key) or
+            !std.mem.eql(u8, candidate[equal_index].value, kv.value))
+        {
+            equal = false;
+        }
+        equal_index += 1;
+
+        if (std.mem.order(u8, key, byte_range.start) == .lt) continue;
+        if (byte_range.end.len > 0 and std.mem.order(u8, key, byte_range.end) != .lt) continue;
+        while (contains_index < candidate.len and std.mem.order(u8, candidate[contains_index].key, key) == .lt)
+            contains_index += 1;
+        if (contains_index == candidate.len or !std.mem.eql(u8, candidate[contains_index].key, key))
+            return .{ .contains_projected_keys = false, .equal = false };
     }
-    try store.putBatch(writes.items, deletes);
+    if (equal_index != candidate.len) equal = false;
+    return .{ .contains_projected_keys = true, .equal = equal };
 }
 
 pub fn currentSplitState(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64) !?AppliedSplitState {

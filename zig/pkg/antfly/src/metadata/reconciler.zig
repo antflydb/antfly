@@ -340,7 +340,11 @@ pub const Reconciler = struct {
 
         for (desired_placements) |desired| {
             {
-                const transition_peers = try allocExpandedTransitionPeerNodeIds(self.alloc, current.placement_intents, desired);
+                const contracting = groupReadyForMembershipContraction(current, desired_placements, desired.record.group_id);
+                const transition_peers = if (contracting)
+                    null
+                else
+                    try allocExpandedTransitionPeerNodeIds(self.alloc, current.placement_intents, desired);
                 defer if (transition_peers) |peers| self.alloc.free(peers);
                 var transition_intent = desired;
                 if (transition_peers) |peers| transition_intent.peer_node_ids = peers;
@@ -458,10 +462,14 @@ pub const Reconciler = struct {
                     });
                 } else {
                     var draining = intent;
-                    draining.serving_state = .draining;
+                    const contracting = groupReadyForMembershipContraction(current, desired_placements, intent.record.group_id);
+                    draining.serving_state = if (contracting) .retiring else .draining;
                     const desired = findPlacementIntentForGroup(desired_placements, intent.record.group_id);
-                    const transition_peers = if (desired) |value|
-                        try allocExpandedTransitionPeerNodeIds(self.alloc, current.placement_intents, value)
+                    const transition_peers = if (!contracting)
+                        if (desired) |value|
+                            try allocExpandedTransitionPeerNodeIds(self.alloc, current.placement_intents, value)
+                        else
+                            null
                     else
                         null;
                     defer if (transition_peers) |peers| self.alloc.free(peers);
@@ -915,12 +923,12 @@ fn effectivePlacementIntent(
         applyRelocationWatermark(&effective, watermark);
 
         effective.serving_state = switch (current_intent.serving_state) {
-            .serving => if (placementHasRelocationIdentity(current_intent))
-                relocationTargetServingState(current, effective)
-            else
-                .serving,
+            // Serving is monotonic for one placement generation. Once the
+            // target has passed data and expanded-membership cutover, final
+            // voter contraction must not temporarily withdraw read service.
+            .serving => .serving,
             .draining => .serving,
-            .planned, .bootstrapping, .replaying, .cutover_ready => relocationTargetServingState(current, effective),
+            .planned, .bootstrapping, .replaying, .cutover_ready, .retiring => relocationTargetServingState(current, effective),
         };
         return effective;
     }
@@ -1020,12 +1028,6 @@ fn relocationTargetReady(current: CurrentMetadataState, intent: raft_reconciler.
     return relocationTargetCutoverReady(current, intent);
 }
 
-fn placementHasRelocationIdentity(intent: raft_reconciler.PlacementIntent) bool {
-    return intent.relocation_generation != 0 or
-        intent.relocation_source_node_id != 0 or
-        intent.relocation_source_store_id != 0;
-}
-
 fn relocationTargetDataReady(current: CurrentMetadataState, intent: raft_reconciler.PlacementIntent) bool {
     const store = findStoreByNode(current.stores, intent.record.local_node_id) orelse return false;
     if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return false;
@@ -1084,55 +1086,83 @@ fn placementSafeToRemove(
 ) bool {
     const desired_count = countPlacementIntents(desired_placements, source.record.group_id);
     if (desired_count == 0) return true;
-    const watermark = relocationWatermarkForGroup(current, source.record.group_id);
-    var saw_replacement = false;
+    if (source.serving_state != .retiring) return false;
+
+    const source_store = findStoreByNode(current.stores, source.record.local_node_id) orelse return false;
+    if (!source_store.live or !std.mem.eql(u8, source_store.health_class, "healthy")) return false;
+    var source_retired = false;
+    for (source_store.group_statuses) |status| {
+        if (status.group_id != source.record.group_id) continue;
+        if (status.local_voter or status.joint_consensus or status.transition_pending) return false;
+        source_retired = true;
+        break;
+    }
+    if (!source_retired) return false;
+
+    var survivor_count: usize = 0;
     for (desired_placements) |desired| {
         if (desired.record.group_id != source.record.group_id) continue;
         if (desired.record.local_node_id == source.record.local_node_id) continue;
-        if (!placementIsReplacementForSource(desired, source)) continue;
-        saw_replacement = true;
         const current_target = findPlacementIntent(current.placement_intents, desired.record.group_id, desired.record.local_node_id) orelse return false;
         if (current_target.serving_state != .serving) return false;
-        var target = current_target;
-        applyRelocationWatermark(&target, watermark);
-        if (!relocationTargetReady(current, target)) return false;
+        const store = findStoreByNode(current.stores, desired.record.local_node_id) orelse return false;
+        if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return false;
+        var stable = false;
+        for (store.group_statuses) |status| {
+            if (status.group_id != source.record.group_id) continue;
+            if (!status.local_voter or status.joint_consensus or status.transition_pending) return false;
+            if (!voterSetMatchesIntent(status, desired)) return false;
+            stable = true;
+            break;
+        }
+        if (!stable) return false;
+        survivor_count += 1;
     }
-    if (saw_replacement) return true;
-    return compactShrinkSafeToRemove(current, desired_placements, source);
+    return survivor_count == desired_count;
 }
 
-fn compactShrinkSafeToRemove(
+fn groupReadyForMembershipContraction(
     current: CurrentMetadataState,
     desired_placements: []const raft_reconciler.PlacementIntent,
-    source: raft_reconciler.PlacementIntent,
+    group_id: u64,
 ) bool {
-    const current_count = countPlacementIntents(current.placement_intents, source.record.group_id);
-    const desired_count = countPlacementIntents(desired_placements, source.record.group_id);
-    if (desired_count == 0 or desired_count >= current_count) return false;
+    const desired_count = countPlacementIntents(desired_placements, group_id);
+    if (desired_count == 0) return false;
+    if (desired_count >= countPlacementIntents(current.placement_intents, group_id)) return false;
 
-    var survivors: usize = 0;
-    var expected_transition_fingerprint: ?table_manager.VoterSetFingerprint = null;
-    for (desired_placements) |desired| {
-        if (desired.record.group_id != source.record.group_id) continue;
-        if (desired.record.local_node_id == source.record.local_node_id) continue;
-        const current_target = findPlacementIntent(current.placement_intents, desired.record.group_id, desired.record.local_node_id) orelse return false;
-        if (current_target.serving_state != .serving) return false;
-        const target_fingerprint = table_manager.voterSetFingerprint(current_target.peer_node_ids, current_target.record.local_node_id);
-        if (expected_transition_fingerprint) |expected| {
-            if (!std.mem.eql(u8, &expected, &target_fingerprint)) return false;
-        } else {
-            expected_transition_fingerprint = target_fingerprint;
-        }
-        if (!placementReadyForCompactShrink(current, current_target)) return false;
-        survivors += 1;
+    // Retirement is a latched metadata phase. Re-expanding the voter set while
+    // the final configuration is committing would oscillate membership and can
+    // prevent convergence under a fast reconciliation loop.
+    for (current.placement_intents) |intent| {
+        if (intent.record.group_id != group_id or intent.serving_state != .retiring) continue;
+        if (findPlacementIntent(desired_placements, group_id, intent.record.local_node_id) == null) return true;
     }
-    if (survivors != desired_count) return false;
 
-    const group_status = mergedGroupStatus(current, source.record.group_id) orelse return false;
+    var survivor_count: usize = 0;
+    var expected_final_fingerprint: ?table_manager.VoterSetFingerprint = null;
+    var expected_final_count: ?usize = null;
+    for (desired_placements) |desired| {
+        if (desired.record.group_id != group_id) continue;
+        const final_fingerprint = table_manager.voterSetFingerprint(desired.peer_node_ids, desired.record.local_node_id);
+        const final_count = table_manager.normalizedVoterCount(desired.peer_node_ids, desired.record.local_node_id);
+        if (expected_final_fingerprint) |expected| {
+            if (!std.mem.eql(u8, &expected, &final_fingerprint) or expected_final_count.? != final_count) return false;
+        } else {
+            expected_final_fingerprint = final_fingerprint;
+            expected_final_count = final_count;
+        }
+        const current_target = findPlacementIntent(current.placement_intents, group_id, desired.record.local_node_id) orelse return false;
+        if (current_target.serving_state != .serving) return false;
+        if (!placementReadyForCompactShrink(current, current_target)) return false;
+        survivor_count += 1;
+    }
+    if (survivor_count != desired_count) return false;
+
+    const group_status = mergedGroupStatus(current, group_id) orelse return false;
     if (!group_status.leader_known) return false;
     for (desired_placements) |desired| {
-        if (desired.record.group_id != source.record.group_id) continue;
-        if (desired.store_id != 0 and desired.store_id == group_status.leader_store_id) return true;
+        if (desired.record.group_id == group_id and desired.store_id != 0 and desired.store_id == group_status.leader_store_id)
+            return true;
     }
     return false;
 }
@@ -1165,15 +1195,6 @@ fn voterSetMatchesIntent(
     return std.mem.eql(u8, &status.voter_set_fingerprint, &expected);
 }
 
-fn placementIsReplacementForSource(
-    target: raft_reconciler.PlacementIntent,
-    source: raft_reconciler.PlacementIntent,
-) bool {
-    if (target.relocation_source_node_id != 0 and target.relocation_source_node_id == source.record.local_node_id) return true;
-    if (target.relocation_source_store_id != 0 and target.relocation_source_store_id == source.store_id) return true;
-    return false;
-}
-
 fn findRelocationSourceIntent(
     intents: []const raft_reconciler.PlacementIntent,
     group_id: u64,
@@ -1183,6 +1204,9 @@ fn findRelocationSourceIntent(
     }
     for (intents) |intent| {
         if (intent.record.group_id == group_id and intent.serving_state == .draining) return intent;
+    }
+    for (intents) |intent| {
+        if (intent.record.group_id == group_id and intent.serving_state == .retiring) return intent;
     }
     for (intents) |intent| {
         if (intent.record.group_id == group_id) return intent;
@@ -3125,7 +3149,7 @@ test "metadata reconciler converges overlapping relocation intents on one desire
     }
 }
 
-test "metadata reconciler removes relocation source only after target is durably serving" {
+test "metadata reconciler removes relocation source only after final voter retirement is observed" {
     var manager = table_manager.TableManager.init(std.testing.allocator);
     defer manager.deinit();
 
@@ -3140,8 +3164,8 @@ test "metadata reconciler removes relocation source only after target is durably
                 .local_node_id = 1,
             },
             .store_id = 11,
-            .peer_node_ids = &.{1},
-            .serving_state = .draining,
+            .peer_node_ids = &.{2},
+            .serving_state = .retiring,
             .relocation_doc_count_watermark = 5,
             .relocation_disk_bytes_watermark = 2048,
         },
@@ -3173,8 +3197,10 @@ test "metadata reconciler removes relocation source only after target is durably
                 .doc_count = 5,
                 .disk_bytes = 2048,
                 .empty = false,
-                .local_voter = true,
+                .local_voter = false,
                 .voter_count = 1,
+                .voter_set_known = true,
+                .voter_set_fingerprint = table_manager.voterSetFingerprint(&.{2}, null),
             }})[0..]),
         },
         .{
@@ -3649,7 +3675,7 @@ test "metadata reconciler retains a compact shrink source until a survivor leads
     try std.testing.expectEqual(raft_reconciler.PlacementServingState.draining, source.serving_state);
 }
 
-test "metadata reconciler compact shrink uses stable raft membership instead of physical bytes" {
+test "metadata reconciler compact shrink enters retirement after stable expanded membership" {
     var manager = table_manager.TableManager.init(std.testing.allocator);
     defer manager.deinit();
 
@@ -3750,12 +3776,13 @@ test "metadata reconciler compact shrink uses stable raft membership instead of 
     });
     defer plan.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), plan.placement_removals.len);
-    try std.testing.expectEqual(@as(u64, 2261), plan.placement_removals[0].group_id);
-    try std.testing.expectEqual(@as(u64, 101), plan.placement_removals[0].local_node_id);
+    try std.testing.expectEqual(@as(usize, 0), plan.placement_removals.len);
+    const retiring = findPlacementIntent(plan.placement_upserts, 2261, 101) orelse return error.MissingRetiringSource;
+    try std.testing.expectEqual(raft_reconciler.PlacementServingState.retiring, retiring.serving_state);
+    try std.testing.expectEqualSlices(u64, &.{ 102, 103 }, retiring.peer_node_ids);
 }
 
-test "metadata reconciler does not require preserved peers to report relocation cutover" {
+test "metadata reconciler requires preserved peers to report stable membership before retirement" {
     var manager = table_manager.TableManager.init(std.testing.allocator);
     defer manager.deinit();
 
@@ -3880,12 +3907,12 @@ test "metadata reconciler does not require preserved peers to report relocation 
     });
     defer plan.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), plan.placement_removals.len);
-    try std.testing.expectEqual(@as(u64, 2221), plan.placement_removals[0].group_id);
-    try std.testing.expectEqual(@as(u64, 1), plan.placement_removals[0].local_node_id);
+    try std.testing.expectEqual(@as(usize, 0), plan.placement_removals.len);
+    const source = findPlacementIntent(plan.placement_upserts, 2221, 1) orelse return error.MissingDrainingSource;
+    try std.testing.expectEqual(raft_reconciler.PlacementServingState.draining, source.serving_state);
 }
 
-test "metadata reconciler ignores unrelated relocation targets when removing a drained source" {
+test "metadata reconciler waits for every final voter despite unrelated relocation identity" {
     var manager = table_manager.TableManager.init(std.testing.allocator);
     defer manager.deinit();
 
@@ -4013,9 +4040,9 @@ test "metadata reconciler ignores unrelated relocation targets when removing a d
     });
     defer plan.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), plan.placement_removals.len);
-    try std.testing.expectEqual(@as(u64, 2241), plan.placement_removals[0].group_id);
-    try std.testing.expectEqual(@as(u64, 101), plan.placement_removals[0].local_node_id);
+    try std.testing.expectEqual(@as(usize, 0), plan.placement_removals.len);
+    const source = findPlacementIntent(plan.placement_upserts, 2241, 101) orelse return error.MissingDrainingSource;
+    try std.testing.expectEqual(raft_reconciler.PlacementServingState.draining, source.serving_state);
 }
 
 test "metadata reconciler finalizes schema migration once every hosting node reports target schema progress" {

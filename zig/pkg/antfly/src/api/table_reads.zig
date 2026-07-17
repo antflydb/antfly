@@ -3792,7 +3792,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 }
                 return true;
             },
-            .planned, .bootstrapping, .replaying, .cutover_ready => return false,
+            .planned, .bootstrapping, .replaying, .cutover_ready, .retiring => return false,
         }
     }
 

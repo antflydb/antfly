@@ -312,6 +312,9 @@ fn findRelocationSourceIntent(
         if (intent.record.group_id == group_id and intent.serving_state == .draining) return intent;
     }
     for (current_intents) |intent| {
+        if (intent.record.group_id == group_id and intent.serving_state == .retiring) return intent;
+    }
+    for (current_intents) |intent| {
         if (intent.record.group_id == group_id) return intent;
     }
     return null;

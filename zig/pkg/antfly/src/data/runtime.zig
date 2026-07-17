@@ -6280,10 +6280,19 @@ pub const DataServer = struct {
         if (try self.tableNameForLocalGroupAlloc(source_group_id)) |table_name| {
             defer self.alloc.free(table_name);
             const live_source = self.liveRuntimeWriteSource();
+            var transition_activity = live_source.beginGroupTransitionActivity(table_name, source_group_id);
+            defer transition_activity.deinit();
+            var fallback_transition_activity: ?@TypeOf(transition_activity) = null;
+            defer if (fallback_transition_activity) |*activity| activity.deinit();
+            if (live_source != &self.write_source) {
+                fallback_transition_activity = self.write_source.beginGroupTransitionActivity(table_name, source_group_id);
+            }
             try live_source.finishManagedWriterAutoBulkForTransition(source_group_id, table_name);
             if (live_source != &self.write_source) {
                 try self.write_source.finishManagedWriterAutoBulkForTransition(source_group_id, table_name);
             }
+            transition_activity.allowReads();
+            if (fallback_transition_activity) |*activity| activity.allowReads();
             if (try live_source.leaseCachedGroupWriter(self.alloc, source_group_id, table_name)) |cached_db| {
                 var cached = cached_db;
                 defer cached.deinit(self.alloc);
@@ -6322,6 +6331,16 @@ pub const DataServer = struct {
         watermark: ?antfly.data.AppliedDataBatch,
         capture_handoff: bool,
     ) !SplitProjectionReconcileResult {
+        if (capture_handoff) {
+            const expected = watermark orelse return error.SplitSourceProjectionNotReady;
+            if (try source_store.captureVerifiedSplitHandoffAtRootGeneration(
+                self.alloc,
+                source_group_id,
+                expected,
+                db.core.root_generation,
+            )) |handoff| return .{ .handoff = handoff };
+        }
+
         var entries = std.ArrayListUnmanaged(antfly.data.AppliedDataKV).empty;
         defer {
             for (entries.items) |entry| {
@@ -6352,33 +6371,49 @@ pub const DataServer = struct {
         const upper = if (byte_range.end.len > 0) try antfly.internal_keys.documentRangeLowerAlloc(self.alloc, byte_range.end) else null;
         defer if (upper) |owned| self.alloc.free(owned);
 
-        db.core.lockApplyShared();
-        defer db.core.unlockApplyShared();
-        const scanned = try db.core.store.scanRange(self.alloc, lower, if (upper) |owned| owned else "");
-        defer antfly.docstore.DocStore.freeResults(self.alloc, scanned);
-        for (scanned) |entry| {
-            const raw_key = (try antfly.internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, entry.key)) orelse continue;
-            errdefer self.alloc.free(raw_key);
-            try entries.append(self.alloc, .{
-                .key = raw_key,
-                .value = try self.alloc.dupe(u8, entry.value),
-            });
-        }
+        const ScanState = struct {
+            alloc: std.mem.Allocator,
+            entries: *std.ArrayListUnmanaged(antfly.data.AppliedDataKV),
+
+            fn append(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!antfly.docstore.DocStore.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(ctx.?));
+                const raw_key = (try antfly.internal_keys.decodePrimaryDocumentKeyAlloc(state.alloc, key)) orelse
+                    return .@"continue";
+                errdefer state.alloc.free(raw_key);
+                const owned_value = try state.alloc.dupe(u8, value);
+                errdefer state.alloc.free(owned_value);
+                try state.entries.append(state.alloc, .{ .key = raw_key, .value = owned_value });
+                return .@"continue";
+            }
+        };
+        var scan_state = ScanState{ .alloc = self.alloc, .entries = &entries };
+        var read_txn = try db.core.store.beginReadTxn();
+        defer read_txn.abort();
+        try db.core.store.scanReadTxnWithContext(
+            &read_txn,
+            lower,
+            if (upper) |owned| owned else "",
+            .{},
+            &scan_state,
+            ScanState.append,
+        );
         if (watermark) |expected| {
             if (capture_handoff) {
-                const handoff = (try source_store.reconcileAndCaptureSplitHandoffAtWatermark(
+                const handoff = (try source_store.reconcileAndCaptureSplitHandoffAtRootGeneration(
                     self.alloc,
                     source_group_id,
                     expected,
+                    db.core.root_generation,
                     byte_range,
                     entries.items,
                 )) orelse return .advanced;
                 return .{ .handoff = handoff };
             }
-            return if (try source_store.reconcileGroupSnapshotAtWatermark(
+            return if (try source_store.reconcileGroupSnapshotAtRootGeneration(
                 self.alloc,
                 source_group_id,
                 expected,
+                db.core.root_generation,
                 byte_range,
                 entries.items,
             )) .reconciled else .advanced;
@@ -6387,6 +6422,7 @@ pub const DataServer = struct {
         return if (try source_store.seedGroupSnapshotIfAbsent(
             self.alloc,
             source_group_id,
+            db.core.root_generation,
             byte_range,
             entries.items,
         )) .reconciled else .advanced;
@@ -10094,6 +10130,7 @@ const PlacementTopologyIndex = struct {
             switch (intent.serving_state) {
                 .serving, .draining, .cutover_ready => try appendUniqueNodeId(alloc, &group.transition_voters, intent.record.local_node_id),
                 .planned, .bootstrapping, .replaying => try appendUniqueNodeId(alloc, &group.transition_learners, intent.record.local_node_id),
+                .retiring => {},
             }
         }
         for (split_transitions) |transition| {

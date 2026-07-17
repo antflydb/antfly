@@ -4728,6 +4728,8 @@ pub fn build(b: *std.Build) void {
             "hosted backup forwarding preserves external io authority",
             "provisioned table restore preparation blocks writes and competing structural mutation",
             "provisioned table restore preparation blocks writes while allowing reads",
+            "provisioned table transition activity excludes writers but preserves reads",
+            "provisioned table transition waiter queues ahead of later writers",
             "provisioned table write request queues structural reconcile ahead of later writes",
             "queued structural reconcile reserves write admission before its worker starts",
             "provisioned structural reconcile blocks table write admission",
