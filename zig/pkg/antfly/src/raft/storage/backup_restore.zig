@@ -233,17 +233,6 @@ fn prepareRestoreSnapshotIfNeeded(
     restore: RestoreSource,
     options: RestoreOptions,
 ) !?db_mod.generation_lifecycle.StagedGeneration {
-    if (try restoreSnapshotAlreadyApplied(alloc, path, group_id, restore, options)) return null;
-    return try prepareRestoreSnapshot(transition, alloc, path, group_id, restore, options);
-}
-
-pub fn restoreSnapshotAlreadyApplied(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    group_id: u64,
-    restore: RestoreSource,
-    options: RestoreOptions,
-) !bool {
     if (try db_mod.DB.readRestoreStateForPath(alloc, path)) |state_value| {
         var state = state_value;
         defer state.deinit(alloc);
@@ -256,11 +245,12 @@ pub fn restoreSnapshotAlreadyApplied(
             if (!state.runtime_repair_complete or
                 try restoreSnapshotMatchesPath(alloc, path, restore, options))
             {
-                return true;
+                return null;
             }
         }
     }
-    return false;
+
+    return try prepareRestoreSnapshot(transition, alloc, path, group_id, restore, options);
 }
 
 fn prepareRestoreSnapshot(
