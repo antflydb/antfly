@@ -136,8 +136,9 @@ func TestDedicatedLeaseRenewalAdvancesUnchangedHolderFromFreshRuntimeProof(t *te
 		t.Fatalf("dedicated renewal: %v", err)
 	}
 	renewed := getOwnershipTestLease(t, reconciler)
-	if renewed.Spec.RenewTime == nil || !renewed.Spec.RenewTime.Time.Equal(now) {
-		t.Fatalf("expected dedicated path to publish strictly newer renewal %s, got %#v", now, renewed.Spec.RenewTime)
+	wantRenewTime := metav1.NewMicroTime(now)
+	if renewed.Spec.RenewTime == nil || !renewed.Spec.RenewTime.Equal(&wantRenewTime) {
+		t.Fatalf("expected dedicated path to publish strictly newer renewal %s, got %#v", wantRenewTime.Time, renewed.Spec.RenewTime)
 	}
 	if renewed.Spec.HolderIdentity == nil || *renewed.Spec.HolderIdentity != "primary-a" ||
 		renewed.Spec.LeaseTransitions == nil || *renewed.Spec.LeaseTransitions != 1 {
