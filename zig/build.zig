@@ -5291,9 +5291,9 @@ pub fn build(b: *std.Build) void {
             "runtime lease watchdog fetch and validation failures publish no bootstrap capability",
             "runtime lease watchdog retains a bounded Kubernetes response budget",
             "runtime lease watchdog prefers a DNS-verified Kubernetes API host and retains the injected port",
-            "Zig Lease executor rejects unscoped request shapes",
-            "Zig Lease executor accepts optional CertificateRequest with projected CA and verified hostname",
-            "Zig Lease executor rejects optional CertificateRequest hostname mismatch",
+            "Lease executor rejects unscoped request shapes",
+            "Lease executor accepts optional CertificateRequest with projected CA and verified hostname",
+            "Lease executor rejects optional CertificateRequest hostname mismatch",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

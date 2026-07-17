@@ -14,7 +14,7 @@ const std = @import("std");
 const httpx = @import("httpx");
 const common = @import("../common/http/http_common.zig");
 
-pub const ZigLeaseExecutor = struct {
+pub const LeaseExecutor = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
     ca_path: []u8,
@@ -26,7 +26,7 @@ pub const ZigLeaseExecutor = struct {
         io: std.Io,
         ca_path: []const u8,
         max_response_bytes: usize,
-    ) !ZigLeaseExecutor {
+    ) !LeaseExecutor {
         if (!std.fs.path.isAbsolute(ca_path) or max_response_bytes == 0 or max_response_bytes > 16 * 1024 * 1024) {
             return error.InvalidLeaseTlsConfig;
         }
@@ -54,18 +54,18 @@ pub const ZigLeaseExecutor = struct {
         };
     }
 
-    pub fn deinit(self: *ZigLeaseExecutor) void {
+    pub fn deinit(self: *LeaseExecutor) void {
         self.client.deinit();
         self.alloc.free(self.ca_path);
         self.* = undefined;
     }
 
-    pub fn executor(self: *ZigLeaseExecutor) common.RequestExecutor {
+    pub fn executor(self: *LeaseExecutor) common.RequestExecutor {
         return .{ .ptr = self, .vtable = &.{ .execute = execute } };
     }
 
     fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
-        const self: *ZigLeaseExecutor = @ptrCast(@alignCast(ptr));
+        const self: *LeaseExecutor = @ptrCast(@alignCast(ptr));
         if (req.method != .GET or req.body.len != 0 or req.headers.len != 0 or req.content_type != null) {
             return error.UnsupportedLeaseTlsRequest;
         }
@@ -98,8 +98,8 @@ pub const ZigLeaseExecutor = struct {
     }
 };
 
-test "Zig Lease executor rejects unscoped request shapes" {
-    var executor = try ZigLeaseExecutor.init(std.testing.allocator, std.testing.io, "/tmp/ca.crt", 4096);
+test "Lease executor rejects unscoped request shapes" {
+    var executor = try LeaseExecutor.init(std.testing.allocator, std.testing.io, "/tmp/ca.crt", 4096);
     defer executor.deinit();
     try std.testing.expectError(error.UnsupportedLeaseTlsRequest, executor.executor().execute(std.testing.allocator, .{
         .method = .POST,
@@ -194,7 +194,7 @@ fn spawnOptionalClientAuthServer(
     };
 }
 
-test "Zig Lease executor accepts optional CertificateRequest with projected CA and verified hostname" {
+test "Lease executor accepts optional CertificateRequest with projected CA and verified hostname" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -206,7 +206,7 @@ test "Zig Lease executor accepts optional CertificateRequest with projected CA a
     }
     const uri = try std.fmt.allocPrint(alloc, "https://localhost:{d}/lease", .{server.port});
     defer alloc.free(uri);
-    var executor = try ZigLeaseExecutor.init(alloc, io, server.cert_path, 4096);
+    var executor = try LeaseExecutor.init(alloc, io, server.cert_path, 4096);
     defer executor.deinit();
     var response = try executor.executor().execute(alloc, .{
         .method = .GET,
@@ -219,7 +219,7 @@ test "Zig Lease executor accepts optional CertificateRequest with projected CA a
     try std.testing.expectEqualStrings("{\"ok\":true}", response.body);
 }
 
-test "Zig Lease executor rejects optional CertificateRequest hostname mismatch" {
+test "Lease executor rejects optional CertificateRequest hostname mismatch" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -231,7 +231,7 @@ test "Zig Lease executor rejects optional CertificateRequest hostname mismatch" 
     }
     const uri = try std.fmt.allocPrint(alloc, "https://127.0.0.1:{d}/lease", .{server.port});
     defer alloc.free(uri);
-    var executor = try ZigLeaseExecutor.init(alloc, io, server.cert_path, 4096);
+    var executor = try LeaseExecutor.init(alloc, io, server.cert_path, 4096);
     defer executor.deinit();
     try std.testing.expectError(error.CertificateHostMismatch, executor.executor().execute(alloc, .{
         .method = .GET,

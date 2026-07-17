@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const zig_lease_executor = @import("zig_lease_executor.zig");
+const lease_executor = @import("lease_executor.zig");
 const platform_sync = @import("antfly_platform").sync;
 const httpx = @import("httpx");
 const antfly = @import("../root.zig");
@@ -186,7 +186,7 @@ const RuntimeLeaseWatchdog = struct {
     const ObservationFailureStage = enum { fetch, validation };
 
     watchdog: antfly.ha.kubernetes_lease_watchdog.Watchdog,
-    executor: zig_lease_executor.ZigLeaseExecutor,
+    executor: lease_executor.LeaseExecutor,
     uri: []u8,
     token_path: []const u8,
     lease_name: []const u8,
@@ -251,7 +251,7 @@ const RuntimeLeaseWatchdog = struct {
             .data_generation = data_generation,
             .process_boot_id = &process_boot_id,
         };
-        var executor = try zig_lease_executor.ZigLeaseExecutor.init(
+        var executor = try lease_executor.LeaseExecutor.init(
             alloc,
             io,
             env.get("ANTFLY_HA_LEASE_CA_PATH") orelse antfly.ha.kubernetes_lease_watchdog.service_account_ca_path,
