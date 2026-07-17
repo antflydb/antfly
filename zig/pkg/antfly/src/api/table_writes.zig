@@ -8747,6 +8747,8 @@ pub const ProvisionedTableWriteSource = struct {
     ) !void {
         const open_retry_timeout_ns = 2 * std.time.ns_per_s;
         const open_start_ns = platform_time.monotonicNs();
+        const repair_timeout_ns = 30 * std.time.ns_per_s;
+        const repair_start_ns = platform_time.monotonicNs();
         var open_attempts: usize = 0;
         var logged_open_wait = false;
         while (true) {
@@ -8791,16 +8793,44 @@ pub const ProvisionedTableWriteSource = struct {
                 try applyLocalTableSchemaJson(alloc, &db, schema_json);
             }
 
-            const timeout_ns = 30 * std.time.ns_per_s;
-            const start_ns = platform_time.monotonicNs();
             var attempts: usize = 0;
             std.log.info("restore foreground repair begin table={s} group_id={d}", .{ table_name, group_id });
             while (try db.restoreRuntimeRepairNeeded()) {
                 attempts += 1;
-                if (try db.repairRestoreRuntimeStateStepIfNeeded(alloc)) {
+                const repaired = db.repairRestoreRuntimeStateStepIfNeeded(alloc) catch |err| switch (err) {
+                    // Async enrichment can advance the durable replay target
+                    // while the sync phase is proving index coverage. Keep the
+                    // restore private and give its asynchronous runtimes time
+                    // to clear that explicit incomplete state before
+                    // re-evaluating it within the existing monotonic deadline.
+                    error.RestoreRuntimeRepairIncomplete,
+                    error.RestoreDenseArtifactRebuildIncomplete,
+                    error.RestoreDenseConfigProofIncomplete,
+                    error.RestoreDenseCounterProofIncomplete,
+                    error.RestoreDenseIndexProofIncomplete,
+                    error.RestoreDenseCoverageProofIncomplete,
+                    error.RestoreDenseCheckpointIncomplete,
+                    error.RestoreIndexAvailabilityIncomplete,
+                    => {
+                        if (platform_time.monotonicNs() -| repair_start_ns >= repair_timeout_ns) {
+                            std.log.warn("restore foreground repair deadline reached table={s} group_id={d} reason={s}", .{
+                                table_name,
+                                group_id,
+                                @errorName(err),
+                            });
+                            return error.TableVisibilityTimeout;
+                        }
+                        self.table_activity_threaded.io().sleep(Io.Duration.fromMilliseconds(100), .awake) catch |sleep_err| switch (sleep_err) {
+                            error.Canceled => Io.recancel(self.table_activity_threaded.io()),
+                        };
+                        continue;
+                    },
+                    else => return err,
+                };
+                if (repaired) {
                     db.clearDenseHbcCaches();
                 }
-                if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
+                if (platform_time.monotonicNs() -| repair_start_ns >= repair_timeout_ns) return error.TableVisibilityTimeout;
             }
             std.log.info("restore foreground repair complete table={s} group_id={d} attempts={d} open_attempts={d}", .{
                 table_name,

@@ -4374,13 +4374,14 @@ pub const DataServer = struct {
     }
 
     fn attachHaExecutors(self: *DataServer, api_server_cfg: *antfly.public_api.http_server.ApiHttpServerConfig) void {
-        if (api_server_cfg.ha_admin_bearer_token == null) {
-            api_server_cfg.ha_admin_bearer_token = self.ha_cfg.admin_bearer_token;
-        }
+        const ha_admin_bearer_token = api_server_cfg.ha_admin_bearer_token orelse
+            self.ha_cfg.admin_bearer_token orelse
+            api_server_cfg.admin_bearer_token;
+        api_server_cfg.ha_admin_bearer_token = ha_admin_bearer_token;
         if (api_server_cfg.ha_admin_executor == null) {
             if (self.ha_cfg.admin_context) |ctx| {
                 self.ha_admin_server = antfly.ha.http_admin.Server.initWithOptions(platform.allocator.processAllocator(std.heap.smp_allocator), ctx, .{
-                    .bearer_token = self.ha_cfg.admin_bearer_token,
+                    .bearer_token = ha_admin_bearer_token,
                     .require_bearer_token = true,
                     .state_mutex = if (ctx.primary != null or ctx.standby != null) &self.ha_state_mutex else null,
                     .seed_capture = if (ctx.primary != null and self.ha_cfg.seed_capture_root != null) .{
