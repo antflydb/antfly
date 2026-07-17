@@ -21,9 +21,13 @@ const raft_host = @import("../raft/host.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const raft_service = @import("../raft/service.zig");
 const transition_state = @import("transition_state.zig");
+const metadata_incarnation = @import("incarnation.zig");
+
+pub const MetadataClusterIncarnation = metadata_incarnation.MetadataClusterIncarnation;
 
 pub const MetadataStatus = struct {
     metadata_group_id: u64,
+    metadata_incarnation: ?MetadataClusterIncarnation = null,
     metadata_epoch: u64 = 0,
     metadata_raft_local_node_id: u64 = 0,
     metadata_raft_role: []const u8 = "absent",
@@ -123,6 +127,7 @@ pub const MetadataStatus = struct {
 
 pub const MetadataHead = struct {
     metadata_group_id: u64,
+    metadata_incarnation: ?MetadataClusterIncarnation = null,
     metadata_epoch: u64 = 0,
 };
 
@@ -156,6 +161,39 @@ pub const AdminSnapshot = struct {
     split_observations: []transition_state.SplitObservationRecord = &.{},
     merge_observations: []transition_state.MergeObservationRecord = &.{},
     merged_group_statuses: []metadata_reconciler.MergedGroupStatus = &.{},
+};
+
+/// Compact catalog values consumed while staging one data-Raft generation.
+/// Metadata replicas compare this after a linearizable read so the network and
+/// allocation cost is independent of the cluster-wide catalog size.
+pub const CatalogPublicationContract = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: MetadataClusterIncarnation,
+    table_id: u64,
+    table_name: []const u8,
+    schema_json: []const u8,
+    indexes_json: []const u8,
+    range: table_manager.RangeRecord,
+
+    pub fn matches(self: @This(), snapshot: *const AdminSnapshot) bool {
+        if (snapshot.status.metadata_group_id != self.metadata_group_id) return false;
+        const incarnation = snapshot.status.metadata_incarnation orelse return false;
+        if (!std.mem.eql(u8, &incarnation, &self.metadata_incarnation)) return false;
+        var table_match = false;
+        for (snapshot.tables) |table| {
+            if (table.table_id != self.table_id) continue;
+            table_match = std.mem.eql(u8, self.table_name, table.name) and
+                std.mem.eql(u8, self.schema_json, table.schema_json) and
+                std.mem.eql(u8, self.indexes_json, table.indexes_json);
+            break;
+        }
+        if (!table_match) return false;
+        for (snapshot.ranges) |range| {
+            if (range.group_id != self.range.group_id) continue;
+            return range.table_id == self.table_id and table_manager.rangeRecordsEqual(self.range, range);
+        }
+        return false;
+    }
 };
 
 pub fn captureSnapshot(alloc: std.mem.Allocator, source: anytype) !AdminSnapshot {
@@ -605,6 +643,7 @@ test "metadata admin snapshot captures projected metadata state" {
             const records = try alloc.alloc(transition_state.SplitTransitionRecord, 1);
             records[0] = .{
                 .transition_id = 9001,
+                .attempt_epoch = 1,
                 .source_group_id = 10,
                 .destination_group_id = 11,
                 .split_key = try alloc.dupe(u8, "doc:m"),

@@ -142,6 +142,8 @@ pub const MetadataState = struct {
         const ranges = try self.projected.listRanges(self.alloc);
         defer self.projected.freeRanges(self.alloc, ranges);
         try self.desired.replaceTopology(tables, ranges);
+        try self.desired.syncProjectedSplitTransitions(self.committed_splits.items);
+        try self.desired.syncProjectedMergeTransitions(self.committed_merges.items);
     }
 
     pub fn syncProjected(self: *MetadataState, service: anytype) !void {
@@ -1036,6 +1038,7 @@ fn applyMergeObservationReadiness(
 fn cloneSplitRecord(alloc: std.mem.Allocator, record: transition_state.SplitTransitionRecord) !transition_state.SplitTransitionRecord {
     return .{
         .transition_id = record.transition_id,
+        .attempt_epoch = record.attempt_epoch,
         .source_group_id = record.source_group_id,
         .destination_group_id = record.destination_group_id,
         .phase = record.phase,
@@ -1149,6 +1152,7 @@ test "metadata state captures committed transitions and observations" {
             const out = try alloc.alloc(transition_state.SplitTransitionRecord, 1);
             out[0] = .{
                 .transition_id = 1,
+                .attempt_epoch = 1,
                 .source_group_id = 11,
                 .destination_group_id = 12,
                 .phase = .prepare,
@@ -1223,6 +1227,37 @@ test "metadata state captures committed transitions and observations" {
     defer state.projectedTableManager().freeRanges(std.testing.allocator, ranges);
     try std.testing.expectEqual(@as(usize, 1), tables.len);
     try std.testing.expectEqual(@as(usize, 1), ranges.len);
+}
+
+test "metadata state seeds active projected transitions after authority handoff" {
+    var state = MetadataState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.projected.upsertTable(.{ .table_id = 7, .name = "docs" });
+    try state.projected.upsertRange(.{
+        .group_id = 71,
+        .table_id = 7,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+        .split_attempt_epoch = 4,
+    });
+    try state.committed_splits.append(std.testing.allocator, try cloneSplitRecord(std.testing.allocator, .{
+        .transition_id = 7001,
+        .attempt_epoch = 4,
+        .source_group_id = 71,
+        .destination_group_id = 72,
+        .phase = .replay_deltas,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
+    }));
+
+    try state.seedDesiredFromProjected();
+    const splits = try state.desired.listDesiredSplitTransitions(std.testing.allocator);
+    defer state.desired.freeSplitTransitions(std.testing.allocator, splits);
+    try std.testing.expectEqual(@as(usize, 1), splits.len);
+    try std.testing.expectEqual(@as(u64, 7001), splits[0].transition_id);
+    try std.testing.expectEqual(@as(u64, 4), splits[0].attempt_epoch);
+    try std.testing.expectEqualStrings("doc:m", splits[0].split_key.?);
 }
 
 test "metadata state skips orphan projected ranges during projected sync" {
@@ -1740,6 +1775,7 @@ test "metadata state prefers leader-qualified transition observation over follow
     const split_transitions = [_]transition_state.SplitTransitionRecord{
         .{
             .transition_id = 9101,
+            .attempt_epoch = 1,
             .source_group_id = 7101,
             .destination_group_id = 7102,
             .phase = .bootstrap_peer,

@@ -54,6 +54,34 @@ const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
+
+fn publishRuntimeStatusGroupForTest(
+    cache: *runtime_status.TableRuntimeSnapshotCache,
+    table_name: []const u8,
+    status: runtime_status.LocalTableRuntimeStatus,
+) !void {
+    const token = try cache.capturePublicationToken(table_name);
+    try std.testing.expectEqual(runtime_status.TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(token, table_name, status));
+}
+
+fn publishRuntimeStatusRefreshForTest(
+    cache: *runtime_status.TableRuntimeSnapshotCache,
+    snapshots: []runtime_status.TableRuntimeSnapshot,
+) !void {
+    var ownership_transferred = false;
+    errdefer if (!ownership_transferred) {
+        for (snapshots) |*snapshot_entry| snapshot_entry.deinit(cache.alloc);
+    };
+    const table_names = try cache.alloc.alloc([]const u8, snapshots.len);
+    defer cache.alloc.free(table_names);
+    for (snapshots, 0..) |snapshot_entry, i| table_names[i] = snapshot_entry.table_name;
+    var token = try cache.captureCatalogToken(cache.alloc, table_names, true);
+    defer token.deinit();
+    ownership_transferred = true;
+    var result = try cache.publishRefresh(&token, snapshots);
+    defer result.deinit();
+    try std.testing.expect(!result.hasRejectedTables());
+}
 const http_client = @import("http_client.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const platform_time = @import("antfly_platform").time;
@@ -199,6 +227,7 @@ pub const ProvisionedTableReadCache = struct {
     // u64 + the name per distinct table ever read through this cache.
     table_epochs: std.StringHashMapUnmanaged(u64) = .empty,
     exclusive_table_access: std.StringHashMapUnmanaged(usize) = .empty,
+    exclusive_group_access: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
     retired_entries: std.ArrayListUnmanaged(*Entry) = .empty,
     pending_opens: std.ArrayListUnmanaged(PendingOpen) = .empty,
@@ -275,6 +304,18 @@ pub const ProvisionedTableReadCache = struct {
         }
     };
 
+    pub const ExclusiveGroupAccess = struct {
+        cache: *ProvisionedTableReadCache,
+        group_id: u64,
+        active: bool = true,
+
+        pub fn deinit(self: *ExclusiveGroupAccess) void {
+            if (!self.active) return;
+            self.cache.endExclusiveGroupAccess(self.group_id);
+            self.active = false;
+        }
+    };
+
     const PendingOpen = struct {
         group_id: u64,
         identity_namespace: ?db_mod.DocIdentityNamespace = null,
@@ -314,6 +355,7 @@ pub const ProvisionedTableReadCache = struct {
         var exclusive_keys = self.exclusive_table_access.keyIterator();
         while (exclusive_keys.next()) |key| self.alloc.free(key.*);
         self.exclusive_table_access.deinit(self.alloc);
+        self.exclusive_group_access.deinit(self.alloc);
         self.mutex.unlock(io);
         self.threaded.deinit();
         self.* = undefined;
@@ -355,7 +397,7 @@ pub const ProvisionedTableReadCache = struct {
             // namespace would open (and cache) the wrong identity.
             const identity_namespace = try loadTableIdentityNamespaceForGroup(self.alloc, catalog, table_name, group_id);
             self.mutex.lockUncancelable(io);
-            if (self.hasExclusiveTableAccessLocked(table_name)) {
+            if (self.hasExclusiveTableAccessLocked(table_name) or self.hasExclusiveGroupAccessLocked(group_id)) {
                 self.mutex.unlock(io);
                 const now_ns = platform_time.monotonicNs();
                 if (exclusive_wait_started_ns == 0) exclusive_wait_started_ns = now_ns;
@@ -365,7 +407,7 @@ pub const ProvisionedTableReadCache = struct {
                 continue;
             }
             exclusive_wait_started_ns = 0;
-            const open_epoch = self.epochForTableLocked(table_name) catch |err| {
+            const open_table_epoch = self.epochForTableLocked(table_name) catch |err| {
                 self.mutex.unlock(io);
                 return err;
             };
@@ -423,11 +465,11 @@ pub const ProvisionedTableReadCache = struct {
 
             self.mutex.lockUncancelable(io);
             self.removePendingOpenForNamespaceLocked(group_id, identity_namespace, table_name);
-            if ((self.table_epochs.get(table_name) orelse open_epoch +% 1) != open_epoch) {
-                // This table was invalidated while we were opening (dropped,
-                // recreated, or the writer published). Epochs are exact
-                // per-table, so this only fires under genuine same-table
-                // churn (catch-up, heal backfill). Retry a bounded number of
+            if ((self.table_epochs.get(table_name) orelse open_table_epoch +% 1) != open_table_epoch or
+                self.hasExclusiveGroupAccessLocked(group_id))
+            {
+                // The table or exact group was invalidated while this DB was
+                // opening. Retry a bounded number of
                 // times; if the table churns faster than an open completes,
                 // fail with TableReadChurn — classified as transient by the
                 // query layer, which retries with backoff — instead of
@@ -577,6 +619,36 @@ pub const ProvisionedTableReadCache = struct {
         };
     }
 
+    pub fn beginExclusiveGroupAccess(self: *ProvisionedTableReadCache, group_id: u64) !ExclusiveGroupAccess {
+        const io = self.threaded.io();
+        self.mutex.lockUncancelable(io);
+        errdefer self.mutex.unlock(io);
+
+        const gop = try self.exclusive_group_access.getOrPut(self.alloc, group_id);
+        if (gop.found_existing) {
+            gop.value_ptr.* = std.math.add(usize, gop.value_ptr.*, 1) catch return error.TooManyExclusiveReaders;
+        } else {
+            gop.value_ptr.* = 1;
+        }
+        self.removeEntriesForGroupLocked(group_id);
+        self.ready.broadcast(io);
+
+        const drain_started_ns = platform_time.monotonicNs();
+        while (self.hasPendingOpenForGroupLocked(group_id) or self.hasGroupLocked(group_id) or self.hasRetiredEntryForGroupLocked(group_id)) {
+            const waited_ns = platform_time.monotonicNs() -| drain_started_ns;
+            if (waited_ns >= exclusive_wait_timeout_ns) {
+                self.releaseExclusiveGroupAccessLocked(group_id);
+                self.ready.broadcast(io);
+                return error.TableReadDrainTimeout;
+            }
+            self.mutex.unlock(io);
+            io.sleep(Io.Duration.fromNanoseconds(@min(exclusive_wait_poll_ns, exclusive_wait_timeout_ns - waited_ns)), .awake) catch {};
+            self.mutex.lockUncancelable(io);
+        }
+        self.mutex.unlock(io);
+        return .{ .cache = self, .group_id = group_id };
+    }
+
     pub fn invalidateTable(self: *ProvisionedTableReadCache, table_name: []const u8) void {
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
@@ -676,6 +748,25 @@ pub const ProvisionedTableReadCache = struct {
         table_name: []const u8,
     ) bool {
         return self.exclusive_table_access.get(table_name) != null;
+    }
+
+    fn hasExclusiveGroupAccessLocked(self: *ProvisionedTableReadCache, group_id: u64) bool {
+        return self.exclusive_group_access.get(group_id) != null;
+    }
+
+    fn hasPendingOpenForGroupLocked(self: *ProvisionedTableReadCache, group_id: u64) bool {
+        for (self.pending_opens.items) |pending| if (pending.group_id == group_id) return true;
+        return false;
+    }
+
+    fn hasGroupLocked(self: *ProvisionedTableReadCache, group_id: u64) bool {
+        for (self.entries.items) |entry| if (entry.group_id == group_id) return true;
+        return false;
+    }
+
+    fn hasRetiredEntryForGroupLocked(self: *ProvisionedTableReadCache, group_id: u64) bool {
+        for (self.retired_entries.items) |entry| if (entry.group_id == group_id) return true;
+        return false;
     }
 
     fn removePendingOpenLocked(
@@ -784,6 +875,18 @@ pub const ProvisionedTableReadCache = struct {
         }
     }
 
+    fn removeEntriesForGroupLocked(self: *ProvisionedTableReadCache, group_id: u64) void {
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            if (self.entries.items[i].group_id != group_id) {
+                i += 1;
+                continue;
+            }
+            const removed = self.entries.orderedRemove(i);
+            self.retireEntryLocked(removed);
+        }
+    }
+
     fn snapshotRuntimeStatusesLocked(
         self: *ProvisionedTableReadCache,
         alloc: std.mem.Allocator,
@@ -847,6 +950,19 @@ pub const ProvisionedTableReadCache = struct {
 
         self.releaseExclusiveTableAccessLocked(table_name);
         self.ready.broadcast(io);
+    }
+
+    fn endExclusiveGroupAccess(self: *ProvisionedTableReadCache, group_id: u64) void {
+        const io = self.threaded.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.releaseExclusiveGroupAccessLocked(group_id);
+        self.ready.broadcast(io);
+    }
+
+    fn releaseExclusiveGroupAccessLocked(self: *ProvisionedTableReadCache, group_id: u64) void {
+        const count = self.exclusive_group_access.getPtr(group_id) orelse unreachable;
+        if (count.* > 1) count.* -= 1 else _ = self.exclusive_group_access.remove(group_id);
     }
 
     fn releaseExclusiveTableAccessLocked(self: *ProvisionedTableReadCache, table_name: []const u8) void {
@@ -938,12 +1054,43 @@ pub const backend_current_root_generation: u64 = 0;
 pub const GroupVisibleRootGenerationSource = struct {
     ptr: *anyopaque,
     visible_root_generation_for_group: *const fn (ptr: *anyopaque, group_id: u64) u64,
+    reserve_root_generation_for_group: ?*const fn (ptr: *anyopaque, group_id: u64) anyerror!void = null,
+    finish_root_generation_reservation: ?*const fn (ptr: *anyopaque, group_id: u64, advance: bool) void = null,
+
+    pub const Reservation = struct {
+        source: GroupVisibleRootGenerationSource,
+        group_id: u64,
+        active: bool = true,
+
+        pub fn advance(self: *Reservation) void {
+            if (!self.active) return;
+            self.source.finish_root_generation_reservation.?(self.source.ptr, self.group_id, true);
+            self.active = false;
+        }
+
+        pub fn deinit(self: *Reservation) void {
+            if (!self.active) return;
+            self.source.finish_root_generation_reservation.?(self.source.ptr, self.group_id, false);
+            self.active = false;
+        }
+    };
 
     /// Shared LSM/HBC cache namespace for the currently visible replica root.
     /// This is advanced when local root/catalog visibility is reconciled; it is
     /// not the storage engine's physical per-write generation.
     pub fn visibleRootGenerationForGroup(self: GroupVisibleRootGenerationSource, group_id: u64) u64 {
         return self.visible_root_generation_for_group(self.ptr, group_id);
+    }
+
+    /// Reserves generation bookkeeping before a fallible publication starts.
+    pub fn reserveRootGenerationForGroup(self: GroupVisibleRootGenerationSource, group_id: u64) !?Reservation {
+        const reserve = self.reserve_root_generation_for_group orelse {
+            if (self.finish_root_generation_reservation != null) return error.InvalidRootGenerationSource;
+            return null;
+        };
+        if (self.finish_root_generation_reservation == null) return error.InvalidRootGenerationSource;
+        try reserve(self.ptr, group_id);
+        return .{ .source = self, .group_id = group_id };
     }
 };
 
@@ -16219,7 +16366,7 @@ test "provisioned table read source runtime status falls back to shared snapshot
         .table_name = try alloc.dupe(u8, "docs"),
         .statuses = .{ .items = items },
     };
-    snapshot_cache.replaceOwned(snapshots);
+    try publishRuntimeStatusRefreshForTest(&snapshot_cache, snapshots);
 
     var source = ProvisionedTableReadSource.init("/tmp/unused-antfly-runtime-snapshot", NoCatalog.iface(), raft_mod.read_gate.noopReadableLeaseRequester());
     source.runtime_status_cache = &snapshot_cache;
@@ -16320,7 +16467,7 @@ test "provisioned table read source runtime status prefers shared snapshot cache
         },
     };
     defer status.deinit(alloc);
-    try snapshot_cache.upsertGroupStatus("docs", status);
+    try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", status);
 
     var source = ProvisionedTableReadSource.init(path, NoCatalog.iface(), raft_mod.read_gate.noopReadableLeaseRequester());
     source.cache = &cache;
@@ -20775,6 +20922,100 @@ test "provisioned read cache exclusive access drains active read leases" {
     try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
     try std.testing.expect(!cache.hasExclusiveTableAccessLocked("docs"));
+}
+
+test "provisioned read cache group exclusive drains only the published group" {
+    const alloc = std.testing.allocator;
+    const root = "/tmp/antfly-api-provisioned-read-cache-group-exclusive";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), root) catch {};
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .indexes_json = @import("tables.zig").default_indexes_json,
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "m" },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const ExclusiveThread = struct {
+        cache: *ProvisionedTableReadCache,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var exclusive = self.cache.beginExclusiveGroupAccess(7001) catch |err| {
+                self.err = err;
+                return;
+            };
+            exclusive.deinit();
+        }
+    };
+
+    const path_one = try std.fmt.allocPrint(alloc, "{s}/group-7001", .{root});
+    defer alloc.free(path_one);
+    const path_two = try std.fmt.allocPrint(alloc, "{s}/group-7002", .{root});
+    defer alloc.free(path_two);
+    var lsm_cache = lsm_backend.Cache.init(alloc, lsm_backend.DefaultCacheSizeBytes);
+    defer lsm_cache.deinit();
+    var cache = ProvisionedTableReadCache.init(alloc);
+    defer cache.deinit();
+    cache.lsm_cache = &lsm_cache;
+
+    var lease_one = try cache.getOrOpen(path_one, FakeCatalog.iface(), 7001, 1, "docs");
+    var lease_two = try cache.getOrOpen(path_two, FakeCatalog.iface(), 7002, 1, "docs");
+    defer lease_two.release();
+    const table_epoch = cache.table_epochs.get("docs").?;
+
+    var ctx = ExclusiveThread{ .cache = &cache };
+    const thread = try std.Thread.spawn(.{}, ExclusiveThread.run, .{&ctx});
+    var observed = false;
+    for (0..100) |_| {
+        const io = cache.threaded.io();
+        cache.mutex.lockUncancelable(io);
+        observed = cache.hasExclusiveGroupAccessLocked(7001) and
+            cache.entries.items.len == 1 and cache.entries.items[0].group_id == 7002 and
+            cache.retired_entries.items.len == 1;
+        cache.mutex.unlock(io);
+        if (observed) break;
+        io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+
+    lease_one.release();
+    thread.join();
+    if (ctx.err) |err| return err;
+    try std.testing.expect(observed);
+    try std.testing.expectEqual(table_epoch, cache.table_epochs.get("docs").?);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 7002), cache.entries.items[0].group_id);
 }
 
 test "provisioned read cache retirement is allocation-free after entry installation" {

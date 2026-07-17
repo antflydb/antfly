@@ -1421,6 +1421,7 @@ const BatchExecutionOptions = struct {
     bypass_ha_write_gate: bool = false,
     ha_applied_lsn_marker: ?u64 = null,
     suppress_derived_replay_append: bool = false,
+    extra_store_writes: []const docstore_mod.KVPair = &.{},
 };
 
 const ha_applied_lsn_value_len: usize = @sizeOf(u64);
@@ -2502,6 +2503,14 @@ fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
     }
 }
 
+fn splitBootstrapMarkersEqual(a: range_state_mod.SplitBootstrapMarker, b: range_state_mod.SplitBootstrapMarker) bool {
+    return a.transition_id == b.transition_id and
+        a.attempt_epoch == b.attempt_epoch and
+        a.source_group_id == b.source_group_id and
+        a.destination_group_id == b.destination_group_id and
+        a.bootstrap_complete == b.bootstrap_complete;
+}
+
 fn lockAtomicWithBackoffProfiled(mutex: *std.atomic.Mutex, stats: *MutexContentionStats) ProfiledLock {
     if (!asyncIndexProfileEnabled()) {
         lockAtomicWithBackoff(mutex);
@@ -2913,6 +2922,7 @@ pub const DB = struct {
     index_repair_state_corrupt: std.atomic.Value(bool) = .init(false),
     published_dense_searches: std.atomic.Value(u32) = .init(0),
     index_repair_mutex: std.atomic.Mutex = .unlocked,
+    generation_replace_mutex: std.atomic.Mutex = .unlocked,
     active_index_repairs: std.StringHashMapUnmanaged(bool) = .{},
     shadow_index_repair_hook: ?@This().ShadowIndexRepairHook = null,
 
@@ -4798,8 +4808,9 @@ pub const DB = struct {
         });
     }
 
-    fn splitMarkerMatches(marker: range_state_mod.SplitBootstrapMarker, transition_id: u64, source_group_id: u64, destination_group_id: u64) bool {
+    fn splitMarkerMatches(marker: range_state_mod.SplitBootstrapMarker, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) bool {
         return marker.transition_id == transition_id and
+            marker.attempt_epoch == attempt_epoch and
             marker.source_group_id == source_group_id and
             marker.destination_group_id == destination_group_id;
     }
@@ -4809,6 +4820,7 @@ pub const DB = struct {
     fn shouldApplySplitReplicationLocked(self: *DB, req: types.BatchRequest) !bool {
         if (req.split_replication) |replication| {
             if (replication.transition_id == 0 or
+                replication.attempt_epoch == 0 or
                 replication.source_group_id == replication.destination_group_id)
             {
                 return error.InvalidBatchRequest;
@@ -4816,18 +4828,19 @@ pub const DB = struct {
             const marker = try self.core.loadSplitBootstrapMarker(self.alloc);
             switch (replication.operation) {
                 .bootstrap_chunk => {
-                    if (marker) |complete| {
-                        if (!splitMarkerMatches(complete, replication.transition_id, replication.source_group_id, replication.destination_group_id)) {
+                    if (marker) |existing| {
+                        if (!splitMarkerMatches(existing, replication.transition_id, replication.attempt_epoch, replication.source_group_id, replication.destination_group_id)) {
                             return error.ConflictingSplitTransition;
                         }
-                        return false;
+                        if (existing.bootstrap_complete) return false;
                     }
                 },
                 .delta => {
                     const complete = marker orelse return error.SplitBootstrapIncomplete;
-                    if (!splitMarkerMatches(complete, replication.transition_id, replication.source_group_id, replication.destination_group_id)) {
+                    if (!splitMarkerMatches(complete, replication.transition_id, replication.attempt_epoch, replication.source_group_id, replication.destination_group_id)) {
                         return error.ConflictingSplitTransition;
                     }
+                    if (!complete.bootstrap_complete) return error.SplitBootstrapIncomplete;
                     if (replication.sequence == 0) return error.InvalidBatchRequest;
                     const applied = try self.core.loadSplitDeltaFinalSeq(self.alloc);
                     if (replication.sequence <= applied) return false;
@@ -4835,28 +4848,31 @@ pub const DB = struct {
                 },
                 .checkpoint => {
                     const checkpoint = req.split_checkpoint orelse return error.MissingSplitReplicationCheckpoint;
-                    if (checkpoint.kind != .destination or
+                    if (checkpoint.kind == .source_ack or
                         checkpoint.transition_id != replication.transition_id or
+                        checkpoint.attempt_epoch != replication.attempt_epoch or
                         checkpoint.source_group_id != replication.source_group_id or
                         checkpoint.destination_group_id != replication.destination_group_id or
                         checkpoint.delta_sequence != replication.sequence)
                     {
                         return error.InvalidBatchRequest;
                     }
-                    if (marker) |complete| {
-                        if (!splitMarkerMatches(complete, replication.transition_id, replication.source_group_id, replication.destination_group_id)) {
+                    if (marker) |existing| {
+                        if (!splitMarkerMatches(existing, replication.transition_id, replication.attempt_epoch, replication.source_group_id, replication.destination_group_id)) {
                             return error.ConflictingSplitTransition;
                         }
                         const applied = try self.core.loadSplitDeltaFinalSeq(self.alloc);
                         if (checkpoint.delta_sequence > applied) return error.SplitReplicationSequenceGap;
-                        return false;
+                        if (checkpoint.kind == .destination_begin or existing.bootstrap_complete) return false;
+                    } else if (checkpoint.kind == .destination_complete) {
+                        return error.SplitBootstrapIncomplete;
                     }
                 },
             }
         } else if (req.split_checkpoint) |checkpoint| {
             if (checkpoint.kind != .source_ack or checkpoint.transition_id == 0) return error.MissingSplitReplicationContext;
             if (try self.core.loadSplitBootstrapMarker(self.alloc)) |marker| {
-                if (!splitMarkerMatches(marker, checkpoint.transition_id, checkpoint.source_group_id, checkpoint.destination_group_id)) {
+                if (!splitMarkerMatches(marker, checkpoint.transition_id, checkpoint.attempt_epoch, checkpoint.source_group_id, checkpoint.destination_group_id)) {
                     return error.ConflictingSplitTransition;
                 }
                 if (checkpoint.delta_sequence <= try self.core.loadSplitDeltaFinalSeq(self.alloc)) return false;
@@ -5657,7 +5673,7 @@ pub const DB = struct {
         }
         var split_range_buf: [1024]u8 = undefined;
         var split_sequence_buf: [8]u8 = undefined;
-        var split_marker_buf: [3 * @sizeOf(u64)]u8 = undefined;
+        var split_marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
         var persisted_range: ?types.ByteRange = null;
         var persisted_range_start_owned: ?[]u8 = null;
         defer if (persisted_range_start_owned) |value| self.alloc.free(value);
@@ -5672,7 +5688,7 @@ pub const DB = struct {
             }
         }
         if (req.split_checkpoint) |checkpoint| {
-            if (checkpoint.kind == .destination) {
+            if (checkpoint.kind != .source_ack) {
                 persisted_range = .{ .start = checkpoint.range_start, .end = checkpoint.range_end };
                 persisted_range_start_owned = try self.alloc.dupe(u8, checkpoint.range_start);
                 persisted_range_end_owned = try self.alloc.dupe(u8, checkpoint.range_end);
@@ -5689,8 +5705,10 @@ pub const DB = struct {
                 .key = range_state_mod.split_bootstrap_marker_key,
                 .value = range_state_mod.encodeSplitBootstrapMarker(.{
                     .transition_id = checkpoint.transition_id,
+                    .attempt_epoch = checkpoint.attempt_epoch,
                     .source_group_id = checkpoint.source_group_id,
                     .destination_group_id = checkpoint.destination_group_id,
+                    .bootstrap_complete = checkpoint.kind == .destination_complete,
                 }, &split_marker_buf),
             });
         }
@@ -5703,6 +5721,7 @@ pub const DB = struct {
             &owned_store_keys,
             &owned_store_values,
         );
+        try store_writes.appendSlice(self.alloc, opts.extra_store_writes);
         try delete_keys.appendSlice(self.alloc, identity_visibility_deletes.items);
         const replay_append: ?docstore_mod.DocStore.ReplayAppend = if (opts.suppress_derived_replay_append)
             null
@@ -11215,6 +11234,310 @@ pub const DB = struct {
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.saveSplitBootstrapMarker(marker);
+    }
+
+    /// Replaces all primary documents and the range for a Raft snapshot in a
+    /// single durable commit. Derived indexes consume the same replacement
+    /// batch, so stale documents are removed instead of surviving restore.
+    pub fn replaceRaftDocumentSnapshot(
+        self: *DB,
+        alloc: Allocator,
+        byte_range: types.ByteRange,
+        writes: []const types.BatchWrite,
+    ) !void {
+        lockAtomicWithBackoff(&self.generation_replace_mutex);
+        defer self.generation_replace_mutex.unlock();
+        if (byte_range.start.len > 0 and byte_range.end.len > 0 and
+            std.mem.order(u8, byte_range.start, byte_range.end) != .lt)
+        {
+            return error.InvalidAppliedDataRange;
+        }
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(alloc);
+        try seen.ensureTotalCapacity(alloc, @intCast(writes.len));
+        for (writes) |write| {
+            if (!byte_range.contains(write.key)) return error.KeyOutOfRange;
+            const result = try seen.getOrPut(alloc, write.key);
+            if (result.found_existing) return error.DuplicateDocumentKey;
+        }
+
+        const lower = try internal_keys.documentRangeLowerAlloc(alloc, "");
+        defer alloc.free(lower);
+        const upper = (try internal_keys.documentRangeUpperAlloc(alloc, "")) orelse return error.InvalidAppliedDataRange;
+        defer alloc.free(upper);
+        lockApplyShared(self);
+        const existing_documents = self.core.scanStoreRange(alloc, lower, upper) catch |err| {
+            self.core.unlockApplyShared();
+            return err;
+        };
+        self.core.unlockApplyShared();
+        defer docstore_mod.DocStore.freeResults(alloc, existing_documents);
+
+        var deletes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (deletes.items) |key| alloc.free(key);
+            deletes.deinit(alloc);
+        }
+        for (existing_documents) |entry| {
+            const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, entry.key)) orelse continue;
+            if (seen.contains(logical_key)) {
+                alloc.free(logical_key);
+                continue;
+            }
+            errdefer alloc.free(logical_key);
+            try deletes.append(alloc, logical_key);
+        }
+
+        var range_buf: [1024]u8 = undefined;
+        const range_write = try range_state_mod.rangeMetadataWrite(byte_range, &range_buf);
+        try self.batchInternal(.{
+            .writes = writes,
+            .deletes = deletes.items,
+            .sync_level = .write,
+        }, null, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+            .bypass_ha_write_gate = true,
+            .extra_store_writes = &.{range_write},
+        });
+        try self.refreshSplitBootstrapRangeInMemory(byte_range);
+    }
+
+    /// Appends a bounded chunk into an isolated Raft snapshot generation.
+    /// The caller owns generation publication and must never call this against
+    /// a live generation because chunks are independently durable.
+    pub fn appendRaftDocumentSnapshotChunk(
+        self: *DB,
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        byte_range: types.ByteRange,
+        writes: []const types.BatchWrite,
+    ) !void {
+        try staged_generation.validatePath(self.core.path);
+        if (byte_range.start.len > 0 and byte_range.end.len > 0 and
+            std.mem.order(u8, byte_range.start, byte_range.end) != .lt)
+        {
+            return error.InvalidAppliedDataRange;
+        }
+        for (writes) |write| if (!byte_range.contains(write.key)) return error.KeyOutOfRange;
+        try self.batchInternal(.{
+            .writes = writes,
+            .sync_level = .write,
+        }, null, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+            .bypass_ha_write_gate = true,
+        });
+    }
+
+    /// Finalizes the range metadata after all chunks have been imported.
+    pub fn finishRaftDocumentSnapshot(
+        self: *DB,
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        byte_range: types.ByteRange,
+    ) !void {
+        try staged_generation.validatePath(self.core.path);
+        var range_buf: [1024]u8 = undefined;
+        const range_write = try range_state_mod.rangeMetadataWrite(byte_range, &range_buf);
+        try self.batchInternal(.{ .sync_level = .write }, null, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+            .bypass_ha_write_gate = true,
+            .extra_store_writes = &.{range_write},
+        });
+        try self.refreshSplitBootstrapRangeInMemory(byte_range);
+    }
+
+    /// Atomically starts or replaces a split destination bootstrap. An
+    /// incomplete marker fences ordinary replication while bounded bootstrap
+    /// chunks are streamed. Callers must hold the destination generation's
+    /// exclusive lifecycle lease.
+    pub fn replaceSplitBootstrap(
+        self: *DB,
+        alloc: Allocator,
+        byte_range: types.ByteRange,
+        writes: []const types.BatchWrite,
+        base_delta_sequence: u64,
+        marker: range_state_mod.SplitBootstrapMarker,
+    ) !bool {
+        lockAtomicWithBackoff(&self.generation_replace_mutex);
+        defer self.generation_replace_mutex.unlock();
+
+        if (marker.transition_id == 0 or marker.attempt_epoch == 0 or
+            marker.source_group_id == 0 or marker.destination_group_id == 0 or
+            marker.bootstrap_complete)
+        {
+            return error.InvalidSplitBootstrapMarker;
+        }
+        if (byte_range.start.len > 0 and byte_range.end.len > 0 and
+            std.mem.order(u8, byte_range.start, byte_range.end) != .lt)
+        {
+            return error.InvalidAppliedDataRange;
+        }
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(alloc);
+        try seen.ensureTotalCapacity(alloc, @intCast(writes.len));
+        for (writes) |write| {
+            if (!byte_range.contains(write.key)) return error.KeyOutOfRange;
+            const result = try seen.getOrPut(alloc, write.key);
+            if (result.found_existing) return error.DuplicateDocumentKey;
+        }
+
+        if (try self.getSplitBootstrapMarker(alloc)) |existing| {
+            const same_attempt = existing.transition_id == marker.transition_id and
+                existing.attempt_epoch == marker.attempt_epoch and
+                existing.source_group_id == marker.source_group_id and
+                existing.destination_group_id == marker.destination_group_id;
+            if (same_attempt) {
+                const reserved_sequence = try self.getSplitDeltaFinalSeq(alloc);
+                if (base_delta_sequence < reserved_sequence) return error.StaleSplitBootstrap;
+                if (!byteRangesEqual(self.core.byteRange(), byte_range)) return error.ConflictingSplitTransition;
+                if (existing.bootstrap_complete) {
+                    if (base_delta_sequence > reserved_sequence) return error.SplitBootstrapComplete;
+                    return false;
+                }
+                // Source leadership can change after an earlier worker has
+                // reserved and populated this exact transfer. Replaying begin
+                // must not erase those chunks beneath its pending completion.
+                if (base_delta_sequence == reserved_sequence) return false;
+            }
+            if (!same_attempt and
+                (existing.source_group_id != marker.source_group_id or
+                    existing.destination_group_id != marker.destination_group_id or
+                    existing.attempt_epoch >= marker.attempt_epoch))
+            {
+                return error.ConflictingSplitTransition;
+            }
+        }
+
+        const lower = try internal_keys.documentRangeLowerAlloc(alloc, "");
+        defer alloc.free(lower);
+        const upper = (try internal_keys.documentRangeUpperAlloc(alloc, "")) orelse return error.InvalidAppliedDataRange;
+        defer alloc.free(upper);
+        lockApplyShared(self);
+        const existing_documents = self.core.scanStoreRange(alloc, lower, upper) catch |err| {
+            self.core.unlockApplyShared();
+            return err;
+        };
+        self.core.unlockApplyShared();
+        defer docstore_mod.DocStore.freeResults(alloc, existing_documents);
+
+        var deletes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (deletes.items) |key| alloc.free(key);
+            deletes.deinit(alloc);
+        }
+        for (existing_documents) |entry| {
+            const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, entry.key)) orelse continue;
+            if (seen.contains(logical_key)) {
+                alloc.free(logical_key);
+                continue;
+            }
+            errdefer alloc.free(logical_key);
+            try deletes.append(alloc, logical_key);
+        }
+
+        var range_buf: [1024]u8 = undefined;
+        var sequence_buf: [8]u8 = undefined;
+        var marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
+        const metadata_writes = try range_state_mod.splitBootstrapMetadataWrites(
+            byte_range,
+            base_delta_sequence,
+            marker,
+            &range_buf,
+            &sequence_buf,
+            &marker_buf,
+        );
+        self.batchInternal(.{
+            .writes = writes,
+            .deletes = deletes.items,
+            .sync_level = .write,
+        }, null, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+            .bypass_ha_write_gate = true,
+            .extra_store_writes = &metadata_writes,
+        }) catch |err| {
+            if (try self.getSplitBootstrapMarker(alloc)) |committed| {
+                if (splitBootstrapMarkersEqual(committed, marker)) {
+                    try self.refreshSplitBootstrapRangeInMemory(byte_range);
+                    return true;
+                }
+            }
+            return err;
+        };
+        try self.refreshSplitBootstrapRangeInMemory(byte_range);
+        return true;
+    }
+
+    /// Atomically publishes a fully streamed split bootstrap. Completion is
+    /// valid only for the exact reservation installed by replaceSplitBootstrap.
+    pub fn completeSplitBootstrap(
+        self: *DB,
+        alloc: Allocator,
+        byte_range: types.ByteRange,
+        base_delta_sequence: u64,
+        marker: range_state_mod.SplitBootstrapMarker,
+    ) !bool {
+        lockAtomicWithBackoff(&self.generation_replace_mutex);
+        defer self.generation_replace_mutex.unlock();
+
+        if (marker.transition_id == 0 or marker.attempt_epoch == 0 or
+            marker.source_group_id == 0 or marker.destination_group_id == 0 or
+            !marker.bootstrap_complete)
+        {
+            return error.InvalidSplitBootstrapMarker;
+        }
+        if (byte_range.start.len > 0 and byte_range.end.len > 0 and
+            std.mem.order(u8, byte_range.start, byte_range.end) != .lt)
+        {
+            return error.InvalidAppliedDataRange;
+        }
+
+        const existing = (try self.getSplitBootstrapMarker(alloc)) orelse
+            return error.SplitBootstrapRequired;
+        if (existing.transition_id != marker.transition_id or
+            existing.attempt_epoch != marker.attempt_epoch or
+            existing.source_group_id != marker.source_group_id or
+            existing.destination_group_id != marker.destination_group_id)
+        {
+            return error.ConflictingSplitTransition;
+        }
+        const reserved_sequence = try self.getSplitDeltaFinalSeq(alloc);
+        if (base_delta_sequence != reserved_sequence) return error.StaleSplitBootstrap;
+        if (!byteRangesEqual(self.core.byteRange(), byte_range)) return error.ConflictingSplitTransition;
+        if (existing.bootstrap_complete) {
+            try self.refreshSplitBootstrapRangeInMemory(byte_range);
+            return false;
+        }
+
+        var range_buf: [1024]u8 = undefined;
+        var sequence_buf: [8]u8 = undefined;
+        var marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
+        const metadata_writes = try range_state_mod.splitBootstrapMetadataWrites(
+            byte_range,
+            base_delta_sequence,
+            marker,
+            &range_buf,
+            &sequence_buf,
+            &marker_buf,
+        );
+        try self.batchInternal(.{ .sync_level = .write }, null, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+            .bypass_ha_write_gate = true,
+            .extra_store_writes = &metadata_writes,
+        });
+        try self.refreshSplitBootstrapRangeInMemory(byte_range);
+        return true;
+    }
+
+    fn refreshSplitBootstrapRangeInMemory(self: *DB, byte_range: types.ByteRange) !void {
+        const start = try self.alloc.dupe(u8, byte_range.start);
+        errdefer self.alloc.free(start);
+        const end = try self.alloc.dupe(u8, byte_range.end);
+        lockApply(self);
+        defer self.core.unlockApply();
+        self.core.replaceRangeInMemoryOwned(start, end);
     }
 
     pub fn clearSplitBootstrapMarker(self: *DB) !void {
@@ -69297,6 +69620,176 @@ test "db split cutover fences enrichment to the owning range" {
     for (parent_result.hits) |hit| {
         try std.testing.expect(!std.mem.eql(u8, hit.id, "doc:y"));
     }
+}
+
+test "db raft snapshot replacement preserves overlapping incoming documents" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:keep", .value = "{\"version\":1}" },
+        .{ .key = "doc:stale", .value = "{\"stale\":true}" },
+    } });
+
+    try db.replaceRaftDocumentSnapshot(alloc, .{ .start = "", .end = "" }, &.{
+        .{ .key = "doc:keep", .value = "{\"version\":2}" },
+        .{ .key = "doc:new", .value = "{\"new\":true}" },
+    });
+
+    const retained = (try db.get(alloc, "doc:keep")).?;
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("{\"version\":2}", retained);
+    const added = (try db.get(alloc, "doc:new")).?;
+    defer alloc.free(added);
+    try std.testing.expectEqualStrings("{\"new\":true}", added);
+    try std.testing.expect((try db.get(alloc, "doc:stale")) == null);
+}
+
+test "db staged raft snapshot chunks atomically replace the live generation" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var live = try DB.open(alloc, std.mem.span(path), .{});
+        defer live.close();
+        try live.batch(.{ .writes = &.{.{ .key = "doc:stale", .value = "{\"stale\":true}" }} });
+    }
+
+    var preparation = try generation_lifecycle.beginProcessPreparationWithRuntime(std.mem.span(path), null);
+    defer preparation.deinit();
+    var staged = try preparation.beginStaging();
+    defer staged.deinit();
+    {
+        var candidate = try DB.open(alloc, staged.path(), .{
+            .staged_generation = &staged,
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+        });
+        defer candidate.close();
+        const byte_range: types.ByteRange = .{ .start = "doc:a", .end = "doc:z" };
+        try candidate.appendRaftDocumentSnapshotChunk(&staged, byte_range, &.{.{
+            .key = "doc:keep",
+            .value = "{\"version\":2}",
+        }});
+        try candidate.appendRaftDocumentSnapshotChunk(&staged, byte_range, &.{.{
+            .key = "doc:new",
+            .value = "{\"new\":true}",
+        }});
+        try candidate.finishRaftDocumentSnapshot(&staged, byte_range);
+        try candidate.sync(true);
+    }
+    try staged.seal();
+    var exclusive = try preparation.promote();
+    defer exclusive.deinit();
+    _ = try staged.publish();
+    exclusive.deinit();
+    staged.deinit();
+    preparation.deinit();
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    const retained = (try reopened.get(alloc, "doc:keep")).?;
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("{\"version\":2}", retained);
+    const added = (try reopened.get(alloc, "doc:new")).?;
+    defer alloc.free(added);
+    try std.testing.expectEqualStrings("{\"new\":true}", added);
+    try std.testing.expect((try reopened.get(alloc, "doc:stale")) == null);
+    try std.testing.expectEqualStrings("doc:a", reopened.getRange().start);
+    try std.testing.expectEqualStrings("doc:z", reopened.getRange().end);
+}
+
+test "db split bootstrap replacement preserves overlapping incoming documents" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:keep", .value = "{\"version\":1}" },
+        .{ .key = "doc:stale", .value = "{\"stale\":true}" },
+    } });
+
+    try std.testing.expect(try db.replaceSplitBootstrap(
+        alloc,
+        .{ .start = "", .end = "" },
+        &.{
+            .{ .key = "doc:keep", .value = "{\"version\":2}" },
+            .{ .key = "doc:new", .value = "{\"new\":true}" },
+        },
+        17,
+        .{
+            .transition_id = 11,
+            .attempt_epoch = 1,
+            .source_group_id = 101,
+            .destination_group_id = 102,
+            .bootstrap_complete = false,
+        },
+    ));
+
+    const retained = (try db.get(alloc, "doc:keep")).?;
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("{\"version\":2}", retained);
+    const added = (try db.get(alloc, "doc:new")).?;
+    defer alloc.free(added);
+    try std.testing.expectEqualStrings("{\"new\":true}", added);
+    try std.testing.expect((try db.get(alloc, "doc:stale")) == null);
+}
+
+test "db split bootstrap retries preserve reserved data and exact sequence" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    const byte_range: types.ByteRange = .{ .start = "doc:m", .end = "doc:z" };
+    const incomplete: range_state_mod.SplitBootstrapMarker = .{
+        .transition_id = 11,
+        .attempt_epoch = 1,
+        .source_group_id = 101,
+        .destination_group_id = 102,
+        .bootstrap_complete = false,
+    };
+    try std.testing.expect(try db.replaceSplitBootstrap(
+        alloc,
+        byte_range,
+        &.{.{ .key = "doc:m", .value = "{\"version\":1}" }},
+        17,
+        incomplete,
+    ));
+    try std.testing.expect(!try db.replaceSplitBootstrap(alloc, byte_range, &.{}, 17, incomplete));
+    const reserved = (try db.get(alloc, "doc:m")).?;
+    defer alloc.free(reserved);
+    try std.testing.expectEqualStrings("{\"version\":1}", reserved);
+
+    var complete = incomplete;
+    complete.bootstrap_complete = true;
+    try std.testing.expectError(
+        error.StaleSplitBootstrap,
+        db.completeSplitBootstrap(alloc, byte_range, 18, complete),
+    );
+    try std.testing.expect(try db.completeSplitBootstrap(alloc, byte_range, 17, complete));
+
+    try std.testing.expect(!try db.replaceSplitBootstrap(alloc, byte_range, &.{}, 17, incomplete));
+    const retained = (try db.get(alloc, "doc:m")).?;
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("{\"version\":1}", retained);
+    try std.testing.expect((try db.getSplitBootstrapMarker(alloc)).?.bootstrap_complete);
+
+    try std.testing.expectError(
+        error.SplitBootstrapComplete,
+        db.replaceSplitBootstrap(alloc, byte_range, &.{}, 18, incomplete),
+    );
 }
 
 test "db split cutover fences enrichment to the owning range with durable lsm primary backend" {

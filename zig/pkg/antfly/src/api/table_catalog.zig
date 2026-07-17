@@ -32,6 +32,8 @@ pub const CatalogSource = struct {
     pub const VTable = struct {
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
+        /// Compares a compact contract after a Raft linearizable-read barrier.
+        validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
     };
 
     pub fn adminSnapshot(self: CatalogSource) !metadata_api.AdminSnapshot {
@@ -42,12 +44,18 @@ pub const CatalogSource = struct {
         self.vtable.free_admin_snapshot(self.ptr, snapshot);
     }
 
+    pub fn validatePublication(self: CatalogSource, contract: metadata_api.CatalogPublicationContract) !bool {
+        const validate = self.vtable.validate_publication orelse return error.CatalogPublicationFenceUnavailable;
+        return try validate(self.ptr, contract);
+    }
+
     pub fn fromMetadataService(svc: *metadata_service.MetadataService) CatalogSource {
         return .{
             .ptr = svc,
             .vtable = &.{
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
+                .validate_publication = metadataServiceValidatePublication,
             },
         };
     }
@@ -58,6 +66,7 @@ pub const CatalogSource = struct {
             .vtable = &.{
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
+                .validate_publication = metadataHttpServiceValidatePublication,
             },
         };
     }
@@ -68,6 +77,7 @@ pub const CatalogSource = struct {
             .vtable = &.{
                 .admin_snapshot = metadataServerAdminSnapshot,
                 .free_admin_snapshot = metadataServerFreeAdminSnapshot,
+                .validate_publication = metadataServerValidatePublication,
             },
         };
     }
@@ -326,6 +336,14 @@ fn metadataServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.Adm
     svc.freeAdminSnapshot(snapshot);
 }
 
+fn metadataServiceValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    try svc.ensureLinearizableRead();
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+    return contract.matches(&snapshot);
+}
+
 fn metadataHttpServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     return try svc.adminSnapshot();
@@ -336,6 +354,14 @@ fn metadataHttpServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api
     svc.freeAdminSnapshot(snapshot);
 }
 
+fn metadataHttpServiceValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    try svc.ensureLinearizableRead();
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+    return contract.matches(&snapshot);
+}
+
 fn metadataServerAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
     return try srv.adminSnapshot();
@@ -344,6 +370,11 @@ fn metadataServerAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
 fn metadataServerFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
     srv.freeAdminSnapshot(snapshot);
+}
+
+fn metadataServerValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+    const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    return try srv.validatePublication(contract);
 }
 
 fn sortRangeRefs(ranges: []const *const metadata_table_manager.RangeRecord) void {
