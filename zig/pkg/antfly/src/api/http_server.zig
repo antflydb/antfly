@@ -24151,11 +24151,12 @@ test "api index status uses read runtime status without consulting write source"
     try std.testing.expectEqual(@as(?u64, 9), parsed.value.status.total_indexed);
     try std.testing.expectEqual(@as(?u64, 17), parsed.value.status.node_count);
     // This fixture intentionally has no derived coverage counters. The read
-    // status is authoritative enough to avoid a writer lookup, while the
-    // public aggregate must still fail closed for index readiness.
-    try std.testing.expectEqual(@as(?u64, 6), parsed.value.status.replay_applied_sequence);
+    // status is authoritative enough to avoid a writer lookup. Coverage still
+    // fails closed independently, while the aggregate replay watermark reports
+    // the real, converged managed-index ledger rather than synthetic debt.
+    try std.testing.expectEqual(@as(?u64, 7), parsed.value.status.replay_applied_sequence);
     try std.testing.expectEqual(@as(?u64, 7), parsed.value.status.replay_target_sequence);
-    try std.testing.expectEqual(@as(?bool, true), parsed.value.status.replay_catch_up_required);
+    try std.testing.expectEqual(@as(?bool, false), parsed.value.status.replay_catch_up_required);
     const shard_status = parsed.value.shard_status.?;
     const shard_10 = shard_status.@"10".?;
     try std.testing.expectEqual(@as(?u64, 9), shard_10.doc_count);
