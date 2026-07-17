@@ -742,7 +742,6 @@ const EncodedTransitionAction = struct {
     allow_doc_identity_reassignment: bool = false,
     split_key: ?[]const u8 = null,
     source_range_end: ?[]const u8 = null,
-    destination_base_uri: ?[]const u8 = null,
 };
 
 fn parseSplitTransitionRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_transition_state.SplitTransitionRecord {
@@ -816,7 +815,6 @@ fn parseTransitionAction(alloc: std.mem.Allocator, body: []const u8) !metadata_m
                 .attempt_epoch = parsed.value.attempt_epoch,
                 .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
                 .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
-                .destination_base_uri = if (parsed.value.destination_base_uri) |value| try alloc.dupe(u8, value) else null,
             },
         },
         .catch_up_split_destination => .{
@@ -825,7 +823,6 @@ fn parseTransitionAction(alloc: std.mem.Allocator, body: []const u8) !metadata_m
                 .attempt_epoch = parsed.value.attempt_epoch,
                 .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
                 .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
-                .destination_base_uri = if (parsed.value.destination_base_uri) |value| try alloc.dupe(u8, value) else null,
             },
         },
         .finalize_split_source => .{
@@ -1333,8 +1330,6 @@ fn freeTransitionActionOwned(alloc: std.mem.Allocator, action: *metadata_mod.Tra
             alloc.free(op.split_key);
             if (op.source_range_end) |value| alloc.free(value);
         },
-        .bootstrap_split_destination => |op| if (op.destination_base_uri) |value| alloc.free(@constCast(value)),
-        .catch_up_split_destination => |op| if (op.destination_base_uri) |value| alloc.free(@constCast(value)),
         else => {},
     }
     action.* = undefined;

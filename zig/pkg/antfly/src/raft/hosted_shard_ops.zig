@@ -111,20 +111,14 @@ pub const HostedShardOperationAdapter = struct {
 
     fn bootstrapSplitDestination(ptr: *anyopaque, op: BootstrapSplitDestination) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
-        const destination_base_uri = try self.groupBaseUriAlloc(self.data_router, op.destination_group_id);
-        defer self.alloc.free(destination_base_uri);
-        var routed_op = op;
-        routed_op.destination_base_uri = destination_base_uri;
-        try self.executeRouted(self.data_router, op.source_group_id, .{ .bootstrap_split_destination = routed_op });
+        try self.requireGroupReadyForTransition(op.destination_group_id);
+        try self.executeRouted(self.data_router, op.source_group_id, .{ .bootstrap_split_destination = op });
     }
 
     fn catchUpSplitDestination(ptr: *anyopaque, op: CatchUpSplitDestination) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
-        const destination_base_uri = try self.groupBaseUriAlloc(self.data_router, op.destination_group_id);
-        defer self.alloc.free(destination_base_uri);
-        var routed_op = op;
-        routed_op.destination_base_uri = destination_base_uri;
-        try self.executeRouted(self.data_router, op.source_group_id, .{ .catch_up_split_destination = routed_op });
+        try self.requireGroupReadyForTransition(op.destination_group_id);
+        try self.executeRouted(self.data_router, op.source_group_id, .{ .catch_up_split_destination = op });
     }
 
     fn finalizeSplitSource(ptr: *anyopaque, op: FinalizeSplitSource) !void {
@@ -366,18 +360,6 @@ pub const HostedShardOperationAdapter = struct {
         defer self.alloc.free(base_uri);
         var client = api_http_client.ApiHttpClient.init(self.alloc, self.executor);
         _ = try client.fetchGroupShardExecute(base_uri, group_id, action);
-    }
-
-    fn groupBaseUriAlloc(self: *HostedShardOperationAdapter, router: api_table_router.HostedGroupRouter, group_id: u64) ![]u8 {
-        try self.requireGroupReadyForTransition(group_id);
-
-        const leader_node_id = router.groupLeaderNodeId(group_id) orelse return error.GroupLeaderUnavailable;
-        if (leader_node_id == router.localNodeId()) {
-            if (router.localStatus(group_id) != .active) return error.GroupLeaderUnavailable;
-        } else if (router.nodeStatus(leader_node_id, group_id)) |status| {
-            if (status != .active) return error.GroupLeaderUnavailable;
-        }
-        return (try router.nodeBaseUriForGroup(self.alloc, group_id, leader_node_id)) orelse error.GroupLeaderUnavailable;
     }
 
     fn requireGroupReadyForTransition(self: *HostedShardOperationAdapter, group_id: u64) !void {

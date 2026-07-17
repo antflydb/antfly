@@ -5464,7 +5464,6 @@ pub const DataServer = struct {
                 op.attempt_epoch,
                 op.source_group_id,
                 op.destination_group_id,
-                op.destination_base_uri orelse return error.MissingDestinationRoute,
             );
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .bootstrap_split_destination = op });
@@ -5489,7 +5488,6 @@ pub const DataServer = struct {
                 op.attempt_epoch,
                 op.source_group_id,
                 op.destination_group_id,
-                op.destination_base_uri orelse return error.MissingDestinationRoute,
             );
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .catch_up_split_destination = op });
@@ -5509,7 +5507,6 @@ pub const DataServer = struct {
         attempt_epoch: u64,
         source_group_id: u64,
         destination_group_id: u64,
-        destination_base_uri: []const u8,
     ) !void {
         const source_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, source_group_id);
         defer self.alloc.free(source_root_dir);
@@ -5541,13 +5538,13 @@ pub const DataServer = struct {
         // impossible to apply without the corresponding bootstrap identity.
         try self.requireLocalDataRaftLeader(source_group_id);
         try self.replicateSplitDestinationCheckpoint(
-            destination_base_uri,
             destination_group_id,
             table_name,
             replication,
             handoff.byte_range,
             handoff.base_delta_sequence,
             .destination_begin,
+            true,
         );
 
         const max_writes_per_batch: usize = 128;
@@ -5560,21 +5557,21 @@ pub const DataServer = struct {
             for (handoff.entries[offset..end], 0..) |entry, i| {
                 writes[i] = .{ .key = entry.key, .value = entry.value };
             }
-            try self.sendSplitDestinationBatch(destination_base_uri, destination_group_id, table_name, replication, .{
+            try self.replicateSplitDestinationBatch(destination_group_id, table_name, replication, .{
                 .writes = writes,
                 .sync_level = .write,
-            });
+            }, false);
             offset = end;
         }
         try self.requireLocalDataRaftLeader(source_group_id);
         try self.replicateSplitDestinationCheckpoint(
-            destination_base_uri,
             destination_group_id,
             table_name,
             replication,
             handoff.byte_range,
             handoff.base_delta_sequence,
             .destination_complete,
+            false,
         );
         try self.requireLocalDataRaftLeader(source_group_id);
         try self.replicateSplitSourceAcknowledgement(
@@ -5628,7 +5625,6 @@ pub const DataServer = struct {
         attempt_epoch: u64,
         source_group_id: u64,
         destination_group_id: u64,
-        destination_base_uri: []const u8,
     ) !void {
         const source_store = self.localTransitionApplyStore() orelse return error.MissingSplitSourceStore;
         const table_name = (try self.tableNameForLocalGroupAlloc(source_group_id)) orelse return error.UnknownGroup;
@@ -5643,6 +5639,7 @@ pub const DataServer = struct {
         const deltas = try source_store.listSplitDeltasAfter(self.alloc, source_group_id, after_seq);
         defer antfly.shard.freeDeltas(self.alloc, deltas);
 
+        var refresh_destination_route = true;
         for (deltas) |delta| {
             var writes = std.ArrayListUnmanaged(antfly.db.types.BatchWrite).empty;
             defer writes.deinit(self.alloc);
@@ -5670,21 +5667,22 @@ pub const DataServer = struct {
             // Empty deltas are still durable sequence barriers. Sending them
             // keeps gap detection exact instead of making a missing mutation
             // indistinguishable from an intentionally empty source delta.
-            try self.sendSplitDestinationBatch(destination_base_uri, destination_group_id, table_name, delta_replication, .{
+            try self.replicateSplitDestinationBatch(destination_group_id, table_name, delta_replication, .{
                 .writes = writes.items,
                 .deletes = deletes.items,
                 .sync_level = .write,
-            });
+            }, refresh_destination_route);
+            refresh_destination_route = false;
         }
         try self.requireLocalDataRaftLeader(source_group_id);
         try self.replicateSplitDestinationCheckpoint(
-            destination_base_uri,
             destination_group_id,
             table_name,
             replication,
             .{ .start = source_state.split_key, .end = source_state.original_range_end },
             source_seq,
             .destination_complete,
+            refresh_destination_route,
         );
         try self.requireLocalDataRaftLeader(source_group_id);
         try self.replicateSplitSourceAcknowledgement(
@@ -5698,19 +5696,19 @@ pub const DataServer = struct {
 
     fn replicateSplitDestinationCheckpoint(
         self: *DataServer,
-        destination_base_uri: []const u8,
         destination_group_id: u64,
         table_name: []const u8,
         replication: antfly.db.types.SplitReplicationContext,
         byte_range: antfly.db.types.ByteRange,
         delta_sequence: u64,
         kind: antfly.db.types.SplitReplicationCheckpoint.Kind,
+        refresh_metadata: bool,
     ) !void {
         if (kind == .source_ack) return error.InvalidBatchRequest;
         var checkpoint_replication = replication;
         checkpoint_replication.operation = .checkpoint;
         checkpoint_replication.sequence = delta_sequence;
-        try self.sendSplitDestinationBatch(destination_base_uri, destination_group_id, table_name, checkpoint_replication, .{
+        try self.replicateSplitDestinationBatch(destination_group_id, table_name, checkpoint_replication, .{
             .sync_level = .write,
             .split_checkpoint = .{
                 .kind = kind,
@@ -5722,7 +5720,7 @@ pub const DataServer = struct {
                 .range_end = byte_range.end,
                 .delta_sequence = delta_sequence,
             },
-        });
+        }, refresh_metadata);
     }
 
     fn replicateSplitSourceAcknowledgement(
@@ -5746,26 +5744,25 @@ pub const DataServer = struct {
         }, true, false);
     }
 
-    fn sendSplitDestinationBatch(
+    fn replicateSplitDestinationBatch(
         self: *DataServer,
-        destination_base_uri: []const u8,
         destination_group_id: u64,
         table_name: []const u8,
         replication: antfly.db.types.SplitReplicationContext,
         req: antfly.db.types.BatchRequest,
+        refresh_metadata: bool,
     ) !void {
         if (replication.destination_group_id != destination_group_id) return error.InvalidBatchRequest;
-        var executor = antfly.raft.transport.StdHttpExecutor.init(self.alloc, .{});
-        defer executor.deinit();
-        var client = antfly.public_api.ApiHttpClient.init(self.alloc, executor.executor());
         var replicated_req = req;
         replicated_req.split_replication = replication;
-        const body = try antfly.public_api.batch.encodeBatchRequest(self.alloc, replicated_req);
-        defer self.alloc.free(body);
-        // Transition work is retried from persisted metadata state. Bound each
-        // attempt so a destination election cannot starve metadata Raft ticks.
-        var response = try client.fetchGroupBatchWithTimeout(destination_base_uri, destination_group_id, table_name, body, 250);
-        response.deinit(self.alloc);
+        try self.proposeRaftBatchGroup(
+            self.alloc,
+            destination_group_id,
+            table_name,
+            replicated_req,
+            true,
+            refresh_metadata,
+        );
     }
 
     fn splitReplicationContext(

@@ -2264,7 +2264,6 @@ const EncodedTransitionAction = struct {
     allow_doc_identity_reassignment: bool = false,
     split_key: ?[]const u8 = null,
     source_range_end: ?[]const u8 = null,
-    destination_base_uri: ?[]const u8 = null,
 };
 
 fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.TransitionAction) ![]u8 {
@@ -2292,7 +2291,6 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
             .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
-            .destination_base_uri = op.destination_base_uri,
         },
         .catch_up_split_destination => |op| .{
             .kind = .catch_up_split_destination,
@@ -2300,7 +2298,6 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
             .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
-            .destination_base_uri = op.destination_base_uri,
         },
         .finalize_split_source => |op| .{
             .kind = .finalize_split_source,

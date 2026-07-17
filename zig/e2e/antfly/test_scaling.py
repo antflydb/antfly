@@ -1618,14 +1618,18 @@ def test_autoscaling_finalizes_shard_split_from_size_threshold(
             return None
         return group_ids if len(group_ids) >= 2 else None
 
+    split_wait_started = time.monotonic()
     split_groups = wait_until(split_completed, timeout_s=180.0, interval_s=0.5)
+    print(f"split transition wait: {time.monotonic() - split_wait_started:.3f}s")
     assert split_groups is not None, (
         "table did not finalize an automatic split after exceeding the configured shard size threshold\n"
         f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
         f"snapshot: {cluster.metadata_snapshot_diagnostic()}\n"
         f"{cluster.debug_logs()}"
     )
+    read_wait_started = time.monotonic()
     _assert_docs_readable(cluster, table_name, docs, timeout_s=60.0)
+    print(f"post-split read wait: {time.monotonic() - read_wait_started:.3f}s")
 
 
 def test_autoscaling_node_churn_keeps_reads_available(
