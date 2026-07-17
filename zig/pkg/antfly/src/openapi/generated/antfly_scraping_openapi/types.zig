@@ -30,7 +30,7 @@ pub const HTTPCredentialConfig = struct {
     security: ?ContentSecurityConfig = null,
 };
 
-/// Configuration for remote content fetching (remotePDF, remoteMedia, remoteText templates). Consolidates S3 credentials and security settings separate from backup storage. **Credential Resolution Order:** 1. Explicit `credentials="name"` parameter in template 2. First credential where `buckets` glob pattern matches URL's bucket 3. `default_s3` credential
+/// Configuration for remote content fetching (`remoteMedia`, `remoteText`, and the deprecated `remotePDF` compatibility helper). Durable PDF ingestion uses a `document_extraction` asset producer. Consolidates S3 credentials and security settings separate from backup storage. **Credential Resolution Order:** 1. Explicit `credentials="name"` parameter in template 2. First credential where `buckets` glob pattern matches URL's bucket 3. `default_s3` credential
 pub const RemoteContentConfig = struct {
     /// Global security defaults for remote content operations.
     security: ?ContentSecurityConfig = null,

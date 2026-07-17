@@ -40,7 +40,8 @@ For AI Engineers we're also prioritizing telemetry, scaling and security. We kno
 - **Native Agents**: Retrieval and query-builder agents for bounded query planning, tool selection, and answer generation
 - **Document Chunking**: Semantic chunking service (Antfly inference) with multi-tier caching
 - **Async Enrichment**: Background embedding and summarization with leader-only processing
-- **Multimodal Remote Processing**: Automatic download, processing, and security controls for images, PDFs, and HTML from URLs (http/https/s3/file) with SSRF prevention and content validation
+- **Durable Document Extraction**: URL-backed artifacts persist PDF pages and chunks; pages without native text use local OCR when the configured model is installed
+- **Multimodal Remote Processing**: Template-time download and inference inputs for images and other media, with SSRF prevention and content validation
 
 ### Developer Experience
 - **Client Libraries**: Auto-generated SDKs for Go, TypeScript, and Python from OpenAPI spec
