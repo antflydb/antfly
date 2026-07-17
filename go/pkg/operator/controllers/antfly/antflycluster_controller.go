@@ -257,9 +257,6 @@ func (r *AntflyClusterReconciler) reconcileHAStartupTargetPVC(ctx context.Contex
 				}},
 			},
 		}
-		if err := controllerutil.SetControllerReference(cluster, created, r.Scheme); err != nil {
-			return nil, err
-		}
 		if err := r.Create(ctx, created); err != nil {
 			return nil, err
 		}
@@ -268,16 +265,13 @@ func (r *AntflyClusterReconciler) reconcileHAStartupTargetPVC(ctx context.Contex
 	if existing.DeletionTimestamp != nil {
 		return nil, fmt.Errorf("HA startup target PVC %s is terminating", name)
 	}
-	if owner := metav1.GetControllerOf(existing); owner != nil && !metav1.IsControlledBy(existing, cluster) {
-		return nil, fmt.Errorf("HA startup target PVC %s is controlled by %s %s", name, owner.Kind, owner.Name)
+	if owner := metav1.GetControllerOf(existing); owner != nil {
+		return nil, fmt.Errorf("HA startup target PVC %s must be independently retained, but is controlled by %s %s", name, owner.Kind, owner.Name)
+	}
+	if expectedUID := strings.TrimSpace(gate.RequiredReceipt.TargetPVCUID); expectedUID != "" && string(existing.UID) != expectedUID {
+		return nil, fmt.Errorf("HA startup target PVC %s UID %s does not match required activation receipt UID %s", name, existing.UID, expectedUID)
 	}
 	changed := false
-	if metav1.GetControllerOf(existing) == nil {
-		if err := controllerutil.SetControllerReference(cluster, existing, r.Scheme); err != nil {
-			return nil, err
-		}
-		changed = true
-	}
 	desiredLabels := persistentVolumeClaimLabels(cluster, "standalone")
 	if existing.Labels == nil {
 		existing.Labels = map[string]string{}
@@ -1798,6 +1792,13 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			}
 		}
 	}
+	// A pre-authentication HA object may have been valid under an older
+	// operator. Revalidate it on every upgrade reconcile before touching its
+	// StatefulSet so a new fail-closed runtime image cannot roll out without a
+	// bearer-token source and silently stop replication/admin control.
+	if !needsValidation && haRuntimeNeedsAdminTokenMigration(&antflyCluster) {
+		needsValidation = true
+	}
 
 	clusterKey := req.String()
 
@@ -2139,6 +2140,14 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func haRuntimeNeedsAdminTokenMigration(cluster *antflyv1.AntflyCluster) bool {
+	if cluster == nil || cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Runtime == nil {
+		return false
+	}
+	ha := cluster.Spec.HighAvailability
+	return ha.Mode != "" && ha.Mode != antflyv1.HAModeDisabled && strings.TrimSpace(ha.Runtime.AdminTokenEnvVar) == ""
 }
 
 func periodicRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {

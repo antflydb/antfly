@@ -827,13 +827,19 @@ Problem: PVC storage size cannot be reduced. Kubernetes only supports volume exp
 				old.Spec.Storage.StandaloneStorage, r.Spec.Storage.StandaloneStorage))
 		}
 	}
-	if old.Spec.HighAvailability != nil && old.Spec.HighAvailability.Admin != nil &&
-		r.Spec.HighAvailability != nil && r.Spec.HighAvailability.Admin != nil &&
-		r.Spec.HighAvailability.Admin.RetryGeneration < old.Spec.HighAvailability.Admin.RetryGeneration {
+	oldRetryGeneration := int64(0)
+	if old.Spec.HighAvailability != nil && old.Spec.HighAvailability.Admin != nil {
+		oldRetryGeneration = old.Spec.HighAvailability.Admin.RetryGeneration
+	}
+	newRetryGeneration := int64(0)
+	if r.Spec.HighAvailability != nil && r.Spec.HighAvailability.Admin != nil {
+		newRetryGeneration = r.Spec.HighAvailability.Admin.RetryGeneration
+	}
+	if newRetryGeneration < oldRetryGeneration {
 		errors = append(errors, fmt.Sprintf(
 			"spec.highAvailability.admin.retryGeneration cannot decrease (current: %d, attempted: %d)",
-			old.Spec.HighAvailability.Admin.RetryGeneration,
-			r.Spec.HighAvailability.Admin.RetryGeneration,
+			oldRetryGeneration,
+			newRetryGeneration,
 		))
 	}
 
@@ -1888,7 +1894,7 @@ func validateHAOptionalPath(value string, fieldPath string) []string {
 }
 
 func validHAIdentifier(value string) bool {
-	return haIdentifierPattern.MatchString(value)
+	return value != "." && value != ".." && haIdentifierPattern.MatchString(value)
 }
 
 func (r *AntflyCluster) validateHARuntimeAdminTokenSource(ha *HighAvailabilitySpec) []string {

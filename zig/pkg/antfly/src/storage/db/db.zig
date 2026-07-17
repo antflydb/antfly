@@ -52842,14 +52842,11 @@ test "storage.ha schema json mutation does not reacquire shared barrier behind q
     try std.testing.expect(waitForAtomicFlag(&probe.started, 1, 10_000));
     var capture_queued = false;
     for (0..10_000) |_| {
-        if (barrier.tryAcquireShared()) |lease_value| {
-            var lease = lease_value;
-            lease.release();
-            std.Thread.yield() catch {};
-        } else {
+        if (barrier.pendingExclusiveAcquisitions() != 0) {
             capture_queued = true;
             break;
         }
+        std.Thread.yield() catch {};
     }
     try std.testing.expect(capture_queued);
 

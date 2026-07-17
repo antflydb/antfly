@@ -14,6 +14,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+threadlocal var shared_barrier: ?*MutationBarrier = null;
+threadlocal var shared_depth: usize = 0;
+
 /// Process-wide HA capture barrier.
 ///
 /// Every primary-side persistent mutation holds a shared lease from before its
@@ -28,12 +31,21 @@ pub const MutationBarrier = struct {
     resource_mutex: std.atomic.Mutex = .unlocked,
     reader_count: usize = 0,
     shared_waiters: std.atomic.Value(u64) = .init(0),
+    exclusive_waiters: std.atomic.Value(u64) = .init(0),
 
     pub const SharedLease = struct {
         barrier: *MutationBarrier,
+        nested: bool = false,
 
         pub fn release(self: *@This()) void {
-            self.barrier.unlockShared();
+            std.debug.assert(shared_barrier == self.barrier);
+            std.debug.assert(shared_depth > 0);
+            shared_depth -= 1;
+            if (!self.nested) {
+                std.debug.assert(shared_depth == 0);
+                shared_barrier = null;
+                self.barrier.unlockShared();
+            }
             self.* = undefined;
         }
     };
@@ -48,12 +60,26 @@ pub const MutationBarrier = struct {
     };
 
     pub fn acquireShared(self: *@This()) SharedLease {
+        if (shared_barrier) |held| {
+            std.debug.assert(held == self);
+            shared_depth += 1;
+            return .{ .barrier = self, .nested = true };
+        }
         self.lockShared();
+        shared_barrier = self;
+        shared_depth = 1;
         return .{ .barrier = self };
     }
 
     pub fn tryAcquireShared(self: *@This()) ?SharedLease {
+        if (shared_barrier) |held| {
+            if (held != self) return null;
+            shared_depth += 1;
+            return .{ .barrier = self, .nested = true };
+        }
         if (!self.tryLockShared()) return null;
+        shared_barrier = self;
+        shared_depth = 1;
         return .{ .barrier = self };
     }
 
@@ -69,6 +95,10 @@ pub const MutationBarrier = struct {
 
     pub fn pendingSharedAcquisitions(self: *const @This()) u64 {
         return self.shared_waiters.load(.acquire);
+    }
+
+    pub fn pendingExclusiveAcquisitions(self: *const @This()) u64 {
+        return self.exclusive_waiters.load(.acquire);
     }
 
     fn lockShared(self: *@This()) void {
@@ -106,6 +136,8 @@ pub const MutationBarrier = struct {
     }
 
     fn lockExclusive(self: *@This()) void {
+        _ = self.exclusive_waiters.fetchAdd(1, .acq_rel);
+        defer _ = self.exclusive_waiters.fetchSub(1, .acq_rel);
         lockAtomic(&self.reader_gate);
         lockAtomic(&self.resource_mutex);
     }

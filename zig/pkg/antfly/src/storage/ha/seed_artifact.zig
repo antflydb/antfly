@@ -658,12 +658,14 @@ pub fn restoreToStaging(alloc: Allocator, store: Store, request: RestoreRequest)
     defer alloc.free(aggregate_hex);
     if (!std.mem.eql(u8, aggregate_hex, receipt.aggregate_sha256)) return error.ArtifactAggregateDigestMismatch;
 
-    const local_receipt = try std.fs.path.join(alloc, &.{ request.staging_root, receipt_name });
-    defer alloc.free(local_receipt);
-    try writeFileAtomically(alloc, local_receipt, receipt_json);
     const local_manifest = try std.fs.path.join(alloc, &.{ request.staging_root, staged_manifest_name });
     defer alloc.free(local_manifest);
     try writeFileAtomically(alloc, local_manifest, manifest_bytes);
+    // The receipt is the completion marker. Publish it only after every file
+    // needed by activation is durable in the staging tree.
+    const local_receipt = try std.fs.path.join(alloc, &.{ request.staging_root, receipt_name });
+    defer alloc.free(local_receipt);
+    try writeFileAtomically(alloc, local_receipt, receipt_json);
     return .{
         .receipt_json = receipt_json,
         .file_count = receipt.files.len,
@@ -679,6 +681,17 @@ pub fn verifyStaged(alloc: Allocator, staging_root: []const u8, expected: Expect
     var parsed = std.json.parseFromSlice(Receipt, alloc, raw, .{}) catch return error.InvalidArtifactReceipt;
     defer parsed.deinit();
     try validateReceipt(parsed.value, expected, limits);
+
+    const manifest_path = try std.fs.path.join(alloc, &.{ staging_root, staged_manifest_name });
+    defer alloc.free(manifest_path);
+    const manifest_bytes = try readFileAlloc(alloc, manifest_path, limits.max_manifest_bytes);
+    defer alloc.free(manifest_bytes);
+    var actual_manifest_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(manifest_bytes, &actual_manifest_digest, .{});
+    var actual_manifest_hex: [Sha256.digest_length * 2]u8 = undefined;
+    encodeHex(&actual_manifest_hex, &actual_manifest_digest);
+    if (!std.mem.eql(u8, &actual_manifest_hex, parsed.value.manifest_sha256))
+        return error.ArtifactManifestDigestMismatch;
 
     var aggregate = Sha256.init(.{});
     // The manifest digest is already bound into the publish receipt. Seed the
@@ -1527,6 +1540,18 @@ test "storage.ha seed artifact publishes last and restores verified staging" {
         .identity = testIdentity(),
         .minimum_checkpoint_lsn = 11,
     }, .{});
+
+    const staged_manifest = try std.fs.path.join(alloc, &.{ staging_root, staged_manifest_name });
+    defer alloc.free(staged_manifest);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().deleteFile(io_impl.io(), staged_manifest);
+    try std.testing.expectError(error.FileNotFound, verifyStaged(alloc, staging_root, .{
+        .generation = "gen-0001",
+        .slot_name = "standby-a",
+        .identity = testIdentity(),
+        .minimum_checkpoint_lsn = 11,
+    }, .{}));
 
     var restored_again = try restoreToStaging(alloc, store, .{
         .expected = .{

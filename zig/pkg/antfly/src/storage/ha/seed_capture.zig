@@ -225,6 +225,7 @@ const Hooks = struct {
     context: ?*anyopaque = null,
     before_exclusive: ?*const fn (?*anyopaque) void = null,
     after_exclusive: ?*const fn (?*anyopaque) void = null,
+    after_checkpoint: ?*const fn (?*anyopaque) void = null,
 };
 
 const CaptureOptions = struct {
@@ -386,6 +387,26 @@ pub fn captureWithExclusiveLease(
     return captureHeld(alloc, request, .{});
 }
 
+/// Capture immutable prepared sources while releasing the runtime's global
+/// mutation/state critical section as soon as the exact backup checkpoint and
+/// durable prepared receipt exist. The callback must release only locks that
+/// protect creation of `request.sources`; those sources must remain immutable
+/// and alive until this function returns.
+pub fn capturePreparedWithExclusiveLease(
+    alloc: Allocator,
+    request: CaptureRequest,
+    lease: *const mutation_barrier.MutationBarrier.ExclusiveLease,
+    context: ?*anyopaque,
+    after_checkpoint: *const fn (?*anyopaque) void,
+) !CaptureResult {
+    try validateRequest(request);
+    if (lease.barrier != request.barrier) return error.WrongCaptureBarrier;
+    return captureHeld(alloc, request, .{ .hooks = .{
+        .context = context,
+        .after_checkpoint = after_checkpoint,
+    } });
+}
+
 fn captureWithOptions(alloc: Allocator, request: CaptureRequest, options: CaptureOptions) !CaptureResult {
     try validateRequest(request);
     if (options.hooks.before_exclusive) |hook| hook(options.hooks.context);
@@ -472,6 +493,7 @@ fn captureHeld(alloc: Allocator, request: CaptureRequest, options: CaptureOption
             try abortIncomplete(alloc, io, request, staging_root, aborted_path, &plan_hex);
             return error.CaptureGenerationAborted;
         }
+        if (options.hooks.after_checkpoint) |hook| hook(options.hooks.context);
         return try finishDurableSnapshot(alloc, io, request, staging_root, generation_root, generations_root, &plan_hex, options);
     }
 
@@ -510,6 +532,8 @@ fn captureHeld(alloc: Allocator, request: CaptureRequest, options: CaptureOption
     const prepared_path = try std.fs.path.join(alloc, &.{ staging_root, prepared_name });
     defer alloc.free(prepared_path);
     _ = try writeImmutableFile(io, alloc, prepared_path, prepared_json, error.CaptureStateConflict);
+
+    if (options.hooks.after_checkpoint) |hook| hook(options.hooks.context);
 
     _ = createSnapshot(alloc, io, request, staging_root, started.backup_lsn, &plan_hex) catch |err| {
         try abortIncomplete(alloc, io, request, staging_root, aborted_path, &plan_hex);
@@ -1389,6 +1413,61 @@ test "storage.ha seed capture waits for in-flight mutation and excludes post-che
     try std.testing.expectEqual(committed_lsn + 1, manifest.checkpoint_lsn);
     try std.testing.expectEqual(manifest.checkpoint_lsn + 1, result.end_record_lsn);
     try std.testing.expectEqual(result.end_record_lsn + 1, post_lsn);
+}
+
+test "storage.ha prepared seed capture releases mutation barrier after checkpoint before copying" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const primary_paths = try testPrimaryPaths(alloc, root, "prepared-release");
+    defer primary_paths.deinit(alloc);
+    const source_root = try std.fs.path.join(alloc, &.{ root, "prepared" });
+    defer alloc.free(source_root);
+    const source_path = try std.fs.path.join(alloc, &.{ source_root, "store.bin" });
+    defer alloc.free(source_path);
+    const capture_root = try std.fs.path.join(alloc, &.{ root, "captures" });
+    defer alloc.free(capture_root);
+    try writeTestFile(source_path, "immutable-prepared-snapshot");
+
+    var primary = try primary_mod.Primary.open(alloc, primary_paths.log, primary_paths.slots, testIdentity(), .{});
+    defer primary.close();
+    var barrier: mutation_barrier.MutationBarrier = .{};
+    var lease = barrier.acquireExclusive();
+    var lease_held = true;
+    defer if (lease_held) lease.release();
+    const Release = struct {
+        lease: *mutation_barrier.MutationBarrier.ExclusiveLease,
+        barrier: *mutation_barrier.MutationBarrier,
+        held: *bool,
+        shared_acquired: *bool,
+
+        fn run(raw: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.lease.release();
+            self.held.* = false;
+            var shared = self.barrier.acquireShared();
+            self.shared_acquired.* = true;
+            shared.release();
+        }
+    };
+    // Keep the barrier pointer separately because releasing invalidates the
+    // lease value by design.
+    const barrier_ptr = &barrier;
+    var shared_acquired = false;
+    var release = Release{ .lease = &lease, .barrier = barrier_ptr, .held = &lease_held, .shared_acquired = &shared_acquired };
+    const sources = [_]Source{.{ .tree = .{ .source_root = source_root, .artifact_prefix = "", .kind = .artifact } }};
+    var captured = try capturePreparedWithExclusiveLease(alloc, .{
+        .primary = &primary,
+        .barrier = barrier_ptr,
+        .slot_name = "standby-a",
+        .generation = "gen-release",
+        .capture_root = capture_root,
+        .sources = &sources,
+    }, &lease, &release, Release.run);
+    defer captured.deinit(alloc);
+    try std.testing.expect(shared_acquired);
 }
 
 test "storage.ha seed capture resumes every durable local crash boundary without duplicate backup end" {

@@ -279,6 +279,9 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	if cluster.Status.HAStatus == nil {
 		return nil
 	}
+	if ha.Runtime == nil {
+		return nil
+	}
 	localNodeID := strings.TrimSpace(ha.Runtime.NodeID)
 	if localNodeID == "" {
 		return nil

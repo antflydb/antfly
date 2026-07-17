@@ -12652,7 +12652,7 @@ func TestReconcileStandaloneStatefulSetStartupGatePrecreatesTargetPVCAndStaysSus
 	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
 	pvc := &corev1.PersistentVolumeClaim{}
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "standby-a-data", Namespace: "default"}, pvc)).To(Succeed())
-	g.Expect(metav1.IsControlledBy(pvc, cluster)).To(BeTrue())
+	g.Expect(metav1.GetControllerOf(pvc)).To(BeNil())
 
 	sts := &appsv1.StatefulSet{}
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, sts)).To(Succeed())
@@ -12666,6 +12666,19 @@ func TestReconcileStandaloneStatefulSetStartupGatePrecreatesTargetPVCAndStaysSus
 		}
 	}
 	g.Expect(storageClaimName).To(Equal("standby-a-data"))
+}
+
+func TestLegacyHARuntimeRequiresAuthMigrationBeforeWorkloadReconcile(t *testing.T) {
+	cluster := startupGatedStandaloneControllerCluster(false)
+	cluster.Spec.HighAvailability.Runtime.AdminTokenEnvVar = ""
+	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef = nil
+	if !haRuntimeNeedsAdminTokenMigration(cluster) {
+		t.Fatal("expected legacy HA runtime without an admin token source to require migration")
+	}
+	cluster.Spec.HighAvailability.Runtime.AdminTokenEnvVar = "ANTFLY_HA_ADMIN_TOKEN"
+	if haRuntimeNeedsAdminTokenMigration(cluster) {
+		t.Fatal("expected authenticated HA runtime not to require migration")
+	}
 }
 
 func TestReconcileStandaloneStatefulSetSuspendPolicyAlwaysHoldsZeroWithoutActivationPVC(t *testing.T) {

@@ -2540,6 +2540,15 @@ func TestValidateUpdate_HighAvailabilityRetryGenerationCannotDecrease(t *testing
 	if err := updated.ValidateUpdate(oldCluster); err != nil {
 		t.Fatalf("expected monotonic retryGeneration recovery bump to be accepted, got: %v", err)
 	}
+
+	updated.Spec.HighAvailability.Admin = nil
+	if err := updated.ValidateUpdate(oldCluster); err == nil || !strings.Contains(err.Error(), "admin.retryGeneration cannot decrease") {
+		t.Fatalf("expected removing admin to preserve the monotonic retryGeneration boundary, got: %v", err)
+	}
+	updated.Spec.HighAvailability = nil
+	if err := updated.ValidateUpdate(oldCluster); err == nil || !strings.Contains(err.Error(), "admin.retryGeneration cannot decrease") {
+		t.Fatalf("expected removing HA to preserve the monotonic retryGeneration boundary, got: %v", err)
+	}
 }
 
 func TestValidateCreate_HighAvailabilityRejectsPaddedAdminURLs(t *testing.T) {

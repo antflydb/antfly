@@ -4325,9 +4325,11 @@ pub const DataServer = struct {
         // Global ordering is non-negotiable: capture excludes every durable
         // mutation before freezing the role pointer that keeps Primary alive.
         var lease = self.ha_mutation_barrier.acquireExclusive();
-        defer lease.release();
+        var lease_held = true;
+        defer if (lease_held) lease.release();
         lockAtomic(&self.ha_state_mutex);
-        defer self.ha_state_mutex.unlock();
+        var state_mutex_held = true;
+        defer if (state_mutex_held) self.ha_state_mutex.unlock();
 
         const ctx = self.ha_cfg.admin_context orelse return error.HASeedCaptureUnavailable;
         if (ctx.standby != null) return error.HASeedCaptureRequiresPrimary;
@@ -4368,7 +4370,31 @@ pub const DataServer = struct {
             .artifact_prefix = "",
             .kind = .artifact,
         } }};
-        var capture = try antfly.ha.seed_capture.captureWithExclusiveLease(alloc, .{
+        const CheckpointRelease = struct {
+            lease: *antfly.db.HAMutationBarrier.ExclusiveLease,
+            lease_held: *bool,
+            state_mutex: *std.atomic.Mutex,
+            state_mutex_held: *bool,
+
+            fn run(raw: ?*anyopaque) void {
+                const release: *@This() = @ptrCast(@alignCast(raw.?));
+                if (release.state_mutex_held.*) {
+                    release.state_mutex.unlock();
+                    release.state_mutex_held.* = false;
+                }
+                if (release.lease_held.*) {
+                    release.lease.release();
+                    release.lease_held.* = false;
+                }
+            }
+        };
+        var checkpoint_release = CheckpointRelease{
+            .lease = &lease,
+            .lease_held = &lease_held,
+            .state_mutex = &self.ha_state_mutex,
+            .state_mutex_held = &state_mutex_held,
+        };
+        var capture = try antfly.ha.seed_capture.capturePreparedWithExclusiveLease(alloc, .{
             .primary = primary,
             .barrier = &self.ha_mutation_barrier,
             .slot_name = slot_name,
@@ -4377,7 +4403,7 @@ pub const DataServer = struct {
             .sources = &sources,
             .binding = binding,
             .pod_uid = self.ha_cfg.pod_uid,
-        }, &lease);
+        }, &lease, &checkpoint_release, CheckpointRelease.run);
         errdefer capture.deinit(alloc);
         return .{
             .capture = capture,

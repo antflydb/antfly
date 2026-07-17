@@ -22,6 +22,7 @@ var catalog_tmp_nonce: std.atomic.Value(u64) = .init(0);
 
 const TestPersistFailureBoundary = enum {
     before_publish,
+    after_publish,
 };
 
 pub const ReplicaBootstrapMode = enum {
@@ -325,13 +326,12 @@ pub const FileReplicaCatalog = struct {
             existing.* = owned;
             var published = false;
             self.persist(&published) catch |err| {
-                if (published) {
-                    previous.deinit(self.alloc);
-                } else {
-                    owned = existing.*;
-                    existing.* = previous;
-                    owned.deinit(self.alloc);
-                }
+                // Even if rename published the new bytes, a directory-sync
+                // failure is not a durable acknowledgement. Restore the live
+                // map so an identical retry persists and syncs again.
+                owned = existing.*;
+                existing.* = previous;
+                owned.deinit(self.alloc);
                 return err;
             };
             previous.deinit(self.alloc);
@@ -344,10 +344,8 @@ pub const FileReplicaCatalog = struct {
         };
         var published = false;
         self.persist(&published) catch |err| {
-            if (!published) {
-                var rejected = self.records.fetchRemove(record.group_id).?.value;
-                rejected.deinit(self.alloc);
-            }
+            var rejected = self.records.fetchRemove(record.group_id).?.value;
+            rejected.deinit(self.alloc);
             return err;
         };
     }
@@ -360,12 +358,7 @@ pub const FileReplicaCatalog = struct {
         const removed = self.records.fetchRemove(group_id) orelse return false;
         var published = false;
         self.persist(&published) catch |err| {
-            if (published) {
-                var committed_removed = removed.value;
-                committed_removed.deinit(self.alloc);
-            } else {
-                self.records.putAssumeCapacity(removed.key, removed.value);
-            }
+            self.records.putAssumeCapacity(removed.key, removed.value);
             return err;
         };
         var committed_removed = removed.value;
@@ -537,6 +530,9 @@ pub const FileReplicaCatalog = struct {
             try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), self.path, self.io());
         temp_exists = false;
         published.* = true;
+
+        if (builtin.is_test and self.test_persist_failure_boundary == .after_publish)
+            return error.TestCatalogPersistAfterPublish;
 
         // Once rename succeeds, the new snapshot is the committed in-process
         // state. Syncing the containing directory makes that name replacement
@@ -725,6 +721,29 @@ test "raft.storage file replica catalog rolls back failed replacement and remova
 
     replica_catalog.test_persist_failure_boundary = null;
     try std.testing.expect(try replica_catalog.catalog().removeReplica(31));
+}
+
+test "raft.storage file replica catalog retries after publish before directory sync" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog-after-publish.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+
+    var replica_catalog = try FileReplicaCatalog.init(std.testing.allocator, path);
+    defer replica_catalog.deinit();
+    replica_catalog.test_persist_failure_boundary = .after_publish;
+    const record = ReplicaRecord{ .group_id = 41, .replica_id = 5, .local_node_id = 7, .metadata_version = 1 };
+    try std.testing.expectError(error.TestCatalogPersistAfterPublish, replica_catalog.catalog().upsertReplica(record));
+    const failed_records = try replica_catalog.catalog().listReplicas(std.testing.allocator);
+    defer freeReplicaRecords(std.testing.allocator, failed_records);
+    try std.testing.expectEqual(@as(usize, 0), failed_records.len);
+
+    replica_catalog.test_persist_failure_boundary = null;
+    try replica_catalog.catalog().upsertReplica(record);
+    const retried_records = try replica_catalog.catalog().listReplicas(std.testing.allocator);
+    defer freeReplicaRecords(std.testing.allocator, retried_records);
+    try std.testing.expectEqual(@as(usize, 1), retried_records.len);
 }
 
 test "file replica catalog persists backup restore bootstrap records across reopen" {

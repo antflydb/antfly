@@ -173,7 +173,13 @@ pub const Watchdog = struct {
         if (!self.authorized_once and !newer_renewal) return .pending_authority;
         if (!self.authorized_once or newer_renewal) {
             self.authorized_once = true;
-            self.local_deadline_ns = monotonic_ns +| self.cfg.grace_ns;
+            // Never manufacture authority past the server-issued Lease
+            // expiry. `realtime_ns` and `monotonic_ns` are sampled only after
+            // the HTTP response has completed, so request latency is already
+            // charged against the remaining Lease lifetime.
+            const lease_expires_ns = renew_ns + duration_ns;
+            const remaining_lease_ns = lease_expires_ns - realtime_ns;
+            self.local_deadline_ns = monotonic_ns +| @min(self.cfg.grace_ns, remaining_lease_ns);
             return .authorized;
         }
         // Re-reading one unchanged cached Lease is not proof that the
@@ -664,6 +670,22 @@ test "kubernetes lease watchdog duplicate renewal cannot extend authority deadli
     try std.testing.expectEqual(first_deadline, watchdog.local_deadline_ns);
     try std.testing.expectEqual(Decision.fence, try watchdog.observe(std.testing.allocator, renewed, realtime, 11 * std.time.ns_per_s));
     try std.testing.expectEqual(FenceReason.api_unreachable, watchdog.fence_reason.?);
+}
+
+test "kubernetes lease watchdog clamps local authority to server lease expiry" {
+    const baseline =
+        \\{"metadata":{"annotations":{"antfly.io/ha-fence-topology-id":"topology-7"}},"spec":{"holderIdentity":"primary-a","leaseDurationSeconds":30,"renewTime":"2026-07-15T12:00:00Z","leaseTransitions":3}}
+    ;
+    const renewed =
+        \\{"metadata":{"annotations":{"antfly.io/ha-fence-topology-id":"topology-7"}},"spec":{"holderIdentity":"primary-a","leaseDurationSeconds":30,"renewTime":"2026-07-15T12:00:01Z","leaseTransitions":3}}
+    ;
+    const observed_after_request = try rfc3339UnixNs("2026-07-15T12:00:29Z");
+    var watchdog = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "primary-a", .data_generation = "initial" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, null);
+    try std.testing.expectEqual(Decision.pending_authority, try watchdog.observe(std.testing.allocator, baseline, observed_after_request, 100));
+    try std.testing.expectEqual(Decision.authorized, try watchdog.observe(std.testing.allocator, renewed, observed_after_request, 200));
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_s + 200), watchdog.local_deadline_ns);
+    try std.testing.expectEqual(Decision.grace, watchdog.noteAPIFailure(2 * std.time.ns_per_s + 199));
+    try std.testing.expectEqual(Decision.fence, watchdog.noteAPIFailure(2 * std.time.ns_per_s + 200));
 }
 
 test "kubernetes lease watchdog rejects older and implausibly future renewals" {
