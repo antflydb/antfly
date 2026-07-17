@@ -20,20 +20,11 @@ import {
 import type { EmbedderProvider } from "@antfly/sdk";
 import { embedderProviders } from "@antfly/sdk";
 import type React from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 import { useFormContext } from "react-hook-form";
-import { useApiConfig } from "@/hooks/use-api-config";
 import { liveModelSuggestions, useConnectedModels } from "@/hooks/use-connections";
 import ChunkingForm from "./ChunkingForm";
 import { Combobox } from "./Combobox";
-
-interface ModelsResponse {
-  chunkers: Record<string, unknown>;
-  rerankers: Record<string, unknown>;
-  ner: Record<string, unknown>;
-  embedders: Record<string, unknown>;
-  generators: Record<string, unknown>;
-}
 
 const staticModelSuggestions: Record<EmbedderProvider, string[]> = {
   antfly: ["all-MiniLM-L6-v2"],
@@ -59,34 +50,10 @@ interface IndexFormProps {
 
 const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = [] }) => {
   const { control, watch } = useFormContext();
-  const { inferenceApiUrl } = useApiConfig();
   const prefix = fieldPrefix ? `${fieldPrefix}.` : "";
 
-  // Antfly inference model detection
-  const [inferenceEmbedders, setInferenceEmbedders] = useState<string[]>([]);
-  const [inferenceModelsLoading, setInferenceModelsLoading] = useState(false);
-
-  useEffect(() => {
-    const fetchInferenceModels = async () => {
-      setInferenceModelsLoading(true);
-      try {
-        const response = await fetch(`${inferenceApiUrl}/ai/v1/models`);
-        if (response.ok) {
-          const data: ModelsResponse = await response.json();
-          setInferenceEmbedders(Object.keys(data.embedders || {}));
-        }
-      } catch {
-        // Antfly inference might not be running - this is fine.
-        console.debug("Antfly inference not available for model detection");
-      } finally {
-        setInferenceModelsLoading(false);
-      }
-    };
-    fetchInferenceModels();
-  }, [inferenceApiUrl]);
-
   // Live model lists per configured provider from /db/v1/connections.
-  const { providers: connectedProviders } = useConnectedModels();
+  const { providers: connectedProviders, loading: inferenceModelsLoading } = useConnectedModels();
   const liveEmbedders = useMemo(
     () => liveModelSuggestions(connectedProviders, "embedder"),
     [connectedProviders]
@@ -95,7 +62,6 @@ const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = 
   const modelSuggestions = useMemo(() => {
     const merged: Record<EmbedderProvider, string[]> = {
       ...staticModelSuggestions,
-      antfly: inferenceEmbedders.length > 0 ? inferenceEmbedders : staticModelSuggestions.antfly,
     };
     // Live provider listings win over static suggestions; unconfigured or
     // failing providers keep their static lists.
@@ -105,7 +71,7 @@ const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = 
       }
     }
     return merged;
-  }, [inferenceEmbedders, liveEmbedders]);
+  }, [liveEmbedders]);
 
   const sourceType = watch(`${prefix}sourceType`, "field");
   const provider = watch(`${prefix}embedder.provider`, "ollama");
@@ -256,7 +222,7 @@ const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = 
             )}
             {provider === "antfly" && !inferenceModelsLoading && (
               <p className="text-xs text-muted-foreground">
-                {inferenceEmbedders.length > 0
+                {(liveEmbedders.antfly?.length ?? 0) > 0
                   ? "Select a model or enter a custom name for Antfly inference to pull."
                   : "Enter a model name (e.g., sentence-transformers/all-MiniLM-L6-v2) for Antfly inference to pull."}
               </p>

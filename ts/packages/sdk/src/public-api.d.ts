@@ -73,6 +73,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/connections/{connection_id}/inference/{operation}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Invoke an Antfly-compatible inference connection */
+        post: operations["invokeInferenceConnection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/secrets": {
         parameters: {
             query?: never;
@@ -12713,6 +12730,66 @@ export interface operations {
                 };
             };
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    invokeInferenceConnection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+                /** @description Requires the connection capability `models.<operation>`. */
+                operation: "embed" | "generate" | "rerank" | "chunk" | "recognize" | "extract" | "rewrite" | "read" | "transcribe";
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Inference provider response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Invalid connection or operation */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized - authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The connection does not declare the capability required by this operation */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Inference provider request failed */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     listSecrets: {

@@ -1,15 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import type { Connection } from "@antfly/sdk";
+import { useMemo } from "react";
 import type {
-  Backend,
   InferenceModel,
   ModelType,
   ModelTypeInfo,
   QuantizationOption,
-  RecognizerCapability,
 } from "@/data/inference-models";
-import { useApiConfig } from "@/hooks/use-api-config";
-
-const FETCH_TIMEOUT = 10000; // 10 seconds
+import { useConnectedModels } from "@/hooks/use-connections";
 
 type InferenceTaskKey =
   | "embedders"
@@ -19,22 +16,8 @@ type InferenceTaskKey =
   | "recognizers"
   | "rewriters"
   | "readers"
-  | "transcribers";
-
-interface InferenceModelInfoResponse {
-  capabilities?: unknown;
-  inputs?: unknown;
-}
-
-type BackendRuntimesResponse = Partial<Record<Backend, unknown>>;
-
-type InferenceModelsResponse = Partial<
-  Record<InferenceTaskKey, Record<string, InferenceModelInfoResponse>>
-> & {
-  object?: unknown;
-  data?: unknown;
-  backends?: BackendRuntimesResponse;
-};
+  | "transcribers"
+  | "other";
 
 const TASK_TO_TYPE: Record<InferenceTaskKey, ModelType> = {
   embedders: "embedder",
@@ -45,6 +28,8 @@ const TASK_TO_TYPE: Record<InferenceTaskKey, ModelType> = {
   rewriters: "rewriter",
   readers: "reader",
   transcribers: "transcriber",
+  // OpenAI-compatible listing APIs generally do not report task metadata.
+  other: "generator",
 };
 
 const MODEL_TYPE_NAMES: Record<ModelType, string> = {
@@ -60,30 +45,6 @@ const MODEL_TYPE_NAMES: Record<ModelType, string> = {
 
 const TASK_KEYS = Object.keys(TASK_TO_TYPE) as InferenceTaskKey[];
 
-function isInferenceModelsResponse(value: unknown): value is InferenceModelsResponse {
-  if (typeof value !== "object" || value === null) return false;
-  return TASK_KEYS.some((task) => {
-    const models = (value as Partial<InferenceModelsResponse>)[task];
-    return typeof models === "object" && models !== null && !Array.isArray(models);
-  });
-}
-
-function stringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value.filter((item): item is string => typeof item === "string");
-}
-
-function isRecognizerCapability(value: string): value is RecognizerCapability {
-  return value === "labels" || value === "zeroshot" || value === "relations" || value === "answers";
-}
-
-const BACKEND_ORDER: Backend[] = ["native", "onnx", "metal", "cuda", "xla", "wasm"];
-
-function enabledBackends(backends: BackendRuntimesResponse | undefined): Backend[] {
-  if (!backends) return [];
-  return BACKEND_ORDER.filter((backend) => backends[backend] === true);
-}
-
 function modelId(type: ModelType, name: string): string {
   return `${type}-${name}`
     .toLowerCase()
@@ -93,15 +54,6 @@ function modelId(type: ModelType, name: string): string {
 
 function isHuggingFaceModelRef(name: string): boolean {
   return name.includes("/") && !name.startsWith("/") && !name.includes("://");
-}
-
-function modelDescription(type: ModelType, name: string, inputs: string[]): string {
-  if (type === "chunker" && name.startsWith("fixed_")) {
-    return "Built-in fixed-size chunker available without downloading a model.";
-  }
-
-  const inputText = inputs.length > 0 ? ` for ${inputs.join(", ")} input` : "";
-  return `Installed ${MODEL_TYPE_NAMES[type]} model reported by Antfly inference${inputText}.`;
 }
 
 // Static model type metadata (not provided by Antfly inference's model list)
@@ -204,163 +156,50 @@ export interface InferenceRegistryState {
   retry: () => void;
 }
 
-// Transform Antfly inference's live /ai/v1/models response into the UI model card format.
-function transformModel(
-  task: InferenceTaskKey,
-  name: string,
-  info: InferenceModelInfoResponse,
-  backends: Backend[]
-): InferenceModel {
-  const type = TASK_TO_TYPE[task];
-  const capabilities = stringArray(info.capabilities).filter(isRecognizerCapability);
-  const inputs = stringArray(info.inputs);
-  const sourceUrl = isHuggingFaceModelRef(name) ? `https://huggingface.co/${name}` : "";
-
-  return {
-    id: modelId(type, name),
-    name,
-    source: name,
-    sourceUrl,
-    type,
-    description: modelDescription(type, name, inputs),
-    capabilities,
-    variants: sourceUrl ? ["f32"] : [],
-    backends,
-    inRegistry: true,
-  };
-}
-
-function transformModels(data: InferenceModelsResponse): InferenceModel[] {
+export function transformConnectionModels(connections: Connection[]): InferenceModel[] {
   const models: InferenceModel[] = [];
   const seen = new Set<string>();
-  const runtimeBackends = enabledBackends(data.backends);
+  for (const connection of connections) {
+    const inference = connection.inference;
+    if (!inference?.models) continue;
+    const connectionName = connection.display_name ?? connection.name;
 
-  for (const task of TASK_KEYS) {
-    const taskModels = data[task];
-    if (!taskModels) continue;
-
-    for (const [name, info] of Object.entries(taskModels)) {
-      const model = transformModel(task, name, info ?? {}, runtimeBackends);
-      if (seen.has(model.id)) continue;
-      seen.add(model.id);
-      models.push(model);
+    for (const task of TASK_KEYS) {
+      const type = TASK_TO_TYPE[task];
+      for (const listed of inference.models[task] ?? []) {
+        const id = modelId(type, `${connection.id}-${listed.name}`);
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const sourceUrl = isHuggingFaceModelRef(listed.name)
+          ? `https://huggingface.co/${listed.name}`
+          : "";
+        models.push({
+          id,
+          name: listed.display_name ?? listed.name,
+          connectionId: connection.id,
+          connectionName,
+          provider: inference.provider,
+          source: listed.name,
+          sourceUrl,
+          type,
+          description: `${MODEL_TYPE_NAMES[type][0]?.toUpperCase()}${MODEL_TYPE_NAMES[type].slice(1)} model available through ${connectionName}.`,
+          variants: [],
+          inRegistry: connection.status === "connected",
+        });
+      }
     }
   }
-
   return models;
 }
 
-// Cache model data while keeping each configured Antfly inference endpoint isolated.
-let modelCache: {
-  key: string;
-  models: InferenceModel[];
-  types: ModelTypeInfo[];
-  quantizationOptions: QuantizationOption[];
-} | null = null;
-
 export function useInferenceRegistry(): InferenceRegistryState {
-  const { inferenceApiUrl } = useApiConfig();
-  const cacheKey = `${inferenceApiUrl}/ai/v1/models`;
-  const cached = modelCache?.key === cacheKey ? modelCache : null;
-  const [models, setModels] = useState<InferenceModel[]>(cached?.models ?? []);
-  const [types, setTypes] = useState<ModelTypeInfo[]>(cached?.types ?? []);
-  const [quantizationOptions, setQuantizationOptions] = useState<QuantizationOption[]>(
-    cached?.quantizationOptions ?? []
-  );
-  const [loading, setLoading] = useState(!cached);
-  const [error, setError] = useState<string | null>(null);
-  const isMountedRef = useRef(true);
-
-  const fetchRegistry = useCallback(
-    async (signal?: AbortSignal) => {
-      setLoading(true);
-      setError(null);
-      const controller = new AbortController();
-      const timeoutId = window.setTimeout(() => {
-        controller.abort(new DOMException("Request timed out", "TimeoutError"));
-      }, FETCH_TIMEOUT);
-      const abortFromParent = () => controller.abort(signal?.reason);
-      signal?.addEventListener("abort", abortFromParent, { once: true });
-
-      try {
-        const response = await fetch(cacheKey, {
-          method: "GET",
-          signal: controller.signal,
-        });
-
-        if (!response.ok) {
-          throw new Error(`Failed to fetch Antfly inference models: ${response.status}`);
-        }
-
-        const data: unknown = await response.json();
-
-        if (!isMountedRef.current) return;
-
-        if (!isInferenceModelsResponse(data)) {
-          throw new Error("Antfly inference model response is missing model groups");
-        }
-
-        const transformedModels = transformModels(data);
-
-        modelCache = {
-          key: cacheKey,
-          models: transformedModels,
-          types: MODEL_TYPES,
-          quantizationOptions: QUANTIZATION_OPTIONS,
-        };
-
-        setModels(transformedModels);
-        setTypes(MODEL_TYPES);
-        setQuantizationOptions(QUANTIZATION_OPTIONS);
-        setLoading(false);
-      } catch (err) {
-        if (signal?.aborted) return;
-        if (!isMountedRef.current) return;
-
-        const message =
-          err instanceof Error ? err.message : "Failed to fetch Antfly inference models";
-        setError(message);
-        setLoading(false);
-      } finally {
-        window.clearTimeout(timeoutId);
-        signal?.removeEventListener("abort", abortFromParent);
-      }
-    },
-    [cacheKey]
-  );
-
-  const retry = useCallback(() => {
-    fetchRegistry();
-  }, [fetchRegistry]);
-
-  // Initial fetch on mount
-  useEffect(() => {
-    isMountedRef.current = true;
-
-    // Skip fetch if we have cached data for this Antfly inference endpoint.
-    if (modelCache?.key === cacheKey) {
-      setModels(modelCache.models);
-      setTypes(modelCache.types);
-      setQuantizationOptions(modelCache.quantizationOptions);
-      setLoading(false);
-      return () => {
-        isMountedRef.current = false;
-      };
-    }
-
-    const controller = new AbortController();
-    fetchRegistry(controller.signal);
-
-    return () => {
-      isMountedRef.current = false;
-      controller.abort();
-    };
-  }, [cacheKey, fetchRegistry]);
+  const { providers, loading, error, retry } = useConnectedModels();
+  const models = useMemo(() => transformConnectionModels(providers), [providers]);
 
   return {
     models,
-    types,
-    quantizationOptions,
+    types: MODEL_TYPES,
+    quantizationOptions: QUANTIZATION_OPTIONS,
     loading,
     error,
     retry,
