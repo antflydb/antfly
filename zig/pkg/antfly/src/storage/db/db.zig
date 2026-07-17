@@ -95,7 +95,7 @@ const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 const mem_backend_mod = @import("../mem_backend.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
-const process_memory_mod = @import("../../platform/process_memory.zig");
+const process_memory_mod = @import("antfly_platform").process_memory;
 const schema_mod = @import("../schema.zig");
 const public_table_schema = @import("../../schema/mod.zig");
 const ttl_mod = @import("../ttl.zig");
@@ -125,6 +125,9 @@ const db_query_graph = @import("query/graph_exec.zig");
 const db_query_projection = @import("query/projection.zig");
 const db_query_result_shape = @import("query/result_shape.zig");
 const db_query_search = @import("query/search_exec.zig");
+const search_mod = @import("../../search/search.zig");
+const index_mod = @import("../../index.zig");
+const introducer_mod = @import("../../introducer.zig");
 const db_query_metrics = @import("query_metrics.zig");
 const ttl_runtime_mod = @import("maintenance/ttl_runtime.zig");
 const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
@@ -137,8 +140,8 @@ const db_split_sim_fixture = @import("db_split_sim_fixture.zig");
 const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
     pub const sim = struct {};
 };
-const platform_clock = @import("../../platform/clock.zig");
-const platform_time = @import("../../platform/time.zig");
+const platform_clock = @import("antfly_platform").clock;
+const platform_time = @import("antfly_platform").time;
 const public_schema_json_key = "\x00\x00__metadata__:schema_json";
 const generated_embed_default_batch_items: usize = 32;
 const generated_embed_default_batch_bytes: usize = 256 * 1024;
@@ -283,6 +286,13 @@ pub const OpenOptions = struct {
     index_backends: db_config.IndexBackendOptions = .{},
     index_base_path: ?[]const u8 = null,
     index_open_parallelism: ?usize = null,
+    /// Authoritative local-provisioning schema to persist after the primary
+    /// store is open but before any configured index is opened or backfilled.
+    /// The caller retains ownership for the duration of `open`. This closes a
+    /// schema-migration ordering hole where an interrupted target-generation
+    /// backfill could resume with the previously persisted (or schema-less)
+    /// mapper before the provisioner got a chance to call `setSchema`.
+    schema_before_index_load: ?schema_mod.TableSchema = null,
     identity_namespace: ?doc_identity.Namespace = null,
     prefer_existing_identity_namespace: bool = false,
     executor: derived_executor_mod.Config = .{},
@@ -629,6 +639,7 @@ const AsyncContext = struct {
     require_graph_resolution_contract: bool = false,
     query_visibility_hook_mutex: std.atomic.Mutex = .unlocked,
     query_visibility_hook: ?QueryVisibilityHook = null,
+    query_visibility_hook_in_flight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
     dense_finish_mutex: std.atomic.Mutex = .unlocked,
@@ -3207,6 +3218,13 @@ pub const DB = struct {
             try db.initAsyncInfrastructure(effective_executor, opts.resource_manager);
             profile.init_async_infrastructure_ns = elapsedSince(init_async_started_ns);
             executor_ready = true;
+            if (opts.schema_before_index_load) |table_schema| {
+                // This option is used by the metadata-authoritative local
+                // provisioner. Persist directly through the core before index
+                // open; no index runtime exists yet and the metadata record is
+                // already the durable authority for this replica projection.
+                try db.core.setSchema(table_schema);
+            }
             const optional_runtimes_initialized = opts.open_mode.allowsOptionalRuntimes() and opts.start_optional_runtimes and !ha_standby_role;
             const optional_runtime_workers_enabled = optional_runtimes_initialized and opts.start_optional_runtime_workers;
             db.optional_runtime_workers_enabled = optional_runtime_workers_enabled;
@@ -3376,6 +3394,7 @@ pub const DB = struct {
             beginDerivedCatchUpSessionAsync,
             finishDerivedCatchUpSessionAsync,
             canAdvanceDerivedToTargetAsync,
+            notifyDerivedAppliedSequenceAdvanced,
             resource_manager,
             self.backend_runtime,
         );
@@ -3385,6 +3404,15 @@ pub const DB = struct {
         lockAtomic(&self.async_context.query_visibility_hook_mutex);
         self.async_context.query_visibility_hook = hook;
         self.async_context.query_visibility_hook_mutex.unlock();
+        if (hook == null) {
+            // A notifier copies the hook before invoking it so the callback may
+            // inspect the DB without holding this mutex. Detachment is also a
+            // teardown barrier: once it returns, no callback can still inspect
+            // optional runtimes or index state that close is about to destroy.
+            while (self.async_context.query_visibility_hook_in_flight.load(.acquire) != 0) {
+                spinOrYield();
+            }
+        }
         if (self.enrichment_runtime) |runtime| {
             runtime.setStatusHook(if (hook == null) null else .{
                 .ptr = self.async_context,
@@ -3398,14 +3426,33 @@ pub const DB = struct {
         notifyQueryVisibilityHook(ctx, .status);
     }
 
-    fn queryVisibilityHook(ctx: *AsyncContext) ?QueryVisibilityHook {
+    fn notifyDerivedAppliedSequenceAdvanced(ptr: *anyopaque, _: []const u8, _: u64) void {
+        const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
+        // The executor invokes this only after publishing its live applied
+        // watermark and releasing its mutex. Status callbacks may therefore
+        // snapshot the executor without deadlocking or observing the previous
+        // sequence at the end of a replay window.
+        notifyQueryVisibilityHook(ctx, .status);
+    }
+
+    fn acquireQueryVisibilityHook(ctx: *AsyncContext) ?QueryVisibilityHook {
         lockAtomic(&ctx.query_visibility_hook_mutex);
         defer ctx.query_visibility_hook_mutex.unlock();
-        return ctx.query_visibility_hook;
+        const hook = ctx.query_visibility_hook orelse return null;
+        _ = ctx.query_visibility_hook_in_flight.fetchAdd(1, .acquire);
+        return hook;
+    }
+
+    fn hasQueryVisibilityHook(ctx: *AsyncContext) bool {
+        lockAtomic(&ctx.query_visibility_hook_mutex);
+        defer ctx.query_visibility_hook_mutex.unlock();
+        return ctx.query_visibility_hook != null;
     }
 
     fn notifyQueryVisibilityHook(ctx: *AsyncContext, change: QueryVisibilityChange) void {
-        if (queryVisibilityHook(ctx)) |hook| hook.notify(change);
+        const hook = acquireQueryVisibilityHook(ctx) orelse return;
+        defer _ = ctx.query_visibility_hook_in_flight.fetchSub(1, .release);
+        hook.notify(change);
     }
 
     const DetachedEnrichmentRuntime = struct {
@@ -3519,7 +3566,7 @@ pub const DB = struct {
         var cfg_owned = true;
         errdefer if (cfg_owned) self.deinitEnrichmentConfig(&owned_cfg);
 
-        const query_visibility_hook = queryVisibilityHook(self.async_context);
+        const query_visibility_hook_present = hasQueryVisibilityHook(self.async_context);
         var detached = try self.createDetachedEnrichmentRuntime(owned_cfg);
         cfg_owned = false;
         errdefer if (detached) |*runtime| runtime.deinit(self.runtime_alloc);
@@ -3528,7 +3575,7 @@ pub const DB = struct {
                 const target_sequence = self.core.nextEnrichmentSequence();
                 if (target_sequence != 0) try runtime.runtime.?.resumeFrom(target_sequence, target_sequence);
             }
-            if (query_visibility_hook != null) {
+            if (query_visibility_hook_present) {
                 runtime.runtime.?.setStatusHook(.{
                     .ptr = self.async_context,
                     .on_change = notifyAsyncContextVisibilityHook,
@@ -3571,7 +3618,7 @@ pub const DB = struct {
             self.enrichment_append_context = owned.append_ctx;
             self.enrichment_runtime = owned.runtime;
         }
-        self.setQueryVisibilityHook(query_visibility_hook);
+        if (!query_visibility_hook_present) self.setQueryVisibilityHook(null);
     }
 
     fn initResolutionRuntime(self: *DB) !void {
@@ -4637,6 +4684,52 @@ pub const DB = struct {
         }
     }
 
+    fn projectedBatchLsmAdmissionBytes(req: types.BatchRequest) u64 {
+        var payload_bytes: u64 = 0;
+        var operations: u64 = 0;
+        for (req.writes) |write| {
+            payload_bytes +|= @intCast(write.key.len);
+            payload_bytes +|= @intCast(write.value.len);
+            operations +|= 1;
+        }
+        for (req.deletes) |key| {
+            payload_bytes +|= @intCast(key.len);
+            operations +|= 1;
+        }
+        for (req.transforms) |transform| {
+            payload_bytes +|= @intCast(transform.key.len);
+            operations +|= 1;
+            for (transform.operations) |operation| {
+                payload_bytes +|= @intCast(operation.path.len);
+                if (operation.value_json) |value| payload_bytes +|= @intCast(value.len);
+                operations +|= 1;
+            }
+        }
+        for (req.graph_writes) |write| {
+            payload_bytes +|= @intCast(write.index_name.len);
+            payload_bytes +|= @intCast(write.source.len);
+            payload_bytes +|= @intCast(write.target.len);
+            payload_bytes +|= @intCast(write.edge_type.len);
+            payload_bytes +|= @intCast(write.metadata_json.len);
+            operations +|= 1;
+        }
+        for (req.graph_deletes) |delete| {
+            payload_bytes +|= @intCast(delete.index_name.len);
+            payload_bytes +|= @intCast(delete.source.len);
+            payload_bytes +|= @intCast(delete.target.len);
+            payload_bytes +|= @intCast(delete.edge_type.len);
+            operations +|= 1;
+        }
+        for (req.predicates) |predicate| payload_bytes +|= @intCast(predicate.key.len);
+
+        // Primary rows are accompanied by internal identity/timestamp/replay
+        // records, allocator capacity, and the memtable hash index. Two times
+        // encoded payload plus a per-operation allowance is deliberately a
+        // conservative preflight; the backend still performs the exact guard
+        // immediately before WAL append.
+        return (payload_bytes *| 2) +| (operations *| 512);
+    }
+
     pub fn drainDocumentArtifactChildRangeOutbox(
         self: *DB,
         dispatcher: DocumentArtifactChildRangeDispatcher,
@@ -4937,6 +5030,15 @@ pub const DB = struct {
         }
 
         try self.executor.failIfUnhealthy();
+
+        // Global LSM throttling must happen before the DB apply lock. Derived
+        // and maintenance workers may need that lock to publish or flush the
+        // state that releases aggregate pressure. The backend commit performs
+        // the final projected check before WAL append, so this non-reserving
+        // preflight is an early wait, not the durability guard.
+        if (self.core.index_manager.resource_manager) |manager| {
+            try manager.awaitAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req));
+        }
 
         lockApply(self);
         var apply_mutex_held = true;
@@ -12786,11 +12888,184 @@ pub const DB = struct {
         try self.core.drainScheduledTextMerges();
     }
 
+    /// Internal search-kernel indexing boundary. Source documents are already
+    /// projected and are published only to the production full-text index.
+    pub fn indexTextKernelDocuments(
+        self: *DB,
+        index_name: []const u8,
+        docs: []const introducer_mod.TextDocument,
+    ) !usize {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        const segment_count = self.core.index_manager.indexTextKernelDocuments(index_name, docs) catch |err| {
+            self.core.unlockApply();
+            return err;
+        };
+        self.core.unlockApply();
+        if (self.text_merge_runtime) |runtime| {
+            runtime.notify();
+            runtime.applyBackpressure();
+        }
+        return segment_count;
+    }
+
     pub fn forceCompactTextIndexes(self: *DB) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.forceCompactTextIndexes();
+    }
+
+    pub fn textIndexLayoutStats(self: *DB, alloc: Allocator, index_name: []const u8) !types.TextIndexLayoutStats {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+
+        const index = self.core.textIndex(index_name) orelse return error.IndexNotFound;
+        const text_snapshot = index.acquireSnapshot();
+        defer text_snapshot.release();
+
+        const segments = try alloc.alloc(types.TextSegmentLayoutStats, text_snapshot.segments.len);
+        errdefer alloc.free(segments);
+        var total_bytes: u64 = 0;
+        for (text_snapshot.segments, 0..) |*segment, i| {
+            const bytes: u64 = @intCast(segment.data.bytes().len);
+            const live_doc_count = segment.liveDocCount();
+            total_bytes +|= bytes;
+            segments[i] = .{
+                .segment_id = segment.id,
+                .doc_count = segment.reader.doc_count,
+                .live_doc_count = live_doc_count,
+                .deleted_count = segment.reader.doc_count -| live_doc_count,
+                .bytes = bytes,
+                .file_backed = segment.data.isFileBacked(),
+            };
+        }
+        return .{
+            .global_doc_count = text_snapshot.global_doc_count,
+            .total_bytes = total_bytes,
+            .segments = segments,
+            .merge_policy = index_manager_mod.defaultTextMergePolicyStats(),
+            .merge_stats = self.core.index_manager.textMergeStatsSnapshotForIndex(index_name),
+        };
+    }
+
+    /// Execute directly against an immutable production text-index snapshot.
+    /// This deliberately bypasses DB query envelopes, MVCC constraint
+    /// derivation, public projection, and stored-document loading. It is an
+    /// internal engineering/benchmark boundary, not a public query API.
+    pub fn searchTextKernel(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        text_query: types.TextQuery,
+        options: types.TextKernelSearchOptions,
+    ) !types.TextKernelResult {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+
+        const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        const text_snapshot = entry.persistent.acquireSnapshot();
+        defer text_snapshot.release();
+
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const query = try db_query_search.textQueryToSearchQuery(
+            arena_state.allocator(),
+            text_query,
+            entry.text_analysis,
+            entry.runtime_schema,
+        );
+        var search_diagnostics = search_mod.SearchDiagnostics{};
+        var result = try search_mod.execute(alloc, text_snapshot, .{
+            .query = query,
+            .k = options.limit,
+            .include_stored = false,
+            .bm25_config = .{ .k1 = options.bm25.k1, .b = options.bm25.b },
+            .diagnostics = if (options.collect_diagnostics) &search_diagnostics else null,
+        });
+        defer result.deinit();
+
+        const hits = try alloc.alloc(types.TextKernelHit, result.hits.len);
+        errdefer alloc.free(hits);
+        for (result.hits, 0..) |hit, i| {
+            hits[i] = .{
+                .doc_ordinal = (try text_snapshot.docOrdinal(hit.doc_id)) orelse return error.MissingTextDocOrdinal,
+                .score = hit.score,
+            };
+        }
+        return .{
+            .hits = hits,
+            .total_hits = result.total_hits,
+            .total_hits_relation = switch (result.total_hits_relation) {
+                .exact => .exact,
+                .gte => .gte,
+            },
+            .diagnostics = .{
+                .segments_considered = search_diagnostics.segments_considered,
+                .segments_searched = search_diagnostics.segments_searched,
+                .segments_pruned = search_diagnostics.segments_pruned,
+                .postings_iterators_opened = search_diagnostics.postings_iterators_opened,
+                .wand_next_in_score = search_diagnostics.wand_next_in_score,
+                .wand_next_in_advance = search_diagnostics.wand_next_in_advance,
+                .wand_pivots_scored = search_diagnostics.wand_pivots_scored,
+                .wand_pivots_advanced = search_diagnostics.wand_pivots_advanced,
+                .wand_chunks_skipped = search_diagnostics.wand_chunks_skipped,
+                .boolean_candidates_scored = search_diagnostics.boolean_candidates_scored,
+                .boolean_chunks_skipped = search_diagnostics.boolean_chunks_skipped,
+                .phrase_candidates_verified = search_diagnostics.phrase_candidates_verified,
+                .phrase_position_records_decoded = search_diagnostics.phrase_position_records_decoded,
+                .phrase_matches_scored = search_diagnostics.phrase_matches_scored,
+            },
+        };
+    }
+
+    /// Inspect the exact BM25 inputs for one term/document pair without
+    /// loading stored source. The ordinal uses Antfly's native one-based
+    /// convention, matching `TextKernelHit.doc_ordinal`.
+    pub fn textKernelTermStats(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        field: []const u8,
+        term: []const u8,
+        doc_ordinal: u32,
+    ) !?index_mod.TextTermStats {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+
+        const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        const text_snapshot = entry.persistent.acquireSnapshot();
+        defer text_snapshot.release();
+        return try text_snapshot.textTermStats(alloc, field, term, doc_ordinal);
+    }
+
+    /// Exact kernel count using the production bitmap/filter implementation,
+    /// without allocating public hits or loading stored documents.
+    pub fn countTextKernel(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        text_query: types.TextQuery,
+    ) !u32 {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+
+        const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        const text_snapshot = entry.persistent.acquireSnapshot();
+        defer text_snapshot.release();
+
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const query = try db_query_search.textQueryToSearchQuery(
+            arena,
+            text_query,
+            entry.text_analysis,
+            entry.runtime_schema,
+        );
+        const filter = try search_mod.searchQueryToFilterArena(arena, query);
+        return std.math.cast(u32, try text_snapshot.countFilter(alloc, filter)) orelse
+            error.CountOverflow;
     }
 
     pub fn bestEffortForceCompactTextIndexes(self: *DB) !void {
@@ -15682,8 +15957,7 @@ pub const DB = struct {
         defer snap.release();
         var terms: u64 = 0;
         for (snap.segments) |*seg| {
-            const layout = seg.layoutStats(true);
-            terms +|= layout.inverted_one_hit_terms +| layout.inverted_postings_terms;
+            terms +|= seg.layoutStats(false).inverted_term_count;
         }
         return terms;
     }
@@ -15834,16 +16108,26 @@ pub const DB = struct {
         return applied_sequence;
     }
 
-    fn projectionStatsTargetSequence(self: *DB, alloc: Allocator, cfg: types.IndexConfig, applied_sequence: u64) !u64 {
+    pub fn managedIndexReplayTargetSequence(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        kind: types.IndexKind,
+        applied_sequence: u64,
+    ) !u64 {
         return try self.probeDerivedReplayTargetSequence(
             alloc,
             self.core.replaySource(),
             .{
-                .name = cfg.name,
-                .kind = cfg.kind,
+                .name = index_name,
+                .kind = kind,
             },
             applied_sequence,
         );
+    }
+
+    fn projectionStatsTargetSequence(self: *DB, alloc: Allocator, cfg: types.IndexConfig, applied_sequence: u64) !u64 {
+        return try self.managedIndexReplayTargetSequence(alloc, cfg.name, cfg.kind, applied_sequence);
     }
 
     fn overlayRuntimeStatusRuntimeOnly(self: *DB, runtime_stats: *types.DBStats) void {
@@ -16224,11 +16508,12 @@ pub const DB = struct {
         defer if (durable_index_repairs) |*state| state.deinit(alloc);
         const async_indexing = self.snapshotAsyncIndexingStats();
         const identity_stats = dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
-        // Coverage is accounted once per primary source document. Derived
-        // artifacts (for example, page chunks) may intentionally outnumber
-        // both source documents and document-identity ordinals, so neither is
-        // an authoritative source total here.
-        const primary_doc_count = try self.scanPrimaryDocCount(self.core.byteRange());
+        // Operational status is polled frequently. Identity metadata is the
+        // normal O(1) source of the live document count; retain the legacy
+        // primary-store scan only as a lazy fallback for an old/incomplete
+        // identity catalog. Coverage remains counted once per primary source
+        // document rather than from derived-artifact totals.
+        var primary_doc_count_fallback: ?u64 = null;
         const repair_summary = try self.artifactRepairSummaryRootSnapshot(alloc);
         const repair_issue_count = repair_summary.count;
         var repair_index_fallback = ArtifactRepairIndexFallbackCounts{ .alloc = alloc };
@@ -16322,10 +16607,15 @@ pub const DB = struct {
                         const sparse_snapshot = entry.index.stats();
                         const sparse_doc_cap = if (identity_stats.live_ordinals > 0)
                             identity_stats.live_ordinals
-                        else if (primary_doc_count > 0)
-                            primary_doc_count
-                        else
-                            visible_doc_count;
+                        else fallback: {
+                            if (primary_doc_count_fallback == null) {
+                                primary_doc_count_fallback = self.scanPrimaryDocCount(self.core.byteRange()) catch 0;
+                            }
+                            break :fallback if (primary_doc_count_fallback.? > 0)
+                                primary_doc_count_fallback.?
+                            else
+                                visible_doc_count;
+                        };
                         item.doc_count = if (entry.chunk_name == null and sparse_doc_cap > 0)
                             @min(sparse_snapshot.doc_count, sparse_doc_cap)
                         else
@@ -16354,8 +16644,16 @@ pub const DB = struct {
             index_count += 1;
         }
 
+        if (primary_doc_count_fallback == null and identity_stats.live_ordinals == 0) {
+            primary_doc_count_fallback = try self.scanPrimaryDocCount(self.core.byteRange());
+        }
+        const source_doc_count = if (identity_stats.live_ordinals > 0)
+            identity_stats.live_ordinals
+        else
+            primary_doc_count_fallback.?;
+
         return .{
-            .source_doc_count = primary_doc_count,
+            .source_doc_count = source_doc_count,
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
             .indexes = index_stats[0..index_count],
@@ -17705,6 +18003,7 @@ pub const DB = struct {
         return try db_query_search.collectExplicitTextStats(alloc, requests, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
+            .load_many_stored = loadStoredSearchDocumentManyCallback,
         });
     }
 
@@ -26956,12 +27255,12 @@ fn noteHAMirrorFailure(mirror: HAAsyncEffectMirror, comptime label: []const u8, 
 }
 
 fn applyDerivedBacklogPressureContext(ctx: *const BatchExecutionContext, sequence: u64, sync_level: types.SyncLevel, sync_targets: ManagedSyncTargets) !void {
-    _ = sync_targets;
-    switch (sync_level) {
-        .propose => return,
-        .write, .enrichments, .full_text, .full_index => {},
-    }
+    if (!syncLevelParticipatesInDerivedBacklogPressure(sync_level)) return;
     const throttle_target = ctx.executor.backlogThrottleTargetSequence() orelse return;
+    if (sync_level == .full_text) {
+        try runDerivedUntilTargetsContext(ctx, sequence, sync_targets.full_text_indexes);
+        return;
+    }
     if (shouldDeferBacklogPressureForExternalDenseBulk(ctx, sync_level)) return;
     runDerivedUntilContext(ctx, throttle_target) catch |err| switch (err) {
         error.WriterLocked, error.ReplayDocumentNotVisible, error.ArtifactRepairRequired => {
@@ -26970,6 +27269,21 @@ fn applyDerivedBacklogPressureContext(ctx: *const BatchExecutionContext, sequenc
         },
         else => return err,
     };
+}
+
+fn syncLevelParticipatesInDerivedBacklogPressure(sync_level: types.SyncLevel) bool {
+    return switch (sync_level) {
+        .propose => false,
+        .write, .enrichments, .full_text, .full_index => true,
+    };
+}
+
+test "durable writes participate in derived backlog admission control" {
+    // `.write` controls visibility/durability, not admission. Once asynchronous
+    // derived payloads cross their memory budget, a normal durable writer must
+    // help the worker catch up instead of admitting an unbounded replay queue.
+    try std.testing.expect(syncLevelParticipatesInDerivedBacklogPressure(.write));
+    try std.testing.expect(!syncLevelParticipatesInDerivedBacklogPressure(.propose));
 }
 
 fn shouldDeferBacklogPressureForExternalDenseBulk(ctx: *const BatchExecutionContext, sync_level: types.SyncLevel) bool {
@@ -33227,6 +33541,28 @@ fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.Deriv
     return true;
 }
 
+fn beginDenseStreamingReplaySessionForAsyncCatchUp(ctx: *AsyncContext, index_ref: index_manager_mod.ManagedIndexRef) !void {
+    var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
+    defer index_apply_guard.unlock();
+    try ctx.index_manager.beginDenseStreamingReplaySessionByName(index_ref.name);
+}
+
+fn finishDenseStreamingReplaySessionForAsyncCatchUp(
+    ctx: *AsyncContext,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    options: backend_types.BulkIngestFinishOptions,
+) !void {
+    var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
+    defer index_apply_guard.unlock();
+    try ctx.index_manager.finishDenseStreamingReplaySessionByNameWithOptions(index_ref.name, options);
+}
+
+fn abortDenseStreamingReplaySessionForAsyncCatchUp(ctx: *AsyncContext, index_ref: index_manager_mod.ManagedIndexRef) void {
+    var index_apply_guard = ctx.index_manager.lockManagedIndexApply(index_ref) catch return;
+    defer index_apply_guard.unlock();
+    ctx.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
+}
+
 fn beginDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) !void {
     if (index_ref.kind != .dense_vector) return;
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
@@ -33234,8 +33570,8 @@ fn beginDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manager
 
     try beginDenseCatchUpSessionTracked(ctx, index_ref.name);
     errdefer finishDenseCatchUpSessionTracked(ctx, index_ref.name);
-    try ctx.index_manager.beginDenseStreamingReplaySessionByName(index_ref.name);
-    errdefer ctx.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
+    try beginDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
+    errdefer abortDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
     _ = ctx.stats.dense_catch_up.begin_calls.fetchAdd(1, .monotonic);
 }
 
@@ -33248,14 +33584,14 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
         var seq_lock = lockAtomicWithBackoffProfiled(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex);
         ctx.applied_sequence_coalescer.removePending(ctx.alloc, index_ref.name);
         seq_lock.unlock();
-        ctx.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
+        abortDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
         finishDenseCatchUpSessionTracked(ctx, index_ref.name);
         return;
     }
     var catch_up_tracked = true;
     errdefer if (catch_up_tracked) finishDenseCatchUpSessionTracked(ctx, index_ref.name);
     var streaming_session_finished = false;
-    errdefer if (!streaming_session_finished) ctx.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
+    errdefer if (!streaming_session_finished) abortDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
     const finish_start_ns = monotonicTimeNs();
     const before_lsm_stats = denseLsmWriteStatsSnapshot(ctx, index_ref.name);
 
@@ -33271,7 +33607,7 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     finish_options.progress_ctx = ctx;
     finish_options.progress_fn = noteDenseBulkFinishProgress;
     const finalize_start_ns = monotonicTimeNs();
-    try ctx.index_manager.finishDenseStreamingReplaySessionByNameWithOptions(index_ref.name, finish_options);
+    try finishDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref, finish_options);
     streaming_session_finished = true;
     const finalize_ns = elapsedSince(finalize_start_ns);
     setDenseCatchUpPhase(ctx, .applied_sequence_flush);
@@ -33311,10 +33647,8 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     }
     finishDenseCatchUpSessionTracked(ctx, index_ref.name);
     catch_up_tracked = false;
-    if (DB.queryVisibilityHook(ctx)) |hook| {
-        if (!published_visibility) hook.notify(.publish_consistent);
-        hook.notify(.publish_blocking);
-    }
+    if (!published_visibility) DB.notifyQueryVisibilityHook(ctx, .publish_consistent);
+    DB.notifyQueryVisibilityHook(ctx, .publish_blocking);
 }
 
 fn storeHasReplayRecordForHintAfter(
@@ -36012,6 +36346,17 @@ test "db evaluates policy-gated algebraic adaptive candidates" {
     try std.testing.expectEqualStrings(progress[0].materialization_id, active_progress.materialization_id);
     try std.testing.expectEqualStrings("backfilling", active_progress.lifecycle);
     try std.testing.expectEqual(progress[0].target_sequence, active_progress.target_sequence);
+}
+
+test "db batch projected admission includes payload and internal record overhead" {
+    const writes = [_]types.BatchWrite{.{ .key = "doc:a", .value = "1234567890" }};
+    const deletes = [_][]const u8{"doc:b"};
+    const estimated = DB.projectedBatchLsmAdmissionBytes(.{
+        .writes = writes[0..],
+        .deletes = deletes[0..],
+    });
+    const payload_bytes = "doc:a".len + "1234567890".len + "doc:b".len;
+    try std.testing.expectEqual(@as(u64, payload_bytes * 2 + 2 * 512), estimated);
 }
 
 test "db open borrows shared backend runtime" {
@@ -55955,6 +56300,60 @@ test "db full-text backfill resumes after interrupted reopen" {
     try std.testing.expectEqual(false, stats.indexes[0].backfill_active);
 }
 
+test "db full-text backfill retires segment fanout at durable batch boundaries" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer {
+            for (writes.items) |item| {
+                alloc.free(@constCast(item.key));
+                alloc.free(@constCast(item.value));
+            }
+            writes.deinit(alloc);
+        }
+        for (0..24) |i| {
+            try writes.append(alloc, .{
+                .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
+                .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"bulk backfill {d}\"}}", .{i}),
+            });
+        }
+        try db.batch(.{ .writes = writes.items });
+        try db.core.index_manager.addAllNoBackfill(db.core.store, &.{.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{\"field\":\"title\"}",
+        }});
+    }
+
+    // Force the pathological pre-fix shape: one published segment per
+    // backfill checkpoint. Production backfill uses much larger byte-bounded
+    // batches, but must also keep even this worst case policy-settled.
+    index_manager_mod.test_text_backfill_batch_size = 1;
+    defer index_manager_mod.test_text_backfill_batch_size = null;
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+
+    const entry = reopened.core.index_manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
+    try std.testing.expect(entry.persistent.snapshot().segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
+
+    var result = try reopened.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .term = .{ .field = "title", .term = "bulk" } },
+        .limit = 32,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 24), result.total_hits);
+}
+
 test "db sparse backfill resumes after interrupted reopen" {
     const alloc = std.testing.allocator;
 
@@ -58791,6 +59190,9 @@ test "db dense repair durably yields and resumes a reopenable building candidate
     var yield_token: u8 = 0;
     const options = types.ArtifactRepairRunOptions{
         .yield_check = .{ .ptr = &yield_token, .is_requested = Yield.requested },
+        // This test covers durable yield/resume checkpoints, not the default
+        // activation pause SLA. Leave enough headroom for contended CI hosts.
+        .max_activation_pause_ms = 5_000,
     };
     var repair_id: u128 = 0;
     var candidate_path: []u8 = undefined;
@@ -63385,6 +63787,10 @@ test "db runUntilIdle drains scheduled text merges after repeated writes" {
 
     try db.runUntilIdle();
 
+    const merge_stats = db.pendingWorkStats().text_merge;
+    try std.testing.expectEqual(@as(u64, 0), merge_stats.pending_indexes);
+    try std.testing.expectEqual(@as(u64, 0), merge_stats.in_flight_merges);
+
     const text_index = db.core.index_manager.textIndex("ft_v1").?;
     try std.testing.expect(text_index.snapshot().segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
 
@@ -63538,6 +63944,80 @@ test "db force compacts text index to searchable merge tier" {
     for (result.hits) |hit| {
         try std.testing.expect(!std.mem.eql(u8, hit.id, "doc:3"));
     }
+}
+
+test "db text kernel search matches projected search without stored bodies" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"type\":\"full_text\",\"analysis_config\":{\"field_analyzers\":{\"text\":\"simple\"}}}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "benchmark:0", .value = "{\"text\":\"alpha beta\"}" },
+            .{ .key = "benchmark:1", .value = "{\"text\":\"alpha gamma\"}" },
+            .{ .key = "benchmark:2", .value = "{\"text\":\"beta gamma\"}" },
+            .{ .key = "benchmark:3", .value = "{\"text\":\"alpha beta gamma\"}" },
+        },
+        .sync_level = .full_text,
+    });
+    try db.forceCompactTextIndexes();
+
+    const should = [_]types.TextQuery{
+        .{ .term = .{ .field = "text", .term = "alpha" } },
+        .{ .term = .{ .field = "text", .term = "beta" } },
+    };
+    const query = types.TextQuery{ .bool_query = .{ .should = &should, .min_should = 1 } };
+
+    var projected = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = query,
+        .limit = 3,
+        .include_stored = false,
+        .include_all_fields = false,
+    });
+    defer projected.deinit();
+    var kernel = try db.searchTextKernel(alloc, "ft_v1", query, .{ .limit = 3 });
+    defer kernel.deinit(alloc);
+    var custom_bm25 = try db.searchTextKernel(alloc, "ft_v1", query, .{
+        .limit = 3,
+        .bm25 = .{ .k1 = 2.0, .b = 0.0 },
+    });
+    defer custom_bm25.deinit(alloc);
+    var profiled = try db.searchTextKernel(alloc, "ft_v1", query, .{
+        .limit = 3,
+        .collect_diagnostics = true,
+    });
+    defer profiled.deinit(alloc);
+
+    try std.testing.expectEqual(projected.hits.len, kernel.hits.len);
+    for (projected.hits, kernel.hits) |projected_hit, kernel_hit| {
+        try std.testing.expectEqual(projected_hit.doc_ordinal.?, kernel_hit.doc_ordinal);
+        try std.testing.expectApproxEqRel(projected_hit.score.?, kernel_hit.score, 0.00001);
+    }
+    try std.testing.expectEqual(kernel.hits.len, custom_bm25.hits.len);
+    try std.testing.expectEqual(kernel.hits[0].doc_ordinal, custom_bm25.hits[0].doc_ordinal);
+    try std.testing.expect(@abs(kernel.hits[0].score - custom_bm25.hits[0].score) > 0.0001);
+    try std.testing.expect(profiled.diagnostics.segments_considered > 0);
+    try std.testing.expect(profiled.diagnostics.postings_iterators_opened > 0);
+    try std.testing.expectEqual(@as(u32, 4), try db.countTextKernel(alloc, "ft_v1", query));
+
+    var layout = try db.textIndexLayoutStats(alloc, "ft_v1");
+    defer layout.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), layout.segments.len);
+    try std.testing.expectEqual(@as(u32, 4), layout.global_doc_count);
+    try std.testing.expectEqual(@as(u32, 4), layout.segments[0].live_doc_count);
+    try std.testing.expect(layout.total_bytes > 0);
+    try std.testing.expectEqual(@as(u32, 10), layout.merge_policy.max_segments_per_tier);
+    try std.testing.expect(layout.merge_policy.max_segment_size > layout.merge_policy.floor_segment_size);
 }
 
 test "db text compaction preserves index sort acceleration" {
@@ -63951,6 +64431,74 @@ test "db text compaction preserves ordinal filters across reopen" {
         try std.testing.expectEqualStrings("doc:8", result.hits[0].id);
         try std.testing.expectEqual(@as(?doc_set.DocOrdinal, expected_ordinal), result.hits[0].doc_ordinal);
     }
+}
+
+test "db provisioning schema is persisted before configured full text indexes open" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    // Persist the target-generation catalog entry while the shard still has
+    // no target schema. This is the state an interrupted migration presents
+    // to the next provisioning open.
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "full_text_index_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+    }
+
+    const schema_json =
+        \\{
+        \\  "version": 1,
+        \\  "default_type": "doc",
+        \\  "enforce_types": true,
+        \\  "document_schemas": {
+        \\    "doc": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "additionalProperties": false,
+        \\        "properties": {
+        \\          "body": {
+        \\            "type": "string",
+        \\            "x-antfly-types": ["text"],
+        \\            "x-antfly-include-in-all": false
+        \\          }
+        \\        },
+        \\        "required": ["body"]
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .schema_before_index_load = runtime_schema,
+    });
+    defer reopened.close();
+
+    const entry = reopened.core.index_manager.textIndexEntry("full_text_index_v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), entry.runtime_schema.?.version);
+    try reopened.batch(.{
+        .writes = &.{.{ .key = "doc:1", .value = "{\"body\":\"alpha beta\"}" }},
+        .sync_level = .full_text,
+    });
+
+    const snapshot = entry.persistent.snapshot();
+    try std.testing.expectEqual(@as(u32, 1), try snapshot.termDocFreq(alloc, "body", "alpha"));
+    try std.testing.expectEqual(@as(u32, 0), try snapshot.termDocFreq(alloc, "body.keyword", "alpha beta"));
+    try std.testing.expectEqual(@as(u32, 0), try snapshot.termDocFreq(alloc, "_all", "alpha"));
 }
 
 test "db best effort force compact leaves text merge debt under pressure" {

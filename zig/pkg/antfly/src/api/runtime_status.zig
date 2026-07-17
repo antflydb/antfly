@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const db_mod = @import("../storage/db/mod.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 
@@ -59,6 +59,10 @@ pub const RuntimeStatusMetadata = struct {
 
 pub const LocalTableRuntimeStatus = struct {
     group_id: u64 = 0,
+    // Internal ordering for concurrent observations of one live DB. This is
+    // deliberately separate from metadata.status_generation, which identifies
+    // externally published store snapshots.
+    cache_observation_generation: u64 = 0,
     metadata: RuntimeStatusMetadata = .{},
     disk_bytes: u64 = 0,
     created_at_millis: u64 = 0,
@@ -73,6 +77,7 @@ pub const LocalTableRuntimeStatus = struct {
     pub fn clone(self: *const @This(), alloc: std.mem.Allocator) !@This() {
         return .{
             .group_id = self.group_id,
+            .cache_observation_generation = self.cache_observation_generation,
             .metadata = self.metadata,
             .disk_bytes = self.disk_bytes,
             .created_at_millis = self.created_at_millis,
@@ -155,6 +160,7 @@ pub const TableRuntimeSummary = struct {
 pub const TableRuntimeSnapshotCache = struct {
     alloc: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
+    next_observation_generation: std.atomic.Value(u64) = .init(1),
     entries: std.ArrayListUnmanaged(TableRuntimeSnapshot) = .empty,
 
     pub fn init(alloc: std.mem.Allocator) @This() {
@@ -193,6 +199,7 @@ pub const TableRuntimeSnapshotCache = struct {
         for (new_entries.items) |*entry| {
             for (entry.statuses.items) |*status| {
                 status.withMetadataDefaults(.background_refresh, now_ns);
+                self.preserveNewerObservedStatusLocked(entry.table_name, status) catch {};
                 self.preserveCachedStatusForSyntheticPlaceholderLocked(entry.table_name, status, now_ns) catch {};
             }
         }
@@ -226,6 +233,7 @@ pub const TableRuntimeSnapshotCache = struct {
         for (new_entries.items) |*entry| {
             for (entry.statuses.items) |*status| {
                 status.withMetadataDefaults(.background_refresh, now_ns);
+                self.preserveNewerObservedStatusLocked(entry.table_name, status) catch {};
                 self.preserveCachedStatusForSyntheticPlaceholderLocked(entry.table_name, status, now_ns) catch {};
             }
         }
@@ -301,6 +309,51 @@ pub const TableRuntimeSnapshotCache = struct {
         try self.upsertGroupStatusInEntries(&self.entries, table_name, status);
     }
 
+    pub fn beginStatusObservation(self: *@This()) u64 {
+        return self.next_observation_generation.fetchAdd(1, .monotonic);
+    }
+
+    pub fn upsertObservedGroupStatus(
+        self: *@This(),
+        table_name: []const u8,
+        status: LocalTableRuntimeStatus,
+        observation_generation: u64,
+    ) !bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.newerObservationAlreadyPublishedLocked(table_name, status.group_id, observation_generation)) return false;
+        var owned = status;
+        owned.cache_observation_generation = observation_generation;
+        owned.withMetadataDefaults(.live_writer_publish, platform_time.monotonicNs());
+        try self.upsertGroupStatusInEntries(&self.entries, table_name, owned);
+        return true;
+    }
+
+    pub fn upsertObservedGroupStatusPreservingMetadata(
+        self: *@This(),
+        table_name: []const u8,
+        status: LocalTableRuntimeStatus,
+        observation_generation: u64,
+    ) !bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.newerObservationAlreadyPublishedLocked(table_name, status.group_id, observation_generation)) return false;
+        var owned = status;
+        owned.cache_observation_generation = observation_generation;
+        try self.upsertGroupStatusInEntries(&self.entries, table_name, owned);
+        return true;
+    }
+
+    fn newerObservationAlreadyPublishedLocked(
+        self: *@This(),
+        table_name: []const u8,
+        group_id: u64,
+        observation_generation: u64,
+    ) bool {
+        const existing = self.findGroupStatusLocked(table_name, group_id) orelse return false;
+        return existing.cache_observation_generation > observation_generation;
+    }
+
     fn upsertGroupStatusLocked(self: *@This(), table_name: []const u8, status: LocalTableRuntimeStatus) !void {
         try self.upsertGroupStatusInEntries(&self.entries, table_name, status);
     }
@@ -358,6 +411,27 @@ pub const TableRuntimeSnapshotCache = struct {
         errdefer merged.deinit(self.alloc);
         status.deinit(self.alloc);
         status.* = merged;
+    }
+
+    fn preserveNewerObservedStatusLocked(
+        self: *@This(),
+        table_name: []const u8,
+        status: *LocalTableRuntimeStatus,
+    ) !void {
+        // A background refresh first snapshots this cache, performs metadata
+        // work without the cache mutex, then replaces the cache wholesale. A
+        // worker can publish a newer live DB observation during that gap. Only
+        // compare non-zero generations: zero denotes an independent remote or
+        // synthetic observation, which must remain free to replace retired
+        // local-writer state.
+        if (status.cache_observation_generation == 0) return;
+        const previous = self.findGroupStatusLocked(table_name, status.group_id) orelse return;
+        if (previous.cache_observation_generation <= status.cache_observation_generation) return;
+
+        var cloned = try previous.clone(self.alloc);
+        errdefer cloned.deinit(self.alloc);
+        status.deinit(self.alloc);
+        status.* = cloned;
     }
 
     fn findGroupStatusLocked(
@@ -1784,6 +1858,65 @@ test "table runtime snapshot cache allows dense visibility decrease with newer a
     try std.testing.expectEqual(@as(u64, 24_999), docs.items[0].stats.indexes[0].doc_count);
     try std.testing.expectEqual(@as(u64, 101), docs.items[0].stats.indexes[0].replay_applied_sequence);
     try std.testing.expectEqual(@as(u64, 101), docs.items[0].stats.indexes[0].replay_target_sequence);
+}
+
+test "table runtime snapshot cache rejects a late stale live observation" {
+    var cache = TableRuntimeSnapshotCache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    const stale_observation = cache.beginStatusObservation();
+    const current_observation = cache.beginStatusObservation();
+
+    const current = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .stats = .{ .doc_count = 12 },
+    };
+    try std.testing.expect(try cache.upsertObservedGroupStatus("docs", current, current_observation));
+
+    const stale = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .stats = .{ .doc_count = 10 },
+    };
+    try std.testing.expect(!try cache.upsertObservedGroupStatus("docs", stale, stale_observation));
+
+    var docs = (try cache.snapshot(std.testing.allocator, "docs")).?;
+    defer docs.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 12), docs.items[0].stats.doc_count);
+    try std.testing.expectEqual(current_observation, docs.items[0].cache_observation_generation);
+}
+
+test "table runtime snapshot cache replacement preserves a newer live observation" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    const stale_observation = cache.beginStatusObservation();
+    const stale = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .stats = .{ .doc_count = 10 },
+    };
+    try std.testing.expect(try cache.upsertObservedGroupStatus("docs", stale, stale_observation));
+
+    // Model a refresh that cloned generation 1, then released the cache lock.
+    const replacement = try alloc.alloc(TableRuntimeSnapshot, 1);
+    replacement[0] = .{
+        .table_name = try alloc.dupe(u8, "docs"),
+        .statuses = .{ .items = try alloc.alloc(LocalTableRuntimeStatus, 1) },
+    };
+    replacement[0].statuses.items[0] = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+
+    const current_observation = cache.beginStatusObservation();
+    const current = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .stats = .{ .doc_count = 12 },
+    };
+    try std.testing.expect(try cache.upsertObservedGroupStatus("docs", current, current_observation));
+
+    cache.replaceOwned(replacement);
+    var docs = (try cache.snapshot(alloc, "docs")).?;
+    defer docs.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 12), docs.items[0].stats.doc_count);
+    try std.testing.expectEqual(current_observation, docs.items[0].cache_observation_generation);
 }
 
 test "cached replay sequence alone is not a runtime fact" {

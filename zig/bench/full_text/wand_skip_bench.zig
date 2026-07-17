@@ -95,6 +95,12 @@ fn buildIndex(
 
 const RunResult = struct {
     elapsed_ns: u64,
+    section_bytes: usize,
+    block_max_bytes: u64,
+    chunk_meta_bytes: u64,
+    skip_bytes: u64,
+    decoded_chunk_meta_heap_bytes: usize,
+    legacy_decoded_chunk_meta_min_bytes: usize,
     next_in_advance: u64,
     next_in_score: u64,
     pivots_advanced: u64,
@@ -134,9 +140,16 @@ fn runScenario(alloc: std.mem.Allocator, sc: Scenario) !RunResult {
     const results = try s.execute();
     const elapsed_ns: u64 = @intCast(platform_time.monotonicNs() - t0);
     defer alloc.free(results.hits);
+    const layout = try reader.detailedLayoutStats();
 
     return .{
         .elapsed_ns = elapsed_ns,
+        .section_bytes = section.len,
+        .block_max_bytes = layout.block_max_bytes,
+        .chunk_meta_bytes = layout.chunk_meta_bytes,
+        .skip_bytes = layout.skip_bytes,
+        .decoded_chunk_meta_heap_bytes = s.decodedChunkMetadataHeapBytes(),
+        .legacy_decoded_chunk_meta_min_bytes = inverted.legacyDecodedChunkMetadataMinBytes(layout.block_max_bytes),
         .next_in_advance = s.next_in_advance,
         .next_in_score = s.next_in_score,
         .pivots_advanced = s.pivots_advanced,
@@ -152,9 +165,11 @@ fn fmtRatio(num: u64, denom: u64) f32 {
 }
 
 pub fn main(init: std.process.Init) !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+    // This is a latency benchmark, so use the same low-overhead allocator as
+    // the other production-oriented full-text benches. DebugAllocator's
+    // bookkeeping otherwise becomes part of the first chunk/collector setup
+    // and can dominate short scorer runs.
+    const alloc = std.heap.c_allocator;
 
     var stdout_buf: [16 * 1024]u8 = undefined;
     var stdout_w = std.Io.File.stdout().writerStreaming(init.io, &stdout_buf);
@@ -163,36 +178,46 @@ pub fn main(init: std.process.Init) !void {
 
     const scenarios = [_]Scenario{
         // Two-term, balanced — both terms in many docs. Pivots advance often.
-        .{ .name = "balanced-2t-100K-k10",  .n_docs = 100_000, .selectivities = &.{ 0.30, 0.30 }, .k = 10,  .seed = 1 },
-        .{ .name = "balanced-2t-100K-k1k",  .n_docs = 100_000, .selectivities = &.{ 0.30, 0.30 }, .k = 1000, .seed = 2 },
+        .{ .name = "balanced-2t-100K-k10", .n_docs = 100_000, .selectivities = &.{ 0.30, 0.30 }, .k = 10, .seed = 1 },
+        .{ .name = "balanced-2t-100K-k1k", .n_docs = 100_000, .selectivities = &.{ 0.30, 0.30 }, .k = 1000, .seed = 2 },
         // Two-term, skewed — one rare, one common. Classic WAND-friendly case.
-        .{ .name = "skewed-2t-100K-k10",    .n_docs = 100_000, .selectivities = &.{ 0.01, 0.50 }, .k = 10,  .seed = 3 },
-        .{ .name = "skewed-2t-100K-k100",   .n_docs = 100_000, .selectivities = &.{ 0.01, 0.50 }, .k = 100, .seed = 4 },
+        .{ .name = "skewed-2t-100K-k10", .n_docs = 100_000, .selectivities = &.{ 0.01, 0.50 }, .k = 10, .seed = 3 },
+        .{ .name = "skewed-2t-100K-k100", .n_docs = 100_000, .selectivities = &.{ 0.01, 0.50 }, .k = 100, .seed = 4 },
         // Three-term mix (typical "pizza near brooklyn" pattern: rare + medium + common).
-        .{ .name = "mixed-3t-100K-k10",     .n_docs = 100_000, .selectivities = &.{ 0.01, 0.10, 0.50 }, .k = 10, .seed = 5 },
+        .{ .name = "mixed-3t-100K-k10", .n_docs = 100_000, .selectivities = &.{ 0.01, 0.10, 0.50 }, .k = 10, .seed = 5 },
         // Large corpus, two-term skewed — where we'd expect chunk skipping to help most.
-        .{ .name = "skewed-2t-1M-k10",      .n_docs = 1_000_000, .selectivities = &.{ 0.005, 0.30 }, .k = 10, .seed = 6 },
+        .{ .name = "skewed-2t-1M-k10", .n_docs = 1_000_000, .selectivities = &.{ 0.005, 0.30 }, .k = 10, .seed = 6 },
         // Small corpus — where the optimization shouldn't matter.
-        .{ .name = "balanced-2t-5K-k10",    .n_docs = 5_000, .selectivities = &.{ 0.30, 0.30 }, .k = 10, .seed = 7 },
+        .{ .name = "balanced-2t-5K-k10", .n_docs = 5_000, .selectivities = &.{ 0.30, 0.30 }, .k = 10, .seed = 7 },
         // Bimodal-norm scenarios. First half of docs have norm=5 (short docs,
         // high TF), second half norm=200 (long, low TF). Once the threshold
         // rises after the first k high-impact docs, low-impact chunks
         // become skippable — this is the workload shape Block-Max chunk
         // skipping is designed for.
-        .{ .name = "skewnorm-2t-100K-k10",  .n_docs = 100_000, .selectivities = &.{ 0.30, 0.30 }, .k = 10,  .seed = 8, .skewed_norms = true },
-        .{ .name = "skewnorm-2t-1M-k10",    .n_docs = 1_000_000, .selectivities = &.{ 0.05, 0.30 }, .k = 10, .seed = 9, .skewed_norms = true },
+        .{ .name = "skewnorm-2t-100K-k10", .n_docs = 100_000, .selectivities = &.{ 0.30, 0.30 }, .k = 10, .seed = 8, .skewed_norms = true },
+        .{ .name = "skewnorm-2t-1M-k10", .n_docs = 1_000_000, .selectivities = &.{ 0.05, 0.30 }, .k = 10, .seed = 9, .skewed_norms = true },
+        // One-term scorers never have a non-pivot advance, so these guard the
+        // post-collection threshold feedback used to skip weak later blocks.
+        .{ .name = "skewnorm-1t-100K-k10", .n_docs = 100_000, .selectivities = &.{0.30}, .k = 10, .seed = 10, .skewed_norms = true },
+        .{ .name = "skewnorm-1t-1M-k10", .n_docs = 1_000_000, .selectivities = &.{0.30}, .k = 10, .seed = 11, .skewed_norms = true },
     };
 
-    try w.print("scenario                       n_docs   k    elapsed_ms  next_in_advance  next_in_score  advance%  pivots_adv  pivots_scored  chunks_skipped  hits\n", .{});
-    try w.print("-----------------------------------------------------------------------------------------------------------------------------------------------------\n", .{});
+    try w.print("scenario                       n_docs   k    elapsed_ms  index_KiB  blockmax_B  chunkmeta_B  skip_B  metaheap_B  v23heap_min_B  next_in_advance  next_in_score  advance%  pivots_adv  pivots_scored  chunks_skipped  hits\n", .{});
+    try w.print("-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n", .{});
     for (scenarios) |sc| {
         const r = try runScenario(alloc, sc);
         const advance_pct = fmtRatio(r.next_in_advance, r.next_in_score) * 100.0;
-        try w.print("{s: <30} {d: >7}  {d: >3}  {d: >10.3}  {d: >15}  {d: >13}  {d: >7.2}%  {d: >10}  {d: >13}  {d: >14}  {d: >4}\n", .{
+        try w.print("{s: <30} {d: >7}  {d: >3}  {d: >10.3}  {d: >9.1}  {d: >10}  {d: >11}  {d: >6}  {d: >10}  {d: >13}  {d: >15}  {d: >13}  {d: >7.2}%  {d: >10}  {d: >13}  {d: >14}  {d: >4}\n", .{
             sc.name,
             sc.n_docs,
             sc.k,
             @as(f64, @floatFromInt(r.elapsed_ns)) / 1_000_000.0,
+            @as(f64, @floatFromInt(r.section_bytes)) / 1024.0,
+            r.block_max_bytes,
+            r.chunk_meta_bytes,
+            r.skip_bytes,
+            r.decoded_chunk_meta_heap_bytes,
+            r.legacy_decoded_chunk_meta_min_bytes,
             r.next_in_advance,
             r.next_in_score,
             advance_pct,

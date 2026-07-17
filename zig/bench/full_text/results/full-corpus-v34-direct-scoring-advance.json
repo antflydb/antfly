@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "status": "accepted_query_only_optimization",
+  "comparison_boundary": "reused_settled_v34_full_corpus_index",
+  "source_index": {
+    "documents": 5032105,
+    "corpus_sha256": "9078d9ea4783ab764fe246046efdc8062692f07afdd7c8749a74ebfe05c51ff4",
+    "wire_version": 34,
+    "segments": 10,
+    "bytes": 3406622680,
+    "prior_cross_engine_correctness": "5_of_5_strict_id_and_score_matches"
+  },
+  "change": {
+    "advance_to": "scan_rejected_doc_ids_directly_and_decode_only_the_selected_scoring_hit",
+    "wand_iteration": "position_free_next_scoring_entry_point_without_positional_branch_or_scratch_touch",
+    "persisted_format_changed": false
+  },
+  "validation": {
+    "focused_search_tests": 50,
+    "focused_search_failures": 0,
+    "focused_search_leaks": 0,
+    "warmup_queries": 1000,
+    "warmup_min_seconds": 1,
+    "latency_repetitions_per_run": 11,
+    "resource_profile_seconds_per_class": 5,
+    "independent_candidate_runs": 2,
+    "work_counters_unchanged": true
+  },
+  "cpu_per_query_ns": {
+    "pre_change_mean": {
+      "term": 94365.5,
+      "union": 320728,
+      "intersection": 277666.5,
+      "phrase": 564416.5
+    },
+    "candidate_runs": {
+      "term": [72694, 72706],
+      "union": [250419, 251000],
+      "intersection": [208656, 208154],
+      "phrase": [545419, 547070]
+    },
+    "candidate_mean": {
+      "term": 72700,
+      "union": 250709.5,
+      "intersection": 208405,
+      "phrase": 546244.5
+    },
+    "change_percent": {
+      "term": -22.9591,
+      "union": -21.8311,
+      "intersection": -24.9441,
+      "phrase": -3.21961
+    }
+  },
+  "latency_median_ns": {
+    "pre_change_mean": {
+      "term": 122854,
+      "union": 334958.5,
+      "intersection": 302479,
+      "phrase": 584042
+    },
+    "candidate_runs": {
+      "term": [82229, 79500],
+      "union": [267125, 272875],
+      "intersection": [235417, 232583],
+      "phrase": [589500, 565458]
+    },
+    "candidate_mean": {
+      "term": 80864.5,
+      "union": 270000,
+      "intersection": 234000,
+      "phrase": 577479
+    },
+    "change_percent": {
+      "term": -34.1784,
+      "union": -19.393,
+      "intersection": -22.6393,
+      "phrase": -1.12372
+    }
+  },
+  "archived_tantivy_reference": {
+    "cpu_per_query_ns": {
+      "term": 40028,
+      "union": 213284,
+      "intersection": 248616,
+      "phrase": 344910
+    },
+    "antfly_to_tantivy_ratio": {
+      "term": 1.81623,
+      "union": 1.17547,
+      "intersection": 0.838261,
+      "phrase": 1.58373
+    }
+  },
+  "decision": {
+    "accepted": true,
+    "reason": "Rejected postings inside advanceTo no longer execute the full scoring-return path. The two independent full-corpus runs are stable, preserve exact results and work counters, and reduce CPU across every query class.",
+    "remaining_priority": "Term and phrase remain above the archived Tantivy CPU reference. Continue from a new native profile; do not assume the pre-change advanceTo profile remains representative."
+  }
+}

@@ -74,7 +74,7 @@ const docstore_mod = @import("../storage/docstore.zig");
 const routes = @import("http_routes.zig");
 const runtime_status = @import("runtime_status.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const platform_sync = @import("antfly_platform").sync;
 const foreign_mod = @import("../foreign/mod.zig");
 const foreign_sources_api = @import("foreign_sources.zig");
@@ -2183,12 +2183,31 @@ pub const ApiHttpServer = struct {
         defer local_statuses.deinit(self.alloc);
 
         var doc_count: u64 = 0;
-        for (local_statuses.items) |item| doc_count +|= item.stats.doc_count;
-        const direct_lsm_status = try self.bestEffortLsmStorageStatus(table_name);
+        var saw_fresh_doc_count = false;
+        for (local_statuses.items) |item| {
+            // Derived visibility may trail a weak-sync primary write. The
+            // runtime snapshot's identity-backed source count is the O(1)
+            // authority for whether the table contains documents; retain the
+            // derived count as a compatibility floor for older/remote status
+            // producers that do not publish source_doc_count yet.
+            doc_count +|= @max(item.stats.source_doc_count, item.stats.doc_count);
+            saw_fresh_doc_count = saw_fresh_doc_count or runtime_status.statusRuntimeFresh(item);
+        }
+        // A nonzero cached count proves the table is non-empty even if the
+        // observation has since gone stale. A zero from an opening/catching-up
+        // placeholder proves nothing: omit this optional status rather than
+        // advertising a populated table as empty during structural work.
+        if (doc_count == 0 and !saw_fresh_doc_count) return null;
         return .{
             .table_name = table_name,
             .empty = doc_count == 0,
-            .lsm = direct_lsm_status orelse liveLsmStorageStatusFromRuntimeStatuses(local_statuses.items),
+            // This endpoint is catalog/status observability and must remain
+            // available while structural maintenance owns the writer. The
+            // runtime-status cache is published from the live DB and already
+            // carries LSM stats; opening a direct read here waits behind schema
+            // backfill and turns a supposedly best-effort field into an
+            // unbounded GET /tables stall.
+            .lsm = liveLsmStorageStatusFromRuntimeStatuses(local_statuses.items),
         };
     }
 
@@ -2207,12 +2226,6 @@ pub const ApiHttpServer = struct {
         }
         if (!saw_lsm_stats) return null;
         return tables_api.lsmStorageStatusFromStats(aggregate);
-    }
-
-    fn bestEffortLsmStorageStatus(self: *ApiHttpServer, table_name: []const u8) !?tables_api.LsmStorageStatus {
-        const source = self.table_reads orelse return null;
-        const stats = (try source.lsmStorageStats(self.alloc, table_name)) orelse return null;
-        return tables_api.lsmStorageStatusFromStats(stats);
     }
 
     fn bestEffortObservedDynamicFieldCapabilitySets(
@@ -4862,13 +4875,27 @@ pub const ApiHttpServer = struct {
                     else => return err,
                 };
                 if (self.table_writes) |table_writes_source| {
+                    var background_reconcile_scheduled = false;
                     if (!local_schema_applied) {
-                        _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
-                            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
-                            else => return write_err,
+                        const scheduled = table_writes_source.requestTableStructuralReconcile(self.alloc, table_name) catch |write_err| {
+                            std.log.err("public schema update structural reconcile enqueue failed table={s} err={s}", .{ table_name, @errorName(write_err) });
+                            return write_err;
                         };
+                        // Embedded/direct DB sources have no reconciliation
+                        // worker and retain their synchronous update contract.
+                        if (scheduled == null) {
+                            _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
+                                error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
+                                else => return write_err,
+                            };
+                        } else {
+                            background_reconcile_scheduled = true;
+                        }
                     }
-                    if (try self.source.runRound()) {
+                    // A provisioned owner has its own structural worker. Do not
+                    // turn an enqueue-only HTTP contract back into synchronous
+                    // work by driving metadata/reconciliation rounds here.
+                    if (!background_reconcile_scheduled and try self.source.runRound()) {
                         _ = try self.source.runRound();
                         _ = try self.source.runRound();
                     }
@@ -6726,7 +6753,7 @@ pub const ApiHttpServer = struct {
             error.InvalidBatchRequest => return error.InvalidBatchRequest,
             error.TableNotFound => return error.NotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
-            error.EnrichmentRetryInProgress => return error.Backpressured,
+            error.EnrichmentRetryInProgress, error.ResourceBudgetExceeded => return error.Backpressured,
             error.DenseRepairBackpressure => return error.DenseRepairBackpressure,
             error.LeaderUnavailable => return error.WriteUnavailable,
             error.HAReadOnlyStandby => return error.HAReadOnlyStandby,
@@ -22616,12 +22643,12 @@ test "api http server table status uses runtime stats without probing storage" {
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqual(@as(u32, 1), reads.status_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 0), reads.scan_calls.load(.monotonic));
-    var parsed = try std.json.parseFromSlice(TableStatusResponse, alloc, resp.body, .{});
+    var parsed = try std.json.parseFromSlice(TableStatusResponse, alloc, resp.body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     try std.testing.expectEqual(@as(?bool, false), parsed.value.storage_status.empty);
 }
 
-test "api http server storage status prefers direct lsm stats over runtime cache" {
+test "api http server storage status does not block on a direct lsm probe" {
     const alloc = std.testing.allocator;
 
     const FakeSource = struct {
@@ -22642,6 +22669,7 @@ test "api http server storage status prefers direct lsm stats over runtime cache
     const FakeReads = struct {
         runtime_status_calls: std.atomic.Value(u32) = .init(0),
         lsm_status_calls: std.atomic.Value(u32) = .init(0),
+        opening: bool = false,
 
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{
@@ -22673,6 +22701,17 @@ test "api http server storage status prefers direct lsm stats over runtime cache
             try std.testing.expectEqualStrings("docs", table_name);
             _ = self.runtime_status_calls.fetchAdd(1, .monotonic);
             const items = try allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+            if (self.opening) {
+                items[0] = .{
+                    .group_id = 7,
+                    .metadata = .{
+                        .source = .startup_catch_up,
+                        .freshness = .opening,
+                    },
+                    .stats = .{},
+                };
+                return .{ .items = items };
+            }
             items[0] = .{
                 .group_id = 7,
                 .stats = .{ .doc_count = 5 },
@@ -22716,13 +22755,18 @@ test "api http server storage status prefers direct lsm stats over runtime cache
 
     const status = (try server.bestEffortSingleTableStorageStatus("docs")).?;
     try std.testing.expectEqual(@as(u32, 1), reads.runtime_status_calls.load(.monotonic));
-    try std.testing.expectEqual(@as(u32, 1), reads.lsm_status_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), reads.lsm_status_calls.load(.monotonic));
     try std.testing.expectEqual(false, status.empty);
-    try std.testing.expectEqual(@as(u64, 9), status.lsm.?.run_count);
-    try std.testing.expectEqual(@as(u64, 4235293264), status.lsm.?.run_bytes);
-    try std.testing.expectEqual(@as(u64, 0), status.lsm.?.obsolete_path_count);
-    try std.testing.expectEqual(@as(u64, 0), status.lsm.?.obsolete_paths_pinned_by_readers);
-    try std.testing.expectEqual(@as(u64, 0), status.lsm.?.maintenance_score);
+    try std.testing.expectEqual(@as(u64, 72), status.lsm.?.run_count);
+    try std.testing.expectEqual(@as(u64, 8246715092), status.lsm.?.run_bytes);
+    try std.testing.expectEqual(@as(u64, 133), status.lsm.?.obsolete_path_count);
+    try std.testing.expectEqual(@as(u64, 133), status.lsm.?.obsolete_paths_pinned_by_readers);
+    try std.testing.expectEqual(@as(u64, 387208), status.lsm.?.maintenance_score);
+
+    reads.opening = true;
+    try std.testing.expect((try server.bestEffortSingleTableStorageStatus("docs")) == null);
+    try std.testing.expectEqual(@as(u32, 2), reads.runtime_status_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), reads.lsm_status_calls.load(.monotonic));
 }
 
 test "api http server serves local index runtime backfill status" {

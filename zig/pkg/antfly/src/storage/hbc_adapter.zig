@@ -42,7 +42,7 @@ const lmdb = if (supports_lmdb) @import("lmdb.zig") else struct {
     pub const Error = error{NotFound};
 };
 const lsm_backend = @import("lsm_backend/mod.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const vec = @import("antfly_vector").vector;
 const proto = @import("antfly_vector").proto;
 const quantizer_mod = @import("antfly_vector").quantizer;

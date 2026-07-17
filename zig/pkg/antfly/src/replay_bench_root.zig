@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-pub const platform_time = @import("platform/time.zig");
+pub const platform_time = @import("antfly_platform").time;
 pub const resource_manager = @import("storage/resource_manager.zig");
 pub const db = struct {
     pub const types = @import("storage/db/types.zig");

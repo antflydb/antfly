@@ -26,9 +26,9 @@ const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
 const data_raft_batch = @import("raft_batch.zig");
-const platform_clock = @import("../platform/clock.zig");
-const process_memory_mod = @import("../platform/process_memory.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_clock = @import("antfly_platform").clock;
+const process_memory_mod = @import("antfly_platform").process_memory;
+const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const raft_engine = @import("raft_engine");
 
@@ -533,9 +533,12 @@ const RaftTableApplyStateMachine = struct {
         self: *RaftTableApplyStateMachine,
         storage: *antfly.public_api.ProvisionedGroupStorage,
     ) void {
-        // Apply/write replay should not populate the shared query-side LSM
-        // block cache. This keeps indexing memory separate from read caching.
-        self.write_cache.lsm_cache = null;
+        // This resident writer is the preferred freshness-sensitive read
+        // owner. Without the shared cache, its first read decodes and retains
+        // a private index for every LSM run, bypassing both the cache bound and
+        // ResourceManager accounting. The shared cache already evicts ingest
+        // and query entries by budget.
+        self.write_cache.lsm_cache = &storage.lsm_cache;
         self.write_cache.hbc_cache = &storage.hbc_cache;
         self.write_cache.resource_manager = &storage.resource_manager;
         self.write_cache.backend_runtime = storage.backend_runtime;
@@ -928,6 +931,11 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_memtables", "gauge", "Cached write LSM immutable memtables waiting to flush", stats.immutable_memtables);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_entries", "gauge", "Cached write LSM immutable memtable entries waiting to flush", stats.immutable_entries);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_bytes", "gauge", "Cached write LSM immutable memtable estimated bytes waiting to flush", stats.immutable_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_retired_immutable_memtables", "gauge", "Flushed LSM immutable generations retained by exact readers", stats.retired_immutable_memtables);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_retired_immutable_entries", "gauge", "Entries in flushed LSM immutable generations retained by exact readers", stats.retired_immutable_entries);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_retired_immutable_bytes", "gauge", "Actual bytes in flushed LSM immutable generations retained by exact readers", stats.retired_immutable_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_pinned_generations", "gauge", "Immutable LSM generations with one or more exact reader pins", stats.immutable_pinned_generations);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_pin_refs", "gauge", "Exact reader references across immutable LSM generations", stats.immutable_pin_refs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_total_runs", "gauge", "Cached write LSM active run count", stats.total_runs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_total_run_bytes", "gauge", "Cached write LSM active run bytes on disk", stats.total_run_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_snapshot_clone_calls_total", "counter", "LSM mutable snapshot clone calls issued by snapshot reads", stats.mutable_snapshot_clone_calls);
@@ -1134,10 +1142,14 @@ fn writeTextMergeMetrics(writer: *std.Io.Writer, stats: antfly.db.types.TextMerg
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_input_bytes_total", "counter", "Source full-text segment bytes consumed by completed merges", stats.merge_input_bytes_total);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_output_segments_total", "counter", "Output full-text segments published by completed merges", stats.merge_output_segments_total);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_output_bytes_total", "counter", "Output full-text segment bytes published by completed merges", stats.merge_output_bytes_total);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_elapsed_ns_total", "counter", "Total elapsed nanoseconds spent building completed full-text merges", stats.merge_elapsed_ns_total);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_peak_task_alloc_bytes", "gauge", "Largest task-local allocation peak observed across completed full-text merges", stats.merge_peak_task_alloc_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_input_segments", "gauge", "Source full-text segments consumed by the last completed merge", stats.last_merge_input_segments);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_input_bytes", "gauge", "Source full-text segment bytes consumed by the last completed merge", stats.last_merge_input_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_output_segments", "gauge", "Output full-text segments published by the last completed merge", stats.last_merge_output_segments);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_output_bytes", "gauge", "Output full-text segment bytes published by the last completed merge", stats.last_merge_output_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_elapsed_ns", "gauge", "Elapsed nanoseconds spent building the last completed full-text merge", stats.last_merge_elapsed_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_peak_task_alloc_bytes", "gauge", "Task-local allocation peak of the last completed full-text merge", stats.last_merge_peak_task_alloc_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_quarantined_merges", "gauge", "Cached write full-text merge candidates currently quarantined after failure", stats.quarantined_merges);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_quarantined_segments", "gauge", "Cached write full-text source segments currently quarantined after failure", stats.quarantined_segments);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_retry_after_ns", "gauge", "Latest monotonic retry-after timestamp for cached write full-text merge work", stats.retry_after_ns);
@@ -1323,6 +1335,7 @@ fn writeResourceMetrics(writer: *std.Io.Writer, manager: *resource_manager_mod.R
     try writeResourceMetricFamily(writer, snapshot, .hard_limit_bytes, "antfly_resource_hard_limit_bytes", "gauge", "Resource slice hard limit in bytes");
     try writeResourceMetricFamily(writer, snapshot, .soft_limit_events, "antfly_resource_soft_limit_events_total", "counter", "Resource slice soft-limit events");
     try writeResourceMetricFamily(writer, snapshot, .hard_limit_rejections, "antfly_resource_hard_limit_rejections_total", "counter", "Resource slice hard-limit rejections");
+    try writeResourceMetricFamily(writer, snapshot, .oversized_single_grants, "antfly_resource_oversized_single_grants_total", "counter", "Resource slice bounded single-operation grants above the normal hard limit");
     try writeResourceMetricFamily(writer, snapshot, .pressure, "antfly_resource_pressure", "gauge", "Resource slice pressure state, 0 normal, 1 soft, 2 hard");
 }
 
@@ -1355,6 +1368,7 @@ const ResourceMetricField = enum {
     hard_limit_bytes,
     soft_limit_events,
     hard_limit_rejections,
+    oversized_single_grants,
     pressure,
 };
 
@@ -1380,6 +1394,7 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.derived_replay_window,
         resource_manager_mod.Slice.full_text_pending_segments,
         resource_manager_mod.Slice.full_text_build_working_set,
+        resource_manager_mod.Slice.full_text_segment_residency,
         resource_manager_mod.Slice.derived_backlog,
         resource_manager_mod.Slice.text_merge_buffers,
         resource_manager_mod.Slice.algebraic_tensor_accumulators,
@@ -1404,6 +1419,7 @@ fn resourceMetricValue(stats: resource_manager_mod.SliceStats, field: ResourceMe
         .hard_limit_bytes => stats.hard_limit_bytes,
         .soft_limit_events => stats.soft_limit_events,
         .hard_limit_rejections => stats.hard_limit_rejections,
+        .oversized_single_grants => stats.oversized_single_grants,
         .pressure => pressureValue(stats.pressure),
     };
 }
@@ -1432,6 +1448,7 @@ fn writeProcessMemoryMetrics(writer: *std.Io.Writer, stats: process_memory_mod.S
     try health_metrics.appendPromMetric(writer, "antfly_process_anonymous_bytes", "gauge", "Process anonymous resident bytes reported by the operating system", stats.anonymous_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_private_dirty_bytes", "gauge", "Process private dirty bytes reported by the operating system", stats.private_dirty_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_footprint_bytes", "gauge", "Process physical footprint bytes reported by the operating system", stats.footprint_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_process_peak_footprint_bytes", "gauge", "Peak process physical footprint bytes reported by the operating system", stats.peak_footprint_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_wired_bytes", "gauge", "Process wired bytes reported by the operating system", stats.wired_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_pageins_total", "counter", "Process page-ins reported by the operating system", stats.pageins);
     try health_metrics.appendPromMetric(writer, "antfly_process_malloc_available", "gauge", "Whether process malloc zone metrics are available on this platform", if (stats.malloc_available) 1 else 0);
@@ -3157,7 +3174,7 @@ pub const DataServer = struct {
             apply_sm.write_source.setLocalIndexRepairDebtHook(self.localIndexRepairDebtHook());
             _ = self.write_source.withLocalWriteOwner(&apply_sm.write_source);
         }
-        self.read_source.primary_lookup_db = self.localPrimaryLookupDbSource();
+        self.read_source.resident_db = self.localResidentDbSource();
         self.write_source.setLocalChangeHook(self.localChangeHook());
         self.write_source.setLocalIndexRepairDebtHook(self.localIndexRepairDebtHook());
         _ = self.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
@@ -4282,28 +4299,28 @@ pub const DataServer = struct {
         };
     }
 
-    fn localPrimaryLookupDbSource(self: *DataServer) antfly.public_api.table_reads.PrimaryLookupDbSource {
+    fn localResidentDbSource(self: *DataServer) antfly.public_api.table_reads.ResidentDbSource {
         return .{
             .ptr = self,
-            .lease_group = localPrimaryLookupDbLeaseGroup,
+            .lease_group = localResidentDbLeaseGroup,
         };
     }
 
-    fn localPrimaryLookupDbLeaseGroup(
+    fn localResidentDbLeaseGroup(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
         group_id: u64,
         lsm_root_generation: u64,
-    ) !?antfly.public_api.table_reads.PrimaryLookupDbLease {
+    ) !?antfly.public_api.table_reads.ResidentDbLease {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.data_raft_apply) |apply_sm| {
-            const apply_source = apply_sm.write_source.primaryLookupDbSource();
+            const apply_source = apply_sm.write_source.residentDbSource();
             if (try apply_source.leaseGroup(alloc, table_name, group_id, lsm_root_generation)) |lease| {
                 return lease;
             }
         }
-        const write_source = self.write_source.primaryLookupDbSource();
+        const write_source = self.write_source.residentDbSource();
         return try write_source.leaseGroup(alloc, table_name, group_id, lsm_root_generation);
     }
 
@@ -12022,9 +12039,13 @@ test "data runtime live writer source follows raft apply ownership" {
 
     var apply_sm = RaftTableApplyStateMachine.init(std.testing.allocator, "/tmp/unused-antfly-live-writer-source", Catalog.iface(), null);
     defer apply_sm.deinit();
+    var storage = antfly.public_api.ProvisionedGroupStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    apply_sm.attachProvisionedStorage(&storage);
     server.data_raft_apply = &apply_sm;
 
     try std.testing.expectEqual(&apply_sm.write_source, server.liveRuntimeWriteSource());
+    try std.testing.expectEqual(&storage.lsm_cache, apply_sm.write_cache.lsm_cache.?);
 }
 
 test "data raft source split lifecycle commands bypass document db apply" {
@@ -17838,6 +17859,7 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     const resource_output = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, resource_output, "# HELP antfly_resource_used_bytes") != null);
     try std.testing.expect(std.mem.indexOf(u8, resource_output, "antfly_resource_used_bytes{slice=\"lsm.block_table_cache\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resource_output, "antfly_resource_used_bytes{slice=\"full_text.segment_residency\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, resource_output, "antfly_resource_pressure{slice=\"text_merge.buffers\"}") != null);
 
     var cache = lsm_backend_mod.Cache.init(std.testing.allocator, 1024 * 1024);

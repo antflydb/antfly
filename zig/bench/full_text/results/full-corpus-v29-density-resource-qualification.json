@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "status": "accepted_with_remaining_density_and_index_rss_gap",
+  "comparison_boundary": "settled_persisted_search_index_only",
+  "corpus": {
+    "documents": 5032105,
+    "normalized_bytes": 8473678432,
+    "sha256": "9078d9ea4783ab764fe246046efdc8062692f07afdd7c8749a74ebfe05c51ff4"
+  },
+  "format": {
+    "wire_version": 29,
+    "accepted_reader_versions": [23, 29],
+    "branch_only_rejected_versions": [24, 25, 26, 27, 28],
+    "postings_per_payload_block": 128,
+    "impact_range_documents": 1024,
+    "position_width_group_documents": 8,
+    "stored_fields": "omitted_for_index_only_kernel_segments",
+    "impact_ids": "adaptive_packed_varint_or_run_encoding",
+    "single_payload_block_impact_ids": "omitted"
+  },
+  "correctness": {
+    "ok": true,
+    "queries": 5,
+    "strict_matches": 5,
+    "tie_aware_matches": 0
+  },
+  "settled_layout": {
+    "segments": 10,
+    "completed_merges": 267,
+    "pending_segments": 0,
+    "in_flight_merges": 0,
+    "failed_merges": 0,
+    "quarantined_merges": 0
+  },
+  "index_size": {
+    "antfly_bytes": 3905870509,
+    "tantivy_bytes": 3251494143,
+    "gap_bytes": 654376366,
+    "antfly_to_tantivy_ratio": 1.2012540503598257,
+    "previous_v29_bytes": 4540994996,
+    "reduction_from_previous_v29_bytes": 635124487,
+    "reduction_from_previous_v29_percent": 13.986460843041193,
+    "v28_bytes": 4088444648,
+    "reduction_from_v28_bytes": 182574139
+  },
+  "antfly_components": {
+    "stored_fields": 50,
+    "inverted": 3885740003,
+    "norms": 5032155,
+    "term_dictionary": 82243313,
+    "bloom": 22544584,
+    "postings": 3775919621,
+    "postings_header": 96633106,
+    "impact_records": 192074486,
+    "impact_range_ids_and_residual": 32355560,
+    "chunk_metadata": 126232145,
+    "doc_frequency_payload": 1176236777,
+    "positions": 2149191067,
+    "skip": 3196480,
+    "ordinals": 20128470,
+    "section_index": 1170,
+    "postings_terms": 11889595,
+    "single_document_postings_terms": 7369973,
+    "document_term_postings": 622897189
+  },
+  "indexing": {
+    "antfly_elapsed_ns": 483883800083,
+    "antfly_cpu_ns": 448073893000,
+    "antfly_peak_rss_bytes": 3922395136,
+    "tantivy_reference_elapsed_ns": 550244512584,
+    "tantivy_reference_peak_rss_bytes": 2810429440,
+    "antfly_to_tantivy_elapsed_ratio": 0.879397775019393,
+    "antfly_to_tantivy_peak_rss_ratio": 1.3956568630308683,
+    "peak_rss_gap_bytes": 1111965696,
+    "merge_input_bytes": 23275650443,
+    "merge_output_bytes": 21771604468
+  },
+  "query_resources": {
+    "minimum_wall_seconds_per_class": 3,
+    "antfly_cpu_per_query_ns": {
+      "term": 103256,
+      "union": 290048,
+      "intersection": 261688,
+      "phrase": 549009
+    },
+    "tantivy_reference_cpu_per_query_ns": {
+      "term": 40028,
+      "union": 213284,
+      "intersection": 248616,
+      "phrase": 344910
+    },
+    "antfly_to_tantivy_cpu_ratio": {
+      "term": 2.579594284001199,
+      "union": 1.3599144802235517,
+      "intersection": 1.05257907777456,
+      "phrase": 1.5917456727842045
+    },
+    "antfly_peak_rss_bytes": 23822336,
+    "tantivy_reference_peak_rss_bytes": 20840448
+  },
+  "rejected_followups": {
+    "unbounded_payload_aligned_impact_bounds": {
+      "index_bytes": 3730205166,
+      "reason": "rejected_selective_query_cpu",
+      "cpu_ratio_to_accepted": {
+        "term": 1.9823,
+        "union": 2.4519,
+        "intersection": 1.6205,
+        "phrase": 0.9282
+      }
+    },
+    "payload_aligned_impact_bounds_through_1024_postings": {
+      "index_bytes": 3813870561,
+      "reason": "rejected_query_cpu_and_peak_index_rss",
+      "peak_rss_bytes": 4466180096,
+      "cpu_ratio_to_accepted": {
+        "term": 1.2613,
+        "union": 1.2414,
+        "intersection": 1.1034,
+        "phrase": 0.9943
+      }
+    },
+    "independent_position_widths": {
+      "tuning_index_bytes": 4697581,
+      "accepted_tuning_index_bytes": 4192666,
+      "reason": "rejected_larger_index_and_phrase_cpu"
+    },
+    "adaptive_shared_or_independent_position_widths": {
+      "tuning_index_bytes": 4192666,
+      "reason": "rejected_zero_size_saving_and_eight_percent_phrase_cpu_regression"
+    }
+  },
+  "decision": {
+    "production_default": "accept_v29_shared_position_widths_and_sparse_high_df_impact_ranges",
+    "remaining_gap": "Postings/index structures remain approximately 487 MB larger than Tantivy and positions approximately 219 MB larger, partly offset by Antfly's smaller dictionary and omitted stored section.",
+    "resource_priority": "Reduce the merge resident set; accepted indexing RSS remains approximately 1.11 GB above the Tantivy reference.",
+    "source_artifact": "/private/tmp/antfly-wiki-full-production-v29-all-density"
+  }
+}

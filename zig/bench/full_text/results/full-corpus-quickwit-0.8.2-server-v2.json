@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "status": "authoritative_existing_comparator_run",
+  "engine": "quickwit-0.8.2",
+  "boundary": "persistent_rest_server_process_durable_mixed_workload",
+  "source_artifact": {
+    "path": "/private/tmp/quickwit-server-full-v2",
+    "manifest_sha256": "2ec8ecc926d7795b89854db203a1c110f81542a6e7ae31534ac3f5c44deb6bec",
+    "summary_sha256": "2ef10c35494a7a0ca1d2c4da4b0a8f82c3c00b06cbbbf6a89cc7e95abe91cbc7",
+    "loads_sha256": "03d181ed6672eb2f6d3f35404cc8abae68463c4468bf04796dfd86beca31f85b",
+    "freshness_sha256": "a9f37b976caa65b95405bed36ffa7afe1654108e94c6adf108f56c53ce135e95",
+    "recovery_sha256": "d7335bed31003cd79513c0cfc9a86ff829dcb493f3ecb75e0c2ea50536c98af4",
+    "requests_sha256": "0ea1b2c64a1dc1d085acbdea0cbac5a78397aee1b80ac708fe4ef9e9a62fc89b"
+  },
+  "corpus": {
+    "documents": 5032105,
+    "load_seconds": 287.204101208,
+    "documents_per_second": 17521.006764299756,
+    "final_commit": "force"
+  },
+  "configuration": {
+    "version": "0.8.2",
+    "index_profile": "store_source_false_body_indexed_with_positions_and_norms_ordinal_stored_fast",
+    "durability_profile": "process-durable",
+    "write_fraction": 0.01,
+    "duration_seconds_per_level": 30,
+    "persistent_http": true,
+    "load_model": "open_loop_scheduled_end_to_end_latency"
+  },
+  "disk_bytes": {
+    "full_data_directory_after_clean_load": 6544097528,
+    "full_data_directory_after_workload": 6544182845,
+    "note": "The full directory includes authoritative splits and a rebuildable indexer split cache. Current post-workload inventory shows approximately 3.138 GB published splits and 3.138 GB duplicate split cache; compare these components separately."
+  },
+  "mixed_loads": [
+    {"concurrency":1,"offered_rps":25,"achieved_rps":25,"errors":0,"p50_ns":13920417,"p95_ns":18525875,"p99_ns":20672875,"max_ns":23976334,"server_cpu_mean_percent":25.4107,"peak_rss_bytes":319501107},
+    {"concurrency":2,"offered_rps":50,"achieved_rps":50,"errors":0,"p50_ns":11422833,"p95_ns":13488417,"p99_ns":15071125,"max_ns":17864000,"server_cpu_mean_percent":40.0947,"peak_rss_bytes":321703116},
+    {"concurrency":4,"offered_rps":100,"achieved_rps":100,"errors":0,"p50_ns":8290041,"p95_ns":9807458,"p99_ns":11971291,"max_ns":14339583,"server_cpu_mean_percent":63.0907,"peak_rss_bytes":322856550},
+    {"concurrency":8,"offered_rps":200,"achieved_rps":199.985405,"errors":0,"p50_ns":7020000,"p95_ns":7978667,"p99_ns":9154250,"max_ns":41963209,"server_cpu_mean_percent":124.564,"peak_rss_bytes":361234432},
+    {"concurrency":16,"offered_rps":400,"achieved_rps":399.923255,"errors":0,"p50_ns":6554291,"p95_ns":7131583,"p99_ns":8050250,"max_ns":55395625,"server_cpu_mean_percent":257.8387,"peak_rss_bytes":383988531},
+    {"concurrency":32,"offered_rps":800,"achieved_rps":799.813548,"errors":0,"p50_ns":6554583,"p95_ns":7920667,"p99_ns":12999458,"max_ns":92449417,"server_cpu_mean_percent":534.1793,"peak_rss_bytes":455711129},
+    {"concurrency":64,"offered_rps":1200,"achieved_rps":1198.511896,"errors":0,"p50_ns":9900959,"p95_ns":53786417,"p99_ns":92330042,"max_ns":142760167,"server_cpu_mean_percent":900.0633,"peak_rss_bytes":627467878}
+  ],
+  "freshness_ns": {
+    "samples": 5,
+    "p50": 60198741333,
+    "p95": 60211451292,
+    "p99": 60211451292
+  },
+  "recovery": {
+    "graceful_ready_seconds": 2.326467291,
+    "graceful_first_search_ns": 34835792,
+    "crash_ready_seconds": 1.306580292,
+    "crash_first_search_ns": 31107208
+  },
+  "decision": {
+    "rerun_quickwit": false,
+    "reason": "This run already covers the full corpus, persistent HTTP, the complete concurrency matrix, mixed writes, freshness, RSS/CPU, disk, and graceful/crash recovery. Repeating it adds no new required dimension."
+  }
+}

@@ -18,9 +18,11 @@ const builtin = @import("builtin");
 pub const Stats = struct {
     available: bool = false,
     resident_bytes: u64 = 0,
+    peak_resident_bytes: u64 = 0,
     anonymous_bytes: u64 = 0,
     private_dirty_bytes: u64 = 0,
     footprint_bytes: u64 = 0,
+    peak_footprint_bytes: u64 = 0,
     wired_bytes: u64 = 0,
     pageins: u64 = 0,
     malloc_available: bool = false,
@@ -66,7 +68,9 @@ pub fn pressureSnapshot() Stats {
     return .{
         .available = true,
         .resident_bytes = info.ri_resident_size,
+        .peak_resident_bytes = processPeakResidentBytes(),
         .footprint_bytes = info.ri_phys_footprint,
+        .peak_footprint_bytes = info.ri_lifetime_max_phys_footprint,
         .wired_bytes = info.ri_wired_size,
         .pageins = info.ri_pageins,
     };
@@ -86,8 +90,22 @@ fn linuxStatusSnapshot() ?Stats {
     return .{
         .available = true,
         .resident_bytes = resident_bytes,
+        .peak_resident_bytes = processPeakResidentBytes(),
         .anonymous_bytes = anonymous_bytes,
         .footprint_bytes = resident_bytes,
+        .peak_footprint_bytes = processPeakResidentBytes(),
+    };
+}
+
+fn processPeakResidentBytes() u64 {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return 0;
+    const usage = std.posix.getrusage(std.posix.rusage.SELF);
+    if (usage.maxrss <= 0) return 0;
+    const maxrss: u64 = @intCast(usage.maxrss);
+    return switch (builtin.os.tag) {
+        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => maxrss,
+        .linux => std.math.mul(u64, maxrss, 1024) catch std.math.maxInt(u64),
+        else => maxrss,
     };
 }
 

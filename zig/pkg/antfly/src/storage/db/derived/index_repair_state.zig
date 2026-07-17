@@ -15,7 +15,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../../common/fs_paths.zig");
 const platform_sync = @import("antfly_platform").sync;
-const platform_time = @import("../../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const types = @import("../types.zig");
 
 const file_name = "index_repair.checkpoint";

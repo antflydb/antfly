@@ -29,7 +29,7 @@ const Allocator = std.mem.Allocator;
 const backend_erased = @import("../storage/backend_erased.zig");
 const backend_types = @import("../storage/backend_types.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const supports_native_sparse_lmdb = builtin.os.tag != .freestanding;
 const lmdb_backend = if (supports_native_sparse_lmdb) @import("../storage/lmdb_backend.zig") else struct {
     pub const Backend = struct {

@@ -16,7 +16,7 @@ const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const fs_paths = @import("fs_paths.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 const c_env = if (builtin.link_libc and builtin.os.tag != .windows) struct {
     extern "c" var environ: [*:null]?[*:0]u8;

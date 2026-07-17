@@ -1,0 +1,5 @@
+{"elapsed_ns": 426583, "engine": "comparator", "operation": "top_k", "query": "V1 PHRASE text alpha beta", "query_index": 4, "repetition": 0, "schema_version": 1}
+{"elapsed_ns": 415625, "engine": "comparator", "operation": "top_k", "query": "V1 PHRASE text alpha beta", "query_index": 4, "repetition": 1, "schema_version": 1}
+{"elapsed_ns": 442708, "engine": "comparator", "operation": "top_k", "query": "V1 PHRASE text alpha beta", "query_index": 4, "repetition": 2, "schema_version": 1}
+{"elapsed_ns": 491042, "engine": "comparator", "operation": "top_k", "query": "V1 PHRASE text alpha beta", "query_index": 4, "repetition": 3, "schema_version": 1}
+{"elapsed_ns": 457250, "engine": "comparator", "operation": "top_k", "query": "V1 PHRASE text alpha beta", "query_index": 4, "repetition": 4, "schema_version": 1}

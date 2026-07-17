@@ -78,6 +78,8 @@ pub const Filter = union(enum) {
 
     /// Execute this filter against a single segment, returning matching doc IDs.
     pub fn execute(self: Filter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
+        seg.beginAccess();
+        defer seg.endAccess();
         return switch (self) {
             .term => |f| f.execute(alloc, seg),
             .bool_filter => |f| f.execute(alloc, seg),
@@ -423,57 +425,61 @@ pub const PhraseFilter = struct {
 
         const candidates = candidate_bm orelse return roaring.RoaringBitmap.init(alloc);
 
-        // Step 2: For each candidate doc, load positions for each term and check adjacency
+        // Step 2: Seek each term iterator in candidate order. Packed position
+        // records for non-candidates are skipped without unpacking their
+        // deltas; positions are decoded only for the current candidate.
+        // This is a true two-phase shape: bitmap conjunction first, positional
+        // verification only while walking the candidate frontier.
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
 
-        // Build position maps: for each term, doc_id → positions
-        var term_positions = try alloc.alloc(std.AutoHashMapUnmanaged(u32, []const u32), self.terms.len);
+        const PhraseTermState = struct {
+            iter: inverted.PostingsIterator,
+            current: ?inverted.PostingsIterator.Hit = null,
+        };
+        var states = try alloc.alloc(PhraseTermState, lookups.items.len);
+        var initialized: usize = 0;
         defer {
-            for (term_positions) |*tp| {
-                var it = tp.valueIterator();
-                while (it.next()) |v| alloc.free(v.*);
-                tp.deinit(alloc);
-            }
-            alloc.free(term_positions);
+            for (states[0..initialized]) |*state| state.iter.deinit();
+            alloc.free(states);
         }
-
         for (lookups.items, 0..) |lr, i| {
-            term_positions[i] = .empty;
-            var post_iter = try lr.iterator(alloc);
-            defer post_iter.deinit();
-            while (try post_iter.next()) |hit| {
-                if (candidates.contains(hit.doc_id)) {
-                    const pos_copy = try alloc.dupe(u32, hit.positions);
-                    try term_positions[i].put(alloc, hit.doc_id, pos_copy);
-                }
-            }
+            states[i] = .{ .iter = try lr.iterator(alloc) };
+            initialized = i + 1;
         }
 
-        // Step 3: Check each candidate for phrase adjacency
+        // Step 3: Align each positional iterator to the candidate and verify
+        // adjacency/slop directly from the iterators' reusable buffers.
         var cand_iter = candidates.iterator();
         while (cand_iter.next()) |doc_id| {
-            if (self.checkPhraseMatch(term_positions, doc_id)) {
-                try result.add(doc_id);
+            var aligned = true;
+            for (states) |*state| {
+                state.current = try state.iter.advanceToWithPositions(doc_id);
+                if (state.current == null or state.current.?.doc_id != doc_id) {
+                    aligned = false;
+                    break;
+                }
             }
+            if (aligned and self.checkPhraseMatchCurrent(states)) try result.add(doc_id);
         }
 
         return result;
     }
 
-    fn checkPhraseMatch(self: PhraseFilter, term_positions: []const std.AutoHashMapUnmanaged(u32, []const u32), doc_id: u32) bool {
-        // Get positions for first term
-        const first_positions = term_positions[0].get(doc_id) orelse return false;
+    fn checkPhraseMatchCurrent(self: PhraseFilter, states: anytype) bool {
+        const first_positions = states[0].current.?.positions;
+        if (first_positions.len == 0) return false;
 
         // For each starting position in term[0], check if subsequent terms
         // appear at position+1, position+2, etc. (within slop)
         for (first_positions) |start_pos| {
             var matched = true;
             for (1..self.terms.len) |ti| {
-                const positions = term_positions[ti].get(doc_id) orelse {
+                const positions = states[ti].current.?.positions;
+                if (positions.len == 0) {
                     matched = false;
                     break;
-                };
+                }
                 const expected: u32 = start_pos + @as(u32, @intCast(ti));
                 if (!positionWithinSlop(positions, expected, self.slop)) {
                     matched = false;
@@ -492,6 +498,10 @@ fn positionWithinSlop(positions: []const u32, expected: u32, slop: u32) bool {
         if (diff <= slop) return true;
     }
     return false;
+}
+
+pub fn positionWithinSlopForScoring(positions: []const u32, expected: u32, slop: u32) bool {
+    return positionWithinSlop(positions, expected, slop);
 }
 
 /// Fuzzy match: finds all terms within Levenshtein edit distance via FST automaton search.
@@ -1602,6 +1612,31 @@ pub fn executeFilter(
     return try alloc.dupe(u32, all_ids.items);
 }
 
+/// Count a filter across all segments without materializing matching document IDs.
+///
+/// The filter implementation still builds its per-segment bitmap, which is also
+/// required for positional and compound-query verification.  Counting consumes
+/// only the bitmap cardinality after applying the live-doc mask, so memory does
+/// not grow with the number of matches across the snapshot.
+pub fn countFilter(
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    filter: Filter,
+) !usize {
+    var total: usize = 0;
+    var doc_offset: u32 = 0;
+    for (snap.segments) |*seg| {
+        var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
+        defer bm.deinit();
+
+        if (seg.shared.deleted) |d| bm.andNotWith(&d);
+        total = std.math.add(usize, total, bm.cardinality()) catch return error.CountOverflow;
+        doc_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch
+            return error.CountOverflow;
+    }
+    return total;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1948,6 +1983,7 @@ test "multi-segment filter execution" {
     try testing.expectEqual(@as(usize, 2), results.len);
     try testing.expectEqual(@as(u32, 0), results[0]);
     try testing.expectEqual(@as(u32, 2), results[1]);
+    try testing.expectEqual(@as(usize, 2), try countFilter(alloc, snap, filter));
 }
 
 test "fuzzy filter finds similar terms" {

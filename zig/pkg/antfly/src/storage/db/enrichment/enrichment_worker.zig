@@ -16,7 +16,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const change_journal_mod = @import("../derived/change_journal.zig");
 const replay_source_mod = @import("../derived/replay_source.zig");
-const platform_time = @import("../../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 pub const PendingDocumentGroup = replay_source_mod.PendingDocumentGroup;
 
 pub fn collectPendingDocumentGroups(

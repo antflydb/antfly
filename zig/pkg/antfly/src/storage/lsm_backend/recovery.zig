@@ -181,6 +181,18 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         defer finishOpenPhase(BackendType, backend, .mounting_runs, phase_start);
         compaction_mod.sortRuns(backend.runs.items);
         if (@hasDecl(BackendType, "registerOpenManifestRunRefs")) try backend.registerOpenManifestRunRefs();
+        if (loaded_manifest and @hasDecl(BackendType, "cleanupOrphanedRunFilesForManifest")) {
+            if (backend.cleanupOrphanedRunFilesForManifest()) |orphan_stats| {
+                if (orphan_stats.cleaned()) {
+                    std.log.warn(
+                        "lsm backend open orphan run cleanup complete root={s} files_deleted={d} bytes_deleted={d}",
+                        .{ backend.root_dir.?, orphan_stats.files_deleted, orphan_stats.bytes_deleted },
+                    );
+                }
+            } else |err| {
+                std.log.warn("lsm backend open skipped orphan run cleanup root={?s} err={}", .{ backend.root_dir, err });
+            }
+        }
     }
     cleanupRecoveredRunFiles(BackendType, backend, "after_mounting_runs", false);
     if (@hasDecl(BackendType, "refreshMaintenanceDebtHint")) {
@@ -243,6 +255,12 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
         }
         backend.retired_immutable_memtables.deinit(backend.allocator);
     }
+    if (@hasField(BackendType, "immutable_memtable_pins")) {
+        backend.immutable_memtable_pins.deinit(backend.allocator);
+    }
+    if (@hasField(BackendType, "mutable_snapshot_pins")) {
+        backend.mutable_snapshot_pins.deinit(backend.allocator);
+    }
     if (@hasField(BackendType, "retired_mutable_snapshots")) {
         for (backend.retired_mutable_snapshots.items) |state| {
             state.deinit(backend.allocator);
@@ -261,6 +279,7 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     }
     for (backend.runs.items) |*run| {
         if (@hasDecl(BackendType, "releaseRunVersionRef")) backend.releaseRunVersionRef(run);
+        if (@hasDecl(BackendType, "forgetRunSnapshotRef")) backend.forgetRunSnapshotRef(run);
         run.deinit(backend.allocator);
     }
     backend.runs.deinit(backend.allocator);
@@ -274,6 +293,7 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
         for (backend.obsolete_runs.items) |*runs| {
             for (runs.items) |*run| {
                 if (@hasDecl(BackendType, "releaseRunVersionRef")) backend.releaseRunVersionRef(run);
+                if (@hasDecl(BackendType, "forgetRunSnapshotRef")) backend.forgetRunSnapshotRef(run);
                 run.deinit(backend.allocator);
             }
             runs.deinit(backend.allocator);

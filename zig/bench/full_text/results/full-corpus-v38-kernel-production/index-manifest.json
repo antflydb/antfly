@@ -1,0 +1,170 @@
+{
+  "schema_version": 1,
+  "result_schema_version": 1,
+  "query_grammar": "V1",
+  "corpus": {
+    "normalization": "trim_ascii_whitespace_drop_blank_append_lf_json_or_plain_text",
+    "sha256": "9078d9ea4783ab764fe246046efdc8062692f07afdd7c8749a74ebfe05c51ff4",
+    "uncompressed_bytes": 8473678432,
+    "input_documents": 5032105,
+    "indexed_documents": 5032105,
+    "rejected_documents": 0,
+    "empty_text_documents": 391079,
+    "truncated_documents": 0,
+    "max_text_bytes": null,
+    "ordinal_assignment": "zero_based_normalized_input_order_u32"
+  },
+  "segment_mode": "production",
+  "indexing_scope": "production_full_text_index_only",
+  "stored_source": "omitted_index_only_ordinal_sidecar",
+  "ingestion_batch_size": 5000,
+  "merge_settlement_interval_documents": 100000,
+  "inverted_wire_version": 38,
+  "postings_layout": "fixed_posting_count_sparse_impacts_contiguous_positions_inline_single_doc_two_column_meta_constant_frequency_five_bit_impact_frequency_vertical_bp128",
+  "postings_chunk_size": 128,
+  "analysis": {
+    "name": "simple",
+    "tokenizer": "unicode_words",
+    "filters": [
+      "ascii_lowercase"
+    ],
+    "stop_words": false,
+    "stemming": false
+  },
+  "bm25": {
+    "k1": 1.2,
+    "b": 0.75
+  },
+  "index_elapsed_ns": 421345216000,
+  "process_cpu_ns": 407516166000,
+  "process_peak_rss_bytes": 1924825088,
+  "layout": {
+    "global_doc_count": 5032105,
+    "total_bytes": 3385816859,
+    "segments": [
+      {
+        "segment_id": 724,
+        "doc_count": 996411,
+        "live_doc_count": 996411,
+        "deleted_count": 0,
+        "bytes": 729058597,
+        "file_backed": true
+      },
+      {
+        "segment_id": 801,
+        "doc_count": 658075,
+        "live_doc_count": 658075,
+        "deleted_count": 0,
+        "bytes": 402112400,
+        "file_backed": true
+      },
+      {
+        "segment_id": 911,
+        "doc_count": 872963,
+        "live_doc_count": 872963,
+        "deleted_count": 0,
+        "bytes": 622644128,
+        "file_backed": true
+      },
+      {
+        "segment_id": 1052,
+        "doc_count": 670463,
+        "live_doc_count": 670463,
+        "deleted_count": 0,
+        "bytes": 505708633,
+        "file_backed": true
+      },
+      {
+        "segment_id": 1226,
+        "doc_count": 528043,
+        "live_doc_count": 528043,
+        "deleted_count": 0,
+        "bytes": 340505184,
+        "file_backed": true
+      },
+      {
+        "segment_id": 1297,
+        "doc_count": 724045,
+        "live_doc_count": 724045,
+        "deleted_count": 0,
+        "bytes": 440493314,
+        "file_backed": true
+      },
+      {
+        "segment_id": 1298,
+        "doc_count": 300000,
+        "live_doc_count": 300000,
+        "deleted_count": 0,
+        "bytes": 176590749,
+        "file_backed": true
+      },
+      {
+        "segment_id": 1321,
+        "doc_count": 100000,
+        "live_doc_count": 100000,
+        "deleted_count": 0,
+        "bytes": 59495840,
+        "file_backed": true
+      },
+      {
+        "segment_id": 1335,
+        "doc_count": 32105,
+        "live_doc_count": 32105,
+        "deleted_count": 0,
+        "bytes": 17490670,
+        "file_backed": true
+      },
+      {
+        "segment_id": 1336,
+        "doc_count": 150000,
+        "live_doc_count": 150000,
+        "deleted_count": 0,
+        "bytes": 91717344,
+        "file_backed": true
+      }
+    ],
+    "merge_policy": {
+      "max_segments_per_tier": 10,
+      "max_merge_at_once": 10,
+      "max_segment_size": 5368709120,
+      "floor_segment_size": 16777216,
+      "skew_weight": 1,
+      "size_weight": 1,
+      "delete_reclaim_weight": 2
+    },
+    "merge_stats": {
+      "enabled": false,
+      "pending_indexes": 0,
+      "pending_segments": 0,
+      "pending_bytes": 0,
+      "pending_heap_bytes": 0,
+      "pending_mmap_bytes": 0,
+      "in_flight_merges": 0,
+      "in_flight_segments": 0,
+      "completed_merges": 267,
+      "skipped_stale_merges": 0,
+      "failed_merges": 0,
+      "merge_input_segments_total": 1326,
+      "merge_input_bytes_total": 17902875053,
+      "merge_output_segments_total": 267,
+      "merge_output_bytes_total": 17263657081,
+      "merge_elapsed_ns_total": 237151042000,
+      "merge_peak_task_alloc_bytes": 0,
+      "last_merge_input_segments": 2,
+      "last_merge_input_bytes": 92412310,
+      "last_merge_output_segments": 1,
+      "last_merge_output_bytes": 91717344,
+      "last_merge_elapsed_ns": 1300020000,
+      "last_merge_peak_task_alloc_bytes": 0,
+      "quarantined_merges": 0,
+      "quarantined_segments": 0,
+      "last_merge_error": "",
+      "retry_after_ns": 0,
+      "deferred_for_pressure": 0,
+      "backpressure_events": 0,
+      "backpressure_ns": 0,
+      "max_pending_segments": 0,
+      "max_pending_bytes": 0
+    }
+  }
+}

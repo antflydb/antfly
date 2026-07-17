@@ -20,7 +20,7 @@ const managed_embedder = @import("../inference/managed_embedder.zig");
 const query_embedding_cache = @import("../inference/query_embedding_cache.zig");
 const cache_budget = @import("../common/cache_budget.zig");
 const common_secrets = @import("../common/secrets.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const scraping = @import("antfly_scraping");
 const db_mod = @import("../storage/db/mod.zig");
 

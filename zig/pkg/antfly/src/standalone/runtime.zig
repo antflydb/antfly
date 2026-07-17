@@ -21,7 +21,7 @@ const inference = @import("inference_server");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
 const fs_paths = @import("../common/fs_paths.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 
 const AntflyApiHandler = antfly.public_api.httpx_handler.AntflyApiHandler;

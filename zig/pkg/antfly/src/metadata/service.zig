@@ -30,9 +30,9 @@ const metadata_store_observer = @import("store_observer.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
 const metadata_storage = @import("storage/mod.zig");
-const platform_clock = @import("../platform/clock.zig");
-const process_memory_mod = @import("../platform/process_memory.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_clock = @import("antfly_platform").clock;
+const process_memory_mod = @import("antfly_platform").process_memory;
+const platform_time = @import("antfly_platform").time;
 const raft_reconciler = @import("../raft/reconciler.zig");
 const transition_state = @import("transition_state.zig");
 const raft_catalog = @import("../raft/catalog.zig");
@@ -1512,7 +1512,12 @@ pub const MetadataService = struct {
 
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForLifecycleRound();
         if (shouldRefreshLocalStoreStatusForLifecycleRound(self, backfill_markers)) {
-            self.refreshLocalStoreStatusWithBackfillMarkers(backfill_markers, false) catch |err| switch (err) {
+            // Lifecycle rounds run while schema provisioning can own the
+            // shard DB for minutes. Use the registered data-runtime provider
+            // here too: bypassing it cold-opened the complete DB once per
+            // lifecycle tick, including every full-text segment, while the
+            // authoritative writer was already rebuilding the next schema.
+            self.refreshLocalStoreStatusWithBackfillMarkers(backfill_markers, true) catch |err| switch (err) {
                 error.UnknownGroup, error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
                 else => return err,
             };
@@ -2025,26 +2030,44 @@ pub const MetadataService = struct {
         defer self.freeProjectedTables(self.alloc, tables);
         const ranges = try self.listProjectedRanges(self.alloc);
         defer self.freeProjectedRanges(self.alloc, ranges);
-        const backend_runtime = try self.ensureBackendRuntime();
-        var fallback_shard_db = metadata_mod.FallbackLocalShardDbAdapter{
-            .replica_root_dir = replica_root_dir,
-            .backend_runtime = backend_runtime,
-        };
-        const shard_db = self.local_shard_db_adapter orelse fallback_shard_db.adapter();
-        const local_progress = try metadata_table_provisioner.collectLocalSchemaProgressWithOptions(
+        const stores = try self.listProjectedStores(self.alloc);
+        defer self.freeProjectedStores(self.alloc, stores);
+        var local_progress = try metadata_table_provisioner.collectLocalSchemaProgressFromRuntime(
             self.alloc,
-            replica_root_dir,
-            self.metadata_group_id,
+            local_node_id,
+            tables,
+            ranges,
+            stores,
+        );
+        defer self.alloc.free(local_progress);
+        if (local_progress.len == 0 and !metadata_table_provisioner.localSchemaRuntimeCoverageComplete(
             local_node_id,
             group_ids,
             tables,
             ranges,
-            .{
+            stores,
+        )) {
+            self.alloc.free(local_progress);
+            const backend_runtime = try self.ensureBackendRuntime();
+            var fallback_shard_db = metadata_mod.FallbackLocalShardDbAdapter{
+                .replica_root_dir = replica_root_dir,
                 .backend_runtime = backend_runtime,
-                .shard_db_adapter = shard_db,
-            },
-        );
-        defer self.alloc.free(local_progress);
+            };
+            const shard_db = self.local_shard_db_adapter orelse fallback_shard_db.adapter();
+            local_progress = try metadata_table_provisioner.collectLocalSchemaProgressWithOptions(
+                self.alloc,
+                replica_root_dir,
+                self.metadata_group_id,
+                local_node_id,
+                group_ids,
+                tables,
+                ranges,
+                .{
+                    .backend_runtime = backend_runtime,
+                    .shard_db_adapter = shard_db,
+                },
+            );
+        }
         const projected_progress = try self.listProjectedSchemaProgress(self.alloc);
         defer self.freeProjectedSchemaProgress(self.alloc, projected_progress);
         try syncLocalSchemaProgress(self, local_node_id, local_progress, projected_progress);
@@ -2188,6 +2211,7 @@ pub const MetadataService = struct {
             error.ReplicationExactCutoverRequired,
             error.InvalidReplicationSourceConfig,
             error.InvalidReplicationSourceRow,
+            error.LibpqUnavailable,
             error.ForeignAuthFailed,
             error.ForeignConnectionFailed,
             error.ForeignQueryFailed,
@@ -2235,6 +2259,7 @@ pub const MetadataService = struct {
             error.ReplicationExactCutoverRequired,
             error.InvalidReplicationSourceConfig,
             error.InvalidReplicationSourceRow,
+            error.LibpqUnavailable,
             error.ForeignAuthFailed,
             error.ForeignConnectionFailed,
             error.ForeignQueryFailed,
@@ -2871,7 +2896,10 @@ pub const MetadataHttpService = struct {
 
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForLifecycleRound();
         if (shouldRefreshLocalStoreStatusForLifecycleRound(self, backfill_markers)) {
-            self.refreshLocalStoreStatusWithBackfillMarkers(backfill_markers, false) catch |err| switch (err) {
+            // Keep lifecycle status observational. The provider returns its
+            // published/runtime cache immediately and refreshes cold state in
+            // the background; it must not be bypassed during long migrations.
+            self.refreshLocalStoreStatusWithBackfillMarkers(backfill_markers, true) catch |err| switch (err) {
                 error.UnknownGroup, error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
                 else => return err,
             };
@@ -3848,7 +3876,13 @@ pub const MetadataHttpService = struct {
             inputs.stores,
         );
         defer self.alloc.free(local_progress);
-        if (local_progress.len == 0) {
+        if (local_progress.len == 0 and !metadata_table_provisioner.localSchemaRuntimeCoverageComplete(
+            local_node_id,
+            group_ids,
+            inputs.tables,
+            inputs.ranges,
+            inputs.stores,
+        )) {
             self.alloc.free(local_progress);
             const backend_runtime = try self.ensureBackendRuntime();
             var fallback_shard_db = metadata_mod.FallbackLocalShardDbAdapter{
@@ -4034,6 +4068,7 @@ pub const MetadataHttpService = struct {
             error.ReplicationExactCutoverRequired,
             error.InvalidReplicationSourceConfig,
             error.InvalidReplicationSourceRow,
+            error.LibpqUnavailable,
             error.ForeignAuthFailed,
             error.ForeignConnectionFailed,
             error.ForeignQueryFailed,
@@ -4084,6 +4119,7 @@ pub const MetadataHttpService = struct {
             error.ReplicationExactCutoverRequired,
             error.InvalidReplicationSourceConfig,
             error.InvalidReplicationSourceRow,
+            error.LibpqUnavailable,
             error.ForeignAuthFailed,
             error.ForeignConnectionFailed,
             error.ForeignQueryFailed,
@@ -4758,7 +4794,11 @@ fn collectLocalGroupStatusReport(
     _ = stores;
     _ = merged_group_statuses;
     var db = try db_mod.DB.open(alloc, db_path, .{
-        .open_mode = .query_readonly,
+        // This path is only a fallback when no local data-runtime provider is
+        // installed. Group status needs primary identity count and filesystem
+        // size, never query execution. Catalog-only mode avoids mmap/open of
+        // every derived segment and cannot race a live index generation.
+        .open_mode = .status_only,
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .transaction_recovery = .{ .enabled = false },
@@ -8275,6 +8315,28 @@ test "metadata service lifecycle round uses cached backfill markers" {
         }
     };
 
+    const ProviderCapture = struct {
+        calls: usize = 0,
+
+        fn collect(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            _: []const u8,
+            _: []const metadata_table_manager.TableRecord,
+            _: []const metadata_table_manager.RangeRecord,
+            _: []const metadata_table_manager.StoreRecord,
+            _: []const metadata_reconciler.MergedGroupStatus,
+            _: []const transition_state.SplitTransitionRecord,
+            _: []const transition_state.MergeTransitionRecord,
+            _: []const transition_state.SplitObservationRecord,
+            _: []const transition_state.MergeObservationRecord,
+        ) ![]metadata_table_manager.GroupStatusReport {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return try alloc.alloc(metadata_table_manager.GroupStatusReport, 0);
+        }
+    };
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
@@ -8303,6 +8365,11 @@ test "metadata service lifecycle round uses cached backfill markers" {
         },
     }, .{});
     defer svc.deinit();
+    var provider_capture = ProviderCapture{};
+    svc.setLocalGroupStatusProvider(.{
+        .ptr = &provider_capture,
+        .vtable = &.{ .collect = ProviderCapture.collect },
+    });
 
     _ = try svc.ensureMetadataReplica(.{
         .group_id = 1978,
@@ -8355,6 +8422,7 @@ test "metadata service lifecycle round uses cached backfill markers" {
     try std.Io.Dir.cwd().deleteFile(io_impl.io(), state_path);
 
     try svc.runLifecycleRound();
+    try std.testing.expectEqual(@as(usize, 1), provider_capture.calls);
     try std.testing.expectEqual(@as(usize, 1), svc.store_status_backfill_marker_cache.markers.len);
     try std.testing.expect(svc.store_status_backfill_marker_cache.rescan_requested);
     try std.testing.expectEqual(@as(usize, 39), svc.store_status_ticks);

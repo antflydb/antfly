@@ -38,7 +38,7 @@ const introducer_mod = @import("../../../introducer.zig");
 const mapper_mod = @import("../document_mapper.zig");
 const schema_api = @import("../../../schema/mod.zig");
 const persistent_mod = @import("../../persistent.zig");
-const platform_time = @import("../../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const vectorindex_mod = @import("antfly_vectorindex");
 const vector_mod = @import("antfly_vector").vector;
@@ -190,6 +190,11 @@ pub const SearchTextStatsExecutor = struct {
         ctx: ?*anyopaque,
         index_name: ?[]const u8,
     ) anyerror!?*index_manager_mod.IndexManager.TextIndex,
+    load_many_stored: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        keys: []const []const u8,
+    ) anyerror![]?[]u8 = null,
 };
 
 pub const ExplicitTextStatRequest = struct {
@@ -8094,7 +8099,8 @@ fn countSortedSegmentVisibleCandidatesAlloc(
 ) !usize {
     if (sortedSegmentConstraintsAreKnownEmpty(constraints)) return 0;
 
-    const snapshot = text_entry.persistent.snapshot();
+    const snapshot = text_entry.persistent.acquireSnapshot();
+    defer snapshot.release();
     const cursor = activeSortCursor(req);
     if (cursor.len == 0 and
         membership == null and
@@ -8205,7 +8211,8 @@ fn sortAndPageMatchAllSortedSegmentsAlloc(
     try validateSortExecutionPlanForRuntime(effective_req, plan, native_loader);
     try checkSearchRequestDeadline(effective_req);
 
-    const snapshot = text_entry.persistent.snapshot();
+    const snapshot = text_entry.persistent.acquireSnapshot();
+    defer snapshot.release();
     const bench_query_profile = shouldLogBenchQueryProfile();
     const collect_sort_profile = bench_query_profile or effective_req.profile;
     if (effective_req.limit == 0) {
@@ -8519,7 +8526,8 @@ fn collectSearchQueryResolvedDocSetAlloc(
     var execute_ns: u64 = 0;
     var ordinal_ns: u64 = 0;
     const snapshot_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    const snapshot = text_entry.persistent.snapshot();
+    const snapshot = text_entry.persistent.acquireSnapshot();
+    defer snapshot.release();
     if (bench_profile) snapshot_ns = platform_time.monotonicNs() - snapshot_start_ns;
     const capability_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     if (!(try searchQueryCanUseSnapshot(
@@ -8595,7 +8603,8 @@ fn collectStructuredFilterTextDocNumsAlloc(
     if (patternFilterValueHasRole(parsed.value)) return null;
     const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
-    const snapshot = text_entry.persistent.snapshot();
+    const snapshot = text_entry.persistent.acquireSnapshot();
+    defer snapshot.release();
     if (!(try searchQueryCanUseSnapshot(
         snapshot,
         search_query,
@@ -8684,7 +8693,8 @@ fn collectStructuredFilterDocIdsAlloc(
     const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch return null;
     const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
-    const snapshot = text_entry.persistent.snapshot();
+    const snapshot = text_entry.persistent.acquireSnapshot();
+    defer snapshot.release();
     if (!(try searchQueryCanUseSnapshot(
         snapshot,
         search_query,
@@ -10815,7 +10825,12 @@ pub fn searchTextQuery(
     defer arena.deinit();
     const arena_alloc = arena.allocator();
     const base_search_query = try textQueryToSearchQuery(arena_alloc, text_query, text_entry.text_analysis, text_entry.runtime_schema);
-    const snapshot = text_index.snapshot();
+    // Full-text projection publishes replacement snapshots independently of
+    // query execution. Pin this generation for the entire request: a borrowed
+    // snapshot can otherwise reach refcount zero while a concurrent write is
+    // still scoring it (observed as allocator corruption in termDocFreq()).
+    const snapshot = text_index.acquireSnapshot();
+    defer snapshot.release();
     const can_apply_live_all_docs = !chunk_backed or snapshot.hasDocOrdinalCoverage();
     const constraints_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var constraint_req = effective_req;
@@ -10889,7 +10904,10 @@ pub fn searchTextQuery(
     const full_candidate_limit = effectiveTextCandidateLimit(snapshot.global_doc_count, native_constraints);
     const requires_field_sort = effective_req.order_by.len > 0;
     const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, effective_req.count_only);
-    const load_stored_in_search_engine = effective_req.include_stored and !chunk_backed and !requires_field_sort;
+    // The primary document store is the source of truth. Production text
+    // segments retain compact keys for hit identity, but no longer duplicate
+    // source bodies merely to project a result page.
+    const load_stored_in_search_engine = false;
     var field_sort_plan = SortExecutionPlan{ .kind = .none };
     if (requires_field_sort) field_sort_plan = try planTextNativeSortFields(effective_req, snapshot, text_entry.runtime_schema);
     if (requires_field_sort and
@@ -11172,11 +11190,6 @@ pub fn searchTextQuery(
             } else {
                 try sortAndPageSearchResultInPlace(&out, effective_req, executor.ctx, executor.load_stored, field_sort_plan, null);
             }
-            if (effective_req.include_stored and !chunk_backed) {
-                const source_profile = try loadMissingProjectedTextHitDocuments(alloc, effective_req, executor, out.hits);
-                applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
-                logBenchProjectedSourceLoadProfile(effective_req, field_sort_plan, "text", source_profile);
-            }
         } else if (late_visibility_paginate and !effective_req.count_only) {
             try paginateSearchResultInPlace(&out, effective_req.offset, effective_req.limit);
         }
@@ -11190,6 +11203,11 @@ pub fn searchTextQuery(
                 .window_len = out.hits.len,
                 .total_ns = execute_ns + hits_ns + postprocess_ns,
             });
+        }
+        if (effective_req.include_stored and !chunk_backed) {
+            const source_profile = try loadMissingProjectedTextHitDocuments(alloc, effective_req, executor, out.hits);
+            applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
+            logBenchProjectedSourceLoadProfile(effective_req, if (requires_field_sort) field_sort_plan else .{ .kind = .score_top_k }, "text", source_profile);
         }
         if (bench_query_profile) {
             std.log.info(
@@ -11489,9 +11507,10 @@ pub fn collectExplicitTextStats(
 
     for (requests, 0..) |request, i| {
         const text_entry = (try executor.text_index_entry(executor.ctx, request.index_name)) orelse return error.IndexNotFound;
-        const snapshot = text_entry.persistent.snapshot();
+        const snapshot = text_entry.persistent.acquireSnapshot();
+        defer snapshot.release();
         if (request.resolved_doc_filter) |filter| {
-            out[i] = try collectFilteredExplicitTextStats(alloc, snapshot, request, filter);
+            out[i] = try collectFilteredExplicitTextStats(alloc, snapshot, request, filter, executor);
             initialized += 1;
             continue;
         }
@@ -11524,6 +11543,7 @@ fn collectFilteredExplicitTextStats(
     snapshot: *const index_mod.IndexSnapshot,
     request: ExplicitTextStatRequest,
     filter: *const doc_set.ResolvedDocFilter,
+    executor: SearchTextStatsExecutor,
 ) !distributed_stats_mod.TextFieldStats {
     const term_doc_freqs = try alloc.alloc(distributed_stats_mod.TermDocFreq, request.terms.len);
     var initialized_terms: usize = 0;
@@ -11541,6 +11561,8 @@ fn collectFilteredExplicitTextStats(
 
     var global_doc_count: u32 = 0;
     var global_total_field_len: u64 = 0;
+    var selected_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer selected_doc_keys.deinit(alloc);
     var doc_offset: u32 = 0;
     for (snapshot.segments) |*seg| {
         for (0..seg.reader.doc_count) |local_doc_usize| {
@@ -11551,12 +11573,26 @@ fn collectFilteredExplicitTextStats(
             const doc_id = doc_offset + local_doc;
             if (!(try docAllowedByResolvedFilter(snapshot, doc_id, filter))) continue;
             global_doc_count += 1;
-            const stored = (try snapshot.storedDocDecompressed(alloc, doc_id)) orelse continue;
-            defer alloc.free(stored.data);
-            var parsed = std.json.parseFromSlice(std.json.Value, alloc, stored.data, .{}) catch continue;
+            const stored = snapshot.storedDoc(doc_id) orelse continue;
+            try selected_doc_keys.append(alloc, stored.id);
+        }
+        doc_offset += seg.reader.doc_count;
+    }
+
+    // Product text segments retain document IDs but intentionally omit the
+    // duplicated source JSON. Hydrate only the filtered documents from the
+    // primary store, preserving exact projection without a full-index postings
+    // scan or restoring the duplicate text-segment copy.
+    if (executor.load_many_stored) |load_many| {
+        const loaded = try load_many(executor.ctx, alloc, selected_doc_keys.items);
+        defer freeOptionalOwnedBytes(alloc, loaded);
+        if (loaded.len != selected_doc_keys.items.len) return error.InvalidData;
+        for (loaded) |maybe_stored| {
+            const stored = maybe_stored orelse continue;
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, stored, .{}) catch continue;
             defer parsed.deinit();
             const value = extractJsonValueAtPath(parsed.value, request.field) orelse continue;
-            global_total_field_len += try countAnalyzedTokensInJsonValue(alloc, value);
+            global_total_field_len +|= try countAnalyzedTokensInJsonValue(alloc, value);
 
             var seen_terms = std.StringHashMap(void).init(alloc);
             defer {
@@ -11569,7 +11605,40 @@ fn collectFilteredExplicitTextStats(
                 if (seen_terms.contains(item.term)) item.doc_freq +|= 1;
             }
         }
-        doc_offset += seg.reader.doc_count;
+    } else {
+        // Index-only adapters have no primary document store. Retain an exact
+        // fallback by summing native term frequencies for allowed documents.
+        doc_offset = 0;
+        for (snapshot.segments) |*seg| {
+            var allowed_local_docs = roaring.RoaringBitmap.init(alloc);
+            defer allowed_local_docs.deinit();
+            for (0..seg.reader.doc_count) |local_doc_usize| {
+                const local_doc: u32 = @intCast(local_doc_usize);
+                if (seg.shared.deleted) |deleted| {
+                    if (deleted.contains(local_doc)) continue;
+                }
+                if (try docAllowedByResolvedFilter(snapshot, doc_offset + local_doc, filter)) {
+                    try allowed_local_docs.add(local_doc);
+                }
+            }
+            if (try seg.reader.invertedIndex(request.field)) |inv_reader| {
+                var terms = try inv_reader.termIterator();
+                defer terms.deinit();
+                while (try terms.next()) |entry| {
+                    var postings = try entry.result.iterator(alloc);
+                    defer postings.deinit();
+                    postings.decode_positions = false;
+                    while (try postings.next()) |hit| {
+                        if (!allowed_local_docs.contains(hit.doc_id)) continue;
+                        global_total_field_len +|= hit.freq;
+                        for (term_doc_freqs) |*item| {
+                            if (std.mem.eql(u8, item.term, entry.term)) item.doc_freq +|= 1;
+                        }
+                    }
+                }
+            }
+            doc_offset += seg.reader.doc_count;
+        }
     }
 
     return .{
@@ -11626,7 +11695,8 @@ pub fn collectExplicitBackgroundTextStats(
 
     for (requests, 0..) |request, i| {
         const text_entry = (try executor.text_index_entry(executor.ctx, request.index_name)) orelse return error.IndexNotFound;
-        const snapshot = text_entry.persistent.snapshot();
+        const snapshot = text_entry.persistent.acquireSnapshot();
+        defer snapshot.release();
         var background_result = try executeBackgroundQuery(alloc, snapshot, request.background_query);
         defer background_result.deinit();
 
@@ -11644,27 +11714,31 @@ pub fn collectExplicitBackgroundTextStats(
             initialized_terms += 1;
         }
 
+        const term_doc_sets = try alloc.alloc(roaring.RoaringBitmap, request.terms.len);
+        var initialized_sets: usize = 0;
+        defer {
+            for (term_doc_sets[0..initialized_sets]) |*set| set.deinit();
+            if (term_doc_sets.len > 0) alloc.free(term_doc_sets);
+        }
+        for (request.terms, 0..) |term, term_index| {
+            term_doc_sets[term_index] = roaring.RoaringBitmap.init(alloc);
+            initialized_sets += 1;
+            const doc_nums = try snapshot.executeFilter(alloc, .{ .term = .{
+                .field = request.field,
+                .term = term,
+            } });
+            defer alloc.free(doc_nums);
+            for (doc_nums) |doc_num| try term_doc_sets[term_index].add(doc_num);
+        }
+
         var background_doc_count: u32 = 0;
         for (background_result.hits) |hit| {
             if (request.resolved_doc_filter) |filter| {
                 if (!(try docAllowedByResolvedFilter(snapshot, hit.doc_id, filter))) continue;
             }
             background_doc_count += 1;
-            const stored = hit.stored_data orelse continue;
-            var parsed = std.json.parseFromSlice(std.json.Value, alloc, stored, .{}) catch continue;
-            defer parsed.deinit();
-            const value = extractJsonValueAtPath(parsed.value, request.field) orelse continue;
-
-            var seen_terms = std.StringHashMap(void).init(alloc);
-            defer {
-                var it = seen_terms.keyIterator();
-                while (it.next()) |key| alloc.free(key.*);
-                seen_terms.deinit();
-            }
-            try collectSignificantTermsFromJsonValue(alloc, value, &seen_terms);
-
-            for (term_doc_freqs) |*item| {
-                if (seen_terms.contains(item.term)) item.doc_freq +|= 1;
+            for (term_doc_freqs, 0..) |*item, term_index| {
+                if (term_doc_sets[term_index].contains(hit.doc_id)) item.doc_freq +|= 1;
             }
         }
 
@@ -11697,9 +11771,107 @@ pub fn executeBackgroundQuery(
             } },
         },
         .k = snapshot.global_doc_count,
-        .include_stored = true,
+        .include_stored = false,
     };
     return search_mod.execute(alloc, snapshot, request);
+}
+
+test "text stats use postings when segment source is omitted" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/background-postings", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const segment = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(
+        alloc,
+        &.{
+            .{
+                .id = "doc:a",
+                .stored_data = "{\"body\":\"alpha\"}",
+                .text_fields = &.{.{ .field_name = "body", .text = "alpha" }},
+            },
+            .{
+                .id = "doc:b",
+                .stored_data = "{\"body\":\"alpha beta\"}",
+                .text_fields = &.{.{ .field_name = "body", .text = "alpha beta" }},
+            },
+        },
+        &analysis_mod.default_analyzer,
+        .{},
+        .{ .store_document_source = false },
+    );
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = null,
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const Harness = struct {
+        entry: *index_manager_mod.IndexManager.TextIndex,
+
+        fn textIndexEntry(ctx: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.entry;
+        }
+    };
+    var harness = Harness{ .entry = &text_entry };
+    const stats = try collectExplicitBackgroundTextStats(alloc, &.{.{
+        .aggregation_name = "sig",
+        .index_name = "ft",
+        .field = "body",
+        .terms = &.{ "alpha", "beta" },
+        .background_query = .{ .match_all = {} },
+    }}, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+    });
+    defer aggregations_mod.deinitDistributedBackgroundTextStats(alloc, stats);
+
+    try std.testing.expectEqual(@as(usize, 1), stats.len);
+    try std.testing.expectEqual(@as(u32, 2), stats[0].background_doc_count);
+    try std.testing.expectEqual(@as(u32, 2), stats[0].term_doc_freqs[0].doc_freq);
+    try std.testing.expectEqual(@as(u32, 1), stats[0].term_doc_freqs[1].doc_freq);
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.cloneDocKeysAlloc(alloc, &.{"doc:b"}),
+    };
+    defer filter.deinit(alloc);
+    const explicit_stats = try collectExplicitTextStats(alloc, &.{.{
+        .index_name = "ft",
+        .field = "body",
+        .terms = &.{ "alpha", "beta" },
+        .resolved_doc_filter = &filter,
+    }}, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+    });
+    defer distributed_stats_mod.deinitTextFieldStats(alloc, explicit_stats);
+
+    try std.testing.expectEqual(@as(usize, 1), explicit_stats.len);
+    try std.testing.expectEqual(@as(u32, 1), explicit_stats[0].global_doc_count);
+    try std.testing.expectEqual(@as(u64, 2), explicit_stats[0].global_total_field_len);
+    try std.testing.expectEqual(@as(u32, 1), explicit_stats[0].term_doc_freqs[0].doc_freq);
+    try std.testing.expectEqual(@as(u32, 1), explicit_stats[0].term_doc_freqs[1].doc_freq);
 }
 
 fn collectQueryTerms(
@@ -21618,6 +21790,7 @@ test "text score query exposes score top k sort profile" {
     const Harness = struct {
         text_entry: *index_manager_mod.IndexManager.TextIndex,
         postprocess_count: usize = 0,
+        load_count: usize = 0,
 
         fn textIndexEntry(
             ctx: ?*anyopaque,
@@ -21654,11 +21827,13 @@ test "text score query exposes score top k sort profile" {
         }
 
         fn loadStored(
-            _: ?*anyopaque,
-            _: Allocator,
-            _: []const u8,
+            ctx: ?*anyopaque,
+            load_alloc: Allocator,
+            key: []const u8,
         ) anyerror!?[]u8 {
-            return error.UnexpectedTestCall;
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.load_count += 1;
+            return try std.fmt.allocPrint(load_alloc, "{{\"body\":\"primary:{s}\"}}", .{key});
         }
 
         fn isExpiredKey(
@@ -21715,6 +21890,26 @@ test "text score query exposes score top k sort profile" {
     try std.testing.expectEqualStrings("", profile.sort_rejection_reason);
     try std.testing.expectEqualStrings("", profile.sort_rejection_detail);
     try std.testing.expectEqualStrings("", profile.sort_rejection_field.slice());
+    try std.testing.expectEqual(@as(usize, 0), harness.load_count);
+
+    var source_result = try searchTextQuery(alloc, .{
+        .index_name = "ft",
+        .include_stored = true,
+        .limit = 2,
+    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+        .search_match_all = Harness.searchMatchAll,
+        .project_stored_search = Harness.projectStoredSearch,
+        .load_stored = Harness.loadStored,
+        .postprocess = Harness.postprocess,
+    });
+    defer source_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), source_result.hits.len);
+    try std.testing.expectEqual(@as(usize, 1), harness.load_count);
+    try std.testing.expectEqualStrings("{\"body\":\"primary:doc:a\"}", source_result.hits[0].stored_data.?);
 }
 
 test "text ordered query rejects unresolved stored pattern filters" {

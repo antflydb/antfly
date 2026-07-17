@@ -46,7 +46,7 @@ const index_manager_mod = @import("../catalog/index_manager.zig");
 const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
 const ownership_mod = @import("../ownership.zig");
 const types = @import("../types.zig");
-const platform_clock = @import("../../../platform/clock.zig");
+const platform_clock = @import("antfly_platform").clock;
 const background_runtime_mod = @import("../../background_runtime.zig");
 const template = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("../template_stub.zig")

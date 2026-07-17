@@ -16,7 +16,7 @@ const std = @import("std");
 const raft_engine = @import("raft_engine");
 const common = @import("http_common.zig");
 const common_http = @import("../../common/http/mod.zig");
-const platform_time = @import("../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const routes = @import("routes.zig");
 
 pub const HttpDriverConfig = struct {

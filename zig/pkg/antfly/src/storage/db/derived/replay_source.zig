@@ -19,7 +19,7 @@ const change_journal_mod = @import("change_journal.zig");
 const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
 const mem_backend_mod = @import("../../mem_backend.zig");
-const platform_time = @import("../../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 pub const TargetHint = change_journal_mod.TargetHint;
 

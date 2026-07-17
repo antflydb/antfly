@@ -30,6 +30,7 @@ const TruncateFnType = *const fn (ctx: *anyopaque, sequence: u64) anyerror!void;
 const BeginCatchUpFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) anyerror!void;
 const FinishCatchUpFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, success: bool) anyerror!void;
 const CanAdvanceToTargetFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) anyerror!bool;
+const AppliedSequenceAdvancedFnType = *const fn (ctx: *anyopaque, index_name: []const u8, applied_sequence: u64) void;
 
 const async_runtime_mod = if (builtin.os.tag == .freestanding) struct {
     pub const RuntimeError = error{AsyncWorkerFailed};
@@ -39,6 +40,7 @@ const async_runtime_mod = if (builtin.os.tag == .freestanding) struct {
     pub const BeginCatchUpFn = BeginCatchUpFnType;
     pub const FinishCatchUpFn = FinishCatchUpFnType;
     pub const CanAdvanceToTargetFn = CanAdvanceToTargetFnType;
+    pub const AppliedSequenceAdvancedFn = AppliedSequenceAdvancedFnType;
 
     pub const DerivedRuntime = struct {
         pub fn init(
@@ -51,6 +53,7 @@ const async_runtime_mod = if (builtin.os.tag == .freestanding) struct {
             begin_catch_up_fn: ?BeginCatchUpFnType,
             finish_catch_up_fn: ?FinishCatchUpFnType,
             can_advance_to_target_fn: ?CanAdvanceToTargetFnType,
+            applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFnType,
             resource_manager: ?*resource_manager_mod.ResourceManager,
         ) @This() {
             _ = alloc;
@@ -62,6 +65,7 @@ const async_runtime_mod = if (builtin.os.tag == .freestanding) struct {
             _ = begin_catch_up_fn;
             _ = finish_catch_up_fn;
             _ = can_advance_to_target_fn;
+            _ = applied_sequence_advanced_fn;
             _ = resource_manager;
             return .{};
         }
@@ -155,6 +159,7 @@ pub const TruncateFn = async_runtime_mod.TruncateFn;
 pub const BeginCatchUpFn = async_runtime_mod.BeginCatchUpFn;
 pub const FinishCatchUpFn = async_runtime_mod.FinishCatchUpFn;
 pub const CanAdvanceToTargetFn = async_runtime_mod.CanAdvanceToTargetFn;
+pub const AppliedSequenceAdvancedFn = async_runtime_mod.AppliedSequenceAdvancedFn;
 pub const RuntimeError = async_runtime_mod.RuntimeError;
 
 pub const Backend = runtime_backend.Backend;
@@ -258,13 +263,14 @@ pub fn init(
     begin_catch_up_fn: ?BeginCatchUpFn,
     finish_catch_up_fn: ?FinishCatchUpFn,
     can_advance_to_target_fn: ?CanAdvanceToTargetFn,
+    applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     backend_runtime: ?*background_runtime_mod.BackendRuntime,
 ) !Executor {
     try runtime_backend.ensureExecutorBackendAvailable(config.backend);
     return switch (config.backend) {
-        .manual => try initManual(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, resource_manager),
-        .io_threaded => try initIoThreaded(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, resource_manager, backend_runtime),
+        .manual => try initManual(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager),
+        .io_threaded => try initIoThreaded(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager, backend_runtime),
     };
 }
 
@@ -285,6 +291,7 @@ const ManualRuntime = struct {
     begin_catch_up_fn: ?BeginCatchUpFn,
     finish_catch_up_fn: ?FinishCatchUpFn,
     can_advance_to_target_fn: ?CanAdvanceToTargetFn,
+    applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
     backlog: backlog_tracker_mod.Tracker,
     workers: std.ArrayListUnmanaged(ManualWorker) = .empty,
 
@@ -410,6 +417,7 @@ const ManualRuntime = struct {
                     std.atomic.spinLoopHint();
                 }
                 worker.applied_sequence = caught_up_sequence;
+                if (self.applied_sequence_advanced_fn) |callback| callback(self.ctx, worker.name, caught_up_sequence);
             }
         }
 
@@ -440,6 +448,7 @@ const ManualRuntime = struct {
                     std.atomic.spinLoopHint();
                 }
                 worker.applied_sequence = caught_up_sequence;
+                if (self.applied_sequence_advanced_fn) |callback| callback(self.ctx, worker.name, caught_up_sequence);
             }
         }
 
@@ -477,6 +486,7 @@ fn initManual(
     begin_catch_up_fn: ?BeginCatchUpFn,
     finish_catch_up_fn: ?FinishCatchUpFn,
     can_advance_to_target_fn: ?CanAdvanceToTargetFn,
+    applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
     resource_manager: ?*resource_manager_mod.ResourceManager,
 ) !Executor {
     const runtime = try alloc.create(ManualRuntime);
@@ -491,6 +501,7 @@ fn initManual(
         .begin_catch_up_fn = begin_catch_up_fn,
         .finish_catch_up_fn = finish_catch_up_fn,
         .can_advance_to_target_fn = can_advance_to_target_fn,
+        .applied_sequence_advanced_fn = applied_sequence_advanced_fn,
         .backlog = backlog_tracker_mod.Tracker.init(resource_manager),
     };
     return .{
@@ -603,6 +614,7 @@ fn initIoThreaded(
     begin_catch_up_fn: ?BeginCatchUpFn,
     finish_catch_up_fn: ?FinishCatchUpFn,
     can_advance_to_target_fn: ?CanAdvanceToTargetFn,
+    applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     backend_runtime: ?*background_runtime_mod.BackendRuntime,
 ) !Executor {
@@ -612,9 +624,9 @@ fn initIoThreaded(
     errdefer alloc.destroy(runtime);
     if (backend_runtime) |bg| {
         const io_impl = bg.io_impl orelse return error.MissingBackendRuntimeIo;
-        runtime.* = io_threaded_runtime_mod.DerivedRuntime.initBorrowed(alloc, io_impl, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, resource_manager);
+        runtime.* = io_threaded_runtime_mod.DerivedRuntime.initBorrowed(alloc, io_impl, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager);
     } else {
-        runtime.* = try io_threaded_runtime_mod.DerivedRuntime.init(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, resource_manager);
+        runtime.* = try io_threaded_runtime_mod.DerivedRuntime.init(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager);
     }
     return .{
         .ptr = runtime,

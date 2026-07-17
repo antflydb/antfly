@@ -1,0 +1,30 @@
+{
+  "version": 2,
+  "default_type": "doc",
+  "enforce_types": true,
+  "document_schemas": {
+    "doc": {
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "corpus_ordinal": {
+            "type": "integer"
+          },
+          "body": {
+            "type": "string",
+            "x-antfly-types": [
+              "text"
+            ],
+            "x-antfly-analyzer": "simple",
+            "x-antfly-include-in-all": false
+          }
+        },
+        "required": [
+          "corpus_ordinal",
+          "body"
+        ]
+      }
+    }
+  }
+}
