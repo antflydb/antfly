@@ -146,6 +146,9 @@ export interface QuantizationOption {
 export interface InferenceModel {
   id: string;
   name: string;
+  connectionId: string;
+  connectionName: string;
+  provider: string;
   source: string;
   sourceUrl: string;
   type: ModelType;

@@ -32,20 +32,12 @@ import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import type { SamplePreset } from "@/components/playground/SamplePresets";
 import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
+import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
 import { fetchWithRetry } from "@/lib/utils";
 
 interface RerankResponse {
   model: string;
   data: { index: number; score: number }[];
-}
-
-interface ModelInfo {
-  capabilities?: string[];
-}
-
-interface ModelsResponse {
-  rerankers: Record<string, ModelInfo>;
-  [key: string]: Record<string, ModelInfo>;
 }
 
 interface RankedDocument {
@@ -74,7 +66,7 @@ const SAMPLE_DATA = {
 };
 
 const RerankingPlaygroundPage: React.FC = () => {
-  const { inferenceApiUrl } = useApiConfig();
+  const { inferenceUrl } = useApiConfig();
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Restore state from localStorage
@@ -115,6 +107,8 @@ const RerankingPlaygroundPage: React.FC = () => {
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const { models: connectionModels, loading: modelsLoading } =
+    useSelectedInferenceModelNames("reranker");
   const docKeyCounterRef = useRef(0);
   const [docKeys, setDocKeys] = useState<string[]>(() => {
     try {
@@ -136,34 +130,17 @@ const RerankingPlaygroundPage: React.FC = () => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ query, documents, selectedModel }));
   }, [query, documents, selectedModel]);
 
-  // Fetch available models on mount
   useEffect(() => {
-    const controller = new AbortController();
-    (async () => {
-      try {
-        const response = await fetch(`${inferenceApiUrl}/ai/v1/models`, {
-          signal: controller.signal,
-        });
-        if (response.ok) {
-          const data: ModelsResponse = await response.json();
-          const rerankers = Object.keys(data.rerankers || {});
-          setAvailableModels(rerankers);
-          setSelectedModel((prev: string) => {
-            if (prev && rerankers.includes(prev)) return prev;
-            const builtin = rerankers.find((m) => m === "antfly-builtin-reranker");
-            return builtin || rerankers[0] || "";
-          });
-        }
-      } catch {
-        // Ignore fetch errors
-      } finally {
-        if (!controller.signal.aborted) {
-          setModelsLoaded(true);
-        }
-      }
-    })();
-    return () => controller.abort();
-  }, [inferenceApiUrl]);
+    setAvailableModels(connectionModels);
+    setSelectedModel((current: string) =>
+      current && connectionModels.includes(current)
+        ? current
+        : connectionModels.find((model) => model === "antfly-builtin-reranker") ||
+          connectionModels[0] ||
+          ""
+    );
+    setModelsLoaded(!modelsLoading);
+  }, [connectionModels, modelsLoading]);
 
   // Handle ?model= URL param from Model Directory "Open in Playground"
   useEffect(() => {
@@ -211,7 +188,7 @@ const RerankingPlaygroundPage: React.FC = () => {
     const startTime = performance.now();
 
     try {
-      const response = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/rerank`, {
+      const response = await fetchWithRetry(inferenceUrl("rerank"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -242,7 +219,7 @@ const RerankingPlaygroundPage: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  }, [query, documents, selectedModel, inferenceApiUrl]);
+  }, [query, documents, selectedModel, inferenceUrl]);
 
   // Cmd+Enter shortcut
   useEffect(() => {

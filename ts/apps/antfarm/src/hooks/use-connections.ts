@@ -1,8 +1,9 @@
 import type { ConnectedModelType, Connection } from "@antfly/sdk";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useApiConfig } from "@/hooks/use-api-config";
 
 const FETCH_TIMEOUT = 15000; // 15 seconds — model expansion fans out to providers
+const MAX_CACHE_ENTRIES = 16;
 
 export interface ConnectionsState {
   connections: Connection[];
@@ -23,7 +24,18 @@ export interface ConnectedModelsState {
 
 // Cache connection data per API endpoint + expansion so dashboards and
 // dropdowns share one fetch per session.
-const connectionsCache = new Map<string, { connections: Connection[]; supported: boolean }>();
+type ConnectionsResult = { connections: Connection[]; supported: boolean };
+
+const connectionsCache = new Map<string, ConnectionsResult>();
+const connectionsInFlight = new Map<string, Promise<ConnectionsResult>>();
+
+function cacheConnections(key: string, result: ConnectionsResult) {
+  connectionsCache.delete(key);
+  connectionsCache.set(key, result);
+  if (connectionsCache.size > MAX_CACHE_ENTRIES) {
+    connectionsCache.delete(connectionsCache.keys().next().value as string);
+  }
+}
 
 function useConnectionsInternal(includeModels: boolean): ConnectionsState {
   const { apiUrl, client } = useApiConfig();
@@ -39,27 +51,40 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
     async (signal?: AbortSignal, options?: { refresh?: boolean }) => {
       setLoading(true);
       setError(null);
-      const controller = new AbortController();
-      const timeoutId = window.setTimeout(() => {
-        controller.abort(new DOMException("Request timed out", "TimeoutError"));
-      }, FETCH_TIMEOUT);
-      const abortFromParent = () => controller.abort(signal?.reason);
-      signal?.addEventListener("abort", abortFromParent, { once: true });
 
       try {
-        const response = await client.connections.list({
-          include: includeModels ? ["models"] : undefined,
-          refresh: options?.refresh,
-          signal: controller.signal,
-        });
+        const requestKey = `${cacheKey}|refresh=${Boolean(options?.refresh)}`;
+        let request = connectionsInFlight.get(requestKey);
+        if (!request) {
+          request = (async () => {
+            const controller = new AbortController();
+            const timeoutId = window.setTimeout(() => {
+              controller.abort(new DOMException("Request timed out", "TimeoutError"));
+            }, FETCH_TIMEOUT);
+            try {
+              const response = await client.connections.list({
+                include: includeModels ? ["models"] : undefined,
+                refresh: options?.refresh,
+                signal: controller.signal,
+              });
+              return {
+                connections: response?.connections ?? [],
+                supported: response !== undefined,
+              };
+            } finally {
+              window.clearTimeout(timeoutId);
+            }
+          })();
+          connectionsInFlight.set(requestKey, request);
+          request.then(
+            () => connectionsInFlight.delete(requestKey),
+            () => connectionsInFlight.delete(requestKey)
+          );
+        }
+        const result = await request;
 
-        if (!isMountedRef.current) return;
-
-        const result = {
-          connections: response?.connections ?? [],
-          supported: response !== undefined,
-        };
-        connectionsCache.set(cacheKey, result);
+        if (signal?.aborted || !isMountedRef.current) return;
+        cacheConnections(cacheKey, result);
 
         setConnections(result.connections);
         setSupported(result.supported);
@@ -71,9 +96,6 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
         const message = err instanceof Error ? err.message : "Failed to fetch connections";
         setError(message);
         setLoading(false);
-      } finally {
-        window.clearTimeout(timeoutId);
-        signal?.removeEventListener("abort", abortFromParent);
       }
     },
     [cacheKey, client, includeModels]
@@ -98,7 +120,7 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
     }
 
     const controller = new AbortController();
-    fetchConnections(controller.signal);
+    void fetchConnections(controller.signal);
 
     return () => {
       isMountedRef.current = false;
@@ -129,6 +151,26 @@ export function useConnectedModels(): ConnectedModelsState {
     error: state.error,
     retry: state.retry,
   };
+}
+
+/** Models exposed by the inference connection selected for playground requests. */
+export function useSelectedInferenceModelNames(kind: ConnectedModelType): {
+  models: string[];
+  loading: boolean;
+} {
+  const { inferenceConnectionId } = useApiConfig();
+  const { providers, loading } = useConnectedModels();
+  const selected = providers.find((connection) => connection.id === inferenceConnectionId);
+  const listed = selected?.inference?.models;
+  const models = useMemo(
+    () =>
+      [
+        ...(listed?.[kind === "other" ? "other" : `${kind}s`] ?? []),
+        ...(kind === "generator" ? (listed?.other ?? []) : []),
+      ].map((model) => model.name),
+    [kind, listed]
+  );
+  return { models: useMemo(() => [...new Set(models)], [models]), loading };
 }
 
 /**

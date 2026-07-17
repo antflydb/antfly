@@ -7706,6 +7706,48 @@ paths:
                 $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/InternalServerError"
+  /connections/{connection_id}/inference/{operation}:
+    post:
+      summary: Invoke an Antfly-compatible inference connection
+      tags:
+        - cluster_management
+      operationId: invokeInferenceConnection
+      parameters:
+        - name: connection_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: operation
+          in: path
+          required: true
+          description: Requires the connection capability `models.<operation>`.
+          schema:
+            type: string
+            enum: [embed, generate, rerank, chunk, recognize, extract, rewrite, read, transcribe]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Inference provider response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Invalid connection or operation
+        "401":
+          description: Unauthorized - authentication required
+        "403":
+          description: The connection does not declare the capability required by this operation
+        "502":
+          description: Inference provider request failed
   /secrets:
     get:
       summary: List secrets status

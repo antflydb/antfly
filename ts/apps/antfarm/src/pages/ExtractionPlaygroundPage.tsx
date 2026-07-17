@@ -44,6 +44,7 @@ import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import type { SamplePreset } from "@/components/playground/SamplePresets";
 import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
+import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
 import { fetchWithRetry } from "@/lib/utils";
 
 // Entity extraction response types matching the Antfly inference API.
@@ -71,15 +72,6 @@ interface ExtractFieldValue {
 interface ExtractResponse {
   model: string;
   results: Record<string, Record<string, unknown>[]>[];
-}
-
-interface ModelInfo {
-  capabilities?: string[];
-}
-
-interface ModelsResponse {
-  recognizers: Record<string, ModelInfo>;
-  [key: string]: Record<string, ModelInfo>;
 }
 
 type PlaygroundMode = "recognize" | "extract";
@@ -238,7 +230,7 @@ const EXTRACT_SAMPLES = {
 };
 
 const ExtractionPlaygroundPage: React.FC = () => {
-  const { inferenceApiUrl } = useApiConfig();
+  const { inferenceUrl } = useApiConfig();
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Restore state from localStorage
@@ -355,6 +347,10 @@ const ExtractionPlaygroundPage: React.FC = () => {
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
   const labelColorMapRef = useRef<Map<string, number>>(new Map());
+  const { models: connectionRecognizers, loading: recognizersLoading } =
+    useSelectedInferenceModelNames("recognizer");
+  const { models: connectionExtractors, loading: extractorsLoading } =
+    useSelectedInferenceModelNames("extractor");
 
   // Persist state to localStorage
   useEffect(() => {
@@ -386,37 +382,13 @@ const ExtractionPlaygroundPage: React.FC = () => {
 
   const availableModels = mode === "recognize" ? recognizerModels : extractorModels;
 
-  // Fetch available models on mount
   useEffect(() => {
-    const controller = new AbortController();
-    (async () => {
-      try {
-        const response = await fetch(`${inferenceApiUrl}/ai/v1/models`, {
-          signal: controller.signal,
-        });
-        if (response.ok) {
-          const data: ModelsResponse = await response.json();
-          const recognizers = Object.keys(data.recognizers || {});
-          setRecognizerModels(recognizers);
-          // Extractors are recognizers with "extraction" capability
-          const extractors = Object.entries(data.recognizers || {})
-            .filter(([, info]) => info.capabilities?.includes("extraction"))
-            .map(([name]) => name);
-          setExtractorModels(extractors);
-          setSelectedModel((prev: string) =>
-            prev && recognizers.includes(prev) ? prev : recognizers[0] || ""
-          );
-        }
-      } catch {
-        // Ignore fetch errors
-      } finally {
-        if (!controller.signal.aborted) {
-          setModelsLoaded(true);
-        }
-      }
-    })();
-    return () => controller.abort();
-  }, [inferenceApiUrl]); // eslint-disable-line react-hooks/exhaustive-deps
+    setRecognizerModels(connectionRecognizers);
+    setExtractorModels(
+      connectionExtractors.length > 0 ? connectionExtractors : connectionRecognizers
+    );
+    setModelsLoaded(!recognizersLoading && !extractorsLoading);
+  }, [connectionRecognizers, connectionExtractors, recognizersLoading, extractorsLoading]);
 
   // Update selected model when mode changes
   useEffect(() => {
@@ -494,7 +466,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
 
     try {
       if (mode === "recognize") {
-        const response = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/recognize`, {
+        const response = await fetchWithRetry(inferenceUrl("recognize"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -519,7 +491,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
           apiSchema[structure.name] = structure.fields.map((f) => `${f.name}::${f.type}`);
         }
 
-        const response = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/extract`, {
+        const response = await fetchWithRetry(inferenceUrl("extract"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -558,7 +530,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
     inputText,
     selectedModel,
     labels,
-    inferenceApiUrl,
+    inferenceUrl,
     mode,
     schema,
     extractThreshold,

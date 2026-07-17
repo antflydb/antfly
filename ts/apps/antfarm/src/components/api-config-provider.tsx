@@ -1,6 +1,6 @@
 import { AntflyClient } from "@antfly/sdk";
 import type { ReactNode } from "react";
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { ApiConfigContext } from "@/contexts/api-config-context";
 import { getAntfarmRuntimeConfig } from "@/runtime-config";
 
@@ -19,6 +19,7 @@ const getDefaultInferenceApiUrl = () => {
 
 const STORAGE_KEY = "antfarm-api-url";
 const INFERENCE_STORAGE_KEY = "antfarm-inference-api-url";
+const INFERENCE_CONNECTION_STORAGE_KEY = "antfarm-inference-connection";
 
 export function ApiConfigProvider({ children }: { children: ReactNode }) {
   const runtimeConfig = getAntfarmRuntimeConfig();
@@ -37,6 +38,9 @@ export function ApiConfigProvider({ children }: { children: ReactNode }) {
     const stored = localStorage.getItem(INFERENCE_STORAGE_KEY);
     return stored || getDefaultInferenceApiUrl();
   });
+  const [inferenceConnectionId, setInferenceConnectionIdState] = useState(
+    () => localStorage.getItem(INFERENCE_CONNECTION_STORAGE_KEY) || "local-inference"
+  );
 
   const [client, setClient] = useState<AntflyClient>(() => new AntflyClient({ baseUrl: apiUrl }));
 
@@ -70,6 +74,19 @@ export function ApiConfigProvider({ children }: { children: ReactNode }) {
     localStorage.removeItem(INFERENCE_STORAGE_KEY);
   };
 
+  const setInferenceConnectionId = useCallback((id: string) => {
+    setInferenceConnectionIdState(id);
+    localStorage.setItem(INFERENCE_CONNECTION_STORAGE_KEY, id);
+  }, []);
+
+  const inferenceUrl = useCallback(
+    (operation: string) =>
+      inferenceConnectionId === "local-inference"
+        ? `${inferenceApiUrl}/ai/v1/${operation}`
+        : `${apiUrl}/connections/${encodeURIComponent(inferenceConnectionId)}/inference/${operation}`,
+    [apiUrl, inferenceApiUrl, inferenceConnectionId]
+  );
+
   return (
     <ApiConfigContext.Provider
       value={{
@@ -80,6 +97,9 @@ export function ApiConfigProvider({ children }: { children: ReactNode }) {
         inferenceApiUrl,
         setInferenceApiUrl,
         resetInferenceApiUrl,
+        inferenceConnectionId,
+        setInferenceConnectionId,
+        inferenceUrl,
       }}
     >
       {children}
