@@ -60,7 +60,6 @@ const RunConfig = struct {
     content_security: ?inference.scraping.ContentSecurityConfig = null,
     s3_credentials: ?inference.scraping.S3CredentialsConfig = null,
     preload: []const WarmModelConfig = &.{},
-    pjrt_plugin_path: ?[]const u8 = null,
     keep_alive_ms: ?u64 = null,
     max_loaded_models: ?usize = null,
     max_concurrent_requests: ?usize = null,
@@ -83,8 +82,8 @@ fn parseBackendType(value: []const u8) ?inference.backends.BackendType {
     if (std.mem.eql(u8, value, "onnx")) return .onnx;
     if (std.mem.eql(u8, value, "metal")) return .metal;
     if (std.mem.eql(u8, value, "cuda")) return .cuda;
-    if (std.mem.eql(u8, value, "pjrt")) return .pjrt;
-    if (std.mem.eql(u8, value, "webgpu")) return .webgpu;
+    if (std.mem.eql(u8, value, "xla") or std.mem.eql(u8, value, "pjrt")) return .pjrt;
+    if (std.mem.eql(u8, value, "wasm") or std.mem.eql(u8, value, "webgpu")) return .wasm;
     return null;
 }
 
@@ -108,10 +107,8 @@ fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
     var backend: ?inference.backends.BackendType = null;
     if (std.mem.indexOfScalar(u8, model_name, ':')) |backend_separator| {
         const backend_name = model_name[0..backend_separator];
-        if (parseBackendType(backend_name)) |parsed_backend| {
-            backend = parsed_backend;
-            model_name = model_name[backend_separator + 1 ..];
-        }
+        backend = parseBackendType(backend_name) orelse return error.InvalidArguments;
+        model_name = model_name[backend_separator + 1 ..];
     }
     if (model_name.len == 0) return error.InvalidArguments;
     return .{
@@ -123,19 +120,10 @@ fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
     };
 }
 
-test "preload flag preserves artifact variant suffixes" {
-    const variant = try parsePreloadModelFlag("generator:hf:owner/model:gguf:Q8_0");
-    try std.testing.expectEqual(inference.server.WarmModelKind.generator, variant.kind);
-    try std.testing.expectEqualStrings("hf:owner/model:gguf:Q8_0", variant.name);
-    try std.testing.expectEqual(@as(?inference.backends.BackendType, null), variant.backend);
-
-    const explicit_backend = try parsePreloadModelFlag("generator:cuda:hf:owner/model:gguf:Q8_0");
-    try std.testing.expectEqualStrings("hf:owner/model:gguf:Q8_0", explicit_backend.name);
-    try std.testing.expectEqual(inference.backends.BackendType.cuda, explicit_backend.backend.?);
-}
-
-fn parseNonNegativeUsize(value: []const u8) !usize {
-    return std.fmt.parseInt(usize, value, 10);
+fn parsePositiveUsize(value: []const u8) !usize {
+    const parsed = try std.fmt.parseInt(usize, value, 10);
+    if (parsed == 0) return error.InvalidArguments;
+    return parsed;
 }
 
 fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConfig.WarmModelConfig) ![]inference.server.WarmModel {
@@ -279,7 +267,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             config_path = args[i + 1];
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--max-concurrent-requests") and i + 1 < args.len) {
-            max_concurrent_requests_override = try parseNonNegativeUsize(args[i + 1]);
+            max_concurrent_requests_override = try parsePositiveUsize(args[i + 1]);
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--preload-model") and i + 1 < args.len) {
             try preload_models.append(allocator, try parsePreloadModelFlag(args[i + 1]));
@@ -319,7 +307,6 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .preload = preload_models.items,
-        .pjrt_plugin_path = if (loaded_cfg) |cfg| cfg.pjrt_plugin_path else null,
     };
     if (loaded_cfg) |cfg| {
         node_cfg.content_security = cfg.content_security;
@@ -344,8 +331,9 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
 
     var node = try inference.server.Node.init(allocator, node_cfg);
     defer node.deinit();
+    node.attachIo(io);
 
-    try node.warmConfiguredModelsWithIo(allocator, io);
+    try node.warmConfiguredModels(allocator);
     print("listening on {s}:{d}\n", .{ host, port });
     try node.serve(allocator, io, host, port);
 
@@ -481,7 +469,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  --port <port>     Listen port (default: 8090)
         \\  --models-dir <dir>    AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>        Traditional ML directory (default: ~/.antfly/inference/ml)
-        \\  --max-concurrent-requests <n> Bound weighted in-flight request capacity before returning 503 (0 = unlimited)
+        \\  --max-concurrent-requests <n> Bound weighted in-flight request capacity before returning 503
         \\  --preload-model <kind:name|kind:backend:name> Preload and warm a configured model before serving
         \\
         \\Pull options:
@@ -544,8 +532,8 @@ test "run config parses shared scraping fields and ignores api_url" {
     try std.testing.expectEqual(@as(u64, 1000), parsed.value.prompt_cache.?.ttl_ms);
 }
 
-test "run max concurrent request parser accepts zero as unlimited" {
-    try std.testing.expectEqual(@as(usize, 6), try parseNonNegativeUsize("6"));
-    try std.testing.expectEqual(@as(usize, 0), try parseNonNegativeUsize("0"));
-    try std.testing.expectError(error.InvalidCharacter, parseNonNegativeUsize("six"));
+test "run max concurrent request parser rejects zero" {
+    try std.testing.expectEqual(@as(usize, 6), try parsePositiveUsize("6"));
+    try std.testing.expectError(error.InvalidArguments, parsePositiveUsize("0"));
+    try std.testing.expectError(error.InvalidCharacter, parsePositiveUsize("six"));
 }

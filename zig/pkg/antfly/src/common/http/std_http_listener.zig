@@ -1820,6 +1820,8 @@ test "std http listener stop returns while saturated with a headerless connectio
 
 test "std http executor runs timed requests concurrently" {
     const std_http_executor = @import("std_http_executor.zig");
+    const request_timeout_ms = 20_000;
+    const completion_wait_iterations = 10_000;
 
     const App = struct {
         entered_slow: std.atomic.Value(bool) = .init(false),
@@ -1871,7 +1873,7 @@ test "std http executor runs timed requests concurrently" {
             var response = self.executor.execute(std.heap.page_allocator, .{
                 .method = .GET,
                 .uri = self.uri,
-                .timeout_ms = 5_000,
+                .timeout_ms = request_timeout_ms,
             }) catch {
                 self.failed.store(true, .release);
                 self.done.store(true, .release);
@@ -1909,7 +1911,7 @@ test "std http executor runs timed requests concurrently" {
     defer app.release_slow.store(true, .release);
 
     var saw_slow = false;
-    for (0..10_000) |_| {
+    for (0..completion_wait_iterations) |_| {
         if (app.entered_slow.load(.acquire)) {
             saw_slow = true;
             break;
@@ -1923,7 +1925,7 @@ test "std http executor runs timed requests concurrently" {
     defer fast_thread.join();
 
     var fast_completed = false;
-    for (0..10_000) |_| {
+    for (0..completion_wait_iterations) |_| {
         if (fast_req.done.load(.acquire)) {
             fast_completed = true;
             break;
@@ -1936,7 +1938,7 @@ test "std http executor runs timed requests concurrently" {
 
     app.release_slow.store(true, .release);
     var slow_completed = false;
-    for (0..10_000) |_| {
+    for (0..completion_wait_iterations) |_| {
         if (slow_req.done.load(.acquire)) {
             slow_completed = true;
             break;

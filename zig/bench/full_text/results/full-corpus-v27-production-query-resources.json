@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "status": "accepted",
+  "corpus_documents": 5032105,
+  "segment_mode": "production",
+  "indexes": {
+    "antfly_v27_bytes": 5065897930,
+    "tantivy_0_25_bytes": 3251494143
+  },
+  "full_rebuild": {
+    "antfly-zig": {
+      "elapsed_ns": 611371550375,
+      "peak_rss_bytes": 4601970688,
+      "index_bytes": 5065897930
+    },
+    "tantivy-0.25": {
+      "elapsed_ns": 550244512584,
+      "peak_rss_bytes": 2810429440,
+      "index_bytes": 3252077340
+    },
+    "antfly_relative_to_tantivy": {
+      "elapsed_ratio": 1.111091,
+      "peak_rss_ratio": 1.637462,
+      "peak_rss_delta_bytes": 1791541248
+    },
+    "correctness": {"queries": 5, "strict_matches": 5},
+    "note": "Antfly reproduced its accepted bytes exactly. Tantivy's production merge schedule varied by 583197 bytes (0.018%) from the preserved size baseline."
+  },
+  "method": {
+    "protocol": "persistent embedded stdin/stdout adapters",
+    "minimum_wall_seconds_per_engine_class": 3.0,
+    "cpu_source": "ps per-process accumulated user+system CPU, centisecond resolution",
+    "rss_source": "ps resident set sampled every 10 ms",
+    "note": "resource pass is separate from latency sampling; query process and index remain open across classes"
+  },
+  "engines": {
+    "antfly-zig": {
+      "steady_rss_bytes": 23511040,
+      "peak_rss_bytes": 23511040,
+      "classes": {
+        "term": {"queries": 37637, "cpu_total_ns": 2680000000, "cpu_per_query_ns": 71206, "wall_per_query_ns": 79766, "cpu_utilization_percent": 89.269},
+        "union": {"queries": 14227, "cpu_total_ns": 2820000000, "cpu_per_query_ns": 198214, "wall_per_query_ns": 211018, "cpu_utilization_percent": 93.933},
+        "intersection": {"queries": 13108, "cpu_total_ns": 2800000000, "cpu_per_query_ns": 213610, "wall_per_query_ns": 229076, "cpu_utilization_percent": 93.248},
+        "phrase": {"queries": 2710, "cpu_total_ns": 2940000000, "cpu_per_query_ns": 1084870, "wall_per_query_ns": 1108207, "cpu_utilization_percent": 97.894}
+      }
+    },
+    "tantivy-0.25": {
+      "steady_rss_bytes": 22003712,
+      "peak_rss_bytes": 22003712,
+      "classes": {
+        "term": {"queries": 65286, "cpu_total_ns": 2520000000, "cpu_per_query_ns": 38599, "wall_per_query_ns": 45984, "cpu_utilization_percent": 83.941},
+        "union": {"queries": 12275, "cpu_total_ns": 2820000000, "cpu_per_query_ns": 229735, "wall_per_query_ns": 244556, "cpu_utilization_percent": 93.940},
+        "intersection": {"queries": 11241, "cpu_total_ns": 2800000000, "cpu_per_query_ns": 249088, "wall_per_query_ns": 267108, "cpu_utilization_percent": 93.253},
+        "phrase": {"queries": 8314, "cpu_total_ns": 2860000000, "cpu_per_query_ns": 343998, "wall_per_query_ns": 361074, "cpu_utilization_percent": 95.271}
+      }
+    }
+  },
+  "antfly_relative_to_tantivy_cpu_per_query": {
+    "term": 1.8448,
+    "union": 0.8628,
+    "intersection": 0.8576,
+    "phrase": 3.1537
+  },
+  "replication": {
+    "antfly_query_peak_rss_bytes": 23068672,
+    "tantivy_query_peak_rss_bytes": 20840448,
+    "antfly_relative_to_tantivy_cpu_per_query": {
+      "term": 1.7935,
+      "union": 0.9515,
+      "intersection": 0.8677,
+      "phrase": 3.1748
+    }
+  },
+  "interpretation": {
+    "query_rss_ratio": 1.0685,
+    "memory_conclusion": "No multi-gigabyte resident-memory differential exists in the embedded selective-query process; indexing peak RSS is materially worse at 1.64x and must be treated independently.",
+    "cpu_priority": ["phrase", "term"],
+    "cpu_non_regression_classes": ["union", "intersection"]
+  }
+}

@@ -160,9 +160,6 @@ func (c *InferenceClient) Embed(ctx context.Context, model string, input []strin
 	if resp.JSON500 != nil {
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
 	}
-	if resp.JSON503 != nil {
-		return nil, fmt.Errorf("service unavailable: %s", resp.JSON503.Error)
-	}
 
 	// Check content type to determine response format
 	contentType := resp.HTTPResponse.Header.Get("Content-Type")
@@ -215,9 +212,6 @@ func (c *InferenceClient) EmbedMultimodal(ctx context.Context, model string, inp
 	if resp.JSON500 != nil {
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
 	}
-	if resp.JSON503 != nil {
-		return nil, fmt.Errorf("service unavailable: %s", resp.JSON503.Error)
-	}
 
 	contentType := resp.HTTPResponse.Header.Get("Content-Type")
 	if strings.Contains(contentType, "application/json") {
@@ -268,9 +262,6 @@ func (c *InferenceClient) EmbedJSON(ctx context.Context, model string, input []s
 	if resp.JSON500 != nil {
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
 	}
-	if resp.JSON503 != nil {
-		return nil, fmt.Errorf("service unavailable: %s", resp.JSON503.Error)
-	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
 	}
@@ -319,9 +310,6 @@ func (c *InferenceClient) Chunk(ctx context.Context, text string, config ChunkCo
 	}
 	if resp.JSON500 != nil {
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON503 != nil {
-		return nil, fmt.Errorf("service unavailable: %s", resp.JSON503.Error)
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
@@ -379,9 +367,6 @@ func (c *InferenceClient) ChunkMedia(ctx context.Context, data []byte, mimeType 
 	}
 	if resp.JSON500 != nil {
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON503 != nil {
-		return nil, fmt.Errorf("service unavailable: %s", resp.JSON503.Error)
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
@@ -788,9 +773,6 @@ func (c *InferenceClient) SparseEmbed(ctx context.Context, model string, input [
 	if resp.JSON500 != nil {
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
 	}
-	if resp.JSON503 != nil {
-		return nil, fmt.Errorf("service unavailable: %s", resp.JSON503.Error)
-	}
 
 	contentType := resp.HTTPResponse.Header.Get("Content-Type")
 
@@ -838,9 +820,6 @@ func (c *InferenceClient) SparseEmbedJSON(ctx context.Context, model string, inp
 	}
 	if resp.JSON500 != nil {
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON503 != nil {
-		return nil, fmt.Errorf("service unavailable: %s", resp.JSON503.Error)
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))

@@ -20,8 +20,8 @@ const metadata_service = @import("../metadata/service.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
-const platform_clock = @import("../platform/clock.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_clock = @import("antfly_platform").clock;
+const platform_time = @import("antfly_platform").time;
 const raft_reconciler = @import("../raft/reconciler.zig");
 const tables_api = @import("tables.zig");
 

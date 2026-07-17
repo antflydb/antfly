@@ -300,11 +300,14 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     }
 } else struct {
     const Entry = struct {
+        lane: *ThreadedDurableJobLane,
         job: Job,
         future: Io.Future(void),
         completed: std.atomic.Value(bool) = .init(false),
+        job_deinited: std.atomic.Value(bool) = .init(false),
 
         fn deinitJobOnce(self: *Entry) void {
+            if (self.job_deinited.swap(true, .acq_rel)) return;
             self.job.deinit(self.job.ptr);
         }
     };
@@ -314,11 +317,15 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
         closing: bool = false,
     };
 
+    const reap_batch_limit: usize = 4096;
+    const idle_reap_interval_ms: u64 = 10;
+
     alloc: Allocator,
     io_impl: *IoImpl,
     mutex: std.atomic.Mutex = .unlocked,
     reap_mutex: std.atomic.Mutex = .unlocked,
     shutdown_reaper: std.atomic.Value(bool) = .init(false),
+    completed_count: std.atomic.Value(usize) = .init(0),
     reaper_future: ?Io.Future(void) = null,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
     owner_states: std.ArrayListUnmanaged(OwnerState) = .empty,
@@ -357,6 +364,7 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
         const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
         const entry = try self.alloc.create(Entry);
         entry.* = .{
+            .lane = self,
             .job = job,
             .future = undefined,
         };
@@ -396,15 +404,29 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
                 @errorName(err),
             });
         };
+        // The payload often owns the transaction state and buffers that make
+        // a durable job large. Release it on the worker at the actual lifetime
+        // boundary instead of retaining it until the bookkeeping reaper joins
+        // the already-completed future. `deinitJobOnce` also makes concurrent
+        // owner drains safe.
+        entry.deinitJobOnce();
+        // Publish the count first. It is only a wake/drain hint; the release
+        // store below remains authoritative. Publishing in this order also
+        // prevents a reaper from freeing `entry` before this worker's last
+        // access to it.
+        _ = entry.lane.completed_count.fetchAdd(1, .monotonic);
         entry.completed.store(true, .release);
     }
 
     fn reaperLoop(self: *ThreadedDurableJobLane) void {
         while (!self.shutdown_reaper.load(.acquire)) {
-            _ = self.reapCompleted(32);
-            self.io_impl.io().sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
+            const reaped = self.reapCompleted(reap_batch_limit);
+            // Drain a backlog without an artificial rate cap. At idle, a
+            // short sleep avoids scanning the active set continuously.
+            if (reaped == reap_batch_limit or self.completed_count.load(.monotonic) > 0) continue;
+            self.io_impl.io().sleep(Io.Duration.fromMilliseconds(idle_reap_interval_ms), .awake) catch {};
         }
-        while (self.reapCompleted(32) > 0) {}
+        while (self.reapCompleted(reap_batch_limit) > 0) {}
     }
 
     fn drainAll(self: *ThreadedDurableJobLane) void {
@@ -451,14 +473,33 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn reapCompleted(self: *ThreadedDurableJobLane, max_jobs: usize) usize {
+        if (max_jobs == 0 or self.completed_count.load(.monotonic) == 0) return 0;
         lockAtomic(&self.reap_mutex);
         defer self.reap_mutex.unlock();
-        var reaped: usize = 0;
-        while (reaped < max_jobs) : (reaped += 1) {
-            const entry = self.popCompleted() orelse return reaped;
-            self.awaitAndDestroy(entry);
+
+        // Detach completed entries in one pass. The previous implementation
+        // repeatedly called orderedRemove, shifting the entire tail for every
+        // completed job. A large ingest could therefore retain millions of
+        // finished payloads while spending most of a core in memmove.
+        var detached: [reap_batch_limit]*Entry = undefined;
+        const target = @min(max_jobs, detached.len);
+        var detached_count: usize = 0;
+        lockAtomic(&self.mutex);
+        var idx: usize = 0;
+        while (idx < self.entries.items.len and detached_count < target) {
+            const entry = self.entries.items[idx];
+            if (!entry.completed.load(.acquire)) {
+                idx += 1;
+                continue;
+            }
+            detached[detached_count] = entry;
+            detached_count += 1;
+            _ = self.entries.swapRemove(idx);
         }
-        return reaped;
+        self.mutex.unlock();
+
+        for (detached[0..detached_count]) |entry| self.awaitAndDestroy(entry);
+        return detached_count;
     }
 
     fn popAny(self: *ThreadedDurableJobLane) ?*Entry {
@@ -477,17 +518,11 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
         return null;
     }
 
-    fn popCompleted(self: *ThreadedDurableJobLane) ?*Entry {
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        for (self.entries.items, 0..) |entry, idx| {
-            if (entry.completed.load(.acquire)) return self.entries.swapRemove(idx);
-        }
-        return null;
-    }
-
     fn awaitAndDestroy(self: *ThreadedDurableJobLane, entry: *Entry) void {
         _ = entry.future.await(self.io_impl.io());
+        if (entry.completed.swap(false, .acq_rel)) {
+            _ = self.completed_count.fetchSub(1, .monotonic);
+        }
         entry.deinitJobOnce();
         self.alloc.destroy(entry);
     }
@@ -836,4 +871,49 @@ test "backend runtime durable lane deinits threaded job payload after completion
 
     try std.testing.expectEqual(@as(u32, 1), ctx.ran.load(.acquire));
     try std.testing.expectEqual(@as(u32, 1), ctx.deinits.load(.acquire));
+}
+
+test "backend runtime threaded worker releases payload before reaper joins" {
+    if (builtin.os.tag == .freestanding) return;
+
+    const Ctx = struct {
+        ran: std.atomic.Value(bool) = .init(false),
+        deinit_called: std.atomic.Value(bool) = .init(false),
+    };
+    const Fns = struct {
+        fn run(ptr: *anyopaque) !void {
+            const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+            ctx.ran.store(true, .release);
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+            ctx.deinit_called.store(true, .release);
+        }
+    };
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer handle.deinit();
+
+    // Prevent both the background reaper and explicit poll from joining the
+    // future. The worker must still release the owned payload promptly.
+    const jobs = handle.ptr().threaded_jobs.?;
+    lockAtomic(&jobs.reap_mutex);
+    defer jobs.reap_mutex.unlock();
+
+    var ctx = Ctx{};
+    try handle.ptr().durable_jobs.submit(.{
+        .owner_id = 10,
+        .class = .commit_durable,
+        .ptr = &ctx,
+        .run = Fns.run,
+        .deinit = Fns.deinit,
+    });
+
+    var attempts: usize = 0;
+    while (!ctx.deinit_called.load(.acquire) and attempts < 200) : (attempts += 1) {
+        if (handle.ptr().io()) |io| io.sleep(Io.Duration.fromMilliseconds(2), .awake) catch {};
+    }
+    try std.testing.expect(ctx.ran.load(.acquire));
+    try std.testing.expect(ctx.deinit_called.load(.acquire));
 }

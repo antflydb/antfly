@@ -65,14 +65,7 @@ const c_file = @import("../util/c_file.zig");
 const runtime = @import("../runtime/root.zig");
 
 const cuda_compute_mod = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
-const metal_runtime_stats_mod = if (build_options.enable_metal) @import("../backends/metal_runtime.zig") else struct {};
 pub const CudaRuntimeStats = if (build_options.enable_cuda) cuda_compute_mod.RuntimeStats else void;
-pub const MetalEmbeddingCacheProcessStats = struct {
-    hits_total: u64 = 0,
-    misses_total: u64 = 0,
-    evictions_total: u64 = 0,
-    bypasses_total: u64 = 0,
-};
 const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.CapabilityProfile else enum {
     clipclap,
     deberta_reranker,
@@ -631,7 +624,6 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
         .allocator = allocator,
         .arch_config = arch_config,
         .task = sessionTaskForModelType(mf.model_type, override),
-        .is_generator = mf.model_type == .generator,
         .backend_type = .native,
         .backend_data = .{ .native = .{
             .allocator = allocator,
@@ -899,7 +891,6 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
         .allocator = allocator,
         .arch_config = arch_config,
         .task = sessionTaskForModelType(mf.model_type, override),
-        .is_generator = mf.model_type == .generator,
         .backend_type = .pjrt,
         .backend_data = .{ .pjrt = .{
             .native = .{
@@ -1000,7 +991,6 @@ pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
         .allocator = allocator,
         .arch_config = native_impl.arch_config,
         .task = native_impl.task,
-        .is_generator = native_impl.is_generator,
         .backend_type = .cuda,
         .backend_data = .{ .cuda = .{ .compute = cuda_compute } },
     };
@@ -1307,7 +1297,6 @@ fn createGpuHostedSessionWithTaskOverride(
         .allocator = allocator,
         .arch_config = arch_config,
         .task = sessionTaskForModelType(mf.model_type, override),
-        .is_generator = mf.model_type == .generator,
         .backend_type = backend_type,
         .budget_floor = budget_floor,
         .shared_cache_budget_floor = shared_cache_floor,
@@ -3151,12 +3140,10 @@ fn makeMetalHostedComputeBackend(
 ) !ops.ComputeBackend {
     if (!build_options.enable_metal) return error.MetalNotEnabled;
     const compute = try allocator.create(MetalCompute);
-    errdefer allocator.destroy(compute);
     compute.* = if (self.io) |io_handle|
         try MetalCompute.initWithIo(allocator, gpuBackendData(self), run_budget, io_handle)
     else
         try MetalCompute.init(allocator, gpuBackendData(self), run_budget);
-    compute.self_owned = true;
     return compute.computeBackend();
 }
 
@@ -4043,7 +4030,6 @@ const native_mod = @import("../ops/native_compute.zig");
 const gpu_hosted_store_mod = @import("../ops/gpu_hosted_store.zig");
 const NativeData = native_mod.WeightStore;
 const LazyWeightEntry = native_mod.LazyWeightEntry;
-pub const MetalNativeProviderPoolStats = gpu_hosted_store_mod.MetalNativeProviderPoolStats;
 
 const GpuHostedData = if (false or build_options.enable_metal) gpu_hosted_store_mod.WeightStore else void;
 
@@ -4074,7 +4060,6 @@ const ArchSession = struct {
     allocator: std.mem.Allocator,
     arch_config: ArchConfig,
     task: SessionTask = .generic,
-    is_generator: bool = false,
     backend_type: BackendType,
     budget_floor: runtime.tier.memory.Limits = .{},
     shared_cache_budget_floor: runtime.tier.cache.Budget = .{},
@@ -4102,25 +4087,6 @@ pub fn attachIo(session: Session, io: std.Io) void {
     if (session.vtable != &arch_vtable) return;
     const arch_session: *ArchSession = @ptrCast(@alignCast(session.ptr));
     arch_session.io = io;
-}
-
-/// Bound overlapping Metal compute backends for this model session. Safe to
-/// call on any Session; non-Metal and non-architecture sessions are no-ops.
-pub fn attachMetalProviderPoolSize(session: Session, pool_size: usize) void {
-    if (session.vtable != &arch_vtable) return;
-    const arch_session: *ArchSession = @ptrCast(@alignCast(session.ptr));
-    if (arch_session.backend_type != .metal) return;
-    if (comptime build_options.enable_metal) {
-        // Decoder-capable GPT sessions keep one compiled runtime provider for
-        // their lifetime. Other architectures use only request leases, so the
-        // configured bound remains exact for embed/rerank workloads.
-        const runtime_reserve: usize = switch (arch_session.arch_config) {
-            .gpt => |cfg| @intFromBool(arch_session.is_generator and metal_runtime.supportsDecoderRuntimeConfig(cfg)),
-            else => 0,
-        };
-        const provider_capacity = @max(pool_size, 1) +| runtime_reserve;
-        gpu_hosted_store_mod.setMetalNativeProviderPoolSize(gpuBackendData(arch_session), provider_capacity);
-    }
 }
 
 /// Attach a graph-runtime execution strategy to a Session created by this
@@ -4165,62 +4131,6 @@ test "attachIo reaches native compute backend" {
     try std.testing.expect(cb.getIo() != null);
 }
 
-test "Metal process cache stats getter is build safe" {
-    const stats = getMetalEmbeddingCacheProcessStats();
-    if (comptime !build_options.enable_metal) {
-        try std.testing.expectEqual(@as(u64, 0), stats.hits_total);
-        try std.testing.expectEqual(@as(u64, 0), stats.misses_total);
-        try std.testing.expectEqual(@as(u64, 0), stats.evictions_total);
-        try std.testing.expectEqual(@as(u64, 0), stats.bypasses_total);
-    }
-}
-
-test "attachIo leases a bounded Metal provider pool" {
-    if (comptime !build_options.enable_metal) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    var arch_session = ArchSession{
-        .allocator = allocator,
-        .arch_config = .{ .gpt = .{
-            .hidden_size = 4,
-            .num_hidden_layers = 1,
-            .num_attention_heads = 1,
-            .intermediate_size = 8,
-            .vocab_size = 16,
-        } },
-        .is_generator = true,
-        .backend_type = .metal,
-        .backend_data = .{ .metal = .{
-            .allocator = allocator,
-            .prefix = "",
-            .lazy_weights = .empty,
-        } },
-    };
-    const metal_data = &arch_session.backend_data.metal;
-    defer metal_data.lazy_weights.deinit(allocator);
-    defer metal_compute_mod.deinitSharedNativeProvider(metal_data);
-    const session = Session{
-        .ptr = &arch_session,
-        .vtable = &arch_vtable,
-    };
-
-    attachMetalProviderPoolSize(session, 1);
-    attachIo(session, std.testing.io);
-    {
-        var cb = try makeComputeBackend(&arch_session, allocator, null);
-        const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
-        defer cb.deinit();
-        try std.testing.expect(cb.getIo() != null);
-        try std.testing.expectEqual(@as(usize, 0), compute.provider_pool_slot);
-        try std.testing.expectEqual(compute.provider_impl, metal_data.metal_native_provider_slots[0].provider.?);
-        try std.testing.expect(metal_data.metal_native_provider_slots[0].in_use);
-        const stats = getMetalNativeProviderPoolStats(session).?;
-        try std.testing.expectEqual(@as(usize, 2), stats.capacity);
-        try std.testing.expectEqual(@as(usize, 1), stats.active_leases);
-    }
-    try std.testing.expect(!metal_data.metal_native_provider_slots[0].in_use);
-    try std.testing.expectEqual(@as(usize, 0), getMetalNativeProviderPoolStats(session).?.active_leases);
-}
-
 fn gpuBackendData(self: *ArchSession) *GpuHostedData {
     return switch (self.backend_type) {
         .metal => if (comptime build_options.enable_metal) &self.backend_data.metal else unreachable,
@@ -4242,10 +4152,27 @@ fn makeComputeBackend(
     allocator: std.mem.Allocator,
     run_budget: ?*runtime.tier.memory.RunBudget,
 ) !ops.ComputeBackend {
-    // Shared tier-cache budgets are fixed when the session is loaded. Mutating
-    // them from request-local RunBudgets races concurrent backends and lets one
-    // request permanently change another's cache policy. The RunBudget still
-    // governs request-owned allocations in each compute backend.
+    if (run_budget) |budget| {
+        switch (self.backend_type) {
+            .native => if (self.backend_data.native.tier_cache) |*tier_cache| {
+                tier_cache.widenToAtLeast(.{
+                    .host_limit_bytes = @max(budget.limits.host_limit_bytes, self.shared_cache_budget_floor.host_limit_bytes),
+                    .backend_limit_bytes = @max(budget.limits.backend_limit_bytes, self.shared_cache_budget_floor.backend_limit_bytes),
+                });
+            },
+            .metal => if (build_options.enable_metal) widenGpuHostedTierCache(self, budget),
+            // PJRT: widen the native CPU host-backend tier cache if present.
+            .pjrt => if (self.backend_data.pjrt.native.tier_cache) |*tier_cache| {
+                tier_cache.widenToAtLeast(.{
+                    .host_limit_bytes = @max(budget.limits.host_limit_bytes, self.shared_cache_budget_floor.host_limit_bytes),
+                    .backend_limit_bytes = @max(budget.limits.backend_limit_bytes, self.shared_cache_budget_floor.backend_limit_bytes),
+                });
+            },
+            .cuda => {},
+            .onnx => {},
+            .wasm => {},
+        }
+    }
     return switch (self.backend_type) {
         .native => blk: {
             const compute = try allocator.create(NativeCompute);
@@ -4273,7 +4200,7 @@ fn makeComputeBackend(
         else
             return error.CudaNotEnabled,
         .onnx => return error.OnnxNotSupportedHere,
-        .webgpu => return error.WasmNotSupportedHere,
+        .wasm => return error.WasmNotSupportedHere,
     };
 }
 
@@ -4318,31 +4245,6 @@ pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
     return switch (self.backend_type) {
         .cuda => self.backend_data.cuda.compute.snapshotStats(),
         else => null,
-    };
-}
-
-pub fn getMetalNativeProviderPoolStats(session: Session) ?MetalNativeProviderPoolStats {
-    if (comptime !build_options.enable_metal) return null;
-    if (session.vtable != &arch_vtable) return null;
-    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
-    return switch (self.backend_type) {
-        .metal => gpu_hosted_store_mod.metalNativeProviderPoolStats(gpuBackendData(self)),
-        else => null,
-    };
-}
-
-pub fn getMetalNativeProviderProcessWaitsTotal() usize {
-    return gpu_hosted_store_mod.metalNativeProviderProcessWaitsTotal();
-}
-
-pub fn getMetalEmbeddingCacheProcessStats() MetalEmbeddingCacheProcessStats {
-    if (comptime !build_options.enable_metal) return .{};
-    const stats = metal_runtime_stats_mod.embeddingCacheProcessStats();
-    return .{
-        .hits_total = stats.hits_total,
-        .misses_total = stats.misses_total,
-        .evictions_total = stats.evictions_total,
-        .bypasses_total = stats.bypasses_total,
     };
 }
 
@@ -4557,7 +4459,7 @@ pub fn memoryBudgetExceededDetail(
             std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
         .cuda => std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
         .onnx => std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
-        .webgpu => std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
+        .wasm => std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
     };
 }
 
@@ -4574,7 +4476,7 @@ pub fn attachSharedPrefetchState(session: Session, shared_prefetch: *runtime.tie
         .pjrt => self.backend_data.pjrt.native.shared_prefetch = shared_prefetch,
         .cuda => {},
         .onnx => {},
-        .webgpu => {},
+        .wasm => {},
     }
 }
 
@@ -5649,7 +5551,7 @@ fn archClose(ptr: *anyopaque) void {
             }
         },
         .onnx => {},
-        .webgpu => {},
+        .wasm => {},
     }
     self.allocator.destroy(self);
 }

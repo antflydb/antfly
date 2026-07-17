@@ -15,7 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
-const platform_time = @import("../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const AtomicU64 = platform.atomic.Value(u64);
 
 pub const ApplyRwLock = struct {

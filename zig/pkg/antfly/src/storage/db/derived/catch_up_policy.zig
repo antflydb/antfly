@@ -25,9 +25,33 @@ const dense_catch_up_session_idle_ns: u64 = 5 * std.time.ns_per_s;
 const replay_cursor_refresh_records: u64 = 8 * 1024;
 const catch_up_max_windows_per_publish: usize = 1;
 const dense_replay_max_items_per_window: usize = 25_000;
+const replay_default_max_items_per_window: usize = 8 * 1024;
 const replay_default_window_bytes: u64 = 16 * 1024 * 1024;
 const dense_replay_default_window_bytes: u64 = 64 * 1024 * 1024;
 const dense_replay_max_window_bytes: u64 = 256 * 1024 * 1024;
+const pressure_retry_min_delay_ns: u64 = 10 * std.time.ns_per_ms;
+const pressure_retry_max_delay_ns: u64 = 250 * std.time.ns_per_ms;
+
+/// Bounded backoff for transient resource-admission failures. The derived
+/// worker owns this state, so a pressured index yields without poisoning the
+/// whole runtime or spinning while compaction releases memory.
+pub const PressureRetryBackoff = struct {
+    failures: u8 = 0,
+
+    pub fn reset(self: *@This()) void {
+        self.failures = 0;
+    }
+
+    pub fn nextDelayNs(self: *@This()) u64 {
+        const shift: u6 = @intCast(@min(self.failures, 5));
+        self.failures +|= 1;
+        return @min(pressure_retry_min_delay_ns << shift, pressure_retry_max_delay_ns);
+    }
+
+    pub fn shouldLog(self: @This()) bool {
+        return self.failures == 1 or std.math.isPowerOfTwo(self.failures);
+    }
+};
 
 fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     if (!builtin.link_libc) return null;
@@ -91,6 +115,7 @@ pub fn forIndex(index_ref: index_manager_mod.ManagedIndexRef, resource_manager: 
         .full_text, .sparse_vector, .graph, .algebraic => .{
             .cursor_refresh_records = replayCursorRefreshRecords(),
             .max_windows_per_publish = replayMaxWindowsPerPublish(),
+            .max_items_per_window = replayMaxItemsPerWindow(),
             .max_chunk_bytes = replayMaxWindowBytes(resource_manager),
         },
     };
@@ -138,6 +163,10 @@ fn denseReplayMaxItemsPerWindow() usize {
     return envUsize("ANTFLY_DENSE_REPLAY_MAX_ITEMS_PER_WINDOW", dense_replay_max_items_per_window);
 }
 
+fn replayMaxItemsPerWindow() usize {
+    return envUsize("ANTFLY_DERIVED_REPLAY_MAX_ITEMS_PER_WINDOW", replay_default_max_items_per_window);
+}
+
 fn denseReplayEstimatedVectorBytes() u64 {
     return envU64("ANTFLY_DENSE_REPLAY_ESTIMATED_VECTOR_BYTES", derived_worker.dense_replay_estimated_vector_bytes_default);
 }
@@ -164,4 +193,23 @@ fn denseReplayMaxWindowBytes(resource_manager: ?*resource_manager_mod.ResourceMa
         .default_bytes = dense_replay_default_window_bytes,
         .max_bytes = dense_replay_max_window_bytes,
     });
+}
+
+test "pressure retry backoff is bounded and resets" {
+    var backoff = PressureRetryBackoff{};
+    try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_ms), backoff.nextDelayNs());
+    try std.testing.expectEqual(@as(u64, 20 * std.time.ns_per_ms), backoff.nextDelayNs());
+    try std.testing.expectEqual(@as(u64, 40 * std.time.ns_per_ms), backoff.nextDelayNs());
+    try std.testing.expectEqual(@as(u64, 80 * std.time.ns_per_ms), backoff.nextDelayNs());
+    try std.testing.expectEqual(@as(u64, 160 * std.time.ns_per_ms), backoff.nextDelayNs());
+    try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), backoff.nextDelayNs());
+    try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), backoff.nextDelayNs());
+    backoff.reset();
+    try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_ms), backoff.nextDelayNs());
+}
+
+test "full text replay policy bounds work by item count as well as bytes" {
+    const policy = forIndex(.{ .name = "text", .kind = .full_text }, null);
+    try std.testing.expectEqual(replay_default_max_items_per_window, policy.max_items_per_window);
+    try std.testing.expectEqual(replay_default_window_bytes, policy.max_chunk_bytes);
 }

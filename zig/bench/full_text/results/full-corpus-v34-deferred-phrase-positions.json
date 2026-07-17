@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "status": "accepted_query_only_optimization",
+  "comparison_boundary": "reused_settled_v34_full_corpus_index",
+  "source_index": {
+    "documents": 5032105,
+    "corpus_sha256": "9078d9ea4783ab764fe246046efdc8062692f07afdd7c8749a74ebfe05c51ff4",
+    "wire_version": 34,
+    "segments": 10,
+    "bytes": 3406622680,
+    "prior_cross_engine_correctness": "5_of_5_strict_id_and_score_matches"
+  },
+  "change": {
+    "approximation": "align_phrase_term_doc_ids_without_unpacking_positions",
+    "verification": "decode_positions_only_after_all_term_iterators_agree_on_the_candidate",
+    "persisted_format_changed": false
+  },
+  "validation": {
+    "focused_search_tests": 50,
+    "focused_search_failures": 0,
+    "focused_search_leaks": 0,
+    "warmup_queries": 1000,
+    "warmup_min_seconds": 1,
+    "latency_repetitions_per_run": 11,
+    "resource_profile_seconds_per_class": 5,
+    "independent_candidate_runs": 2
+  },
+  "phrase_work_diagnostics": {
+    "document_candidates_verified": 3571,
+    "position_records_decoded": 7142,
+    "terms_per_phrase": 2,
+    "position_records_per_candidate": 2,
+    "phrase_matches_scored": 525
+  },
+  "cpu_per_query_ns": {
+    "pre_change_runs": [588260, 580972],
+    "pre_change_mean": 584616,
+    "candidate_runs": [577131, 551702],
+    "candidate_mean": 564416.5,
+    "change_percent": -3.45517
+  },
+  "latency_median_ns": {
+    "pre_change_runs": [625292, 644916],
+    "pre_change_mean": 635104,
+    "candidate_runs": [612875, 555209],
+    "candidate_mean": 584042,
+    "change_percent": -8.03994
+  },
+  "decision": {
+    "accepted": true,
+    "reason": "The iterator now implements an actual two-phase phrase path: document conjunction first and exact position decode second. It improves matched full-corpus phrase CPU and latency while retaining exact IDs, scores, total hits, and randomized positional-reference equivalence.",
+    "remaining_priority": "Phrase still exceeds the archived Tantivy CPU reference; next work should reduce conjunction and exactPhraseFrequency control cost without eagerly decoding rejected positions."
+  }
+}

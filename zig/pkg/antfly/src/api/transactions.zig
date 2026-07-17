@@ -20,7 +20,7 @@ const distributed_txn = @import("distributed_txn.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const docstore_mod = @import("../storage/docstore.zig");
 const lease_mod = @import("../storage/db/lease.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 const session_prefix = "\x00\x00__api_txn_sessions__:";
 const session_lease_prefix = "\x00\x00__api_txn_session_leases__:";

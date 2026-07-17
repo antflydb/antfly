@@ -206,7 +206,7 @@ func backendRuntimesFromAvailable() BackendRuntimes {
 		case backends.BackendONNX:
 			runtimes.Onnx = true
 		case backends.BackendXLA:
-			runtimes.Pjrt = true
+			runtimes.Xla = true
 		case backends.BackendCoreML:
 			runtimes.Metal = true
 		}

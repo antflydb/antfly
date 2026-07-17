@@ -27,8 +27,7 @@ T = TypeVar("T", bound="InferenceGenerateRequest")
 class InferenceGenerateRequest:
     """
     Attributes:
-        model (str): Name of the generator model from models_dir/generators/. Use
-            `<owner>/<repo>:<format>:<quantization>` to select a preloaded artifact variant. Example: google/gemma-3-1b-it.
+        model (str): Name of the generator model from models_dir/generators/ Example: google/gemma-3-1b-it.
         messages (list[InferenceChatMessage]): Conversation messages (OpenAI-compatible format)
         max_tokens (int | Unset): Maximum tokens to generate Default: 256. Example: 256.
         temperature (float | Unset): Sampling temperature (0.0 = deterministic, higher = more random) Default: 1.0.
@@ -70,11 +69,11 @@ class InferenceGenerateRequest:
             request.
         backend (InferenceModelBackend | Unset): Optional backend preference for model loading or request execution.
             `auto` keeps the node default behavior.
-            `pjrt` selects the PJRT backend and requires `pjrt_plugin_path` unless
-            the standard `PJRT_PLUGIN_PATH` environment variable is set.
-            `webgpu` selects the Wasm/WebGPU backend in Wasm builds. Generation uses
-            WebGPU graph partition execution over the Wasm-native base session.
-            `mode: "compiled"` may be supplied explicitly but is not required.
+            `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via
+            `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`,
+            `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
+            `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with
+            `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
         mode (InferenceGenerateRequestMode | Unset): inference-native graph execution mode. `eager` keeps the direct
             runtime path when possible.
             `compiled` runs inference graph planning, partitioning, and backend executor attachment.

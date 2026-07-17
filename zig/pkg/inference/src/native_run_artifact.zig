@@ -1234,7 +1234,7 @@ fn runPjrtHloArtifactFull(
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
-        .webgpu => return error.UnexpectedWasmBackend,
+        .wasm => return error.UnexpectedWasmBackend,
     };
     const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
     const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
@@ -2082,7 +2082,7 @@ fn materializePartitionInputs(
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
-        .webgpu => return error.UnexpectedWasmBackend,
+        .wasm => return error.UnexpectedWasmBackend,
     };
     const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
     const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
@@ -2462,7 +2462,7 @@ fn computeNativeLastLogitsForArtifact(
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
-        .webgpu => return error.UnexpectedWasmBackend,
+        .wasm => return error.UnexpectedWasmBackend,
     };
 
     return computeNativeLastLogitsWithBackend(
@@ -2960,7 +2960,8 @@ pub fn printUsage() void {
         \\output shapes; --compare-host adds a traced native output comparison.
         \\Use --validate/--dry-run for load-only validation without execution; package
         \\validation reports artifact/prefill/decode counts and runtime ownership.
-        \\PJRT HLO artifacts require PJRT_PLUGIN_PATH.
+        \\PJRT/XLA HLO artifacts require ANTFLY_INFERENCE_XLA_PLUGIN,
+        \\ANTFLY_INFERENCE_PJRT_PLUGIN, PJRT_PLUGIN_PATH, or PJRT_PLUGIN.
         \\
     , .{});
 }

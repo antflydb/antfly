@@ -1,0 +1,4 @@
+{
+  "method": "GET",
+  "path": "/api/v1/indexes/antfly-benchmark/describe"
+}

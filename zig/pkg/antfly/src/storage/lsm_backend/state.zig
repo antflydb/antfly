@@ -17,8 +17,86 @@ const Allocator = std.mem.Allocator;
 const backend_adapter = @import("../backend_adapter.zig");
 const backend_types = @import("../backend_types.zig");
 
-const EntryIndexBucket = std.ArrayListUnmanaged(usize);
-const EntryIndex = std.AutoHashMapUnmanaged(u64, EntryIndexBucket);
+const CollisionBucket = std.ArrayListUnmanaged(usize);
+
+/// Most key hashes are unique. Keep that path to one compact hash-table value
+/// and allocate collision storage only for the exceptional case. The previous
+/// hash -> ArrayList representation allocated a backing buffer for every key,
+/// even though virtually every list contained exactly one entry.
+const EntryIndex = struct {
+    primary: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    collisions: std.AutoHashMapUnmanaged(u64, CollisionBucket) = .empty,
+
+    fn deinit(self: *EntryIndex, allocator: Allocator) void {
+        var values = self.collisions.valueIterator();
+        while (values.next()) |bucket| bucket.deinit(allocator);
+        self.collisions.deinit(allocator);
+        self.primary.deinit(allocator);
+        self.* = .{};
+    }
+
+    fn count(self: *const EntryIndex) usize {
+        return self.primary.count();
+    }
+
+    fn find(
+        self: *const EntryIndex,
+        entries: []const OwnedEntry,
+        key_hash: u64,
+        namespace: backend_types.Namespace,
+        key: []const u8,
+    ) ?usize {
+        const primary_idx = self.primary.get(key_hash) orelse return null;
+        if (entryAtIndexMatches(entries, primary_idx, namespace, key)) return primary_idx;
+        const bucket = self.collisions.get(key_hash) orelse return null;
+        for (bucket.items) |idx| {
+            if (entryAtIndexMatches(entries, idx, namespace, key)) return idx;
+        }
+        return null;
+    }
+
+    fn insert(self: *EntryIndex, allocator: Allocator, key_hash: u64, idx: usize) !void {
+        const primary = try self.primary.getOrPut(allocator, key_hash);
+        if (!primary.found_existing) {
+            primary.value_ptr.* = idx;
+            return;
+        }
+
+        const collision = try self.collisions.getOrPut(allocator, key_hash);
+        if (!collision.found_existing) collision.value_ptr.* = .empty;
+        collision.value_ptr.append(allocator, idx) catch |err| {
+            if (!collision.found_existing) {
+                collision.value_ptr.deinit(allocator);
+                _ = self.collisions.remove(key_hash);
+            }
+            return err;
+        };
+    }
+
+    fn estimatedMemoryBytes(self: *const EntryIndex) u64 {
+        var total = hashMapAllocationBytes(u64, usize, self.primary.capacity());
+        total +|= hashMapAllocationBytes(u64, CollisionBucket, self.collisions.capacity());
+        var values = self.collisions.valueIterator();
+        while (values.next()) |bucket| {
+            total +|= @as(u64, @intCast(bucket.capacity)) * @sizeOf(usize);
+        }
+        return total;
+    }
+};
+
+fn hashMapAllocationBytes(comptime Key: type, comptime Value: type, capacity: usize) u64 {
+    if (capacity == 0) return 0;
+    // std.HashMap uses one allocation containing a two-pointer/u32 header,
+    // one metadata byte per slot, then aligned key and value arrays.
+    const header_bytes = std.mem.alignForward(usize, 2 * @sizeOf(usize) + @sizeOf(u32), @alignOf(usize));
+    var total = header_bytes + capacity;
+    total = std.mem.alignForward(usize, total, @alignOf(Key));
+    total += capacity * @sizeOf(Key);
+    total = std.mem.alignForward(usize, total, @alignOf(Value));
+    total += capacity * @sizeOf(Value);
+    total = std.mem.alignForward(usize, total, @max(@alignOf(usize), @alignOf(Key), @alignOf(Value)));
+    return @intCast(total);
+}
 
 pub const OwnedEntry = struct {
     namespace_name: ?[]u8,
@@ -200,13 +278,14 @@ pub const State = struct {
 
 pub const ActiveMemTable = struct {
     entries: std.ArrayListUnmanaged(OwnedEntry) = .empty,
-    index: EntryIndex = .empty,
+    index: EntryIndex = .{},
     arena_owner: ?*std.heap.ArenaAllocator = null,
+    logical_bytes: u64 = 0,
 
     pub fn deinit(self: *ActiveMemTable, allocator: Allocator) void {
         for (self.entries.items) |*entry| entry.deinit(allocator);
         self.entries.deinit(allocator);
-        deinitEntryIndex(&self.index, allocator);
+        self.index.deinit(allocator);
         if (self.arena_owner) |arena| {
             arena.deinit();
             allocator.destroy(arena);
@@ -244,14 +323,14 @@ pub const ActiveMemTable = struct {
         };
         self.entries = .empty;
         self.arena_owner = null;
+        self.logical_bytes = 0;
         self.clearIndex(allocator);
         sortStateEntries(&out);
         return out;
     }
 
     fn clearIndex(self: *ActiveMemTable, allocator: Allocator) void {
-        deinitEntryIndex(&self.index, allocator);
-        self.index = .empty;
+        self.index.deinit(allocator);
     }
 
     pub fn resetAfterEntriesMoved(self: *ActiveMemTable, allocator: Allocator) void {
@@ -287,8 +366,15 @@ pub const ActiveMemTable = struct {
     }
 
     pub fn findIndex(self: *const ActiveMemTable, namespace: backend_types.Namespace, key: []const u8) ?usize {
-        const bucket = self.index.get(hashEntryKey(namespace, key)) orelse return null;
-        return findIndexInEntries(self.entries.items, bucket, namespace, key);
+        return self.index.find(self.entries.items, hashEntryKey(namespace, key), namespace, key);
+    }
+
+    pub fn estimatedIndexMemoryBytes(self: *const ActiveMemTable) u64 {
+        return self.index.estimatedMemoryBytes();
+    }
+
+    pub fn estimatedLogicalBytes(self: *const ActiveMemTable) u64 {
+        return self.logical_bytes;
     }
 
     pub fn upsert(
@@ -302,10 +388,10 @@ pub const ActiveMemTable = struct {
         const entry_allocator = try self.ensureArenaAllocator(allocator);
         const entry_from_arena = true;
         const key_hash = hashEntryKey(namespace, key);
-        const gop = try self.index.getOrPut(allocator, key_hash);
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
-        if (findIndexInBucket(self, gop.value_ptr.*, namespace, key)) |idx| {
+        if (self.index.find(self.entries.items, key_hash, namespace, key)) |idx| {
+            const old_value_len: u64 = @intCast(self.entries.items[idx].value.len);
             try replaceEntryValueCopy(&self.entries.items[idx], entry_allocator, value, tombstone, entry_from_arena);
+            self.logical_bytes = self.logical_bytes -| old_value_len +| @as(u64, @intCast(value.len));
             return;
         }
 
@@ -317,38 +403,33 @@ pub const ActiveMemTable = struct {
         try self.entries.append(allocator, owned);
         owned = undefined;
         const idx = self.entries.items.len - 1;
-        gop.value_ptr.append(allocator, idx) catch |err| {
+        self.index.insert(allocator, key_hash, idx) catch |err| {
             var removed = self.entries.pop().?;
             removed.deinit(allocator);
-            if (!gop.found_existing and gop.value_ptr.items.len == 0) {
-                gop.value_ptr.deinit(allocator);
-                _ = self.index.remove(key_hash);
-            }
             return err;
         };
+        self.logical_bytes +|= logicalEntryBytes(self.entries.items[idx]);
     }
 
     pub fn upsertMove(self: *ActiveMemTable, allocator: Allocator, entry: OwnedEntry) !void {
         const namespace = namespaceOf(entry);
         const key_hash = hashEntryKey(namespace, entry.key);
-        const gop = try self.index.getOrPut(allocator, key_hash);
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
-        if (findIndexInBucket(self, gop.value_ptr.*, namespace, entry.key)) |idx| {
+        if (self.index.find(self.entries.items, key_hash, namespace, entry.key)) |idx| {
+            const old_value_len: u64 = @intCast(self.entries.items[idx].value.len);
+            const new_value_len: u64 = @intCast(entry.value.len);
             replaceEntryValueMove(&self.entries.items[idx], allocator, entry);
+            self.logical_bytes = self.logical_bytes -| old_value_len +| new_value_len;
             return;
         }
 
         try self.entries.append(allocator, entry);
         const idx = self.entries.items.len - 1;
-        gop.value_ptr.append(allocator, idx) catch |err| {
+        self.index.insert(allocator, key_hash, idx) catch |err| {
             var removed = self.entries.pop().?;
             removed.deinit(allocator);
-            if (!gop.found_existing and gop.value_ptr.items.len == 0) {
-                gop.value_ptr.deinit(allocator);
-                _ = self.index.remove(key_hash);
-            }
             return err;
         };
+        self.logical_bytes +|= logicalEntryBytes(self.entries.items[idx]);
     }
 
     pub fn appendUpsert(
@@ -362,6 +443,14 @@ pub const ActiveMemTable = struct {
         try self.upsert(allocator, namespace, key, value, tombstone);
     }
 };
+
+fn logicalEntryBytes(entry: OwnedEntry) u64 {
+    var total: u64 = @sizeOf(OwnedEntry);
+    if (entry.namespace_name) |name| total +|= name.len;
+    total +|= entry.key.len;
+    total +|= entry.value.len;
+    return total;
+}
 
 pub const SplitStates = struct {
     left: State,
@@ -463,32 +552,13 @@ fn hashEntryKey(namespace: backend_types.Namespace, key: []const u8) u64 {
     return hasher.final();
 }
 
-fn deinitEntryIndex(index: *EntryIndex, allocator: Allocator) void {
-    var values = index.valueIterator();
-    while (values.next()) |bucket| bucket.deinit(allocator);
-    index.deinit(allocator);
-}
-
-fn findIndexInEntries(
+fn entryAtIndexMatches(
     entries: []const OwnedEntry,
-    bucket: EntryIndexBucket,
+    idx: usize,
     namespace: backend_types.Namespace,
     key: []const u8,
-) ?usize {
-    for (bucket.items) |idx| {
-        if (idx >= entries.len) continue;
-        if (compareEntryTo(entries[idx], namespace, key) == .eq) return idx;
-    }
-    return null;
-}
-
-fn findIndexInBucket(
-    self: *const ActiveMemTable,
-    bucket: EntryIndexBucket,
-    namespace: backend_types.Namespace,
-    key: []const u8,
-) ?usize {
-    return findIndexInEntries(self.entries.items, bucket, namespace, key);
+) bool {
+    return idx < entries.len and compareEntryTo(entries[idx], namespace, key) == .eq;
 }
 
 pub fn mergeStates(
@@ -901,4 +971,26 @@ test "ActiveMemTable overwrites by hash index and materializes sorted state" {
     try std.testing.expectEqual(@as(usize, 3), moved.entries.items.len);
     try std.testing.expectEqualStrings("doc:a", moved.entries.items[0].key);
     try std.testing.expectEqualStrings("doc:c", moved.entries.items[1].key);
+}
+
+test "EntryIndex stores unique hashes inline and preserves collision lookup" {
+    var entries: std.ArrayListUnmanaged(OwnedEntry) = .empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(std.testing.allocator);
+        entries.deinit(std.testing.allocator);
+    }
+    try entries.append(std.testing.allocator, try initEntry(std.testing.allocator, .{}, "alpha", "1", false));
+    try entries.append(std.testing.allocator, try initEntry(std.testing.allocator, .{}, "beta", "2", false));
+
+    var index: EntryIndex = .{};
+    defer index.deinit(std.testing.allocator);
+    const forced_hash: u64 = 42;
+    try index.insert(std.testing.allocator, forced_hash, 0);
+    try index.insert(std.testing.allocator, forced_hash, 1);
+
+    try std.testing.expectEqual(@as(usize, 1), index.primary.count());
+    try std.testing.expectEqual(@as(usize, 1), index.collisions.count());
+    try std.testing.expectEqual(@as(?usize, 0), index.find(entries.items, forced_hash, .{}, "alpha"));
+    try std.testing.expectEqual(@as(?usize, 1), index.find(entries.items, forced_hash, .{}, "beta"));
+    try std.testing.expectEqual(@as(?usize, null), index.find(entries.items, forced_hash, .{}, "missing"));
 }

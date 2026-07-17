@@ -17,8 +17,8 @@ const group_ids = @import("../common/group_ids.zig");
 const placement_planner = @import("placement_planner.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const table_manager = @import("table_manager.zig");
-const platform_clock = @import("../platform/clock.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_clock = @import("antfly_platform").clock;
+const platform_time = @import("antfly_platform").time;
 const transition_controller = @import("transition_controller.zig");
 const transition_state = @import("transition_state.zig");
 

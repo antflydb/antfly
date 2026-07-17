@@ -150,12 +150,11 @@ pub fn writeClipclapVariantsManifest(allocator: Allocator, io: std.Io, model_dir
     try writer.writeAll(
         \\{
         \\  "family": "clipclap_variants/v1",
-        \\  "defaults": {
+        \\  "defaults":
     );
-    var wrote_default = false;
     if (has_default_onnx) {
-        wrote_default = true;
         try writer.writeAll(
+            \\{
             \\    "onnx": {
             \\      "format": "F32",
             \\      "text_model": "text_model.onnx",
@@ -165,22 +164,13 @@ pub fn writeClipclapVariantsManifest(allocator: Allocator, io: std.Io, model_dir
             \\      "visual_projection": "visual_projection.onnx",
             \\      "audio_projection": "audio_projection.onnx"
             \\    }
+            \\  }
         );
-    }
-    if (hasFile(names.items, "clipclap-clip.gguf") and hasFile(names.items, "clipclap-clap.gguf")) {
-        if (wrote_default) try writer.writeAll(",\n");
-        wrote_default = true;
-        try writer.writeAll(
-            \\    "gguf": {
-            \\      "target": "gguf",
-            \\      "format": "F32",
-            \\      "clip": "clipclap-clip.gguf",
-            \\      "clap": "clipclap-clap.gguf"
-            \\    }
-        );
+    } else {
+        try writer.writeAll("{}");
     }
     try writer.writeAll(
-        \\  },
+        \\,
         \\  "variants": [
         \\
     );
@@ -273,32 +263,22 @@ pub fn writeGliner2VariantsManifest(allocator: Allocator, io: std.Io, model_dir:
     try writer.writeAll(
         \\{
         \\  "family": "gliner2_variants/v1",
-        \\  "defaults": {
+        \\  "defaults":
     );
-    var wrote_default = false;
     if (hasFile(names.items, "model.onnx")) {
-        wrote_default = true;
         try writer.writeAll(
+            \\{
             \\    "onnx": {
             \\      "format": "F32",
             \\      "model": "model.onnx"
             \\    }
+            \\  }
         );
-    }
-    if (hasFile(names.items, "gliner2-encoder.gguf") and hasFile(names.items, "gliner2-head.gguf")) {
-        if (wrote_default) try writer.writeAll(",\n");
-        wrote_default = true;
-        try writer.writeAll(
-            \\    "gguf": {
-            \\      "target": "gguf",
-            \\      "format": "F32",
-            \\      "encoder": "gliner2-encoder.gguf",
-            \\      "head": "gliner2-head.gguf"
-            \\    }
-        );
+    } else {
+        try writer.writeAll("{}");
     }
     try writer.writeAll(
-        \\  },
+        \\,
         \\  "variants": [
         \\
     );
@@ -378,26 +358,7 @@ pub fn writeFlorence2VariantsManifestForModel(
     try writer.writeAll(
         \\{
         \\  "family": "florence2_variants/v1",
-        \\  "defaults": {
-    );
-    var default_name: ?[]const u8 = null;
-    for (gguf_names.items) |name| {
-        if (florence2FormatSuffixFromGgufName(name).len == 0) {
-            default_name = name;
-            break;
-        }
-    }
-    if (default_name) |name| {
-        try writer.print(
-            \\    "gguf": {{
-            \\      "target": "gguf",
-            \\      "format": "F32",
-            \\      "model": "{s}"
-            \\    }}
-        , .{name});
-    }
-    try writer.writeAll(
-        \\  },
+        \\  "defaults": {},
         \\  "variants": [
         \\
     );
@@ -465,10 +426,11 @@ fn florence2FormatSuffixFromGgufName(name: []const u8) []const u8 {
     const dot = std.mem.lastIndexOfScalar(u8, stem, '.') orelse return "";
     const suffix = stem[dot + 1 ..];
     const canonical = canonicalFormatSuffix(suffix);
-    // Only a genuinely unsuffixed filename denotes the F32 default. Explicit
-    // F32/FP32 suffixes remain variants, and newer GGUF formats (F16, BF16,
-    // IQ*, vendor formats) retain their selector instead of being mislabeled.
-    return if (canonical.len == 0) "F32" else canonical;
+    if (canonical.len == 0) return "";
+    inline for (.{ "Q1_0", "Q2_K", "Q3_K", "Q4_0", "Q4_1", "Q4_K", "Q5_0", "Q5_1", "Q5_K", "Q6_K", "Q8_0", "Q8_1", "Q8_K" }) |known| {
+        if (std.mem.eql(u8, canonical, known)) return known;
+    }
+    return "";
 }
 
 fn listFileNames(allocator: Allocator, io: std.Io, model_dir: []const u8) !std.ArrayListUnmanaged([]u8) {
@@ -602,13 +564,6 @@ test "Florence2 GGUF names leave F32 unsuffixed" {
     const q4_name = try florence2GgufName(std.testing.allocator, "q4_k");
     defer std.testing.allocator.free(q4_name);
     try std.testing.expectEqualStrings("florence-2-base.Q4_K.gguf", q4_name);
-}
-
-test "Florence2 manifest format parsing never treats suffixed files as the F32 default" {
-    try std.testing.expectEqualStrings("", florence2FormatSuffixFromGgufName("florence2.gguf"));
-    try std.testing.expectEqualStrings("F32", florence2FormatSuffixFromGgufName("florence2.F32.gguf"));
-    try std.testing.expectEqualStrings("F16", florence2FormatSuffixFromGgufName("florence2.F16.gguf"));
-    try std.testing.expectEqualStrings("IQ4_XS", florence2FormatSuffixFromGgufName("florence2.IQ4_XS.gguf"));
 }
 
 test "ClipClap variants manifest indexes complete GGUF and ONNX variants" {

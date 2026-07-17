@@ -31,10 +31,10 @@ This installs:
 - Operator Deployment
 
 The operator binary defaults `--inference-antfly-image` to
-`ghcr.io/antflydb/antfly:latest`, the supported Zig runtime image. Production
-deployments should set `--inference-antfly-image=<image>` to an immutable release
-tag or digest that has been promoted into the cluster's registry. The image must
-provide the `/antfly inference` runtime contract.
+`ghcr.io/antflydb/antfly:omni`. If you use `spec.inference` and that image is not
+mirrored or available to your cluster, add `--inference-antfly-image=<image>` to
+the deployment args. The image must provide the `/antfly inference` runtime
+contract.
 
 For production environments that manage CRDs through GitOps or another platform
 workflow, run the operator with `--skip-crd-install=true` and remove the

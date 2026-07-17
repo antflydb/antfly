@@ -56,29 +56,28 @@ def _first_query_hit_id(result: dict) -> str | None:
 def _document_units_index_config() -> dict:
     return {
         "type": "graph",
-        "sources": [{
+        "source": {
+            "kind": "artifact",
             "artifact": DOCUMENT_UNITS_ARTIFACT,
             "path": "$.edges[*]",
             "format": "extraction_relation",
-        }],
-        "enrichments": [{
+        },
+        "artifact": {
             "name": DOCUMENT_UNITS_ARTIFACT,
             "kind": "asset",
             "field": "url",
             "content_type": "application/json",
-            "producer_json": json.dumps(
-                {
-                    "type": "document_extraction",
-                    "config": {
-                        "source": {
-                            "filename_field": "filename",
-                            "content_type_field": "mime_type",
-                            "version_field": "version",
-                        }
-                    },
-                }
-            ),
-        }],
+            "producer_json": {
+                "type": "document_extraction",
+                "config": {
+                    "source": {
+                        "filename_field": "filename",
+                        "content_type_field": "mime_type",
+                        "version_field": "version",
+                    }
+                },
+            },
+        },
         "edge_types": [{"name": "mentions"}],
     }
 
@@ -110,21 +109,6 @@ def _table_has_artifact_enrichment(
         if enrichment.get("name") == artifact_name and enrichment.get("kind") == kind:
             return table
     return None
-
-
-def _index_ready(api, table_name: str, index_name: str) -> dict | None:
-    try:
-        detail = api.get_index(table_name, index_name)
-    except Exception:
-        return None
-    status = detail.get("status") or {}
-    # A metadata-only response can briefly have no runtime status at all. It
-    # is not evidence that the per-shard admission/repair gate is clear.
-    if "rebuilding" not in status or "backfill_state" not in status:
-        return None
-    if status.get("rebuilding") or status.get("backfill_state") != "ready":
-        return None
-    return detail
 
 
 def test_document_artifact_manifest_and_reprocess_job_e2e(stateful_api):
@@ -349,8 +333,10 @@ def test_artifact_backed_chunk_embeddings_are_semantic_searchable(stateful_api, 
             {
                 "name": "document_vectors",
                 "type": "embeddings",
+                "field": "embedding",
                 "dimension": 3,
-                "sources": [{"artifact": "document_chunk_dense_v1"}],
+                "source_artifact_name": "document_chunks_v1",
+                "embedding_name": "document_chunk_dense_v1",
                 "embedder": {
                     "provider": "openai",
                     "model": "text-embedding-3-small",
@@ -360,14 +346,7 @@ def test_artifact_backed_chunk_embeddings_are_semantic_searchable(stateful_api, 
         )
         == {}
     )
-    index_detail = wait_until(
-        lambda: _index_ready(stateful_api, table_name, "document_vectors"),
-        timeout_s=60.0,
-        interval_s=0.5,
-    )
-    assert index_detail is not None, json.dumps(
-        stateful_api.get_index(table_name, "document_vectors"), sort_keys=True
-    )
+    index_detail = stateful_api.get_index(table_name, "document_vectors")
     assert index_detail["config"]["name"] == "document_vectors"
     assert index_detail["config"]["type"] == "embeddings"
 

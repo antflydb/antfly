@@ -336,6 +336,83 @@ pub const TypedDocValuesReader = struct {
         return snappy.decode(self.alloc, compressed);
     }
 
+    pub const DecodedChunk = struct {
+        alloc: Allocator,
+        data: []u8,
+        value_type: ValueType,
+        num_docs: u32,
+        values_start: usize,
+
+        pub const Entry = struct {
+            doc_id: u32,
+            value: TypedValue,
+        };
+
+        pub const Iterator = struct {
+            chunk: *const DecodedChunk,
+            pos: u32 = 0,
+            bytes_cursor: usize,
+
+            pub fn next(self: *Iterator) !?Entry {
+                if (self.pos >= self.chunk.num_docs) return null;
+                const pos: usize = @intCast(self.pos);
+                const doc_offset = 4 + pos * 4;
+                const doc_id = std.mem.readInt(u32, self.chunk.data[doc_offset..][0..4], .little);
+                const value: TypedValue = switch (self.chunk.value_type) {
+                    .u64_val => .{ .u64_val = std.mem.readInt(u64, self.chunk.data[self.chunk.values_start + pos * 8 ..][0..8], .little) },
+                    .i64_val => .{ .i64_val = std.mem.readInt(i64, self.chunk.data[self.chunk.values_start + pos * 8 ..][0..8], .little) },
+                    .f64_val => .{ .f64_val = try decodeSerializableF64(self.chunk.data[self.chunk.values_start + pos * 8 ..][0..8].*) },
+                    .geo_point => blk: {
+                        const value_offset = self.chunk.values_start + pos * 16;
+                        break :blk .{ .geo_point = .{
+                            .lat = try decodeSerializableF64(self.chunk.data[value_offset..][0..8].*),
+                            .lon = try decodeSerializableF64(self.chunk.data[value_offset + 8 ..][0..8].*),
+                        } };
+                    },
+                    .bool_val => .{ .bool_val = try decodeSerializableBool(self.chunk.data[self.chunk.values_start + pos]) },
+                    .bytes_val => blk: {
+                        if (self.bytes_cursor + 4 > self.chunk.data.len) return error.InvalidData;
+                        const value_len = std.mem.readInt(u32, self.chunk.data[self.bytes_cursor..][0..4], .little);
+                        self.bytes_cursor += 4;
+                        if (value_len > self.chunk.data.len - self.bytes_cursor) return error.InvalidData;
+                        const bytes = self.chunk.data[self.bytes_cursor..][0..value_len];
+                        self.bytes_cursor += value_len;
+                        break :blk .{ .bytes_val = bytes };
+                    },
+                };
+                self.pos += 1;
+                return .{ .doc_id = doc_id, .value = value };
+            }
+        };
+
+        pub fn deinit(self: *DecodedChunk) void {
+            self.alloc.free(self.data);
+            self.* = undefined;
+        }
+
+        pub fn iterator(self: *const DecodedChunk) Iterator {
+            return .{ .chunk = self, .bytes_cursor = self.values_start };
+        }
+    };
+
+    /// Decode and validate one complete chunk for sequential consumers such as
+    /// segment merge. This avoids the point-lookup API's repeated scan and
+    /// decompression of every preceding chunk for each document.
+    pub fn decodeChunk(self: *const TypedDocValuesReader, chunk_idx: u32) !DecodedChunk {
+        const chunk_data = try self.decompressChunk(chunk_idx);
+        errdefer self.alloc.free(chunk_data);
+        if (chunk_data.len < 4) return error.InvalidData;
+        const num_docs = std.mem.readInt(u32, chunk_data[0..4], .little);
+        try self.validateChunkValuePayload(chunk_data, num_docs);
+        return .{
+            .alloc = self.alloc,
+            .data = chunk_data,
+            .value_type = self.value_type,
+            .num_docs = num_docs,
+            .values_start = try valuesStartForDocIds(chunk_data, num_docs),
+        };
+    }
+
     /// Find which chunk contains a given doc_id by scanning chunk doc IDs.
     /// Returns (chunk_idx, position_within_chunk).
     pub fn findDoc(self: *const TypedDocValuesReader, doc_id: u32) !?struct { chunk_idx: u32, pos: u32, chunk_data: []u8 } {
@@ -893,6 +970,68 @@ test "typed doc values bulk chunk read" {
     try std.testing.expectEqual(@as(usize, 5), doc_ids.len);
     try std.testing.expectEqual(@as(u32, 0), doc_ids[0]);
     try std.testing.expectEqual(@as(u32, 4), doc_ids[4]);
+}
+
+test "typed doc values decoded chunk iterator preserves sparse values across chunks" {
+    const alloc = std.testing.allocator;
+
+    var writer = TypedDocValuesWriter.init(alloc, .u64_val, 2);
+    defer writer.deinit();
+    try writer.add(1, .{ .u64_val = 10 });
+    try writer.add(4, .{ .u64_val = 40 });
+    try writer.add(9, .{ .u64_val = 90 });
+    try writer.add(15, .{ .u64_val = 150 });
+    try writer.add(31, .{ .u64_val = 310 });
+
+    const data = try writer.build();
+    defer alloc.free(data);
+
+    var reader = try TypedDocValuesReader.init(alloc, data);
+    try std.testing.expectEqual(@as(u32, 3), reader.num_chunks);
+
+    const expected_doc_ids = [_]u32{ 1, 4, 9, 15, 31 };
+    const expected_values = [_]u64{ 10, 40, 90, 150, 310 };
+    var value_index: usize = 0;
+    for (0..reader.num_chunks) |chunk_index| {
+        var chunk = try reader.decodeChunk(@intCast(chunk_index));
+        defer chunk.deinit();
+        var it = chunk.iterator();
+        while (try it.next()) |entry| {
+            try std.testing.expectEqual(expected_doc_ids[value_index], entry.doc_id);
+            try std.testing.expectEqual(expected_values[value_index], entry.value.u64_val);
+            value_index += 1;
+        }
+    }
+    try std.testing.expectEqual(expected_doc_ids.len, value_index);
+}
+
+test "typed doc values decoded chunk iterator borrows byte values from its chunk" {
+    const alloc = std.testing.allocator;
+
+    var writer = TypedDocValuesWriter.init(alloc, .bytes_val, 2);
+    defer writer.deinit();
+    try writer.add(0, .{ .bytes_val = "alpha" });
+    try writer.add(3, .{ .bytes_val = "beta" });
+    try writer.add(8, .{ .bytes_val = "gamma" });
+
+    const data = try writer.build();
+    defer alloc.free(data);
+
+    var reader = try TypedDocValuesReader.init(alloc, data);
+    const expected_doc_ids = [_]u32{ 0, 3, 8 };
+    const expected_values = [_][]const u8{ "alpha", "beta", "gamma" };
+    var value_index: usize = 0;
+    for (0..reader.num_chunks) |chunk_index| {
+        var chunk = try reader.decodeChunk(@intCast(chunk_index));
+        defer chunk.deinit();
+        var it = chunk.iterator();
+        while (try it.next()) |entry| {
+            try std.testing.expectEqual(expected_doc_ids[value_index], entry.doc_id);
+            try std.testing.expectEqualStrings(expected_values[value_index], entry.value.bytes_val);
+            value_index += 1;
+        }
+    }
+    try std.testing.expectEqual(expected_doc_ids.len, value_index);
 }
 
 test "typed doc values bytes round-trip" {

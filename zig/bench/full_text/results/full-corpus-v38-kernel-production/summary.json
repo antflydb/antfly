@@ -1,0 +1,81 @@
+{
+  "engines": {
+    "antfly-zig": {
+      "intersection": {
+        "max_ns": 230625,
+        "median_ns": 170125,
+        "min_ns": 168125,
+        "p50_ns": 170125,
+        "p95_ns": 230625,
+        "p99_ns": 230625,
+        "samples": 5
+      },
+      "phrase": {
+        "max_ns": 477250,
+        "median_ns": 473750,
+        "min_ns": 451125,
+        "p50_ns": 473750,
+        "p95_ns": 477250,
+        "p99_ns": 477250,
+        "samples": 5
+      },
+      "term": {
+        "max_ns": 69917,
+        "median_ns": 52875,
+        "min_ns": 33333,
+        "p50_ns": 66916,
+        "p95_ns": 69917,
+        "p99_ns": 69917,
+        "samples": 10
+      },
+      "union": {
+        "max_ns": 202458,
+        "median_ns": 189709,
+        "min_ns": 181125,
+        "p50_ns": 189709,
+        "p95_ns": 202458,
+        "p99_ns": 202458,
+        "samples": 5
+      }
+    },
+    "comparator": {
+      "intersection": {
+        "max_ns": 278250,
+        "median_ns": 256833,
+        "min_ns": 243917,
+        "p50_ns": 256833,
+        "p95_ns": 278250,
+        "p99_ns": 278250,
+        "samples": 5
+      },
+      "phrase": {
+        "max_ns": 491042,
+        "median_ns": 442708,
+        "min_ns": 415625,
+        "p50_ns": 442708,
+        "p95_ns": 491042,
+        "p99_ns": 491042,
+        "samples": 5
+      },
+      "term": {
+        "max_ns": 58833,
+        "median_ns": 47166,
+        "min_ns": 33834,
+        "p50_ns": 47750,
+        "p95_ns": 58833,
+        "p99_ns": 58833,
+        "samples": 10
+      },
+      "union": {
+        "max_ns": 248959,
+        "median_ns": 239334,
+        "min_ns": 224417,
+        "p50_ns": 239334,
+        "p95_ns": 248959,
+        "p99_ns": 248959,
+        "samples": 5
+      }
+    }
+  },
+  "schema_version": 1
+}

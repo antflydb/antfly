@@ -19,8 +19,6 @@ const donut_mod = @import("donut.zig");
 const moondream_mod = @import("moondream.zig");
 const ortgenai = if (build_options.enable_onnx) @import("../backends/ortgenai.zig") else struct {};
 const model_manager_mod = @import("../server/model_manager.zig");
-const manifest_mod = @import("../models/manifest.zig");
-const encoder_decoder = @import("../pipelines/encoder_decoder.zig");
 const generation = @import("../pipelines/generation.zig");
 const onnx_decoder_only_vlm = @import("../pipelines/onnx_decoder_only_vlm.zig");
 const multistage_metadata = @import("multistage_metadata.zig");
@@ -53,13 +51,11 @@ const VisionLoadedReader = struct {
         model_path: []const u8,
         session_manager: *backends.SessionManager,
         model_manager: *model_manager_mod.ModelManager,
-        request_id: ?u64,
-        artifact_selection: manifest_mod.ArtifactSelection,
     ) !VisionLoadedReader {
         return .{
             .allocator = allocator,
             .parser_kind = try detectParserKind(allocator, model_path),
-            .core = try vision_reader_mod.LoadedVisionReader.loadFromDir(allocator, model_path, session_manager, model_manager, request_id, artifact_selection),
+            .core = try vision_reader_mod.LoadedVisionReader.loadFromDir(allocator, model_path, session_manager, model_manager),
         };
     }
 
@@ -117,7 +113,6 @@ const VlmLoadedReader = struct {
     pub fn loadFromDir(
         allocator: std.mem.Allocator,
         model_path: []const u8,
-        artifact_selection: manifest_mod.ArtifactSelection,
     ) !VlmLoadedReader {
         const parser_kind = try detectParserKind(allocator, model_path);
         if (parser_kind != .moondream) return error.InvalidModelForReading;
@@ -125,7 +120,7 @@ const VlmLoadedReader = struct {
         return .{
             .allocator = allocator,
             .parser_kind = parser_kind,
-            .pipeline = try onnx_decoder_only_vlm.Pipeline.loadWithArtifactSelection(allocator, model_path, artifact_selection),
+            .pipeline = try onnx_decoder_only_vlm.Pipeline.load(allocator, model_path),
         };
     }
 
@@ -158,38 +153,23 @@ const VlmLoadedReader = struct {
 const GenAiLoadedReader = struct {
     allocator: std.mem.Allocator,
     parser_kind: ParserKind,
-    prepared_package: if (build_options.enable_onnx) ortgenai.PreparedGenerativeModelPackage else void,
+    prepared_model_dir: if (build_options.enable_onnx) []u8 else void,
     model: if (build_options.enable_onnx) ortgenai.GenAiModel else void,
 
     pub fn loadFromDir(
         allocator: std.mem.Allocator,
         model_path: []const u8,
-        artifact_selection: manifest_mod.ArtifactSelection,
     ) !GenAiLoadedReader {
         if (!build_options.enable_onnx) return error.OnnxNotEnabled;
 
         const parser_kind = try detectParserKind(allocator, model_path);
         if (parser_kind != .moondream) return error.InvalidModelForReading;
 
-        var prepared_package = if (!artifact_selection.isEmpty()) blk: {
-            var selected_manifest = try manifest_mod.loadFromDirWithArtifactSelection(
-                allocator,
-                model_path,
-                artifact_selection,
-            );
-            defer selected_manifest.deinit();
-            const selected_onnx_path = selected_manifest.onnx_path orelse
-                return error.UnsupportedReaderArtifactSelection;
-            break :blk try ortgenai.prepareGenerativeModelPackageForArtifact(
-                allocator,
-                model_path,
-                selected_onnx_path,
-            );
-        } else (try ortgenai.prepareGenerativeModelPackage(allocator, model_path)) orelse
+        const prepared_model_dir = (try ortgenai.prepareGenerativeModelPackage(allocator, model_path)) orelse
             return error.InvalidModelForReading;
-        errdefer prepared_package.deinit();
+        errdefer allocator.free(prepared_model_dir);
 
-        const model = try ortgenai.GenAiModel.load(allocator, prepared_package.path);
+        const model = try ortgenai.GenAiModel.load(allocator, prepared_model_dir);
         errdefer {
             var model_mut = model;
             model_mut.deinit();
@@ -198,7 +178,7 @@ const GenAiLoadedReader = struct {
         return .{
             .allocator = allocator,
             .parser_kind = parser_kind,
-            .prepared_package = prepared_package,
+            .prepared_model_dir = prepared_model_dir,
             .model = model,
         };
     }
@@ -206,7 +186,7 @@ const GenAiLoadedReader = struct {
     pub fn deinit(self: *GenAiLoadedReader) void {
         if (!build_options.enable_onnx) return;
         self.model.deinit();
-        self.prepared_package.deinit();
+        self.allocator.free(self.prepared_model_dir);
     }
 
     pub fn read(self: *GenAiLoadedReader, image_data: []const u8, options: ReadOptions) !Result {
@@ -236,71 +216,31 @@ const GenAiLoadedReader = struct {
     }
 };
 
-const LoadedReaderImpl = union(enum) {
+pub const LoadedReader = union(enum) {
     vision: VisionLoadedReader,
     genai: GenAiLoadedReader,
     vlm: VlmLoadedReader,
     multistage: multistage_reader_mod.LoadedMultiStageReader,
-};
-
-pub const LoadedReader = struct {
-    impl: LoadedReaderImpl,
-    transient_lease: ?model_manager_mod.TransientModelLease = null,
 
     pub fn loadFromDir(
         allocator: std.mem.Allocator,
         model_path: []const u8,
         session_manager: *backends.SessionManager,
         model_manager: *model_manager_mod.ModelManager,
-        request_id: ?u64,
-        artifact_selection: manifest_mod.ArtifactSelection,
     ) !LoadedReader {
         if (multistage_metadata.isMultiStageModelDir(allocator, model_path)) {
-            if (!artifact_selection.isEmpty()) {
-                const format = artifact_selection.format orelse return error.UnsupportedReaderArtifactSelection;
-                if (!std.ascii.eqlIgnoreCase(format, "hybrid")) return error.UnsupportedReaderArtifactSelection;
-                // Composite readers select their stage files as one atomic
-                // hybrid package. Loading the selected manifest validates
-                // uniqueness and rejects quantization before any stage opens.
-                var selected_manifest = try manifest_mod.loadFromDirWithArtifactSelection(
-                    allocator,
-                    model_path,
-                    artifact_selection,
-                );
-                selected_manifest.deinit();
-            }
-            var lease = try beginTransientLease(model_manager, request_id);
-            errdefer deinitTransientLease(&lease);
-            var reader = try multistage_reader_mod.LoadedMultiStageReader.loadFromDir(allocator, model_path, session_manager);
-            errdefer reader.deinit();
-            try activateTransientLease(&lease);
-            return .{ .impl = .{ .multistage = reader }, .transient_lease = lease };
+            return .{ .multistage = try multistage_reader_mod.LoadedMultiStageReader.loadFromDir(allocator, model_path, session_manager) };
         }
 
         const parser_kind = try detectParserKind(allocator, model_path);
         if (parser_kind == .moondream) {
             if (onnx_decoder_only_vlm.isSupportedModelDir(allocator, model_path)) {
-                var lease = try beginTransientLease(model_manager, request_id);
-                errdefer deinitTransientLease(&lease);
-                var reader = try VlmLoadedReader.loadFromDir(allocator, model_path, artifact_selection);
-                errdefer reader.deinit();
-                try activateTransientLease(&lease);
-                return .{ .impl = .{ .vlm = reader }, .transient_lease = lease };
+                return .{ .vlm = try VlmLoadedReader.loadFromDir(allocator, model_path) };
             }
             if (build_options.enable_onnx) {
-                var lease = try beginTransientLease(model_manager, request_id);
-                if (GenAiLoadedReader.loadFromDir(allocator, model_path, artifact_selection)) |loaded| {
-                    errdefer deinitTransientLease(&lease);
-                    var reader = loaded;
-                    errdefer reader.deinit();
-                    try activateTransientLease(&lease);
-                    return .{ .impl = .{ .genai = reader }, .transient_lease = lease };
+                if (GenAiLoadedReader.loadFromDir(allocator, model_path)) |reader| {
+                    return .{ .genai = reader };
                 } else |err| {
-                    deinitTransientLease(&lease);
-                    // An exact artifact reference is authoritative. Do not
-                    // hide selection, manifest, or package failures by
-                    // silently switching to a different reader family.
-                    if (!artifact_selection.isEmpty()) return err;
                     std.log.warn("ortgenai moondream reader load failed for {s}: {s}", .{ model_path, @errorName(err) });
                 }
             }
@@ -309,31 +249,21 @@ pub const LoadedReader = struct {
             return error.NativePix2StructNotYetSupported;
         }
 
-        if (usesRequestScopedVisionSessions(allocator, model_path)) {
-            var lease = try beginTransientLease(model_manager, request_id);
-            errdefer deinitTransientLease(&lease);
-            var reader = try VisionLoadedReader.loadFromDir(allocator, model_path, session_manager, model_manager, request_id, artifact_selection);
-            errdefer reader.deinit();
-            try activateTransientLease(&lease);
-            return .{ .impl = .{ .vision = reader }, .transient_lease = lease };
-        }
-
-        return .{ .impl = .{ .vision = try VisionLoadedReader.loadFromDir(allocator, model_path, session_manager, model_manager, request_id, artifact_selection) } };
+        return .{ .vision = try VisionLoadedReader.loadFromDir(allocator, model_path, session_manager, model_manager) };
     }
 
     pub fn deinit(self: *LoadedReader) void {
-        switch (self.impl) {
+        switch (self.*) {
             .vision => |*reader| reader.deinit(),
             .genai => |*reader| reader.deinit(),
             .vlm => |*reader| reader.deinit(),
             .multistage => |*reader| reader.deinit(),
         }
-        deinitTransientLease(&self.transient_lease);
     }
 
     pub fn read(self: *LoadedReader, image_data: []const u8, options: ReadOptions) !Result {
         try validateReadOptions(options);
-        var result = try switch (self.impl) {
+        var result = try switch (self.*) {
             .vision => |*reader| reader.read(image_data, options),
             .genai => |*reader| reader.read(image_data, options),
             .vlm => |*reader| reader.read(image_data, options),
@@ -347,7 +277,7 @@ pub const LoadedReader = struct {
     pub fn readBatch(self: *LoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
         try validateReadOptions(options);
         const allocator = self.resultAllocator();
-        const results = try switch (self.impl) {
+        const results = try switch (self.*) {
             .vision => |*reader| reader.readBatch(image_datas, options),
             .genai => |*reader| reader.readBatch(image_datas, options),
             .vlm => |*reader| reader.readBatch(image_datas, options),
@@ -362,57 +292,11 @@ pub const LoadedReader = struct {
     }
 
     fn resultAllocator(self: *LoadedReader) std.mem.Allocator {
-        return switch (self.impl) {
+        return switch (self.*) {
             inline else => |*reader| reader.allocator,
         };
     }
 };
-
-fn beginTransientLease(model_manager: *model_manager_mod.ModelManager, request_id: ?u64) !?model_manager_mod.TransientModelLease {
-    return if (request_id) |id| try model_manager.beginTransientModelLoadForRequest(id) else null;
-}
-
-fn activateTransientLease(lease: *?model_manager_mod.TransientModelLease) !void {
-    if (lease.*) |*active| try active.activate();
-}
-
-fn deinitTransientLease(lease: *?model_manager_mod.TransientModelLease) void {
-    if (lease.*) |*active| active.deinit();
-    lease.* = null;
-}
-
-fn usesRequestScopedVisionSessions(allocator: std.mem.Allocator, model_path: []const u8) bool {
-    const paths = encoder_decoder.findEncoderDecoderPaths(allocator, model_path) catch return false;
-    allocator.free(paths.encoder);
-    allocator.free(paths.decoder);
-    return true;
-}
-
-test "reader identifies direct encoder-decoder sessions as request scoped" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "direct");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "direct/encoder_model.onnx", .data = "stub" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "direct/decoder_model.onnx", .data = "stub" });
-    try tmp.dir.createDirPath(std.testing.io, "managed");
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "managed/config.json",
-        .data = "{\"model_type\":\"florence2\",\"text_config\":{\"d_model\":768},\"vision_config\":{\"image_size\":768}}",
-    });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "managed/florence.gguf", .data = "stub" });
-
-    const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
-    defer allocator.free(base_dir);
-    const direct_dir = try std.fs.path.join(allocator, &.{ base_dir, "direct" });
-    defer allocator.free(direct_dir);
-    const managed_dir = try std.fs.path.join(allocator, &.{ base_dir, "managed" });
-    defer allocator.free(managed_dir);
-
-    try std.testing.expect(usesRequestScopedVisionSessions(allocator, direct_dir));
-    try std.testing.expect(!usesRequestScopedVisionSessions(allocator, managed_dir));
-}
 
 fn readBatchSerial(comptime ReaderType: type, reader: *ReaderType, image_datas: []const []const u8, options: ReadOptions) ![]Result {
     const allocator = reader.allocator;
