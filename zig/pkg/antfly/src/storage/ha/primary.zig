@@ -634,24 +634,50 @@ pub const Primary = struct {
     }
 
     fn recoverOrphanedBaseBackupStart(self: *Primary, request: BaseBackupStart, state: slot_store.SlotState) !?BaseBackupStartResult {
-        const previous_lsn = self.lastLsn();
-        if (state.lifecycle != .seeding or state.active or state.reseed_required or
-            state.restart_lsn != previous_lsn +| 1 or
-            state.received_lsn != previous_lsn or state.applied_lsn != previous_lsn or state.safe_read_lsn != previous_lsn)
+        if (state.lifecycle != .seeding or state.active or state.reseed_required or state.restart_lsn == 0 or
+            state.received_lsn != state.restart_lsn - 1 or
+            state.applied_lsn != state.restart_lsn - 1 or
+            state.safe_read_lsn != state.restart_lsn - 1)
             return null;
 
-        const payload = try backupStartPayload(self.alloc, self.identity, request.slot_name, request.manifest_id, state.restart_lsn);
+        var backup_lsn = state.restart_lsn;
+        const last_lsn = self.lastLsn();
+        if (backup_lsn <= last_lsn) {
+            var occupied = (try self.log.entryAt(self.alloc, backup_lsn)) orelse return null;
+            defer occupied.deinit(self.alloc);
+            if (occupied.record.kind == .backup_start) return null;
+
+            // The durable slot reservation survived, but another WAL record
+            // consumed its LSN before capture retried. No backup_start exists,
+            // so advance the inactive seeding reservation to the current WAL
+            // boundary and publish the start record there.
+            backup_lsn = self.nextLsn();
+            try self.slots.createOrUpdate(.{
+                .name = request.slot_name,
+                .timeline_id = self.identity.timeline_id,
+                .restart_lsn = backup_lsn,
+                .received_lsn = last_lsn,
+                .applied_lsn = last_lsn,
+                .safe_read_lsn = last_lsn,
+                .active = false,
+                .lifecycle = .seeding,
+            });
+        } else if (backup_lsn != last_lsn +| 1) {
+            return null;
+        }
+
+        const payload = try backupStartPayload(self.alloc, self.identity, request.slot_name, request.manifest_id, backup_lsn);
         defer self.alloc.free(payload);
         const start_lsn = try self.append(.{
             .kind = .backup_start,
             .payload_codec = .json,
             .payload = payload,
         });
-        if (start_lsn != state.restart_lsn) return error.BackupStartMismatch;
+        if (start_lsn != backup_lsn) return error.BackupStartMismatch;
         return .{
             .slot_name = request.slot_name,
             .manifest_id = request.manifest_id,
-            .backup_lsn = state.restart_lsn,
+            .backup_lsn = backup_lsn,
             .start_record_lsn = start_lsn,
         };
     }
@@ -1169,6 +1195,33 @@ test "storage.ha primary recovers reservation durable before backup start" {
     try std.testing.expectEqual(@as(u64, 2), recovered.backup_lsn);
     try std.testing.expectEqual(@as(u64, 2), recovered.start_record_lsn);
     try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+    const retried = try primary.beginBaseBackup(.{
+        .slot_name = "standby-a",
+        .manifest_id = "manifest-1",
+    });
+    try std.testing.expectEqual(recovered.backup_lsn, retried.backup_lsn);
+}
+
+test "storage.ha primary advances orphaned reservation after intervening WAL append" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "backup-start-orphan-occupied");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "before-backup" });
+    try primary.reserveBaseBackupSlot("standby-a", 2, 1);
+    try std.testing.expectEqual(@as(u64, 2), try primary.append(.{ .payload = "intervening-write" }));
+
+    const recovered = try primary.beginBaseBackup(.{
+        .slot_name = "standby-a",
+        .manifest_id = "manifest-1",
+    });
+    try std.testing.expectEqual(@as(u64, 3), recovered.backup_lsn);
+    try std.testing.expectEqual(@as(u64, 3), recovered.start_record_lsn);
+    try std.testing.expectEqual(@as(u64, 3), primary.lastLsn());
+
     const retried = try primary.beginBaseBackup(.{
         .slot_name = "standby-a",
         .manifest_id = "manifest-1",

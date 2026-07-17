@@ -199,6 +199,9 @@ const meta: Meta<typeof GraphIndexExplorer> = {
           inferenceApiUrl: "",
           setInferenceApiUrl: () => undefined,
           resetInferenceApiUrl: () => undefined,
+          inferenceConnectionId: "local-inference",
+          setInferenceConnectionId: () => undefined,
+          inferenceUrl: (operation) => `/ai/v1/${operation}`,
         }}
       >
         <div className="af-dashboard min-h-screen bg-background p-6">

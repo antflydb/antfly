@@ -22,7 +22,7 @@ import {
   Separator,
   Textarea,
 } from "@antfly/design-system";
-import { type ChunkResponse, InferenceClient } from "@antfly/sdk";
+import type { ChunkResponse } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   ClipboardCopy,
@@ -37,6 +37,7 @@ import {
 import type React from "react";
 import { useMemo, useRef, useState } from "react";
 import { PlaygroundEmptyState } from "@/components/branded-empty-state";
+import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useTable } from "@/hooks/use-table";
 
@@ -108,7 +109,7 @@ function extractDocumentText(source: Record<string, unknown>): string {
 }
 
 const AntflyChunkingPlaygroundPage: React.FC = () => {
-  const { client, inferenceApiUrl } = useApiConfig();
+  const { client, inferenceUrl } = useApiConfig();
   const { selectedTable, selectedIndex } = useTable();
 
   const [config, setConfig] = useState<ChunkConfig>(DEFAULT_CONFIG);
@@ -126,11 +127,6 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
   );
   const [isSearching, setIsSearching] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
-
-  const inferenceClient = useMemo(
-    () => new InferenceClient({ baseUrl: inferenceApiUrl }),
-    [inferenceApiUrl]
-  );
 
   const estimateTokens = (text: string): number => {
     return Math.ceil(text.length / 4);
@@ -214,30 +210,32 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
     try {
       const actualSeparator = config.separator.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
 
-      const data = await inferenceClient.chunk(
-        inputText,
-        {
-          model: config.model,
-          text: {
-            target_tokens: config.target_tokens,
-            overlap_tokens: config.overlap_tokens,
-            separator: actualSeparator,
+      const response = await fetch(inferenceUrl("chunk"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          input: inputText,
+          config: {
+            model: config.model,
+            text: {
+              target_tokens: config.target_tokens,
+              overlap_tokens: config.overlap_tokens,
+              separator: actualSeparator,
+            },
+            max_chunks: config.max_chunks,
+            threshold: config.threshold,
           },
-          max_chunks: config.max_chunks,
-          threshold: config.threshold,
-        },
-        { signal: abortControllerRef.current.signal }
-      );
+        }),
+        signal: abortControllerRef.current.signal,
+      });
+      if (!response.ok) throw new Error((await response.text()) || `HTTP ${response.status}`);
+      const data = (await response.json()) as ChunkResponse;
 
       setResult(data);
       setProcessingTime(performance.now() - startTime);
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") return;
-      setError(
-        err instanceof Error
-          ? err.message
-          : `Failed to connect to Antfly inference at ${inferenceApiUrl}`
-      );
+      setError(err instanceof Error ? err.message : "Failed to connect to inference");
     } finally {
       setIsLoading(false);
     }
@@ -327,6 +325,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
 
   return (
     <DashboardPage className="h-full space-y-3">
+      <BackendInfoBar />
       <DashboardPageHeader>
         <div>
           <DashboardPageTitle className="font-aeonik">Chunking Playground</DashboardPageTitle>

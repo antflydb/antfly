@@ -37,6 +37,7 @@ import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import type { SamplePreset } from "@/components/playground/SamplePresets";
 import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
+import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
 import { fetchWithRetry } from "@/lib/utils";
 
 // Recognition response types matching the Antfly inference extraction API.
@@ -81,15 +82,6 @@ interface KGResult {
   model: string;
   nodes: KGNode[];
   edges: KGEdge[];
-}
-
-interface ModelInfo {
-  capabilities?: string[];
-}
-
-interface ModelsResponse {
-  recognizers: Record<string, ModelInfo>;
-  [key: string]: Record<string, ModelInfo>;
 }
 
 interface ResolverConfig {
@@ -198,7 +190,7 @@ function getModelName(model: string): string {
 }
 
 const KnowledgeGraphPlaygroundPage: React.FC = () => {
-  const { inferenceApiUrl } = useApiConfig();
+  const { inferenceUrl } = useApiConfig();
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Restore state from localStorage
@@ -274,6 +266,8 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
   const [selectedNode, setSelectedNode] = useState<KGNode | null>(null);
   const [selectedEdge, setSelectedEdge] = useState<KGEdge | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const { models: connectionModels, loading: modelsLoading } =
+    useSelectedInferenceModelNames("recognizer");
 
   // Persist state to localStorage
   useEffect(() => {
@@ -283,47 +277,16 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     );
   }, [inputText, selectedModel, entityLabels, relationLabels, config]);
 
-  // Fetch available models on mount
   useEffect(() => {
-    const controller = new AbortController();
-    (async () => {
-      try {
-        const response = await fetch(`${inferenceApiUrl}/ai/v1/models`, {
-          signal: controller.signal,
-        });
-        if (response.ok) {
-          const data: ModelsResponse = await response.json();
-          const recognizersMap = data.recognizers || {};
-
-          // Filter for models with "relations" capability (REBEL, GLiNER multitask)
-          const relationModels = Object.entries(recognizersMap)
-            .filter(([, info]) => info.capabilities?.includes("relations"))
-            .map(([name]) => name);
-
-          // Mark REBEL models with prefix for special handling
-          const models = relationModels.map((m) => {
-            // REBEL models typically have "rebel" in the name
-            if (m.toLowerCase().includes("rebel")) {
-              return `rel:${m}`;
-            }
-            return m;
-          });
-
-          setAvailableModels(models);
-          setSelectedModel((prev: string) =>
-            prev && models.includes(prev) ? prev : models[0] || ""
-          );
-        }
-      } catch {
-        // Ignore fetch errors
-      } finally {
-        if (!controller.signal.aborted) {
-          setModelsLoaded(true);
-        }
-      }
-    })();
-    return () => controller.abort();
-  }, [inferenceApiUrl]);
+    const models = connectionModels.map((model) =>
+      model.toLowerCase().includes("rebel") ? `rel:${model}` : model
+    );
+    setAvailableModels(models);
+    setSelectedModel((current: string) =>
+      current && models.includes(current) ? current : models[0] || ""
+    );
+    setModelsLoaded(!modelsLoading);
+  }, [connectionModels, modelsLoading]);
 
   // Handle ?model= URL param from Model Directory "Open in Playground"
   useEffect(() => {
@@ -396,7 +359,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
         }
       }
 
-      const response = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/recognize`, {
+      const response = await fetchWithRetry(inferenceUrl("recognize"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -425,15 +388,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  }, [
-    inputText,
-    selectedModel,
-    isRebelModel,
-    entityLabels,
-    relationLabels,
-    config,
-    inferenceApiUrl,
-  ]);
+  }, [inputText, selectedModel, isRebelModel, entityLabels, relationLabels, config, inferenceUrl]);
 
   // Cmd+Enter shortcut
   useEffect(() => {

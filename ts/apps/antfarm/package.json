@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "node scripts/sync-command-index.mjs --check && tsc -b && vite build",
+    "test": "vitest run --project unit",
     "typecheck": "node scripts/sync-command-index.mjs --check && tsc -b",
     "generate": "node scripts/sync-command-index.mjs",
     "generate:commands": "node scripts/sync-command-index.mjs",

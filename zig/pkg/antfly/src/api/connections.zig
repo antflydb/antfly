@@ -143,6 +143,87 @@ pub const ConnectionsResponse = struct {
     connections: []const Connection = &.{},
 };
 
+pub const InvokeResult = struct {
+    status: u16,
+    body: []u8,
+};
+
+pub fn invokeInferenceConnection(
+    alloc: Allocator,
+    http: *httpx.Client,
+    node_config: *const common_config.Config,
+    secret_store: ?*common_secrets.FileStore,
+    connection_id: []const u8,
+    operation: []const u8,
+    body: []const u8,
+) !InvokeResult {
+    const required_capability = inferenceCapability(operation) orelse return error.UnsupportedInferenceOperation;
+    const connection = node_config.connections.get(connection_id) orelse return error.ConnectionNotFound;
+    if (connection.kind != .inference) return error.ConnectionNotInference;
+    try requireInferenceCapability(connection.capabilities, required_capability);
+    const cfg = connection.inference orelse return error.InvalidConfig;
+    if (!std.mem.eql(u8, cfg.provider, "antfly")) return error.ProviderNotAntflyCompatible;
+    const raw_url = cfg.url orelse return error.ConnectionURLMissing;
+    if (!validInferenceURL(raw_url)) return error.InvalidConnectionURL;
+    const base = std.mem.trimEnd(u8, raw_url, "/");
+    const prefix = if (std.mem.endsWith(u8, base, "/ai/v1")) base else try std.fmt.allocPrint(alloc, "{s}/ai/v1", .{base});
+    defer if (prefix.ptr != base.ptr) alloc.free(prefix);
+    const url = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, operation });
+    defer alloc.free(url);
+
+    const resolved_key = try resolveInferenceApiKey(alloc, secret_store, cfg.api_key);
+    defer if (resolved_key) |key| alloc.free(key);
+    const auth = if (resolved_key) |key| try std.fmt.allocPrint(alloc, "Bearer {s}", .{key}) else null;
+    defer if (auth) |value| alloc.free(value);
+    const headers = if (auth) |value| &[_][2][]const u8{
+        .{ "Authorization", value },
+        .{ "Content-Type", "application/json" },
+    } else &[_][2][]const u8{.{ "Content-Type", "application/json" }};
+
+    var response = try http.request(.POST, url, .{ .headers = headers, .body = body, .timeout_ms = 120_000 });
+    defer response.deinit();
+    return .{
+        .status = response.status.code,
+        .body = try alloc.dupe(u8, response.body orelse ""),
+    };
+}
+
+fn inferenceCapability(operation: []const u8) ?[]const u8 {
+    inline for (&.{
+        .{ "embed", "models.embed" },
+        .{ "generate", "models.generate" },
+        .{ "rerank", "models.rerank" },
+        .{ "chunk", "models.chunk" },
+        .{ "recognize", "models.recognize" },
+        .{ "extract", "models.extract" },
+        .{ "rewrite", "models.rewrite" },
+        .{ "read", "models.read" },
+        .{ "transcribe", "models.transcribe" },
+    }) |mapping| {
+        if (std.mem.eql(u8, operation, mapping[0])) return mapping[1];
+    }
+    return null;
+}
+
+fn resolveInferenceApiKey(
+    alloc: Allocator,
+    secret_store: ?*common_secrets.FileStore,
+    raw: ?[]const u8,
+) !?[]u8 {
+    return if (raw) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null;
+}
+
+fn requireInferenceCapability(capabilities: []const []const u8, required: []const u8) !void {
+    if (!containsString(capabilities, required)) return error.ConnectionCapabilityMissing;
+}
+
+fn validInferenceURL(raw_url: []const u8) bool {
+    if (std.mem.indexOfAny(u8, raw_url, "?#") != null) return false;
+    const parsed = std.Uri.parse(raw_url) catch return false;
+    return parsed.host != null and
+        (std.ascii.eqlIgnoreCase(parsed.scheme, "http") or std.ascii.eqlIgnoreCase(parsed.scheme, "https"));
+}
+
 pub const Sources = struct {
     node_config: ?*const common_config.Config = null,
     snapshot: ?*const metadata_api.AdminSnapshot = null,
@@ -377,6 +458,10 @@ pub fn buildConnectionsResponse(
 
     var connections = std.ArrayListUnmanaged(Connection).empty;
 
+    if (kinds.contains(.inference) and sources.antfly_provider != null) {
+        try appendLocalInferenceConnection(arena, &connections, sources, cache, effective_opts);
+    }
+
     if (sources.node_config) |node_config| {
         try appendConfiguredConnections(arena, &connections, sources, cache, effective_opts, kinds, node_config);
         if (effective_opts.probe and kinds.contains(.external_io)) {
@@ -385,6 +470,49 @@ pub fn buildConnectionsResponse(
     }
 
     return .{ .connections = connections.items };
+}
+
+fn appendLocalInferenceConnection(
+    arena: Allocator,
+    connections: *std.ArrayListUnmanaged(Connection),
+    sources: Sources,
+    cache: ?*Cache,
+    opts: BuildOptions,
+) !void {
+    const instance = try arena.create(Instance);
+    instance.* = .{
+        .provider = .antfly,
+        .key = "runtime:local-inference",
+    };
+    try instance.sources.append(arena, "runtime:local-inference");
+
+    var connection = Connection{
+        .id = common_config.local_inference_connection_id,
+        .name = common_config.local_inference_connection_id,
+        .display_name = "Local inference",
+        .kind = .inference,
+        .status = .configured,
+        .capabilities = &.{ "embedding", "generation", "reranking", "chunking" },
+        .sources = &.{"runtime:local-inference"},
+        .inference = .{ .provider = .antfly },
+    };
+
+    if (opts.include_models) {
+        const instances = try arena.alloc(*Instance, 1);
+        instances[0] = instance;
+        const outcomes = try resolveModels(arena, sources, cache, opts, instances);
+        if (outcomes[0]) |outcome| {
+            if (outcome.ok) {
+                connection.status = .connected;
+                connection.inference.?.models = try modelsMapAlloc(arena, outcome.models, instance);
+            } else {
+                connection.status = .@"error";
+                connection.@"error" = outcome.err_name;
+            }
+        }
+    }
+
+    try connections.append(arena, connection);
 }
 
 fn parseKindFilter(filter: []const u8) std.EnumSet(ConnectionKind) {
@@ -812,12 +940,17 @@ fn resolveModels(
             }
         }
 
+        const api_key = resolveInferenceApiKey(arena, sources.secret_store, instance.api_key) catch |err| {
+            outcomes[i] = .{ .ok = false, .err_name = @errorName(err) };
+            continue;
+        };
+
         const job = try arena.create(ModelsJob);
         job.* = .{
             .ep = .{
                 .provider = instance.provider,
                 .url = instance.url,
-                .api_key = instance.api_key,
+                .api_key = api_key,
                 .region = instance.region,
                 .project_id = instance.project_id,
                 .location = instance.location,
@@ -1287,6 +1420,75 @@ test "connection cache remains valid across every allocation failure" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "build response exposes embedded inference as a local connection" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const provider = managed_embedder.AntflyProvider{
+        .ptr = undefined,
+        .embed_dense_texts = undefined,
+        .embed_sparse_texts = undefined,
+    };
+    const response = try buildConnectionsResponse(
+        arena_state.allocator(),
+        .{ .antfly_provider = provider },
+        null,
+        .{ .types_filter = "inference" },
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), response.connections.len);
+    try std.testing.expectEqualStrings("local-inference", response.connections[0].id);
+    try std.testing.expectEqual(ConnectionKind.inference, response.connections[0].kind);
+    try std.testing.expectEqual(list_models.ProviderTag.antfly, response.connections[0].inference.?.provider);
+}
+
+test "inference connection operations are allowlisted" {
+    try std.testing.expectEqualStrings("models.generate", inferenceCapability("generate").?);
+    try std.testing.expectEqualStrings("models.embed", inferenceCapability("embed").?);
+    try std.testing.expect(inferenceCapability("../models") == null);
+
+    const embed_only = &.{"models.embed"};
+    try requireInferenceCapability(embed_only, inferenceCapability("embed").?);
+    try std.testing.expectError(error.ConnectionCapabilityMissing, requireInferenceCapability(embed_only, inferenceCapability("generate").?));
+
+    const alloc = std.testing.allocator;
+    var cfg = try common_config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "connections": {
+        \\    "embed-only": {
+        \\      "kind": "inference",
+        \\      "capabilities": ["models.embed"],
+        \\      "inference": { "provider": "antfly", "url": "https://platform.antfly.io" }
+        \\    }
+        \\  }
+        \\}
+    );
+    defer cfg.deinit();
+    try std.testing.expectError(error.ConnectionCapabilityMissing, invokeInferenceConnection(alloc, undefined, &cfg, null, "embed-only", "generate", "{}"));
+
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-connection-secrets-{d}.json", .{platform_time.monotonicNs()});
+    defer alloc.free(store_path);
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
+
+    var secret_store = try common_secrets.FileStore.init(alloc, store_path);
+    defer secret_store.deinit();
+    var stored = try secret_store.put(alloc, "openai.api_key", "resolved-key");
+    defer stored.deinit(alloc);
+
+    const resolved = (try resolveInferenceApiKey(alloc, &secret_store, "${secret:openai.api_key}")).?;
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings("resolved-key", resolved);
+}
+
+test "inference connection URLs require an HTTP origin" {
+    try std.testing.expect(validInferenceURL("https://platform.antfly.io/ai/v1"));
+    try std.testing.expect(validInferenceURL("http://antfly-inference.default.svc:8080"));
+    try std.testing.expect(!validInferenceURL("file:///etc/passwd"));
+    try std.testing.expect(!validInferenceURL("https://platform.antfly.io/ai/v1?redirect=bad"));
 }
 
 test "build response reports mock connected and types filter" {
