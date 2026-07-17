@@ -963,7 +963,10 @@ def compact_scaling_cluster() -> MultiNodeScalingCluster:
 def split_scaling_cluster() -> MultiNodeScalingCluster:
     cluster = MultiNodeScalingCluster(
         _scaling_antfly_binary(),
-        initial_data_node_count=5,
+        # Three voters still exercises placement and a real cross-node split,
+        # while avoiding a five-voter bootstrap race where newly provisioned
+        # groups can see only three peer routes and never elect a leader.
+        initial_data_node_count=3,
         max_shard_size_bytes=512,
     )
     try:
