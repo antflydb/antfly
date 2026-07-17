@@ -2887,6 +2887,7 @@ fn deleteDocumentExtractionForRuntime(
 /// machinery as replay-driven extraction.
 pub fn completeDocumentExtractionGeneratedTextForRequest(
     runtime: *EnrichmentRuntime,
+    alloc: Allocator,
     request: enrichment_types.GeneratedEnrichmentRequest,
     config: document_extraction_mod.Config,
     source_url: []const u8,
@@ -2895,13 +2896,14 @@ pub fn completeDocumentExtractionGeneratedTextForRequest(
     extraction: *document_extraction_mod.Result,
 ) !void {
     const producer = runtime.config.asset_producer orelse return;
-    const batch_policy = requestGeneratedTextBatchPolicy(runtime.alloc, request);
-    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .ocr, null);
-    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .transcript, null);
+    const batch_policy = requestGeneratedTextBatchPolicy(alloc, request);
+    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, alloc, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .ocr, null);
+    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, alloc, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .transcript, null);
 }
 
 fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     runtime: *EnrichmentRuntime,
+    alloc: Allocator,
     producer: asset_producer_mod.Producer,
     config: document_extraction_mod.Config,
     batch_policy: GeneratedTextBatchPolicy,
@@ -2943,13 +2945,13 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     const ocr_prompt = if (kind == .ocr) document_extraction_mod.effectiveOcrPrompt(config) else "";
 
     var requests = std.ArrayListUnmanaged(asset_producer_mod.Request).empty;
-    defer requests.deinit(runtime.alloc);
+    defer requests.deinit(alloc);
     var unit_indices = std.ArrayListUnmanaged(usize).empty;
-    defer unit_indices.deinit(runtime.alloc);
+    defer unit_indices.deinit(alloc);
     var parts_values = std.ArrayListUnmanaged([]u8).empty;
     defer {
-        clearRuntimeGeneratedTextBatchParts(runtime.alloc, &parts_values);
-        parts_values.deinit(runtime.alloc);
+        clearRuntimeGeneratedTextBatchParts(alloc, &parts_values);
+        parts_values.deinit(alloc);
     }
 
     var batch_bytes: usize = 0;
@@ -2957,23 +2959,23 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     defer if (owned_pdf_session) |*session| session.deinit();
     var pdf_session = pdf_session_override;
     if (pdf_session == null and kind == .ocr and std.mem.eql(u8, route_type, "pdf")) {
-        owned_pdf_session = try document_extraction_mod.PdfRenderSession.init(runtime.alloc, source_bytes);
+        owned_pdf_session = try document_extraction_mod.PdfRenderSession.init(alloc, source_bytes);
         pdf_session = &owned_pdf_session.?;
     }
     for (units, 0..) |unit, idx| {
         if (unit.extraction_status == null or !std.mem.eql(u8, unit.extraction_status.?, pending_status)) continue;
         var rendered: ?[]u8 = null;
-        defer if (rendered) |png| runtime.alloc.free(png);
+        defer if (rendered) |png| alloc.free(png);
         if (kind == .ocr) {
             units[idx].ocr_attempted = true;
             if (std.mem.eql(u8, route_type, "pdf")) {
                 units[idx].ocr_render_dpi = config.ocr_render_dpi;
                 const render_started_ns = runtime.config.clock.nowRealtimeNs();
-                const rendered_page = pdf_session.?.renderPagePngAdaptiveAlloc(runtime.alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels, config.ocr_max_rendered_dimension) catch |err| {
+                const rendered_page = pdf_session.?.renderPagePngAdaptiveAlloc(alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels, config.ocr_max_rendered_dimension) catch |err| {
                     logRuntimeOcrRenderProfile(runtime, profile_source_id, unit.page_number, config.ocr_render_dpi, null, null, null, null, render_started_ns, @errorName(err));
                     if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
-                    try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[idx], kind, "render");
-                    try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[idx], method, kind, err);
+                    try setRuntimeGeneratedUnitFailureStage(alloc, &units[idx], kind, "render");
+                    try markRuntimeGeneratedUnitTextFailure(alloc, &units[idx], method, kind, err);
                     continue;
                 };
                 units[idx].ocr_effective_render_dpi = rendered_page.effective_dpi;
@@ -2990,17 +2992,17 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
         if (rendered) |png| {
             const encoded_len = std.base64.standard.Encoder.calcSize(png.len);
             if (encoded_len >= batch_policy.max_bytes or config_json.len >= batch_policy.max_bytes - encoded_len) {
-                try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[idx], kind, "request");
-                try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[idx], method, kind, error.GeneratedTextRequestTooLarge);
+                try setRuntimeGeneratedUnitFailureStage(alloc, &units[idx], kind, "request");
+                try markRuntimeGeneratedUnitTextFailure(alloc, &units[idx], method, kind, error.GeneratedTextRequestTooLarge);
                 continue;
             }
         }
         const parts_json = if (rendered) |png|
-            try document_extraction_mod.ocrPagePartsJsonAlloc(runtime.alloc, config, route_type, source_content_type, unit, png)
+            try document_extraction_mod.ocrPagePartsJsonAlloc(alloc, config, route_type, source_content_type, unit, png)
         else
-            try runtimeDocumentGeneratedTextPartsJsonAlloc(runtime.alloc, route_type, source_content_type, unit);
+            try runtimeDocumentGeneratedTextPartsJsonAlloc(alloc, route_type, source_content_type, unit);
         var owns_parts_json = true;
-        errdefer if (owns_parts_json) runtime.alloc.free(parts_json);
+        errdefer if (owns_parts_json) alloc.free(parts_json);
         const request = asset_producer_mod.Request{
             .producer_type = producer_type,
             .config_json = config_json,
@@ -3011,26 +3013,26 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
         };
         const request_bytes = runtimeGeneratedTextRequestBytes(request);
         if (request_bytes > batch_policy.max_bytes) {
-            try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[idx], kind, "request");
-            try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[idx], method, kind, error.GeneratedTextRequestTooLarge);
-            runtime.alloc.free(parts_json);
+            try setRuntimeGeneratedUnitFailureStage(alloc, &units[idx], kind, "request");
+            try markRuntimeGeneratedUnitTextFailure(alloc, &units[idx], method, kind, error.GeneratedTextRequestTooLarge);
+            alloc.free(parts_json);
             owns_parts_json = false;
             continue;
         }
         if (requests.items.len > 0 and (requests.items.len >= batch_policy.max_items or batch_bytes + request_bytes > batch_policy.max_bytes)) {
-            try flushRuntimeGeneratedTextBatch(runtime, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, profile_source_id);
+            try flushRuntimeGeneratedTextBatch(runtime, alloc, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, profile_source_id);
             requests.clearRetainingCapacity();
             unit_indices.clearRetainingCapacity();
             batch_bytes = 0;
         }
-        try parts_values.append(runtime.alloc, parts_json);
+        try parts_values.append(alloc, parts_json);
         owns_parts_json = false;
-        try unit_indices.append(runtime.alloc, idx);
-        try requests.append(runtime.alloc, request);
+        try unit_indices.append(alloc, idx);
+        try requests.append(alloc, request);
         batch_bytes = addUsizeSaturating(batch_bytes, request_bytes);
     }
     if (requests.items.len > 0) {
-        try flushRuntimeGeneratedTextBatch(runtime, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, profile_source_id);
+        try flushRuntimeGeneratedTextBatch(runtime, alloc, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, profile_source_id);
     }
 }
 
@@ -3051,6 +3053,7 @@ fn clearRuntimeGeneratedTextBatchParts(
 
 fn flushRuntimeGeneratedTextBatch(
     runtime: *EnrichmentRuntime,
+    alloc: Allocator,
     producer: asset_producer_mod.Producer,
     requests: []const asset_producer_mod.Request,
     unit_indices: []const usize,
@@ -3067,41 +3070,42 @@ fn flushRuntimeGeneratedTextBatch(
 
     const started_ns = runtime.config.clock.nowRealtimeNs();
     const request_bytes = runtimeGeneratedTextBatchBytes(requests);
-    var produced = producer.produceBatch(runtime.alloc, requests) catch |err| {
+    var produced = producer.produceBatch(alloc, requests) catch |err| {
         logRuntimeOcrBatchProfile(runtime, profile_source_id, units, unit_indices, requests.len, request_bytes, "serial_fallback", @errorName(err), started_ns);
         if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
-        for (unit_indices) |unit_idx| try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[unit_idx], kind, "inference");
-        return try flushRuntimeGeneratedTextBatchSequential(runtime, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, profile_source_id, @errorName(err));
+        for (unit_indices) |unit_idx| try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, "inference");
+        return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, profile_source_id, @errorName(err));
     };
     if (produced.len != requests.len) {
         for (produced) |item| {
-            if (item.len > 0) runtime.alloc.free(item);
+            if (item.len > 0) alloc.free(item);
         }
-        runtime.alloc.free(produced);
+        alloc.free(produced);
         logRuntimeOcrBatchProfile(runtime, profile_source_id, units, unit_indices, requests.len, request_bytes, "serial_fallback", "response_count_mismatch", started_ns);
-        return try flushRuntimeGeneratedTextBatchSequential(runtime, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, profile_source_id, "response_count_mismatch");
+        return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, profile_source_id, "response_count_mismatch");
     }
     logRuntimeOcrBatchProfile(runtime, profile_source_id, units, unit_indices, requests.len, request_bytes, "batch", null, started_ns);
 
-    defer runtime.alloc.free(produced);
+    defer alloc.free(produced);
     errdefer {
         for (produced) |item| {
-            if (item.len > 0) runtime.alloc.free(item);
+            if (item.len > 0) alloc.free(item);
         }
     }
     for (produced, unit_indices, 0..) |item, unit_idx, i| {
         produced[i] = &.{};
-        applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], item, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
+        applyRuntimeGeneratedUnitText(alloc, &units[unit_idx], item, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
             if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
-            try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
-            try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
+            try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
+            try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
         };
     }
-    clearRuntimeGeneratedTextBatchParts(runtime.alloc, parts_values);
+    clearRuntimeGeneratedTextBatchParts(alloc, parts_values);
 }
 
 fn flushRuntimeGeneratedTextBatchSequential(
     runtime: *EnrichmentRuntime,
+    alloc: Allocator,
     producer: asset_producer_mod.Producer,
     requests: []const asset_producer_mod.Request,
     unit_indices: []const usize,
@@ -3117,21 +3121,21 @@ fn flushRuntimeGeneratedTextBatchSequential(
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
     for (requests, unit_indices) |request, unit_idx| {
         const started_ns = runtime.config.clock.nowRealtimeNs();
-        const produced = producer.produce(runtime.alloc, request) catch |err| {
+        const produced = producer.produce(alloc, request) catch |err| {
             logRuntimeOcrBatchProfile(runtime, profile_source_id, units, &.{unit_idx}, 1, runtimeGeneratedTextRequestBytes(request), "serial", @errorName(err), started_ns);
             if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
-            try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
-            try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
+            try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
+            try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
             continue;
         };
         logRuntimeOcrBatchProfile(runtime, profile_source_id, units, &.{unit_idx}, 1, runtimeGeneratedTextRequestBytes(request), "serial", fallback_reason, started_ns);
-        applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], produced, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
+        applyRuntimeGeneratedUnitText(alloc, &units[unit_idx], produced, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
             if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
-            try setRuntimeGeneratedUnitFailureStage(runtime.alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
-            try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
+            try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
+            try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
         };
     }
-    clearRuntimeGeneratedTextBatchParts(runtime.alloc, parts_values);
+    clearRuntimeGeneratedTextBatchParts(alloc, parts_values);
 }
 
 fn runtimeGeneratedTextBatchBytes(requests: []const asset_producer_mod.Request) usize {
@@ -3829,6 +3833,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
         }
         try completeRuntimeDocumentExtractionGeneratedTextBatch(
             self.runtime,
+            self.runtime.alloc,
             producer,
             self.config,
             self.batch_policy,
@@ -9463,6 +9468,7 @@ test "synchronous document extraction OCR batches honor request execution item c
     };
     try completeDocumentExtractionGeneratedTextForRequest(
         &runtime,
+        alloc,
         .{
             .kind = .asset,
             .index_name = "document_units_v1",
@@ -9545,6 +9551,7 @@ test "document extraction rejects and records Florence prompt echoes" {
 
     try completeRuntimeDocumentExtractionGeneratedTextBatch(
         &runtime,
+        alloc,
         producer,
         .{ .ocr_enabled = true, .ocr_model = "antflydb/Florence-2-base" },
         .{ .max_items = 8, .max_bytes = 1024 * 1024 },
@@ -9748,6 +9755,7 @@ test "document extraction generated OCR batch fallback isolates permanent unit f
 
     try completeRuntimeDocumentExtractionGeneratedTextBatch(
         &runtime,
+        alloc,
         producer,
         .{ .ocr_enabled = true },
         .{ .max_items = 8, .max_bytes = 1024 * 1024 },
@@ -9846,6 +9854,7 @@ test "document extraction generated OCR batch fallback isolates malformed batch 
 
     try completeRuntimeDocumentExtractionGeneratedTextBatch(
         &runtime,
+        alloc,
         producer,
         .{ .ocr_enabled = true },
         .{ .max_items = 8, .max_bytes = 1024 * 1024 },

@@ -21713,6 +21713,7 @@ fn computeDocumentExtractionAssetRequestDerived(
     if (db.enrichment_runtime) |runtime| {
         try enrichment_runtime_mod.completeDocumentExtractionGeneratedTextForRequest(
             runtime,
+            alloc,
             request,
             config,
             source_url,
