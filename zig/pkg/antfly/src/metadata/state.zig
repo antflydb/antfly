@@ -601,6 +601,11 @@ pub fn mergeHealthyGroupStatuses(
 
         for (store.group_statuses) |group_status| {
             if (placement_intents.len > 0 and !storeHasPlacement(placement_intents, group_status.group_id, store.node_id)) continue;
+            if (placement_intents.len > 0 and !groupStatusMatchesPlacementGeneration(
+                placement_intents,
+                store.node_id,
+                group_status,
+            )) continue;
             const entry = try indexes.getOrPut(alloc, group_status.group_id);
             if (!entry.found_existing) {
                 entry.value_ptr.* = states.items.len;
@@ -735,6 +740,18 @@ pub fn mergeHealthyGroupStatuses(
     overlayRestoreReadiness(merged, tables, ranges, placement_intents, restore_progresses);
     refreshDocIdentityLifecycles(merged);
     return merged;
+}
+
+fn groupStatusMatchesPlacementGeneration(
+    placements: []const raft_reconciler.PlacementIntent,
+    node_id: u64,
+    status: metadata_table_manager.GroupStatusReport,
+) bool {
+    for (placements) |intent| {
+        if (intent.record.group_id != status.group_id or intent.record.local_node_id != node_id) continue;
+        return intent.relocation_generation == status.relocation_generation;
+    }
+    return false;
 }
 
 pub fn freeMergedGroupStatuses(alloc: std.mem.Allocator, statuses: []metadata_reconciler.MergedGroupStatus) void {
@@ -2007,7 +2024,7 @@ test "metadata state tracks authoritative voter count when healthy peers agree" 
 test "metadata state ignores group status from stores without current placement" {
     const placement_intents = [_]raft_reconciler.PlacementIntent{
         .{ .record = .{ .group_id = 7204, .replica_id = 1, .local_node_id = 2, .bootstrap_mode = .persisted }, .store_id = 22, .peer_node_ids = &.{ 2, 3 } },
-        .{ .record = .{ .group_id = 7204, .replica_id = 2, .local_node_id = 3, .bootstrap_mode = .persisted }, .store_id = 33, .peer_node_ids = &.{ 2, 3 } },
+        .{ .record = .{ .group_id = 7204, .replica_id = 2, .local_node_id = 3, .bootstrap_mode = .persisted }, .store_id = 33, .peer_node_ids = &.{ 2, 3 }, .relocation_generation = 7 },
     };
     const stores = [_]metadata_table_manager.StoreRecord{
         .{
@@ -2019,6 +2036,7 @@ test "metadata state ignores group status from stores without current placement"
             .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{
                 .{
                     .group_id = 7204,
+                    .relocation_generation = 6,
                     .doc_count = 99,
                     .disk_bytes = 990,
                     .empty = false,
@@ -2057,6 +2075,7 @@ test "metadata state ignores group status from stores without current placement"
             .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{
                 .{
                     .group_id = 7204,
+                    .relocation_generation = 6,
                     .doc_count = 10,
                     .disk_bytes = 100,
                     .empty = false,
@@ -2077,7 +2096,7 @@ test "metadata state ignores group status from stores without current placement"
     try std.testing.expectEqual(@as(u64, 10), merged[0].doc_count);
     try std.testing.expect(merged[0].voter_count_known);
     try std.testing.expectEqual(@as(u16, 2), merged[0].voter_count);
-    try std.testing.expectEqual(@as(u16, 2), merged[0].healthy_voter_reports);
+    try std.testing.expectEqual(@as(u16, 1), merged[0].healthy_voter_reports);
 }
 
 test "metadata state marks restore-pending groups as not yet ready" {

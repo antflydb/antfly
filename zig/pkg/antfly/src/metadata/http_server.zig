@@ -1977,6 +1977,8 @@ fn persistRestoreTableIntent(service_impl: anytype, alloc: std.mem.Allocator, ta
 
 const ParsedGroupStatus = struct {
     group_id: u64,
+    relocation_generation: ?u64 = null,
+    raft_applied_index: ?u64 = null,
     doc_count: ?u64 = null,
     disk_bytes: ?u64 = null,
     empty: ?bool = null,
@@ -2218,6 +2220,8 @@ fn cloneParsedGroupStatuses(
     for (parsed_group_statuses, 0..) |parsed, i| {
         out[i] = .{
             .group_id = parsed.group_id,
+            .relocation_generation = parsed.relocation_generation orelse 0,
+            .raft_applied_index = parsed.raft_applied_index orelse 0,
             .doc_count = parsed.doc_count orelse 0,
             .disk_bytes = parsed.disk_bytes orelse 0,
             .empty = parsed.empty orelse true,

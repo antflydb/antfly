@@ -99,6 +99,25 @@ pub const PlacementPlanner = struct {
         candidate_domains: []const CandidateDomain,
         provisioning_ranges: []const table_manager.RangeRecord,
     ) ![]raft_reconciler.PlacementIntent {
+        return try self.planAllIntentsWithConstraints(
+            manager,
+            candidate_node_ids,
+            current_intents,
+            candidate_domains,
+            provisioning_ranges,
+            &.{},
+        );
+    }
+
+    pub fn planAllIntentsWithConstraints(
+        self: *const PlacementPlanner,
+        manager: *table_manager.TableManager,
+        candidate_node_ids: []const u64,
+        current_intents: []const raft_reconciler.PlacementIntent,
+        candidate_domains: []const CandidateDomain,
+        provisioning_ranges: []const table_manager.RangeRecord,
+        protected_group_ids: []const u64,
+    ) ![]raft_reconciler.PlacementIntent {
         if (candidate_node_ids.len == 0) return error.MissingCandidateNodes;
 
         const tables = try manager.listTables(self.alloc);
@@ -148,6 +167,7 @@ pub const PlacementPlanner = struct {
                 candidate_node_ids,
                 candidate_domains,
                 table.placement_role,
+                std.sort.binarySearch(u64, protected_group_ids, range.group_id, comptime std.sort.asc(u64)) != null,
             );
             defer self.alloc.free(preserved);
             for (preserved) |node_id| {
@@ -459,6 +479,7 @@ fn collectCurrentPeers(
     candidate_node_ids: []const u64,
     candidate_domains: []const CandidateDomain,
     placement_role: []const u8,
+    protect_current_members: bool,
 ) ![]u64 {
     const ExistingPeer = struct {
         node_id: u64,
@@ -471,7 +492,7 @@ fn collectCurrentPeers(
         if (intent.record.group_id != group_id) continue;
         if (!containsNode(candidate_node_ids, intent.record.local_node_id)) continue;
         if (!candidateRoleMatches(candidate_domains, intent.record.local_node_id, placement_role)) continue;
-        if (!candidateRetentionAllowed(candidate_domains, intent.record.local_node_id)) continue;
+        if (!candidateRetentionAllowed(candidate_domains, intent.record.local_node_id, protect_current_members)) continue;
         var duplicate = false;
         for (peers.items) |peer| {
             if (peer.node_id == intent.record.local_node_id) {
@@ -567,9 +588,11 @@ fn candidateLoadPressure(candidate_domains: []const CandidateDomain, node_id: u6
     return 0;
 }
 
-fn candidateRetentionAllowed(candidate_domains: []const CandidateDomain, node_id: u64) bool {
+fn candidateRetentionAllowed(candidate_domains: []const CandidateDomain, node_id: u64, protect_current_member: bool) bool {
     for (candidate_domains) |candidate| {
-        if (candidate.node_id == node_id) return candidate.status_tag != .excluded and candidate.retain_current;
+        if (candidate.node_id == node_id) {
+            return candidate.status_tag != .excluded and (protect_current_member or candidate.retain_current);
+        }
     }
     return true;
 }
@@ -902,4 +925,44 @@ test "placement planner tags replacement with the dropped current peer as source
     try std.testing.expectEqual(@as(u64, 101), target.relocation_source_node_id);
     try std.testing.expectEqual(@as(u64, 101), target.relocation_source_store_id);
     try std.testing.expectEqual(raft_reconciler.PlacementServingState.bootstrapping, target.serving_state);
+}
+
+test "placement planner preserves protected unconverged members during forced rebalance" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+    try manager.upsertTable(.{ .table_id = 151, .name = "docs", .desired_replica_count = 3 });
+    try manager.upsertRange(.{
+        .group_id = 15101,
+        .table_id = 151,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 15101, .replica_id = 1, .local_node_id = 101 }, .peer_node_ids = &.{ 101, 102, 105 } },
+        .{ .record = .{ .group_id = 15101, .replica_id = 2, .local_node_id = 102 }, .peer_node_ids = &.{ 101, 102, 105 } },
+        .{ .record = .{ .group_id = 15101, .replica_id = 3, .local_node_id = 105 }, .peer_node_ids = &.{ 101, 102, 105 } },
+    };
+    const candidates = [_]CandidateDomain{
+        .{ .node_id = 101, .role = "data", .failure_domain = "rack-a", .retain_current = false },
+        .{ .node_id = 102, .role = "data", .failure_domain = "rack-b", .retain_current = false },
+        .{ .node_id = 103, .role = "data", .failure_domain = "rack-c", .retain_current = false },
+        .{ .node_id = 104, .role = "data", .failure_domain = "rack-d", .retain_current = false },
+        .{ .node_id = 105, .role = "data", .failure_domain = "rack-e", .retain_current = false },
+    };
+
+    var planner = PlacementPlanner.init(std.testing.allocator);
+    const intents = try planner.planAllIntentsWithConstraints(
+        &manager,
+        &.{ 101, 102, 103, 104, 105 },
+        &current,
+        &candidates,
+        &.{},
+        &.{15101},
+    );
+    defer planner.freeIntents(std.testing.allocator, intents);
+    try std.testing.expectEqual(@as(usize, 3), intents.len);
+    try std.testing.expect(findCurrentIntent(intents, 15101, 101) != null);
+    try std.testing.expect(findCurrentIntent(intents, 15101, 102) != null);
+    try std.testing.expect(findCurrentIntent(intents, 15101, 105) != null);
 }

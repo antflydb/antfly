@@ -621,15 +621,26 @@ fn preserveArtifactVisibilityOnReplayRegression(previous: LocalTableRuntimeStatu
         const cached = findMatchingIndexStatus(previous.stats.indexes, dst.name, dst.kind) orelse continue;
         const applied_regressed = dst.replay_applied_sequence < cached.replay_applied_sequence;
         const target_not_older = dst.replay_target_sequence >= cached.replay_target_sequence;
+        const same_projection_config = if (dst.projection_checkpoint_config_hash != 0 and
+            cached.projection_checkpoint_config_hash != 0)
+            dst.projection_checkpoint_config_hash == cached.projection_checkpoint_config_hash
+        else
+            dst.coverage_config_hash != 0 and
+                dst.coverage_config_hash == cached.coverage_config_hash;
+        const same_projection = same_projection_config and
+            dst.projection_checkpoint_generation <= cached.projection_checkpoint_generation;
+        const projection_regressed = same_projection and
+            dst.projection_checkpoint_applied_sequence < cached.projection_checkpoint_applied_sequence;
         const cached_has_visibility = indexHasArtifactVisibilityFacts(cached);
         const dst_has_visibility = indexHasArtifactVisibilityFacts(dst.*);
         const visibility_regressed_without_newer_replay = target_not_older and
             cached_has_visibility and
             !dst_has_visibility and
             dst.replay_applied_sequence <= cached.replay_applied_sequence;
-        if (!applied_regressed and !visibility_regressed_without_newer_replay) continue;
+        if (!applied_regressed and !projection_regressed and !visibility_regressed_without_newer_replay) continue;
 
         preserveIndexArtifactVisibility(dst, cached);
+        if (projection_regressed) preserveIndexProjectionLifecycle(dst, cached);
         dst.replay_applied_sequence = @max(dst.replay_applied_sequence, cached.replay_applied_sequence);
         dst.replay_target_sequence = @max(dst.replay_target_sequence, cached.replay_target_sequence);
         dst.catch_up_applied_sequence = @max(dst.catch_up_applied_sequence, cached.catch_up_applied_sequence);
@@ -651,6 +662,24 @@ fn preserveArtifactVisibilityOnReplayRegression(previous: LocalTableRuntimeStatu
     if (preserved_visibility and incoming.stats.source_doc_count < previous.stats.source_doc_count) {
         incoming.stats.source_doc_count = previous.stats.source_doc_count;
     }
+}
+
+fn preserveIndexProjectionLifecycle(dst: *db_mod.types.DBIndexStats, cached: db_mod.types.DBIndexStats) void {
+    dst.coverage_produced_count = cached.coverage_produced_count;
+    dst.coverage_skipped_count = cached.coverage_skipped_count;
+    dst.coverage_terminal_failed_count = cached.coverage_terminal_failed_count;
+    dst.coverage_config_hash = cached.coverage_config_hash;
+    dst.coverage_summary_ready = cached.coverage_summary_ready;
+    dst.coverage_generation = cached.coverage_generation;
+    dst.coverage_identity_ready = cached.coverage_identity_ready;
+    dst.backfill_active = cached.backfill_active;
+    dst.backfill_progress = cached.backfill_progress;
+    dst.enrichment_failed = cached.enrichment_failed;
+    dst.projection_checkpoint_status = cached.projection_checkpoint_status;
+    dst.projection_checkpoint_applied_sequence = cached.projection_checkpoint_applied_sequence;
+    dst.projection_checkpoint_generation = cached.projection_checkpoint_generation;
+    dst.projection_checkpoint_config_hash = cached.projection_checkpoint_config_hash;
+    dst.checkpoint_replay_tail_sequence_count = cached.checkpoint_replay_tail_sequence_count;
 }
 
 fn runtimeStatusWorthPreserving(status: LocalTableRuntimeStatus) bool {
@@ -2197,6 +2226,87 @@ test "table runtime snapshot cache live publication does not starve structural r
     defer docs.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 12), docs.items[0].stats.doc_count);
     try std.testing.expectEqual(live_token.observation_generation, docs.items[0].cache_observation_generation);
+}
+
+test "table runtime snapshot cache preserves live completion over regressing persisted projection" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    var live_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 1,
+        .coverage_produced_count = 1,
+        .coverage_config_hash = 77,
+        .coverage_generation = 1,
+        .coverage_identity_ready = true,
+        .backfill_progress = 1.0,
+        .projection_checkpoint_status = "clean",
+        .projection_checkpoint_applied_sequence = 2,
+        .projection_checkpoint_generation = 0,
+        .projection_checkpoint_config_hash = 0,
+        .replay_applied_sequence = 2,
+        .replay_target_sequence = 2,
+    }};
+    const live_token = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(live_token, "docs", .{
+        .group_id = 7001,
+        .stats = .{
+            .source_doc_count = 1,
+            .doc_count = 1,
+            .index_count = 1,
+            .indexes = live_indexes[0..],
+        },
+    }));
+
+    const table_names = [_][]const u8{"docs"};
+    var refresh_token = try cache.captureCatalogToken(alloc, &table_names, true);
+    defer refresh_token.deinit();
+    const refresh_indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1);
+    refresh_indexes[0] = .{
+        .name = try alloc.dupe(u8, "semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 1,
+        .coverage_produced_count = 1,
+        .coverage_config_hash = 77,
+        .coverage_generation = 1,
+        .coverage_identity_ready = true,
+        .backfill_active = true,
+        .backfill_progress = 0.5,
+        .projection_checkpoint_status = "rebuilding",
+        .projection_checkpoint_applied_sequence = 0,
+        .projection_checkpoint_generation = 0,
+        .projection_checkpoint_config_hash = 0,
+        .replay_applied_sequence = 2,
+        .replay_target_sequence = 2,
+    };
+    const refresh_statuses = try alloc.alloc(LocalTableRuntimeStatus, 1);
+    refresh_statuses[0] = .{
+        .group_id = 7001,
+        .stats = .{
+            .source_doc_count = 0,
+            .doc_count = 1,
+            .index_count = 1,
+            .indexes = refresh_indexes,
+        },
+    };
+    const refresh = try alloc.alloc(TableRuntimeSnapshot, 1);
+    defer alloc.free(refresh);
+    refresh[0] = .{
+        .table_name = try alloc.dupe(u8, "docs"),
+        .statuses = .{ .items = refresh_statuses },
+    };
+    var refresh_result = try cache.publishRefresh(&refresh_token, refresh);
+    defer refresh_result.deinit();
+
+    var published = (try cache.snapshot(alloc, "docs")).?;
+    defer published.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), published.items[0].stats.source_doc_count);
+    try std.testing.expectEqualStrings("clean", published.items[0].stats.indexes[0].projection_checkpoint_status);
+    try std.testing.expectEqual(@as(u64, 2), published.items[0].stats.indexes[0].projection_checkpoint_applied_sequence);
+    try std.testing.expect(!published.items[0].stats.indexes[0].backfill_active);
+    try std.testing.expectEqual(@as(f64, 1.0), published.items[0].stats.indexes[0].backfill_progress);
 }
 
 test "table runtime snapshot cache table fences isolate unrelated invalidations" {

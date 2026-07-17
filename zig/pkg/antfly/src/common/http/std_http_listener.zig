@@ -1824,9 +1824,8 @@ test "std http executor runs timed requests concurrently" {
     const completion_wait_iterations = 10_000;
 
     const App = struct {
-        io: std.Io,
-        entered_slow: std.Io.Event = .unset,
-        release_slow: std.Io.Event = .unset,
+        entered_slow: std.atomic.Value(bool) = .init(false),
+        release_slow: std.atomic.Value(bool) = .init(false),
 
         fn executor(self: *@This()) common.RequestExecutor {
             return .{
@@ -1840,8 +1839,8 @@ test "std http executor runs timed requests concurrently" {
         fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (std.mem.eql(u8, req.uri, "/slow")) {
-                self.entered_slow.set(self.io);
-                self.release_slow.waitUncancelable(self.io);
+                self.entered_slow.store(true, .release);
+                while (!self.release_slow.load(.acquire)) sleepMs(1);
                 return .{
                     .status = 200,
                     .content_type = try alloc.dupe(u8, "text/plain; charset=utf-8"),
@@ -1866,13 +1865,12 @@ test "std http executor runs timed requests concurrently" {
     const RequestThread = struct {
         uri: []const u8,
         executor: common.RequestExecutor,
-        io: std.Io,
         status: std.atomic.Value(u16) = .init(0),
         failed: std.atomic.Value(bool) = .init(false),
-        done: std.Io.Event = .unset,
+        done: std.atomic.Value(bool) = .init(false),
 
         fn run(self: *@This()) void {
-            defer self.done.set(self.io);
+            defer self.done.store(true, .release);
             var response = self.executor.execute(std.heap.page_allocator, .{
                 .method = .GET,
                 .uri = self.uri,
@@ -1887,10 +1885,7 @@ test "std http executor runs timed requests concurrently" {
         }
     };
 
-    var event_io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer event_io_impl.deinit();
-    const event_io = event_io_impl.io();
-    var app = App{ .io = event_io };
+    var app = App{};
     var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
     defer executor.deinit();
     const request_executor = executor.executor();
@@ -1909,7 +1904,7 @@ test "std http executor runs timed requests concurrently" {
     const fast_uri = try std.fmt.allocPrint(std.testing.allocator, "{s}/fast", .{base_uri});
     defer std.testing.allocator.free(fast_uri);
 
-    var slow_req = RequestThread{ .uri = slow_uri, .executor = request_executor, .io = event_io };
+    var slow_req = RequestThread{ .uri = slow_uri, .executor = request_executor };
     const slow_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&slow_req});
     defer slow_thread.join();
     defer app.release_slow.store(true, .release);
@@ -1924,7 +1919,7 @@ test "std http executor runs timed requests concurrently" {
     }
     try std.testing.expect(saw_slow);
 
-    var fast_req = RequestThread{ .uri = fast_uri, .executor = request_executor, .io = event_io };
+    var fast_req = RequestThread{ .uri = fast_uri, .executor = request_executor };
     const fast_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&fast_req});
     defer fast_thread.join();
 

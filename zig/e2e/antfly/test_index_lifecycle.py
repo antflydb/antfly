@@ -997,7 +997,10 @@ def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
         }
         assert stateful_api.create_index(table_name, index_name, index_payload) == {}
         assert wait_until(
-            lambda table_name=table_name: ready_index_status(stateful_api.get_index(table_name, index_name)),
+            lambda table_name=table_name: ready_index_status(
+                stateful_api.get_index(table_name, index_name),
+                require_query_fresh=True,
+            ),
             timeout_s=30.0,
             interval_s=0.5,
         )
@@ -1032,9 +1035,37 @@ def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
         interval_s=0.5,
     )
     def shared_pacing_debug() -> dict:
+        status_keys = (
+            "backfill_active",
+            "backfill_progress",
+            "backfill_state",
+            "rebuilding",
+            "total_indexed",
+            "source_doc_count",
+            "replay_applied_sequence",
+            "replay_target_sequence",
+            "projection_checkpoint_applied_sequence",
+            "projection_checkpoint_generation",
+            "runtime_source",
+            "runtime_freshness",
+            "coverage",
+        )
+
+        def index_status(table_name: str) -> dict:
+            info = stateful_api.get_index(table_name, index_name)
+            aggregate = info.get("status", {})
+            shards = info.get("shard_status", {})
+            return {
+                "status": {key: aggregate.get(key) for key in status_keys if key in aggregate},
+                "shards": {
+                    group_id: {key: shard.get(key) for key in status_keys if key in shard}
+                    for group_id, shard in shards.items()
+                },
+            }
+
         def query(table_name: str) -> dict:
             try:
-                return stateful_api.query_table(
+                response = stateful_api.query_table(
                     table_name,
                     {
                         "embeddings": {
@@ -1044,12 +1075,14 @@ def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
                         "limit": 3,
                     },
                 )
+                hits = response.get("responses", [{}])[0].get("hits", {}).get("hits", [])
+                return {"ids": [hit.get("_id") for hit in hits]}
             except Exception as exc:  # pragma: no cover - failure diagnostics only
                 return {"error": repr(exc)}
 
         return {
-            "first_index": stateful_api.get_index(first_table, index_name),
-            "second_index": stateful_api.get_index(second_table, index_name),
+            "first_index": index_status(first_table),
+            "second_index": index_status(second_table),
             "first_query": query(first_table),
             "second_query": query(second_table),
             "embedder": strict_pacing_sensitive_openai_embedder.stats(),

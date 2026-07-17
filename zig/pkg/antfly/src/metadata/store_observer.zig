@@ -138,6 +138,8 @@ fn groupStatusEqual(
     rhs: table_manager.GroupStatusReport,
 ) bool {
     return lhs.group_id == rhs.group_id and
+        lhs.relocation_generation == rhs.relocation_generation and
+        lhs.raft_applied_index == rhs.raft_applied_index and
         lhs.doc_count == rhs.doc_count and
         lhs.disk_bytes == rhs.disk_bytes and
         lhs.empty == rhs.empty and

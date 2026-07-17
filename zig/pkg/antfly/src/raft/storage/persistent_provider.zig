@@ -96,6 +96,8 @@ pub const PersistentReplicaProvider = struct {
         const self: *PersistentReplicaProvider = @ptrCast(@alignCast(ptr));
         const state = try self.ensureState(record);
         var desc = try self.base_factory.buildDescriptor(record);
+        errdefer self.base_factory.freeDescriptor(self.alloc, &desc);
+        try state.seedConfStateIfEmpty(desc.initial_voters orelse desc.group.raft_config.peers);
         desc.group.storage = state.storage();
         desc.group.raft_config.applied = state.appliedIndex();
         return desc;

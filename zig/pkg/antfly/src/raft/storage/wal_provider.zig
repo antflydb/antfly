@@ -137,7 +137,7 @@ pub const WalReplicaProvider = struct {
         var desc = try self.base_factory.buildDescriptor(record);
         errdefer self.base_factory.freeDescriptor(self.alloc, &desc);
         const state = try self.ensureState(record);
-        try state.seedConfStateIfEmpty(desc.group.raft_config.peers);
+        try state.seedConfStateIfEmpty(desc.initial_voters orelse desc.group.raft_config.peers);
         desc.group.storage = state.storage();
         desc.group.raft_config.applied = state.appliedIndex();
         return desc;
@@ -215,6 +215,8 @@ test "wal replica provider wires host through WAL-backed local state" {
     const BaseFactory = struct {
         alloc: std.mem.Allocator,
         dummy_store: *raft_engine.core.MemoryStorage,
+        transport_peers: []const u64 = &.{},
+        initial_voters: ?[]const u64 = null,
 
         fn iface(self: *@This()) host.ReplicaDescriptorFactory {
             return .{
@@ -228,7 +230,10 @@ test "wal replica provider wires host through WAL-backed local state" {
 
         fn buildDescriptor(ptr: *anyopaque, record: catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            const peers = try self.alloc.dupe(u64, &.{record.local_node_id});
+            const peer_source = if (self.transport_peers.len > 0) self.transport_peers else &.{record.local_node_id};
+            const peers = try self.alloc.dupe(u64, peer_source);
+            errdefer self.alloc.free(peers);
+            const initial_voters = if (self.initial_voters) |voters| try self.alloc.dupe(u64, voters) else null;
             return .{
                 .group = .{
                     .group_id = record.group_id,
@@ -244,6 +249,7 @@ test "wal replica provider wires host through WAL-backed local state" {
                     },
                     .storage = self.dummy_store.storage(),
                 },
+                .initial_voters = initial_voters,
                 .bootstrap = .persisted,
             };
         }
@@ -251,6 +257,7 @@ test "wal replica provider wires host through WAL-backed local state" {
         fn freeDescriptor(ptr: *anyopaque, alloc: std.mem.Allocator, desc: *raft_engine.runtime.ReplicaDescriptor) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = alloc;
+            if (desc.initial_voters) |voters| self.alloc.free(voters);
             self.alloc.free(desc.group.raft_config.peers);
         }
     };
@@ -327,5 +334,32 @@ test "wal replica provider wires host through WAL-backed local state" {
 
         const state = provider.stateForGroup(501) orelse return error.MissingState;
         try std.testing.expect((try state.storage().lastIndex()) >= 1);
+    }
+
+    {
+        var relocation_factory = BaseFactory{
+            .alloc = std.testing.allocator,
+            .dummy_store = &dummy_store,
+            .transport_peers = &.{ 1, 2 },
+            .initial_voters = &.{1},
+        };
+        var provider = try WalReplicaProvider.init(std.testing.allocator, .{ .root_dir = root }, relocation_factory.iface());
+        defer provider.deinit();
+        var local_host = host.Host.init(std.testing.allocator, .{ .local_node_id = 2 }, .{
+            .descriptor_factory = provider.descriptorFactory(),
+            .runtime_hooks = provider.runtimeHooks(),
+        });
+        defer local_host.deinit();
+
+        _ = try local_host.ensureReplica(.{
+            .group_id = 502,
+            .replica_id = 2,
+            .local_node_id = 2,
+            .bootstrap_mode = .persisted,
+        });
+        const state = provider.stateForGroup(502) orelse return error.MissingState;
+        var initial_state = try state.storage().initialState(std.testing.allocator);
+        defer initial_state.deinit(std.testing.allocator);
+        try std.testing.expectEqualSlices(u64, &.{1}, initial_state.conf_state.voters);
     }
 }

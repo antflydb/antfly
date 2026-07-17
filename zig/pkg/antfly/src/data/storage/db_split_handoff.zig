@@ -1513,8 +1513,8 @@ test "db split sync coordinator resumes catch-up across source and destination r
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:92:1:92:doc:m") },
-            .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:92:1:92:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:92:1:122:doc:m") },
+            .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:92:1:122:doc:m") },
         });
         defer std.testing.allocator.free(setup);
         try source.snapshotBuilder().applyBatch(.{
@@ -1981,6 +1981,10 @@ test "db split sync coordinator can prepare source split again after rollback" {
         try std.testing.expectEqual(shard_state_store.SplitPhase.none, rolled_back.source_split_phase);
     }
 
+    // A durable rollback terminal fences the completed attempt. Re-prepare as
+    // a successor attempt instead of reusing the rolled-back identity.
+    coord.transition_id = 137;
+    coord.attempt_epoch = 2;
     try std.testing.expect(try coord.prepareSourceSplit("doc:m", "doc:z"));
     {
         const prepared = try coord.status();

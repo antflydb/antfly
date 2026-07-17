@@ -209,9 +209,12 @@ def ready_index_status(index_info: dict[str, Any], *, require_query_fresh: bool 
     if require_query_fresh:
         expected_groups = status.get("expected_groups")
         fresh_groups = status.get("fresh_groups")
-        if isinstance(expected_groups, int) and expected_groups > 0:
-            if not isinstance(fresh_groups, int) or fresh_groups < expected_groups:
-                return None
+        if not isinstance(expected_groups, int) or expected_groups <= 0:
+            return None
+        if not isinstance(fresh_groups, int) or fresh_groups < expected_groups:
+            return None
+        if status.get("runtime_present") is not True:
+            return None
         stale_groups = status.get("stale_groups")
         if isinstance(stale_groups, int) and stale_groups > 0:
             return None

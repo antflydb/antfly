@@ -3436,13 +3436,24 @@ pub const DB = struct {
         notifyQueryVisibilityHook(ctx, .status);
     }
 
-    fn notifyDerivedAppliedSequenceAdvanced(ptr: *anyopaque, _: []const u8, _: u64) void {
+    fn notifyDerivedAppliedSequenceAdvanced(ptr: *anyopaque, index_name: []const u8, _: u64) void {
         const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
-        // The executor invokes this only after publishing its live applied
-        // watermark and releasing its mutex. Status callbacks may therefore
-        // snapshot the executor without deadlocking or observing the previous
-        // sequence at the end of a replay window.
-        notifyQueryVisibilityHook(ctx, .status);
+        // The executor invokes this only after persistence, publishing its live
+        // applied watermark, and releasing its mutex. Dense lifecycle status
+        // must be captured at this post-watermark boundary: the preceding
+        // persistence callback cannot yet observe the new live sequence, and a
+        // best-effort follow-up may lose the only completion edge to a writer.
+        // Provisioned runtimes translate this edge into an owner-thread
+        // publication; no DB apply or applied-sequence lock is held while the
+        // notification is delivered. Other index kinds retain the cheaper
+        // overlay path.
+        notifyQueryVisibilityHook(
+            ctx,
+            if (ctx.index_manager.denseProjectionCheckpointMetadata(index_name) != null)
+                .publish_blocking
+            else
+                .status,
+        );
     }
 
     fn acquireQueryVisibilityHook(ctx: *AsyncContext) ?QueryVisibilityHook {
@@ -14482,12 +14493,20 @@ pub const DB = struct {
     }
 
     fn flushAppliedSequencesForIdle(self: *DB) !void {
-        var seq_lock = lockAtomicWithBackoffProfiled(
-            &self.async_context.applied_sequence_mutex,
-            &self.async_context.stats.applied_sequence_mutex,
-        );
-        defer seq_lock.unlock();
-        _ = try flushPendingAppliedSequencesLocked(self.async_context, true);
+        var lifecycle_completed = false;
+        const published = blk: {
+            var seq_lock = lockAtomicWithBackoffProfiled(
+                &self.async_context.applied_sequence_mutex,
+                &self.async_context.stats.applied_sequence_mutex,
+            );
+            defer seq_lock.unlock();
+            break :blk try flushPendingAppliedSequencesLocked(self.async_context, true, &lifecycle_completed);
+        };
+        if (lifecycle_completed) {
+            notifyQueryVisibilityHook(self.async_context, .publish_blocking);
+        } else if (published) {
+            notifyQueryVisibilityHook(self.async_context, .publish_consistent);
+        }
     }
 
     fn isRecoverableEmbeddingArtifactError(err: anyerror) bool {
@@ -16857,6 +16876,15 @@ pub const DB = struct {
         return try self.statsLocked(alloc);
     }
 
+    fn applyCachedIdentityVisibilitySummary(identity_stats: *doc_identity.Stats, summary: ?doc_identity.VisibilitySummary) void {
+        const cached = summary orelse return;
+        identity_stats.live_ordinals = cached.live_ordinals;
+        identity_stats.tombstone_ordinals = cached.tombstone_ordinals;
+        identity_stats.max_created_generation = cached.max_created_generation;
+        identity_stats.min_deleted_generation = cached.min_deleted_generation;
+        identity_stats.max_deleted_generation = cached.max_deleted_generation;
+    }
+
     pub fn reassignIdentityNamespaceForInternalTransition(self: *DB, namespace: doc_identity.Namespace) !void {
         if (self.open_mode == .status_only) return error.UnsupportedOperation;
         lockApply(self);
@@ -16971,7 +16999,14 @@ pub const DB = struct {
         var durable_index_repairs = try self.loadIndexRepairStateForStats(alloc);
         defer if (durable_index_repairs) |*state| state.deinit(alloc);
         const async_indexing = self.snapshotAsyncIndexingStats();
-        const identity_stats = dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
+        var raw_identity_stats = try doc_identity.fastStatsFromStore(self.core.store);
+        // Coalesced primary writes update this summary immediately after the
+        // store accepts the batch, while a probe transaction can still see the
+        // previous durable summary until the bulk window is published. Runtime
+        // owners must publish the maintained live summary rather than making
+        // status wait for a flush or fall back to a primary scan.
+        applyCachedIdentityVisibilitySummary(&raw_identity_stats, self.identity_visibility_summary_cache);
+        const identity_stats = dbDocIdentityStats(raw_identity_stats, self.core.identity_namespace);
         // Operational status is polled frequently. Identity metadata is the
         // normal O(1) source of the live document count; retain the legacy
         // primary-store scan only as a lazy fallback for an old/incomplete
@@ -28541,7 +28576,7 @@ fn saveAppliedSequencesBatchContext(
             ctx.applied_sequence_checkpoint_path,
             enriched_updates,
         );
-        for (enriched_updates) |update| try finalizeCoveredDenseProjectionCheckpoint(async_ctx, update.index_name, update.sequence);
+        for (enriched_updates) |update| _ = try finalizeCoveredDenseProjectionCheckpoint(async_ctx, update.index_name, update.sequence);
         try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
         return;
     }
@@ -33826,13 +33861,14 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     streaming_session_finished = true;
     const finalize_ns = elapsedSince(finalize_start_ns);
     setDenseCatchUpPhase(ctx, .applied_sequence_flush);
-    const published_visibility = blk: {
+    var lifecycle_completed = false;
+    _ = blk: {
         var seq_lock = lockAtomicWithBackoffProfiled(
             &ctx.applied_sequence_mutex,
             &ctx.stats.applied_sequence_mutex,
         );
         defer seq_lock.unlock();
-        const published = try flushFinishedDenseAppliedSequenceLocked(ctx, index_ref.name);
+        const published = try flushFinishedDenseAppliedSequenceLocked(ctx, index_ref.name, &lifecycle_completed);
         break :blk published;
     };
     const after_lsm_stats = denseLsmWriteStatsSnapshot(ctx, index_ref.name);
@@ -33862,8 +33898,10 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     }
     finishDenseCatchUpSessionTracked(ctx, index_ref.name);
     catch_up_tracked = false;
-    if (!published_visibility) DB.notifyQueryVisibilityHook(ctx, .publish_consistent);
-    DB.notifyQueryVisibilityHook(ctx, .publish_blocking);
+    // The executor persists the new applied sequence after this session-close
+    // callback returns. That persistence boundary owns the terminal status
+    // publish so the cache can never observe a completed replay watermark with
+    // the previous projection checkpoint.
 }
 
 fn storeHasReplayRecordForHintAfter(
@@ -34575,39 +34613,61 @@ fn rebuildSparseIndexFromStoredEmbeddingArtifactsContext(
 fn persistAppliedSequenceAsync(ctx_ptr: *anyopaque, index_name: []const u8, sequence: u64, force: bool) !bool {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     if (force) {
-        var seq_lock = lockAtomicWithBackoffProfiled(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex);
-        defer seq_lock.unlock();
-        _ = ctx.stats.applied_sequence.note_calls.fetchAdd(1, .monotonic);
-        _ = ctx.stats.applied_sequence.forced_flush_calls.fetchAdd(1, .monotonic);
-        try ctx.applied_sequence_coalescer.note(ctx.alloc, index_name, sequence);
-        return try flushPendingAppliedSequencesLocked(ctx, true);
+        var lifecycle_completed = false;
+        const published = blk: {
+            var seq_lock = lockAtomicWithBackoffProfiled(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex);
+            defer seq_lock.unlock();
+            _ = ctx.stats.applied_sequence.note_calls.fetchAdd(1, .monotonic);
+            _ = ctx.stats.applied_sequence.forced_flush_calls.fetchAdd(1, .monotonic);
+            try ctx.applied_sequence_coalescer.note(ctx.alloc, index_name, sequence);
+            break :blk try flushPendingAppliedSequencesLocked(ctx, true, &lifecycle_completed);
+        };
+        const dense_index = ctx.index_manager.denseProjectionCheckpointMetadata(index_name) != null;
+        if (published and !dense_index) {
+            DB.notifyQueryVisibilityHook(ctx, .publish_consistent);
+        }
+        return published;
     }
     if (!ctx.applied_sequence_mutex.tryLock()) {
         _ = ctx.stats.applied_sequence.skipped_flush_calls.fetchAdd(1, .monotonic);
         return false;
     }
-    defer ctx.applied_sequence_mutex.unlock();
+    errdefer ctx.applied_sequence_mutex.unlock();
+    var lifecycle_completed = false;
     _ = ctx.stats.applied_sequence.note_calls.fetchAdd(1, .monotonic);
     try ctx.applied_sequence_coalescer.note(ctx.alloc, index_name, sequence);
     if (shouldDeferAppliedSequenceFlush(ctx, false)) {
         _ = ctx.stats.applied_sequence.skipped_flush_calls.fetchAdd(1, .monotonic);
+        ctx.applied_sequence_mutex.unlock();
         return false;
     }
     if (!ctx.applied_sequence_coalescer.shouldFlush(monotonicTimeNs())) {
         _ = ctx.stats.applied_sequence.skipped_flush_calls.fetchAdd(1, .monotonic);
+        ctx.applied_sequence_mutex.unlock();
         return false;
     }
-    return try flushPendingAppliedSequencesLocked(ctx, false);
+    const published = try flushPendingAppliedSequencesLocked(ctx, false, &lifecycle_completed);
+    ctx.applied_sequence_mutex.unlock();
+    const dense_index = ctx.index_manager.denseProjectionCheckpointMetadata(index_name) != null;
+    if (published and !dense_index) {
+        DB.notifyQueryVisibilityHook(ctx, .publish_consistent);
+    }
+    return published;
 }
 
-fn finalizeCoveredDenseProjectionCheckpoint(ctx: *AsyncContext, index_name: []const u8, applied_sequence: u64) !void {
-    const checkpoint = ctx.index_manager.denseProjectionCheckpointMetadata(index_name) orelse return;
-    if (checkpoint.status != .rebuilding) return;
-    if (asyncContextHasActiveExternalDenseBulkWork(ctx) or ctx.active_dense_catch_up_sessions.load(.acquire) != 0) return;
+fn finalizeCoveredDenseProjectionCheckpoint(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    applied_sequence: u64,
+) !bool {
+    const checkpoint = ctx.index_manager.denseProjectionCheckpointMetadata(index_name) orelse return false;
+    if (checkpoint.status != .rebuilding) return false;
+    if (asyncContextHasActiveExternalDenseBulkWork(ctx)) return false;
+    if (ctx.active_dense_catch_up_sessions.load(.acquire) != 0) return false;
 
-    const expected_count = (try denseTargetCountForIndexContext(ctx, index_name)) orelse return;
-    const entry = ctx.index_manager.denseIndex(index_name) orelse return;
-    if (entry.index.stats().active_count != expected_count) return;
+    const expected_count = (try denseTargetCountForIndexContext(ctx, index_name)) orelse return false;
+    const entry = ctx.index_manager.denseIndex(index_name) orelse return false;
+    if (entry.index.stats().active_count != expected_count) return false;
 
     const clean_checkpoint: apply_state.ProjectionCheckpoint = .{
         .applied_sequence = applied_sequence,
@@ -34623,9 +34683,14 @@ fn finalizeCoveredDenseProjectionCheckpoint(ctx: *AsyncContext, index_name: []co
         index_name,
         clean_checkpoint,
     );
+    return true;
 }
 
-fn flushFinishedDenseAppliedSequenceLocked(ctx: *AsyncContext, index_name: []const u8) !bool {
+fn flushFinishedDenseAppliedSequenceLocked(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    lifecycle_completed: *bool,
+) !bool {
     const pending = ctx.applied_sequence_coalescer.takePending(index_name) orelse return false;
     defer ctx.alloc.free(pending.owned_name);
 
@@ -34646,7 +34711,7 @@ fn flushFinishedDenseAppliedSequenceLocked(ctx: *AsyncContext, index_name: []con
     try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
     try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
     try apply_state.saveAppliedSequencesWithCheckpoint(ctx.alloc, ctx.store, ctx.applied_sequence_checkpoint_path, enriched_updates);
-    try finalizeCoveredDenseProjectionCheckpoint(ctx, pending.owned_name, pending.sequence);
+    lifecycle_completed.* = try finalizeCoveredDenseProjectionCheckpoint(ctx, pending.owned_name, pending.sequence) or lifecycle_completed.*;
     try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
     const save_ns = elapsedSince(save_start_ns);
 
@@ -34657,11 +34722,14 @@ fn flushFinishedDenseAppliedSequenceLocked(ctx: *AsyncContext, index_name: []con
     _ = ctx.stats.applied_sequence.save_ns.fetchAdd(save_ns, .monotonic);
     _ = ctx.stats.applied_sequence.flush_ns.fetchAdd(flush_ns, .monotonic);
     atomicMaxU64(&ctx.stats.applied_sequence.max_flush_ns, flush_ns);
-    DB.notifyQueryVisibilityHook(ctx, .status);
     return true;
 }
 
-fn flushPendingAppliedSequencesLocked(ctx: *AsyncContext, force: bool) !bool {
+fn flushPendingAppliedSequencesLocked(
+    ctx: *AsyncContext,
+    force: bool,
+    lifecycle_completed: *bool,
+) !bool {
     if (ctx.applied_sequence_coalescer.pending.count() == 0) return false;
 
     const flush_start_ns = monotonicTimeNs();
@@ -34695,7 +34763,9 @@ fn flushPendingAppliedSequencesLocked(ctx: *AsyncContext, force: bool) !bool {
         ctx.applied_sequence_checkpoint_path,
         enriched_updates,
     );
-    for (enriched_updates) |update| try finalizeCoveredDenseProjectionCheckpoint(ctx, update.index_name, update.sequence);
+    for (enriched_updates) |update| {
+        lifecycle_completed.* = try finalizeCoveredDenseProjectionCheckpoint(ctx, update.index_name, update.sequence) or lifecycle_completed.*;
+    }
     try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
     const save_ns = elapsedSince(save_start_ns);
     ctx.applied_sequence_coalescer.clearPending(ctx.alloc);
@@ -34707,7 +34777,6 @@ fn flushPendingAppliedSequencesLocked(ctx: *AsyncContext, force: bool) !bool {
     _ = ctx.stats.applied_sequence.save_ns.fetchAdd(save_ns, .monotonic);
     _ = ctx.stats.applied_sequence.flush_ns.fetchAdd(flush_ns, .monotonic);
     atomicMaxU64(&ctx.stats.applied_sequence.max_flush_ns, flush_ns);
-    DB.notifyQueryVisibilityHook(ctx, .status);
     return true;
 }
 
@@ -37407,6 +37476,42 @@ test "db stats expose document identity coverage and tombstones" {
     try std.testing.expectEqual(@as(u64, 0), repaired_diagnostic.doc_identity.primary_docs_missing_identity_state);
     try std.testing.expectEqual(@as(u64, 1), repaired_diagnostic.doc_identity.primary_docs_with_tombstone_ordinals);
     try std.testing.expect(repaired_diagnostic.doc_identity.rebuild_required);
+}
+
+test "db operational stats prefer the maintained live identity summary" {
+    var stats = doc_identity.Stats{
+        .live_ordinals = 0,
+        .tombstone_ordinals = 1,
+        .max_created_generation = 2,
+        .min_deleted_generation = 2,
+        .max_deleted_generation = 2,
+    };
+    DB.applyCachedIdentityVisibilitySummary(&stats, .{
+        .live_ordinals = 1,
+        .tombstone_ordinals = 0,
+        .max_created_generation = 3,
+    });
+    try std.testing.expectEqual(@as(u64, 1), stats.live_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), stats.tombstone_ordinals);
+    try std.testing.expectEqual(@as(u64, 3), stats.max_created_generation);
+    try std.testing.expectEqual(@as(u64, 0), stats.min_deleted_generation);
+    try std.testing.expectEqual(@as(u64, 0), stats.max_deleted_generation);
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(std.testing.allocator, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+    db.identity_visibility_summary_cache = .{
+        .live_ordinals = 1,
+        .max_created_generation = 3,
+    };
+    const operational = try db.stats(std.testing.allocator);
+    defer types.freeDBStats(std.testing.allocator, operational);
+    try std.testing.expectEqual(@as(u64, 1), operational.source_doc_count);
+    try std.testing.expectEqual(@as(u64, 1), operational.doc_identity.live_ordinals);
 }
 
 test "db stats flag document identity ordinal capacity exhaustion" {
@@ -68152,6 +68257,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
     });
+    try db.core.saveProjectionCheckpoint("dense_idx", .{ .status = .rebuilding });
 
     const HookCtx = struct {
         publish_calls: u64 = 0,
@@ -68159,6 +68265,9 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
         status_calls_after_wal_checkpoint: u64 = 0,
         publish_blocking_calls: u64 = 0,
         publish_blocking_while_applied_sequence_locked: u64 = 0,
+        publish_blocking_with_clean_checkpoint: u64 = 0,
+        publish_blocking_checkpoint_applied: u64 = 0,
+        publish_blocking_checkpoint_clean: bool = false,
         invalidate_calls: u64 = 0,
 
         fn onChange(ptr: *anyopaque, _: []const u8, _: u64, changed_db: ?*DB, change: QueryVisibilityChange) void {
@@ -68190,6 +68299,13 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
                             hook_db.async_context.applied_sequence_mutex.unlock();
                         } else {
                             self.publish_blocking_while_applied_sequence_locked += 1;
+                        }
+                        if (hook_db.core.index_manager.denseProjectionCheckpointMetadata("dense_idx")) |checkpoint| {
+                            self.publish_blocking_checkpoint_applied = checkpoint.applied_sequence;
+                            self.publish_blocking_checkpoint_clean = checkpoint.status == .clean;
+                            if (checkpoint.status == .clean and checkpoint.applied_sequence >= 4) {
+                                self.publish_blocking_with_clean_checkpoint += 1;
+                            }
                         }
                     }
                 },
@@ -68234,15 +68350,17 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
     try db.executor.waitForAll(4);
 
     try std.testing.expect(hook_ctx.publish_calls > 0);
-    try std.testing.expect(hook_ctx.status_calls > 0);
-    try std.testing.expect(hook_ctx.status_calls_after_wal_checkpoint > 0);
     try std.testing.expect(hook_ctx.publish_blocking_calls > 0);
     try std.testing.expectEqual(@as(u64, 0), hook_ctx.publish_blocking_while_applied_sequence_locked);
+    try std.testing.expectEqual(@as(u64, 4), hook_ctx.publish_blocking_checkpoint_applied);
+    try std.testing.expect(hook_ctx.publish_blocking_checkpoint_clean);
+    try std.testing.expect(hook_ctx.publish_blocking_with_clean_checkpoint > 0);
     try std.testing.expectEqual(@as(u64, 0), hook_ctx.invalidate_calls);
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
     try std.testing.expectEqual(@as(u64, 4), stats.indexes[0].replay_applied_sequence);
     try std.testing.expectEqual(@as(u64, 4), stats.indexes[0].replay_target_sequence);
+    try std.testing.expectEqualStrings("clean", stats.indexes[0].projection_checkpoint_status);
 
     const persisted_status = (try db.loadIndexStatusSnapshot(alloc, "dense_idx")).?;
     try std.testing.expectEqual(@as(u64, 4), persisted_status.doc_count);

@@ -2828,7 +2828,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_common_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{ "provider registry", "std http listener" },
+        .filters = &.{ "provider registry", "std http listener", "std http executor" },
     });
     const run_lib_common_tests = b.addRunArtifact(lib_common_tests);
     const lib_common_test_step = b.step("lib-common-test", "Run common/provider registry tests");
@@ -3400,6 +3400,11 @@ pub fn build(b: *std.Build) void {
         "data runtime health metrics include replay debt and provisioned warmup counters",
         "data runtime status refresh publishes synthetic missing status for absent local group db",
         "data runtime local group status does not open roots owned by transitions",
+        "data runtime local group status provider collects and caches group statuses",
+        "data runtime placement fingerprint covers relocation ownership",
+        "data descriptor factory separates bootstrap voters from transport peers",
+        "data descriptor factory bootstraps pristine group from complete intent peer set",
+        "placement peer collection preserves complete intent peers during partial projection",
         "data runtime local group status reflects active transition readiness",
         "data runtime local group status uses metadata transition observation when local pair is absent",
         "data runtime local group status prefers merged snapshot readiness fallback",
@@ -3478,6 +3483,8 @@ pub fn build(b: *std.Build) void {
         "derive split transition phases",
         "db split coordinator rejects mismatched active transition destination",
         "db split coordinator remains closed after failed reopen",
+        "db split sync coordinator resumes catch-up across source and destination reopen",
+        "db split sync coordinator can prepare source split again after rollback",
         "db split successor bootstrap atomically replaces stale destination generation",
         "data raft apply store applies delete operations into group state",
         "data raft apply store prepared snapshot retains its MVCC view across later writes",
@@ -3486,6 +3493,7 @@ pub fn build(b: *std.Build) void {
         "data raft apply store skips persisted split commands in overlapping replay",
         "data raft apply store recovers exact split replay after injected projection corruption",
         "data raft apply store reconciles inherited documents while preserving active split control",
+        "data raft apply store rejects a regressing source generation during active split",
         "data raft apply store rejects mismatched terminal split identity",
         "data raft apply store persists split destination acknowledgements",
         "data raft apply store seeds pre-raft snapshots once at reserved index zero",
@@ -4546,6 +4554,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table write coalescer isolates failed waiters",
             "provisioned table write source consistent visibility hook does not block on busy apply lock",
             "provisioned table write source consistent visibility refreshes stale dense status",
+            "provisioned table write source visibility hook defers status sampling to runtime owner",
             "provisioned table write source status visibility does not invalidate read cache",
             "provisioned table restore lifecycle blocks group operations but allows foreground structural mutation",
             "provisioned table restore lifecycle blocks request admission without blocking foreground structural mutation",
@@ -4721,7 +4730,9 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up allocation failure preserves bounded retry",
             "managed repair visibility edges retire cached readers and runtime status",
             "table runtime snapshot cache invalidation fences a stale observed publisher",
+            "runtime status hook orders completed observation without crossing invalidation",
             "table runtime snapshot cache live publication does not starve structural refresh",
+            "table runtime snapshot cache preserves live completion over regressing persisted projection",
             "table runtime snapshot cache table fences isolate unrelated invalidations",
             "runtime status cache publishes unaffected tables and retries only invalidated tables",
             "runtime status cache stable absence removal retires the old table epoch",

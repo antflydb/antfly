@@ -178,6 +178,13 @@ pub const StoreRecord = struct {
 
 pub const GroupStatusReport = struct {
     group_id: u64,
+    /// Placement incarnation observed by the reporting store. A relocation
+    /// target may only be promoted from status produced for the same
+    /// incarnation as its placement intent.
+    relocation_generation: u64 = 0,
+    /// Highest data-Raft log index applied to this store's local state
+    /// machine for the group.
+    raft_applied_index: u64 = 0,
     doc_count: u64 = 0,
     disk_bytes: u64 = 0,
     empty: bool = true,
@@ -1237,6 +1244,8 @@ pub fn cloneGroupStatus(alloc: std.mem.Allocator, record: GroupStatusReport) !Gr
     _ = alloc;
     return .{
         .group_id = record.group_id,
+        .relocation_generation = record.relocation_generation,
+        .raft_applied_index = record.raft_applied_index,
         .doc_count = record.doc_count,
         .disk_bytes = record.disk_bytes,
         .empty = record.empty,

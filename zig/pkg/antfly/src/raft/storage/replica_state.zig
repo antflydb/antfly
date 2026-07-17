@@ -121,6 +121,21 @@ pub const PersistentReplicaState = struct {
         try self.persist();
     }
 
+    pub fn seedConfStateIfEmpty(self: *PersistentReplicaState, voters: []const raft_engine.core.types.NodeId) !void {
+        if (voters.len == 0) return;
+        var initial_state = try self.store.storage().initialState(self.alloc);
+        defer initial_state.deinit(self.alloc);
+        if (initial_state.conf_state.voters.len > 0 or
+            initial_state.conf_state.voters_outgoing.len > 0 or
+            initial_state.conf_state.learners.len > 0 or
+            initial_state.conf_state.learners_next.len > 0 or
+            initial_state.conf_state.auto_leave)
+        {
+            return;
+        }
+        try self.setConfState(.{ .voters = @constCast(voters) });
+    }
+
     pub fn appliedIndex(self: *const PersistentReplicaState) raft_engine.core.types.Index {
         return self.applied_index;
     }

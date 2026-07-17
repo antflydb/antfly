@@ -2895,7 +2895,7 @@ pub const RaftApplyStore = struct {
 
 const transition_magic = "afmd1";
 const runtime_status_record_version: u16 = 7;
-const group_status_record_version: u16 = 1;
+const group_status_record_version: u16 = 2;
 
 const TransitionTag = enum(u8) {
     initialize_metadata_incarnation = 45,
@@ -4027,6 +4027,8 @@ fn appendGroupStatusRecord(
 ) !void {
     try appendInt(alloc, out, u16, group_status_record_version);
     try appendInt(alloc, out, u64, record.group_id);
+    try appendInt(alloc, out, u64, record.relocation_generation);
+    try appendInt(alloc, out, u64, record.raft_applied_index);
     try appendInt(alloc, out, u64, record.doc_count);
     try appendInt(alloc, out, u64, record.disk_bytes);
     try out.append(alloc, if (record.empty) 1 else 0);
@@ -4053,8 +4055,10 @@ fn readGroupStatusRecord(
 ) !metadata.GroupStatusReport {
     _ = alloc;
     const version = try readInt(encoded, pos, u16);
-    if (version != group_status_record_version) return error.InvalidMetadataTransitionEncoding;
+    if (version != 1 and version != group_status_record_version) return error.InvalidMetadataTransitionEncoding;
     const group_id = try readInt(encoded, pos, u64);
+    const relocation_generation = if (version >= 2) try readInt(encoded, pos, u64) else 0;
+    const raft_applied_index = if (version >= 2) try readInt(encoded, pos, u64) else 0;
     const doc_count = try readInt(encoded, pos, u64);
     const disk_bytes = try readInt(encoded, pos, u64);
     if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
@@ -4120,6 +4124,8 @@ fn readGroupStatusRecord(
     pos.* += metadata_table_manager.voter_set_fingerprint_len;
     return .{
         .group_id = group_id,
+        .relocation_generation = relocation_generation,
+        .raft_applied_index = raft_applied_index,
         .doc_count = doc_count,
         .disk_bytes = disk_bytes,
         .empty = empty,
@@ -7360,6 +7366,48 @@ test "metadata raft apply store runtime status codec preserves document identity
     try std.testing.expectEqual(@as(u64, 0x1234), status.indexes[0].coverage_config_hash);
     try std.testing.expect(status.indexes[0].coverage_identity_ready);
     try std.testing.expect(status.indexes[0].coverage_summary_ready);
+}
+
+test "metadata raft apply store group status decoder accepts version one records" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+
+    const fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 3, 5, 8 }, null);
+    try appendInt(alloc, &encoded, u16, 1);
+    try appendInt(alloc, &encoded, u64, 41);
+    try appendInt(alloc, &encoded, u64, 17);
+    try appendInt(alloc, &encoded, u64, 4096);
+    try encoded.append(alloc, 0);
+    try appendInt(alloc, &encoded, u32, 0);
+    try appendInt(alloc, &encoded, u64, 1234);
+    try encoded.append(alloc, 1);
+    try appendInt(alloc, &encoded, u64, 1200);
+    try encoded.append(alloc, 0);
+    try encoded.append(alloc, 1);
+    try encoded.append(alloc, 1);
+    try encoded.append(alloc, 0);
+    try encoded.append(alloc, 0);
+    try encoded.append(alloc, 1);
+    try appendInt(alloc, &encoded, u16, 3);
+    try encoded.append(alloc, 0);
+    try encoded.append(alloc, 1);
+    try encoded.appendSlice(alloc, &fingerprint);
+
+    var pos: usize = 0;
+    const decoded = try readGroupStatusRecord(alloc, encoded.items, &pos);
+    try std.testing.expectEqual(encoded.items.len, pos);
+    try std.testing.expectEqual(@as(u64, 41), decoded.group_id);
+    try std.testing.expectEqual(@as(u64, 0), decoded.relocation_generation);
+    try std.testing.expectEqual(@as(u64, 0), decoded.raft_applied_index);
+    try std.testing.expectEqual(@as(u64, 17), decoded.doc_count);
+    try std.testing.expectEqual(@as(u64, 4096), decoded.disk_bytes);
+    try std.testing.expect(decoded.local_leader);
+    try std.testing.expect(decoded.local_voter);
+    try std.testing.expect(decoded.replay_required);
+    try std.testing.expect(decoded.replay_caught_up);
+    try std.testing.expect(decoded.voter_set_known);
+    try std.testing.expectEqualSlices(u8, &fingerprint, &decoded.voter_set_fingerprint);
 }
 
 test "metadata apply store replay is idempotent when applied watermark lags WAL state" {

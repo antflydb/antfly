@@ -10872,8 +10872,43 @@ test "metadata http cluster simulation rebalances away from high lease pressure"
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 5301, .active, 1));
     try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, cluster.node(2).status(5301));
 
-    try std.testing.expectEqual(@as(usize, 2), try cluster.node(leader_index).reportStoreStatuses(&.{
-        .{ .store_id = 1, .live = true, .health_class = "healthy", .capacity_bytes = 1024, .available_bytes = 950, .lease_pressure = 96, .read_load = 200, .write_load = 140 },
+    const stable_fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 1, 2 }, null);
+    try std.testing.expectEqual(@as(usize, 3), try cluster.node(leader_index).reportStoreStatuses(&.{
+        .{
+            .store_id = 1,
+            .live = true,
+            .health_class = "healthy",
+            .capacity_bytes = 1024,
+            .available_bytes = 950,
+            .lease_pressure = 96,
+            .read_load = 200,
+            .write_load = 140,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{.{
+                .group_id = 5301,
+                .local_leader = true,
+                .local_voter = true,
+                .voter_count = 2,
+                .voter_set_known = true,
+                .voter_set_fingerprint = stable_fingerprint,
+            }})[0..]),
+        },
+        .{
+            .store_id = 2,
+            .live = true,
+            .health_class = "healthy",
+            .capacity_bytes = 1024,
+            .available_bytes = 900,
+            .lease_pressure = 8,
+            .read_load = 12,
+            .write_load = 8,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{.{
+                .group_id = 5301,
+                .local_voter = true,
+                .voter_count = 2,
+                .voter_set_known = true,
+                .voter_set_fingerprint = stable_fingerprint,
+            }})[0..]),
+        },
         .{ .store_id = 3, .live = true, .health_class = "healthy", .capacity_bytes = 1024, .available_bytes = 880, .lease_pressure = 12, .read_load = 18, .write_load = 10 },
     }));
     try cluster.stepAll();
