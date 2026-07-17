@@ -1892,8 +1892,11 @@ func validHAIdentifier(value string) bool {
 }
 
 func (r *AntflyCluster) validateHARuntimeAdminTokenSource(ha *HighAvailabilitySpec) []string {
-	if ha == nil || ha.Runtime == nil || strings.TrimSpace(ha.Runtime.AdminTokenEnvVar) == "" {
+	if ha == nil || ha.Runtime == nil {
 		return nil
+	}
+	if strings.TrimSpace(ha.Runtime.AdminTokenEnvVar) == "" {
+		return []string{"spec.highAvailability.runtime.adminTokenEnvVar is required for a hot-standby runtime"}
 	}
 	if ha.Runtime.AdminTokenSecretRef != nil {
 		return nil

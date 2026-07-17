@@ -1911,7 +1911,7 @@ func TestValidateCreate_HighAvailabilityHotStandbyValid(t *testing.T) {
 	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
-		Runtime: &HARuntimeSpec{Role: HARuntimeRolePrimary, NodeID: "primary-a", FencingLease: &HARuntimeFencingLeaseSpec{
+		Runtime: &HARuntimeSpec{Role: HARuntimeRolePrimary, NodeID: "primary-a", AdminTokenEnvVar: "ANTFLY_HA_ADMIN_TOKEN", AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"}, Key: "token"}, FencingLease: &HARuntimeFencingLeaseSpec{
 			Name: "topology-ha-fence", TopologyID: "topology-anchor-uid", WatchdogGraceSeconds: 10,
 		}},
 		Admin: &HAAdminSpec{
@@ -1955,7 +1955,7 @@ func TestValidateCreate_HighAvailabilityAutomaticFailoverRequiresNoLossDurabilit
 	base := baseStandaloneCluster()
 	base.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
-		Runtime: &HARuntimeSpec{Role: HARuntimeRolePrimary, NodeID: "primary-a", FencingLease: &HARuntimeFencingLeaseSpec{
+		Runtime: &HARuntimeSpec{Role: HARuntimeRolePrimary, NodeID: "primary-a", AdminTokenEnvVar: "ANTFLY_HA_ADMIN_TOKEN", AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"}, Key: "token"}, FencingLease: &HARuntimeFencingLeaseSpec{
 			Name: "topology-ha-fence", TopologyID: "topology-anchor-uid", WatchdogGraceSeconds: 10,
 		}},
 		Admin: &HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081", ExecutePlannedActions: true},
@@ -2146,7 +2146,7 @@ func TestValidateCreate_HighAvailabilityRejectsNonExecutablePortableSeedArtifact
 		Identity: &HAReplicationIdentitySpec{
 			ClusterID: 100, TimelineID: 1, Epoch: 1, CurrentPrimaryID: "primary-a",
 		},
-		Runtime: &HARuntimeSpec{Role: HARuntimeRolePrimary, NodeID: "primary-a"},
+		Runtime: &HARuntimeSpec{Role: HARuntimeRolePrimary, NodeID: "primary-a", AdminTokenEnvVar: "ANTFLY_HA_ADMIN_TOKEN", AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"}, Key: "token"}},
 		Standbys: []HAStandbySpec{{
 			Name: "standby-a", SeedManifestPath: "/source/manifest.afha", SeedContentRoot: "/source/content",
 			SeedArtifact: &HASeedArtifactSpec{
@@ -2189,6 +2189,7 @@ func TestValidateCreate_HighAvailabilityAllowsRuntimeOwnedSeedCapture(t *testing
 		},
 		Runtime: &HARuntimeSpec{
 			Role: HARuntimeRolePrimary, NodeID: "primary-a",
+			AdminTokenEnvVar: "ANTFLY_HA_ADMIN_TOKEN", AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"}, Key: "token"},
 			SeedCaptureRoot: "/antflydb/ha/seed-captures",
 		},
 		Standbys: []HAStandbySpec{{
@@ -2216,6 +2217,7 @@ func TestValidateCreate_HighAvailabilityAllowsExactActivatedSeedStartupGate(t *t
 		},
 		Runtime: &HARuntimeSpec{
 			Role: HARuntimeRoleStandby, NodeID: "standby-a",
+			AdminTokenEnvVar: "ANTFLY_HA_ADMIN_TOKEN", AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"}, Key: "token"},
 			Standby: &HAStandbyRuntimeSpec{UpstreamURL: "http://primary.default.svc:8080", SlotName: "standby-a"},
 			StartupGate: &HAStartupGateSpec{
 				Policy:             HAStartupGatePolicyRequireActivatedSeed,
@@ -2255,6 +2257,7 @@ func TestValidateCreate_HighAvailabilityAllowsSharedTopologyAnnotationAcrossRunt
 		Identity: &HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 1, Epoch: 1, CurrentPrimaryID: "primary-a"},
 		Runtime: &HARuntimeSpec{
 			Role: HARuntimeRoleStandby, NodeID: "standby-a",
+			AdminTokenEnvVar: "ANTFLY_HA_ADMIN_TOKEN", AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"}, Key: "token"},
 			Standby: &HAStandbyRuntimeSpec{UpstreamURL: "http://primary.default.svc:8080", SlotName: "standby-a"},
 			StartupGate: &HAStartupGateSpec{
 				Policy: HAStartupGatePolicyRequireActivatedSeed, RuntimeEligible: false, ReceiptMatchPolicy: HAReceiptMatchPolicyExact,
@@ -2304,6 +2307,7 @@ func TestValidateCreate_HighAvailabilityAllowsExplicitSuspendStartupGate(t *test
 		Identity: &HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 2, Epoch: 2, CurrentPrimaryID: "primary-b"},
 		Runtime: &HARuntimeSpec{
 			Role: HARuntimeRoleStandby, NodeID: "former-primary-a",
+			AdminTokenEnvVar: "ANTFLY_HA_ADMIN_TOKEN", AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"}, Key: "token"},
 			Standby: &HAStandbyRuntimeSpec{UpstreamURL: "http://primary-b.default.svc:8080", SlotName: "former-primary-a"},
 			StartupGate: &HAStartupGateSpec{
 				Policy:          HAStartupGatePolicy("Suspend"),
@@ -2799,8 +2803,10 @@ func TestValidateCreate_HighAvailabilityRuntimeNodeIDMustMatchRoleIdentity(t *te
 			CurrentPrimaryID: "primary-a",
 		},
 		Runtime: &HARuntimeSpec{
-			Role:   HARuntimeRolePrimary,
-			NodeID: "standby-a",
+			Role:                HARuntimeRolePrimary,
+			NodeID:              "standby-a",
+			AdminTokenEnvVar:    "ANTFLY_HA_ADMIN_TOKEN",
+			AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"}, Key: "token"},
 		},
 	}
 
@@ -3043,6 +3049,31 @@ func TestValidateCreate_HighAvailabilityRuntimeAdminTokenRequiresPodEnvSource(t 
 	}}
 	if err := cluster.ValidateCreate(); err != nil {
 		t.Fatalf("expected runtime admin token to accept spec.standalone.envFrom token source, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRuntimeRequiresAdminToken(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:   HARuntimeRolePrimary,
+			NodeID: "primary-a",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected hot-standby runtime without an admin token to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime.adminTokenEnvVar is required") {
+		t.Fatalf("expected runtime admin token requirement, got: %v", err)
 	}
 }
 

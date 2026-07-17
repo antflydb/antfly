@@ -27079,7 +27079,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     });
     ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
-    mirrorHAReplayPayloadBestEffortContext(ctx, replay_payload);
+    try mirrorHAReplayPayloadCommitContext(ctx, replay_payload);
     var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, derived_batch);
     defer sync_targets.deinit(ctx.alloc);
     ctx.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
@@ -27146,7 +27146,7 @@ fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: der
     const payload = try encodeChangeRecordPayload(ctx, batch, sequence);
     defer ctx.alloc.free(payload);
     try ctx.store.appendReplayOpaque(ctx.alloc, sequence, payload);
-    mirrorHAReplayPayloadBestEffortContext(ctx, payload);
+    try mirrorHAReplayPayloadCommitContext(ctx, payload);
     ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
     return sequence;
 }
@@ -28198,7 +28198,7 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
         if (shouldAppendSplitDeltaForContext(&batch_ctx)) {
             try batch_ctx.shard_manager.appendSplitDelta(currentTimeNs(), &.{}, artifact_delete_keys);
         }
-        mirrorHAReplayPayloadBestEffortContext(&batch_ctx, payload);
+        try mirrorHAReplayPayloadCommitContext(&batch_ctx, payload);
         batch_ctx.executor.trackBacklogBytes(reserved_sequence, @intCast(payload.len)) catch {};
         break :blk reserved_sequence;
     };
@@ -52533,6 +52533,84 @@ test "storage.ha db mirrors appended derived replay records into HA stream" {
     try std.testing.expectEqual(@as(u64, 1), decoded.record.sequence);
     try std.testing.expectEqualStrings(artifact_key, decoded.record.changed_artifact_keys[0]);
     try std.testing.expectEqual(change_journal_mod.TargetHint.graph, decoded.record.target_hints[0]);
+}
+
+test "storage.ha db waits for remote apply before completing derived enrichment" {
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 201,
+        .shard_id = 3,
+        .table_id = 9,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    const SyncWait = struct {
+        calls: u64 = 0,
+
+        fn wait(ctx: *anyopaque, primary_arg: *ha_primary_mod.Primary, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            try std.testing.expectEqual(ha_primary_mod.DurabilityMode.remote_apply, policy.mode);
+            try primary_arg.standbyStatusUpdate("standby-a", primary_arg.identity.timeline_id, target_lsn, target_lsn);
+        }
+    };
+
+    var wait_state = SyncWait{};
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_action = std.atomic.Value(u8).init(255);
+    var waits = std.atomic.Value(u64).init(0);
+    const standby_names = [_][]const u8{"standby-a"};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .identity_namespace = .{ .shard_id = 3, .table_id = 9 },
+        .ha_async_effect_mirror = .{
+            .primary = &primary,
+            .last_lsn = &last_lsn,
+            .sync_policy = .{
+                .mode = .remote_apply,
+                .standby_names = &standby_names,
+                .failure_policy = .block,
+            },
+            .sync_wait_ctx = &wait_state,
+            .sync_wait_fn = SyncWait.wait,
+            .last_gate_lsn = &gate_lsn,
+            .last_gate_action = &gate_action,
+            .sync_wait_count = &waits,
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "graph_v1", "mentions", "doc:b");
+    defer alloc.free(artifact_key);
+    const changed_artifact_keys = [_][]const u8{artifact_key};
+    const sequence = try appendDerivedBatchRecord(&db, .{
+        .changed_artifact_keys = changed_artifact_keys[0..],
+    });
+
+    try std.testing.expectEqual(@as(u64, 1), sequence);
+    try std.testing.expectEqual(@as(u64, 1), wait_state.calls);
+    try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
 }
 
 test "storage.ha db mirrors committed batch mutations into HA stream for standby apply" {
