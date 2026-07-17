@@ -161,11 +161,10 @@ pub const Watchdog = struct {
         if (!scope_matches) return error.LeaseScopeMismatch;
 
         const process_matches = if (std.mem.eql(u8, holder, self.cfg.scope.node_id) and self.cfg.scope.process_boot_id.len != 0)
-            std.mem.eql(
-                u8,
-                try requiredString(annotations, "antfly.io/ha-fence-process-boot-id"),
-                self.cfg.scope.process_boot_id,
-            )
+            if (annotations.get("antfly.io/ha-fence-process-boot-id")) |value|
+                value == .string and std.mem.eql(u8, value.string, self.cfg.scope.process_boot_id)
+            else
+                false
         else
             true;
         if (self.authorized_once and !process_matches) return self.latch(.process_changed);
@@ -658,6 +657,19 @@ test "kubernetes lease watchdog binds self-held authority to one process incarna
     try std.testing.expectEqual(Decision.fence, try process_a.observe(std.testing.allocator, bound_b, realtime, 3));
     try std.testing.expectEqual(FenceReason.process_changed, process_a.fence_reason.?);
     try std.testing.expectEqual(Decision.authorized, try process_b.observe(std.testing.allocator, bound_b, realtime, 2));
+}
+
+test "kubernetes lease watchdog publishes pending proof for an initially unbound self-held lease" {
+    const unbound =
+        \\{"metadata":{"annotations":{"antfly.io/ha-fence-topology-id":"topology-7"}},"spec":{"holderIdentity":"primary-a","leaseDurationSeconds":30,"renewTime":"2026-07-15T12:00:00Z","leaseTransitions":1}}
+    ;
+    const bound =
+        \\{"metadata":{"annotations":{"antfly.io/ha-fence-topology-id":"topology-7","antfly.io/ha-fence-process-boot-id":"process-a"}},"spec":{"holderIdentity":"primary-a","leaseDurationSeconds":30,"renewTime":"2026-07-15T12:00:02Z","leaseTransitions":1}}
+    ;
+    const realtime = try rfc3339UnixNs("2026-07-15T12:00:03Z");
+    var watchdog = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "primary-a", .data_generation = "initial", .process_boot_id = "process-a" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, null);
+    try std.testing.expectEqual(Decision.pending_authority, try watchdog.observe(std.testing.allocator, unbound, realtime, 1));
+    try std.testing.expectEqual(Decision.authorized, try watchdog.observe(std.testing.allocator, bound, realtime, 2));
 }
 
 test "kubernetes lease watchdog standby waits for transfer then fences rollback" {

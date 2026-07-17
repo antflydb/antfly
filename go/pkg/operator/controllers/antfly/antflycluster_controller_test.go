@@ -5703,6 +5703,22 @@ func TestHAPlannedActionDependenciesPreferExplicitDependsOn(t *testing.T) {
 	g.Expect(haAdminActionHash(typed)).NotTo(Equal(typedHash))
 }
 
+func TestHAPlannedActionDependenciesDoNotAliasAcrossStandbys(t *testing.T) {
+	g := NewWithT(t)
+	actions := []antflyv1.HAPlannedActionStatus{
+		{Kind: string(haActionPauseSlot), StandbyName: "standby-a", SlotName: "standby-a", AdminJobPhase: haAdminJobPhaseSucceeded},
+		{Kind: string(haActionPauseSlot), StandbyName: "standby-b", SlotName: "standby-b", AdminJobPhase: haAdminJobPhaseFailed},
+		{Kind: string(haActionDropSlot), DependsOn: string(haActionPauseSlot), StandbyName: "standby-b", SlotName: "standby-b"},
+	}
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 2)).To(BeFalse())
+	actions[1].AdminJobPhase = haAdminJobPhaseSucceeded
+	actions[1].AdminResult = &antflyv1.HAAdminActionResultStatus{
+		SchemaVersion: 1, ActionID: "replication_slot_pause:standby-b", ActionKind: "replication_slot_pause",
+		ActionTarget: "standby-b", ActionState: "applied", ActionNodeID: "primary-a", SlotAction: "pause", SlotName: "standby-b",
+	}
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 2)).To(BeTrue())
+}
+
 func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 	g := NewWithT(t)
 
@@ -12997,6 +13013,49 @@ func TestUpdateHAStartupGateStatusUsesOnlyObservedActivationJobAndPVC(t *testing
 	g.Expect(cluster.Status.HAStatus.StartupGate.RuntimeEligible).To(BeFalse())
 	g.Expect(cluster.Status.HAStatus.StartupGate.Reason).To(Equal("DeclarativelySuspended"))
 	g.Expect(cluster.Status.HAStatus.StartupGate.ActivationReceipt).NotTo(BeNil())
+}
+
+func TestUpdateHAStartupGateStatusObservesActivationReceiptFromPrimaryCR(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	target := startupGatedStandaloneControllerCluster(true)
+	target.Name = "antflydb-standby-a"
+	target.Status.HAStatus = &antflyv1.HAStatus{}
+	digest := strings.Repeat("a", 64)
+	primary := target.DeepCopy()
+	primary.Name = "antflydb"
+	primary.Spec.HighAvailability.Runtime.StartupGate = nil
+	primary.Spec.HighAvailability.Runtime.Role = antflyv1.HARuntimeRolePrimary
+	primary.Spec.HighAvailability.Runtime.NodeID = "primary-a"
+	primary.Status.HAStatus = &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{{
+		Kind: string(haActionActivateSeedArtifact), StandbyName: "standby-a", SlotName: "standby-a",
+		TargetLSN: 10, SeedArtifactGeneration: "prod-standby-a-10", AdminJobName: "activation-job", AdminJobPhase: haAdminJobPhaseSucceeded,
+		SeedCaptureReceiptSHA256: strings.Repeat("d", 64), TargetLocalNodeID: 1, TargetReplicaID: 1,
+		SeedArtifactReceipt: &antflyv1.HASeedArtifactReceiptStatus{
+			FormatVersion: 2, Generation: "prod-standby-a-10", SlotName: "standby-a", TopologyID: "test-standalone", TopologyGeneration: 3,
+			NodeID: "standby-a", TargetPVCName: "standby-a-data", TargetPVCUID: "pvc-uid-1", ClusterID: 100, TimelineID: 1, Epoch: 1,
+			ManifestID: "prod-standby-a-10", BackupLSN: 10, CheckpointLSN: 10, ManifestSHA256: digest, AggregateSHA256: strings.Repeat("b", 64),
+			SeedReceiptSHA256: strings.Repeat("c", 64), CaptureReceiptSHA256: strings.Repeat("d", 64), MaterializedReceiptSHA256: strings.Repeat("e", 64),
+			MaterializedAggregateSHA256: strings.Repeat("f", 64), TargetLocalNodeID: 1, TargetReplicaID: 1,
+			GenerationPath: "live-generations/prod-standby-a-10", RawGenerationPath: "generations/prod-standby-a-10",
+		},
+	}, {
+		Kind: string(haActionGCTargetSeedGenerations), StandbyName: "standby-a", SlotName: "standby-a", SeedArtifactGeneration: "prod-standby-a-10",
+		AdminJobPhase: haAdminJobPhaseSucceeded, SeedArtifactReceipt: &antflyv1.HASeedArtifactReceiptStatus{
+			FormatVersion: 1, ActionKind: "gc_local_seed_generations", Scope: "target_activation", Generation: "prod-standby-a-10",
+			SlotName: "standby-a", CheckpointSHA256: strings.Repeat("d", 64), RetainedCount: 2,
+		},
+	}}}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "standby-a-data", Namespace: "default", UID: types.UID("pvc-uid-1")}}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(target, primary, pvc).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+	reconciler.updateHAStartupGateStatus(context.Background(), target)
+	g.Expect(target.Status.HAStatus.StartupGate).NotTo(BeNil())
+	g.Expect(target.Status.HAStatus.StartupGate.RuntimeEligible).To(BeTrue())
+	g.Expect(target.Status.HAStatus.StartupGate.ActivationReceipt).NotTo(BeNil())
+	g.Expect(target.Status.HAStatus.StartupGate.ActivationReceipt.TargetPVCUID).To(Equal("pvc-uid-1"))
 }
 
 func startupGatedStandaloneControllerCluster(runtimeEligible bool) *antflyv1.AntflyCluster {

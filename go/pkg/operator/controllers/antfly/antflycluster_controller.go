@@ -41,6 +41,7 @@ import (
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -4629,67 +4630,82 @@ func (r *AntflyClusterReconciler) updateHAStartupGateStatus(ctx context.Context,
 		status.Reason = "ReplicationIdentityMissing"
 		return
 	}
-	for i := range cluster.Status.HAStatus.PlannedActions {
-		action := cluster.Status.HAStatus.PlannedActions[i]
-		if haActionKind(action.Kind) != haActionActivateSeedArtifact ||
-			strings.TrimSpace(action.SlotName) != strings.TrimSpace(required.SlotName) ||
-			strings.TrimSpace(action.SeedArtifactGeneration) != strings.TrimSpace(required.Generation) ||
-			!haAdminActionSucceededWithEvidence(action) {
+	actionSets := [][]antflyv1.HAPlannedActionStatus{cluster.Status.HAStatus.PlannedActions}
+	peers := &antflyv1.AntflyClusterList{}
+	if err := r.List(ctx, peers, client.InNamespace(cluster.Namespace)); err != nil {
+		status.Reason = "ActivationReceiptSourceLookupFailed"
+		return
+	}
+	for i := range peers.Items {
+		peer := &peers.Items[i]
+		if peer.Name == cluster.Name || peer.Status.HAStatus == nil {
 			continue
 		}
-		receipt := action.SeedArtifactReceipt
-		if receipt.ClusterID != identity.ClusterID || receipt.ShardID != identity.ShardID ||
-			receipt.TableID != identity.TableID || receipt.TimelineID != identity.TimelineID || receipt.Epoch != identity.Epoch {
-			status.Reason = "ActivationReceiptReplicationIdentityMismatch"
-			return
-		}
-		status.ActivationReceipt = &antflyv1.HASeedActivationReceiptStatus{
-			TopologyID:                  receipt.TopologyID,
-			TopologyGeneration:          receipt.TopologyGeneration,
-			NodeID:                      receipt.NodeID,
-			SlotName:                    receipt.SlotName,
-			Generation:                  receipt.Generation,
-			TargetPVCName:               receipt.TargetPVCName,
-			TargetPVCUID:                receipt.TargetPVCUID,
-			ClusterID:                   receipt.ClusterID,
-			ShardID:                     receipt.ShardID,
-			TableID:                     receipt.TableID,
-			TimelineID:                  receipt.TimelineID,
-			Epoch:                       receipt.Epoch,
-			BackupLSN:                   receipt.BackupLSN,
-			CheckpointLSN:               receipt.CheckpointLSN,
-			ManifestID:                  receipt.ManifestID,
-			ManifestSHA256:              receipt.ManifestSHA256,
-			AggregateSHA256:             receipt.AggregateSHA256,
-			SeedReceiptSHA256:           receipt.SeedReceiptSHA256,
-			CaptureReceiptSHA256:        receipt.CaptureReceiptSHA256,
-			MaterializedReceiptSHA256:   receipt.MaterializedReceiptSHA256,
-			MaterializedAggregateSHA256: receipt.MaterializedAggregateSHA256,
-			TargetLocalNodeID:           receipt.TargetLocalNodeID,
-			TargetReplicaID:             receipt.TargetReplicaID,
-			GenerationPath:              receipt.GenerationPath,
-			RawGenerationPath:           receipt.RawGenerationPath,
-		}
-		for j := range cluster.Status.HAStatus.PlannedActions {
-			gc := cluster.Status.HAStatus.PlannedActions[j]
-			if haActionKind(gc.Kind) != haActionGCTargetSeedGenerations ||
-				strings.TrimSpace(gc.SlotName) != strings.TrimSpace(required.SlotName) ||
-				strings.TrimSpace(gc.SeedArtifactGeneration) != strings.TrimSpace(required.Generation) {
+		actionSets = append(actionSets, peer.Status.HAStatus.PlannedActions)
+	}
+	for _, actions := range actionSets {
+		for i := range actions {
+			action := actions[i]
+			if haActionKind(action.Kind) != haActionActivateSeedArtifact ||
+				strings.TrimSpace(action.SlotName) != strings.TrimSpace(required.SlotName) ||
+				strings.TrimSpace(action.SeedArtifactGeneration) != strings.TrimSpace(required.Generation) ||
+				!haAdminActionSucceededWithEvidence(action) {
 				continue
 			}
-			if !haAdminActionSucceededWithEvidence(gc) {
-				status.Reason = "TargetGenerationGCNotObserved"
+			receipt := action.SeedArtifactReceipt
+			if receipt.ClusterID != identity.ClusterID || receipt.ShardID != identity.ShardID ||
+				receipt.TableID != identity.TableID || receipt.TimelineID != identity.TimelineID || receipt.Epoch != identity.Epoch {
+				status.Reason = "ActivationReceiptReplicationIdentityMismatch"
 				return
 			}
-			break
+			status.ActivationReceipt = &antflyv1.HASeedActivationReceiptStatus{
+				TopologyID:                  receipt.TopologyID,
+				TopologyGeneration:          receipt.TopologyGeneration,
+				NodeID:                      receipt.NodeID,
+				SlotName:                    receipt.SlotName,
+				Generation:                  receipt.Generation,
+				TargetPVCName:               receipt.TargetPVCName,
+				TargetPVCUID:                receipt.TargetPVCUID,
+				ClusterID:                   receipt.ClusterID,
+				ShardID:                     receipt.ShardID,
+				TableID:                     receipt.TableID,
+				TimelineID:                  receipt.TimelineID,
+				Epoch:                       receipt.Epoch,
+				BackupLSN:                   receipt.BackupLSN,
+				CheckpointLSN:               receipt.CheckpointLSN,
+				ManifestID:                  receipt.ManifestID,
+				ManifestSHA256:              receipt.ManifestSHA256,
+				AggregateSHA256:             receipt.AggregateSHA256,
+				SeedReceiptSHA256:           receipt.SeedReceiptSHA256,
+				CaptureReceiptSHA256:        receipt.CaptureReceiptSHA256,
+				MaterializedReceiptSHA256:   receipt.MaterializedReceiptSHA256,
+				MaterializedAggregateSHA256: receipt.MaterializedAggregateSHA256,
+				TargetLocalNodeID:           receipt.TargetLocalNodeID,
+				TargetReplicaID:             receipt.TargetReplicaID,
+				GenerationPath:              receipt.GenerationPath,
+				RawGenerationPath:           receipt.RawGenerationPath,
+			}
+			for j := range actions {
+				gc := actions[j]
+				if haActionKind(gc.Kind) != haActionGCTargetSeedGenerations ||
+					strings.TrimSpace(gc.SlotName) != strings.TrimSpace(required.SlotName) ||
+					strings.TrimSpace(gc.SeedArtifactGeneration) != strings.TrimSpace(required.Generation) {
+					continue
+				}
+				if !haAdminActionSucceededWithEvidence(gc) {
+					status.Reason = "TargetGenerationGCNotObserved"
+					return
+				}
+				break
+			}
+			// Seed the status as eligible only for the exact matcher invocation;
+			// declarative suspension and every configured evidence mismatch still win.
+			status.RuntimeEligible = true
+			eligible, reason := haStartupGateRuntimeEligible(cluster, pvc)
+			status.RuntimeEligible = eligible
+			status.Reason = reason
+			return
 		}
-		// Seed the status as eligible only for the exact matcher invocation;
-		// declarative suspension and every configured evidence mismatch still win.
-		status.RuntimeEligible = true
-		eligible, reason := haStartupGateRuntimeEligible(cluster, pvc)
-		status.RuntimeEligible = eligible
-		status.Reason = reason
-		return
 	}
 	if !gate.RuntimeEligible {
 		status.Reason = "DeclarativelySuspended"
@@ -9716,9 +9732,9 @@ func haPlannedActionDependenciesSucceeded(actions []antflyv1.HAPlannedActionStat
 	if action.DependsOn == "" {
 		return haPriorAdminActionsSucceeded(actions[:index])
 	}
-	for i := 0; i < index; i++ {
+	for i := index - 1; i >= 0; i-- {
 		dependency := actions[i]
-		if dependency.Kind != action.DependsOn {
+		if dependency.Kind != action.DependsOn || !haPlannedActionDependencyScopeMatches(action, dependency) {
 			continue
 		}
 		if dependency.Executor == string(haActionExecutorControllerAction) {
@@ -9733,6 +9749,35 @@ func haPlannedActionDependenciesSucceeded(actions []antflyv1.HAPlannedActionStat
 		return haAdminActionSucceededWithEvidence(dependency)
 	}
 	return false
+}
+
+func haPlannedActionDependencyScopeMatches(action, dependency antflyv1.HAPlannedActionStatus) bool {
+	// Former-primary repair deliberately crosses node identities (for example,
+	// demote primary-a depends on promotion of standby-a).
+	if haFormerPrimaryActionKind(action.Kind) || haFormerPrimaryActionKind(dependency.Kind) ||
+		haActionKind(dependency.Kind) == haActionFenceFormerPrimary || haActionKind(dependency.Kind) == haActionIsolateFormerPrimary ||
+		haActionKind(action.Kind) == haActionDemoteFormerPrimary {
+		return true
+	}
+	actionTarget := firstNonEmptyString(action.SlotName, action.StandbyName, action.RouteTo)
+	dependencyTarget := firstNonEmptyString(dependency.SlotName, dependency.StandbyName, dependency.RouteTo)
+	if actionTarget != "" && dependencyTarget != "" && actionTarget != dependencyTarget {
+		return false
+	}
+	if action.SeedArtifactGeneration != "" && dependency.SeedArtifactGeneration != "" &&
+		dependency.SeedArtifactGeneration != action.SeedArtifactGeneration {
+		return false
+	}
+	return true
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func haPlannedActionDependenciesSucceededForStatus(status *antflyv1.HAStatus, actions []antflyv1.HAPlannedActionStatus, index int, clusters ...*antflyv1.AntflyCluster) bool {
@@ -12272,6 +12317,7 @@ func hasAnyPrefix(name string, prefixes []string) bool {
 func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := ctrl.NewControllerManagedBy(mgr).
 		Named("antflycluster-ha-lease-renewal").
+		WithOptions(controller.Options{MaxConcurrentReconciles: 16}).
 		For(&antflyv1.AntflyCluster{}).
 		Complete(&haLeaseRenewalReconciler{parent: r}); err != nil {
 		return err

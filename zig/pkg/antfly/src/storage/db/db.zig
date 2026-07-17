@@ -11630,12 +11630,17 @@ pub const DB = struct {
                 // and appending so it cannot advance the checkpoint across an
                 // empty replay window between those two operations.
                 runtime.stop();
-                errdefer runtime.start() catch |start_err| {
-                    std.log.warn("restore runtime repair enrichment restart failed path={s} err={}", .{ self.core.path, start_err });
+                errdefer if (self.optional_runtime_workers_enabled) {
+                    runtime.start() catch |start_err| {
+                        std.log.warn("restore runtime repair enrichment restart failed path={s} err={}", .{ self.core.path, start_err });
+                    };
                 };
                 try runtime.resumeFrom(0, self.core.nextDerivedSequence());
                 const generated_refs = try self.replayGeneratedEnrichmentsFromStoredDocs(alloc);
-                try runtime.start();
+                // Restore opens with optional workers disabled and drains them
+                // synchronously. Starting a background worker here races the
+                // foreground catch-up in the next phase over index mutation.
+                if (self.optional_runtime_workers_enabled) try runtime.start();
                 std.log.info("restore runtime repair replayed generated enrichments path={s} refs={d}", .{ self.core.path, generated_refs });
             }
             try self.updateRestoreRuntimeRepairPhase(alloc, "drain_async", false);
