@@ -416,6 +416,33 @@ pub fn putEntry(
     expected: ?ExpectedTransition,
     entry: Entry,
 ) !void {
+    return try putEntryWithAuthority(alloc, path, expected_identity, expected, entry, .normal);
+}
+
+/// Staged restore may rebuild a newly admitted active generation directly,
+/// without creating the shadow candidate used by ordinary repair. The DB
+/// layer performs the coverage/config/replay proof; this operation grants only
+/// the narrow durable phase transition needed to record that proof.
+pub fn putRestoreProvenAdmissionEntry(
+    alloc: Allocator,
+    path: []const u8,
+    expected_identity: ReplicaIdentity,
+    expected: ExpectedTransition,
+    entry: Entry,
+) !void {
+    return try putEntryWithAuthority(alloc, path, expected_identity, expected, entry, .restore_admission_proof);
+}
+
+const TransitionAuthority = enum { normal, restore_admission_proof };
+
+fn putEntryWithAuthority(
+    alloc: Allocator,
+    path: []const u8,
+    expected_identity: ReplicaIdentity,
+    expected: ?ExpectedTransition,
+    entry: Entry,
+    authority: TransitionAuthority,
+) !void {
     try validateEntry(entry);
     if (!entry.intent.identity().eql(expected_identity)) return error.ReplicaIdentityMismatch;
 
@@ -437,10 +464,21 @@ pub fn putEntry(
         {
             return error.RepairTransitionConflict;
         }
-        if (!phaseTransitionAllowed(existing.phase, entry.intent.phase)) {
+        const restore_admission_completion = authority == .restore_admission_proof and
+            existing.trigger == .incomplete_bulk_publish and
+            entry.intent.trigger == .incomplete_bulk_publish and
+            existing.phase != .terminal and
+            existing.phase != .cleanup and
+            entry.intent.phase == .cleanup and
+            existing.candidate_relative_path == null and
+            entry.intent.candidate_relative_path == null;
+        if (!phaseTransitionAllowed(existing.phase, entry.intent.phase) and
+            !restore_admission_completion)
+        {
             return error.InvalidIndexRepairTransition;
         }
     } else {
+        if (authority != .normal) return error.InvalidIndexRepairTransition;
         if (existing_index != null) return error.RepairTransitionConflict;
         if (entry.intent.phase != .detected or entry.pin != null) {
             return error.InvalidIndexRepairTransition;

@@ -210,8 +210,20 @@ class HAStandaloneNode:
             return None
         return {"Authorization": f"Bearer {self.admin_token}"}
 
+    def _request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        try:
+            return requests.request(method, url, **kwargs)
+        except requests.RequestException as err:
+            exit_code = self.proc.poll() if self.proc is not None else None
+            err.add_note(
+                f"HA {self.role} request failed; process_exit_code={exit_code}\n"
+                f"[logs]\n{self.debug_logs()}"
+            )
+            raise
+
     def admin_get_response(self, path: str, **params: Any) -> requests.Response:
-        return requests.get(
+        return self._request(
+            "GET",
             f"{self.url}{HA_ADMIN_ROOT}{path}",
             params=params,
             headers=self.admin_headers(),
@@ -219,7 +231,8 @@ class HAStandaloneNode:
         )
 
     def admin_post_response(self, path: str, payload: dict[str, Any]) -> requests.Response:
-        return requests.post(
+        return self._request(
+            "POST",
             f"{self.url}{HA_ADMIN_ROOT}{path}",
             json=payload,
             headers=self.admin_headers(),
@@ -235,7 +248,8 @@ class HAStandaloneNode:
         return self._check(response)
 
     def create_table(self, table_name: str) -> dict[str, Any]:
-        response = requests.post(
+        response = self._request(
+            "POST",
             f"{self.url}{DB_API_ROOT}/tables/{table_name}",
             json={"num_shards": 1},
             timeout=30,
@@ -247,7 +261,8 @@ class HAStandaloneNode:
         return self._check(response)
 
     def batch_write_response(self, table_name: str, inserts: dict[str, dict[str, Any]]) -> requests.Response:
-        return requests.post(
+        return self._request(
+            "POST",
             f"{self.url}{DB_API_ROOT}/tables/{table_name}/batch",
             json={"inserts": inserts},
             timeout=30,
@@ -255,7 +270,8 @@ class HAStandaloneNode:
 
     def lookup_key(self, table_name: str, key: str, *, consistency: str | None = None) -> dict[str, Any]:
         params = {"consistency": consistency} if consistency is not None else None
-        response = requests.get(
+        response = self._request(
+            "GET",
             f"{self.url}{DB_API_ROOT}{lookup_key_path(table_name, key)}",
             params=params,
             timeout=30,

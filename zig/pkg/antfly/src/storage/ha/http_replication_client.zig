@@ -99,7 +99,7 @@ pub const Client = struct {
         });
         defer self.alloc.free(resp.request_uri);
         defer resp.response.deinit(self.alloc);
-        try mapStatus(resp.response.status);
+        try mapStatus(resp.response.status, resp.response.body);
 
         var parsed = try std.json.parseFromSlice(
             internal_api.HAIdentifySystemResponse,
@@ -141,7 +141,7 @@ pub const Client = struct {
         });
         defer self.alloc.free(resp.request_uri);
         defer resp.response.deinit(self.alloc);
-        try mapStatus(resp.response.status);
+        try mapStatus(resp.response.status, resp.response.body);
     }
 
     pub fn createReplicationSlotForStandby(
@@ -363,7 +363,7 @@ pub const Client = struct {
             self.alloc.free(resp.request_uri);
             resp.response.deinit(self.alloc);
         }
-        try mapStatus(resp.response.status);
+        try mapStatus(resp.response.status, resp.response.body);
 
         const parsed = try std.json.parseFromSlice(
             internal_api.HAStartReplicationResponse,
@@ -418,7 +418,7 @@ pub const Client = struct {
         free_uri_on_error = false;
         defer self.alloc.free(resp.request_uri);
         defer resp.response.deinit(self.alloc);
-        try mapStatus(resp.response.status);
+        try mapStatus(resp.response.status, resp.response.body);
 
         var parsed = try std.json.parseFromSlice(
             internal_api.HAStandbyStatusUpdateResponse,
@@ -655,14 +655,25 @@ fn join(alloc: Allocator, base_uri: []const u8, path: []const u8) ![]u8 {
     return try routes.Routes.join(alloc, base_uri, path);
 }
 
-fn mapStatus(status: u16) !void {
+fn mapStatus(status: u16, body: []const u8) !void {
     if (status >= 200 and status < 300) return;
     if (status == 400) return error.InvalidInternalReplicationRequest;
-    if (status == 404) return error.InternalReplicationEndpointNotFound;
+    // Fixed internal routes use the error name as their command-error body.
+    // Preserve resource absence separately from an incompatible/missing route
+    // so the standby exposes an actionable degraded-state reason.
+    if (status == 404) {
+        if (std.mem.eql(u8, std.mem.trim(u8, body, " \t\r\n"), "SlotNotFound")) return error.SlotNotFound;
+        return error.InternalReplicationEndpointNotFound;
+    }
     if (status == 405) return error.UnsupportedOperation;
     if (status == 409) return error.InternalReplicationConflict;
     if (status == 503) return error.InternalReplicationEndpointNotReady;
     return error.UnexpectedHttpStatus;
+}
+
+test "http replication status distinguishes missing slots from missing routes" {
+    try std.testing.expectError(error.SlotNotFound, mapStatus(404, "SlotNotFound"));
+    try std.testing.expectError(error.InternalReplicationEndpointNotFound, mapStatus(404, "not found"));
 }
 
 const TestPaths = struct {

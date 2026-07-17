@@ -3451,6 +3451,7 @@ pub fn build(b: *std.Build) void {
         "data server applies routed HA replication records through standby write gate",
         "data server pulls and applies HA standby replication through internal HTTP client",
         "data server resumes HA standby replication from durable progress after restart",
+        "data server keeps upstream replication availability failures nonfatal",
         "data runtime records HA standby replication round failures",
         "data runtime records HA standby apply failures without stopping run round",
     };
@@ -4714,6 +4715,7 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up preserves restore repair debt while index load is terminal",
             "managed startup catch-up allocation failure preserves bounded retry",
+            "managed repair visibility edges retire cached readers and runtime status",
             "provisioned named index repair keeps group queued for aggregate debt audit",
             "dirty table tracking stays bounded to writer cache ownership",
             "writer cache eviction retires dirty ownership after the last cache owner",
@@ -5029,6 +5031,7 @@ pub fn build(b: *std.Build) void {
             "db dense artifact counter bootstrap restarts from a fresh snapshot",
             "db dense artifact counter bootstrap fences stale concurrent attempt",
             "db malformed quarantined dense config does not block healthy artifact counters",
+            "db query repair gate revalidates stale debt without clearing admission",
             "db dense repair working set scales batch to resource budget",
             "db dense counter bootstrap admission respects soft background budget",
             "managed startup catch-up advances counterless incomplete dense repair",

@@ -155,6 +155,7 @@ pub const TableRuntimeSummary = struct {
 pub const TableRuntimeSnapshotCache = struct {
     alloc: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
+    publication_revision: std.atomic.Value(u64) = .init(1),
     entries: std.ArrayListUnmanaged(TableRuntimeSnapshot) = .empty,
 
     pub fn init(alloc: std.mem.Allocator) @This() {
@@ -171,12 +172,21 @@ pub const TableRuntimeSnapshotCache = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         self.clearLocked();
+        _ = self.publication_revision.fetchAdd(1, .release);
     }
 
     pub fn invalidateTable(self: *@This(), table_name: []const u8) void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         self.removeTableLocked(table_name);
+        // Advance even when the table is absent. Invalidation is also a
+        // publication fence for a refresh that captured the prior storage
+        // generation but has not reached the cache yet.
+        _ = self.publication_revision.fetchAdd(1, .release);
+    }
+
+    pub fn publicationRevision(self: *@This()) u64 {
+        return self.publication_revision.load(.acquire);
     }
 
     pub fn replaceOwned(self: *@This(), snapshots: []TableRuntimeSnapshot) void {
@@ -201,6 +211,44 @@ pub const TableRuntimeSnapshotCache = struct {
         self.entries = new_entries;
         for (old_entries.items) |*entry| entry.deinit(self.alloc);
         old_entries.deinit(self.alloc);
+        _ = self.publication_revision.fetchAdd(1, .release);
+    }
+
+    /// Consumes `snapshots`. Returns false when a concurrent cache mutation
+    /// invalidated the storage view from which the refresh was collected.
+    pub fn replaceOwnedIfRevision(
+        self: *@This(),
+        snapshots: []TableRuntimeSnapshot,
+        expected_revision: u64,
+    ) bool {
+        lockAtomic(&self.mutex);
+        if (self.publication_revision.load(.acquire) != expected_revision) {
+            self.mutex.unlock();
+            for (snapshots) |*entry| entry.deinit(self.alloc);
+            return false;
+        }
+        defer self.mutex.unlock();
+
+        var new_entries = std.ArrayListUnmanaged(TableRuntimeSnapshot).empty;
+        new_entries.appendSlice(self.alloc, snapshots) catch {
+            for (snapshots) |*entry| entry.deinit(self.alloc);
+            return false;
+        };
+
+        const now_ns = platform_time.monotonicNs();
+        for (new_entries.items) |*entry| {
+            for (entry.statuses.items) |*status| {
+                status.withMetadataDefaults(.background_refresh, now_ns);
+                self.preserveCachedStatusForSyntheticPlaceholderLocked(entry.table_name, status, now_ns) catch {};
+            }
+        }
+
+        var old_entries = self.entries;
+        self.entries = new_entries;
+        for (old_entries.items) |*entry| entry.deinit(self.alloc);
+        old_entries.deinit(self.alloc);
+        _ = self.publication_revision.fetchAdd(1, .release);
+        return true;
     }
 
     pub fn replaceOwnedPreservingGroupStatus(
@@ -256,6 +304,69 @@ pub const TableRuntimeSnapshotCache = struct {
         self.entries = new_entries;
         for (old_entries.items) |*entry| entry.deinit(self.alloc);
         old_entries.deinit(self.alloc);
+        _ = self.publication_revision.fetchAdd(1, .release);
+    }
+
+    /// Preserving variant of `replaceOwnedIfRevision`. A rejected refresh
+    /// consumes its snapshots without merging status from an older storage
+    /// generation back into the cache.
+    pub fn replaceOwnedPreservingGroupStatusIfRevision(
+        self: *@This(),
+        snapshots: []TableRuntimeSnapshot,
+        table_name: []const u8,
+        group_id: u64,
+        expected_revision: u64,
+    ) !bool {
+        lockAtomic(&self.mutex);
+        if (self.publication_revision.load(.acquire) != expected_revision) {
+            self.mutex.unlock();
+            for (snapshots) |*entry| entry.deinit(self.alloc);
+            return false;
+        }
+        defer self.mutex.unlock();
+
+        var new_entries = std.ArrayListUnmanaged(TableRuntimeSnapshot).empty;
+        errdefer {
+            for (new_entries.items) |*entry| entry.deinit(self.alloc);
+            new_entries.deinit(self.alloc);
+        }
+        try new_entries.appendSlice(self.alloc, snapshots);
+
+        const now_ns = platform_time.monotonicNs();
+        for (new_entries.items) |*entry| {
+            for (entry.statuses.items) |*status| {
+                status.withMetadataDefaults(.background_refresh, now_ns);
+                self.preserveCachedStatusForSyntheticPlaceholderLocked(entry.table_name, status, now_ns) catch {};
+            }
+        }
+
+        var preserved: ?LocalTableRuntimeStatus = null;
+        errdefer if (preserved) |*status| status.deinit(self.alloc);
+        for (self.entries.items) |*entry| {
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            for (entry.statuses.items) |status| {
+                if (status.group_id != group_id) continue;
+                if (!runtimeStatusWorthPreserving(status)) break;
+                preserved = try status.clone(self.alloc);
+                break;
+            }
+            if (preserved != null) break;
+        }
+
+        if (preserved) |status| {
+            defer {
+                var owned = status;
+                owned.deinit(self.alloc);
+            }
+            try self.upsertGroupStatusInEntries(&new_entries, table_name, status);
+        }
+
+        var old_entries = self.entries;
+        self.entries = new_entries;
+        for (old_entries.items) |*entry| entry.deinit(self.alloc);
+        old_entries.deinit(self.alloc);
+        _ = self.publication_revision.fetchAdd(1, .release);
+        return true;
     }
 
     pub fn snapshot(self: *@This(), alloc: std.mem.Allocator, table_name: []const u8) !?LocalTableRuntimeStatuses {
@@ -293,12 +404,44 @@ pub const TableRuntimeSnapshotCache = struct {
         var owned = status;
         owned.withMetadataDefaults(.live_writer_publish, platform_time.monotonicNs());
         try self.upsertGroupStatusInEntries(&self.entries, table_name, owned);
+        _ = self.publication_revision.fetchAdd(1, .release);
+    }
+
+    pub fn upsertGroupStatusIfRevision(
+        self: *@This(),
+        table_name: []const u8,
+        status: LocalTableRuntimeStatus,
+        expected_revision: u64,
+    ) !bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.publication_revision.load(.acquire) != expected_revision) return false;
+        var owned = status;
+        owned.withMetadataDefaults(.live_writer_publish, platform_time.monotonicNs());
+        try self.upsertGroupStatusInEntries(&self.entries, table_name, owned);
+        _ = self.publication_revision.fetchAdd(1, .release);
+        return true;
     }
 
     pub fn upsertGroupStatusPreservingMetadata(self: *@This(), table_name: []const u8, status: LocalTableRuntimeStatus) !void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         try self.upsertGroupStatusInEntries(&self.entries, table_name, status);
+        _ = self.publication_revision.fetchAdd(1, .release);
+    }
+
+    pub fn upsertGroupStatusPreservingMetadataIfRevision(
+        self: *@This(),
+        table_name: []const u8,
+        status: LocalTableRuntimeStatus,
+        expected_revision: u64,
+    ) !bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.publication_revision.load(.acquire) != expected_revision) return false;
+        try self.upsertGroupStatusInEntries(&self.entries, table_name, status);
+        _ = self.publication_revision.fetchAdd(1, .release);
+        return true;
     }
 
     fn upsertGroupStatusLocked(self: *@This(), table_name: []const u8, status: LocalTableRuntimeStatus) !void {
@@ -1104,6 +1247,45 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         .term_doc_freq_cache_misses = stats.term_doc_freq_cache_misses,
         .async_indexing = stats.async_indexing,
     };
+}
+
+test "runtime status cache rejects refresh captured before invalidation" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    const stale_revision = cache.publicationRevision();
+    cache.invalidateTable("docs");
+
+    const stale_statuses = try alloc.alloc(LocalTableRuntimeStatus, 1);
+    stale_statuses[0] = .{
+        .group_id = 7,
+        .stats = .{ .repair_degraded = true },
+    };
+    const stale_snapshots = try alloc.alloc(TableRuntimeSnapshot, 1);
+    defer alloc.free(stale_snapshots);
+    stale_snapshots[0] = .{
+        .table_name = try alloc.dupe(u8, "docs"),
+        .statuses = .{ .items = stale_statuses },
+    };
+    try std.testing.expect(!cache.replaceOwnedIfRevision(stale_snapshots, stale_revision));
+    try std.testing.expect((try cache.snapshot(alloc, "docs")) == null);
+
+    const current_revision = cache.publicationRevision();
+    const clean_statuses = try alloc.alloc(LocalTableRuntimeStatus, 1);
+    clean_statuses[0] = .{ .group_id = 7, .stats = .{} };
+    const clean_snapshots = try alloc.alloc(TableRuntimeSnapshot, 1);
+    defer alloc.free(clean_snapshots);
+    clean_snapshots[0] = .{
+        .table_name = try alloc.dupe(u8, "docs"),
+        .statuses = .{ .items = clean_statuses },
+    };
+    try std.testing.expect(cache.replaceOwnedIfRevision(clean_snapshots, current_revision));
+
+    var published = (try cache.snapshot(alloc, "docs")).?;
+    defer published.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), published.items.len);
+    try std.testing.expect(!published.items[0].stats.repair_degraded);
 }
 
 test "table runtime snapshot cache clones stored status" {

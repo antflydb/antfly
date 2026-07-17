@@ -2167,6 +2167,12 @@ const HAStandbyReplicationErrorCode = enum(u8) {
     ConnectionRefused,
     BrokenPipe,
     EndOfStream,
+    InvalidInternalReplicationRequest,
+    InternalReplicationEndpointNotFound,
+    UnsupportedOperation,
+    InternalReplicationConflict,
+    InternalReplicationEndpointNotReady,
+    SlotNotFound,
     UnexpectedHttpStatus,
     NotListening,
     UnsupportedReplicationFormat,
@@ -2206,6 +2212,12 @@ fn haStandbyReplicationErrorCode(err: anyerror) HAStandbyReplicationErrorCode {
         error.ConnectionRefused => .ConnectionRefused,
         error.BrokenPipe => .BrokenPipe,
         error.EndOfStream => .EndOfStream,
+        error.InvalidInternalReplicationRequest => .InvalidInternalReplicationRequest,
+        error.InternalReplicationEndpointNotFound => .InternalReplicationEndpointNotFound,
+        error.UnsupportedOperation => .UnsupportedOperation,
+        error.InternalReplicationConflict => .InternalReplicationConflict,
+        error.InternalReplicationEndpointNotReady => .InternalReplicationEndpointNotReady,
+        error.SlotNotFound => .SlotNotFound,
         error.UnexpectedHttpStatus => .UnexpectedHttpStatus,
         error.NotListening => .NotListening,
         error.UnsupportedReplicationFormat => .UnsupportedReplicationFormat,
@@ -2247,6 +2259,12 @@ fn haStandbyReplicationErrorName(code: HAStandbyReplicationErrorCode) ?[]const u
         .ConnectionRefused => "ConnectionRefused",
         .BrokenPipe => "BrokenPipe",
         .EndOfStream => "EndOfStream",
+        .InvalidInternalReplicationRequest => "InvalidInternalReplicationRequest",
+        .InternalReplicationEndpointNotFound => "InternalReplicationEndpointNotFound",
+        .UnsupportedOperation => "UnsupportedOperation",
+        .InternalReplicationConflict => "InternalReplicationConflict",
+        .InternalReplicationEndpointNotReady => "InternalReplicationEndpointNotReady",
+        .SlotNotFound => "SlotNotFound",
         .UnexpectedHttpStatus => "UnexpectedHttpStatus",
         .NotListening => "NotListening",
         .UnsupportedReplicationFormat => "UnsupportedReplicationFormat",
@@ -2299,6 +2317,16 @@ fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
         error.ConnectionRefused,
         error.BrokenPipe,
         error.EndOfStream,
+        // Upstream route/resource availability and protocol negotiation are
+        // operational degradation, not local process integrity failures. Keep
+        // stale reads and promotion controls available while reporting the
+        // exact reason and retrying on subsequent rounds.
+        error.InvalidInternalReplicationRequest,
+        error.InternalReplicationEndpointNotFound,
+        error.UnsupportedOperation,
+        error.InternalReplicationConflict,
+        error.InternalReplicationEndpointNotReady,
+        error.SlotNotFound,
         error.UnexpectedHttpStatus,
         error.NotListening,
         error.UnsupportedReplicationFormat,
@@ -2342,6 +2370,20 @@ fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+test "data server keeps upstream replication availability failures nonfatal" {
+    inline for (.{
+        error.InvalidInternalReplicationRequest,
+        error.InternalReplicationEndpointNotFound,
+        error.UnsupportedOperation,
+        error.InternalReplicationConflict,
+        error.InternalReplicationEndpointNotReady,
+        error.SlotNotFound,
+    }) |err| {
+        try std.testing.expect(isNonFatalHAStandbyReplicationError(err));
+        try std.testing.expect(haStandbyReplicationErrorCode(err) != .Other);
+    }
 }
 
 fn isRetryableMetadataBootstrapError(err: anyerror) bool {
@@ -3745,6 +3787,23 @@ pub const DataServer = struct {
 
     fn haPublicGateStateChangedCallback(ptr: *anyopaque) void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
+        // The admin server invokes this hook while it still owns
+        // ha_state_mutex. Adopt a durable promotion in that same transition so
+        // the successful promotion response cannot race the standalone
+        // runtime's next polling round. Adoption failures remain fail-closed
+        // and are retried by runHAStandbyReplicationRound.
+        if (self.ha_cfg.standby_replication) |cfg| {
+            if (self.openPromotedPrimaryFromStandbyIfReady(cfg) catch |err| {
+                _ = self.ha_standby_replication_failure_count.fetchAdd(1, .monotonic);
+                self.recordHAStandbyReplicationError(err);
+                std.log.warn("HA promoted primary adoption deferred err={}", .{err});
+                self.refreshHAPublicGateState();
+                return;
+            }) {
+                self.clearHAStandbyReplicationError();
+                return;
+            }
+        }
         self.refreshHAPublicGateState();
     }
 
@@ -8687,6 +8746,7 @@ pub const DataServer = struct {
         var active_target_owned = active_target;
         defer if (active_target_owned) |*target| target.deinit(self.alloc);
 
+        const cache_publication_revision = self.provisioned_storage.runtime_status_cache.publicationRevision();
         const status_generation = self.runtime_status_generation.fetchAdd(1, .monotonic);
         const snapshots = self.collectOwnedRuntimeSnapshots(active_target_owned, &budget, status_generation) catch |err| {
             _ = self.runtime_status_refresh_failed.fetchAdd(1, .monotonic);
@@ -8706,13 +8766,25 @@ pub const DataServer = struct {
             if (runtimeStatusStartupCatchUpDebtPresent(entry.statuses.items)) startup_catch_up_debt_present = true;
         }
         if (active_target_owned) |target| {
-            self.provisioned_storage.runtime_status_cache.replaceOwnedPreservingGroupStatus(snapshots, target.table_name, target.group_id) catch |err| {
+            const published = self.provisioned_storage.runtime_status_cache.replaceOwnedPreservingGroupStatusIfRevision(
+                snapshots,
+                target.table_name,
+                target.group_id,
+                cache_publication_revision,
+            ) catch |err| {
                 _ = self.runtime_status_refresh_failed.fetchAdd(1, .monotonic);
                 std.log.warn("runtime status refresh cache merge failed err={}", .{err});
                 return stats;
             };
+            if (!published) {
+                self.runtime_status_dirty.store(true, .release);
+                return stats;
+            }
         } else {
-            self.provisioned_storage.runtime_status_cache.replaceOwned(snapshots);
+            if (!self.provisioned_storage.runtime_status_cache.replaceOwnedIfRevision(snapshots, cache_publication_revision)) {
+                self.runtime_status_dirty.store(true, .release);
+                return stats;
+            }
         }
         self.provisioned_startup_catch_up_dirty.store(startup_catch_up_debt_present, .release);
         self.runtime_status_last_refresh_at_ms.store(
@@ -20351,7 +20423,7 @@ test "data server HA replication network wait leaves state mutex available" {
     try std.testing.expectEqual(error.HAStandbyStateChanged, replication_err);
 }
 
-test "data server promotion rewires live HTTP internal HA executor" {
+test "data server HA state change synchronously adopts promotion and rewires live HTTP executor" {
     const alloc = std.testing.allocator;
     const FakeStatus = struct {
         fn iface() antfly.public_api.http_server.StatusSource {
@@ -20471,7 +20543,9 @@ test "data server promotion rewires live HTTP internal HA executor" {
     defer before.deinit(server.http_server.?.alloc);
     try std.testing.expectEqual(@as(u16, 404), before.status);
 
-    try server.runHAStandbyReplicationRound();
+    lockAtomic(&server.ha_state_mutex);
+    DataServer.haPublicGateStateChangedCallback(&server);
+    server.ha_state_mutex.unlock();
     try std.testing.expect(standby == null);
     try std.testing.expect(server.ha_promoted_primary != null);
     try std.testing.expect(server.ha_cfg.admin_context.?.standby == null);
