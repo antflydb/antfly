@@ -605,8 +605,10 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
     assert coverage["policy"] == "strict"
     assert coverage["complete"] is False
     assert coverage["pending"] >= 3
-    assert converged["backfill_active"] is True
-    assert converged["rebuilding"] is True
+    assert converged["backfill_active"] is False
+    assert converged["rebuilding"] is False
+    assert converged["backfill_state"] == "failed"
+    assert "coverage policy unsatisfied" in converged["error"]
 
 
 def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited_enrichment(
@@ -885,7 +887,10 @@ def test_stateful_managed_embeddings_status_reports_partial_retrying_backfill_af
     assert partial["backfill_state"] == "retrying"
     assert partial["backfill_active"] is True
     assert partial["backfill_progress"] < 1.0
-    assert partial["replay_applied_sequence"] < partial["replay_target_sequence"]
+    # The managed replay ledger is already current; retrying enrichment is a
+    # separate stage and must not manufacture index replay debt.
+    assert partial["replay_applied_sequence"] == partial["replay_target_sequence"]
+    assert partial["replay_catch_up_required"] is False
 
     enrichment = partial["enrichment_runtime"]
     assert enrichment["error_count"] >= 1
