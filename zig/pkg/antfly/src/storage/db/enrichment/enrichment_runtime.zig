@@ -2335,6 +2335,7 @@ fn processDocumentExtractionAsset(
         .config = config,
         .batch_policy = requestGeneratedTextBatchPolicy(runtime.alloc, request),
         .source_url = source_url,
+        .source_bytes = downloaded_mut.data,
         .doc_key = request.doc_key,
         .artifact_name = artifact_name,
         .desired_unit_keys = &desired_unit_keys,
@@ -2706,12 +2707,13 @@ fn completeRuntimeDocumentExtractionGeneratedText(
     config: document_extraction_mod.Config,
     batch_policy: GeneratedTextBatchPolicy,
     source_url: []const u8,
+    source_bytes: []const u8,
     source_content_type: []const u8,
     extraction: *document_extraction_mod.Result,
 ) !void {
     const producer = runtime.config.asset_producer orelse return;
-    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, producer, config, batch_policy, source_url, extraction.route_type, source_content_type, extraction.units, .ocr);
-    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, producer, config, batch_policy, source_url, extraction.route_type, source_content_type, extraction.units, .transcript);
+    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .ocr);
+    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .transcript);
 }
 
 fn completeRuntimeDocumentExtractionGeneratedTextBatch(
@@ -2720,6 +2722,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     config: document_extraction_mod.Config,
     batch_policy: GeneratedTextBatchPolicy,
     source_url: []const u8,
+    source_bytes: []const u8,
     route_type: []const u8,
     source_content_type: []const u8,
     units: []document_extraction_mod.Unit,
@@ -2740,7 +2743,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
         .transcript => .transcriber,
     };
     const config_json = switch (kind) {
-        .ocr => config.ocr_config_json,
+        .ocr => document_extraction_mod.effectiveOcrConfigJson(config),
         .transcript => config.transcription_config_json,
     };
     const method = switch (kind) {
@@ -2761,13 +2764,25 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     var batch_bytes: usize = 0;
     for (units, 0..) |unit, idx| {
         if (unit.extraction_status == null or !std.mem.eql(u8, unit.extraction_status.?, pending_status)) continue;
-        const parts_json = try runtimeDocumentGeneratedTextPartsJsonAlloc(runtime.alloc, route_type, source_content_type, unit);
+        var rendered_page: ?[]u8 = null;
+        defer if (rendered_page) |png| runtime.alloc.free(png);
+        if (kind == .ocr and std.mem.eql(u8, route_type, "pdf")) {
+            rendered_page = document_extraction_mod.renderPdfPagePngAlloc(runtime.alloc, source_bytes, unit.page_number orelse 1) catch |err| {
+                if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+                try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[idx], method, kind, err);
+                continue;
+            };
+        }
+        const parts_json = if (rendered_page) |png|
+            try document_extraction_mod.ocrPagePartsJsonAlloc(runtime.alloc, route_type, source_content_type, unit, png)
+        else
+            try runtimeDocumentGeneratedTextPartsJsonAlloc(runtime.alloc, route_type, source_content_type, unit);
         var owns_parts_json = true;
         errdefer if (owns_parts_json) runtime.alloc.free(parts_json);
         const request = asset_producer_mod.Request{
             .producer_type = producer_type,
             .config_json = config_json,
-            .source_text = source_url,
+            .source_text = if (rendered_page != null) "" else source_url,
             .source_parts_json = parts_json,
             .content_type = "text/plain",
         };
@@ -2818,6 +2833,13 @@ fn flushRuntimeGeneratedTextBatch(
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
 
     var produced = producer.produceBatch(runtime.alloc, requests) catch |err| {
+        if (isUnavailableOcrModelError(kind, err)) {
+            for (unit_indices) |unit_idx| {
+                try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
+            }
+            clearRuntimeGeneratedTextBatchParts(runtime.alloc, parts_values);
+            return;
+        }
         if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
         return try flushRuntimeGeneratedTextBatchSequential(runtime, producer, requests, unit_indices, parts_values, units, method, kind);
     };
@@ -2858,6 +2880,10 @@ fn flushRuntimeGeneratedTextBatchSequential(
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
     for (requests, unit_indices) |request, unit_idx| {
         const produced = producer.produce(runtime.alloc, request) catch |err| {
+            if (isUnavailableOcrModelError(kind, err)) {
+                try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
+                continue;
+            }
             if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
             try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
             continue;
@@ -2870,49 +2896,18 @@ fn flushRuntimeGeneratedTextBatchSequential(
     clearRuntimeGeneratedTextBatchParts(runtime.alloc, parts_values);
 }
 
-fn completeRuntimeDocumentExtractionGeneratedTextUnit(
-    runtime: *EnrichmentRuntime,
-    producer: asset_producer_mod.Producer,
-    config: document_extraction_mod.Config,
-    source_url: []const u8,
-    route_type: []const u8,
-    source_content_type: []const u8,
-    unit: *document_extraction_mod.Unit,
-) !void {
-    const kind: RuntimeGeneratedUnitTextKind = if (config.ocr_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_ocr"))
-        .ocr
-    else if (config.transcription_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_transcription"))
-        .transcript
-    else
-        return;
-
-    const producer_type: asset_producer_mod.ProducerType = switch (kind) {
-        .ocr => .reader,
-        .transcript => .transcriber,
-    };
-    const config_json = switch (kind) {
-        .ocr => config.ocr_config_json,
-        .transcript => config.transcription_config_json,
-    };
-    const method = switch (kind) {
-        .ocr => "ocr_text",
-        .transcript => "transcript_text",
-    };
-
-    const parts_json = try runtimeDocumentGeneratedTextPartsJsonAlloc(runtime.alloc, route_type, source_content_type, unit.*);
-    defer runtime.alloc.free(parts_json);
-    const produced = try producer.produce(runtime.alloc, .{
-        .producer_type = producer_type,
-        .config_json = config_json,
-        .source_text = source_url,
-        .source_parts_json = parts_json,
-        .content_type = "text/plain",
-    });
-    errdefer runtime.alloc.free(produced);
-    try applyRuntimeGeneratedUnitText(runtime.alloc, unit, produced, method, "completed", kind);
-}
-
 const RuntimeGeneratedUnitTextKind = enum { ocr, transcript };
+
+fn isUnavailableOcrModelError(kind: RuntimeGeneratedUnitTextKind, err: anyerror) bool {
+    if (kind != .ocr) return false;
+    return switch (err) {
+        error.ModelNotFound,
+        error.ModelNotSpecified,
+        error.UnsupportedReaderProvider,
+        => true,
+        else => false,
+    };
+}
 
 fn applyRuntimeGeneratedUnitText(
     alloc: Allocator,
@@ -2924,7 +2919,7 @@ fn applyRuntimeGeneratedUnitText(
 ) !void {
     if (produced.len == 0) {
         alloc.free(produced);
-        return;
+        return error.EmptyGeneratedText;
     }
     defer alloc.free(produced);
     var parsed = try parseRuntimeGeneratedUnitTextOutputAlloc(alloc, produced);
@@ -3310,6 +3305,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
     config: document_extraction_mod.Config,
     batch_policy: GeneratedTextBatchPolicy,
     source_url: []const u8,
+    source_bytes: []const u8,
     doc_key: []const u8,
     artifact_name: []const u8,
     info: RuntimeDocumentExtractionStreamInfo = .{},
@@ -3387,6 +3383,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
             self.config,
             self.batch_policy,
             self.source_url,
+            self.source_bytes,
             self.info.route_type,
             self.info.content_type,
             self.pending_generated_units.items,
@@ -8779,6 +8776,7 @@ test "document extraction generated OCR batches honor execution item cap" {
         .{ .ocr_enabled = true },
         .{ .max_items = 2, .max_bytes = 1024 * 1024 },
         "data:application/pdf;base64,AA==",
+        &.{},
         "ocr",
         "application/pdf",
         units[0..],
@@ -8791,6 +8789,67 @@ test "document extraction generated OCR batches honor execution item cap" {
     try std.testing.expectEqualStrings("ocr text 0", units[0].text);
     try std.testing.expectEqualStrings("ocr text 1", units[1].text);
     try std.testing.expectEqualStrings("ocr text 0", units[2].text);
+}
+
+test "document extraction missing OCR model is a terminal unit failure" {
+    const alloc = std.testing.allocator;
+
+    const MissingModelProducer = struct {
+        fn producer(self: *@This()) asset_producer_mod.Producer {
+            return .{ .ptr = self, .vtable = &.{ .produce = produce, .produce_batch = produceBatch } };
+        }
+
+        fn produce(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            return error.ModelNotFound;
+        }
+
+        fn produceBatch(_: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
+            return error.ModelNotFound;
+        }
+    };
+
+    var fake = MissingModelProducer{};
+    const producer = fake.producer();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .asset_producer = producer },
+        .ownership = undefined,
+    };
+    var units = [_]document_extraction_mod.Unit{.{
+        .unit_id = try alloc.dupe(u8, "unit:1"),
+        .unit_type = try alloc.dupe(u8, "image"),
+        .text = try alloc.dupe(u8, ""),
+        .method = try alloc.dupe(u8, "ocr_pending"),
+        .extraction_status = try alloc.dupe(u8, "pending_ocr"),
+    }};
+    defer units[0].deinit(alloc);
+
+    try completeRuntimeDocumentExtractionGeneratedTextBatch(
+        &runtime,
+        producer,
+        .{ .ocr_enabled = true },
+        .{ .max_items = 8, .max_bytes = 1024 * 1024 },
+        "https://example.test/image.png",
+        &.{},
+        "image",
+        "image/png",
+        units[0..],
+        .ocr,
+    );
+
+    try std.testing.expectEqualStrings("failed_ocr", units[0].extraction_status.?);
+    try std.testing.expect(!units[0].ocr_used);
+    try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "ModelNotFound") != null);
 }
 
 test "generic generated asset batch fallback isolates malformed batch envelope" {
@@ -8982,6 +9041,7 @@ test "document extraction generated OCR batch fallback isolates permanent unit f
         .{ .ocr_enabled = true },
         .{ .max_items = 8, .max_bytes = 1024 * 1024 },
         "data:application/pdf;base64,AA==",
+        &.{},
         "ocr",
         "application/pdf",
         units[0..],
@@ -9078,6 +9138,7 @@ test "document extraction generated OCR batch fallback isolates malformed batch 
         .{ .ocr_enabled = true },
         .{ .max_items = 8, .max_bytes = 1024 * 1024 },
         "data:application/pdf;base64,AA==",
+        &.{},
         "ocr",
         "application/pdf",
         units[0..],

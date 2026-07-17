@@ -372,7 +372,11 @@ fn renderPageContentRgbaInBoxAlloc(
     const width = ceilPositiveToUsize(page_w, 1);
     const height = ceilPositiveToUsize(page_h, 1);
 
-    const rgba = try alloc.alloc(u8, width * height * 4);
+    const pixel_count = std.math.mul(usize, width, height) catch return error.RenderedPageTooLarge;
+    if (pixel_count > 100_000_000) return error.RenderedPageTooLarge;
+    const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.RenderedPageTooLarge;
+    const rgba = try alloc.alloc(u8, rgba_len);
+    errdefer alloc.free(rgba);
     @memset(rgba, 0xff);
     const groups = try collectGroupMetasAlloc(alloc, text_runs, image_runs, shading_runs, pattern_runs, shape_runs);
     defer alloc.free(groups);

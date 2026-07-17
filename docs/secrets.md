@@ -114,7 +114,7 @@ domains:
   and write database artifacts. Serverless lanes may select different named
   connections and buckets.
 - `remote_content.s3.*` authorizes read access to customer documents used by
-  `remoteText`, `remotePDF`, and related helpers. Several named credentials can
+  `remoteText`, the deprecated `remotePDF`, and related helpers. Several named credentials can
   be selected by bucket.
 
 Do not reuse a broad storage writer credential for remote content. Prefer

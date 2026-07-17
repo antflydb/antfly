@@ -2625,6 +2625,18 @@ pub fn build(b: *std.Build) void {
     const bench_pdf_step = b.step("bench-pdf", "Run lib/pdf benchmarks");
     bench_pdf_step.dependOn(&run_lib_pdf_bench.step);
 
+    const lib_pdf_safety_tests = b.addTest(.{
+        .root_module = pdf_mod,
+        .filters = &.{
+            "native backend renders simple pdf first page png",
+            "stream decoders enforce the decoded byte budget before growth",
+            "xref parser rejects a cyclic Prev chain",
+        },
+    });
+    const run_lib_pdf_safety_tests = b.addRunArtifact(lib_pdf_safety_tests);
+    const lib_pdf_safety_test_step = b.step("lib-pdf-safety-test", "Run focused PDF OCR rendering and parser safety tests");
+    lib_pdf_safety_test_step.dependOn(&run_lib_pdf_safety_tests.step);
+
     const lib_image_conformance_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/src/mod.zig"),
         .target = target,

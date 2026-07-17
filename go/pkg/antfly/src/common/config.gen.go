@@ -457,7 +457,8 @@ type Config struct {
 	// MinShardsPerTable Minimum number of shards to keep for a table. Automatic merges will not reduce a table below this count.
 	MinShardsPerTable uint64 `json:"min_shards_per_table,omitempty,omitzero"`
 
-	// RemoteContent Configuration for remote content fetching (remotePDF, remoteMedia, remoteText templates).
+	// RemoteContent Configuration for remote content fetching (`remoteMedia`, `remoteText`, and the deprecated
+	// `remotePDF` compatibility helper). Durable PDF ingestion uses a `document_extraction` asset producer.
 	// Consolidates S3 credentials and security settings separate from backup storage.
 	//
 	// **Credential Resolution Order:**
@@ -2223,16 +2224,17 @@ var swaggerSpec = []string{
 	"K9sXuagVs9uKazzV+eSshGiumRrRGQuxe3sResczqGMIWXbgaOHxskLfarXGUax/+2bvoL//zJIxzx/J",
 	"lUxRyGequL5f+A3PWMzpLlEM9LxKjm0zt8hESbmKOt+qThU07G/JJOy+SllumUYDu6+WpJGqUb7Di0U6",
 	"lD1Hs3CwJGTa/Hx57qgnZg2oTEMzTEJo5CYhj5XCwsvS265JXgvbLKoIS5f4ja2XLfzRDjv/9g2bDECm",
-	"eBh2qh4+lUP5kbUEtseCS5ZKw9xwm5uxFHQr6MiUGcgRQnbww8Xbd13X5oPFd//HNbs3Ra1BvdsfihNQ",
-	"j3gM5dyt5FQpkQZM1O3QXirDxcweBEQ9M8yzbEXWPCP2WOjMF4ot0ZpcMuCjdt2fVMwUlFc76JNTX5Nt",
-	"XJnxL0PI4DPsjCtmBy6KFQ/FYZ+8g+ImFVzFUgJj5Jp6TGaJnFi2bZgSJKUG8n18vjx/ph2LHoqjPhk7",
-	"mjjSR+PKaAGzX9mwfTK+7lwNcmjCcuK6m7O5oDptyRRPqQpK7HNjslUX6/E4HCRArZv5kaYsJg0ypNfR",
-	"oYrXJhQrFDTp0YzXiVKnVvnXt/Nl1UuaUq+YP+i8YVQxRRoXvvMQvn5HPwZ6V0ebwq5xq1Zc3wbkPFa0",
-	"9fqS2Fnt9YYtHjpVPTqk3Aa01/oo+M8HYNLCqFwbzFa1dGonn/rp3f2zIq1l8j33uffcXqh8kvCo9xys",
-	"H49fpp/RL7VOzZcKa16iWoIgfyyGEMCrWtzDd+cObXmIFwfXsoxXCCniraNlLnN8Q2aA2tNMu1odFMQL",
-	"T36pH6fb6sY1pu32ieoa6lELl1LL0BCVNteKfudDbvm/1/lDvYBYnUE02G6Zur8tzDw8OLPsGoEBN1c1",
-	"g8fcgmqSQ15AtuiheRNlKzv9LcM6DIyqaE5cxVG7AG4qsjCpT3MF06CLOyoeHaslHlj4O4h2Bp2j/n7/",
-	"yJIE1PNFniQP/38AAAD//969DVzgVAEA",
+	"eBh2qh4+lUP5kbUEtseCS5ZKw9xwm5uxFHQr6MiUGcgRQnbG+OWDxfJxl7g/r9m9GWO2RUzcmykG2DMU",
+	"rsXF23dj4oVtnlhNcM4STPH5NlcgZF28fUe4ZQewDMgKQsnYx9OPXAosLsWYUK2ZcRk94CnpBNQwHkPZ",
+	"eCuhVUqxAbN2kLSX13AxswcO0dUM8zlb0TjPiD1+OvMFacvrQy4Z8Gu7sE8qZgrKuB30yamv/TauzPiX",
+	"IWQKGnbGFfMGF0UVxqE47JN3UESlciewZMEYubMek1kiJ1Y8MEwJklIDeUU+X54/004UGIqjPhk72jvS",
+	"R+PKaAHzYtmwjQG+vl0Ncmgqc2qBm7O5oDoNyxRPqQpqBnNjslUX+PF3JUjoWhTgI01ZTBrkTq+jdxXv",
+	"UCiKKGjSoxmvE79OrcKwb+fLt5e0q16Zf9B5w6hiijQIS+chfM2Pfgz0ro42hV3jVq0gEw3Ieaxo2w9K",
+	"omq15Bu2eOhU9fWQEh3Qkuuj4D8fQBgQRuXaYFaspVM7OdhP7+6fFZ2tMNFzn3vP7YXKJwmPes/ByvL4",
+	"ZfoZ/VLrXGOpUOgltyUI8sdiPAG8qsVXfHeO0pYnenFwLQt8hZAi3jpa5jLUN2QTqHHNtKsJQkGM8eSX",
+	"+nG6rW5cY3pwnxCvoYa1cCm1LBRRaXPt63c+5JaffZ0/1AuV1RlEg+2WJQLaQtPDgzP/rhFMcHNVc3vM",
+	"LagmOeQfZIsemlFRhrPT3zKs98CoiubEVTa1C+CmInOT+jRXMA260qOC07Ha6IGFv4NoZ9A56u/3jyxJ",
+	"QHuCyJPk4f8PAAD//9kTvUBIVQEA",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

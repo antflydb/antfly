@@ -1786,6 +1786,8 @@ fn remoteTextQueryHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
     return .{ .string = text_copy };
 }
 
+/// Deprecated compatibility helper. Prefer document_extraction for durable PDF
+/// ingestion or remoteMedia for template-time multimodal inference input.
 fn remotePdfQueryHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
     const url = ctx.hash.get("url") orelse return .{ .safe_string = "" };
     const url_str = switch (url) {
