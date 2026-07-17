@@ -1,0 +1,8 @@
+{
+  "method": "POST",
+  "path": "/api/v1/antfly-benchmark/ingest",
+  "headers": {
+    "Content-Type": "application/x-ndjson"
+  },
+  "raw_body": "{\"corpus_ordinal\":9000000000000000000,\"body\":\"benchmark mixed write\"}\n"
+}

@@ -2479,8 +2479,6 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "export and import documents round trip",
             "file import rejects oversized portable blocks before allocation",
-            "portable graph edge values accept Go semantic encoding without guessing a generation",
-            "import accepts Go portable AFB edge batch encoding end to end",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3133,57 +3131,31 @@ pub fn build(b: *std.Build) void {
     const lite_native_test_step = b.step("lite-native-test", "Run Lite native backend tests");
     lite_native_test_step.dependOn(&run_lite_native_tests.step);
 
-    const cmd_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/cmd_test.zig"),
+    const lite_cli_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lite_cli_test.zig"),
         .target = target,
         .optimize = optimize,
     });
-    cmd_test_mod.addImport("antfly-zig", lib_mod);
-    cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
-    cmd_test_mod.addImport("httpx", httpx_mod);
-    cmd_test_mod.addImport("antfly_vellum", vellum_mod);
-    cmd_test_mod.addImport("raft_engine", raft_engine_mod);
-    cmd_test_mod.addImport("structlog", structlog_mod);
-    cmd_test_mod.addImport("antfly_platform", platform_mod);
-    cmd_test_mod.addImport("handlebars", handlebars_mod);
-    cmd_test_mod.addOptions("build_options", build_options);
-    const cmd_tests = b.addTest(.{
-        .root_module = cmd_test_mod,
-        .filters = &.{ "cmd.lite", "cmd.serverless", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.mod" },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_cmd_tests = b.addRunArtifact(cmd_tests);
-    const cmd_test_step = b.step("cmd-test", "Run Antfly command and client CLI tests");
-    cmd_test_step.dependOn(&run_cmd_tests.step);
-
-    const lite_cmd_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/lite_cmd_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    lite_cmd_test_mod.addImport("antfly-zig", lib_mod);
-    lite_cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
-    lite_cmd_test_mod.addImport("httpx", httpx_mod);
-    lite_cmd_test_mod.addImport("antfly_vellum", vellum_mod);
-    lite_cmd_test_mod.addImport("raft_engine", raft_engine_mod);
-    lite_cmd_test_mod.addImport("structlog", structlog_mod);
-    lite_cmd_test_mod.addImport("antfly_platform", platform_mod);
-    lite_cmd_test_mod.addImport("handlebars", handlebars_mod);
-    lite_cmd_test_mod.addOptions("build_options", build_options);
-    const lite_cmd_tests = b.addTest(.{
-        .root_module = lite_cmd_test_mod,
+    lite_cli_test_mod.addImport("antfly-zig", lib_mod);
+    lite_cli_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
+    lite_cli_test_mod.addImport("httpx", httpx_mod);
+    lite_cli_test_mod.addImport("antfly_vellum", vellum_mod);
+    lite_cli_test_mod.addImport("raft_engine", raft_engine_mod);
+    lite_cli_test_mod.addImport("structlog", structlog_mod);
+    lite_cli_test_mod.addImport("antfly_platform", platform_mod);
+    lite_cli_test_mod.addImport("handlebars", handlebars_mod);
+    lite_cli_test_mod.addOptions("build_options", build_options);
+    const lite_cli_tests = b.addTest(.{
+        .root_module = lite_cli_test_mod,
         .filters = &.{ "cmd.lite", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.mod" },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_lite_cmd_tests = b.addRunArtifact(lite_cmd_tests);
-    const lite_cmd_test_step = b.step("lite-cmd-test", "Run command tests owned by Antfly Lite profiles");
-    lite_cmd_test_step.dependOn(&run_lite_cmd_tests.step);
+    const run_lite_cli_tests = b.addRunArtifact(lite_cli_tests);
+    const lite_cli_test_step = b.step("lite-cli-test", "Run Antfly Lite CLI tests");
+    lite_cli_test_step.dependOn(&run_lite_cli_tests.step);
 
     const lib_recall_default_filters = [_][]const u8{
         "HBC recall",
@@ -3345,7 +3317,10 @@ pub fn build(b: *std.Build) void {
 
     const lib_db_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &.{"storage.db.db.test."}),
+        .filters = selectTestFilters(b, &.{
+            "storage.db.db.test.",
+            "io threaded applied callback observes published watermark outside runtime lock",
+        }),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3375,12 +3350,7 @@ pub fn build(b: *std.Build) void {
     antfly_imports.configure(b, serverless_manifest_test_mod, true, true);
     const serverless_manifest_tests = b.addTest(.{
         .root_module = serverless_manifest_test_mod,
-        .filters = &.{
-            "objectstore-backed manifest store supports publish and list",
-            "manifest head CAS verifies a stat ETag when GET omits it",
-            "objectstore-backed manifest store resolves conditional create races by content",
-            "host object storage delegates through callbacks",
-        },
+        .filters = &.{"objectstore-backed manifest store supports publish and list"},
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     const run_serverless_manifest_tests = b.addRunArtifact(serverless_manifest_tests);
@@ -3398,12 +3368,6 @@ pub fn build(b: *std.Build) void {
         "data server repair owner cancels and drains through backend runtime",
         "data runtime health metrics include replay debt and provisioned warmup counters",
         "data runtime status refresh publishes synthetic missing status for absent local group db",
-        "data runtime local group status does not open roots owned by transitions",
-        "data runtime local group status reflects active transition readiness",
-        "data runtime local group status uses metadata transition observation when local pair is absent",
-        "data runtime local group status prefers merged snapshot readiness fallback",
-        "data runtime status refresh publishes placeholder when live managed writer is busy and cache entry is missing",
-        "data runtime status refresh publishes sibling placeholder when only one group has managed writer",
         "data runtime status refresh budget preserves fresh cached group status for visible generation",
         "data runtime status refresh reuses managed writer snapshot instead of reopening table db",
         "data runtime keeps status refresh dirty for non-startup async index work",
@@ -3411,14 +3375,12 @@ pub fn build(b: *std.Build) void {
         "data runtime runRound backs off retryable provision metadata failures",
         "data runtime provisioned root refresh worker backs off retryable metadata failures",
         "data runtime data changes mark provisioned startup catch-up dirty",
-        "data runtime reconciled changes invalidate status without scheduling root catch-up",
         "data runtime repair debt hook targets the affected group queue",
         "data runtime repair failures preserve durable backoff and increase retry delay",
         "index repair fallback backoff never blocks an exact durable wake",
         "data runtime repair queue links and removes debt in constant time",
         "data runtime startup catch-up parks scheduler when only quarantined debt remains",
         "data runtime raft status changes force immediate store status publication",
-        "data runtime replicated split policy is identity and phase aware",
         "data raft draining leader handoff campaigns preferred serving survivor",
         "data raft removed leader handoff campaigns preferred serving survivor",
         "data raft source split lifecycle commands bypass document db apply",
@@ -3428,7 +3390,6 @@ pub fn build(b: *std.Build) void {
         "data runtime startup catch-up clears no-debt busy writer groups",
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
-        "remote metadata source pins one cluster incarnation across cache invalidation",
         "data runtime treats metadata leadership churn as retryable bootstrap failure",
         "data runtime metadata bootstrap retry delay is bounded and jittered",
         "idle cached runtime status stays fresh only for the published root generation",
@@ -3473,42 +3434,11 @@ pub fn build(b: *std.Build) void {
         "db split sync coordinator allocates destination identity namespace",
         "db split status rejects stale destination identity namespace",
         "db split status borrows the live raft apply store without a second writer",
-        "db split status uses source acknowledgement without opening destination",
-        "derive split transition phases",
-        "db split coordinator rejects mismatched active transition destination",
-        "db split coordinator remains closed after failed reopen",
-        "db split successor bootstrap atomically replaces stale destination generation",
         "data raft apply store applies delete operations into group state",
-        "data raft apply store prepared snapshot retains its MVCC view across later writes",
         "data raft apply store orders independent groups through separate shards",
-        "data raft apply store admits one writable owner per root",
         "data raft apply store skips persisted split commands in overlapping replay",
-        "data raft apply store recovers exact split replay after injected projection corruption",
-        "data raft apply store rejects mismatched terminal split identity",
-        "data raft apply store persists split destination acknowledgements",
         "data raft apply store seeds pre-raft snapshots once at reserved index zero",
-        "data raft apply store reconciles an inherited document root at an exact watermark",
-        "data raft apply store transition reads fail fast during generation staging",
-        "data raft apply store installs snapshot watermark atomically",
-        "data raft snapshot staging blocks only the target group",
-        "data raft apply store bounds and retires resource-managed group owners",
-        "data raft apply placement transition retains union on abort and retires without allocation",
-        "data raft apply placement transition retires high cardinality summaries in one pass",
-        "split bootstrap marker distinguishes reservation from completion",
         "group state range scan is allocation-failure safe",
-        "shard state store persists split lifecycle and ownership",
-        "shard state snapshot round trips split control state",
-        "shard state snapshot rejects duplicate and out-of-range documents",
-        "shard state store finalize split reclaims right-hand document range",
-        "raft snapshot durability tests are reachable",
-        "raft snapshot payload envelope validates identity length and checksum",
-        "raft snapshot payload publication rejects an artifact length contract violation",
-        "raft snapshot payload cleanup retains only the durable identity",
-        "persistent replica state refuses a corrupt durable snapshot payload on reopen",
-        "persistent replica state publishes an artifact snapshot and reopens it",
-        "persistent replica state recovers both snapshot publication crash windows",
-        "wal replica state persists semantic compaction snapshot and preserves suffix",
-        "wal replica state refuses a missing durable snapshot payload on reopen",
         "db merge coordinator opt-in applies configured receiver identity namespace",
         "db merge coordinator reapplies target namespace for persisted reassignment opt-in",
         "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",
@@ -4518,7 +4448,6 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source rejects stale doc identity namespace before write",
             "replicated split destination seeds inherited doc identity before range publication",
             "internal batch parser rejects mixed split transition commands",
-            "internal batch parser requires source acknowledgements to be metadata-only",
             "internal batch split identity round trips the full u64 id space",
             "api http client preserves group doc identity conflicts",
             "bound table write source backs up and restores a local table",
@@ -4541,7 +4470,7 @@ pub fn build(b: *std.Build) void {
             "write cache local mutation preempts stale startup writer",
             "hosted runtime status prefers live writer over stale hosted snapshot",
             "runtime status collection leaves active stale write lease live",
-            "primary lookup adopts seeded write cache across visible generation bump",
+            "resident DB lease adopts seeded write cache across visible generation bump",
             "provisioned write cache close detaches promotion leadership callback before stats",
             "provisioned table write source coalesces same-group waiters",
             "provisioned table write source preserves same-key delete then write across coalesced waiters",
@@ -4554,7 +4483,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table restore lifecycle blocks request admission without blocking foreground structural mutation",
             "provisioned table restore lifecycle reserves forwarded owner and caller sources",
             "provisioned startup catch-up enters through forwarded write owner",
-            "provisioned runtime status inspection waits for structural transition",
+            "provisioned runtime status inspection remains available during structural transition",
             "provisioned read admission enters through forwarded write owner",
             "provisioned table write source drop table waits for active read cache lease",
             "provisioned table write source drop table closes schema-bearing cached writer once",
@@ -4570,6 +4499,9 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up finishes restore repair before terminal index load degradation",
             "table runtime snapshot cache clones stored status",
+            "table runtime snapshot cache rejects a late stale live observation",
+            "table runtime snapshot cache replacement preserves a newer live observation",
+            "provisioned managed replay tails converge and publish without later traffic",
             "provisioned runtime status overlays live writer replay target without republishing stats",
             "provisioned runtime status live replay overlay preserves cold dense visibility refresh",
             "provisioned runtime status live replay overlay clears ambiguous replay-only backfill",
@@ -4590,12 +4522,12 @@ pub fn build(b: *std.Build) void {
             "aggregation completeness requires exact total relation",
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
             "provisioned read cache exclusive access drains active read leases",
-            "provisioned read cache group exclusive drains only the published group",
             "provisioned storage inspection uses table read admission",
             "provisioned distributed aggregations collect path terms nested cardinality",
             "parseRemoteSearchResult preserves fused index scores",
             "table read distributed sorted merge uses catalog runtime schema and rejects incomplete shard windows",
             "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
+            "provisioned local query reuses resident generation without readonly open",
             "catalog backed router skips non-serving relocation placements",
         },
         .test_runner = .{
@@ -4681,6 +4613,8 @@ pub fn build(b: *std.Build) void {
             "partial coverage embeddings readiness does not mask pending enrichment",
             "derived coverage reasons deduplicate overlapping freshness signals",
             "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery",
+            "single embeddings index encoder keeps retrying coverage gaps catch-up coherent",
+            "managed embeddings coverage debt does not fabricate replay debt",
             "external embeddings index readiness does not require table doc coverage",
             "api http server create index waits for exact target config projection",
         },
@@ -4712,10 +4646,12 @@ pub fn build(b: *std.Build) void {
             "provisioned table write request queues structural reconcile ahead of later writes",
             "queued structural reconcile reserves write admission before its worker starts",
             "provisioned structural reconcile blocks table write admission",
+            "provisioned schema reconcile keeps reads and status available",
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up preserves restore repair debt while index load is terminal",
             "managed startup catch-up allocation failure preserves bounded retry",
             "managed repair visibility edges retire cached readers and runtime status",
+            "table runtime snapshot cache invalidation fences a stale observed publisher",
             "provisioned named index repair keeps group queued for aggregate debt audit",
             "dirty table tracking stays bounded to writer cache ownership",
             "writer cache eviction retires dirty ownership after the last cache owner",
@@ -4727,14 +4663,6 @@ pub fn build(b: *std.Build) void {
             "median key lookup reuses startup writer instead of reopening its root",
             "write cache retirement is allocation-free after entry installation",
             "provisioned read cache retirement is allocation-free after entry installation",
-            "provisioned group storage prunes stale visible root generations",
-            "provisioned Raft snapshot install publishes a fenced group generation",
-            "provisioned Raft snapshot install rejects a changed catalog contract",
-            "prepared generation publication rolls back before serving admission",
-            "prepared generation reconciliation rolls back an exchanged candidate",
-            "prepared first generation reconciliation removes an unvalidated candidate",
-            "committed generation reconciliation preserves the validated candidate",
-            "generation publication marker parsing preserves allocator exhaustion",
         },
     });
     const run_api_table_writes_production_regression_tests = b.addRunArtifact(api_table_writes_production_regression_tests);
@@ -4890,7 +4818,6 @@ pub fn build(b: *std.Build) void {
             "metadata module compiles",
             "metadata transition driver ",
             "metadata storage module compiles",
-            "metadata cluster incarnation has one canonical JSON representation",
             "table workflow can build desired topology through the control loop seam",
             "table workflow doc identity guards reject active transition intents",
             "table workflow can remove a table topology from desired state",
@@ -4966,15 +4893,20 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "resource manager observes over-budget external usage",
+            "resource manager evaluates projected admission with configured action",
+            "resource manager bounds soft write throttling without waiting for compaction publication",
             "resource manager records index repair activation pause separately from cleanup",
             "catchUpIndex refuses to open an apply window after its deadline",
             "cache reports shared byte usage to resource manager",
+            "lsm backend resource manager throttles projected immutable state",
+            "lsm backend resource manager rejects before wal apply",
             "derived backlog tracker accounts and releases payload bytes",
             "derived backlog tracker fails closed when sequence accounting allocation fails",
             "hbc shared cache namespaces entries",
             "hbc shared cache evicts across namespaces under one resource budget",
             "hbc cache reports byte usage to resource manager",
             "hbc cache shrinks to resource budget under pressure",
+            "resource-managed mapped residency evicts cold segments and preserves hot mappings",
             "provisioned group storage derives all resource budgets",
             "resource manager capacity source is immutable after composition",
             "capacity reservation revalidation fails closed when available space falls",
@@ -5031,7 +4963,7 @@ pub fn build(b: *std.Build) void {
             "db dense artifact counter bootstrap restarts from a fresh snapshot",
             "db dense artifact counter bootstrap fences stale concurrent attempt",
             "db malformed quarantined dense config does not block healthy artifact counters",
-            "db query repair gate revalidates stale debt without clearing admission",
+            "db query repair gate revalidates stale debt",
             "db dense repair working set scales batch to resource budget",
             "db dense counter bootstrap admission respects soft background budget",
             "managed startup catch-up advances counterless incomplete dense repair",
@@ -5333,7 +5265,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
     unit_test_step.dependOn(&run_capi_tests.step);
     unit_test_step.dependOn(&run_lite_native_tests.step);
-    unit_test_step.dependOn(&run_cmd_tests.step);
+    unit_test_step.dependOn(&run_lite_cli_tests.step);
     unit_test_step.dependOn(&run_lib_db_tests.step);
     unit_test_step.dependOn(&run_introducer_tests.step);
     unit_test_step.dependOn(&run_lib_db_text_query_tests.step);
@@ -5859,10 +5791,33 @@ pub fn build(b: *std.Build) void {
     const derived_log_test_step = b.step("derived-log-test", "Run storage/db/derived/derived_log unit tests");
     derived_log_test_step.dependOn(&run_derived_log_unit_tests.step);
 
+    // `root-test`, `lib-storage-test`, and `lib-metadata-test` are useful
+    // focused aliases, but all compile the same root module. Use one
+    // union-filtered artifact in the default aggregate so an overlapping test
+    // is executed only once.
+    const unit_root_default_filters = lib_unit_default_filters ++ lib_storage_default_filters ++ [_][]const u8{"metadata."};
+    const unit_root_filters = selectTestFilters(b, &unit_root_default_filters);
+    const unit_root_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = unit_root_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_unit_root_tests = b.addRunArtifact(unit_root_tests);
+    addRuntimeTestFilters(run_unit_root_tests, unit_root_filters);
+    for (root_test_skip_filters) |filter| {
+        run_unit_root_tests.addArgs(&.{ "--skip-test-filter", filter });
+    }
+
     // Default Antfly unit coverage is hermetic: no network fetchers, no
     // benchmarks, and no soak/conformance suites that require external corpora.
-    // Focused aliases stay available as separate steps; broader module suites
-    // are wired here once.
+    // The root storage suite already discovers LMDB, docstore, shard, WAL,
+    // persistent, index-manager, DB, and derived-log tests. Do not also wire
+    // their focused aliases into this aggregate: Zig discovers imported tests
+    // transitively, so doing both ran the same test in as many as three test
+    // binaries. The focused aliases remain available for direct invocation.
     dependOnAll(unit_test_step, &.{
         &run_lib_json_tests.step,
         &run_lib_onnx_tests.step,
@@ -5870,21 +5825,8 @@ pub fn build(b: *std.Build) void {
         &run_httpx_tests.step,
         &run_api_json_helpers_tests.step,
         &run_antfly_client_pkg_tests.step,
-        &run_lib_unit_tests.step,
-        &run_lib_metadata_tests.step,
-        &run_lib_storage_tests.step,
-        &run_lsm_backend_tests.step,
-        &run_resource_budget_tests.step,
-        &run_lmdb_unit_tests.step,
-        &run_storage_lmdb_unit_tests.step,
-        &run_docstore_unit_tests.step,
-        &run_shard_unit_tests.step,
-        &run_wal_unit_tests.step,
-        &run_persistent_unit_tests.step,
-        &run_index_manager_unit_tests.step,
-        &run_db_unit_tests.step,
+        &run_unit_root_tests.step,
         &run_sparse_unit_tests.step,
-        &run_derived_log_unit_tests.step,
     });
 
     const lmdb_bench_engine_options_c = makeLmdbBuildOptions(b, .c, false, false);
@@ -6554,6 +6496,81 @@ pub fn build(b: *std.Build) void {
     });
     const install_search_benchmark_query = b.addInstallArtifact(search_benchmark_query, .{});
 
+    const search_benchmark_common_test_mod = b.createModule(.{
+        .root_source_file = b.path("bench/full_text/search_benchmark_common.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    search_benchmark_common_test_mod.addImport("antfly-zig", lib_mod);
+    const search_benchmark_common_tests = b.addTest(.{
+        .root_module = search_benchmark_common_test_mod,
+    });
+    const run_search_benchmark_common_tests = b.addRunArtifact(search_benchmark_common_tests);
+    const search_bench_test_step = b.step("search-bench-test", "Run search benchmark grammar and protocol tests");
+    search_bench_test_step.dependOn(&run_search_benchmark_common_tests.step);
+
+    const search_performance_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "search bool conjunction query",
+            "search bool should-only query",
+            "streaming boolean scorer matches all-hit reference on randomized corpus",
+            "search pure bool should uses WAND top-k",
+            "search term phrase uses exact positional BM25 top-k",
+            "streaming phrase scorer matches randomized positional reference",
+            "phrase filter exact adjacency",
+            "phrase filter with slop",
+            "PostingsIterator positional seek decodes only selected records",
+            "PostingsIterator deferred positional seek decodes only accepted candidates",
+            "PostingsIterator streams deferred grouped positions without scratch arrays",
+            "production reader rejects branch-only v24-v37 formats",
+            "v12 positions are bit-packed smaller than raw u32",
+            "v12 reads back positions with wide packed deltas",
+            "current one posting block retains one global impact bound",
+            "v29 impact frequency escape remains a conservative upper bound",
+            "v29 adaptive impact IDs use runs and round-trip",
+            "v29 one-payload-block postings omit sparse impact range IDs",
+            "v30 contiguous grouped positions retain direct document round-trip",
+            "v31 inline single-document postings retain frequency positions and direct iteration",
+            "v32 posting-count metadata derives chunk ordinal and document count",
+            "v33 constant-frequency blocks omit packed frequency payload",
+            "v34 five-bit impact frequencies are conservative upper bounds",
+            "v35 full posting blocks use portable vertical BP128 for docs and frequencies",
+            "portable vertical BP128 round-trips every bit width",
+            "portable vertical BP128 fuses document delta prefix sums",
+            "PostingsIterator advanceTo uses sparse skip data for long postings",
+            "current reader reopens origin-main v23 postings and block-max layout",
+            "index-only stored fields preserve ordinals key ranges and merges",
+            "v25 field norms match Tantivy quantization",
+            "BM25 term scorer retains query-invariant arithmetic",
+            "BM25 bound table matches packed impact and norm domains",
+            "snapshot BM25 bound table cache is reused and bounded",
+            "v25 norm table uses one byte per document and reads legacy packed norms",
+            "v22 term dictionary block values compact one-hit terms and delta postings offsets",
+            "v23 term dictionary stores front-coded blocks indexed by block ceiling",
+            "WAND pivot bound remains conservative across later high-impact blocks",
+            "single-term block scan preserves a later higher-impact chunk",
+            "single-term equality pruning retains earliest cutoff ties",
+            "pure conjunction block pruning retains earliest cutoff ties",
+            "pure conjunction metadata scan preserves later competitive block",
+            "multi-segment filter execution",
+            "multi-segment search merges per-segment top-k globally",
+            "fragmented snapshot retains segment bound pruning",
+            "bool fallback applies native doc number constraints",
+            "db text kernel search matches projected search without stored bodies",
+            "split preserves postings when text segments omit source bodies",
+            "background text stats use postings when segment source is omitted",
+            "text score query exposes score top k sort profile",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_search_performance_tests = b.addRunArtifact(search_performance_tests);
+    const search_performance_test_step = b.step("search-performance-test", "Run focused full-text scorer regression tests");
+    search_performance_test_step.dependOn(&run_search_performance_tests.step);
+
     const search_benchmark_codec_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/search_benchmark_codec_bench.zig"),
         .target = target,
@@ -6572,6 +6589,37 @@ pub fn build(b: *std.Build) void {
     }
     const search_bench_codec_step = b.step("search-bench-codec-bench", "Benchmark StreamVByte codec used by search postings");
     search_bench_codec_step.dependOn(&run_search_benchmark_codec_bench.step);
+
+    const search_benchmark_bitpack_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/full_text/search_benchmark_bitpack_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    search_benchmark_bitpack_bench_mod.addImport("antfly-zig", lib_mod);
+    const search_benchmark_bitpack_bench = b.addExecutable(.{
+        .name = "search_benchmark_bitpack_bench",
+        .root_module = search_benchmark_bitpack_bench_mod,
+    });
+    const install_search_benchmark_bitpack_bench = b.addInstallArtifact(search_benchmark_bitpack_bench, .{});
+    const run_search_benchmark_bitpack_bench = b.addRunArtifact(search_benchmark_bitpack_bench);
+    if (b.args) |args| run_search_benchmark_bitpack_bench.addArgs(args);
+    const search_bench_bitpack_step = b.step("search-bench-bitpack-bench", "Benchmark portable Zig vector BP128 against horizontal bit packing");
+    search_bench_bitpack_step.dependOn(&run_search_benchmark_bitpack_bench.step);
+
+    const search_impact_layout_analyze_mod = b.createModule(.{
+        .root_source_file = b.path("bench/full_text/search_impact_layout_analyze.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    search_impact_layout_analyze_mod.addImport("antfly-zig", lib_mod);
+    const search_impact_layout_analyze = b.addExecutable(.{
+        .name = "search_impact_layout_analyze",
+        .root_module = search_impact_layout_analyze_mod,
+    });
+    const run_search_impact_layout_analyze = b.addRunArtifact(search_impact_layout_analyze);
+    if (b.args) |args| run_search_impact_layout_analyze.addArgs(args);
+    const search_impact_layout_analyze_step = b.step("search-impact-layout-analyze", "Project exact adaptive impact-column density for segment files");
+    search_impact_layout_analyze_step.dependOn(&run_search_impact_layout_analyze.step);
 
     const wand_skip_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/wand_skip_bench.zig"),
@@ -6594,6 +6642,7 @@ pub fn build(b: *std.Build) void {
     search_bench_build_step.dependOn(&install_search_benchmark_index.step);
     search_bench_build_step.dependOn(&install_search_benchmark_query.step);
     search_bench_build_step.dependOn(&install_search_benchmark_codec_bench.step);
+    search_bench_build_step.dependOn(&install_search_benchmark_bitpack_bench.step);
 
     const storage_fixture_promote_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/storage_fixture_promote.zig"),
@@ -7579,7 +7628,7 @@ pub fn build(b: *std.Build) void {
     const run_lite_core_main_tests = b.addRunArtifact(lite_core_main_tests);
     const lite_core_test_step = b.step("lite-core-test", "Run Antfly Lite core wrapper tests");
     lite_core_test_step.dependOn(&run_lite_core_main_tests.step);
-    lite_core_test_step.dependOn(&run_lite_cmd_tests.step);
+    lite_core_test_step.dependOn(&run_lite_cli_tests.step);
     lite_core_test_step.dependOn(&run_lite_native_tests.step);
     lite_core_test_step.dependOn(&run_lite_capi_smoke.step);
     lite_core_test_step.dependOn(&run_lite_go_tests.step);
@@ -7609,7 +7658,7 @@ pub fn build(b: *std.Build) void {
     lite_full_step.dependOn(&install_lite_capi_lib.step);
     lite_full_step.dependOn(&install_lite_capi_header.step);
     lite_full_step.dependOn(&run_antfly_main_tests.step);
-    lite_full_step.dependOn(&run_lite_cmd_tests.step);
+    lite_full_step.dependOn(&run_lite_cli_tests.step);
     lite_full_step.dependOn(&run_lite_native_tests.step);
     lite_full_step.dependOn(&run_lite_capi_smoke.step);
     lite_full_step.dependOn(&run_lite_go_tests.step);
@@ -7653,7 +7702,7 @@ pub fn build(b: *std.Build) void {
     lite_dev_step.dependOn(&install_lite_capi_header.step);
     lite_dev_step.dependOn(&run_antfly_main_tests.step);
     lite_dev_step.dependOn(&run_lite_core_main_tests.step);
-    lite_dev_step.dependOn(&run_lite_cmd_tests.step);
+    lite_dev_step.dependOn(&run_lite_cli_tests.step);
     lite_dev_step.dependOn(&run_lite_native_tests.step);
     lite_dev_step.dependOn(&run_lite_capi_smoke.step);
     lite_dev_step.dependOn(&run_lite_go_tests.step);

@@ -17,7 +17,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const metadata_state = @import("state.zig");
 const metadata_table_manager = @import("table_manager.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const transition_state = @import("transition_state.zig");
 
 pub const ReconcileSummary = struct {
@@ -26,7 +26,6 @@ pub const ReconcileSummary = struct {
     rebalance_placement_groups: usize = 0,
     table_upserts: usize = 0,
     range_upserts: usize = 0,
-    split_admissions: usize = 0,
     split_upserts: usize = 0,
     merge_upserts: usize = 0,
     placement_removals: usize = 0,
@@ -101,7 +100,6 @@ pub const MetadataControlLoop = struct {
             .rebalance_placement_groups = plan.rebalance_placement_groups,
             .table_upserts = plan.table_upserts.len,
             .range_upserts = plan.range_upserts.len,
-            .split_admissions = plan.split_admissions.len,
             .split_upserts = plan.split_upserts.len,
             .merge_upserts = plan.merge_upserts.len,
             .placement_removals = plan.placement_removals.len,
@@ -151,7 +149,6 @@ test "metadata control loop proposes desired transitions through the service sea
         tables: []const metadata_table_manager.TableRecord,
         ranges: []const metadata_table_manager.RangeRecord,
         placement_upserts: usize = 0,
-        split_admissions: usize = 0,
         split_upserts: usize = 0,
         merge_upserts: usize = 0,
 
@@ -230,7 +227,6 @@ test "metadata control loop proposes desired transitions through the service sea
 
         pub fn applyReconciliationPlan(self: *@This(), plan: *const metadata_reconciler.ReconciliationPlan) !void {
             self.placement_upserts += plan.placement_upserts.len;
-            self.split_admissions += plan.split_admissions.len;
             self.split_upserts += plan.split_upserts.len;
             self.merge_upserts += plan.merge_upserts.len;
         }
@@ -256,12 +252,6 @@ test "metadata control loop proposes desired transitions through the service sea
         .destination_group_id = 103,
         .split_key = "doc:h",
     });
-    const desired_ranges = try loop.stateRef().tableManager().listRanges(std.testing.allocator);
-    defer loop.stateRef().tableManager().freeRanges(std.testing.allocator, desired_ranges);
-    const desired_source = for (desired_ranges) |record| {
-        if (record.group_id == 101) break record;
-    } else return error.MissingSourceRange;
-    try std.testing.expectEqual(@as(u64, 1), desired_source.split_attempt_epoch);
 
     var fake = FakeService{
         .tables = &tables,
@@ -271,9 +261,8 @@ test "metadata control loop proposes desired transitions through the service sea
     try std.testing.expectEqual(@as(usize, 0), summary.table_upserts);
     try std.testing.expectEqual(@as(usize, 0), summary.range_upserts);
     try std.testing.expectEqual(@as(usize, 0), summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.split_admissions);
-    try std.testing.expectEqual(@as(usize, 1), fake.split_admissions);
-    try std.testing.expectEqual(@as(usize, 0), summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), fake.split_upserts);
 }
 
 test "metadata control loop plans placement intents from desired topology and candidates" {
@@ -496,8 +485,8 @@ test "metadata control loop installs service median key lookup for automatic spl
                 std.testing.allocator.free(value);
                 self.planned_split_key = null;
             }
-            if (plan.split_admissions.len != 0) {
-                self.planned_split_key = try std.testing.allocator.dupe(u8, plan.split_admissions[0].record.split_key.?);
+            if (plan.split_upserts.len != 0) {
+                self.planned_split_key = try std.testing.allocator.dupe(u8, plan.split_upserts[0].split_key.?);
             }
         }
     };
@@ -543,7 +532,7 @@ test "metadata control loop installs service median key lookup for automatic spl
     defer fake.deinit(std.testing.allocator);
 
     const summary = try loop.reconcileOnce(&fake);
-    try std.testing.expectEqual(@as(usize, 1), summary.split_admissions);
+    try std.testing.expectEqual(@as(usize, 1), summary.split_upserts);
     try std.testing.expect(fake.planned_split_key != null);
     try std.testing.expectEqualStrings("doc:m", fake.planned_split_key.?);
 }
@@ -554,7 +543,6 @@ test "metadata control loop rewrites desired topology after finalized split" {
         ranges: []const metadata_table_manager.RangeRecord,
         split_records: []const transition_state.SplitTransitionRecord,
         range_upserts: usize = 0,
-        split_upserts: usize = 0,
         split_removals: usize = 0,
 
         pub fn listProjectedTables(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
@@ -612,7 +600,6 @@ test "metadata control loop rewrites desired topology after finalized split" {
             for (self.split_records, 0..) |record, i| {
                 out[i] = .{
                     .transition_id = record.transition_id,
-                    .attempt_epoch = record.attempt_epoch,
                     .source_group_id = record.source_group_id,
                     .destination_group_id = record.destination_group_id,
                     .phase = record.phase,
@@ -659,7 +646,6 @@ test "metadata control loop rewrites desired topology after finalized split" {
 
         pub fn applyReconciliationPlan(self: *@This(), plan: *const metadata_reconciler.ReconciliationPlan) !void {
             self.range_upserts += plan.range_upserts.len;
-            self.split_upserts += plan.split_upserts.len;
             self.split_removals += plan.split_removals.len;
         }
     };
@@ -685,7 +671,6 @@ test "metadata control loop rewrites desired topology after finalized split" {
     const split_records = [_]transition_state.SplitTransitionRecord{
         .{
             .transition_id = 8001,
-            .attempt_epoch = 1,
             .source_group_id = 101,
             .destination_group_id = 102,
             .phase = .finalizing,
@@ -701,9 +686,7 @@ test "metadata control loop rewrites desired topology after finalized split" {
 
     const summary = try loop.reconcileOnce(&fake);
     try std.testing.expectEqual(@as(usize, 2), summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.split_upserts);
-    try std.testing.expectEqual(@as(usize, 0), summary.split_removals);
+    try std.testing.expectEqual(@as(usize, 1), summary.split_removals);
     try std.testing.expectEqual(@as(usize, 2), fake.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), fake.split_upserts);
-    try std.testing.expectEqual(@as(usize, 0), fake.split_removals);
+    try std.testing.expectEqual(@as(usize, 1), fake.split_removals);
 }

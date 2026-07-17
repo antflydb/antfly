@@ -1,0 +1,11 @@
+{
+  "method": "POST",
+  "path": "/api/v1/antfly-benchmark/search",
+  "body": {
+    "query": "marker:{marker}",
+    "max_hits": 1,
+    "sort_by": "_score"
+  },
+  "expect_contains": "{marker}",
+  "expect_nonempty_hits": true
+}

@@ -1,0 +1,15 @@
+{
+  "engines": {
+    "antfly-zig": {
+      "index_peak_rss_bytes": 1924825088,
+      "query_peak_rss_bytes": 103743488,
+      "query_steady_rss_bytes": 103743488
+    },
+    "comparator": {
+      "index_peak_rss_bytes": null,
+      "query_peak_rss_bytes": 20955136,
+      "query_steady_rss_bytes": 20955136
+    }
+  },
+  "schema_version": 2
+}

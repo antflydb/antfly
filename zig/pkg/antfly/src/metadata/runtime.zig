@@ -21,7 +21,7 @@ const raft_engine = @import("raft_engine");
 const platform = @import("antfly_platform");
 const tracing = @import("../tracing/mod.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 const setup_io_thread_stack_size = 1 * 1024 * 1024;
 const metadata_raft_retained_entries = 1024;
@@ -48,7 +48,11 @@ fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
 }
 
 fn metadataWalReplicaStateConfig() antfly.raft.storage.WalReplicaStateConfig {
-    return .{};
+    return .{
+        .compaction_retained_entries = metadata_raft_retained_entries,
+        .compaction_min_interval_entries = metadata_raft_compaction_min_interval_entries,
+        .compaction_single_node_only = false,
+    };
 }
 
 const CliConfig = struct {
@@ -121,7 +125,6 @@ const Factory = struct {
                     .heartbeat_tick = 1,
                     .pre_vote = true,
                     .check_quorum = true,
-                    .step_down_on_removal = true,
                     .random_seed = antfly.raft.stableRandomSeed(record.group_id, record.local_node_id),
                 },
                 .storage = self.store.storage(),
@@ -202,9 +205,6 @@ pub const HealthSource = struct {
         try append(writer, "antfly_raft_runtime_pending_apply_bytes", "gauge", "Approximate pending raft apply bytes inside the runtime", @intCast(host_metrics.runtime_pending_apply_bytes));
         try append(writer, "antfly_raft_runtime_transport_queue_denials_total", "counter", "Total raft ready denials from outbound transport queue pressure", @intCast(host_metrics.runtime_transport_queue_denials));
         try append(writer, "antfly_raft_runtime_apply_queue_denials_total", "counter", "Total raft ready denials from apply queue pressure", @intCast(host_metrics.runtime_apply_queue_denials));
-        try append(writer, "antfly_raft_snapshot_compaction_completions_total", "counter", "Raft snapshot compactions published", @intCast(host_metrics.runtime_snapshot_compaction_completions));
-        try append(writer, "antfly_raft_snapshot_compaction_failures_total", "counter", "Raft snapshot compaction build or publication failures", @intCast(host_metrics.runtime_snapshot_compaction_failures));
-        try append(writer, "antfly_raft_snapshot_compaction_candidates", "gauge", "Raft groups currently queued for snapshot compaction", @intCast(host_metrics.runtime_snapshot_compaction_candidates));
         try append(writer, "antfly_raft_backup_bootstrap_attempts_total", "counter", "Total backup bootstrap attempts", @intCast(host_metrics.backup_bootstrap_attempts));
         try append(writer, "antfly_raft_backup_bootstrap_failures_total", "counter", "Total backup bootstrap failures", @intCast(host_metrics.backup_bootstrap_failures));
         try append(writer, "antfly_raft_backup_bootstrap_successes_total", "counter", "Total backup bootstrap successes", @intCast(host_metrics.backup_bootstrap_successes));
@@ -232,6 +232,7 @@ pub const HealthSource = struct {
             try append(writer, "antfly_process_anonymous_bytes", "gauge", "Process anonymous resident bytes reported by the operating system", memory.process.anonymous_bytes);
             try append(writer, "antfly_process_private_dirty_bytes", "gauge", "Process private dirty bytes reported by the operating system", memory.process.private_dirty_bytes);
             try append(writer, "antfly_process_footprint_bytes", "gauge", "Process physical footprint bytes reported by the operating system", memory.process.footprint_bytes);
+            try append(writer, "antfly_process_peak_footprint_bytes", "gauge", "Peak process physical footprint bytes reported by the operating system", memory.process.peak_footprint_bytes);
             try append(writer, "antfly_process_wired_bytes", "gauge", "Process wired bytes reported by the operating system", memory.process.wired_bytes);
             try append(writer, "antfly_process_pageins_total", "counter", "Process page-ins reported by the operating system", memory.process.pageins);
             try append(writer, "antfly_process_malloc_available", "gauge", "Whether process malloc zone metrics are available on this platform", if (memory.process.malloc_available) 1 else 0);
@@ -584,15 +585,6 @@ pub const Server = struct {
         self.refreshMetadataRaftStorageDiagnostics();
     }
 
-    pub fn runRaftRoundOnly(self: *Server) !void {
-        try self.server.runRaftRoundOnly();
-        self.refreshMetadataRaftStorageDiagnostics();
-    }
-
-    pub fn runControlRoundOnly(self: *Server) !void {
-        try self.server.runControlRoundOnly();
-    }
-
     pub fn runCdcRound(self: *Server) !void {
         try self.server.runCdcRound();
     }
@@ -710,48 +702,6 @@ fn metadataBootstrapCampaignRetryIntervalNs(tick_ms: u64) u64 {
         tick_ms * std.time.ns_per_ms * metadata_raft_election_max_ticks * 2,
     );
 }
-
-const MetadataRaftTicker = struct {
-    server: *Server,
-    io: std.Io,
-    interval_ns: u64,
-    stop_requested: std.atomic.Value(bool) = .init(false),
-    failed: std.atomic.Value(bool) = .init(false),
-    failure: ?anyerror = null,
-
-    fn run(self: *@This()) void {
-        while (!self.stop_requested.load(.acquire)) {
-            const started_ns = platform_time.monotonicNs();
-            self.server.runRaftRoundOnly() catch |err| {
-                self.failure = err;
-                self.failed.store(true, .release);
-                return;
-            };
-            const elapsed_ns = platform_time.monotonicNs() -| started_ns;
-            if (elapsed_ns < self.interval_ns) {
-                self.io.sleep(
-                    std.Io.Duration.fromNanoseconds(self.interval_ns - elapsed_ns),
-                    .awake,
-                ) catch |err| {
-                    if (self.stop_requested.load(.acquire)) return;
-                    self.failure = err;
-                    self.failed.store(true, .release);
-                    return;
-                };
-            }
-        }
-    }
-
-    fn check(self: *const @This()) !void {
-        if (!self.failed.load(.acquire)) return;
-        return self.failure orelse error.MetadataRaftTickerFailed;
-    }
-
-    fn stop(self: *@This(), thread: *std.Thread) void {
-        self.stop_requested.store(true, .release);
-        thread.join();
-    }
-};
 
 fn allocMetadataPeerNodeIds(
     alloc: std.mem.Allocator,
@@ -939,15 +889,7 @@ pub fn runFromIterator(
     const preferred_bootstrap_campaigner = metadataClusterPreferredCampaigner(cluster_peers, local_node_id);
     const bootstrap_campaign_retry_interval_ns = metadataBootstrapCampaignRetryIntervalNs(tick_ms);
     var last_bootstrap_campaign_retry_ns = platform_time.monotonicNs();
-    var raft_ticker = MetadataRaftTicker{
-        .server = &server,
-        .io = init.io,
-        .interval_ns = tick_ms * std.time.ns_per_ms,
-    };
-    var raft_ticker_thread = try std.Thread.spawn(.{}, MetadataRaftTicker.run, .{&raft_ticker});
-    defer raft_ticker.stop(&raft_ticker_thread);
     while (true) {
-        try raft_ticker.check();
         if (preferred_bootstrap_campaigner) {
             const now_ns = platform_time.monotonicNs();
             if (last_bootstrap_campaign_retry_ns == 0 or
@@ -960,7 +902,7 @@ pub fn runFromIterator(
             }
         }
         const run_round_start_ns = platform_time.monotonicNs();
-        try server.runControlRoundOnly();
+        try server.runRound();
         const run_round_elapsed_ns = platform_time.monotonicNs() -| run_round_start_ns;
         if (run_round_elapsed_ns > antfly.metadata_service.metadata_run_round_slow_threshold_ns) {
             std.log.warn("metadata runRound slow elapsed_ms={d}", .{@divTrunc(run_round_elapsed_ns, std.time.ns_per_ms)});
@@ -1638,6 +1580,11 @@ test "metadata runtime enables bounded raft storage compaction for multi-node gr
     try std.testing.expectEqual(@as(u64, metadata_raft_retained_entries), runtime_cfg.applied_log_retained_entries);
     try std.testing.expectEqual(@as(u64, metadata_raft_compaction_min_interval_entries), runtime_cfg.applied_log_compaction_min_interval_entries);
     try std.testing.expect(!runtime_cfg.applied_log_compaction_single_node_only);
+
+    const wal_cfg = metadataWalReplicaStateConfig();
+    try std.testing.expectEqual(@as(u64, metadata_raft_retained_entries), wal_cfg.compaction_retained_entries);
+    try std.testing.expectEqual(@as(u64, metadata_raft_compaction_min_interval_entries), wal_cfg.compaction_min_interval_entries);
+    try std.testing.expect(!wal_cfg.compaction_single_node_only);
 }
 
 test "metadata runtime chooses one preferred bootstrap campaigner" {

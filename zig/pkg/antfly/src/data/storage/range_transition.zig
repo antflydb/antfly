@@ -95,7 +95,6 @@ pub fn deriveSplitStatus(
     source_delta_sequence: u64,
     dest_delta_sequence: u64,
 ) SplitStatus {
-    if (source_phase == null) return pendingSplitStatus(source_delta_sequence, dest_delta_sequence);
     const replay_required = bootstrapped and source_phase != null and
         (source_phase.? == .splitting or source_phase.? == .finalizing);
     const replay_caught_up = if (replay_required) dest_delta_sequence >= source_delta_sequence else false;
@@ -109,7 +108,10 @@ pub fn deriveSplitStatus(
             .cutover_ready,
         .rolling_back => .rolling_back,
         .none => if (bootstrapped) .finalized else .rolled_back,
-    } else unreachable;
+    } else if (bootstrapped)
+        .finalized
+    else
+        .rolled_back;
 
     return .{
         .phase = phase,
@@ -119,36 +121,6 @@ pub fn deriveSplitStatus(
         .replay_caught_up = replay_caught_up,
         .cutover_ready = phase == .cutover_ready or phase == .finalized,
         .destination_ready_for_reads = phase == .cutover_ready or phase == .finalized,
-        .source_delta_sequence = source_delta_sequence,
-        .dest_delta_sequence = dest_delta_sequence,
-    };
-}
-
-/// Absence is the initial state before the replicated prepare command applies.
-/// Only a durable source terminal record can prove completion.
-pub fn pendingSplitStatus(source_delta_sequence: u64, dest_delta_sequence: u64) SplitStatus {
-    return .{
-        .phase = .prepare,
-        .source_split_phase = null,
-        .bootstrapped = false,
-        .replay_required = false,
-        .replay_caught_up = false,
-        .cutover_ready = false,
-        .destination_ready_for_reads = false,
-        .source_delta_sequence = source_delta_sequence,
-        .dest_delta_sequence = dest_delta_sequence,
-    };
-}
-
-pub fn completedSplitStatus(finalized: bool, source_delta_sequence: u64, dest_delta_sequence: u64) SplitStatus {
-    return .{
-        .phase = if (finalized) .finalized else .rolled_back,
-        .source_split_phase = .none,
-        .bootstrapped = finalized,
-        .replay_required = false,
-        .replay_caught_up = false,
-        .cutover_ready = finalized,
-        .destination_ready_for_reads = finalized,
         .source_delta_sequence = source_delta_sequence,
         .dest_delta_sequence = dest_delta_sequence,
     };
@@ -239,12 +211,6 @@ pub fn validateMirroredMergePair(
 }
 
 test "derive split transition phases" {
-    {
-        const status = deriveSplitStatus(null, true, 2, 2);
-        try std.testing.expectEqual(TransitionPhase.prepare, status.phase);
-        try std.testing.expect(!status.bootstrapped);
-        try std.testing.expect(!status.destination_ready_for_reads);
-    }
     {
         const status = deriveSplitStatus(.prepare, false, 0, 0);
         try std.testing.expectEqual(TransitionPhase.prepare, status.phase);

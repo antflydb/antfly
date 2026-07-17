@@ -17,4 +17,4 @@ const root = @import("storage/derived_log_bench_root.zig");
 pub const DerivedLog = root.DerivedLog;
 pub const FullStats = root.FullStats;
 pub const OpenOptions = root.OpenOptions;
-pub const platform_time = @import("platform/time.zig");
+pub const platform_time = @import("antfly_platform").time;

@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.inference_backend_priority_entry import InferenceBackendPriorityEntry
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.inference_config_model_strategies import InferenceConfigModelStrategies
     from ..models.inference_content_security_config import InferenceContentSecurityConfig
     from ..models.inference_credentials import InferenceCredentials
     from ..models.inference_model_ref import InferenceModelRef
@@ -24,7 +24,7 @@ T = TypeVar("T", bound="InferenceConfig")
 class InferenceConfig:
     """
     Attributes:
-        api_url (str | Unset): URL of the Antfly inference embedding/chunking service Example: http://localhost:8080.
+        api_url (str): URL of the Antfly inference embedding/chunking service Example: http://localhost:8080.
         api_key (str | Unset): API key used when calling an authenticated shared Antfly inference API.
         models_dir (str | Unset): Base directory containing model subdirectories. Antfly inference auto-discovers models
             from:
@@ -43,59 +43,69 @@ class InferenceConfig:
              Example: ~/.antfly/inference/ml.
         content_security (InferenceContentSecurityConfig | Unset):
         s3_credentials (InferenceCredentials | Unset):
-        keep_alive (str | Unset): Idle-eviction policy for loaded models (Ollama-compatible). Runtimes that
-            support idle eviction may unload a model after this duration of inactivity.
-            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
-            Defaults to "5m". Set to "0" to keep loaded models resident without idle
-            eviction. For compatibility, some runtimes also eagerly load discovered
-            models in this mode. Use `preload` when startup loading must be deterministic.
+        keep_alive (str | Unset): How long to keep models loaded in memory after last use (Ollama-compatible).
+            Models are automatically unloaded after this duration of inactivity.
+            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading).
+            Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading
+            where all models are loaded at startup and never unloaded.
              Default: '5m'. Example: 5m.
-        max_loaded_models (int | Unset): Maximum steady-state number of resident logical model instances. Manager-cached
-            models and request-scoped specialized or composite pipelines share this budget.
-            A composite pipeline counts as one logical model even when it owns multiple backend
-            sessions. At capacity, one replacement may initialize while an idle cached model
-            remains available; successful activation evicts that model. If no idle model is
-            available, the request receives 503 Service Unavailable. Set to 0 for unlimited.
-             Default: 10. Example: 3.
-        pool_size (int | Unset): Number of reusable inference execution slots per model. Some runtimes realize
-            each slot as a complete pipeline, increasing both possible concurrency and
-            per-model memory; others pool lightweight backend providers, so memory and
-            throughput effects are backend-dependent. Generation and backends with shared
-            runtime state may remain serialized even when this is greater than one. Model
-            residency is controlled separately by `max_loaded_models`.
+        max_loaded_models (int | Unset): Maximum total models loaded across all registry types (embedders, rerankers,
+            generators, chunkers, etc.). When the limit is reached, the least-recently-used
+            idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
+             Default: 0. Example: 3.
+        pool_size (int | Unset): Number of concurrent inference pipelines per model. Each pipeline loads
+            a copy of the model, so higher values use more memory but allow more
+            concurrent requests. Note: pool_size multiplies per-model memory
+            independently of max_loaded_models.
              Default: 1. Example: 1.
         prompt_cache (InferencePromptCacheConfig | Unset): Native generator prompt KV cache configuration.
-        backend_priority (list[InferenceBackendPriorityEntry] | Unset): Explicit backend order for inference. Antfly
-            tries entries in order and uses the first
-            backend supported by both the build and the operation. Direct model loading skips
-            compiled-only `pjrt` entries and continues to the next backend, while generation uses
-            PJRT for compiled graph partitions when it is the first available entry. An empty list
-            is invalid. A single entry is a strict backend requirement and causes startup to fail
-            when that backend is unavailable or cannot directly load a model session.
+        backend_priority (list[str] | Unset): Backend priority order for model loading with optional device specifiers.
+            Format: `backend` or `backend:device` where device defaults to `auto`.
 
-            **Backends** (depend on build flags):
-            - `native` - Native CPU backend
-            - `onnx` - ONNX Runtime backend
-            - `metal` - Apple Metal backend
-            - `cuda` - NVIDIA CUDA backend
-            - `pjrt` - PJRT compiled graph backend
-            - `webgpu` - WebGPU backend for Wasm builds
-             Example: ['pjrt', 'native'].
-        pjrt_plugin_path (str | Unset): Filesystem path to the PJRT C API plugin used for compiled generation.
-            This is the preferred production configuration. `PJRT_PLUGIN_PATH` is
-            accepted as a process-level fallback when this field is unset.
-             Example: /usr/local/lib/libtpu.so.
-        max_concurrent_requests (int | Unset): Maximum weighted inference work admitted concurrently by the Zig runtime.
-            Requests beyond the limit receive 503 Service Unavailable with Retry-After;
-            they are not held in an in-process wait queue. Set to 0 for unlimited.
-             Default: 32. Example: 4.
+            Antfly inference tries entries in order and uses the first available backend+device
+            combination that supports the model.
+
+            **Examples**:
+            - `["native", "onnx", "xla"]` - Try backends with auto device detection
+            - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
+             Example: ['cuda', 'onnx:cuda', 'xla:tpu', 'native'].
+        max_concurrent_requests (int | Unset): Maximum number of concurrent inference requests allowed.
+            Additional requests will be queued up to max_queue_size.
+            Set to 0 for unlimited (default).
+             Default: 0. Example: 4.
+        max_queue_size (int | Unset): Maximum number of requests to queue when max_concurrent_requests is reached.
+            When the queue is full, new requests receive 503 Service Unavailable with Retry-After header.
+            Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
+             Default: 0. Example: 100.
+        request_timeout (str | Unset): Maximum time to wait for a request to complete, including queue wait time.
+            Use Go duration format: "30s", "1m", "0" (no timeout, default).
+            Requests exceeding this timeout receive 504 Gateway Timeout.
+             Default: '0'. Example: 30s.
         preload (list[InferenceModelRef] | Unset): Models to preload and warm at startup. Generators run a tiny
             generation
             request so native/Metal weights, KV setup, and kernels use the same
             budgeted path as request-time generation. Other model kinds use the
-            best available warm path for that kind. Specialized request-scoped pipelines
-            are capacity-bounded but may still initialize on their first request.
-             Example: [{'kind': 'generator', 'name': 'antflydb/gemma-e2b', 'backend': 'metal'}].
+            best available warm path for that kind.
+             Example: [{'kind': 'generator', 'name': 'antflydb/gemma-e2b', 'backend': 'metal', 'format': 'gguf',
+            'quantization': 'q4_k'}].
+        max_memory_mb (int | Unset): Maximum memory (in MB) to use for loaded models.
+            When this limit is approached, least recently used models are unloaded.
+            Set to 0 for unlimited (default). This is an advisory limit - actual memory
+            usage depends on model sizes and may temporarily exceed this value.
+            Works alongside max_loaded_models for fine-grained control.
+             Default: 0. Example: 4096.
+        model_strategies (InferenceConfigModelStrategies | Unset): Per-model loading strategy overrides. Maps model
+            names to their loading strategy.
+            Models not in this map use the default strategy based on keep_alive:
+            - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle)
+            - If keep_alive="0": eager loading (load at startup, never unload)
+
+            When a model has strategy "eager" in this map:
+            - It is loaded at startup through the same startup warmup path
+            - It is never unloaded, even when keep_alive>0 (pinned in memory)
+
+            This allows mixing eager and lazy models in the same pool.
+             Example: {'BAAI/bge-small-en-v1.5': 'eager', 'mirth/chonky-mmbert-small-multilingual-1': 'lazy'}.
         allow_downloads (bool | Unset): Whether the dashboard should show model download commands.
             Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed
             deployments (e.g., Kubernetes operator) where models are managed externally.
@@ -103,20 +113,23 @@ class InferenceConfig:
         log (InferenceschemasConfig | Unset): Logging configuration for inference services
     """
 
-    api_url: str | Unset = UNSET
+    api_url: str
     api_key: str | Unset = UNSET
     models_dir: str | Unset = UNSET
     ml_dir: str | Unset = UNSET
     content_security: InferenceContentSecurityConfig | Unset = UNSET
     s3_credentials: InferenceCredentials | Unset = UNSET
     keep_alive: str | Unset = "5m"
-    max_loaded_models: int | Unset = 10
+    max_loaded_models: int | Unset = 0
     pool_size: int | Unset = 1
     prompt_cache: InferencePromptCacheConfig | Unset = UNSET
-    backend_priority: list[InferenceBackendPriorityEntry] | Unset = UNSET
-    pjrt_plugin_path: str | Unset = UNSET
-    max_concurrent_requests: int | Unset = 32
+    backend_priority: list[str] | Unset = UNSET
+    max_concurrent_requests: int | Unset = 0
+    max_queue_size: int | Unset = 0
+    request_timeout: str | Unset = "0"
     preload: list[InferenceModelRef] | Unset = UNSET
+    max_memory_mb: int | Unset = 0
+    model_strategies: InferenceConfigModelStrategies | Unset = UNSET
     allow_downloads: bool | Unset = True
     log: InferenceschemasConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -150,14 +163,13 @@ class InferenceConfig:
 
         backend_priority: list[str] | Unset = UNSET
         if not isinstance(self.backend_priority, Unset):
-            backend_priority = []
-            for backend_priority_item_data in self.backend_priority:
-                backend_priority_item = backend_priority_item_data.value
-                backend_priority.append(backend_priority_item)
-
-        pjrt_plugin_path = self.pjrt_plugin_path
+            backend_priority = self.backend_priority
 
         max_concurrent_requests = self.max_concurrent_requests
+
+        max_queue_size = self.max_queue_size
+
+        request_timeout = self.request_timeout
 
         preload: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.preload, Unset):
@@ -165,6 +177,12 @@ class InferenceConfig:
             for preload_item_data in self.preload:
                 preload_item = preload_item_data.to_dict()
                 preload.append(preload_item)
+
+        max_memory_mb = self.max_memory_mb
+
+        model_strategies: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.model_strategies, Unset):
+            model_strategies = self.model_strategies.to_dict()
 
         allow_downloads = self.allow_downloads
 
@@ -174,9 +192,11 @@ class InferenceConfig:
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({})
-        if api_url is not UNSET:
-            field_dict["api_url"] = api_url
+        field_dict.update(
+            {
+                "api_url": api_url,
+            }
+        )
         if api_key is not UNSET:
             field_dict["api_key"] = api_key
         if models_dir is not UNSET:
@@ -197,12 +217,18 @@ class InferenceConfig:
             field_dict["prompt_cache"] = prompt_cache
         if backend_priority is not UNSET:
             field_dict["backend_priority"] = backend_priority
-        if pjrt_plugin_path is not UNSET:
-            field_dict["pjrt_plugin_path"] = pjrt_plugin_path
         if max_concurrent_requests is not UNSET:
             field_dict["max_concurrent_requests"] = max_concurrent_requests
+        if max_queue_size is not UNSET:
+            field_dict["max_queue_size"] = max_queue_size
+        if request_timeout is not UNSET:
+            field_dict["request_timeout"] = request_timeout
         if preload is not UNSET:
             field_dict["preload"] = preload
+        if max_memory_mb is not UNSET:
+            field_dict["max_memory_mb"] = max_memory_mb
+        if model_strategies is not UNSET:
+            field_dict["model_strategies"] = model_strategies
         if allow_downloads is not UNSET:
             field_dict["allow_downloads"] = allow_downloads
         if log is not UNSET:
@@ -212,6 +238,7 @@ class InferenceConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.inference_config_model_strategies import InferenceConfigModelStrategies
         from ..models.inference_content_security_config import InferenceContentSecurityConfig
         from ..models.inference_credentials import InferenceCredentials
         from ..models.inference_model_ref import InferenceModelRef
@@ -219,7 +246,7 @@ class InferenceConfig:
         from ..models.inferenceschemas_config import InferenceschemasConfig
 
         d = dict(src_dict)
-        api_url = d.pop("api_url", UNSET)
+        api_url = d.pop("api_url")
 
         api_key = d.pop("api_key", UNSET)
 
@@ -254,18 +281,13 @@ class InferenceConfig:
         else:
             prompt_cache = InferencePromptCacheConfig.from_dict(_prompt_cache)
 
-        _backend_priority = d.pop("backend_priority", UNSET)
-        backend_priority: list[InferenceBackendPriorityEntry] | Unset = UNSET
-        if _backend_priority is not UNSET:
-            backend_priority = []
-            for backend_priority_item_data in _backend_priority:
-                backend_priority_item = InferenceBackendPriorityEntry(backend_priority_item_data)
-
-                backend_priority.append(backend_priority_item)
-
-        pjrt_plugin_path = d.pop("pjrt_plugin_path", UNSET)
+        backend_priority = cast(list[str], d.pop("backend_priority", UNSET))
 
         max_concurrent_requests = d.pop("max_concurrent_requests", UNSET)
+
+        max_queue_size = d.pop("max_queue_size", UNSET)
+
+        request_timeout = d.pop("request_timeout", UNSET)
 
         _preload = d.pop("preload", UNSET)
         preload: list[InferenceModelRef] | Unset = UNSET
@@ -275,6 +297,15 @@ class InferenceConfig:
                 preload_item = InferenceModelRef.from_dict(preload_item_data)
 
                 preload.append(preload_item)
+
+        max_memory_mb = d.pop("max_memory_mb", UNSET)
+
+        _model_strategies = d.pop("model_strategies", UNSET)
+        model_strategies: InferenceConfigModelStrategies | Unset
+        if isinstance(_model_strategies, Unset):
+            model_strategies = UNSET
+        else:
+            model_strategies = InferenceConfigModelStrategies.from_dict(_model_strategies)
 
         allow_downloads = d.pop("allow_downloads", UNSET)
 
@@ -297,9 +328,12 @@ class InferenceConfig:
             pool_size=pool_size,
             prompt_cache=prompt_cache,
             backend_priority=backend_priority,
-            pjrt_plugin_path=pjrt_plugin_path,
             max_concurrent_requests=max_concurrent_requests,
+            max_queue_size=max_queue_size,
+            request_timeout=request_timeout,
             preload=preload,
+            max_memory_mb=max_memory_mb,
+            model_strategies=model_strategies,
             allow_downloads=allow_downloads,
             log=log,
         )

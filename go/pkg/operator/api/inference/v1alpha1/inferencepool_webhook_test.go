@@ -29,7 +29,7 @@ func validPool() *InferencePool {
 		ObjectMeta: metav1.ObjectMeta{Name: "test-pool", Namespace: "default"},
 		Spec: InferencePoolSpec{
 			Models: ModelConfig{
-				Preload: []ModelSpec{{Name: "bge-small-en-v1.5", Kind: ModelKindEmbedder}},
+				Preload: []ModelSpec{{Name: "bge-small-en-v1.5"}},
 			},
 			Replicas: ReplicaConfig{Min: 1, Max: 3},
 		},
@@ -40,34 +40,6 @@ func TestValidateInferencePool_Valid(t *testing.T) {
 	pool := validPool()
 	if err := pool.ValidateInferencePool(); err != nil {
 		t.Errorf("expected no error, got: %v", err)
-	}
-}
-
-func TestValidateInferencePool_ManagedModelsDir(t *testing.T) {
-	t.Run("accepts the managed path", func(t *testing.T) {
-		pool := validPool()
-		pool.Spec.Config = `{"models_dir":"/models"}`
-		if err := pool.ValidateInferencePool(); err != nil {
-			t.Fatalf("expected managed models_dir to be accepted, got: %v", err)
-		}
-	})
-
-	for name, config := range map[string]string{
-		"different path": `{"models_dir":"/custom/models"}`,
-		"null path":      `{"models_dir":null}`,
-		"non-object":     `null`,
-	} {
-		t.Run(name, func(t *testing.T) {
-			pool := validPool()
-			pool.Spec.Config = config
-			err := pool.ValidateInferencePool()
-			if err == nil {
-				t.Fatal("expected invalid managed models_dir configuration to be rejected")
-			}
-			if !strings.Contains(err.Error(), "spec.config") {
-				t.Fatalf("expected spec.config validation error, got: %v", err)
-			}
-		})
 	}
 }
 

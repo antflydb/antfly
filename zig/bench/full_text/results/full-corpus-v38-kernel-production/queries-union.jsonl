@@ -1,0 +1,5 @@
+{"elapsed_ns": 182750, "engine": "antfly-zig", "operation": "top_k", "query": "V1 UNION text alpha beta", "query_index": 2, "repetition": 0, "schema_version": 1}
+{"elapsed_ns": 189709, "engine": "antfly-zig", "operation": "top_k", "query": "V1 UNION text alpha beta", "query_index": 2, "repetition": 1, "schema_version": 1}
+{"elapsed_ns": 181125, "engine": "antfly-zig", "operation": "top_k", "query": "V1 UNION text alpha beta", "query_index": 2, "repetition": 2, "schema_version": 1}
+{"elapsed_ns": 202458, "engine": "antfly-zig", "operation": "top_k", "query": "V1 UNION text alpha beta", "query_index": 2, "repetition": 3, "schema_version": 1}
+{"elapsed_ns": 193792, "engine": "antfly-zig", "operation": "top_k", "query": "V1 UNION text alpha beta", "query_index": 2, "repetition": 4, "schema_version": 1}

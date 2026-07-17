@@ -342,14 +342,6 @@ pub const MetadataServer = struct {
         try self.svc.runRound();
     }
 
-    pub fn runRaftRoundOnly(self: *MetadataServer) !void {
-        try self.svc.runRaftRoundOnly();
-    }
-
-    pub fn runControlRoundOnly(self: *MetadataServer) !void {
-        try self.svc.runControlRoundOnly();
-    }
-
     pub fn runCdcRound(self: *MetadataServer) !void {
         try self.svc.runCdcRound();
     }
@@ -384,13 +376,6 @@ pub const MetadataServer = struct {
 
     pub fn adminSnapshot(self: *MetadataServer) !@import("api.zig").AdminSnapshot {
         return try self.svc.adminSnapshot();
-    }
-
-    pub fn validatePublication(self: *MetadataServer, contract: @import("api.zig").CatalogPublicationContract) !bool {
-        try self.svc.ensureLinearizableRead();
-        var snapshot = try self.svc.adminSnapshot();
-        defer self.svc.freeAdminSnapshot(&snapshot);
-        return contract.matches(&snapshot);
     }
 
     pub fn freeAdminSnapshot(self: *MetadataServer, snapshot: *@import("api.zig").AdminSnapshot) void {

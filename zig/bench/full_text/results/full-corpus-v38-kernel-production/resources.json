@@ -1,0 +1,137 @@
+{
+  "engines": {
+    "antfly-zig": {
+      "classes": {
+        "intersection": {
+          "cpu": {
+            "per_query_ns": 154508,
+            "system_ns": 54059000,
+            "total_ns": 2778831000,
+            "user_ns": 2724772000,
+            "utilization_percent": 92.53173558377736
+          },
+          "queries": 17985,
+          "rss_end_bytes": null,
+          "rss_peak_bytes": 103677952,
+          "rss_start_bytes": null,
+          "wall_ns": 3003111292,
+          "wall_per_query_ns": 166978
+        },
+        "phrase": {
+          "cpu": {
+            "per_query_ns": 402711,
+            "system_ns": 29492000,
+            "total_ns": 2860459000,
+            "user_ns": 2830967000,
+            "utilization_percent": 95.22022489255635
+          },
+          "queries": 7103,
+          "rss_end_bytes": null,
+          "rss_peak_bytes": 103743488,
+          "rss_start_bytes": null,
+          "wall_ns": 3004045625,
+          "wall_per_query_ns": 422926
+        },
+        "term": {
+          "cpu": {
+            "per_query_ns": 46384,
+            "system_ns": 134363000,
+            "total_ns": 2590031000,
+            "user_ns": 2455668000,
+            "utilization_percent": 86.27809658098576
+          },
+          "queries": 55838,
+          "rss_end_bytes": null,
+          "rss_peak_bytes": 103743488,
+          "rss_start_bytes": null,
+          "wall_ns": 3001956583,
+          "wall_per_query_ns": 53761
+        },
+        "union": {
+          "cpu": {
+            "per_query_ns": 185663,
+            "system_ns": 53878000,
+            "total_ns": 2804999000,
+            "user_ns": 2751121000,
+            "utilization_percent": 93.4327508965177
+          },
+          "queries": 15108,
+          "rss_end_bytes": null,
+          "rss_peak_bytes": 103743488,
+          "rss_start_bytes": null,
+          "wall_ns": 3002158208,
+          "wall_per_query_ns": 198713
+        }
+      },
+      "enabled": true,
+      "minimum_wall_seconds_per_class": 3.0
+    },
+    "comparator": {
+      "classes": {
+        "intersection": {
+          "cpu": {
+            "per_query_ns": 238035,
+            "system_ns": 40000000,
+            "total_ns": 2830000000,
+            "user_ns": 2790000000,
+            "utilization_percent": 94.26463273482993
+          },
+          "queries": 11889,
+          "rss_end_bytes": 20021248,
+          "rss_peak_bytes": 20021248,
+          "rss_start_bytes": 20004864,
+          "wall_ns": 3002186417,
+          "wall_per_query_ns": 252517
+        },
+        "phrase": {
+          "cpu": {
+            "per_query_ns": 331095,
+            "system_ns": 30000000,
+            "total_ns": 2860000000,
+            "user_ns": 2830000000,
+            "utilization_percent": 95.25976367803946
+          },
+          "queries": 8638,
+          "rss_end_bytes": 20021248,
+          "rss_peak_bytes": 20021248,
+          "rss_start_bytes": 20021248,
+          "wall_ns": 3002316917,
+          "wall_per_query_ns": 347570
+        },
+        "term": {
+          "cpu": {
+            "per_query_ns": 39043,
+            "system_ns": 150000000,
+            "total_ns": 2540000000,
+            "user_ns": 2390000000,
+            "utilization_percent": 84.60521040069065
+          },
+          "queries": 65056,
+          "rss_end_bytes": 20021248,
+          "rss_peak_bytes": 20021248,
+          "rss_start_bytes": 20021248,
+          "wall_ns": 3002179166,
+          "wall_per_query_ns": 46147
+        },
+        "union": {
+          "cpu": {
+            "per_query_ns": 233316,
+            "system_ns": 60000000,
+            "total_ns": 2790000000,
+            "user_ns": 2730000000,
+            "utilization_percent": 92.88836753396741
+          },
+          "queries": 11958,
+          "rss_end_bytes": 20955136,
+          "rss_peak_bytes": 20955136,
+          "rss_start_bytes": 20021248,
+          "wall_ns": 3003605375,
+          "wall_per_query_ns": 251179
+        }
+      },
+      "enabled": true,
+      "minimum_wall_seconds_per_class": 3.0
+    }
+  },
+  "schema_version": 1
+}

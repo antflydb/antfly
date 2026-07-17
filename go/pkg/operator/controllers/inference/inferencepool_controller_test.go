@@ -16,8 +16,6 @@ package controllers
 
 import (
 	"context"
-	"encoding/json"
-	"strconv"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -25,7 +23,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -53,7 +50,6 @@ var _ = Describe("InferencePool Controller", func() {
 						Preload: []antflyaiv1alpha1.ModelSpec{
 							{
 								Name:         "bge-small-en-v1.5",
-								Kind:         antflyaiv1alpha1.ModelKindEmbedder,
 								Tasks:        []string{"embed"},
 								Capabilities: []string{"text"},
 								Priority:     antflyaiv1alpha1.ModelPriorityHigh,
@@ -107,14 +103,6 @@ var _ = Describe("InferencePool Controller", func() {
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_POOL"]).To(Equal(poolName))
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_WORKLOAD_TYPE"]).To(Equal("general"))
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_LOADING_STRATEGY"]).To(Equal("eager"))
-			var completeConfig map[string]any
-			Expect(json.Unmarshal([]byte(createdConfigMap.Data["config.json"]), &completeConfig)).To(Succeed())
-			runtimeConfig, ok := completeConfig["inference"].(map[string]any)
-			Expect(ok).To(BeTrue())
-			Expect(runtimeConfig["backend_priority"]).To(HaveExactElements("pjrt", "native"))
-			Expect(runtimeConfig["pjrt_plugin_path"]).To(Equal(defaultTPUPJRTPluginPath))
-			Expect(runtimeConfig["preload"]).To(HaveLen(1))
-			Expect(runtimeConfig["allow_downloads"]).To(BeFalse())
 
 			// Verify the StatefulSet was created
 			stsLookupKey := types.NamespacedName{Name: poolName, Namespace: poolNamespace}
@@ -125,16 +113,11 @@ var _ = Describe("InferencePool Controller", func() {
 			}, timeout, interval).Should(BeTrue())
 
 			Expect(*createdSts.Spec.Replicas).To(Equal(int32(1)))
-			initialConfigHash := createdSts.Spec.Template.Annotations["inference.antfly.io/config-hash"]
-			Expect(initialConfigHash).NotTo(BeEmpty())
 			Expect(createdSts.Spec.ServiceName).To(Equal(poolName))
 			Expect(createdSts.Spec.Template.Spec.Containers).To(HaveLen(1))
 			Expect(createdSts.Spec.Template.Spec.Containers[0].Name).To(Equal("inference"))
 			Expect(createdSts.Spec.Template.Spec.Containers[0].Command).To(Equal([]string{"/antfly"}))
-			Expect(createdSts.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
-				"inference", "run", "--config", "/config/config.json",
-				"--host", "0.0.0.0", "--port", strconv.Itoa(InferenceAPIPort),
-			}))
+			Expect(createdSts.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"inference", "run", "--host", "0.0.0.0", "--port", "8080", "--models-dir", "/models"}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers).To(HaveLen(1))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Command).To(Equal([]string{"/antfly"}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Args).To(Equal([]string{
@@ -165,67 +148,6 @@ var _ = Describe("InferencePool Controller", func() {
 		})
 	})
 
-	Context("When selecting accelerator backends", func() {
-		It("preserves an explicit PJRT plugin path for custom TPU images", func() {
-			pool := &antflyaiv1alpha1.InferencePool{
-				Spec: antflyaiv1alpha1.InferencePoolSpec{
-					Models:   antflyaiv1alpha1.ModelConfig{LoadingStrategy: antflyaiv1alpha1.LoadingStrategyLazy},
-					Hardware: antflyaiv1alpha1.HardwareConfig{Accelerator: "tpu-v5-lite-podslice"},
-					Config:   `{"pjrt_plugin_path":"/opt/custom/libtpu.so"}`,
-				},
-			}
-			reconciler := &InferencePoolReconciler{}
-			configJSON, err := reconciler.generateCompleteConfig(pool)
-			Expect(err).NotTo(HaveOccurred())
-			var config map[string]any
-			Expect(json.Unmarshal([]byte(configJSON), &config)).To(Succeed())
-			inferenceConfig := config["inference"].(map[string]any)
-			Expect(inferenceConfig["backend_priority"]).To(HaveExactElements("pjrt", "native"))
-			Expect(inferenceConfig["pjrt_plugin_path"]).To(Equal("/opt/custom/libtpu.so"))
-		})
-
-		It("derives CUDA from NVIDIA resources without adding TPU resources", func() {
-			pool := &antflyaiv1alpha1.InferencePool{
-				Spec: antflyaiv1alpha1.InferencePoolSpec{
-					Models: antflyaiv1alpha1.ModelConfig{LoadingStrategy: antflyaiv1alpha1.LoadingStrategyLazy},
-					Resources: &corev1.ResourceRequirements{
-						Limits: corev1.ResourceList{
-							corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("1"),
-						},
-					},
-				},
-			}
-			reconciler := &InferencePoolReconciler{}
-			configJSON, err := reconciler.generateCompleteConfig(pool)
-			Expect(err).NotTo(HaveOccurred())
-			var config map[string]any
-			Expect(json.Unmarshal([]byte(configJSON), &config)).To(Succeed())
-			inferenceConfig := config["inference"].(map[string]any)
-			Expect(inferenceConfig["backend_priority"]).To(HaveExactElements("cuda"))
-
-			resources := reconciler.buildResources(pool)
-			Expect(resources.Limits).NotTo(HaveKey(corev1.ResourceName("google.com/tpu")))
-			Expect(resources.Requests).NotTo(HaveKey(corev1.ResourceName("google.com/tpu")))
-			Expect(isTPUInferencePool(pool)).To(BeFalse())
-		})
-
-		It("does not treat an unknown accelerator label as a TPU or CUDA declaration", func() {
-			pool := &antflyaiv1alpha1.InferencePool{
-				Spec: antflyaiv1alpha1.InferencePoolSpec{
-					Models:   antflyaiv1alpha1.ModelConfig{LoadingStrategy: antflyaiv1alpha1.LoadingStrategyLazy},
-					Hardware: antflyaiv1alpha1.HardwareConfig{Accelerator: "custom-accelerator"},
-				},
-			}
-			reconciler := &InferencePoolReconciler{}
-			configJSON, err := reconciler.generateCompleteConfig(pool)
-			Expect(err).NotTo(HaveOccurred())
-			var config map[string]any
-			Expect(json.Unmarshal([]byte(configJSON), &config)).To(Succeed())
-			Expect(config["inference"].(map[string]any)).NotTo(HaveKey("backend_priority"))
-			Expect(reconciler.buildResources(pool).Limits).NotTo(HaveKey(corev1.ResourceName("google.com/tpu")))
-		})
-	})
-
 	Context("When updating a InferencePool", func() {
 		It("Should update the StatefulSet replicas", func() {
 			ctx := context.Background()
@@ -239,7 +161,7 @@ var _ = Describe("InferencePool Controller", func() {
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
 					Models: antflyaiv1alpha1.ModelConfig{
 						Preload: []antflyaiv1alpha1.ModelSpec{
-							{Name: "test-model", Kind: antflyaiv1alpha1.ModelKindGenerator},
+							{Name: "test-model"},
 						},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
@@ -262,8 +184,6 @@ var _ = Describe("InferencePool Controller", func() {
 			}, timeout, interval).Should(BeTrue())
 
 			Expect(*createdSts.Spec.Replicas).To(Equal(int32(1)))
-			initialConfigHash := createdSts.Spec.Template.Annotations["inference.antfly.io/config-hash"]
-			Expect(initialConfigHash).NotTo(BeEmpty())
 
 			// Update the pool
 			poolLookupKey := types.NamespacedName{Name: "update-test-pool", Namespace: poolNamespace}
@@ -283,21 +203,6 @@ var _ = Describe("InferencePool Controller", func() {
 				return *createdSts.Spec.Replicas
 			}, timeout, interval).Should(Equal(int32(3)))
 
-			Eventually(func() error {
-				if err := k8sClient.Get(ctx, poolLookupKey, pool); err != nil {
-					return err
-				}
-				pool.Spec.Config = `{"max_concurrent_requests":7}`
-				return k8sClient.Update(ctx, pool)
-			}, timeout, interval).Should(Succeed())
-
-			Eventually(func() string {
-				if err := k8sClient.Get(ctx, stsLookupKey, createdSts); err != nil {
-					return initialConfigHash
-				}
-				return createdSts.Spec.Template.Annotations["inference.antfly.io/config-hash"]
-			}, timeout, interval).ShouldNot(Equal(initialConfigHash))
-
 			// Cleanup
 			Expect(k8sClient.Delete(ctx, pool)).Should(Succeed())
 		})
@@ -313,7 +218,7 @@ var _ = Describe("InferencePool Controller", func() {
 				Spec: antflyaiv1alpha1.InferencePoolSpec{
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
 					Models: antflyaiv1alpha1.ModelConfig{
-						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "test-model", Kind: antflyaiv1alpha1.ModelKindGenerator}},
+						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "test-model"}},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
 					Replicas: antflyaiv1alpha1.ReplicaConfig{
@@ -368,7 +273,7 @@ var _ = Describe("InferencePool Controller", func() {
 				Spec: antflyaiv1alpha1.InferencePoolSpec{
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
 					Models: antflyaiv1alpha1.ModelConfig{
-						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "test-model", Kind: antflyaiv1alpha1.ModelKindGenerator}},
+						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "test-model"}},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
 					Replicas: antflyaiv1alpha1.ReplicaConfig{
@@ -412,94 +317,6 @@ var _ = Describe("InferencePool Controller", func() {
 		})
 	})
 
-	Context("When generating model loading configuration", func() {
-		It("Should preserve artifact variants as structured eager preload identity", func() {
-			reconciler := &InferencePoolReconciler{}
-			pool := &antflyaiv1alpha1.InferencePool{
-				Spec: antflyaiv1alpha1.InferencePoolSpec{
-					Models: antflyaiv1alpha1.ModelConfig{
-						Preload: []antflyaiv1alpha1.ModelSpec{
-							{Name: "hf:owner/model:gguf:Q4_K", Kind: antflyaiv1alpha1.ModelKindGenerator},
-							{Name: "hf:owner/model:gguf:Q8_0", Kind: antflyaiv1alpha1.ModelKindGenerator},
-							{Name: "owner/legacy:i8", Kind: antflyaiv1alpha1.ModelKindEmbedder},
-						},
-						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
-					},
-				},
-			}
-			configJSON, err := reconciler.generateCompleteConfig(pool)
-			Expect(err).NotTo(HaveOccurred())
-			var completeConfig map[string]any
-			Expect(json.Unmarshal([]byte(configJSON), &completeConfig)).To(Succeed())
-			config := completeConfig["inference"].(map[string]any)
-			preload := config["preload"].([]any)
-			Expect(preload).To(HaveLen(3))
-			Expect(preload[0].(map[string]any)).To(SatisfyAll(
-				HaveKeyWithValue("format", "gguf"),
-				HaveKeyWithValue("quantization", "Q4_K"),
-			))
-			Expect(preload[1].(map[string]any)).To(SatisfyAll(
-				HaveKeyWithValue("format", "gguf"),
-				HaveKeyWithValue("quantization", "Q8_0"),
-			))
-			Expect(preload[2].(map[string]any)).NotTo(HaveKey("format"))
-		})
-
-		It("Should only warm models for eager pools", func() {
-			reconciler := &InferencePoolReconciler{}
-			pool := &antflyaiv1alpha1.InferencePool{
-				Spec: antflyaiv1alpha1.InferencePoolSpec{
-					Models: antflyaiv1alpha1.ModelConfig{
-						Preload: []antflyaiv1alpha1.ModelSpec{{
-							Name: "test-model", Kind: antflyaiv1alpha1.ModelKindGenerator,
-						}},
-						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyLazy,
-					},
-				},
-			}
-			configJSON, err := reconciler.generateCompleteConfig(pool)
-			Expect(err).NotTo(HaveOccurred())
-			var completeConfig map[string]any
-			Expect(json.Unmarshal([]byte(configJSON), &completeConfig)).To(Succeed())
-			config, ok := completeConfig["inference"].(map[string]any)
-			Expect(ok).To(BeTrue())
-			Expect(config).NotTo(HaveKey("preload"))
-			Expect(config["models_dir"]).To(Equal(antflyaiv1alpha1.ManagedInferenceModelsDir))
-			Expect(config["keep_alive"]).To(Equal("5m"))
-			Expect(config["allow_downloads"]).To(BeFalse())
-		})
-
-		It("Should reject a models directory disconnected from the managed volume", func() {
-			reconciler := &InferencePoolReconciler{}
-			pool := &antflyaiv1alpha1.InferencePool{
-				Spec: antflyaiv1alpha1.InferencePoolSpec{
-					Config: `{"models_dir":"/custom/models"}`,
-					Models: antflyaiv1alpha1.ModelConfig{
-						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyBounded,
-					},
-				},
-			}
-			_, err := reconciler.generateCompleteConfig(pool)
-			Expect(err).To(MatchError(ContainSubstring("models_dir is operator-managed")))
-		})
-
-		It("Should preserve an explicit download policy", func() {
-			reconciler := &InferencePoolReconciler{}
-			pool := &antflyaiv1alpha1.InferencePool{
-				Spec: antflyaiv1alpha1.InferencePoolSpec{
-					Config: `{"allow_downloads":true}`,
-				},
-			}
-			configJSON, err := reconciler.generateCompleteConfig(pool)
-			Expect(err).NotTo(HaveOccurred())
-			var completeConfig map[string]any
-			Expect(json.Unmarshal([]byte(configJSON), &completeConfig)).To(Succeed())
-			config, ok := completeConfig["inference"].(map[string]any)
-			Expect(ok).To(BeTrue())
-			Expect(config["allow_downloads"]).To(BeTrue())
-		})
-	})
-
 	Context("When creating a InferencePool with tagged model refs", func() {
 		It("Should preserve the tag in the ConfigMap", func() {
 			ctx := context.Background()
@@ -515,7 +332,6 @@ var _ = Describe("InferencePool Controller", func() {
 						Preload: []antflyaiv1alpha1.ModelSpec{
 							{
 								Name: "bge-small-en-v1.5:quantized",
-								Kind: antflyaiv1alpha1.ModelKindEmbedder,
 							},
 						},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
@@ -559,7 +375,7 @@ var _ = Describe("InferencePool Controller", func() {
 					Image:        "my-registry/antfly:omni-v1.0.0",
 					Models: antflyaiv1alpha1.ModelConfig{
 						Preload: []antflyaiv1alpha1.ModelSpec{
-							{Name: "test-model", Kind: antflyaiv1alpha1.ModelKindGenerator},
+							{Name: "test-model"},
 						},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
@@ -601,9 +417,9 @@ var _ = Describe("InferencePool Controller", func() {
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
 					Models: antflyaiv1alpha1.ModelConfig{
 						Preload: []antflyaiv1alpha1.ModelSpec{
-							{Name: "model-a:i8", Kind: antflyaiv1alpha1.ModelKindGenerator},
-							{Name: "model-b", Kind: antflyaiv1alpha1.ModelKindGenerator},
-							{Name: "model-c:i8", Kind: antflyaiv1alpha1.ModelKindGenerator},
+							{Name: "model-a:i8"},
+							{Name: "model-b"},
+							{Name: "model-c:i8"},
 						},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},

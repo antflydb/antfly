@@ -29,7 +29,7 @@ const platform_sync = @import("antfly_platform").sync;
 const Io = std.Io;
 const http_common = @import("http/http_common.zig");
 const std_http_listener = @import("http/std_http_listener.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const prometheus = @import("prometheus.zig");
 
 const StdHttpListener = std_http_listener.StdHttpListener;

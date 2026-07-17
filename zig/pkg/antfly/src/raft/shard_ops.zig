@@ -177,14 +177,12 @@ test "shard operation adapter metadata runtime dispatches actions" {
 
     _ = try runtime.observeSplit(.{
         .transition_id = 1,
-        .attempt_epoch = 1,
         .source_group_id = 10,
         .destination_group_id = 11,
     });
     try runtime.execute(.{
         .prepare_split_source = .{
             .transition_id = 1,
-            .attempt_epoch = 1,
             .source_group_id = 10,
             .destination_group_id = 11,
             .split_key = "doc:m",

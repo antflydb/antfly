@@ -31,7 +31,7 @@ const change_journal_mod = @import("db/derived/change_journal.zig");
 const internal_keys = @import("internal_keys.zig");
 const lsm_backend = @import("lsm_backend.zig");
 const mem_backend = @import("mem_backend.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const supports_lmdb = builtin.os.tag != .freestanding;
 const backend_lmdb_adapter = if (supports_lmdb) @import("backend_lmdb_adapter.zig") else struct {
     pub const Cursor = struct {
@@ -137,7 +137,6 @@ fn encodeReplayPayloadForHint(
     switch (hint) {
         .enrichment => {
             filtered.changed_doc_keys = record.changed_doc_keys;
-            filtered.generated_enrichment_refs = record.generated_enrichment_refs;
         },
         .full_text => {
             filtered.changed_doc_keys = record.changed_doc_keys;
@@ -1488,11 +1487,6 @@ pub const DocStore = struct {
         var txn = try self.beginReadTxn();
         defer txn.abort();
 
-        return try scanPrefixTxn(alloc, &txn, prefix);
-    }
-
-    /// Scan a prefix from an existing point-in-time read transaction.
-    pub fn scanPrefixTxn(alloc: Allocator, txn: *Txn, prefix: []const u8) ![]OwnedKVPair {
         var cur = try txn.openCursor();
         defer cur.close();
 
@@ -1573,11 +1567,6 @@ pub const DocStore = struct {
         var txn = try self.beginReadTxn();
         defer txn.abort();
 
-        return try scanRangeTxn(alloc, &txn, lower, upper);
-    }
-
-    /// Scan a range from an existing point-in-time read transaction.
-    pub fn scanRangeTxn(alloc: Allocator, txn: *Txn, lower: []const u8, upper: []const u8) ![]OwnedKVPair {
         var cur = try txn.openCursor();
         defer cur.close();
         cur.setUpperBound(if (upper.len > 0) upper else null);
@@ -1612,31 +1601,6 @@ pub const DocStore = struct {
         const owned = try alloc.dupe(OwnedKVPair, results.items);
         results.deinit(alloc);
         return owned;
-    }
-
-    /// Scan only keys in [lower, upper). This avoids copying document values
-    /// when callers need an atomic delete set for generation replacement.
-    pub fn scanRangeKeys(self: *DocStore, alloc: Allocator, lower: []const u8, upper: []const u8) ![][]u8 {
-        var txn = try self.beginReadTxn();
-        defer txn.abort();
-
-        var cur = try txn.openCursor();
-        defer cur.close();
-        cur.setUpperBound(if (upper.len > 0) upper else null);
-
-        var keys = std.ArrayListUnmanaged([]u8).empty;
-        errdefer {
-            for (keys.items) |key| alloc.free(key);
-            keys.deinit(alloc);
-        }
-        var entry = if (lower.len == 0) try cur.first() else try cur.seekAtOrAfter(lower);
-        while (entry) |kv| : (entry = try cur.next()) {
-            if (upper.len > 0 and std.mem.order(u8, kv.key, upper) != .lt) break;
-            const key = try alloc.dupe(u8, kv.key);
-            errdefer alloc.free(key);
-            try keys.append(alloc, key);
-        }
-        return try keys.toOwnedSlice(alloc);
     }
 
     pub fn findMedianKey(self: *DocStore, alloc: Allocator, lower: []const u8, upper: []const u8, options: ScanOptions) ![]u8 {

@@ -58,9 +58,8 @@ pub const SplitCoordinatorRuntime = struct {
         };
     }
 
-    fn observeStatus(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !data.SplitTransitionStatus {
+    fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data.SplitTransitionStatus {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        try self.coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
         const status = try self.coordinator.status();
         return .{
             .phase = status.phase,
@@ -75,39 +74,33 @@ pub const SplitCoordinatorRuntime = struct {
         };
     }
 
-    fn prepareSource(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64, split_key: []const u8, source_range_end: ?[]const u8) !bool {
+    fn prepareSource(ptr: *anyopaque, _: u64, _: u64, split_key: []const u8, source_range_end: ?[]const u8) !bool {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        try self.coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
         return try self.coordinator.prepareSourceSplit(split_key, source_range_end);
     }
 
-    fn startSource(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !bool {
+    fn startSource(ptr: *anyopaque, _: u64, _: u64) !bool {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        try self.coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
         return try self.coordinator.startSourceSplit();
     }
 
-    fn bootstrapDestination(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !bool {
+    fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64) !bool {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        try self.coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
         return try self.coordinator.ensureBootstrapped();
     }
 
-    fn catchUpDestination(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !usize {
+    fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64) !usize {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        try self.coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
         return try self.coordinator.catchUp();
     }
 
-    fn finalizeSource(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !bool {
+    fn finalizeSource(ptr: *anyopaque, _: u64, _: u64) !bool {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        try self.coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
         return try self.coordinator.finalizeSource();
     }
 
-    fn rollbackSource(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !bool {
+    fn rollbackSource(ptr: *anyopaque, _: u64, _: u64) !bool {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        try self.coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
         return try self.coordinator.rollbackSource();
     }
 };
@@ -178,8 +171,6 @@ pub const MultiplexedTransitionRuntime = struct {
     merge_entries: std.ArrayListUnmanaged(MergeEntry) = .empty,
 
     const SplitEntry = struct {
-        transition_id: u64,
-        attempt_epoch: u64,
         source_group_id: u64,
         destination_group_id: u64,
         runtime: SplitRuntime,
@@ -201,30 +192,12 @@ pub const MultiplexedTransitionRuntime = struct {
         self.* = undefined;
     }
 
-    pub fn addSplit(self: *MultiplexedTransitionRuntime, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64, split_runtime: SplitRuntime) !void {
-        if (transition_id == 0 or attempt_epoch == 0 or source_group_id == 0 or destination_group_id == 0 or source_group_id == destination_group_id) {
-            return error.InvalidSplitRuntimeCoordinates;
-        }
-        if (self.findSplitIndex(transition_id, attempt_epoch, source_group_id, destination_group_id)) |index| {
+    pub fn addSplit(self: *MultiplexedTransitionRuntime, source_group_id: u64, destination_group_id: u64, split_runtime: SplitRuntime) !void {
+        if (self.findSplitIndex(source_group_id, destination_group_id)) |index| {
             self.split_entries.items[index].runtime = split_runtime;
             return;
         }
-        if (self.findSplitSourceIndex(source_group_id)) |index| {
-            const existing = self.split_entries.items[index];
-            if (attempt_epoch < existing.attempt_epoch) return error.StaleSplitRuntime;
-            if (attempt_epoch == existing.attempt_epoch) return error.ConflictingSplitRuntime;
-            self.split_entries.items[index] = .{
-                .transition_id = transition_id,
-                .attempt_epoch = attempt_epoch,
-                .source_group_id = source_group_id,
-                .destination_group_id = destination_group_id,
-                .runtime = split_runtime,
-            };
-            return;
-        }
         try self.split_entries.append(self.alloc, .{
-            .transition_id = transition_id,
-            .attempt_epoch = attempt_epoch,
             .source_group_id = source_group_id,
             .destination_group_id = destination_group_id,
             .runtime = split_runtime,
@@ -271,17 +244,9 @@ pub const MultiplexedTransitionRuntime = struct {
         };
     }
 
-    fn findSplitIndex(self: *const MultiplexedTransitionRuntime, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) ?usize {
+    fn findSplitIndex(self: *const MultiplexedTransitionRuntime, source_group_id: u64, destination_group_id: u64) ?usize {
         for (self.split_entries.items, 0..) |entry, i| {
-            if (entry.transition_id == transition_id and entry.attempt_epoch == attempt_epoch and
-                entry.source_group_id == source_group_id and entry.destination_group_id == destination_group_id) return i;
-        }
-        return null;
-    }
-
-    fn findSplitSourceIndex(self: *const MultiplexedTransitionRuntime, source_group_id: u64) ?usize {
-        for (self.split_entries.items, 0..) |entry, i| {
-            if (entry.source_group_id == source_group_id) return i;
+            if (entry.source_group_id == source_group_id and entry.destination_group_id == destination_group_id) return i;
         }
         return null;
     }
@@ -293,8 +258,8 @@ pub const MultiplexedTransitionRuntime = struct {
         return null;
     }
 
-    fn requireSplit(self: *const MultiplexedTransitionRuntime, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !SplitRuntime {
-        const index = self.findSplitIndex(transition_id, attempt_epoch, source_group_id, destination_group_id) orelse return error.UnknownSplitRuntime;
+    fn requireSplit(self: *const MultiplexedTransitionRuntime, source_group_id: u64, destination_group_id: u64) !SplitRuntime {
+        const index = self.findSplitIndex(source_group_id, destination_group_id) orelse return error.UnknownSplitRuntime;
         return self.split_entries.items[index].runtime;
     }
 
@@ -303,46 +268,46 @@ pub const MultiplexedTransitionRuntime = struct {
         return self.merge_entries.items[index].runtime;
     }
 
-    fn multiplexObserveSplit(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !data.SplitTransitionStatus {
+    fn multiplexObserveSplit(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) !data.SplitTransitionStatus {
         const self: *MultiplexedTransitionRuntime = @ptrCast(@alignCast(ptr));
-        const split_runtime = try self.requireSplit(transition_id, attempt_epoch, source_group_id, destination_group_id);
-        return try split_runtime.observeStatus(transition_id, attempt_epoch, source_group_id, destination_group_id);
+        const split_runtime = try self.requireSplit(source_group_id, destination_group_id);
+        return try split_runtime.observeStatus(source_group_id, destination_group_id);
     }
 
-    fn multiplexPrepareSplit(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64, split_key: []const u8, source_range_end: ?[]const u8) !bool {
+    fn multiplexPrepareSplit(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64, split_key: []const u8, source_range_end: ?[]const u8) !bool {
         const self: *MultiplexedTransitionRuntime = @ptrCast(@alignCast(ptr));
-        const split_runtime = try self.requireSplit(transition_id, attempt_epoch, source_group_id, destination_group_id);
-        return try split_runtime.prepareSource(transition_id, attempt_epoch, source_group_id, destination_group_id, split_key, source_range_end);
+        const split_runtime = try self.requireSplit(source_group_id, destination_group_id);
+        return try split_runtime.prepareSource(source_group_id, destination_group_id, split_key, source_range_end);
     }
 
-    fn multiplexStartSplit(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !bool {
+    fn multiplexStartSplit(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) !bool {
         const self: *MultiplexedTransitionRuntime = @ptrCast(@alignCast(ptr));
-        const split_runtime = try self.requireSplit(transition_id, attempt_epoch, source_group_id, destination_group_id);
-        return try split_runtime.startSource(transition_id, attempt_epoch, source_group_id, destination_group_id);
+        const split_runtime = try self.requireSplit(source_group_id, destination_group_id);
+        return try split_runtime.startSource(source_group_id, destination_group_id);
     }
 
-    fn multiplexBootstrapSplit(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !bool {
+    fn multiplexBootstrapSplit(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) !bool {
         const self: *MultiplexedTransitionRuntime = @ptrCast(@alignCast(ptr));
-        const split_runtime = try self.requireSplit(transition_id, attempt_epoch, source_group_id, destination_group_id);
-        return try split_runtime.bootstrapDestination(transition_id, attempt_epoch, source_group_id, destination_group_id);
+        const split_runtime = try self.requireSplit(source_group_id, destination_group_id);
+        return try split_runtime.bootstrapDestination(source_group_id, destination_group_id);
     }
 
-    fn multiplexCatchUpSplit(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !usize {
+    fn multiplexCatchUpSplit(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) !usize {
         const self: *MultiplexedTransitionRuntime = @ptrCast(@alignCast(ptr));
-        const split_runtime = try self.requireSplit(transition_id, attempt_epoch, source_group_id, destination_group_id);
-        return try split_runtime.catchUpDestination(transition_id, attempt_epoch, source_group_id, destination_group_id);
+        const split_runtime = try self.requireSplit(source_group_id, destination_group_id);
+        return try split_runtime.catchUpDestination(source_group_id, destination_group_id);
     }
 
-    fn multiplexFinalizeSplit(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !bool {
+    fn multiplexFinalizeSplit(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) !bool {
         const self: *MultiplexedTransitionRuntime = @ptrCast(@alignCast(ptr));
-        const split_runtime = try self.requireSplit(transition_id, attempt_epoch, source_group_id, destination_group_id);
-        return try split_runtime.finalizeSource(transition_id, attempt_epoch, source_group_id, destination_group_id);
+        const split_runtime = try self.requireSplit(source_group_id, destination_group_id);
+        return try split_runtime.finalizeSource(source_group_id, destination_group_id);
     }
 
-    fn multiplexRollbackSplit(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !bool {
+    fn multiplexRollbackSplit(ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) !bool {
         const self: *MultiplexedTransitionRuntime = @ptrCast(@alignCast(ptr));
-        const split_runtime = try self.requireSplit(transition_id, attempt_epoch, source_group_id, destination_group_id);
-        return try split_runtime.rollbackSource(transition_id, attempt_epoch, source_group_id, destination_group_id);
+        const split_runtime = try self.requireSplit(source_group_id, destination_group_id);
+        return try split_runtime.rollbackSource(source_group_id, destination_group_id);
     }
 
     fn multiplexObserveMerge(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !data.MergeTransitionStatus {
@@ -387,41 +352,41 @@ pub const SplitRuntime = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        observe_status: *const fn (ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) anyerror!data.SplitTransitionStatus,
-        prepare_source: *const fn (ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64, split_key: []const u8, source_range_end: ?[]const u8) anyerror!bool,
-        start_source: *const fn (ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) anyerror!bool,
-        bootstrap_destination: *const fn (ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) anyerror!bool,
-        catch_up_destination: *const fn (ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) anyerror!usize,
-        finalize_source: *const fn (ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) anyerror!bool,
-        rollback_source: *const fn (ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) anyerror!bool,
+        observe_status: *const fn (ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) anyerror!data.SplitTransitionStatus,
+        prepare_source: *const fn (ptr: *anyopaque, source_group_id: u64, destination_group_id: u64, split_key: []const u8, source_range_end: ?[]const u8) anyerror!bool,
+        start_source: *const fn (ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) anyerror!bool,
+        bootstrap_destination: *const fn (ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) anyerror!bool,
+        catch_up_destination: *const fn (ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) anyerror!usize,
+        finalize_source: *const fn (ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) anyerror!bool,
+        rollback_source: *const fn (ptr: *anyopaque, source_group_id: u64, destination_group_id: u64) anyerror!bool,
     };
 
-    pub fn observeStatus(self: SplitRuntime, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !data.SplitTransitionStatus {
-        return try self.vtable.observe_status(self.ptr, transition_id, attempt_epoch, source_group_id, destination_group_id);
+    pub fn observeStatus(self: SplitRuntime, source_group_id: u64, destination_group_id: u64) !data.SplitTransitionStatus {
+        return try self.vtable.observe_status(self.ptr, source_group_id, destination_group_id);
     }
 
-    pub fn prepareSource(self: SplitRuntime, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64, split_key: []const u8, source_range_end: ?[]const u8) !bool {
-        return try self.vtable.prepare_source(self.ptr, transition_id, attempt_epoch, source_group_id, destination_group_id, split_key, source_range_end);
+    pub fn prepareSource(self: SplitRuntime, source_group_id: u64, destination_group_id: u64, split_key: []const u8, source_range_end: ?[]const u8) !bool {
+        return try self.vtable.prepare_source(self.ptr, source_group_id, destination_group_id, split_key, source_range_end);
     }
 
-    pub fn startSource(self: SplitRuntime, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !bool {
-        return try self.vtable.start_source(self.ptr, transition_id, attempt_epoch, source_group_id, destination_group_id);
+    pub fn startSource(self: SplitRuntime, source_group_id: u64, destination_group_id: u64) !bool {
+        return try self.vtable.start_source(self.ptr, source_group_id, destination_group_id);
     }
 
-    pub fn bootstrapDestination(self: SplitRuntime, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !bool {
-        return try self.vtable.bootstrap_destination(self.ptr, transition_id, attempt_epoch, source_group_id, destination_group_id);
+    pub fn bootstrapDestination(self: SplitRuntime, source_group_id: u64, destination_group_id: u64) !bool {
+        return try self.vtable.bootstrap_destination(self.ptr, source_group_id, destination_group_id);
     }
 
-    pub fn catchUpDestination(self: SplitRuntime, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !usize {
-        return try self.vtable.catch_up_destination(self.ptr, transition_id, attempt_epoch, source_group_id, destination_group_id);
+    pub fn catchUpDestination(self: SplitRuntime, source_group_id: u64, destination_group_id: u64) !usize {
+        return try self.vtable.catch_up_destination(self.ptr, source_group_id, destination_group_id);
     }
 
-    pub fn finalizeSource(self: SplitRuntime, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !bool {
-        return try self.vtable.finalize_source(self.ptr, transition_id, attempt_epoch, source_group_id, destination_group_id);
+    pub fn finalizeSource(self: SplitRuntime, source_group_id: u64, destination_group_id: u64) !bool {
+        return try self.vtable.finalize_source(self.ptr, source_group_id, destination_group_id);
     }
 
-    pub fn rollbackSource(self: SplitRuntime, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !bool {
-        return try self.vtable.rollback_source(self.ptr, transition_id, attempt_epoch, source_group_id, destination_group_id);
+    pub fn rollbackSource(self: SplitRuntime, source_group_id: u64, destination_group_id: u64) !bool {
+        return try self.vtable.rollback_source(self.ptr, source_group_id, destination_group_id);
     }
 };
 
@@ -501,7 +466,7 @@ pub const TransitionRuntime = struct {
 
     pub fn observeSplit(self: TransitionRuntime, record: metadata.SplitTransitionRecord) !data.SplitTransitionStatus {
         const split = self.split orelse return error.MissingSplitRuntime;
-        return try split.observeStatus(record.transition_id, record.attempt_epoch, record.source_group_id, record.destination_group_id);
+        return try split.observeStatus(record.source_group_id, record.destination_group_id);
     }
 
     pub fn observeMerge(self: TransitionRuntime, record: metadata.MergeTransitionRecord) !metadata.MergeObservation {
@@ -518,27 +483,27 @@ pub const TransitionRuntime = struct {
             .none => {},
             .prepare_split_source => |op| {
                 const split = self.split orelse return error.MissingSplitRuntime;
-                _ = try split.prepareSource(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, op.split_key, op.source_range_end);
+                _ = try split.prepareSource(op.source_group_id, op.destination_group_id, op.split_key, op.source_range_end);
             },
             .start_split_source => |op| {
                 const split = self.split orelse return error.MissingSplitRuntime;
-                _ = try split.startSource(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
+                _ = try split.startSource(op.source_group_id, op.destination_group_id);
             },
             .bootstrap_split_destination => |op| {
                 const split = self.split orelse return error.MissingSplitRuntime;
-                _ = try split.bootstrapDestination(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
+                _ = try split.bootstrapDestination(op.source_group_id, op.destination_group_id);
             },
             .catch_up_split_destination => |op| {
                 const split = self.split orelse return error.MissingSplitRuntime;
-                _ = try split.catchUpDestination(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
+                _ = try split.catchUpDestination(op.source_group_id, op.destination_group_id);
             },
             .finalize_split_source => |op| {
                 const split = self.split orelse return error.MissingSplitRuntime;
-                _ = try split.finalizeSource(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
+                _ = try split.finalizeSource(op.source_group_id, op.destination_group_id);
             },
             .rollback_split => |op| {
                 const split = self.split orelse return error.MissingSplitRuntime;
-                _ = try split.rollbackSource(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
+                _ = try split.rollbackSource(op.source_group_id, op.destination_group_id);
             },
             .accept_merge_receiver => |op| {
                 const merge = self.merge orelse return error.MissingMergeRuntime;
@@ -671,42 +636,42 @@ test "transition runtime executes split and merge actions through local seams" {
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !data.SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data.SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
 
-        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
+        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "prepare");
             return true;
         }
 
-        fn startSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn startSource(ptr: *anyopaque, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "start");
             return true;
         }
 
-        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "bootstrap");
             return true;
         }
 
-        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
+        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64) !usize {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "catchup");
             return 1;
         }
 
-        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "finalize");
             return true;
         }
 
-        fn rollbackSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn rollbackSource(ptr: *anyopaque, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "rollback");
             return true;
@@ -809,7 +774,6 @@ test "transition runtime executes split and merge actions through local seams" {
 
     const split_status = try runtime.observeSplit(.{
         .transition_id = 1,
-        .attempt_epoch = 1,
         .source_group_id = 41,
         .destination_group_id = 42,
     });
@@ -822,9 +786,9 @@ test "transition runtime executes split and merge actions through local seams" {
     });
     try std.testing.expectEqual(data.RangeTransitionPhase.cutover_ready, merge_observation.receiver.phase);
 
-    try runtime.execute(.{ .start_split_source = .{ .transition_id = 1, .attempt_epoch = 1, .source_group_id = 41, .destination_group_id = 42 } });
-    try runtime.execute(.{ .bootstrap_split_destination = .{ .transition_id = 1, .attempt_epoch = 1, .source_group_id = 41, .destination_group_id = 42 } });
-    try runtime.execute(.{ .finalize_split_source = .{ .transition_id = 1, .attempt_epoch = 1, .source_group_id = 41, .destination_group_id = 42 } });
+    try runtime.execute(.{ .start_split_source = .{ .transition_id = 1, .source_group_id = 41, .destination_group_id = 42 } });
+    try runtime.execute(.{ .bootstrap_split_destination = .{ .transition_id = 1, .source_group_id = 41, .destination_group_id = 42 } });
+    try runtime.execute(.{ .finalize_split_source = .{ .transition_id = 1, .source_group_id = 41, .destination_group_id = 42 } });
     try runtime.execute(.{ .accept_merge_receiver = .{ .transition_id = 2, .donor_group_id = 61, .receiver_group_id = 62 } });
     try runtime.execute(.{ .finalize_merge = .{
         .transition_id = 2,
@@ -930,42 +894,42 @@ test "multiplexed transition runtime dispatches by group ids" {
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !data.SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data.SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
 
-        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
+        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "prepare");
             return true;
         }
 
-        fn startSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn startSource(ptr: *anyopaque, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "start");
             return true;
         }
 
-        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "bootstrap");
             return true;
         }
 
-        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
+        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64) !usize {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "catchup");
             return 1;
         }
 
-        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "finalize");
             return true;
         }
 
-        fn rollbackSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn rollbackSource(ptr: *anyopaque, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "rollback");
             return true;
@@ -1084,19 +1048,19 @@ test "multiplexed transition runtime dispatches by group ids" {
 
     var multiplex = MultiplexedTransitionRuntime.init(std.testing.allocator);
     defer multiplex.deinit();
-    try multiplex.addSplit(10, 1, 1, 2, split_a.iface());
-    try multiplex.addSplit(11, 1, 3, 4, split_b.iface());
+    try multiplex.addSplit(1, 2, split_a.iface());
+    try multiplex.addSplit(3, 4, split_b.iface());
     try multiplex.addMerge(21, 22, merge_a.iface());
     try multiplex.addMerge(31, 32, merge_b.iface());
 
     const runtime = multiplex.runtime();
-    const split_status = try runtime.observeSplit(.{ .transition_id = 11, .attempt_epoch = 1, .source_group_id = 3, .destination_group_id = 4 });
+    const split_status = try runtime.observeSplit(.{ .transition_id = 1, .source_group_id = 3, .destination_group_id = 4 });
     try std.testing.expectEqual(data.RangeTransitionPhase.cutover_ready, split_status.phase);
     const merge_observation = try runtime.observeMerge(.{ .transition_id = 2, .donor_group_id = 21, .receiver_group_id = 22 });
     try std.testing.expectEqual(data.RangeTransitionPhase.prepare, merge_observation.receiver.phase);
 
-    try runtime.execute(.{ .start_split_source = .{ .transition_id = 10, .attempt_epoch = 1, .source_group_id = 1, .destination_group_id = 2 } });
-    try runtime.execute(.{ .finalize_split_source = .{ .transition_id = 11, .attempt_epoch = 1, .source_group_id = 3, .destination_group_id = 4 } });
+    try runtime.execute(.{ .start_split_source = .{ .transition_id = 10, .source_group_id = 1, .destination_group_id = 2 } });
+    try runtime.execute(.{ .finalize_split_source = .{ .transition_id = 11, .source_group_id = 3, .destination_group_id = 4 } });
     try runtime.execute(.{ .accept_merge_receiver = .{ .transition_id = 12, .donor_group_id = 21, .receiver_group_id = 22 } });
     try runtime.execute(.{ .finalize_merge = .{
         .transition_id = 13,
@@ -1116,23 +1080,6 @@ test "multiplexed transition runtime dispatches by group ids" {
     try std.testing.expectEqualStrings("docid", merge_b.calls.items[0]);
     try std.testing.expectEqualStrings("finalize", merge_b.calls.items[1]);
     try std.testing.expectEqualStrings("rollback", merge_b.calls.items[2]);
-
-    try multiplex.addSplit(12, 2, 1, 5, split_b.iface());
-    try std.testing.expectEqual(@as(usize, 2), multiplex.split_entries.items.len);
-    try std.testing.expectError(error.StaleSplitRuntime, multiplex.addSplit(10, 1, 1, 2, split_a.iface()));
-    try std.testing.expectError(error.UnknownSplitRuntime, runtime.observeSplit(.{
-        .transition_id = 10,
-        .attempt_epoch = 1,
-        .source_group_id = 1,
-        .destination_group_id = 2,
-    }));
-    const successor = try runtime.observeSplit(.{
-        .transition_id = 12,
-        .attempt_epoch = 2,
-        .source_group_id = 1,
-        .destination_group_id = 5,
-    });
-    try std.testing.expectEqual(data.RangeTransitionPhase.cutover_ready, successor.phase);
 }
 
 test "metadata transition controller drives split runtime deterministically" {
@@ -1170,12 +1117,12 @@ test "metadata transition controller drives split runtime deterministically" {
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !data.SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data.SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
 
-        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
+        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "prepare");
             self.status = .{
@@ -1192,7 +1139,7 @@ test "metadata transition controller drives split runtime deterministically" {
             return true;
         }
 
-        fn startSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn startSource(ptr: *anyopaque, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "start");
             self.status = .{
@@ -1209,7 +1156,7 @@ test "metadata transition controller drives split runtime deterministically" {
             return true;
         }
 
-        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "bootstrap");
             self.status = .{
@@ -1226,7 +1173,7 @@ test "metadata transition controller drives split runtime deterministically" {
             return true;
         }
 
-        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
+        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64) !usize {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "catchup");
             self.status = .{
@@ -1243,7 +1190,7 @@ test "metadata transition controller drives split runtime deterministically" {
             return 1;
         }
 
-        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "finalize");
             self.status = .{
@@ -1260,7 +1207,7 @@ test "metadata transition controller drives split runtime deterministically" {
             return true;
         }
 
-        fn rollbackSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn rollbackSource(ptr: *anyopaque, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.calls.append(std.testing.allocator, "rollback");
             self.status = .{
@@ -1284,7 +1231,6 @@ test "metadata transition controller drives split runtime deterministically" {
     const runtime = TransitionRuntime{ .split = split.iface() };
     var record = metadata.SplitTransitionRecord{
         .transition_id = 20,
-        .attempt_epoch = 1,
         .source_group_id = 71,
         .destination_group_id = 72,
     };
@@ -1471,7 +1417,7 @@ test "real split coordinator runtime observes prepared source state" {
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:1702:1:1702:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -1491,8 +1437,6 @@ test "real split coordinator runtime observes prepared source state" {
     }
 
     var split = try SplitCoordinatorRuntime.init(std.testing.allocator, .{
-        .transition_id = 1702,
-        .attempt_epoch = 1,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 1701,
@@ -1500,15 +1444,9 @@ test "real split coordinator runtime observes prepared source state" {
     });
     defer split.deinit();
 
-    const split_runtime = split.runtime();
-    try std.testing.expectError(error.ConflictingSplitTransition, split_runtime.observeStatus(1702, 1, 1701, 1703));
-    try std.testing.expectError(error.ConflictingSplitTransition, split_runtime.prepareSource(1702, 1, 1701, 1703, "doc:m", "doc:z"));
-    try std.testing.expectError(error.ConflictingSplitTransition, split_runtime.startSource(1702, 1, 1703, 1702));
-
-    const runtime = TransitionRuntime{ .split = split_runtime };
+    const runtime = TransitionRuntime{ .split = split.runtime() };
     const observation = try runtime.observeSplit(.{
-        .transition_id = 1702,
-        .attempt_epoch = 1,
+        .transition_id = 1,
         .source_group_id = 1701,
         .destination_group_id = 1702,
     });

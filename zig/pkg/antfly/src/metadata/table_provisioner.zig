@@ -57,7 +57,6 @@ pub const ProvisionSummary = struct {
 pub const ReconcileReplicaRootOptions = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     shard_db_adapter: ?shard_db_adapter_mod.ShardDbAdapter = null,
-    embedding_options: managed_embedder.InitOptions = .{},
 };
 
 fn provisioningDbOpenOptions() db_mod.OpenOptions {
@@ -175,16 +174,15 @@ pub fn reconcileReplicaRootWithOptions(
         try fs_paths.createDirPathPortable(io_impl.io(), path);
         try applyRestoreIntentIfNeeded(alloc, path, group_id, table, range);
 
+        const runtime_schema = try runtimeTableSchemaFromJson(alloc, table.schema_json);
+        defer if (runtime_schema) |schema| @import("../storage/schema.zig").freeSchema(alloc, schema);
         var open_options = provisioningDbOpenOptions();
         open_options.backend_runtime = options.backend_runtime;
+        open_options.schema_before_index_load = runtime_schema;
         var db = try db_mod.DB.open(alloc, path, open_options);
         defer db.close();
         summary.dbs_opened += 1;
-        try applyTableSchemaJson(alloc, &db, table.schema_json);
-        const index_summary = try reconcileDbIndexesWithOptions(alloc, &db, table.indexes_json, .{
-            .embedding_options = options.embedding_options,
-            .index_admission = .managed_async,
-        });
+        const index_summary = try reconcileDbIndexes(alloc, &db, table.indexes_json);
         summary.indexes_removed += index_summary.indexes_removed;
         summary.indexes_added += index_summary.indexes_added;
         summary.enrichments_added += index_summary.enrichments_added;
@@ -197,13 +195,11 @@ pub fn reconcileReplicaRootWithOptions(
     return summary;
 }
 
-fn applyTableSchemaJson(alloc: std.mem.Allocator, db: *db_mod.DB, schema_json: []const u8) !void {
-    if (schema_json.len == 0) return;
+fn runtimeTableSchemaFromJson(alloc: std.mem.Allocator, schema_json: []const u8) !?@import("../storage/schema.zig").TableSchema {
+    if (schema_json.len == 0) return null;
     var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
-    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
-    defer @import("../storage/schema.zig").freeSchema(alloc, runtime_schema);
-    try db.setSchema(runtime_schema);
+    return try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
 }
 
 pub fn reconcileDbIndexes(
@@ -214,12 +210,8 @@ pub fn reconcileDbIndexes(
     return try reconcileDbIndexesWithOptions(alloc, db, indexes_json, .{});
 }
 
-pub const IndexAdmission = enum { synchronous, managed_async };
-
 pub const ReconcileDbIndexOptions = struct {
     drain_resolver_backfill: bool = true,
-    embedding_options: managed_embedder.InitOptions = .{},
-    index_admission: IndexAdmission = .synchronous,
 };
 
 fn dbIndexReconciliationCanMutate(db: *const db_mod.DB) bool {
@@ -237,7 +229,7 @@ pub fn reconcileDbIndexesWithOptions(
         for (desired_enrichments.items) |*cfg| cfg.deinit(alloc);
         desired_enrichments.deinit(alloc);
     }
-    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, options.embedding_options, &desired_enrichments);
+    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, &desired_enrichments);
     try indexes_api.validateArtifactEnrichmentConfigs(desired_enrichments.items);
     dedupeDesiredEnrichments(alloc, &desired_enrichments);
     indexes_api.sortArtifactEnrichmentsByDependency(desired_enrichments.items);
@@ -252,7 +244,7 @@ pub fn reconcileDbIndexesWithOptions(
         .drain_backfill = options.drain_resolver_backfill,
     });
     const missing_indexes_removed = try removeMissingIndexes(alloc, db, indexes_json);
-    const index_summary = try ensureIndexes(alloc, db, indexes_json, options.index_admission);
+    const index_summary = try ensureIndexes(alloc, db, indexes_json);
     const enrichments_removed = try removeMissingEnrichments(alloc, db, desired_enrichments.items);
     const indexes_removed = missing_indexes_removed + index_summary.removed;
     if (index_summary.added > 0 or indexes_removed > 0 or enrichment_summary.changed() or enrichments_removed > 0 or resolver_summary.changed()) {
@@ -391,6 +383,57 @@ pub fn collectLocalSchemaProgressFromRuntime(
         }
     }.lessThan);
     return try out.toOwnedSlice(alloc);
+}
+
+/// Whether projected runtime observations cover every locally hosted range
+/// participating in a schema migration. An explicit opening/catching-up
+/// observation is coverage even though it is not ready: falling back to a
+/// filesystem DB reopen in that state duplicates the live owner's work and
+/// cannot make the migration ready sooner.
+pub fn localSchemaRuntimeCoverageComplete(
+    local_node_id: u64,
+    hosted_group_ids: []const u64,
+    tables: []const table_manager.TableRecord,
+    ranges: []const table_manager.RangeRecord,
+    stores: []const table_manager.StoreRecord,
+) bool {
+    var saw_migrating_group = false;
+    for (hosted_group_ids) |group_id| {
+        const range = findRange(ranges, group_id) orelse continue;
+        const table = findTable(tables, range.table_id) orelse continue;
+        if (table.read_schema_json.len == 0) continue;
+        saw_migrating_group = true;
+        _ = findLocalRuntimeStatus(stores, local_node_id, table.table_id, group_id) orelse return false;
+    }
+    return saw_migrating_group;
+}
+
+test "schema progress runtime coverage treats opening observations as authoritative without hiding missing groups" {
+    const tables = [_]table_manager.TableRecord{.{
+        .table_id = 11,
+        .name = "docs",
+        .schema_json = "{\"version\":1}",
+        .read_schema_json = "{\"version\":0}",
+    }};
+    const ranges = [_]table_manager.RangeRecord{
+        .{ .group_id = 7, .table_id = 11, .start_key = "", .end_key = "m" },
+        .{ .group_id = 8, .table_id = 11, .start_key = "m" },
+    };
+    const hosted = [_]u64{ 7, 8 };
+    var runtimes = [_]table_manager.RuntimeGroupStatusReport{
+        .{ .table_id = 11, .group_id = 7, .node_id = 3, .source = "startup_catch_up", .freshness = "opening" },
+        .{ .table_id = 11, .group_id = 8, .node_id = 3, .source = "startup_catch_up", .freshness = "opening" },
+    };
+    var stores = [_]table_manager.StoreRecord{.{
+        .store_id = 5,
+        .node_id = 3,
+        .runtime_statuses = runtimes[0..1],
+    }};
+
+    try std.testing.expect(!localSchemaRuntimeCoverageComplete(3, &hosted, &tables, &ranges, &stores));
+    stores[0].runtime_statuses = &runtimes;
+    try std.testing.expect(localSchemaRuntimeCoverageComplete(3, &hosted, &tables, &ranges, &stores));
+    try std.testing.expect(!localSchemaRuntimeCoverageComplete(4, &hosted, &tables, &ranges, &stores));
 }
 
 pub fn collectLocalRestoreProgress(
@@ -533,12 +576,7 @@ const IndexEnsureSummary = struct {
     removed: usize = 0,
 };
 
-fn ensureIndexes(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    indexes_json: []const u8,
-    admission: IndexAdmission,
-) !IndexEnsureSummary {
+fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !IndexEnsureSummary {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer parsed.deinit();
     const object = switch (parsed.value) {
@@ -559,7 +597,7 @@ fn ensureIndexes(
             const name = try indexDefinitionName(item);
             const kind = try parseIndexKind(item);
             const config_value = indexDefinitionConfigValue(item);
-            try ensureIndexDefinition(alloc, db, current, &summary, name, kind, config_value, true, admission);
+            try ensureIndexDefinition(alloc, db, current, &summary, name, kind, config_value, true);
         }
         return summary;
     }
@@ -571,7 +609,7 @@ fn ensureIndexes(
         if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or
             std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
         const kind = try parseIndexKind(entry.value_ptr.*);
-        try ensureIndexDefinition(alloc, db, current, &summary, entry.key_ptr.*, kind, entry.value_ptr.*, false, admission);
+        try ensureIndexDefinition(alloc, db, current, &summary, entry.key_ptr.*, kind, entry.value_ptr.*, false);
     }
     return summary;
 }
@@ -585,7 +623,6 @@ fn ensureIndexDefinition(
     kind: db_mod.types.IndexKind,
     config_value: std.json.Value,
     storage_config: bool,
-    admission: IndexAdmission,
 ) !void {
     const config_json = if (storage_config)
         try extractStoredIndexConfigJson(alloc, config_value)
@@ -610,16 +647,12 @@ fn ensureIndexDefinition(
         if (try indexConfigsEqual(alloc, existing_cfg, desired)) return;
         if (try db.deleteIndex(desired.name)) summary.removed += 1;
     }
-    const cfg = db_mod.types.IndexConfig{
+    try db.addIndex(.{
         .name = desired.name,
         .kind = desired.kind,
         .config_json = desired.config_json,
         .coverage_generation = desired.coverage_generation,
-    };
-    switch (admission) {
-        .synchronous => try db.addIndex(cfg),
-        .managed_async => try db.addIndexAsync(cfg),
-    }
+    });
     summary.added += 1;
 }
 
@@ -737,11 +770,10 @@ fn jsonValuesEqualIgnoringTopLevelEnrichments(a: std.json.Value, b: std.json.Val
 fn collectDesiredEnrichmentsFromJson(
     alloc: std.mem.Allocator,
     indexes_json: []const u8,
-    embedding_options: managed_embedder.InitOptions,
     out: *std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig),
 ) !void {
     {
-        const collected = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(alloc, indexes_json, embedding_options);
+        const collected = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
         errdefer db_mod.types.freeEnrichmentConfigs(alloc, collected);
         try out.appendSlice(alloc, collected);
         alloc.free(collected);
@@ -842,7 +874,6 @@ fn enrichmentConfigsEqual(a: db_mod.types.EnrichmentConfig, b: db_mod.types.Enri
         std.mem.eql(u8, a.template, b.template) and
         std.mem.eql(u8, a.source_artifact_name, b.source_artifact_name) and
         a.expected_dims == b.expected_dims and
-        std.mem.eql(u8, a.vector_space, b.vector_space) and
         a.chunk_size == b.chunk_size and
         a.chunk_overlap == b.chunk_overlap and
         std.mem.eql(u8, a.chunker_json, b.chunker_json) and
@@ -970,19 +1001,37 @@ fn localRangeHasSchemaVersionIndex(
     const path = try groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
     defer alloc.free(path);
 
+    var target_name_buf: [64]u8 = undefined;
+    const target_name = if (schema_version == 0)
+        @import("../api/tables.zig").default_full_text_index_name
+    else
+        try std.fmt.bufPrint(&target_name_buf, "full_text_index_v{d}", .{schema_version});
+
+    // A rebuild marker is the durable, authoritative statement that this
+    // schema index is not ready. Check it before opening the DB: schema
+    // progress is polled by the metadata lifecycle while the resident writer
+    // can spend minutes backfilling a large corpus. Reopening the same DB in
+    // query mode on every poll maps the complete retained read index and scans
+    // primary LSM metadata even though the answer is already on disk here.
+    const rebuild_state_root = try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ path, target_name });
+    defer alloc.free(rebuild_state_root);
+    const rebuild_state = db_mod.backfill_state.RebuildState.init(rebuild_state_root);
+    if (try rebuild_state.check(alloc)) |resume_key| {
+        alloc.free(resume_key);
+        return false;
+    }
+
     var open_options = provisioningDbOpenOptions();
-    open_options.open_mode = .query_readonly;
+    // Marker disappearance is followed by one catalog-only verification.
+    // Status probes do not execute queries and must not load/mmap full-text
+    // segment data merely to inspect persisted readiness metadata.
+    open_options.open_mode = .status_only;
     open_options.backend_runtime = options.backend_runtime;
     var db = try db_mod.DB.open(alloc, path, open_options);
     defer db.close();
     const stats = try db.stats(alloc);
     defer db_mod.types.freeDBStats(alloc, stats);
 
-    var target_name_buf: [64]u8 = undefined;
-    const target_name = if (schema_version == 0)
-        @import("../api/tables.zig").default_full_text_index_name
-    else
-        try std.fmt.bufPrint(&target_name_buf, "full_text_index_v{d}", .{schema_version});
     const target_index = findDbIndexStats(stats.indexes, target_name) orelse return false;
     if (!indexStatsReady(target_index)) return false;
     if (schema_version == read_schema_version) return true;
@@ -1148,9 +1197,6 @@ fn extractIndexConfigJsonForKind(
     if (value != .object) return try alloc.dupe(u8, "{}");
     switch (kind) {
         .dense_vector, .sparse_vector => return try managed_embedder.translateEmbeddingsIndexConfigJson(alloc, index_name, value),
-        .graph => if (value.object.get("source") != null or value.object.get("artifact") != null) {
-            return error.InvalidCreateTableRequest;
-        },
         else => {},
     }
 
@@ -1431,7 +1477,7 @@ test "table provisioner reconciles stored algebraic metadata without public type
     const indexes_json =
         \\{"alg":{"version":1,"table":"docs","schema_version":1,"group_fields":[{"name":"product","path":"product","type":"string"}],"materializations":[]}}
     ;
-    const summary = try ensureIndexes(std.testing.allocator, &db, indexes_json, .synchronous);
+    const summary = try ensureIndexes(std.testing.allocator, &db, indexes_json);
     try std.testing.expectEqual(@as(usize, 0), summary.added);
     try std.testing.expectEqual(@as(usize, 0), summary.removed);
     try std.testing.expect(db.core.index_manager.algebraicIndex("alg") != null);
@@ -1524,8 +1570,8 @@ test "table provisioner registers a resolver declared in the table index config"
     const indexes_json =
         \\{
         \\  "relations_graph":{"type":"graph",
-        \\    "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
-        \\    "enrichments":[{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}]},
+        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
         \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}
@@ -1581,8 +1627,8 @@ test "table provisioner registers a resolver declared in the table index config"
     const bumped_indexes_json =
         \\{
         \\  "relations_graph":{"type":"graph",
-        \\    "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
-        \\    "enrichments":[{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}]},
+        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
         \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":2}
@@ -1627,8 +1673,8 @@ test "table provisioner registers a resolver declared in the table index config"
     const removed_indexes_json =
         \\{
         \\  "relations_graph":{"type":"graph",
-        \\    "sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}],
-        \\    "enrichments":[{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}]},
+        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
         \\  "resolvers":[]
         \\}
     ;
@@ -2697,6 +2743,35 @@ test "table provisioner schema progress probes do not take a writer lease" {
 
     try std.testing.expectEqual(@as(usize, 1), progress.len);
     try std.testing.expectEqual(@as(u64, 9), progress[0].table_id);
+}
+
+test "table provisioner schema progress returns not ready from rebuild marker without opening DB" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-metadata-table-provisioner-progress-rebuild-marker";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2007);
+    defer alloc.free(db_path);
+    const index_root = try std.fmt.allocPrint(alloc, "{s}/indexes/full_text_index_v2", .{db_path});
+    defer alloc.free(index_root);
+    const rebuild_state = db_mod.backfill_state.RebuildState.init(index_root);
+    try rebuild_state.update("doc:m");
+
+    // There is deliberately no DB at db_path. If the progress probe attempts
+    // DB.open instead of trusting the durable marker, this call fails rather
+    // than returning the expected in-progress result.
+    try std.testing.expect(!try localRangeHasSchemaVersionIndex(
+        alloc,
+        path,
+        "docs",
+        2007,
+        2,
+        1,
+        .{},
+    ));
 }
 
 test "table provisioner withholds schema progress when any local shard is missing the target full-text index" {

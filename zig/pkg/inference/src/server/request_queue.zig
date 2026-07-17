@@ -14,20 +14,12 @@
 
 // Request queue: limits concurrent inference requests with backpressure.
 //
-// A Node may serve HTTP and in-process providers from different OS threads,
-// so admission and accounting share one small atomic critical section.
+// httpx uses fiber-based concurrency on a single OS thread,
+// so a simple counter suffices (no mutex needed).
 
 const std = @import("std");
 
 pub const RequestQueue = struct {
-    pub const Snapshot = struct {
-        active_requests: usize,
-        active_units: usize,
-        capacity: usize,
-        available: usize,
-    };
-
-    mutex: std.atomic.Mutex = .unlocked,
     active_requests: usize = 0,
     active_units: usize = 0,
     max_concurrent: usize,
@@ -44,13 +36,11 @@ pub const RequestQueue = struct {
     /// Acquire weighted capacity units. Single-slot callers should continue using acquire().
     pub fn acquireUnits(self: *RequestQueue, units: usize) !void {
         const requested = self.capacityUnits(units);
-        self.lock();
-        defer self.mutex.unlock();
-        if (self.max_concurrent != 0 and requested > self.max_concurrent - self.active_units) {
+        if (self.active_units + requested > self.max_concurrent) {
             return error.QueueFull;
         }
-        self.active_requests +|= 1;
-        self.active_units +|= requested;
+        self.active_requests += 1;
+        self.active_units += requested;
     }
 
     /// Release a slot after request completes.
@@ -60,8 +50,6 @@ pub const RequestQueue = struct {
 
     pub fn releaseUnits(self: *RequestQueue, units: usize) void {
         const requested = self.capacityUnits(units);
-        self.lock();
-        defer self.mutex.unlock();
         if (self.active_requests > 0) self.active_requests -= 1;
         if (self.active_units > requested) {
             self.active_units -= requested;
@@ -71,38 +59,19 @@ pub const RequestQueue = struct {
     }
 
     pub fn capacityUnits(self: *const RequestQueue, units: usize) usize {
-        const requested = @max(units, 1);
-        return if (self.max_concurrent == 0) requested else @min(requested, self.max_concurrent);
+        return @min(@max(units, 1), self.max_concurrent);
     }
 
-    pub fn snapshot(self: *RequestQueue) Snapshot {
-        self.lock();
-        defer self.mutex.unlock();
-        return .{
-            .active_requests = self.active_requests,
-            .active_units = self.active_units,
-            .capacity = self.max_concurrent,
-            .available = if (self.max_concurrent == 0)
-                std.math.maxInt(usize)
-            else
-                self.max_concurrent - self.active_units,
-        };
+    pub fn depth(self: *const RequestQueue) usize {
+        return self.active_units;
     }
 
-    pub fn depth(self: *RequestQueue) usize {
-        return self.snapshot().active_units;
+    pub fn requests(self: *const RequestQueue) usize {
+        return self.active_requests;
     }
 
-    pub fn requests(self: *RequestQueue) usize {
-        return self.snapshot().active_requests;
-    }
-
-    pub fn available(self: *RequestQueue) usize {
-        return self.snapshot().available;
-    }
-
-    fn lock(self: *RequestQueue) void {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    pub fn available(self: *const RequestQueue) usize {
+        return self.max_concurrent - self.active_units;
     }
 };
 
@@ -145,50 +114,4 @@ test "request queue weighted capacity" {
     try std.testing.expectEqual(@as(usize, 3), q.available());
     try std.testing.expectEqual(@as(usize, 4), q.capacityUnits(100));
     try std.testing.expectEqual(@as(usize, 1), q.capacityUnits(0));
-}
-
-test "request queue zero capacity limit is unlimited" {
-    var q = RequestQueue.init(0);
-
-    try q.acquireUnits(3);
-    try q.acquire();
-    try std.testing.expectEqual(@as(usize, 4), q.depth());
-    try std.testing.expectEqual(@as(usize, 2), q.requests());
-    try std.testing.expectEqual(std.math.maxInt(usize), q.available());
-
-    q.releaseUnits(3);
-    q.release();
-    try std.testing.expectEqual(@as(usize, 0), q.depth());
-}
-
-test "request queue serializes admission across OS threads" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
-    const Worker = struct {
-        fn run(q: *RequestQueue, violations: *std.atomic.Value(usize)) void {
-            for (0..1000) |_| {
-                q.acquire() catch |err| switch (err) {
-                    error.QueueFull => {
-                        std.Thread.yield() catch {};
-                        continue;
-                    },
-                };
-                const state = q.snapshot();
-                if (state.active_units > state.capacity) _ = violations.fetchAdd(1, .monotonic);
-                std.Thread.yield() catch {};
-                q.release();
-            }
-        }
-    };
-
-    var q = RequestQueue.init(2);
-    var violations = std.atomic.Value(usize).init(0);
-    var threads: [4]std.Thread = undefined;
-    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, Worker.run, .{ &q, &violations });
-    for (threads) |thread| thread.join();
-
-    try std.testing.expectEqual(@as(usize, 0), violations.load(.monotonic));
-    const final = q.snapshot();
-    try std.testing.expectEqual(@as(usize, 0), final.active_requests);
-    try std.testing.expectEqual(@as(usize, 0), final.active_units);
 }

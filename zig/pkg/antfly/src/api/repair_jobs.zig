@@ -16,7 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const docstore_mod = @import("../storage/docstore.zig");
 const db_mod = @import("../storage/db/mod.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const platform_sync = @import("antfly_platform").sync;
 
 fn testProcessId() u64 {

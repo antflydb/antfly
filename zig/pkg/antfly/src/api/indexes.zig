@@ -292,14 +292,6 @@ pub fn collectArtifactEnrichmentsFromTableIndexesJson(
     alloc: std.mem.Allocator,
     indexes_json: []const u8,
 ) ![]db_mod.types.EnrichmentConfig {
-    return try collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(alloc, indexes_json, .{});
-}
-
-pub fn collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(
-    alloc: std.mem.Allocator,
-    indexes_json: []const u8,
-    embedding_options: managed_embedder.InitOptions,
-) ![]db_mod.types.EnrichmentConfig {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexesJsonSource(indexes_json), .{});
     defer parsed.deinit();
 
@@ -308,7 +300,7 @@ pub fn collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(
         for (out.items) |*cfg| cfg.deinit(alloc);
         out.deinit(alloc);
     }
-    try collectArtifactEnrichmentsFromValue(alloc, parsed.value, embedding_options, &out);
+    try collectArtifactEnrichmentsFromValue(alloc, parsed.value, &out);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -394,18 +386,10 @@ pub fn sortArtifactEnrichmentsByDependency(configs: []db_mod.types.EnrichmentCon
 fn collectArtifactEnrichmentsFromValue(
     alloc: std.mem.Allocator,
     value: std.json.Value,
-    embedding_options: managed_embedder.InitOptions,
     out: *std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig),
 ) !void {
     switch (value) {
         .object => |object| {
-            const embedding_producer_json = blk: {
-                const type_value = object.get("type") orelse break :blk null;
-                if (type_value != .string or !std.mem.eql(u8, type_value.string, "embeddings")) break :blk null;
-                if (object.get("embedder") == null) break :blk null;
-                break :blk try managed_embedder.embeddingSemanticProducerJsonAllocWithOptions(alloc, value, embedding_options);
-            };
-            defer if (embedding_producer_json) |raw| alloc.free(raw);
             if (object.get("enrichments")) |enrichments| {
                 if (enrichments == .array) {
                     for (enrichments.array.items) |item| {
@@ -417,12 +401,6 @@ fn collectArtifactEnrichmentsFromValue(
                         defer parsed.deinit();
                         var owned = try db_mod.types.EnrichmentConfig.clone(alloc, parsed.value);
                         errdefer owned.deinit(alloc);
-                        if (owned.kind == .embedding) {
-                            if (embedding_producer_json) |raw| {
-                                if (owned.producer_json.len > 0) alloc.free(owned.producer_json);
-                                owned.producer_json = try alloc.dupe(u8, raw);
-                            }
-                        }
                         try out.append(alloc, owned);
                     }
                 }
@@ -430,11 +408,11 @@ fn collectArtifactEnrichmentsFromValue(
             var it = object.iterator();
             while (it.next()) |entry| {
                 if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
-                try collectArtifactEnrichmentsFromValue(alloc, entry.value_ptr.*, embedding_options, out);
+                try collectArtifactEnrichmentsFromValue(alloc, entry.value_ptr.*, out);
             }
         },
         .array => |array| {
-            for (array.items) |item| try collectArtifactEnrichmentsFromValue(alloc, item, embedding_options, out);
+            for (array.items) |item| try collectArtifactEnrichmentsFromValue(alloc, item, out);
         },
         else => {},
     }
@@ -468,7 +446,6 @@ fn artifactEnrichmentConfigsEqual(a: db_mod.types.EnrichmentConfig, b: db_mod.ty
         std.mem.eql(u8, a.template, b.template) and
         std.mem.eql(u8, a.source_artifact_name, b.source_artifact_name) and
         a.expected_dims == b.expected_dims and
-        std.mem.eql(u8, a.vector_space, b.vector_space) and
         a.chunk_size == b.chunk_size and
         a.chunk_overlap == b.chunk_overlap and
         std.mem.eql(u8, a.chunker_json, b.chunker_json) and
@@ -804,7 +781,7 @@ fn appendIndexStatus(
     else
         false;
     const graph_source_status = if (index_type == .graph)
-        graphSourcesStatus(config)
+        graphSourceStatus(config)
     else
         null;
     const coverage_generation = if (index_type == .embeddings)
@@ -959,12 +936,12 @@ const GraphSourceStatus = struct {
     format: []const u8 = "extraction_relation",
 };
 
-const GraphSourcesStatus = struct {
-    sources: []const std.json.Value = &.{},
-};
-
-fn graphSourceStatusFromValue(source: std.json.Value) ?GraphSourceStatus {
+fn graphSourceStatus(config: std.json.Value) ?GraphSourceStatus {
+    if (config != .object) return null;
+    const source = config.object.get("source") orelse return null;
     if (source != .object) return null;
+    const kind = source.object.get("kind") orelse return null;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "artifact")) return null;
     const artifact = source.object.get("artifact") orelse return null;
     if (artifact != .string or artifact.string.len == 0) return null;
     return .{
@@ -978,36 +955,6 @@ fn graphSourceStatusFromValue(source: std.json.Value) ?GraphSourceStatus {
             else => "extraction_relation",
         } else "extraction_relation",
     };
-}
-
-fn graphSourcesStatus(config: std.json.Value) ?GraphSourcesStatus {
-    if (config != .object) return null;
-    const sources = config.object.get("sources") orelse return null;
-    if (sources != .array or sources.array.items.len == 0) return null;
-    return .{ .sources = sources.array.items };
-}
-
-fn appendGraphSourceStatusObject(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    source: GraphSourceStatus,
-    materialization_pending: bool,
-) !void {
-    try out.append(alloc, '{');
-    try appendJsonString(alloc, out, "name");
-    try out.append(alloc, ':');
-    try appendJsonString(alloc, out, source.artifact);
-    try out.append(alloc, ',');
-    try appendJsonString(alloc, out, "path");
-    try out.append(alloc, ':');
-    try appendJsonString(alloc, out, source.path);
-    try out.append(alloc, ',');
-    try appendJsonString(alloc, out, "format");
-    try out.append(alloc, ':');
-    try appendJsonString(alloc, out, source.format);
-    try out.appendSlice(alloc, ",\"materialization_pending\":");
-    try out.appendSlice(alloc, if (materialization_pending) "true" else "false");
-    try out.append(alloc, '}');
 }
 
 fn indexTypeName(index_type: ApiIndexType) []const u8 {
@@ -1138,7 +1085,7 @@ fn appendIndexRuntimeStatus(
     embeddings_sparse: bool,
     coverage_generation: u64,
     coverage_config_hash: u64,
-    graph_source_status: ?GraphSourcesStatus,
+    graph_source_status: ?GraphSourceStatus,
     expected_group_ids: []const u64,
     local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
     status_lookup: *const RuntimeStatusLookup,
@@ -2341,7 +2288,7 @@ fn appendSingleIndexRuntimeStatus(
     embeddings_sparse: bool,
     coverage_generation: u64,
     coverage_config_hash: u64,
-    graph_source_status: ?GraphSourcesStatus,
+    graph_source_status: ?GraphSourceStatus,
     async_indexing: db_mod.types.AsyncIndexingStats,
     enrichment: ?db_mod.types.EnrichmentStats,
     resolution: ?db_mod.types.ReplayStageStats,
@@ -2357,9 +2304,26 @@ fn appendSingleIndexRuntimeStatus(
         null;
     var backfill_active = if (embeddings_view) |view| view.backfill_active else item.backfill_active;
     var backfill_progress = if (embeddings_view) |view| view.backfill_progress else item.backfill_progress;
-    var replay_applied_sequence = if (embeddings_view) |view| view.replay_applied_sequence else item.replay_applied_sequence;
-    var replay_target_sequence = if (embeddings_view) |view| view.replay_target_sequence else item.replay_target_sequence;
-    var replay_catch_up_required = if (embeddings_view) |view| view.replay_catch_up_required else item.replay_catch_up_required;
+    // Replay watermarks describe the managed index worker's real ledger.
+    // Coverage and enrichment are separate stages with separate sequence
+    // domains; they may keep readiness/backfill active, but must not rewrite a
+    // converged index watermark into synthetic replay debt. Older snapshots
+    // that contain no index replay facts can still derive a compatibility
+    // view from enrichment status.
+    const index_replay_present = item.replay_applied_sequence != 0 or
+        item.replay_target_sequence != 0 or item.replay_catch_up_required;
+    var replay_applied_sequence = if (index_replay_present or embeddings_view == null)
+        item.replay_applied_sequence
+    else
+        embeddings_view.?.replay_applied_sequence;
+    var replay_target_sequence = if (index_replay_present or embeddings_view == null)
+        item.replay_target_sequence
+    else
+        embeddings_view.?.replay_target_sequence;
+    var replay_catch_up_required = if (index_replay_present or embeddings_view == null)
+        item.replay_catch_up_required
+    else
+        embeddings_view.?.replay_catch_up_required;
     const dense_catch_up = async_indexing.dense_catch_up;
     var catch_up_active = item.catch_up_active;
     var catch_up_phase = item.catch_up_phase;
@@ -2379,7 +2343,7 @@ fn appendSingleIndexRuntimeStatus(
             }
         }
     }
-    if (catch_up_active or catch_up_target_sequence > catch_up_applied_sequence) {
+    if (!index_replay_present and (catch_up_active or catch_up_target_sequence > catch_up_applied_sequence)) {
         replay_catch_up_required = true;
         backfill_active = true;
         replay_target_sequence = @max(replay_target_sequence, catch_up_target_sequence);
@@ -2568,17 +2532,22 @@ fn appendSingleIndexRuntimeStatus(
         try out.appendSlice(alloc, ",\"result_nodes\":");
         try appendIntValue(alloc, out, item.algebraic_graph_traversal_result_node_count);
         try out.appendSlice(alloc, "}}");
-        if (graph_source_status) |status| {
-            const materialization_pending = catch_up_active or replay_catch_up_required;
-            try out.appendSlice(alloc, ",\"source_artifacts\":[");
-            var first = true;
-            for (status.sources) |source_value| {
-                const source = graphSourceStatusFromValue(source_value) orelse continue;
-                if (!first) try out.append(alloc, ',');
-                first = false;
-                try appendGraphSourceStatusObject(alloc, out, source, materialization_pending);
-            }
-            try out.append(alloc, ']');
+        if (graph_source_status) |source| {
+            try out.appendSlice(alloc, ",\"source_artifact\":{");
+            try appendJsonString(alloc, out, "name");
+            try out.append(alloc, ':');
+            try appendJsonString(alloc, out, source.artifact);
+            try out.append(alloc, ',');
+            try appendJsonString(alloc, out, "path");
+            try out.append(alloc, ':');
+            try appendJsonString(alloc, out, source.path);
+            try out.append(alloc, ',');
+            try appendJsonString(alloc, out, "format");
+            try out.append(alloc, ':');
+            try appendJsonString(alloc, out, source.format);
+            try out.appendSlice(alloc, ",\"materialization_pending\":");
+            try out.appendSlice(alloc, if (catch_up_active or replay_catch_up_required) "true" else "false");
+            try out.append(alloc, '}');
         }
     }
     if (index_type == .algebraic) try appendAlgebraicIndexStatsFields(alloc, out, item);
@@ -3373,29 +3342,6 @@ test "index metadata validates artifact enrichment graph" {
     );
 }
 
-pub fn testEmbeddingEnrichmentsPersistSemanticProducerIdentity() !void {
-    const configs = try collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator,
-        \\{"vectors":{"type":"embeddings","dimension":3,"embedder":{"provider":"openai","model":"embed-v1","url":"https://models.example/v1","api_key":"secret"},"sources":[{"artifact":"title_dense_v1"},{"artifact":"body_dense_v1"}],"enrichments":[{"name":"title_dense_v1","kind":"embedding","field":"title"},{"name":"body_dense_v1","kind":"embedding","field":"body"}]}}
-    );
-    defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, configs);
-    try std.testing.expectEqual(@as(usize, 2), configs.len);
-    try std.testing.expect(configs[0].producer_json.len > 0);
-    try std.testing.expectEqualStrings(configs[0].producer_json, configs[1].producer_json);
-    try std.testing.expect(std.mem.indexOf(u8, configs[0].producer_json, "embed-v1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, configs[0].producer_json, "secret") == null);
-
-    const effective = try collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(std.testing.allocator,
-        \\{"vectors":{"type":"embeddings","dimension":3,"embedder":{"provider":"antfly","model":"embed-v1"},"sources":[{"artifact":"dense_v1"}],"enrichments":[{"name":"dense_v1","kind":"embedding","field":"body"}]}}
-    , .{ .inference_api_url = "https://inference.example" });
-    defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, effective);
-    try std.testing.expectEqual(@as(usize, 1), effective.len);
-    try std.testing.expect(std.mem.indexOf(u8, effective[0].producer_json, "https://inference.example/ai/v1") != null);
-}
-
-test "embedding enrichments persist canonical semantic producer identity" {
-    try testEmbeddingEnrichmentsPersistSemanticProducerIdentity();
-}
-
 test "index metadata rejects artifact enrichment deletion with dependents" {
     const indexes_json = "{\"enrichments\":[{\"name\":\"units\",\"kind\":\"asset\",\"field\":\"url\"},{\"name\":\"chunks\",\"kind\":\"chunk\",\"field\":\"text\",\"source_artifact_name\":\"units\",\"chunk_size\":512}]}";
     const removed = (try removeEnrichmentFromTableIndexesJson(std.testing.allocator, indexes_json, "units")).?;
@@ -3593,7 +3539,7 @@ test "index encoders expose algebraic graph traversal health" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"algebraic_graph\":{\"traversal\":{\"attempted\":3,\"proven\":2,\"rejected\":1,\"fallback\":4,\"result_nodes\":9}}") != null);
 }
 
-pub fn testGraphArtifactSourceMaterializationStatus() !void {
+test "index encoders expose graph artifact source materialization status" {
     const alloc = std.testing.allocator;
     const indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1);
     defer alloc.free(indexes);
@@ -3624,7 +3570,7 @@ pub fn testGraphArtifactSourceMaterializationStatus() !void {
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"relations_graph\":{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\"},{\"artifact\":\"entity_graph_v1\",\"path\":\"$.graph\",\"format\":\"extraction_graph\"}]}}",
+            .indexes_json = "{\"relations_graph\":{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\"}}}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -3636,14 +3582,8 @@ pub fn testGraphArtifactSourceMaterializationStatus() !void {
 
     const encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "relations_graph", &local_status)).?;
     defer alloc.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_artifacts\":[{\"name\":\"relations_v1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_artifact\":") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "{\"name\":\"entity_graph_v1\",\"path\":\"$.graph\",\"format\":\"extraction_graph\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_artifact\":{\"name\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\",\"materialization_pending\":true}") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"shard_status\":{\"7\":{") != null);
-}
-
-test "index encoders expose graph artifact source materialization status" {
-    try testGraphArtifactSourceMaterializationStatus();
 }
 
 test "index encoders expose compact algebraic public status" {
@@ -4481,8 +4421,8 @@ test "single embeddings index encoder keeps backfill active while enrichment rep
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":0.600") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":3") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":5") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"retrying\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"retrying\":true") != null);
 }
@@ -4538,11 +4478,80 @@ test "single embeddings index encoder keeps retrying coverage gaps catch-up cohe
     const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
     defer std.testing.allocator.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":0.333") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":33") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":0.000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":34") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":34") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"retrying\"") != null);
+}
+
+test "managed embeddings coverage debt does not fabricate replay debt" {
+    const config_json = "{\"type\":\"embeddings\",\"field\":\"semantic_content\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const config_hash = try expectedCoverageConfigHash(std.testing.allocator, "semantic_idx", parsed_config.value);
+
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .doc_count = 6,
+        .node_count = 1,
+        .root_node = 1,
+        .coverage_produced_count = 6,
+        .coverage_skipped_count = 3,
+        .coverage_generation = 42,
+        .coverage_config_hash = config_hash,
+        .coverage_identity_ready = true,
+        .replay_applied_sequence = 12,
+        .replay_target_sequence = 12,
+        .replay_catch_up_required = false,
+        .catch_up_active = false,
+        .catch_up_phase = .idle,
+        .catch_up_applied_sequence = 10,
+        .catch_up_target_sequence = 12,
+    }};
+    var items = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{
+            .source_doc_count = 9,
+            .doc_count = 9,
+            .index_count = 1,
+            .indexes = indexes[0..],
+            .enrichment = .{
+                .enabled = true,
+                .target_sequence = 10,
+                .applied_sequence = 10,
+                .processed_requests = 9,
+                .skipped_source_count = 3,
+            },
+        },
+    }};
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = items[0..] };
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"semantic_idx\":" ++ config_json ++ "}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"policy\":\"strict\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"pending\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"complete\":false") != null);
 }
 
 test "external embeddings index readiness does not require table doc coverage" {

@@ -13,5 +13,5 @@
 // limitations.
 
 pub const doc_set = @import("storage/db/doc_set.zig");
-pub const platform_time = @import("platform/time.zig");
+pub const platform_time = @import("antfly_platform").time;
 pub const roaring = @import("encoding/roaring.zig");

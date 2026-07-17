@@ -1,0 +1,129 @@
+{
+  "global_doc_count": 5032105,
+  "merge_policy": {
+    "delete_reclaim_weight": 2,
+    "floor_segment_size": 16777216,
+    "max_merge_at_once": 10,
+    "max_segment_size": 5368709120,
+    "max_segments_per_tier": 10,
+    "size_weight": 1,
+    "skew_weight": 1
+  },
+  "merge_stats": {
+    "backpressure_events": 0,
+    "backpressure_ns": 0,
+    "completed_merges": 267,
+    "deferred_for_pressure": 0,
+    "enabled": false,
+    "failed_merges": 0,
+    "in_flight_merges": 0,
+    "in_flight_segments": 0,
+    "last_merge_elapsed_ns": 1300020000,
+    "last_merge_error": "",
+    "last_merge_input_bytes": 92412310,
+    "last_merge_input_segments": 2,
+    "last_merge_output_bytes": 91717344,
+    "last_merge_output_segments": 1,
+    "last_merge_peak_task_alloc_bytes": 0,
+    "max_pending_bytes": 0,
+    "max_pending_segments": 0,
+    "merge_elapsed_ns_total": 237151042000,
+    "merge_input_bytes_total": 17902875053,
+    "merge_input_segments_total": 1326,
+    "merge_output_bytes_total": 17263657081,
+    "merge_output_segments_total": 267,
+    "merge_peak_task_alloc_bytes": 0,
+    "pending_bytes": 0,
+    "pending_heap_bytes": 0,
+    "pending_indexes": 0,
+    "pending_mmap_bytes": 0,
+    "pending_segments": 0,
+    "quarantined_merges": 0,
+    "quarantined_segments": 0,
+    "retry_after_ns": 0,
+    "skipped_stale_merges": 0
+  },
+  "segments": [
+    {
+      "bytes": 729058597,
+      "deleted_count": 0,
+      "doc_count": 996411,
+      "file_backed": true,
+      "live_doc_count": 996411,
+      "segment_id": 724
+    },
+    {
+      "bytes": 402112400,
+      "deleted_count": 0,
+      "doc_count": 658075,
+      "file_backed": true,
+      "live_doc_count": 658075,
+      "segment_id": 801
+    },
+    {
+      "bytes": 622644128,
+      "deleted_count": 0,
+      "doc_count": 872963,
+      "file_backed": true,
+      "live_doc_count": 872963,
+      "segment_id": 911
+    },
+    {
+      "bytes": 505708633,
+      "deleted_count": 0,
+      "doc_count": 670463,
+      "file_backed": true,
+      "live_doc_count": 670463,
+      "segment_id": 1052
+    },
+    {
+      "bytes": 340505184,
+      "deleted_count": 0,
+      "doc_count": 528043,
+      "file_backed": true,
+      "live_doc_count": 528043,
+      "segment_id": 1226
+    },
+    {
+      "bytes": 440493314,
+      "deleted_count": 0,
+      "doc_count": 724045,
+      "file_backed": true,
+      "live_doc_count": 724045,
+      "segment_id": 1297
+    },
+    {
+      "bytes": 176590749,
+      "deleted_count": 0,
+      "doc_count": 300000,
+      "file_backed": true,
+      "live_doc_count": 300000,
+      "segment_id": 1298
+    },
+    {
+      "bytes": 59495840,
+      "deleted_count": 0,
+      "doc_count": 100000,
+      "file_backed": true,
+      "live_doc_count": 100000,
+      "segment_id": 1321
+    },
+    {
+      "bytes": 17490670,
+      "deleted_count": 0,
+      "doc_count": 32105,
+      "file_backed": true,
+      "live_doc_count": 32105,
+      "segment_id": 1335
+    },
+    {
+      "bytes": 91717344,
+      "deleted_count": 0,
+      "doc_count": 150000,
+      "file_backed": true,
+      "live_doc_count": 150000,
+      "segment_id": 1336
+    }
+  ],
+  "total_bytes": 3385816859
+}

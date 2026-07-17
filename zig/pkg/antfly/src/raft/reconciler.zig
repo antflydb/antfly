@@ -285,7 +285,6 @@ pub const Reconciler = struct {
     fn reconcileRaftMembership(self: *Reconciler, intent: PlacementIntent) !bool {
         const status = self.host.raftStatus(intent.record.group_id) orelse return false;
         if (status.soft.role != .leader or status.soft.leader_id != status.id) return false;
-        if (!localNodeCanProposeMembership(status)) return false;
 
         // A new change cannot be proposed while joint consensus is active. Leave
         // the committed joint configuration first; the next reconcile round will
@@ -324,11 +323,6 @@ pub const Reconciler = struct {
         return true;
     }
 };
-
-fn localNodeCanProposeMembership(status: raft_engine.core.Status) bool {
-    return containsNodeId(status.conf_state.voters, status.id) or
-        containsNodeId(status.conf_state.voters_outgoing, status.id);
-}
 
 fn allocMembershipChanges(
     alloc: std.mem.Allocator,
@@ -688,32 +682,6 @@ test "membership reconciliation normalizes duplicate and missing local voters" {
     defer std.testing.allocator.free(changes);
 
     try std.testing.expectEqual(@as(usize, 0), changes.len);
-}
-
-test "membership reconciliation requires a local voter" {
-    const base: raft_engine.core.Status = .{
-        .id = 7,
-        .group_id = 11,
-        .soft = .{ .leader_id = 7, .role = .leader },
-        .hard = .{},
-        .conf_state = .{},
-        .last_index = 0,
-        .applied_index = 0,
-        .election_elapsed = 0,
-        .randomized_election_timeout = 0,
-        .votes_granted = 0,
-        .votes_rejected = 0,
-        .votes_unknown = 0,
-    };
-
-    var removed = base;
-    removed.conf_state.voters = @constCast((&[_]u64{ 8, 9 })[0..]);
-    try std.testing.expect(!localNodeCanProposeMembership(removed));
-
-    var outgoing = base;
-    outgoing.conf_state.voters = @constCast((&[_]u64{ 8, 9 })[0..]);
-    outgoing.conf_state.voters_outgoing = @constCast((&[_]u64{ 7, 8, 9 })[0..]);
-    try std.testing.expect(localNodeCanProposeMembership(outgoing));
 }
 
 test "reconciler module compiles" {

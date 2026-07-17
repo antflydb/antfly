@@ -15,10 +15,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+var freestanding_counter: u64 = 0;
+
 pub fn sleepNs(ns: u64) void {
-    if (comptime builtin.os.tag == .freestanding and (builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64)) {
-        return;
-    }
+    if (comptime builtin.os.tag == .freestanding) return;
 
     var req = std.posix.timespec{
         .sec = @intCast(ns / std.time.ns_per_s),
@@ -32,12 +32,15 @@ pub fn sleepNs(ns: u64) void {
 }
 
 pub fn yieldBriefly() void {
-    if (comptime builtin.os.tag == .freestanding and (builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64)) return;
+    if (comptime builtin.os.tag == .freestanding) return;
     sleepNs(100_000);
 }
 
 pub fn monotonicNs() u64 {
-    if (comptime builtin.os.tag == .freestanding and (builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64)) return 0;
+    if (comptime builtin.os.tag == .freestanding) {
+        freestanding_counter +%= 1;
+        return freestanding_counter;
+    }
 
     var ts: std.posix.timespec = undefined;
     switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
@@ -46,8 +49,25 @@ pub fn monotonicNs() u64 {
     }
 }
 
+pub fn realtimeNs() u64 {
+    if (comptime builtin.os.tag == .freestanding) {
+        freestanding_counter +%= 1;
+        return freestanding_counter;
+    }
+
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
+        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => return 0,
+    }
+}
+
+pub fn nowSeconds() u64 {
+    return monotonicNs() / std.time.ns_per_s;
+}
+
 pub fn residentBytes() usize {
-    if (comptime builtin.os.tag == .freestanding and (builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64)) return 0;
+    if (comptime builtin.os.tag == .freestanding) return 0;
 
     const usage = std.posix.getrusage(std.posix.rusage.SELF);
     if (usage.maxrss <= 0) return 0;

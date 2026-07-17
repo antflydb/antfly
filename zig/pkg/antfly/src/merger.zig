@@ -152,6 +152,11 @@ pub const SegmentInfo = struct {
 pub const MergeOutputOptions = struct {
     target_segment_bytes: usize = 256 * 1024 * 1024,
     index_sort: []const segment_mod.SegmentIndexSortField = &.{},
+    /// Optional task-owned deletion view aligned with `segment_indices`.
+    /// Background merges use this to remain independent of later mutations to
+    /// the live segment bitmaps while the expensive merge runs without the
+    /// per-index apply mutex.
+    deleted_docs: ?[]const ?roaring.RoaringBitmap = null,
 };
 
 /// Merge multiple segments from the snapshot into one.
@@ -189,6 +194,9 @@ pub fn mergeSegmentsBounded(
     options: MergeOutputOptions,
 ) ![][]u8 {
     if (segment_indices.len == 0) return error.NoSegments;
+    if (options.deleted_docs) |deleted_docs| {
+        if (deleted_docs.len != segment_indices.len) return error.InvalidDeletionSnapshot;
+    }
 
     var inputs = try alloc.alloc(segment_mod.MergeInput, segment_indices.len);
     defer alloc.free(inputs);
@@ -199,7 +207,7 @@ pub fn mergeSegmentsBounded(
         total_input_bytes += seg.data.bytes().len;
         inputs[i] = .{
             .reader = &seg.reader,
-            .deleted = seg.shared.deleted,
+            .deleted = if (options.deleted_docs) |deleted_docs| deleted_docs[i] else seg.shared.deleted,
         };
     }
     const common_index_sort = if (options.index_sort.len == 0)

@@ -12,12 +12,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const std = @import("std");
-
 pub const storage = @import("storage/mod.zig");
 pub const runtime = @import("runtime.zig");
 pub const api = @import("api.zig");
-pub const incarnation = @import("incarnation.zig");
 pub const admin = @import("admin.zig");
 pub const http_routes = @import("http_routes.zig");
 pub const http_server = @import("http_server.zig");
@@ -44,7 +41,6 @@ pub const encodeTransitionCommand = storage.encodeTransitionCommand;
 pub const decodeTransitionCommand = storage.decodeTransitionCommand;
 pub const AdminSnapshot = api.AdminSnapshot;
 pub const MetadataStatus = api.MetadataStatus;
-pub const MetadataClusterIncarnation = incarnation.MetadataClusterIncarnation;
 pub const captureAdminSnapshot = api.captureSnapshot;
 pub const freeAdminSnapshot = api.freeSnapshot;
 pub const ActiveTransitionCounts = admin.ActiveTransitionCounts;
@@ -130,7 +126,6 @@ test "metadata module compiles" {
     _ = storage;
     _ = runtime;
     _ = api;
-    std.testing.refAllDecls(incarnation);
     _ = admin;
     _ = http_routes;
     _ = http_server;

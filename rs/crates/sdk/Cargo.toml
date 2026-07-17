@@ -4,9 +4,6 @@ version = "0.1.0"
 edition = "2024"
 description = "Async Rust client for the Antfly API, generated from the OpenAPI spec"
 
-[lib]
-doctest = false
-
 [dependencies]
 progenitor-client = "0.13"
 reqwest = { version = "0.13", features = ["json"] }
@@ -21,6 +18,3 @@ prettyplease = "0.2"
 syn = "2.0"
 serde_yaml = "0.9"
 openapiv3 = "2.2"
-
-[dev-dependencies]
-serde_yaml = "0.9"

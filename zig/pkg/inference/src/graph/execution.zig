@@ -170,97 +170,13 @@ pub fn graphForwardAll(
         }
     }
 
-    while (pipeline.compiled_partition_backend) |backend| {
-        const maybe_logits = executeExplicitCompiledPartitionBackend(
-            pipeline,
-            allocator,
-            entry,
-            graph,
-            exec_options,
-            backend,
-            attn_mode,
-        ) catch |err| {
-            if (pipeline.compiled_partition_strict or
-                pipeline.compiled_provider_committed or
-                !isRetryableCompiledProviderError(backend, err)) return err;
-            // A failed attach can leave an incomplete executor set in the
-            // shape cache. Clear only compiled state; the traced graph,
-            // analysis and immutable weight bindings remain reusable.
-            entry.resetCompiledPartitions();
-            std.log.warn("compiled generation provider {s} failed ({s}); advancing configured priority", .{
-                @tagName(backend),
-                @errorName(err),
-            });
-            advanceCompiledPartitionProvider(pipeline);
-            continue;
-        };
-        if (maybe_logits) |logits| {
-            pipeline.compiled_provider_committed = true;
+    if (pipeline.compiled_partition_backend) |backend| {
+        if (try executeExplicitCompiledPartitionBackend(pipeline, allocator, entry, graph, exec_options, backend, attn_mode)) |logits| {
             return logits;
         }
-        if (pipeline.compiled_partition_strict or pipeline.compiled_provider_committed)
-            return error.UnsupportedCompiledGraphRuntime;
-        entry.resetCompiledPartitions();
-        advanceCompiledPartitionProvider(pipeline);
     }
 
     return try executeSingleDeviceGraphExecutor(pipeline, allocator, graph, exec_options);
-}
-
-fn advanceCompiledPartitionProvider(pipeline: anytype) void {
-    if (pipeline.compiled_partition_fallback_backends.len > 0) {
-        pipeline.compiled_partition_backend = pipeline.compiled_partition_fallback_backends[0];
-        pipeline.compiled_partition_fallback_backends = pipeline.compiled_partition_fallback_backends[1..];
-    } else {
-        pipeline.compiled_partition_backend = null;
-    }
-}
-
-/// Only provider availability and explicit capability incompatibility are safe
-/// to retry. Artifact metadata, weight, shape, binding and output errors are
-/// terminal by default so a corrupt package is never hidden by a lower-priority
-/// backend.
-pub fn isRetryableCompiledProviderError(backend: contracts.BackendKind, err: anyerror) bool {
-    switch (err) {
-        error.BackendUnavailable,
-        error.ConfiguredBackendUnavailable,
-        error.NoBackendAvailable,
-        error.UnsupportedArchitecture,
-        error.UnsupportedCompiledGraphRuntime,
-        error.UnsupportedOnnxGraphBackend,
-        error.UnsupportedResidentInputBackend,
-        => return true,
-        else => {},
-    }
-    return switch (backend) {
-        .onnx => switch (err) {
-            error.OnnxUnavailable,
-            error.OrtEnvCreationFailed,
-            error.OrtSessionOptionsFailed,
-            error.OnnxSessionInitializationFailed,
-            => true,
-            else => false,
-        },
-        .pjrt => switch (err) {
-            error.MissingPjrtClient,
-            error.PluginLoadFailed,
-            error.SymbolNotFound,
-            error.NoDevices,
-            error.UnsupportedPjrtFeature,
-            => true,
-            else => false,
-        },
-        .webgpu => err == error.WebGpuUnavailable,
-        else => false,
-    };
-}
-
-/// Runtime preparation is an optional fast path, not a prerequisite for lazy
-/// whole-model attachment. Providers without this hook must remain selected so
-/// their normal forward path can initialize the runtime on first use.
-pub fn compiledBackendSupportsRuntimePreparation(backend: contracts.BackendKind) bool {
-    const backend_def = compiledBackendDefinition(backend) orelse return false;
-    return backend_def.prepare_model_runtime_direct != null;
 }
 
 fn executeSingleDeviceGraphExecutor(
@@ -873,25 +789,6 @@ test "shouldUsePartitionedGraphExecution requires explicit sharding config" {
         .strategy = .pipeline,
         .num_devices = 2,
     }));
-}
-
-test "compiled provider fallback excludes artifact corruption" {
-    try std.testing.expect(isRetryableCompiledProviderError(.onnx, error.OnnxSessionInitializationFailed));
-    try std.testing.expect(isRetryableCompiledProviderError(.pjrt, error.MissingPjrtClient));
-    try std.testing.expect(!isRetryableCompiledProviderError(.onnx, error.InvalidOnnxModel));
-    try std.testing.expect(!isRetryableCompiledProviderError(.onnx, error.ArtifactShapeMismatch));
-    try std.testing.expect(!isRetryableCompiledProviderError(.pjrt, error.InvalidArtifact));
-    try std.testing.expect(!isRetryableCompiledProviderError(.pjrt, error.MissingArtifactMetadata));
-    try std.testing.expect(!isRetryableCompiledProviderError(.onnx, error.UnsupportedShape));
-    try std.testing.expect(!isRetryableCompiledProviderError(.onnx, error.OnnxInputArityMismatch));
-    try std.testing.expect(!isRetryableCompiledProviderError(.onnx, error.UnsupportedOnnxOutputDType));
-    try std.testing.expect(!isRetryableCompiledProviderError(.pjrt, error.UnsupportedTensorType));
-}
-
-test "runtime preparation remains optional for lazy compiled providers" {
-    try std.testing.expect(!compiledBackendSupportsRuntimePreparation(.onnx));
-    try std.testing.expect(!compiledBackendSupportsRuntimePreparation(.pjrt));
-    try std.testing.expectEqual(build_options.enable_metal, compiledBackendSupportsRuntimePreparation(.metal));
 }
 
 test "shouldUsePartitionedGraphExecution requires multiple mesh devices" {

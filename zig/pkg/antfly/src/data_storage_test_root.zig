@@ -21,24 +21,11 @@ const data_store = @import("data/storage/raft_apply_store.zig");
 const doc_identity = @import("storage/db/doc_identity.zig");
 const range_transition = @import("data/storage/range_transition.zig");
 const raft_state_machine = @import("raft/state_machine/mod.zig");
-const raft_storage = @import("raft/storage/mod.zig");
-const snapshot_payload_store = @import("raft/storage/snapshot_payload_store.zig");
-const persistent_replica_state = @import("raft/storage/replica_state.zig");
-const wal_replica_state = @import("raft/storage/wal_replica_state.zig");
 
 test "data storage module tests are reachable" {
     std.testing.refAllDecls(storage.shard_state_store);
     std.testing.refAllDecls(storage.raft_apply_store);
     std.testing.refAllDecls(db_split_handoff);
-    std.testing.refAllDecls(raft_storage.snapshot_payload_store);
-    std.testing.refAllDecls(raft_storage.replica_state);
-    std.testing.refAllDecls(raft_storage.wal_replica_state);
-}
-
-test "raft snapshot durability tests are reachable" {
-    std.testing.refAllDecls(snapshot_payload_store);
-    std.testing.refAllDecls(persistent_replica_state);
-    std.testing.refAllDecls(wal_replica_state);
 }
 
 test "db split sync coordinator allocates destination identity namespace" {
@@ -56,8 +43,8 @@ test "db split sync coordinator allocates destination identity namespace" {
         const setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("split_prepare:7022:1:7022:doc:m") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_start:7022:1:7022:doc:m") },
+            .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_start:7022:doc:m") },
         });
         defer std.testing.allocator.free(setup);
         try source.snapshotBuilder().applyBatch(.{
@@ -73,8 +60,6 @@ test "db split sync coordinator allocates destination identity namespace" {
         .range_id = 9102,
     };
     var coord = try db_split_handoff.SyncCoordinator.init(std.testing.allocator, .{
-        .transition_id = 7022,
-        .attempt_epoch = 1,
         .source_root_dir = src_root,
         .dest_root_dir = dst_root,
         .source_group_id = 7021,

@@ -376,10 +376,9 @@ pub const Raft = struct {
                 },
             }
         }
-        const self_idx = try self.localAppendPeerIndex();
         if (!self.increaseUncommittedSizeEntries(msg.entries)) return;
         for (msg.entries) |entry| {
-            const appended = try self.appendLocalEntryOfTypeUnchecked(self_idx, entry.entry_type, entry.data);
+            const appended = try self.appendLocalEntryOfTypeUnchecked(entry.entry_type, entry.data);
             switch (entry.entry_type) {
                 .normal => self.trace(.replicate, null),
                 .conf_change => {
@@ -644,10 +643,10 @@ pub const Raft = struct {
             conf_change.transition == .joint_implicit and self.soft_state.role == .leader;
         const next = (try replayConfChangeV2(self.alloc, self.conf_state, conf_change)) orelse return self.conf_state;
         try self.applyRuntimeConfState(next);
-        self.maybeStepDownOnRemoval();
-        if (should_append_auto_leave and self.soft_state.role == .leader) {
+        if (should_append_auto_leave) {
             try self.appendAutoLeaveJointEntry();
         }
+        self.maybeStepDownOnRemoval();
         self.traceConfChange(.apply_conf_change, conf_change.changes, conf_change.transition);
         return self.conf_state;
     }
@@ -1281,12 +1280,11 @@ pub const Raft = struct {
     }
 
     fn appendLocalEntryOfType(self: *Raft, entry_type: types.EntryType, data: []const u8) !types.Index {
-        const self_idx = try self.localAppendPeerIndex();
         if (!self.increaseUncommittedSizeEntry(entry_type, data)) return error.ProposalDropped;
-        return try self.appendLocalEntryOfTypeUnchecked(self_idx, entry_type, data);
+        return try self.appendLocalEntryOfTypeUnchecked(entry_type, data);
     }
 
-    fn appendLocalEntryOfTypeUnchecked(self: *Raft, self_idx: usize, entry_type: types.EntryType, data: []const u8) !types.Index {
+    fn appendLocalEntryOfTypeUnchecked(self: *Raft, entry_type: types.EntryType, data: []const u8) !types.Index {
         const next_index = self.log.lastIndex() + 1;
         const entry = types.Entry{
             .term = self.hard_state.current_term,
@@ -1300,14 +1298,10 @@ pub const Raft = struct {
         }
 
         _ = try self.log.appendEntries(&.{entry});
+        const self_idx = peerIndex(self.peers, self.cfg.id).?;
         self.progress[self_idx].match_index = self.log.lastIndex();
         self.progress[self_idx].next_index = self.log.lastIndex() + 1;
         return self.log.lastIndex();
-    }
-
-    fn localAppendPeerIndex(self: *const Raft) !usize {
-        if (self.soft_state.role != .leader or !self.isVotingMember(self.cfg.id)) return error.NotLeader;
-        return peerIndex(self.peers, self.cfg.id) orelse error.NotLeader;
     }
 
     fn increaseUncommittedSizeEntry(self: *Raft, entry_type: types.EntryType, data: []const u8) bool {
