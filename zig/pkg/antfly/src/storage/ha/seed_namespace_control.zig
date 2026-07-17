@@ -92,7 +92,12 @@ pub fn acquirePublish(alloc: Allocator, store: Store, binding: Binding, owner: [
     if (state.phase == .publishing and sameAuthority(state, binding) and std.mem.eql(u8, state.owner, owner)) {
         return .{ .key = key, .etag = try alloc.dupe(u8, etag), .revision = state.revision };
     }
-    if (state.phase != .active or !sameAuthority(state, binding))
+    // One stable namespace serves the whole HA topology. Once a publication is
+    // active, permit only a strictly monotonic generation handoff for that
+    // same topology; foreign topology IDs and generation rollback remain
+    // fail-closed under the same object-store CAS.
+    if (state.phase != .active or
+        (!sameAuthority(state, binding) and !sameTopologyNewerGeneration(state, binding)))
         return error.SeedNamespaceUnavailable;
     return try replaceWithLease(alloc, store, key, etag, .{
         .version = version,
@@ -241,6 +246,26 @@ test "storage.ha seed namespace control normalizes remote URI prefixes beside th
 fn sameAuthority(state: State, binding: Binding) bool {
     return state.topology_generation == binding.topology_generation and
         std.mem.eql(u8, state.topology_id, binding.topology_id);
+}
+
+fn sameTopologyNewerGeneration(state: State, binding: Binding) bool {
+    return binding.topology_generation > state.topology_generation and
+        std.mem.eql(u8, state.topology_id, binding.topology_id);
+}
+
+test "storage.ha seed namespace permits only monotonic same-topology generation handoff" {
+    const state = State{
+        .version = version,
+        .revision = 2,
+        .phase = .active,
+        .topology_id = "topology-a",
+        .topology_generation = 1,
+        .owner = "initial-generation",
+    };
+    try std.testing.expect(sameTopologyNewerGeneration(state, .{ .topology_id = "topology-a", .topology_generation = 2 }));
+    try std.testing.expect(!sameTopologyNewerGeneration(state, .{ .topology_id = "topology-a", .topology_generation = 1 }));
+    try std.testing.expect(!sameTopologyNewerGeneration(state, .{ .topology_id = "topology-a", .topology_generation = 0 }));
+    try std.testing.expect(!sameTopologyNewerGeneration(state, .{ .topology_id = "topology-b", .topology_generation = 2 }));
 }
 
 fn validateState(state: State) !void {

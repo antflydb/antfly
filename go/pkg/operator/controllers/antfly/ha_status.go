@@ -122,7 +122,16 @@ const (
 	haFencingLeaseAnnotationTransferOriginUID   = "antfly.io/ha-fence-transfer-origin-uid"
 	haFencingLeaseAnnotationCommittedTransition = "antfly.io/ha-fence-committed-transition"
 	haFencingLeaseAnnotationBootstrapReceipt    = "antfly.io/ha-fence-bootstrap-receipt"
+	haFencingLeaseAnnotationProcessBootID       = "antfly.io/ha-fence-process-boot-id"
 )
+
+type haProcessIncarnationGraceKey struct {
+	leaseUID       types.UID
+	transition     int32
+	renewUnixNS    int64
+	currentProcess string
+	candidate      string
+}
 
 func haFencingLeaseRenewalRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
 	graceSeconds := int32(10)
@@ -342,6 +351,9 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		durationSeconds := haFencingLeaseDefaultDurationSeconds
 		annotations := scope.annotations()
 		annotations[haFencingLeaseAnnotationTopologyID] = haFencingLeaseTopologyID(cluster)
+		if pendingWatchdogAuthority {
+			annotations[haFencingLeaseAnnotationProcessBootID] = strings.TrimSpace(cluster.Status.HAStatus.PrimaryWatchdogProof.ProcessBootID)
+		}
 		lease = &coordinationv1.Lease{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:        haFencingLeaseName(cluster),
@@ -421,7 +433,17 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		if err != nil || !ready {
 			return err
 		}
+		currentProcess := strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationProcessBootID])
+		if currentProcess == "" {
+			currentProcess = strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt])
+		}
+		unboundInitialBootstrap := currentProcess == "" && bootstrapUnknownBoundary && scope.primaryLSN == 0
+		if !unboundInitialBootstrap && currentProcess != proof.ProcessBootID && currentProcess != currentReceipt &&
+			!r.haProcessIncarnationBarrierElapsed(cluster, lease, currentProcess, proof.ProcessBootID) {
+			return nil
+		}
 		lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] = currentReceipt
+		lease.Annotations[haFencingLeaseAnnotationProcessBootID] = proof.ProcessBootID
 		lease.Spec.RenewTime = &now
 		if err := r.Update(ctx, lease); err != nil {
 			return err
@@ -522,6 +544,10 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	if clearBootstrapReceipt {
 		delete(lease.Annotations, haFencingLeaseAnnotationBootstrapReceipt)
 	}
+	if proof := cluster.Status.HAStatus.PrimaryWatchdogProof; proof != nil && proof.AuthorityGranted &&
+		strings.TrimSpace(proof.ProcessBootID) != "" && holder == localNodeID {
+		lease.Annotations[haFencingLeaseAnnotationProcessBootID] = strings.TrimSpace(proof.ProcessBootID)
+	}
 	lease.Annotations[haFencingLeaseAnnotationTopologyID] = haFencingLeaseTopologyID(cluster)
 	if err := r.Update(ctx, lease); err != nil {
 		return err
@@ -570,6 +596,11 @@ func (r *AntflyClusterReconciler) renewCurrentHAFencingLease(ctx context.Context
 	if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) != localNodeID {
 		return nil
 	}
+	proof := cluster.Status.HAStatus.PrimaryWatchdogProof
+	if proof == nil || strings.TrimSpace(proof.ProcessBootID) == "" ||
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationProcessBootID]) != strings.TrimSpace(proof.ProcessBootID) {
+		return nil
+	}
 	identityScope := haFencingLeaseScopeForIdentity(identity, 0)
 	for key, value := range identityScope.annotations() {
 		if key == haFencingLeaseAnnotationPrimaryLSN {
@@ -594,6 +625,42 @@ func (r *AntflyClusterReconciler) renewCurrentHAFencingLease(ctx context.Context
 	now := metav1.NewMicroTime(r.haNow())
 	lease.Spec.RenewTime = &now
 	return r.Update(ctx, lease)
+}
+
+func (r *AntflyClusterReconciler) haProcessIncarnationBarrierElapsed(
+	cluster *antflyv1.AntflyCluster,
+	lease *coordinationv1.Lease,
+	currentProcess string,
+	candidate string,
+) bool {
+	if r == nil || cluster == nil || lease == nil || lease.Spec.RenewTime == nil ||
+		cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Runtime == nil ||
+		cluster.Spec.HighAvailability.Runtime.FencingLease == nil {
+		return false
+	}
+	grace := cluster.Spec.HighAvailability.Runtime.FencingLease.WatchdogGraceSeconds
+	if grace <= 0 {
+		return false
+	}
+	transition := int32(0)
+	if lease.Spec.LeaseTransitions != nil {
+		transition = *lease.Spec.LeaseTransitions
+	}
+	key := haProcessIncarnationGraceKey{
+		leaseUID: lease.UID, transition: transition, renewUnixNS: lease.Spec.RenewTime.UnixNano(),
+		currentProcess: currentProcess, candidate: candidate,
+	}
+	now := r.haMonotonicNow()
+	value, loaded := r.haProcessGraceStarts.LoadOrStore(key, now)
+	if !loaded {
+		return false
+	}
+	started, ok := value.(time.Time)
+	if !ok || now.Before(started) {
+		r.haProcessGraceStarts.Store(key, now)
+		return false
+	}
+	return now.Sub(started) >= time.Duration(grace)*time.Second
 }
 
 func haFencingLeaseBootstrapReceipt(holder string, transition int32, processBootID string) string {

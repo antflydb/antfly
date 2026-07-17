@@ -79,6 +79,10 @@ type AntflyClusterReconciler struct {
 	// controller or leader restart must observe the exact Lease transfer again
 	// and wait a fresh full runtime maximum fence latency.
 	haIsolationGraceStarts sync.Map
+	// haProcessGraceStarts prevents a replacement process from inheriting a
+	// still-live process incarnation's Lease before that incarnation's maximum
+	// local authority window has elapsed without a renewal.
+	haProcessGraceStarts sync.Map
 }
 
 var defaultOperatorHTTPClient = &http.Client{Timeout: 10 * time.Second}
@@ -764,7 +768,7 @@ func haPublicAPISelector(cluster *antflyv1.AntflyCluster, standaloneMode bool, t
 	if target == "" || target == "primary" {
 		component := "metadata"
 		if standaloneMode {
-			component = "standalone"
+			component = standaloneComponent(cluster)
 		}
 		return serviceSelectorLabels(cluster.Name, component), true
 	}
@@ -2736,7 +2740,7 @@ func (r *AntflyClusterReconciler) generateStandaloneConfig(cluster *antflyv1.Ant
 	}
 
 	orchestrationURLs := map[string]string{
-		strconv.FormatInt(int64(standalone.NodeID), 16): fmt.Sprintf("http://%s-standalone.%s.svc.cluster.local:%d", cluster.Name, cluster.Namespace, standalone.MetadataAPI.Port),
+		strconv.FormatInt(int64(standalone.NodeID), 16): fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", standaloneStatefulSetName(cluster), cluster.Namespace, standalone.MetadataAPI.Port),
 	}
 
 	completeConfig := map[string]any{

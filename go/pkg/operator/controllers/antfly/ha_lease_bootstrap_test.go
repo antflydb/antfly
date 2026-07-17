@@ -220,18 +220,30 @@ func TestPositiveBoundaryPrimaryRestartBootstrapIsOneShot(t *testing.T) {
 			reconciler := testHAReconciler(t, lease, pod)
 			now := leaseTime.Add(2 * time.Second)
 			reconciler.Now = func() time.Time { return now }
+			monotonicNow := time.Now()
+			reconciler.MonotonicNow = func() time.Time { return monotonicNow }
 
 			if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
-				t.Fatalf("positive-boundary restart bootstrap: %v", err)
+				t.Fatalf("start positive-boundary restart fence wait: %v", err)
 			}
 			renewed := &coordinationv1.Lease{}
+			if err := reconciler.Get(context.Background(), client.ObjectKey{Name: lease.Name, Namespace: lease.Namespace}, renewed); err != nil {
+				t.Fatal(err)
+			}
+			if renewed.Spec.RenewTime == nil || !renewed.Spec.RenewTime.Time.Equal(leaseTime) {
+				t.Fatalf("positive-boundary replacement renewed before old authority expired: %#v", renewed)
+			}
+			monotonicNow = monotonicNow.Add(10 * time.Second)
+			if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
+				t.Fatalf("positive-boundary restart bootstrap after fence wait: %v", err)
+			}
 			if err := reconciler.Get(context.Background(), client.ObjectKey{Name: lease.Name, Namespace: lease.Namespace}, renewed); err != nil {
 				t.Fatal(err)
 			}
 			if renewed.Spec.RenewTime == nil || !renewed.Spec.RenewTime.Time.Equal(now) ||
 				renewed.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "17" ||
 				renewed.Annotations[haFencingLeaseAnnotationBootstrapReceipt] == "" {
-				t.Fatalf("positive bootstrap did not renew once while preserving scope: %#v", renewed)
+				t.Fatalf("positive bootstrap did not renew after fence wait while preserving scope: %#v", renewed)
 			}
 			if err := reconciler.observeHAFencingStatus(context.Background(), cluster); err != nil {
 				t.Fatalf("observe pending positive bootstrap fencing: %v", err)
@@ -282,7 +294,7 @@ func TestPositiveBoundaryPrimaryRestartBootstrapIsOneShot(t *testing.T) {
 	}
 }
 
-func TestPendingBootstrapReceiptAllowsReplacementProcessOnce(t *testing.T) {
+func TestPendingBootstrapReceiptWaitsOldProcessFenceBoundaryThenRebindsOnce(t *testing.T) {
 	leaseTime := time.Date(2026, 7, 16, 5, 30, 0, 0, time.UTC)
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 	cluster.Spec.HighAvailability.Identity.ShardID = 10
@@ -302,18 +314,32 @@ func TestPendingBootstrapReceiptAllowsReplacementProcessOnce(t *testing.T) {
 	reconciler := testHAReconciler(t, lease, pod)
 	now := leaseTime.Add(2 * time.Second)
 	reconciler.Now = func() time.Time { return now }
+	monotonicNow := time.Now()
+	reconciler.MonotonicNow = func() time.Time { return monotonicNow }
 
 	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
-		t.Fatalf("replacement process bootstrap renewal: %v", err)
+		t.Fatalf("start replacement process fence boundary: %v", err)
 	}
 	renewed := &coordinationv1.Lease{}
 	if err := reconciler.Get(context.Background(), client.ObjectKey{Name: lease.Name, Namespace: lease.Namespace}, renewed); err != nil {
 		t.Fatal(err)
 	}
+	if renewed.Spec.RenewTime == nil || !renewed.Spec.RenewTime.Time.Equal(leaseTime) {
+		t.Fatalf("replacement process renewed before the old process fence boundary: %#v", renewed)
+	}
+
+	monotonicNow = monotonicNow.Add(10 * time.Second)
+	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("replacement process bootstrap renewal after fence boundary: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKey{Name: lease.Name, Namespace: lease.Namespace}, renewed); err != nil {
+		t.Fatal(err)
+	}
 	wantReplacementReceipt := haFencingLeaseBootstrapReceipt("primary-a", 1, strings.Repeat("b", 64))
 	if renewed.Spec.RenewTime == nil || !renewed.Spec.RenewTime.Time.Equal(now) ||
-		renewed.Annotations[haFencingLeaseAnnotationBootstrapReceipt] != wantReplacementReceipt {
-		t.Fatalf("replacement process did not receive its one-shot renewal: %#v", renewed)
+		renewed.Annotations[haFencingLeaseAnnotationBootstrapReceipt] != wantReplacementReceipt ||
+		renewed.Annotations[haFencingLeaseAnnotationProcessBootID] != strings.Repeat("b", 64) {
+		t.Fatalf("replacement process was not rebound after the old process fence boundary: %#v", renewed)
 	}
 	if cluster.Status.HAStatus.Fencing.Ready {
 		t.Fatalf("replacement pending process became authoritative: %#v", cluster.Status.HAStatus.Fencing)
@@ -332,6 +358,33 @@ func TestPendingBootstrapReceiptAllowsReplacementProcessOnce(t *testing.T) {
 	}
 	if !repeated.Spec.RenewTime.Equal(renewed.Spec.RenewTime) {
 		t.Fatalf("replacement process renewed twice: first=%s repeat=%s", renewed.Spec.RenewTime, repeated.Spec.RenewTime)
+	}
+}
+
+func TestProcessIncarnationFenceBoundaryRestartsOnOldProcessRenewal(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	leaseTime := time.Date(2026, 7, 16, 6, 0, 0, 0, time.UTC)
+	lease := haFenceLease(cluster, leaseTime, haFencingLeaseDefaultDurationSeconds, 1, "primary-a")
+	now := time.Now()
+	reconciler := &AntflyClusterReconciler{MonotonicNow: func() time.Time { return now }}
+	if reconciler.haProcessIncarnationBarrierElapsed(cluster, lease, "process-a", "process-b") {
+		t.Fatal("replacement crossed a new fence boundary immediately")
+	}
+	now = now.Add(9 * time.Second)
+	if reconciler.haProcessIncarnationBarrierElapsed(cluster, lease, "process-a", "process-b") {
+		t.Fatal("replacement crossed the boundary before the full grace")
+	}
+	lease.Spec.RenewTime = &metav1.MicroTime{Time: leaseTime.Add(time.Second)}
+	if reconciler.haProcessIncarnationBarrierElapsed(cluster, lease, "process-a", "process-b") {
+		t.Fatal("old-process renewal did not restart the fence boundary")
+	}
+	now = now.Add(9 * time.Second)
+	if reconciler.haProcessIncarnationBarrierElapsed(cluster, lease, "process-a", "process-b") {
+		t.Fatal("replacement borrowed elapsed time from before the old-process renewal")
+	}
+	now = now.Add(time.Second)
+	if !reconciler.haProcessIncarnationBarrierElapsed(cluster, lease, "process-a", "process-b") {
+		t.Fatal("replacement remained blocked after a full unchanged grace")
 	}
 }
 

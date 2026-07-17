@@ -12523,8 +12523,20 @@ func TestReconcileLegacySwarmLayoutRunsStandaloneWithoutReplacingPVCIdentity(t *
 	g.Expect(observed.Spec.Template.Spec.Containers[0].Args[0]).To(ContainSubstring("exec /antfly standalone"))
 	g.Expect(observed.Annotations).To(HaveKeyWithValue(annotationStorageEngine, "local"))
 
+	configJSON, err := reconciler.generateCompleteConfig(cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	var config map[string]any
+	g.Expect(json.Unmarshal([]byte(configJSON), &config)).To(Succeed())
+	standaloneConfig, ok := config["metadata"].(map[string]any)
+	g.Expect(ok).To(BeTrue())
+	orchestrationURLs, ok := standaloneConfig["orchestration_urls"].(map[string]any)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(orchestrationURLs["1"]).To(Equal("http://test-standalone-swarm.default.svc.cluster.local:8080"))
+	g.Expect(reconciler.createPublicAPIService(cluster, true).Spec.Selector).
+		To(HaveKeyWithValue("app.kubernetes.io/component", "swarm"))
+
 	currentLayout := &appsv1.StatefulSet{}
-	err := client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, currentLayout)
+	err = client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, currentLayout)
 	g.Expect(errors.IsNotFound(err)).To(BeTrue())
 }
 

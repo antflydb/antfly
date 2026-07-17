@@ -182,3 +182,34 @@ test "storage.ha seed cleanup excludes publishers and leaves a durable tombstone
     defer retry.deinit(alloc);
     try std.testing.expectEqualStrings(result.receipt_json, retry.receipt_json);
 }
+
+test "storage.ha seed namespace hands active authority to a newer same-topology generation" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("ha-bucket");
+    const store = namespace_control.Store{ .client = &client, .bucket = "ha-bucket", .prefix = object_prefix };
+    const generation_one = namespace_control.Binding{ .topology_id = "topology-a", .topology_generation = 1 };
+    var first = try namespace_control.acquirePublish(alloc, store, generation_one, "initial-standby-a-1");
+    try namespace_control.releasePublish(alloc, store, generation_one, "initial-standby-a-1", first);
+    first.deinit(alloc);
+
+    const generation_two = namespace_control.Binding{ .topology_id = "topology-a", .topology_generation = 2 };
+    var second = try namespace_control.acquirePublish(alloc, store, generation_two, "replacement-standby-b-2");
+    try namespace_control.releasePublish(alloc, store, generation_two, "replacement-standby-b-2", second);
+    second.deinit(alloc);
+
+    try std.testing.expectError(error.SeedNamespaceUnavailable, namespace_control.acquirePublish(
+        alloc,
+        store,
+        generation_one,
+        "rollback-generation",
+    ));
+    try std.testing.expectError(error.SeedNamespaceUnavailable, namespace_control.acquirePublish(
+        alloc,
+        store,
+        .{ .topology_id = "topology-b", .topology_generation = 3 },
+        "foreign-topology",
+    ));
+}

@@ -73,7 +73,7 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 		}
 
 		statefulSet := &appsv1.StatefulSet{}
-		key := types.NamespacedName{Name: cluster.Name + "-standalone", Namespace: cluster.Namespace}
+		key := types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}
 		if err := reader.Get(ctx, key, statefulSet); err != nil {
 			return fmt.Errorf("isolate former primary: read StatefulSet: %w", err)
 		}
@@ -83,7 +83,7 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 		}
 		if action.AdminJobPhase == "" || action.AdminJobPhase == haAdminJobPhaseWaitingDependency {
 			var initialPods corev1.PodList
-			if err := reader.List(ctx, &initialPods, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, "standalone"))); err != nil {
+			if err := reader.List(ctx, &initialPods, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, standaloneComponent(cluster)))); err != nil {
 				return fmt.Errorf("isolate former primary: list initial runtime pods: %w", err)
 			}
 			receipt, err := newHAPhysicalIsolationIntentReceipt(cluster, action, statefulSet, &initialPods, lease, scope)
@@ -130,7 +130,7 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 		}
 
 		var pods corev1.PodList
-		if err := reader.List(ctx, &pods, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, "standalone"))); err != nil {
+		if err := reader.List(ctx, &pods, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, standaloneComponent(cluster)))); err != nil {
 			return fmt.Errorf("isolate former primary: list runtime pods: %w", err)
 		}
 		absenceProven := true
@@ -551,7 +551,7 @@ func validateHAPhysicalIsolationIntent(cluster *antflyv1.AntflyCluster, action *
 	}
 	receipt := action.PhysicalIsolationReceipt
 	if !haPhysicalIsolationIntentStructurallyMatches(*action) || cluster.UID == "" || receipt.ClusterUID != string(cluster.UID) ||
-		receipt.StatefulSetName != cluster.Name+"-standalone" || strings.TrimSpace(receipt.StatefulSetUID) == "" ||
+		receipt.StatefulSetName != standaloneStatefulSetName(cluster) || strings.TrimSpace(receipt.StatefulSetUID) == "" ||
 		receipt.LeaseName != haFencingLeaseName(cluster) {
 		return fmt.Errorf("isolate former primary: physical-isolation intent receipt is incomplete or does not match the action")
 	}

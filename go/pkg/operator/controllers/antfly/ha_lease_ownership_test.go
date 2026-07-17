@@ -132,6 +132,7 @@ func TestDedicatedLeaseRenewalAdvancesUnchangedHolderFromFreshRuntimeProof(t *te
 	proof.AuthorityRemainingMS = 8_000
 	cluster.Status.HAStatus.PrimaryWatchdogProof = proof
 	lease := haFenceLease(cluster, now.Add(-time.Second), 10, 1, "primary-a")
+	lease.Annotations[haFencingLeaseAnnotationProcessBootID] = proof.ProcessBootID
 	reconciler := testHAReconciler(t, cluster, lease, candidateLeasePod(now, "primary-a-pod-uid"))
 	reconciler.Now = func() time.Time { return now }
 
@@ -172,6 +173,7 @@ func TestDedicatedLeaseRenewalUsesAuthenticatedWatchdogProofEndpoint(t *testing.
 	cluster.Spec.HighAvailability.Admin.PrimaryURL = server.URL
 	cluster.Spec.HighAvailability.Admin.TokenEnvVar = "TEST_HA_WATCHDOG_TOKEN"
 	lease := haFenceLease(cluster, now.Add(-time.Second), 10, 1, "primary-a")
+	lease.Annotations[haFencingLeaseAnnotationProcessBootID] = strings.Repeat("a", 64)
 	reconciler := testHAReconciler(t, cluster, lease, candidateLeasePod(now, "primary-a-pod-uid"))
 	reconciler.HTTPClient = server.Client()
 	reconciler.Now = func() time.Time { return now }

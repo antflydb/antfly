@@ -11,6 +11,7 @@
 //! prolonged loss of the API durably fences this data generation.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const fs_paths = @import("../../common/fs_paths.zig");
 const http_common = @import("../../common/http/http_common.zig");
 const std_http_executor = @import("../../common/http/std_http_executor.zig");
@@ -25,6 +26,9 @@ pub const Scope = struct {
     /// all of those legitimately change during promotion.
     topology_id: []const u8,
     node_id: []const u8,
+    /// Exact runtime process incarnation permitted to consume a self-held
+    /// Lease. Other holders' process bindings are intentionally ignored.
+    process_boot_id: []const u8 = "",
     /// Exact materialized data generation protected by a durable fence.
     data_generation: []const u8,
 };
@@ -51,6 +55,7 @@ pub const Decision = enum {
 pub const FenceReason = enum {
     persisted,
     holder_changed,
+    process_changed,
     scope_changed,
     generation_rollback,
     renewal_rollback,
@@ -71,7 +76,8 @@ pub const Watchdog = struct {
 
     pub fn init(cfg: Config, sentinel_generation: ?[]const u8, repaired_generation: ?[]const u8) !Watchdog {
         if (cfg.grace_ns == 0 or cfg.sentinel_path.len == 0 or cfg.scope.node_id.len == 0 or
-            cfg.scope.topology_id.len == 0 or cfg.scope.data_generation.len == 0)
+            cfg.scope.topology_id.len == 0 or cfg.scope.data_generation.len == 0 or
+            (!builtin.is_test and cfg.scope.process_boot_id.len == 0))
         {
             return error.InvalidLeaseWatchdogConfig;
         }
@@ -154,6 +160,16 @@ pub const Watchdog = struct {
         }
         if (!scope_matches) return error.LeaseScopeMismatch;
 
+        const process_matches = if (std.mem.eql(u8, holder, self.cfg.scope.node_id) and self.cfg.scope.process_boot_id.len != 0)
+            std.mem.eql(
+                u8,
+                try requiredString(annotations, "antfly.io/ha-fence-process-boot-id"),
+                self.cfg.scope.process_boot_id,
+            )
+        else
+            true;
+        if (self.authorized_once and !process_matches) return self.latch(.process_changed);
+
         // A standby must publish proof that it is actively monitoring this
         // exact topology before the holder transfer. Preserve the monotonic
         // Lease generation even though public authority is not yet granted.
@@ -169,6 +185,7 @@ pub const Watchdog = struct {
         @memcpy(self.last_observed_holder[0..holder.len], holder);
         self.last_observed_holder_len = @intCast(holder.len);
         if (!std.mem.eql(u8, holder, self.cfg.scope.node_id)) return .observed;
+        if (!process_matches) return .pending_authority;
 
         if (!self.authorized_once and !newer_renewal) return .pending_authority;
         if (!self.authorized_once or newer_renewal) {
@@ -619,6 +636,28 @@ test "kubernetes lease watchdog fences transfer and API partition and never reop
     try std.testing.expectEqual(Decision.fence, watchdog.noteAPIFailure(11 * std.time.ns_per_s));
     try std.testing.expect(!watchdog.authorityGranted());
     try std.testing.expectEqual(Decision.fence, try watchdog.observe(std.testing.allocator, body, realtime, 12 * std.time.ns_per_s));
+}
+
+test "kubernetes lease watchdog binds self-held authority to one process incarnation" {
+    const bound_a =
+        \\{"metadata":{"annotations":{"antfly.io/ha-fence-topology-id":"topology-7","antfly.io/ha-fence-process-boot-id":"process-a"}},"spec":{"holderIdentity":"primary-a","leaseDurationSeconds":30,"renewTime":"2026-07-15T12:00:00Z","leaseTransitions":3}}
+    ;
+    const renewed_a =
+        \\{"metadata":{"annotations":{"antfly.io/ha-fence-topology-id":"topology-7","antfly.io/ha-fence-process-boot-id":"process-a"}},"spec":{"holderIdentity":"primary-a","leaseDurationSeconds":30,"renewTime":"2026-07-15T12:00:02Z","leaseTransitions":3}}
+    ;
+    const bound_b =
+        \\{"metadata":{"annotations":{"antfly.io/ha-fence-topology-id":"topology-7","antfly.io/ha-fence-process-boot-id":"process-b"}},"spec":{"holderIdentity":"primary-a","leaseDurationSeconds":30,"renewTime":"2026-07-15T12:00:04Z","leaseTransitions":3}}
+    ;
+    const realtime = try rfc3339UnixNs("2026-07-15T12:00:05Z");
+    var process_a = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "primary-a", .data_generation = "initial", .process_boot_id = "process-a" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, null);
+    try std.testing.expectEqual(Decision.pending_authority, try process_a.observe(std.testing.allocator, bound_a, realtime, 1));
+    try std.testing.expectEqual(Decision.authorized, try process_a.observe(std.testing.allocator, renewed_a, realtime, 2));
+
+    var process_b = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "primary-a", .data_generation = "initial", .process_boot_id = "process-b" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, null);
+    try std.testing.expectEqual(Decision.pending_authority, try process_b.observe(std.testing.allocator, renewed_a, realtime, 1));
+    try std.testing.expectEqual(Decision.fence, try process_a.observe(std.testing.allocator, bound_b, realtime, 3));
+    try std.testing.expectEqual(FenceReason.process_changed, process_a.fence_reason.?);
+    try std.testing.expectEqual(Decision.authorized, try process_b.observe(std.testing.allocator, bound_b, realtime, 2));
 }
 
 test "kubernetes lease watchdog standby waits for transfer then fences rollback" {

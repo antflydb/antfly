@@ -242,14 +242,15 @@ const RuntimeLeaseWatchdog = struct {
             );
         }
         const data_generation = repaired_generation orelse requested_generation;
+        var entropy: [32]u8 = undefined;
+        try io.randomSecure(&entropy);
+        const process_boot_id = std.fmt.bytesToHex(entropy, .lower);
         const scope = antfly.ha.kubernetes_lease_watchdog.Scope{
             .topology_id = topology_id,
             .node_id = node_id,
             .data_generation = data_generation,
+            .process_boot_id = &process_boot_id,
         };
-        var entropy: [32]u8 = undefined;
-        try io.randomSecure(&entropy);
-        const process_boot_id = std.fmt.bytesToHex(entropy, .lower);
         var executor = try zig_lease_executor.ZigLeaseExecutor.init(
             alloc,
             io,
