@@ -136,7 +136,10 @@ func TestDedicatedLeaseRenewalAdvancesUnchangedHolderFromFreshRuntimeProof(t *te
 		t.Fatalf("dedicated renewal: %v", err)
 	}
 	renewed := getOwnershipTestLease(t, reconciler)
-	wantRenewTime := metav1.NewMicroTime(now)
+	// Lease renewTime is an RFC3339 microsecond timestamp. Some fake-client
+	// serializers preserve nanoseconds in-process while CI round-trips through
+	// the API representation, so compare at the wire precision.
+	wantRenewTime := metav1.NewMicroTime(now.Truncate(time.Microsecond))
 	if renewed.Spec.RenewTime == nil || !renewed.Spec.RenewTime.Equal(&wantRenewTime) {
 		t.Fatalf("expected dedicated path to publish strictly newer renewal %s, got %#v", wantRenewTime.Time, renewed.Spec.RenewTime)
 	}
