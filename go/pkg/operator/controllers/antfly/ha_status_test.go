@@ -102,6 +102,23 @@ func TestHASeedPlanPublishesSourcePVCNameOnEveryTopologyBoundAction(t *testing.T
 	}
 }
 
+func TestHASeedPlanKeepsUnboundRuntimeCaptureDescriptorNonExecutable(t *testing.T) {
+	standby := antflyv1.HAStandbySpec{
+		Name:     "standby-a",
+		SlotName: "standby-a",
+		SeedArtifact: &antflyv1.HASeedArtifactSpec{
+			Location:    "s3://ha-seeds/cluster-a",
+			Generation:  "seed-standby-a-10",
+			StagingRoot: "/target/staging",
+			SourcePVC:   &antflyv1.HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+			TargetPVC:   &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+		},
+	}
+	if actions := haSeedCompletionActions(standby, "standby-a", 10, "pending-pvc-binding", haActionReseedFormerPrimary); len(actions) != 0 {
+		t.Fatalf("unbound seed transport must remain pending, got executable actions %#v", actions)
+	}
+}
+
 func TestHASeedPlanPreservesObservedSourcePVCUIDOnlyForTheSameClaim(t *testing.T) {
 	standby := antflyv1.HAStandbySpec{
 		Name:     "standby-a",
@@ -1648,9 +1665,10 @@ func TestPlanHAUsesExplicitExactSeedArtifactGenerationAcrossChangingLSN(t *testi
 		Name: "standby-a",
 		SeedArtifact: &antflyv1.HASeedArtifactSpec{
 			Location: "s3://ha-seeds/cluster-a", Generation: "release-2026-07-14-a",
-			StagingRoot: "/target/.antfly-ha/staging",
-			SourcePVC:   &antflyv1.HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
-			TargetPVC:   &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+			StagingRoot: "/target/.antfly-ha/staging", TopologyID: "topology-a", TopologyGeneration: 7,
+			NodeID: "standby-a", TargetPVCUID: "target-pvc-uid",
+			SourcePVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+			TargetPVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
 		},
 	}
 	first := haSeedCompletionActions(standby, "standby-a", 10, "seed", haActionCreateSlot)

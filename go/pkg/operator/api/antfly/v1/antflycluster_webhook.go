@@ -1267,8 +1267,11 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 				if artifact.SourcePVC == nil {
 					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedArtifact.sourcePVC is required for executable seed publication", i))
 				}
-				if strings.TrimSpace(artifact.TopologyID) == "" || artifact.TopologyGeneration <= 0 ||
-					strings.TrimSpace(artifact.NodeID) == "" || strings.TrimSpace(artifact.TargetPVCUID) == "" {
+				hasAnyBinding := strings.TrimSpace(artifact.TopologyID) != "" || artifact.TopologyGeneration != 0 ||
+					strings.TrimSpace(artifact.NodeID) != "" || strings.TrimSpace(artifact.TargetPVCUID) != ""
+				if (hasManifest || hasContent || hasAnyBinding) &&
+					(strings.TrimSpace(artifact.TopologyID) == "" || artifact.TopologyGeneration <= 0 ||
+						strings.TrimSpace(artifact.NodeID) == "" || strings.TrimSpace(artifact.TargetPVCUID) == "") {
 					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedArtifact requires topologyID, topologyGeneration, nodeID, and targetPVCUID for an executable seed chain", i))
 				}
 			}

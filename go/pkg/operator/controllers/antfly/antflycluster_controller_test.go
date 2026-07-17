@@ -4489,10 +4489,10 @@ func TestHASeedCompletionActionsPlanLifecycleGatedLocalGCBeforeRemotePrune(t *te
 	standby := antflyv1.HAStandbySpec{
 		Name: "standby-a",
 		SeedArtifact: &antflyv1.HASeedArtifactSpec{
-			Location:    "s3://ha-seeds/cluster-a",
-			StagingRoot: "/target/staging",
-			SourcePVC:   &antflyv1.HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
-			TargetPVC:   &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+			Location: "s3://ha-seeds/cluster-a", StagingRoot: "/target/staging",
+			TopologyID: "topology-a", TopologyGeneration: 7, NodeID: "standby-a", TargetPVCUID: "target-pvc-uid",
+			SourcePVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+			TargetPVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
 		},
 	}
 

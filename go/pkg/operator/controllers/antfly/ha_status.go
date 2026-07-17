@@ -2914,6 +2914,14 @@ func haReplicationIdentity(ha *antflyv1.HighAvailabilitySpec) *antflyv1.HAReplic
 
 func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, targetLSN uint64, reason string, dependsOn haActionKind) []haPlannedAction {
 	if artifact := standby.SeedArtifact; artifact != nil {
+		// Colony first declares the source/target transport, then binds it to
+		// observed topology and PVC identity. The unbound descriptor is pending
+		// state only: never materialize an executable action chain until every
+		// immutable authority field is present.
+		if strings.TrimSpace(artifact.TopologyID) == "" || artifact.TopologyGeneration <= 0 ||
+			strings.TrimSpace(artifact.NodeID) == "" || strings.TrimSpace(artifact.TargetPVCUID) == "" {
+			return nil
+		}
 		location := strings.TrimSpace(artifact.Location)
 		stagingRoot := strings.TrimRight(strings.TrimSpace(artifact.StagingRoot), "/")
 		contentRoot := strings.TrimSpace(standby.SeedContentRoot)

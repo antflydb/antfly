@@ -2196,9 +2196,8 @@ func TestValidateCreate_HighAvailabilityAllowsRuntimeOwnedSeedCapture(t *testing
 			SeedArtifact: &HASeedArtifactSpec{
 				Location:    "s3://ha-seeds/cluster-a",
 				StagingRoot: "/target/.antfly-ha/staging",
-				TopologyID:  "cluster-a", TopologyGeneration: 1, NodeID: "standby-a", TargetPVCUID: "standby-pvc-uid",
-				SourcePVC: &HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/antflydb"},
-				TargetPVC: &HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+				SourcePVC:   &HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/antflydb"},
+				TargetPVC:   &HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
 			},
 		}},
 	}
