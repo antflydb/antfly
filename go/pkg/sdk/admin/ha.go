@@ -19,6 +19,7 @@ const (
 	AdminV1Path                       = "/admin/v1"
 	HAPath                            = AdminV1Path + "/ha"
 	HAPrimaryStatusPath               = HAPath + "/primary/status"
+	HAWatchdogProofPath               = HAPath + "/watchdog-proof"
 	HAStandbyStatusPath               = HAPath + "/standby/status"
 	HACommitCheckPath                 = HAPath + "/commit/check"
 	HACommitAppendPath                = HAPath + "/commit/append"
@@ -73,6 +74,7 @@ type (
 	HAFenceResponse                    = oapi.HAFenceResponse
 	HAIdentity                         = oapi.HAIdentity
 	HALeaseWatchdogProof               = oapi.HALeaseWatchdogProof
+	HAWatchdogProofResponse            = oapi.HAWatchdogProofResponse
 	HAOwnerJobCheckResponse            = oapi.HAOwnerJobCheckResponse
 	HAOwnerJobDecision                 = oapi.HAOwnerJobDecision
 	HAOwnerJobDecisionAction           = oapi.HAOwnerJobDecisionAction
@@ -820,6 +822,20 @@ func ValidateHAPrimaryStatusResponse(response HAPrimaryStatusResponse) error {
 		if err := validateHADurabilityDecision(snapshot.Durability); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func ValidateHAWatchdogProofResponse(response HAWatchdogProofResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing watchdog proof schema_version")
+	}
+	proof := response.Proof
+	if proof.CapabilityVersion == 0 || strings.TrimSpace(proof.LeaseName) == "" ||
+		strings.TrimSpace(proof.LeaseNamespace) == "" || strings.TrimSpace(proof.StableTopologyId) == "" ||
+		strings.TrimSpace(proof.LocalNodeId) == "" || strings.TrimSpace(proof.PodUid) == "" ||
+		strings.TrimSpace(proof.ProcessBootId) == "" || proof.MaxFenceLatencyMs == 0 {
+		return fmt.Errorf("missing watchdog capability proof fields")
 	}
 	return nil
 }
@@ -2600,6 +2616,18 @@ func (c *HAClient) PrimaryStatusResponse(ctx context.Context, params *HAPrimaryS
 
 func (c *HAClient) PrimaryStatus(ctx context.Context, params *HAPrimaryStatusParams) (*HAPrimaryStatusResponse, error) {
 	return haResponseValue(c.PrimaryStatusResponse(ctx, params))
+}
+
+func (c *HAClient) WatchdogProofResponse(ctx context.Context) (*HAResponse[HAWatchdogProofResponse], error) {
+	resp, err := c.client.GetHAWatchdogProofWithResponse(ctx, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200Validated("get HA watchdog proof", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAWatchdogProofResponse)
+}
+
+func (c *HAClient) WatchdogProof(ctx context.Context) (*HAWatchdogProofResponse, error) {
+	return haResponseValue(c.WatchdogProofResponse(ctx))
 }
 
 func (c *HAClient) PrimaryStatusParsedResponse(ctx context.Context, params *HAPrimaryStatusParams) (*HAResponse[ParsedHAPrimaryStatus], error) {

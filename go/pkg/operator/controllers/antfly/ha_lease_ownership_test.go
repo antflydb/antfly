@@ -2,6 +2,9 @@ package controllers
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -146,6 +149,42 @@ func TestDedicatedLeaseRenewalAdvancesUnchangedHolderFromFreshRuntimeProof(t *te
 	if renewed.Spec.HolderIdentity == nil || *renewed.Spec.HolderIdentity != "primary-a" ||
 		renewed.Spec.LeaseTransitions == nil || *renewed.Spec.LeaseTransitions != 1 {
 		t.Fatalf("dedicated renewal changed holder authority: %#v", renewed.Spec)
+	}
+}
+
+func TestDedicatedLeaseRenewalUsesAuthenticatedWatchdogProofEndpoint(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	t.Setenv("TEST_HA_WATCHDOG_TOKEN", "watchdog-token")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet || req.URL.Path != "/admin/v1/ha/watchdog-proof" {
+			t.Fatalf("request = %s %s, want dedicated watchdog proof endpoint", req.Method, req.URL.Path)
+		}
+		if got := req.Header.Get("Authorization"); got != "Bearer watchdog-token" {
+			t.Fatalf("Authorization = %q, want Bearer watchdog-token", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"schema_version":1,"proof":{"capability_version":1,"active":true,"authority_granted":true,"authority_remaining_ms":8000,"lease_name":"topology-ha-fence","lease_namespace":"default","stable_topology_id":"topology-anchor-uid","local_node_id":"primary-a","observed_holder_node_id":"primary-a","pod_uid":"primary-a-pod-uid","process_boot_id":"%s","observed_lease_transitions":1,"max_fence_latency_ms":10000}}`, strings.Repeat("a", 64))
+	}))
+	defer server.Close()
+
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Spec.HighAvailability.Admin.PrimaryURL = server.URL
+	cluster.Spec.HighAvailability.Admin.TokenEnvVar = "TEST_HA_WATCHDOG_TOKEN"
+	lease := haFenceLease(cluster, now.Add(-time.Second), 10, 1, "primary-a")
+	reconciler := testHAReconciler(t, cluster, lease, candidateLeasePod(now, "primary-a-pod-uid"))
+	reconciler.HTTPClient = server.Client()
+	reconciler.Now = func() time.Time { return now }
+
+	if err := reconciler.observeHACurrentPrimaryWatchdogProof(context.Background(), cluster); err != nil {
+		t.Fatalf("observe dedicated watchdog proof: %v", err)
+	}
+	if err := reconciler.renewCurrentHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("renew from dedicated watchdog proof: %v", err)
+	}
+	renewed := getOwnershipTestLease(t, reconciler)
+	if renewed.Spec.RenewTime == nil || !renewed.Spec.RenewTime.Time.Equal(now) {
+		t.Fatalf("renewTime = %#v, want %s", renewed.Spec.RenewTime, now)
 	}
 }
 

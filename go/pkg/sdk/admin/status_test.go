@@ -259,6 +259,34 @@ func TestHAClientPrimaryStatusParsedResponseValidatesRawBody(t *testing.T) {
 	}
 }
 
+func TestHAClientWatchdogProofUsesDedicatedAuthenticatedRoute(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != HAWatchdogProofPath {
+			t.Fatalf("request = %s %s, want GET %s", r.Method, r.URL.Path, HAWatchdogProofPath)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("Authorization = %q, want Bearer test-token", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"schema_version":1,"proof":{"capability_version":1,"active":true,"authority_granted":true,"authority_remaining_ms":5000,"lease_name":"lease-a","lease_namespace":"default","stable_topology_id":"topology-a","local_node_id":"primary-a","observed_holder_node_id":"primary-a","pod_uid":"pod-a","process_boot_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","observed_lease_transitions":1,"max_fence_latency_ms":10000}}`)
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	response, err := client.WithToken("test-token").WatchdogProofResponse(context.Background())
+	if err != nil {
+		t.Fatalf("WatchdogProofResponse returned error: %v", err)
+	}
+	if response.Value.Proof.LocalNodeId != "primary-a" || !response.Value.Proof.AuthorityGranted {
+		t.Fatalf("watchdog proof = %+v, want authoritative primary-a proof", response.Value.Proof)
+	}
+}
+
 func TestHAClientPrimaryStatusParsedResponseSanitizesGeneratedQuery(t *testing.T) {
 	t.Parallel()
 

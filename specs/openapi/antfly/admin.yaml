@@ -193,6 +193,27 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
+  /ha/watchdog-proof:
+    get:
+      tags: [ha]
+      operationId: getHAWatchdogProof
+      summary: Get the runtime Lease watchdog capability proof
+      description: >-
+        Returns only the authenticated, process-local Lease watchdog proof. This
+        endpoint remains independent of storage mutation critical sections so a
+        slow seed capture cannot prevent the operator from renewing an otherwise
+        valid fencing Lease.
+      responses:
+        "200":
+          description: Current runtime Lease watchdog capability proof.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAWatchdogProofResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
   /ha/standby/status:
     get:
       tags: [ha]
@@ -1492,6 +1513,17 @@ components:
           minimum: 1
         snapshot:
           $ref: "#/components/schemas/HAPrimarySnapshot"
+    HAWatchdogProofResponse:
+      type: object
+      required: [schema_version, proof]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        proof:
+          $ref: "#/components/schemas/HALeaseWatchdogProof"
     HAStandbyStatusResponse:
       type: object
       required: [schema_version, snapshot]

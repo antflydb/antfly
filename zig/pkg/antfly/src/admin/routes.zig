@@ -25,6 +25,7 @@ pub const maintenance_jobs = maintenance ++ "/jobs";
 pub const maintenance_jobs_prefix = maintenance_jobs ++ "/";
 pub const ha = base ++ "/ha";
 pub const ha_primary_status = ha ++ "/primary/status";
+pub const ha_watchdog_proof = ha ++ "/watchdog-proof";
 pub const ha_standby_status = ha ++ "/standby/status";
 pub const ha_commit_check = ha ++ "/commit/check";
 pub const ha_commit_append = ha ++ "/commit/append";
@@ -149,6 +150,7 @@ fn isPathSegmentUnreserved(byte: u8) bool {
 
 test "admin routes define HA control-plane paths" {
     try std.testing.expectEqualStrings("/admin/v1/ha/primary/status", ha_primary_status);
+    try std.testing.expectEqualStrings("/admin/v1/ha/watchdog-proof", ha_watchdog_proof);
     try std.testing.expectEqualStrings("/admin/v1/ha/standby/status", ha_standby_status);
     try std.testing.expectEqualStrings("/admin/v1/ha/commit/check", ha_commit_check);
     try std.testing.expectEqualStrings("/admin/v1/ha/commit/append", ha_commit_append);
@@ -256,6 +258,7 @@ const ExpectedRoute = struct {
 
 const expected_ha_routes = [_]ExpectedRoute{
     .{ .operation_id = "getHAPrimaryStatus", .method = "GET", .full_path = ha_primary_status },
+    .{ .operation_id = "getHAWatchdogProof", .method = "GET", .full_path = ha_watchdog_proof },
     .{ .operation_id = "getHAStandbyStatus", .method = "GET", .full_path = ha_standby_status },
     .{ .operation_id = "checkHACommit", .method = "POST", .full_path = ha_commit_check },
     .{ .operation_id = "appendHACommit", .method = "POST", .full_path = ha_commit_append },

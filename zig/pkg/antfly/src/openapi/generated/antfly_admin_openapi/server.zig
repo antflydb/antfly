@@ -183,6 +183,7 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/ha/seed-lifecycle/receipts", .operation_id = "getHASeedLifecycleReceipts" },
     .{ .method = "POST", .path = "/ha/standby/bootstrap", .operation_id = "bootstrapHAStandby" },
     .{ .method = "GET", .path = "/ha/standby/status", .operation_id = "getHAStandbyStatus" },
+    .{ .method = "GET", .path = "/ha/watchdog-proof", .operation_id = "getHAWatchdogProof" },
     .{ .method = "POST", .path = "/ha/write/check", .operation_id = "checkHAWrite" },
     .{ .method = "POST", .path = "/maintenance/check", .operation_id = "startStorageCheck" },
     .{ .method = "POST", .path = "/maintenance/compact", .operation_id = "startStorageCompact" },
@@ -227,6 +228,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "getHASeedLifecycleReceipts")) @compileError("ServerRouter: Impl missing required method 'getHASeedLifecycleReceipts'");
         if (!@hasDecl(Impl, "bootstrapHAStandby")) @compileError("ServerRouter: Impl missing required method 'bootstrapHAStandby'");
         if (!@hasDecl(Impl, "getHAStandbyStatus")) @compileError("ServerRouter: Impl missing required method 'getHAStandbyStatus'");
+        if (!@hasDecl(Impl, "getHAWatchdogProof")) @compileError("ServerRouter: Impl missing required method 'getHAWatchdogProof'");
         if (!@hasDecl(Impl, "checkHAWrite")) @compileError("ServerRouter: Impl missing required method 'checkHAWrite'");
         if (!@hasDecl(Impl, "startStorageCheck")) @compileError("ServerRouter: Impl missing required method 'startStorageCheck'");
         if (!@hasDecl(Impl, "startStorageCompact")) @compileError("ServerRouter: Impl missing required method 'startStorageCompact'");
@@ -272,6 +274,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.get("/ha/seed-lifecycle/receipts", getHASeedLifecycleReceipts);
             try server.post("/ha/standby/bootstrap", bootstrapHAStandby);
             try server.get("/ha/standby/status", getHAStandbyStatus);
+            try server.get("/ha/watchdog-proof", getHAWatchdogProof);
             try server.post("/ha/write/check", checkHAWrite);
             try server.post("/maintenance/check", startStorageCheck);
             try server.post("/maintenance/compact", startStorageCompact);
@@ -476,6 +479,13 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.getHAStandbyStatus(ctx, query_params);
         }
 
+        /// Get the runtime Lease watchdog capability proof
+        /// GET /ha/watchdog-proof
+        fn getHAWatchdogProof(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.getHAWatchdogProof(ctx);
+        }
+
         /// Evaluate whether this node can accept writes
         /// POST /ha/write/check
         fn checkHAWrite(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -549,6 +559,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn getHASeedLifecycleReceipts(self: *Impl, ctx: *httpx.Context, params: GetHASeedLifecycleReceiptsParams) !httpx.Response
 //   fn bootstrapHAStandby(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getHAStandbyStatus(self: *Impl, ctx: *httpx.Context, params: GetHAStandbyStatusParams) !httpx.Response
+//   fn getHAWatchdogProof(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn checkHAWrite(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn startStorageCheck(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn startStorageCompact(self: *Impl, ctx: *httpx.Context) !httpx.Response

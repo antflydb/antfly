@@ -214,6 +214,10 @@ pub const Server = struct {
             if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
             return try self.handleAdminLifecycleReceipts(req);
         }
+        if (std.mem.eql(u8, path, admin_api.routes.ha_watchdog_proof)) {
+            if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
+            return try self.handleAdminWatchdogProof();
+        }
         const state_mutex = self.auth.state_mutex;
         if (state_mutex) |mutex| platform_sync.lockYielding(mutex);
         defer if (state_mutex) |mutex| mutex.unlock();
@@ -381,6 +385,18 @@ pub const Server = struct {
         };
         defer self.alloc.free(response.snapshot.slots);
         return try self.handleTypedJson(response);
+    }
+
+    fn handleAdminWatchdogProof(self: *Server) !http_common.HttpResponse {
+        const source = self.auth.lease_watchdog_proof orelse
+            return try textResponse(self.alloc, 409, "WatchdogProofUnavailable");
+        const proof = try source.snapshot(self.alloc) orelse
+            return try textResponse(self.alloc, 409, "WatchdogProofUnavailable");
+        defer self.alloc.free(proof.observed_holder_node_id);
+        return try self.handleTypedJson(admin_api.HAWatchdogProofResponse{
+            .schema_version = 1,
+            .proof = proof,
+        });
     }
 
     fn handleAdminStandbyStatus(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -1918,6 +1934,7 @@ fn knownFixedRoute(path: []const u8) bool {
         std.mem.eql(u8, path, Routes.ready) or
         std.mem.eql(u8, path, Routes.command) or
         std.mem.eql(u8, path, admin_api.routes.ha_primary_status) or
+        std.mem.eql(u8, path, admin_api.routes.ha_watchdog_proof) or
         std.mem.eql(u8, path, admin_api.routes.ha_standby_status) or
         std.mem.eql(u8, path, admin_api.routes.ha_commit_check) or
         std.mem.eql(u8, path, admin_api.routes.ha_commit_append) or
@@ -3536,6 +3553,60 @@ test "storage.ha http admin bearer authorization requires exact token" {
     try std.testing.expect(!bearerAuthorizationMatches("secret-token", "Bearer secret-token "));
     try std.testing.expect(!bearerAuthorizationMatches("secret-token", "Bearer secret"));
     try std.testing.expect(!bearerAuthorizationMatches("secret-token", "Bearer secret-token-extra"));
+}
+
+test "storage.ha watchdog proof remains available outside HA state mutex" {
+    const alloc = std.testing.allocator;
+    const ProofSource = struct {
+        state_mutex: *std.atomic.Mutex,
+        observed_locked: bool = false,
+
+        fn snapshot(ptr: *const anyopaque, proof_alloc: Allocator) !?admin_api.HALeaseWatchdogProof {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            const acquired = self.state_mutex.tryLock();
+            self.observed_locked = !acquired;
+            if (acquired) self.state_mutex.unlock();
+            return .{
+                .capability_version = 1,
+                .active = true,
+                .authority_granted = true,
+                .authority_remaining_ms = 5000,
+                .lease_name = "lease-a",
+                .lease_namespace = "default",
+                .stable_topology_id = "topology-a",
+                .local_node_id = "primary-a",
+                .observed_holder_node_id = try proof_alloc.dupe(u8, "primary-a"),
+                .pod_uid = "pod-a",
+                .process_boot_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                .observed_lease_transitions = 1,
+                .max_fence_latency_ms = 10000,
+            };
+        }
+    };
+
+    var state_mutex: std.atomic.Mutex = .unlocked;
+    var source = ProofSource{ .state_mutex = &state_mutex };
+    var server = Server.initWithOptions(alloc, .{}, .{
+        .bearer_token = "secret-token",
+        .require_bearer_token = true,
+        .state_mutex = &state_mutex,
+        .lease_watchdog_proof = .{ .ptr = &source, .snapshot_fn = ProofSource.snapshot },
+    });
+    defer server.deinit();
+
+    platform_sync.lockYielding(&state_mutex);
+    defer state_mutex.unlock();
+    var response = try server.handle(.{
+        .method = .GET,
+        .uri = admin_api.routes.ha_watchdog_proof,
+        .authorization = "Bearer secret-token",
+    });
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try std.testing.expect(source.observed_locked);
+    try expectContains(response.body, "\"schema_version\":1");
+    try expectContains(response.body, "\"authority_granted\":true");
 }
 
 test "storage.ha http admin empty configured bearer token fails closed" {

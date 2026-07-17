@@ -7,6 +7,8 @@ package controllers
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
@@ -40,10 +42,42 @@ func (r *haLeaseRenewalReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	proofCtx, cancel := context.WithTimeout(ctx, haLeaseProofTimeout)
 	defer cancel()
-	if err := r.parent.observeHAPrimaryAdminStatus(proofCtx, cluster); err == nil {
+	if err := r.parent.observeHACurrentPrimaryWatchdogProof(proofCtx, cluster); err == nil {
 		if err := r.parent.renewCurrentHAFencingLease(proofCtx, cluster); err != nil && !apierrors.IsConflict(err) {
 			return ctrl.Result{RequeueAfter: haLeaseRenewalInterval}, err
 		}
 	}
 	return ctrl.Result{RequeueAfter: haLeaseRenewalInterval}, nil
+}
+
+// observeHACurrentPrimaryWatchdogProof fetches only the authenticated runtime
+// capability needed for Lease renewal. The runtime serves this proof outside
+// storage mutation critical sections; all exact Lease, topology, Pod, process,
+// and freshness checks remain in renewCurrentHAFencingLease.
+func (r *AntflyClusterReconciler) observeHACurrentPrimaryWatchdogProof(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	if cluster == nil || cluster.Spec.HighAvailability == nil || cluster.Status.HAStatus == nil {
+		return fmt.Errorf("HA watchdog proof requires configured HA status")
+	}
+	ha := cluster.Spec.HighAvailability
+	adminURL := strings.TrimSpace(haCurrentPrimaryAdminURL(ha, cluster.Status.HAStatus))
+	nodeID := strings.TrimSpace(haCurrentPrimaryNodeID(ha, cluster.Status.HAStatus))
+	if adminURL == "" || nodeID == "" {
+		return fmt.Errorf("HA watchdog proof requires the current primary admin URL and node ID")
+	}
+	adminClient, err := r.haAdminSDKClient(cluster, adminURL)
+	if err != nil {
+		return err
+	}
+	requestStartedAt := r.haNow()
+	response, err := adminClient.WatchdogProofResponse(ctx)
+	if err != nil {
+		return err
+	}
+	observedAt := r.haNow()
+	proof, err := haWatchdogProofFromAdmin(&response.Value.Proof, cluster, nodeID, true, requestStartedAt, observedAt)
+	if err != nil {
+		return err
+	}
+	cluster.Status.HAStatus.PrimaryWatchdogProof = proof
+	return nil
 }

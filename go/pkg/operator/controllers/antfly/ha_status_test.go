@@ -1846,6 +1846,13 @@ func TestHAAdminOperationsMatchAdminOpenAPISpec(t *testing.T) {
 			operationID: "getHAPrimaryStatus",
 		},
 		{
+			name:        "watchdog proof",
+			method:      "GET",
+			path:        haAdminWatchdogProofPath,
+			openAPIPath: "/ha/watchdog-proof",
+			operationID: "getHAWatchdogProof",
+		},
+		{
 			name:        "standby status",
 			method:      "GET",
 			path:        haAdminStandbyStatusPath,
@@ -2015,6 +2022,7 @@ func TestHAAdminRouteConstantsAreDocumentedInAdminOpenAPISpec(t *testing.T) {
 		operationID string
 	}{
 		{method: "GET", path: haAdminPrimaryStatusPath, operationID: "getHAPrimaryStatus"},
+		{method: "GET", path: haAdminWatchdogProofPath, operationID: "getHAWatchdogProof"},
 		{method: "GET", path: haAdminStandbyStatusPath, operationID: "getHAStandbyStatus"},
 		{method: "POST", path: haAdminCommitCheckPath, operationID: "checkHACommit"},
 		{method: "POST", path: haAdminCommitAppendPath, operationID: "appendHACommit"},

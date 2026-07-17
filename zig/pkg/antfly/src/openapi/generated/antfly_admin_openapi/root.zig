@@ -54,6 +54,7 @@ pub const HAStandbyBootstrapResponse = types.HAStandbyBootstrapResponse;
 pub const HAStandbySnapshot = types.HAStandbySnapshot;
 pub const HAStandbyStatusResponse = types.HAStandbyStatusResponse;
 pub const HASyncPolicy = types.HASyncPolicy;
+pub const HAWatchdogProofResponse = types.HAWatchdogProofResponse;
 pub const HAWriteCheckResponse = types.HAWriteCheckResponse;
 pub const HAWriteDecision = types.HAWriteDecision;
 pub const OwnerJobCheckRequest = types.OwnerJobCheckRequest;

@@ -520,6 +520,11 @@ pub const HASyncPolicy = struct {
     failure_policy: ?[]const u8 = null,
 };
 
+pub const HAWatchdogProofResponse = struct {
+    schema_version: i64,
+    proof: HALeaseWatchdogProof,
+};
+
 pub const HAWriteCheckResponse = struct {
     schema_version: i64,
     decision: HAWriteDecision,

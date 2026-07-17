@@ -39,6 +39,7 @@ pub const PromotionAssessRequest = openapi.PromotionAssessRequest;
 pub const RejoinAssessRequest = openapi.RejoinAssessRequest;
 
 pub const HAPrimaryStatusResponse = openapi.HAPrimaryStatusResponse;
+pub const HAWatchdogProofResponse = openapi.HAWatchdogProofResponse;
 pub const HAStandbyStatusResponse = openapi.HAStandbyStatusResponse;
 pub const HACommitCheckResponse = openapi.HACommitCheckResponse;
 pub const HACommitAppendResponse = openapi.HACommitAppendResponse;
@@ -250,6 +251,7 @@ const ha_contract_type_names = [_][]const u8{
     "PromotionAssessRequest",
     "RejoinAssessRequest",
     "HAPrimaryStatusResponse",
+    "HAWatchdogProofResponse",
     "HAStandbyStatusResponse",
     "HACommitCheckResponse",
     "HACommitAppendResponse",

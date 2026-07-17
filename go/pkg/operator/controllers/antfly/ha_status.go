@@ -77,6 +77,7 @@ const (
 	haAdminBasePath                        = adminsdk.AdminV1Path
 	haAdminHAPath                          = adminsdk.HAPath
 	haAdminPrimaryStatusPath               = adminsdk.HAPrimaryStatusPath
+	haAdminWatchdogProofPath               = adminsdk.HAWatchdogProofPath
 	haAdminStandbyStatusPath               = adminsdk.HAStandbyStatusPath
 	haAdminCommitCheckPath                 = adminsdk.HACommitCheckPath
 	haAdminCommitAppendPath                = adminsdk.HACommitAppendPath
