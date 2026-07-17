@@ -222,9 +222,20 @@ fn replaceWithLease(alloc: Allocator, store: Store, key: []u8, etag: []const u8,
 }
 
 fn controlKeyAlloc(alloc: Allocator, prefix: []const u8) ![]u8 {
-    if (prefix.len == 0) return try alloc.dupe(u8, ".antfly-ha-seeds.control.json");
-    if (prefix[prefix.len - 1] != '/') return error.InvalidSeedNamespacePrefix;
-    return try std.fmt.allocPrint(alloc, "{s}.control.json", .{prefix[0 .. prefix.len - 1]});
+    const normalized = std.mem.trim(u8, prefix, "/");
+    if (normalized.len == 0) return try alloc.dupe(u8, ".antfly-ha-seeds.control.json");
+    return try std.fmt.allocPrint(alloc, "{s}.control.json", .{normalized});
+}
+
+test "storage.ha seed namespace control normalizes remote URI prefixes beside the data namespace" {
+    const alloc = std.testing.allocator;
+    const without_separator = try controlKeyAlloc(alloc, "instances/instance-a/ha-seeds");
+    defer alloc.free(without_separator);
+    const with_separator = try controlKeyAlloc(alloc, "/instances/instance-a/ha-seeds/");
+    defer alloc.free(with_separator);
+
+    try std.testing.expectEqualStrings("instances/instance-a/ha-seeds.control.json", without_separator);
+    try std.testing.expectEqualStrings(without_separator, with_separator);
 }
 
 fn sameAuthority(state: State, binding: Binding) bool {
