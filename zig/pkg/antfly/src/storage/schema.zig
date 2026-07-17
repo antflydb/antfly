@@ -29,7 +29,7 @@ const DocStore = docstore.DocStore;
 const lsm_backend = @import("lsm_backend.zig");
 const lmdb = @import("lmdb.zig");
 const mem_backend = @import("mem_backend.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 fn cleanupTestDir(path: []const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});

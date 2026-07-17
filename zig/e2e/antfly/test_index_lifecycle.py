@@ -516,6 +516,95 @@ def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_qu
     assert hits[0]["_id"] == "doc:a"
 
 
+def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
+    stateful_api,
+    openai_embedder,
+):
+    """A field-less write tail must not leave public replay status idle-behind."""
+    table_name = f"stateful_managed_embeddings_replay_tail_{time.time_ns()}"
+    index_name = "semantic_idx"
+
+    created = stateful_api.create_table(table_name, num_shards=1)
+    assert created["name"] == table_name
+
+    assert (
+        stateful_api.create_index(
+            table_name,
+            index_name,
+            {
+                "name": index_name,
+                "type": "embeddings",
+                "field": "semantic_content",
+                "dimension": 3,
+                "embedder": {
+                    "provider": "openai",
+                    "model": "text-embedding-3-small",
+                    "url": openai_embedder,
+                },
+            },
+        )
+        == {}
+    )
+    assert wait_until(
+        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        timeout_s=10.0,
+        interval_s=0.1,
+    )
+
+    semantic_batch = stateful_api.batch_write(
+        table_name,
+        inserts={
+            f"doc:{i}": {
+                "content": f"semantic document {i}",
+                "semantic_content": f"unique semantic payload {i}",
+            }
+            for i in range(6)
+        },
+        sync_level="write",
+    )
+    assert semantic_batch["inserted"] == 6
+
+    # End the burst with committed records that have no work for this index.
+    # The test intentionally issues no later write or explicit catch-up request.
+    plain_batch = stateful_api.batch_write(
+        table_name,
+        inserts={f"plain:{i}": {"content": f"plain trailing document {i}"} for i in range(3)},
+        sync_level="write",
+    )
+    assert plain_batch["inserted"] == 3
+
+    latest_status: dict | None = None
+
+    def converged_replay_status() -> dict | None:
+        nonlocal latest_status
+        latest_status = _index_stats(stateful_api.get_index(table_name, index_name))
+        applied = int(latest_status.get("replay_applied_sequence", 0))
+        target = int(latest_status.get("replay_target_sequence", 0))
+        indexed = int(latest_status.get("total_indexed", latest_status.get("doc_count", 0)))
+        if (
+            indexed < 6
+            or applied < target
+            or latest_status.get("replay_catch_up_required") is not False
+            or latest_status.get("catch_up_active") is not False
+            or latest_status.get("catch_up_phase") != "idle"
+        ):
+            return None
+        return latest_status
+
+    converged = wait_until(converged_replay_status, timeout_s=12.0, interval_s=0.1)
+    assert converged is not None, json.dumps(latest_status, indent=2, sort_keys=True)
+
+    # The default strict policy still reports the three field-less documents as
+    # coverage debt. It must not rewrite the authoritative replay ledger into
+    # fake replay debt or imply that a worker is still active.
+    coverage = converged["coverage"]
+    assert coverage["policy"] == "strict"
+    assert coverage["complete"] is False
+    assert coverage["pending"] >= 3
+    assert converged["backfill_active"] is True
+    assert converged["rebuilding"] is True
+
+
 def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited_enrichment(
     single_item_enrichment_batches,
     stateful_api,

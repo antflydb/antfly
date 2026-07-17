@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const background_runtime = @import("background_runtime.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const platform_sync = @import("antfly_platform").sync;
 
 var coordinator_boot_sequence: std.atomic.Value(u64) = .init(1);

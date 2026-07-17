@@ -1,0 +1,9 @@
+[
+  "Tantivy 0.25 embedded search-kernel comparator with a persistent stdin/stdout process.",
+  "Consumes the same normalized JSONL/plain-text corpus and assigns zero-based u32 ordinals in input order.",
+  "Uses SimpleTokenizer over an ASCII-lowercased copy of the text, preserving non-ASCII case to match Antfly's declared simple analyzer.",
+  "Indexes corpus_ordinal as a native u64 fast field; result mapping never loads stored source bodies.",
+  "Supports only strict V1 TERM/UNION/INTERSECTION/PHRASE queries and fails closed with UNSUPPORTED.",
+  "Tantivy 0.25 exposes fixed BM25 k1=1.2 and b=0.75, so the adapter rejects other values instead of claiming score equivalence.",
+  "Single mode explicitly merges all searchable segments; production mode retains the commit-per-5000-doc ingestion state."
+]

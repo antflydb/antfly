@@ -1,0 +1,8 @@
+{"name":"punctuation","text":"Hello, world!"}
+{"name":"mixed_case_non_ascii","text":"MiXeD CAFÉ café"}
+{"name":"emoji_boundaries","text":"alpha🙂beta 🚀 gamma"}
+{"name":"combining_characters","text":"café café"}
+{"name":"numbers","text":"v2 123 12.34"}
+{"name":"long_token","text":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+{"name":"repeated_terms","text":"echo echo echo"}
+{"name":"empty","text":""}

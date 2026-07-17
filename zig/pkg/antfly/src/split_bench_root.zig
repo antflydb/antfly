@@ -20,4 +20,4 @@ pub const KVPair = root.KVPair;
 pub const OwnedKVPair = root.OwnedKVPair;
 pub const ByteRange = root.ByteRange;
 pub const ShardManager = root.ShardManager;
-pub const platform_time = @import("platform/time.zig");
+pub const platform_time = @import("antfly_platform").time;

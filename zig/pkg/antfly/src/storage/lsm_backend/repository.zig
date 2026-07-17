@@ -533,7 +533,7 @@ pub fn loadRunStateAllocWithStorage(storage: storage_io.Storage, allocator: Allo
 
         const end = block.first_entry_index + block.entry_count;
         for (block.first_entry_index..end) |entry_index| {
-            const relative_offset: usize = @intCast(index.entryStart(entry_index) - window.relative_offset);
+            const relative_offset: usize = @intCast(index.entryStartInBlock(entry_index, block_index) - window.relative_offset);
             const entry = try lsm_table_file.parseEntryAt(bytes, relative_offset);
             try appendStateEntryClone(allocator, &state, entry);
         }
@@ -594,6 +594,21 @@ pub fn loadRunTableIndexAllocWithStorage(
         return try lsm_table_file.decodeIndexFromFooterAlloc(allocator, footer, metadata_bytes);
     }
     return error.UnsupportedVersion;
+}
+
+pub fn loadRunSequentialTableIndexAllocWithStorage(
+    storage: storage_io.Storage,
+    allocator: Allocator,
+    path: []const u8,
+) !lsm_table_file.SequentialTableIndex {
+    const footer_bytes = try storage.readFileTrailerAlloc(allocator, path, lsm_table_file.footer_len);
+    defer allocator.free(footer_bytes);
+    if (!lsm_table_file.hasFooterMagic(footer_bytes)) return error.UnsupportedVersion;
+
+    const footer = try lsm_table_file.decodeFooterBytes(footer_bytes);
+    const metadata_bytes = try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
+    defer allocator.free(metadata_bytes);
+    return try lsm_table_file.decodeSequentialIndexFromFooterAlloc(allocator, footer, metadata_bytes);
 }
 
 pub fn deleteFileAbsolute(path: []const u8) !void {

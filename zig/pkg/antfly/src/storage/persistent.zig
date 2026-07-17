@@ -77,7 +77,7 @@ const lmdb_backend = if (supports_main_lmdb) @import("lmdb_backend.zig") else st
 const mem_backend = @import("mem_backend.zig");
 const lsm_backend = @import("lsm_backend/mod.zig");
 const storage_io = lsm_backend.storage_io;
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const wal_mod = if (builtin.os.tag == .freestanding) @import("portable_wal.zig") else @import("wal.zig");
 const storage_sim = @import("sim_runtime.zig");
 const sim_fixture = @import("sim_fixture.zig");
@@ -88,6 +88,7 @@ const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
     pub const sim = struct {};
 };
 const index_mod = @import("../index.zig");
+const resource_manager_mod = @import("resource_manager.zig");
 const segment_mod = @import("../segment.zig");
 const inverted_mod = @import("../section/inverted.zig");
 const introducer_mod = @import("../introducer.zig");
@@ -243,6 +244,11 @@ pub const PersistentIndexStats = struct {
 pub const PersistentIndexMemoryStats = struct {
     configured_lmdb_main_map_bytes: u64 = 0,
     configured_lmdb_wal_map_bytes: u64 = 0,
+    segment_virtual_mapped_bytes: u64 = 0,
+    segment_estimated_resident_bytes: u64 = 0,
+    segment_recently_touched_bytes: u64 = 0,
+    segment_cold_mapped_bytes: u64 = 0,
+    segment_residency_evictions: u64 = 0,
 };
 
 const SegmentFileStore = struct {
@@ -306,7 +312,10 @@ const SegmentFileStore = struct {
         defer if (active) writer.abort();
         try writer.appendSlice(bytes);
         active = false;
-        try writer.finish();
+        writer.finish() catch |err| {
+            if (builtin.os.tag != .freestanding) std.log.err("text segment atomic finish failed: {s}", .{@errorName(err)});
+            return err;
+        };
 
         if (self.storage_owner == null) {
             return .fromOwnedHeap(try self.allocator.dupe(u8, bytes));
@@ -370,7 +379,25 @@ const RetiredSegmentFileDeleter = struct {
 };
 
 const AtomicSegmentSink = struct {
+    allocator: Allocator,
     writer: *storage_io.AtomicWriteSink,
+    append_buffer: std.ArrayListUnmanaged(u8) = .empty,
+
+    const append_buffer_bytes: usize = 1024 * 1024;
+
+    fn init(allocator: Allocator, writer: *storage_io.AtomicWriteSink) AtomicSegmentSink {
+        return .{ .allocator = allocator, .writer = writer };
+    }
+
+    fn deinit(self: *AtomicSegmentSink) void {
+        self.append_buffer.deinit(self.allocator);
+    }
+
+    fn flush(self: *AtomicSegmentSink) !void {
+        if (self.append_buffer.items.len == 0) return;
+        try self.writer.appendSlice(self.append_buffer.items);
+        self.append_buffer.clearRetainingCapacity();
+    }
 
     fn sink(self: *AtomicSegmentSink) segment_mod.SegmentSink {
         return .{
@@ -381,17 +408,33 @@ const AtomicSegmentSink = struct {
 
     fn len(ptr: *anyopaque) usize {
         const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
-        return self.writer.len();
+        return self.writer.len() + self.append_buffer.items.len;
     }
 
     fn appendSlice(ptr: *anyopaque, bytes: []const u8) !void {
         const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
-        try self.writer.appendSlice(bytes);
+        var remaining = bytes;
+        while (remaining.len > 0) {
+            if (self.append_buffer.items.len == 0 and remaining.len >= append_buffer_bytes) {
+                const direct_len = remaining.len - (remaining.len % append_buffer_bytes);
+                try self.writer.appendSlice(remaining[0..direct_len]);
+                remaining = remaining[direct_len..];
+                continue;
+            }
+
+            try self.append_buffer.ensureTotalCapacity(self.allocator, append_buffer_bytes);
+            const available = append_buffer_bytes - self.append_buffer.items.len;
+            const take = @min(available, remaining.len);
+            try self.append_buffer.appendSlice(self.allocator, remaining[0..take]);
+            remaining = remaining[take..];
+            if (self.append_buffer.items.len == append_buffer_bytes) try self.flush();
+        }
     }
 
     fn appendByte(ptr: *anyopaque, byte: u8) !void {
         const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
-        try self.writer.appendByte(byte);
+        const one = [1]u8{byte};
+        try appendSlice(self, &one);
     }
 
     fn appendNTimes(ptr: *anyopaque, byte: u8, count: usize) !void {
@@ -401,18 +444,26 @@ const AtomicSegmentSink = struct {
         var remaining = count;
         while (remaining > 0) {
             const n = @min(remaining, buf.len);
-            try self.writer.appendSlice(buf[0..n]);
+            try appendSlice(self, buf[0..n]);
             remaining -= n;
         }
     }
 
     fn writeAt(ptr: *anyopaque, offset: usize, bytes: []const u8) !void {
         const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
+        const buffer_start = self.writer.len();
+        if (offset >= buffer_start and bytes.len <= self.append_buffer.items.len and offset - buffer_start <= self.append_buffer.items.len - bytes.len) {
+            const relative = offset - buffer_start;
+            @memcpy(self.append_buffer.items[relative..][0..bytes.len], bytes);
+            return;
+        }
+        try self.flush();
         try self.writer.writeAt(offset, bytes);
     }
 
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
         const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
+        try self.flush();
         return try self.writer.crc32Prefix(len_prefix);
     }
 };
@@ -666,6 +717,10 @@ pub const PersistentIndex = struct {
     pub fn supportsFileBackedSegmentArtifacts(self: *const PersistentIndex) bool {
         const store = self.segment_files orelse return false;
         return store.storage_owner != null;
+    }
+
+    pub fn attachResourceManager(self: *PersistentIndex, manager: *resource_manager_mod.ResourceManager) void {
+        self.writer.attachResourceManager(manager);
     }
 
     const MainTxn = struct {
@@ -1074,10 +1129,12 @@ pub const PersistentIndex = struct {
         if (self.read_only) return error.ReadOnly;
 
         const retired_cleanup = self.writer.retired_segment_cleanup;
+        const resource_manager = self.writer.resource_manager;
         var replacement_writer = try index_mod.IndexWriter.init(self.alloc);
         var replacement_writer_moved = false;
         defer if (!replacement_writer_moved) replacement_writer.deinit();
         replacement_writer.setRetiredSegmentCleanup(retired_cleanup);
+        if (resource_manager) |manager| replacement_writer.attachResourceManager(manager);
 
         self.lockStorage();
         defer self.unlockStorage();
@@ -1261,7 +1318,10 @@ pub const PersistentIndex = struct {
 
         // 5. Add to in-memory writer (addSegmentWithIdData will acquire the lock itself)
         const writer_publish_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        try self.writer.addSegmentWithIdData(seg_id, segment_data.?);
+        self.writer.addSegmentWithIdData(seg_id, segment_data.?) catch |err| {
+            if (builtin.os.tag != .freestanding) std.log.err("text segment snapshot publish failed: {s}", .{@errorName(err)});
+            return err;
+        };
         segment_data = null;
         if (profile_enabled) writer_publish_ns = platform_time.monotonicNs() - writer_publish_start_ns;
 
@@ -1345,11 +1405,13 @@ pub const PersistentIndex = struct {
         var writer_active = true;
         errdefer if (writer_active) writer.abort();
 
-        var sink_adapter = AtomicSegmentSink{ .writer = &writer };
+        var sink_adapter = AtomicSegmentSink.init(self.alloc, &writer);
+        defer sink_adapter.deinit();
         var sink = sink_adapter.sink();
         const build_sink_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         try build_fn(ctx, &sink);
         const segment_len = sink.len();
+        try sink_adapter.flush();
         if (profile_enabled) build_sink_ns = platform_time.monotonicNs() - build_sink_start_ns;
 
         writer_active = false;
@@ -1359,7 +1421,10 @@ pub const PersistentIndex = struct {
         if (profile_enabled) materialize_ns = platform_time.monotonicNs() - materialize_start_ns;
 
         const map_segment_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        var segment_data: ?index_mod.SegmentData = .fromMapped(try mapSegmentFile(path));
+        var segment_data: ?index_mod.SegmentData = .fromMapped(mapSegmentFile(path) catch |err| {
+            if (builtin.os.tag != .freestanding) std.log.err("text segment map failed: {s}", .{@errorName(err)});
+            return err;
+        });
         segment_data.?.madviseAccessPattern();
         if (profile_enabled) map_segment_ns = platform_time.monotonicNs() - map_segment_start_ns;
         errdefer {
@@ -1368,20 +1433,38 @@ pub const PersistentIndex = struct {
         }
 
         const key_range_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        var key_range = try extractSegmentKeyRange(self.alloc, segment_data.?.bytes());
+        var key_range = extractSegmentKeyRange(self.alloc, segment_data.?.bytes()) catch |err| {
+            if (builtin.os.tag != .freestanding) std.log.err("text segment key-range scan failed: {s}", .{@errorName(err)});
+            return err;
+        };
         if (profile_enabled) key_range_ns = platform_time.monotonicNs() - key_range_start_ns;
         defer key_range.deinit(self.alloc);
 
         const persist_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         self.lockStorage();
         defer self.unlockStorage();
-        var txn = try self.beginWriteMainTxn();
+        var txn = self.beginWriteMainTxn() catch |err| {
+            if (builtin.os.tag != .freestanding) std.log.err("text segment catalog transaction failed: {s}", .{@errorName(err)});
+            return err;
+        };
         errdefer txn.abort();
-        try self.saveSegmentRange(&txn, seg_id, key_range);
-        try self.updateActiveSegments(&txn, seg_id, .add);
+        self.saveSegmentRange(&txn, seg_id, key_range) catch |err| {
+            if (builtin.os.tag != .freestanding) std.log.err("text segment key-range publish failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        self.updateActiveSegments(&txn, seg_id, .add) catch |err| {
+            if (builtin.os.tag != .freestanding) std.log.err("text segment active-set publish failed: {s}", .{@errorName(err)});
+            return err;
+        };
         const lsn_bytes = std.mem.toBytes(std.mem.nativeToLittle(u64, self.committed_lsn));
-        try txn.put(.meta, meta_committed_lsn, &lsn_bytes);
-        try txn.commit();
+        txn.put(.meta, meta_committed_lsn, &lsn_bytes) catch |err| {
+            if (builtin.os.tag != .freestanding) std.log.err("text segment checkpoint publish failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        txn.commit() catch |err| {
+            if (builtin.os.tag != .freestanding) std.log.err("text segment catalog commit failed: {s}", .{@errorName(err)});
+            return err;
+        };
         if (profile_enabled) persist_ns = platform_time.monotonicNs() - persist_start_ns;
 
         const writer_publish_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
@@ -1439,10 +1522,16 @@ pub const PersistentIndex = struct {
         };
     }
 
-    pub fn memoryStatsSnapshot(self: *const PersistentIndex) PersistentIndexMemoryStats {
+    pub fn memoryStatsSnapshot(self: *PersistentIndex) PersistentIndexMemoryStats {
+        const residency = self.writer.mappedResidencyStats();
         return .{
             .configured_lmdb_main_map_bytes = if (self.main_backend == .lmdb) @intCast(self.main_map_size) else 0,
             .configured_lmdb_wal_map_bytes = if (self.wal_backend == .lmdb) @intCast(self.wal_map_size) else 0,
+            .segment_virtual_mapped_bytes = residency.virtual_mapped_bytes,
+            .segment_estimated_resident_bytes = residency.estimated_resident_bytes,
+            .segment_recently_touched_bytes = residency.recently_touched_bytes,
+            .segment_cold_mapped_bytes = residency.cold_mapped_bytes,
+            .segment_residency_evictions = residency.eviction_count,
         };
     }
 
@@ -1686,10 +1775,18 @@ pub const PersistentIndex = struct {
 
     /// Tombstone a document by external ID and persist the segment deletion bitmap.
     pub fn deleteById(self: *PersistentIndex, doc_id: []const u8) !bool {
+        return try self.deleteByIds(&.{doc_id});
+    }
+
+    /// Tombstone a batch of external IDs in one segment traversal and one
+    /// storage transaction. This preserves all-or-nothing bitmap persistence
+    /// without multiplying the scan cost by the number of IDs.
+    pub fn deleteByIds(self: *PersistentIndex, doc_ids: []const []const u8) !bool {
+        if (doc_ids.len == 0) return false;
         self.lockStorage();
         defer self.unlockStorage();
 
-        const delete_infos = try self.writer.deleteAllByIdTracked(self.alloc, doc_id);
+        const delete_infos = try self.writer.deleteAllByIdsTracked(self.alloc, doc_ids);
         defer index_mod.IndexWriter.freeDeleteInfos(self.alloc, delete_infos);
         if (delete_infos.len == 0) return false;
         var persisted = false;
@@ -1771,37 +1868,68 @@ pub const PersistentIndex = struct {
     }
 
     pub fn prepareMergedSegmentToFile(self: *PersistentIndex, snap: *const index_mod.IndexSnapshot, segment_indices: []const usize) ![]PreparedMergeSegment {
+        return try self.prepareMergedSegmentToFileWithAllocator(self.alloc, snap, segment_indices);
+    }
+
+    /// File-backed merge with an explicit allocator for task-local working
+    /// state. Published mappings, key ranges, and the returned prepared list
+    /// remain owned by the persistent index allocator; only temporary merge
+    /// buffers use `work_alloc`.
+    pub fn prepareMergedSegmentToFileWithAllocator(
+        self: *PersistentIndex,
+        work_alloc: Allocator,
+        snap: *const index_mod.IndexSnapshot,
+        segment_indices: []const usize,
+    ) ![]PreparedMergeSegment {
+        return try self.prepareMergedSegmentToFileWithAllocatorAndDeletes(work_alloc, snap, segment_indices, null);
+    }
+
+    /// Prepare a file-backed merge against an immutable, task-owned deletion
+    /// view. The optional slice is aligned with `segment_indices`; callers may
+    /// therefore release their mutation lock while segment bytes are merged.
+    pub fn prepareMergedSegmentToFileWithAllocatorAndDeletes(
+        self: *PersistentIndex,
+        work_alloc: Allocator,
+        snap: *const index_mod.IndexSnapshot,
+        segment_indices: []const usize,
+        deleted_docs: ?[]const ?roaring.RoaringBitmap,
+    ) ![]PreparedMergeSegment {
         if (segment_indices.len == 0) return error.NoSegments;
+        if (deleted_docs) |frozen| {
+            if (frozen.len != segment_indices.len) return error.InvalidDeletionSnapshot;
+        }
         const store = &(self.segment_files orelse return error.Unsupported);
         if (store.storage_owner == null) return error.Unsupported;
 
         const new_seg_id = self.reserveSegmentId();
         errdefer self.deleteSegmentFile(new_seg_id);
 
-        var inputs = try self.alloc.alloc(segment_mod.MergeInput, segment_indices.len);
-        defer self.alloc.free(inputs);
+        var inputs = try work_alloc.alloc(segment_mod.MergeInput, segment_indices.len);
+        defer work_alloc.free(inputs);
         for (segment_indices, 0..) |seg_idx, i| {
             const seg = &snap.segments[seg_idx];
             inputs[i] = .{
                 .reader = &seg.reader,
-                .deleted = seg.shared.deleted,
+                .deleted = if (deleted_docs) |frozen| frozen[i] else seg.shared.deleted,
             };
         }
-        const index_sort = try segment_mod.commonIndexSortForMergeInputsAlloc(self.alloc, inputs);
-        defer segment_mod.freeIndexSortFields(self.alloc, index_sort);
+        const index_sort = try segment_mod.commonIndexSortForMergeInputsAlloc(work_alloc, inputs);
+        defer segment_mod.freeIndexSortFields(work_alloc, index_sort);
 
         const path = try store.pathAlloc(new_seg_id);
         defer store.allocator.free(path);
 
-        var writer = try store.storage.beginAtomicWrite(self.alloc, path);
+        var writer = try store.storage.beginAtomicWrite(work_alloc, path);
         var writer_active = true;
         errdefer if (writer_active) writer.abort();
 
-        var sink_adapter = AtomicSegmentSink{ .writer = &writer };
+        var sink_adapter = AtomicSegmentSink.init(work_alloc, &writer);
+        defer sink_adapter.deinit();
         var sink = sink_adapter.sink();
-        try segment_mod.writeMergedSegmentToSinkWithOptions(self.alloc, &sink, inputs, .{
+        try segment_mod.writeMergedSegmentToSinkWithOptions(work_alloc, &sink, inputs, .{
             .index_sort = index_sort,
         });
+        try sink_adapter.flush();
 
         writer_active = false;
         try writer.finish();
@@ -2428,6 +2556,18 @@ fn extractSegmentKeyRange(alloc: Allocator, segment_bytes: []const u8) !SegmentK
     defer reader.deinit();
 
     if (reader.doc_count == 0) return error.EmptySegment;
+
+    if (reader.storedFieldsOmitted()) {
+        const range = (try reader.docKeyRange()) orelse return error.InvalidSegment;
+        const min_doc_key = try alloc.dupe(u8, range.min_key);
+        errdefer alloc.free(min_doc_key);
+        const max_doc_key = try alloc.dupe(u8, range.max_key);
+        return .{
+            .seg_id = 0,
+            .min_doc_key = min_doc_key,
+            .max_doc_key = max_doc_key,
+        };
+    }
 
     var min_key: ?[]u8 = null;
     errdefer if (min_key) |key| alloc.free(key);

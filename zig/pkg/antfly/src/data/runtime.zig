@@ -26,9 +26,9 @@ const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
 const data_raft_batch = @import("raft_batch.zig");
-const platform_clock = @import("../platform/clock.zig");
-const process_memory_mod = @import("../platform/process_memory.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_clock = @import("antfly_platform").clock;
+const process_memory_mod = @import("antfly_platform").process_memory;
+const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const raft_engine = @import("raft_engine");
 
@@ -533,9 +533,12 @@ const RaftTableApplyStateMachine = struct {
         self: *RaftTableApplyStateMachine,
         storage: *antfly.public_api.ProvisionedGroupStorage,
     ) void {
-        // Apply/write replay should not populate the shared query-side LSM
-        // block cache. This keeps indexing memory separate from read caching.
-        self.write_cache.lsm_cache = null;
+        // This resident writer is the preferred freshness-sensitive read
+        // owner. Without the shared cache, its first read decodes and retains
+        // a private index for every LSM run, bypassing both the cache bound and
+        // ResourceManager accounting. The shared cache already evicts ingest
+        // and query entries by budget.
+        self.write_cache.lsm_cache = &storage.lsm_cache;
         self.write_cache.hbc_cache = &storage.hbc_cache;
         self.write_cache.resource_manager = &storage.resource_manager;
         self.write_cache.backend_runtime = storage.backend_runtime;
@@ -928,6 +931,11 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_memtables", "gauge", "Cached write LSM immutable memtables waiting to flush", stats.immutable_memtables);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_entries", "gauge", "Cached write LSM immutable memtable entries waiting to flush", stats.immutable_entries);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_bytes", "gauge", "Cached write LSM immutable memtable estimated bytes waiting to flush", stats.immutable_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_retired_immutable_memtables", "gauge", "Flushed LSM immutable generations retained by exact readers", stats.retired_immutable_memtables);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_retired_immutable_entries", "gauge", "Entries in flushed LSM immutable generations retained by exact readers", stats.retired_immutable_entries);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_retired_immutable_bytes", "gauge", "Actual bytes in flushed LSM immutable generations retained by exact readers", stats.retired_immutable_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_pinned_generations", "gauge", "Immutable LSM generations with one or more exact reader pins", stats.immutable_pinned_generations);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_pin_refs", "gauge", "Exact reader references across immutable LSM generations", stats.immutable_pin_refs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_total_runs", "gauge", "Cached write LSM active run count", stats.total_runs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_total_run_bytes", "gauge", "Cached write LSM active run bytes on disk", stats.total_run_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_snapshot_clone_calls_total", "counter", "LSM mutable snapshot clone calls issued by snapshot reads", stats.mutable_snapshot_clone_calls);
@@ -1134,10 +1142,14 @@ fn writeTextMergeMetrics(writer: *std.Io.Writer, stats: antfly.db.types.TextMerg
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_input_bytes_total", "counter", "Source full-text segment bytes consumed by completed merges", stats.merge_input_bytes_total);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_output_segments_total", "counter", "Output full-text segments published by completed merges", stats.merge_output_segments_total);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_output_bytes_total", "counter", "Output full-text segment bytes published by completed merges", stats.merge_output_bytes_total);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_elapsed_ns_total", "counter", "Total elapsed nanoseconds spent building completed full-text merges", stats.merge_elapsed_ns_total);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_peak_task_alloc_bytes", "gauge", "Largest task-local allocation peak observed across completed full-text merges", stats.merge_peak_task_alloc_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_input_segments", "gauge", "Source full-text segments consumed by the last completed merge", stats.last_merge_input_segments);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_input_bytes", "gauge", "Source full-text segment bytes consumed by the last completed merge", stats.last_merge_input_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_output_segments", "gauge", "Output full-text segments published by the last completed merge", stats.last_merge_output_segments);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_output_bytes", "gauge", "Output full-text segment bytes published by the last completed merge", stats.last_merge_output_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_elapsed_ns", "gauge", "Elapsed nanoseconds spent building the last completed full-text merge", stats.last_merge_elapsed_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_peak_task_alloc_bytes", "gauge", "Task-local allocation peak of the last completed full-text merge", stats.last_merge_peak_task_alloc_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_quarantined_merges", "gauge", "Cached write full-text merge candidates currently quarantined after failure", stats.quarantined_merges);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_quarantined_segments", "gauge", "Cached write full-text source segments currently quarantined after failure", stats.quarantined_segments);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_retry_after_ns", "gauge", "Latest monotonic retry-after timestamp for cached write full-text merge work", stats.retry_after_ns);
@@ -1323,6 +1335,7 @@ fn writeResourceMetrics(writer: *std.Io.Writer, manager: *resource_manager_mod.R
     try writeResourceMetricFamily(writer, snapshot, .hard_limit_bytes, "antfly_resource_hard_limit_bytes", "gauge", "Resource slice hard limit in bytes");
     try writeResourceMetricFamily(writer, snapshot, .soft_limit_events, "antfly_resource_soft_limit_events_total", "counter", "Resource slice soft-limit events");
     try writeResourceMetricFamily(writer, snapshot, .hard_limit_rejections, "antfly_resource_hard_limit_rejections_total", "counter", "Resource slice hard-limit rejections");
+    try writeResourceMetricFamily(writer, snapshot, .oversized_single_grants, "antfly_resource_oversized_single_grants_total", "counter", "Resource slice bounded single-operation grants above the normal hard limit");
     try writeResourceMetricFamily(writer, snapshot, .pressure, "antfly_resource_pressure", "gauge", "Resource slice pressure state, 0 normal, 1 soft, 2 hard");
 }
 
@@ -1355,6 +1368,7 @@ const ResourceMetricField = enum {
     hard_limit_bytes,
     soft_limit_events,
     hard_limit_rejections,
+    oversized_single_grants,
     pressure,
 };
 
@@ -1380,6 +1394,7 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.derived_replay_window,
         resource_manager_mod.Slice.full_text_pending_segments,
         resource_manager_mod.Slice.full_text_build_working_set,
+        resource_manager_mod.Slice.full_text_segment_residency,
         resource_manager_mod.Slice.derived_backlog,
         resource_manager_mod.Slice.text_merge_buffers,
         resource_manager_mod.Slice.algebraic_tensor_accumulators,
@@ -1404,6 +1419,7 @@ fn resourceMetricValue(stats: resource_manager_mod.SliceStats, field: ResourceMe
         .hard_limit_bytes => stats.hard_limit_bytes,
         .soft_limit_events => stats.soft_limit_events,
         .hard_limit_rejections => stats.hard_limit_rejections,
+        .oversized_single_grants => stats.oversized_single_grants,
         .pressure => pressureValue(stats.pressure),
     };
 }
@@ -1432,6 +1448,7 @@ fn writeProcessMemoryMetrics(writer: *std.Io.Writer, stats: process_memory_mod.S
     try health_metrics.appendPromMetric(writer, "antfly_process_anonymous_bytes", "gauge", "Process anonymous resident bytes reported by the operating system", stats.anonymous_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_private_dirty_bytes", "gauge", "Process private dirty bytes reported by the operating system", stats.private_dirty_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_footprint_bytes", "gauge", "Process physical footprint bytes reported by the operating system", stats.footprint_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_process_peak_footprint_bytes", "gauge", "Peak process physical footprint bytes reported by the operating system", stats.peak_footprint_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_wired_bytes", "gauge", "Process wired bytes reported by the operating system", stats.wired_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_pageins_total", "counter", "Process page-ins reported by the operating system", stats.pageins);
     try health_metrics.appendPromMetric(writer, "antfly_process_malloc_available", "gauge", "Whether process malloc zone metrics are available on this platform", if (stats.malloc_available) 1 else 0);
@@ -2746,10 +2763,8 @@ pub const DataServer = struct {
     provisioned_startup_catch_up_not_before_ms: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_mutex: std.atomic.Mutex = .unlocked,
     provisioned_index_repair_owner_id: u64 = 0,
-    provisioned_index_repair_ready: std.atomic.Value(bool) = .init(false),
     provisioned_index_repair_shutdown: std.atomic.Value(bool) = .init(false),
     provisioned_index_repair_active: std.atomic.Value(bool) = .init(false),
-    provisioned_index_repair_resubmit_requested: std.atomic.Value(bool) = .init(false),
     provisioned_index_repair_dirty: std.atomic.Value(bool) = .init(false),
     provisioned_index_repair_last_run_at_ms: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_discovery_interval_ms: u64 = default_provisioned_index_repair_discovery_interval_ms,
@@ -3144,7 +3159,7 @@ pub const DataServer = struct {
             apply_sm.write_source.setLocalIndexRepairDebtHook(self.localIndexRepairDebtHook());
             _ = self.write_source.withLocalWriteOwner(&apply_sm.write_source);
         }
-        self.read_source.primary_lookup_db = self.localPrimaryLookupDbSource();
+        self.read_source.resident_db = self.localResidentDbSource();
         self.write_source.setLocalChangeHook(self.localChangeHook());
         self.write_source.setLocalIndexRepairDebtHook(self.localIndexRepairDebtHook());
         _ = self.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
@@ -3191,9 +3206,6 @@ pub const DataServer = struct {
             self.write_source.source(),
         );
         self.http_server.?.antfly_provider = self.read_source.antfly_provider;
-        // Publish scheduler readiness only after every write-source pointer and
-        // hook target the worker may dereference has been initialized.
-        self.provisioned_index_repair_ready.store(true, .release);
     }
 
     pub fn applyHAReplicationRecord(self: *DataServer, record: antfly.ha.replication_record.RecordView) !void {
@@ -4272,28 +4284,28 @@ pub const DataServer = struct {
         };
     }
 
-    fn localPrimaryLookupDbSource(self: *DataServer) antfly.public_api.table_reads.PrimaryLookupDbSource {
+    fn localResidentDbSource(self: *DataServer) antfly.public_api.table_reads.ResidentDbSource {
         return .{
             .ptr = self,
-            .lease_group = localPrimaryLookupDbLeaseGroup,
+            .lease_group = localResidentDbLeaseGroup,
         };
     }
 
-    fn localPrimaryLookupDbLeaseGroup(
+    fn localResidentDbLeaseGroup(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
         group_id: u64,
         lsm_root_generation: u64,
-    ) !?antfly.public_api.table_reads.PrimaryLookupDbLease {
+    ) !?antfly.public_api.table_reads.ResidentDbLease {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.data_raft_apply) |apply_sm| {
-            const apply_source = apply_sm.write_source.primaryLookupDbSource();
+            const apply_source = apply_sm.write_source.residentDbSource();
             if (try apply_source.leaseGroup(alloc, table_name, group_id, lsm_root_generation)) |lease| {
                 return lease;
             }
         }
-        const write_source = self.write_source.primaryLookupDbSource();
+        const write_source = self.write_source.residentDbSource();
         return try write_source.leaseGroup(alloc, table_name, group_id, lsm_root_generation);
     }
 
@@ -4700,30 +4712,10 @@ pub const DataServer = struct {
     ) void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         switch (action) {
-            .enqueue => {
-                self.enqueueProvisionedIndexRepairForTable(table_name, group_id) catch |err| {
-                    _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
-                    self.provisioned_index_repair_dirty.store(true, .release);
-                    std.log.warn("provisioned index repair debt enqueue failed group={} err={s}", .{ group_id, @errorName(err) });
-                    return;
-                };
-                // Exact durable-debt notifications are the primary wakeup;
-                // the periodic scan is only lost-wakeup recovery. Submission
-                // is bounded and the repair job still performs authoritative
-                // leadership, root-generation, capacity, and activation
-                // fencing before it can mutate an index generation.
-                if (!self.provisioned_index_repair_ready.load(.acquire)) return;
-                self.requestProvisionedIndexRepair() catch |err| switch (err) {
-                    error.BackgroundOwnerClosing => {},
-                    else => {
-                        _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
-                        self.recordProvisionedIndexRepairSchedulerFailure(@intCast(@divTrunc(
-                            platform_time.monotonicNs(),
-                            std.time.ns_per_ms,
-                        )));
-                        std.log.warn("provisioned index repair debt wake failed group={} err={s}", .{ group_id, @errorName(err) });
-                    },
-                };
+            .enqueue => self.enqueueProvisionedIndexRepairForTable(table_name, group_id) catch |err| {
+                _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
+                self.provisioned_index_repair_dirty.store(true, .release);
+                std.log.warn("provisioned index repair debt enqueue failed group={} err={s}", .{ group_id, @errorName(err) });
             },
             .remove => {
                 self.removeProvisionedIndexRepair(group_id);
@@ -6822,21 +6814,14 @@ pub const DataServer = struct {
         // repair state machine observes this at bounded snapshot, catch-up,
         // capacity, and activation boundaries and leaves its durable candidate
         // resumable for the next owner.
-        self.provisioned_index_repair_ready.store(false, .release);
         self.provisioned_index_repair_shutdown.store(true, .release);
         lockAtomic(&self.provisioned_index_repair_mutex);
         const owner_id = self.provisioned_index_repair_owner_id;
         const runtime = self.backend_runtime;
         self.provisioned_index_repair_mutex.unlock();
         if (owner_id != 0) {
-            if (runtime) |active_runtime| {
-                active_runtime.durable_jobs.closeOwner(owner_id);
-                // The job captures `self`; draining is required even when the
-                // BackendRuntime is borrowed and outlives this DataServer.
-                active_runtime.durable_jobs.drainOwner(owner_id);
-            }
+            if (runtime) |active_runtime| active_runtime.durable_jobs.closeOwner(owner_id);
         }
-        self.provisioned_index_repair_resubmit_requested.store(false, .release);
         self.provisioned_index_repair_active.store(false, .release);
     }
 
@@ -7458,14 +7443,7 @@ pub const DataServer = struct {
             self.provisioned_index_repair_last_duration_ns.store(platform_time.monotonicNs() -| started_ns, .monotonic);
         }
 
-        // Standalone/local deployments legitimately have no metadata store
-        // registration but still own provisioned table groups. Domain zero is
-        // the node-local ResourceManager domain; distributed stores continue
-        // to use their stable registered id.
-        const capacity_domain_id: u128 = if (self.store_registration) |registration|
-            registration.store_id
-        else
-            0;
+        const registration = self.store_registration orelse return;
 
         var found_pending = false;
         var attempted = false;
@@ -7713,7 +7691,7 @@ pub const DataServer = struct {
                     // The DB measures the selected index generation. Group disk
                     // bytes above are only a fair-scheduling proxy.
                     .estimated_candidate_bytes = candidate.estimated_bytes,
-                    .capacity_domain_id = capacity_domain_id,
+                    .capacity_domain_id = registration.store_id,
                     .owner_epoch = ownership_fence.owner_epoch,
                     .max_activation_gap_sequences = self.provisioned_index_repair_max_activation_gap_sequences,
                     .max_convergence_rounds = self.provisioned_index_repair_max_convergence_rounds,
@@ -7741,24 +7719,12 @@ pub const DataServer = struct {
                 );
                 continue;
             };
-            // A cooperative busy result is not evidence that durable debt was
-            // cleared: the group may have been unavailable before the DB could
-            // inspect its repair checkpoint. Retain the exact route with a
-            // bounded retry instead of turning ordinary writer contention into
-            // a lost wakeup and a later fleet-discovery scan.
-            const repair_pending = result.index_repair_pending or result.busy;
-            found_pending = found_pending or repair_pending;
+            found_pending = found_pending or result.index_repair_pending;
             if (result.index_repair_disk_wait) {
                 _ = self.provisioned_index_repair_disk_waits.fetchAdd(1, .monotonic);
             }
-            if (repair_pending) {
-                const retry_at_ms = if (result.index_repair_retry_at_ms != 0)
-                    result.index_repair_retry_at_ms
-                else if (result.busy)
-                    now_ms +| provisioned_index_repair_interval_ms
-                else
-                    0;
-                self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, retry_at_ms) catch |err| {
+            if (result.index_repair_pending) {
+                self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, result.index_repair_retry_at_ms) catch |err| {
                     _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
                     self.recordProvisionedIndexRepairSchedulerFailure(now_ms);
                     if (!candidate.queued) {
@@ -8094,7 +8060,6 @@ pub const DataServer = struct {
     }
 
     fn maybeRequestProvisionedIndexRepair(self: *DataServer) !void {
-        if (!self.provisioned_index_repair_ready.load(.acquire)) return;
         if (self.provisioned_index_repair_shutdown.load(.acquire)) return;
         const dirty = self.provisioned_index_repair_dirty.load(.acquire);
         if (self.provisioned_index_repair_active.load(.acquire)) return;
@@ -8111,15 +8076,12 @@ pub const DataServer = struct {
     }
 
     fn requestProvisionedIndexRepair(self: *DataServer) !void {
-        if (!self.provisioned_index_repair_ready.load(.acquire)) return;
         const runtime = try self.ensureBackendRuntime();
+        if (self.provisioned_index_repair_active.load(.acquire)) return;
         lockAtomic(&self.provisioned_index_repair_mutex);
         defer self.provisioned_index_repair_mutex.unlock();
         if (self.provisioned_index_repair_shutdown.load(.acquire)) return error.BackgroundOwnerClosing;
-        if (self.provisioned_index_repair_active.load(.acquire)) {
-            self.provisioned_index_repair_resubmit_requested.store(true, .release);
-            return;
-        }
+        if (self.provisioned_index_repair_active.load(.acquire)) return;
         if (self.provisioned_index_repair_owner_id == 0) {
             self.provisioned_index_repair_owner_id = runtime.allocOwnerId();
         }
@@ -8136,28 +8098,8 @@ pub const DataServer = struct {
 
     fn runProvisionedIndexRepairJob(ptr: *anyopaque) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        defer self.finishProvisionedIndexRepairJob();
+        defer self.provisioned_index_repair_active.store(false, .release);
         self.runProvisionedIndexRepair();
-    }
-
-    fn finishProvisionedIndexRepairJob(self: *DataServer) void {
-        // Serialize the active-to-idle transition with request registration.
-        // An atomic-only fast path can lose a wake when a requester observes
-        // `active`, stalls, and sets the latch after this worker consumes it.
-        lockAtomic(&self.provisioned_index_repair_mutex);
-        self.provisioned_index_repair_active.store(false, .release);
-        const resubmit = self.provisioned_index_repair_resubmit_requested.swap(false, .acq_rel) and
-            !self.provisioned_index_repair_shutdown.load(.acquire);
-        self.provisioned_index_repair_mutex.unlock();
-        if (!resubmit) return;
-        self.requestProvisionedIndexRepair() catch |err| switch (err) {
-            error.BackgroundOwnerClosing => {},
-            else => {
-                _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
-                self.provisioned_index_repair_dirty.store(true, .release);
-                std.log.warn("provisioned index repair resubmit failed err={s}", .{@errorName(err)});
-            },
-        };
     }
 
     fn deinitProvisionedIndexRepairJob(_: *anyopaque) void {}
@@ -8933,10 +8875,10 @@ pub const DataServer = struct {
                     defer activity.deinit();
 
                     var group_ids_one = [_]u64{group_id};
-                    const provision_summary = provision: {
+                    {
                         lockAtomic(refresh_write_source.localDbMutex());
                         defer refresh_write_source.localDbMutex().unlock();
-                        break :provision try refresh_write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
+                        _ = try refresh_write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
                             self.alloc,
                             head.metadata_group_id,
                             group_ids_one[0..],
@@ -8944,19 +8886,8 @@ pub const DataServer = struct {
                             snapshot.ranges,
                             backend_runtime,
                         );
-                    };
-                    try self.provisioned_storage.bumpGroupVisibleRootGenerations(group_ids_one[0..]);
-                    if (provision_summary.indexes_added != 0) {
-                        // Reconciliation opens/adopts the foreground writer in
-                        // order to persist the admission marker and intent. The
-                        // durable repair owner is deliberately isolated from a
-                        // live foreground writer, so retire that cache entry
-                        // before giving the exact group route another wakeup.
-                        // Publish the new visible generation first so the
-                        // repair ownership fence cannot capture the generation
-                        // that provisioning just superseded.
-                        refresh_write_source.handOffProvisionedIndexAdmission(table.name, group_id);
                     }
+                    try self.provisioned_storage.bumpGroupVisibleRootGenerations(group_ids_one[0..]);
                 }
             }
             self.provisioned_storage.read_cache.clear();
@@ -12092,9 +12023,13 @@ test "data runtime live writer source follows raft apply ownership" {
 
     var apply_sm = RaftTableApplyStateMachine.init(std.testing.allocator, "/tmp/unused-antfly-live-writer-source", Catalog.iface(), null);
     defer apply_sm.deinit();
+    var storage = antfly.public_api.ProvisionedGroupStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    apply_sm.attachProvisionedStorage(&storage);
     server.data_raft_apply = &apply_sm;
 
     try std.testing.expectEqual(&apply_sm.write_source, server.liveRuntimeWriteSource());
+    try std.testing.expectEqual(&storage.lsm_cache, apply_sm.write_cache.lsm_cache.?);
 }
 
 test "data raft source split lifecycle commands bypass document db apply" {
@@ -16656,8 +16591,6 @@ test "data runtime repair debt hook targets the affected group queue" {
     try std.testing.expect(server.provisioned_index_repair_group_ages.contains(7001));
     try std.testing.expectEqualStrings("docs", server.provisioned_index_repair_group_ages.get(7001).?.table_name.?);
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_index_repair_queue_depth.load(.monotonic));
-    try std.testing.expect(server.backend_runtime == null);
-    try std.testing.expect(!server.provisioned_index_repair_active.load(.acquire));
 
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .cancel);
     try std.testing.expect(server.provisionedIndexRepairCancellationRequested(7001));
@@ -17910,6 +17843,7 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     const resource_output = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, resource_output, "# HELP antfly_resource_used_bytes") != null);
     try std.testing.expect(std.mem.indexOf(u8, resource_output, "antfly_resource_used_bytes{slice=\"lsm.block_table_cache\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resource_output, "antfly_resource_used_bytes{slice=\"full_text.segment_residency\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, resource_output, "antfly_resource_pressure{slice=\"text_merge.buffers\"}") != null);
 
     var cache = lsm_backend_mod.Cache.init(std.testing.allocator, 1024 * 1024);

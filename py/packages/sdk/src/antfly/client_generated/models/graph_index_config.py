@@ -11,7 +11,6 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.edge_type_config import EdgeTypeConfig
     from ..models.generator_config import GeneratorConfig
-    from ..models.graph_index_source import GraphIndexSource
 
 
 T = TypeVar("T", bound="GraphIndexConfig")
@@ -22,8 +21,6 @@ class GraphIndexConfig:
     """Configuration for graph index type
 
     Attributes:
-        sources (list[GraphIndexSource] | Unset): Chunk or JSON asset artifact streams whose edge-like values are
-            unioned into this graph index.
         summarizer (GeneratorConfig | Unset): A unified configuration for a generative AI provider.
              Example: {'provider': 'openai', 'model': 'gpt-4.1', 'temperature': 0.7, 'max_tokens': 2048}.
         template (str | Unset): Handlebars template for generating summarizer input text.
@@ -35,7 +32,6 @@ class GraphIndexConfig:
         max_edges_per_document (int | Unset): Maximum number of edges per document (0 = unlimited)
     """
 
-    sources: list[GraphIndexSource] | Unset = UNSET
     summarizer: GeneratorConfig | Unset = UNSET
     template: str | Unset = UNSET
     edge_types: list[EdgeTypeConfig] | Unset = UNSET
@@ -43,13 +39,6 @@ class GraphIndexConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        sources: list[dict[str, Any]] | Unset = UNSET
-        if not isinstance(self.sources, Unset):
-            sources = []
-            for sources_item_data in self.sources:
-                sources_item = sources_item_data.to_dict()
-                sources.append(sources_item)
-
         summarizer: dict[str, Any] | Unset = UNSET
         if not isinstance(self.summarizer, Unset):
             summarizer = self.summarizer.to_dict()
@@ -68,8 +57,6 @@ class GraphIndexConfig:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
-        if sources is not UNSET:
-            field_dict["sources"] = sources
         if summarizer is not UNSET:
             field_dict["summarizer"] = summarizer
         if template is not UNSET:
@@ -85,18 +72,8 @@ class GraphIndexConfig:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.edge_type_config import EdgeTypeConfig
         from ..models.generator_config import GeneratorConfig
-        from ..models.graph_index_source import GraphIndexSource
 
         d = dict(src_dict)
-        _sources = d.pop("sources", UNSET)
-        sources: list[GraphIndexSource] | Unset = UNSET
-        if _sources is not UNSET:
-            sources = []
-            for sources_item_data in _sources:
-                sources_item = GraphIndexSource.from_dict(sources_item_data)
-
-                sources.append(sources_item)
-
         _summarizer = d.pop("summarizer", UNSET)
         summarizer: GeneratorConfig | Unset
         if isinstance(_summarizer, Unset):
@@ -118,7 +95,6 @@ class GraphIndexConfig:
         max_edges_per_document = d.pop("max_edges_per_document", UNSET)
 
         graph_index_config = cls(
-            sources=sources,
             summarizer=summarizer,
             template=template,
             edge_types=edge_types,

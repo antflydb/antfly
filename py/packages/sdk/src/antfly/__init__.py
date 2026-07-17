@@ -6,16 +6,6 @@ from .client import AntflyClient
 from .client_generated.models.embedding_type_1 import EmbeddingType1 as SparseEmbedding
 from .client_generated.models.embedding_type_3 import EmbeddingType3 as PackedSparseEmbedding
 from .exceptions import AntflyAuthError, AntflyConnectionError, AntflyException
-from .index_config import (
-    ArtifactEmbeddingSource,
-    GraphArtifactSource,
-    GraphContextMapping,
-    GraphEdgeMapping,
-    GraphNodeMapping,
-    artifact_embedding_index_config,
-    artifact_index_sources,
-    graph_index_sources,
-)
 
 __version__ = "0.1.0"
 
@@ -26,13 +16,5 @@ __all__ = [
     "AntflyAuthError",
     "SparseEmbedding",
     "PackedSparseEmbedding",
-    "ArtifactEmbeddingSource",
-    "GraphArtifactSource",
-    "GraphContextMapping",
-    "GraphEdgeMapping",
-    "GraphNodeMapping",
-    "artifact_embedding_index_config",
-    "artifact_index_sources",
-    "graph_index_sources",
     "__version__",
 ]

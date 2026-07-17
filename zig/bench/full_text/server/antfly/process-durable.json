@@ -1,0 +1,10 @@
+{
+  "engine": "antfly-zig-swarm",
+  "storage": "local Antfly swarm data directory",
+  "write_sync_level": "write",
+  "acknowledgement": "primary database write is durable before acknowledgement; full-text projection is asynchronous",
+  "search_commit": "normal asynchronous full-text projection",
+  "load_final_sync_level": "full_index",
+  "scope": "acknowledged writes must survive an Antfly process restart; host or storage-directory loss is out of scope",
+  "machine_durability_claimed": false
+}

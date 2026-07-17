@@ -114,11 +114,9 @@ embedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
 index, err := antfly.NewArtifactEmbeddingIndexConfig(
     "document_vectors",
     antfly.ArtifactEmbeddingIndexConfig{
-        Sources: []antfly.ArtifactEmbeddingSource{{
-            ArtifactName:       "document_chunk_dense_v1",
-            SourceArtifactName: docsaf.DefaultDocumentChunksArtifact,
-            SourceField:        "text",
-        }},
+        SourceArtifactName: docsaf.DefaultDocumentChunksArtifact,
+        EmbeddingName:      "document_chunk_dense_v1",
+        SourceField:        "text",
         Embedder:           *embedder,
         DistanceMetric:     antfly.DistanceMetricCosine,
     },

@@ -198,7 +198,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
-        .webgpu => return error.UnexpectedWasmBackend,
+        .wasm => return error.UnexpectedWasmBackend,
     };
     const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
     const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
@@ -506,7 +506,7 @@ fn writeCompiledArtifact(
         freeShapeSlices(allocator, pjrt_output_shapes);
     }
 
-    const implicit_whole_model_xla_executable = opts.backend == .pjrt and
+    const implicit_whole_model_xla_executable = opts.backend == .xla and
         !selection.is_partial_artifact and
         !opts.xla_artifact_kind_explicit and
         opts.xla_artifact_kind == .hlo and
@@ -584,7 +584,7 @@ fn writeCompiledArtifact(
                 });
             }
         },
-        .pjrt => {
+        .xla => {
             if (comptime build_options.enable_pjrt) {
                 const semantic_kv_bindings = !selection.is_partial_artifact and !std.mem.eql(u8, attention_mode, "full_recompute");
                 const semantic_kv_inputs = semantic_kv_bindings and std.mem.eql(u8, attention_mode, "paged_decode");
@@ -665,7 +665,7 @@ fn writeCompiledArtifact(
         .{
             .kind = artifactKind(opts.backend, selection.is_partial_artifact, resolved_xla_artifact_kind),
             .artifact_role = opts.artifact_role orelse artifactRole(attention_mode),
-            .backend = compiledArtifactBackendName(opts.backend),
+            .backend = @tagName(opts.backend),
             .model_dir = opts.model_dir,
             .artifact_path = artifact_path,
             .source_path = "",
@@ -692,15 +692,15 @@ fn writeCompiledArtifact(
             .pjrt_output_shapes = pjrt_output_shapes,
         },
     );
-    const refreshed_package = if (!selection.is_partial_artifact and (opts.backend == .pjrt or opts.backend == .onnx))
+    const refreshed_package = if (!selection.is_partial_artifact and (opts.backend == .xla or opts.backend == .onnx))
         try refreshWholeModelPackageManifest(
             allocator,
             io,
             std.fs.path.dirname(manifest_path) orelse ".",
-            compiledArtifactBackendName(opts.backend),
+            @tagName(opts.backend),
             opts.model_dir,
             artifactKind(opts.backend, selection.is_partial_artifact, resolved_xla_artifact_kind),
-            if (opts.backend == .pjrt) switch (opts.xla_parameter_mode) {
+            if (opts.backend == .xla) switch (opts.xla_parameter_mode) {
                 .embedded => compiled_artifact.pjrt_parameter_mode_embedded,
                 .inputs => compiled_artifact.pjrt_parameter_mode_inputs,
             } else null,
@@ -808,7 +808,7 @@ fn writeWholeModelPjrtPackageArtifacts(
     defer allocator.free(package_path);
     printCompiledPackageSummary(
         "xla",
-        artifactKind(.pjrt, false, prefill_result.xla_artifact_kind),
+        artifactKind(.xla, false, prefill_result.xla_artifact_kind),
         package_path,
         1 + (max_decode_seq_len - prefill_seq_len),
         1,
@@ -822,7 +822,7 @@ fn validateWholeModelPjrtPackageRequest(
     prefill_seq_len: usize,
     max_decode_seq_len: usize,
 ) !void {
-    if (opts.backend != .pjrt) return error.UnsupportedCompileBackend;
+    if (opts.backend != .xla) return error.UnsupportedCompileBackend;
     if (opts.output_path != null) return error.InvalidArguments;
     if (is_partial_artifact) return error.InvalidArguments;
     if (opts.artifact_role != null and !std.mem.eql(u8, opts.artifact_role.?, compiled_artifact.artifact_role_prefill)) {
@@ -862,7 +862,7 @@ fn wholeModelPjrtPackageManifestPath(
         artifact_dir,
         "xla",
         model_dir,
-        artifactKind(.pjrt, false, xla_artifact_kind),
+        artifactKind(.xla, false, xla_artifact_kind),
         switch (parameter_mode) {
             .embedded => compiled_artifact.pjrt_parameter_mode_embedded,
             .inputs => compiled_artifact.pjrt_parameter_mode_inputs,
@@ -894,7 +894,7 @@ fn writeWholeModelPjrtArtifactForShape(
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
-        .webgpu => return error.UnexpectedWasmBackend,
+        .wasm => return error.UnexpectedWasmBackend,
     };
     const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
     const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
@@ -1111,15 +1111,7 @@ fn deinitOwnedPartition(allocator: std.mem.Allocator, part: *const graph_mod.par
 fn compileBackendKind(choice: BackendChoice) ops.BackendKind {
     return switch (choice) {
         .onnx => .onnx,
-        .pjrt => .pjrt,
-        else => unreachable,
-    };
-}
-
-fn compiledArtifactBackendName(choice: BackendChoice) []const u8 {
-    return switch (choice) {
-        .onnx => "onnx",
-        .pjrt => "xla",
+        .xla => .pjrt,
         else => unreachable,
     };
 }
@@ -1561,7 +1553,7 @@ fn buildWholeModelSelectionForShape(
         .metal => .metal,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
-        .webgpu => return error.UnexpectedWasmBackend,
+        .wasm => return error.UnexpectedWasmBackend,
         else => return error.UnexpectedBackend,
     };
     const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
@@ -1615,7 +1607,7 @@ fn buildWholeModelSelectionForShape(
         .part = try buildWholeGraphPartition(
             allocator,
             &entry.graph,
-            compileBackendKind(.pjrt),
+            compileBackendKind(.xla),
             false,
         ),
     };
@@ -1792,13 +1784,13 @@ fn defaultOutputPath(
     const stem = std.fs.path.basename(model_dir);
     const ext = switch (backend) {
         .onnx => "onnx",
-        .pjrt => switch (xla_artifact_kind) {
+        .xla => switch (xla_artifact_kind) {
             .hlo => "hlo",
             .executable => "pjrt_exec",
         },
         else => return error.UnsupportedCompileBackend,
     };
-    const artifact_dir = try compiled_artifact.defaultArtifactDirForModel(allocator, model_dir, compiledArtifactBackendName(backend));
+    const artifact_dir = try compiled_artifact.defaultArtifactDirForModel(allocator, model_dir, @tagName(backend));
     defer allocator.free(artifact_dir);
     const prefix = if (output_label) |label|
         try std.fmt.allocPrint(allocator, "{s}.{s}", .{ stem, label })
@@ -1834,7 +1826,7 @@ fn updateDefaultXlaOutputPathForResolvedKind(
     const next_path = try defaultOutputPath(
         allocator,
         model_dir,
-        .pjrt,
+        .xla,
         xla_artifact_kind,
         partition_index,
         output_label,
@@ -1929,7 +1921,7 @@ fn resolveXlaArtifactKind(
     explicit_kind: bool,
     is_partial_artifact: bool,
 ) !PjrtArtifactExportKind {
-    if (backend != .pjrt) return requested_kind;
+    if (backend != .xla) return requested_kind;
     if (explicit_kind or is_partial_artifact or requested_kind != .hlo) return requested_kind;
     const executable_supported = try pjrtLoadOnlyExecutableArtifactsSupported(allocator);
     return defaultWholeModelXlaArtifactKind(
@@ -1943,7 +1935,7 @@ fn resolveXlaArtifactKind(
 fn artifactKind(backend: BackendChoice, is_partition: bool, xla_artifact_kind: PjrtArtifactExportKind) []const u8 {
     return switch (backend) {
         .onnx => if (is_partition) "onnx_partition_graph" else "onnx_graph",
-        .pjrt => xlaArtifactKind(xla_artifact_kind, is_partition),
+        .xla => xlaArtifactKind(xla_artifact_kind, is_partition),
         else => unreachable,
     };
 }
@@ -2107,7 +2099,7 @@ fn validateCompileBackend(choice: BackendChoice) !void {
     try native_backend_choice.validate(choice);
     switch (choice) {
         .onnx => {},
-        .pjrt => if (!build_options.enable_pjrt) return error.BackendUnavailable,
+        .xla => if (!build_options.enable_pjrt) return error.BackendUnavailable,
         else => return error.UnsupportedCompileBackend,
     }
 }
@@ -2264,7 +2256,7 @@ fn parsePjrtParameterExportMode(raw: []const u8) ?PjrtParameterExportMode {
 
 pub fn printUsage() void {
     print(
-        \\usage: antfly inference compile-artifact <model-dir> <prompt> [--backend onnx|pjrt] [--attention-mode auto|full_recompute|paged_prefill|paged_decode] [--onnx-weight-mode dense|q8_0_weight_only] [--onnx-weight-policy SUBSTRING=MODE] [--onnx-reuse-initializers-from <artifact.onnx>] [--onnx-import-from <semantic-decoder.onnx>] [--onnx-semantic-entrypoint] [--artifact-role prefill|decode] [--xla-artifact-kind hlo|executable] [--xla-parameter-mode embedded|inputs] [--xla-package-decode-max-seq-len N] [--debug-output-node N] [--output <path>] [--list-partitions] [--list-op-nodes <op>] [--list-node-window N] [--list-node-window-radius N] [--best-partition] [--partition-index N] [--node-index N] [--node-range START END] [--node-closure] [--node-neighborhood N] [--seq-len N] [--query-seq-len N] [--no-chat-template] [--raw-prompt]
+        \\usage: antfly inference compile-artifact <model-dir> <prompt> [--backend onnx|xla] [--attention-mode auto|full_recompute|paged_prefill|paged_decode] [--onnx-weight-mode dense|q8_0_weight_only] [--onnx-weight-policy SUBSTRING=MODE] [--onnx-reuse-initializers-from <artifact.onnx>] [--onnx-import-from <semantic-decoder.onnx>] [--onnx-semantic-entrypoint] [--artifact-role prefill|decode] [--xla-artifact-kind hlo|executable] [--xla-parameter-mode embedded|inputs] [--xla-package-decode-max-seq-len N] [--debug-output-node N] [--output <path>] [--list-partitions] [--list-op-nodes <op>] [--list-node-window N] [--list-node-window-radius N] [--best-partition] [--partition-index N] [--node-index N] [--node-range START END] [--node-closure] [--node-neighborhood N] [--seq-len N] [--query-seq-len N] [--no-chat-template] [--raw-prompt]
         \\
         \\Compiles a traced generation graph into an offline artifact for a concrete shape.
         \\  default artifact dir mirrors model layout: ~/.antfly/inference/artifacts/<owner>/<model>/<backend>/...
@@ -2280,7 +2272,7 @@ pub fn printUsage() void {
         \\  xla-package-decode-max-seq-len compiles one whole-model PJRT prefill artifact plus contiguous decode buckets through seq_len=N
         \\  whole-model ONNX/XLA compiles refresh and print a package manifest beside the emitted artifacts
         \\  debug-output-node marks one traced node as an additional ONNX graph output; repeat for multiple nodes
-        \\  backend=pjrt   emits serialized HLO or a plugin-native executable plus PJRT binding metadata
+        \\  backend=xla    emits serialized HLO or a plugin-native executable plus PJRT binding metadata
         \\  list-partitions prints traced backend partitions for the selected shape and exits
         \\  list-op-nodes prints traced node IDs matching an op tag and exits
         \\  list-node-window prints a traced node window around one node ID and exits
@@ -2473,7 +2465,7 @@ test "validateWholeModelPjrtPackageRequest accepts whole-model prefill package r
     var opts = Options{
         .model_dir = "/tmp/model",
         .prompt = "hello",
-        .backend = .pjrt,
+        .backend = .xla,
         .attention_mode = .paged_prefill,
         .query_seq_len = 8,
         .seq_len = 8,
@@ -2488,7 +2480,7 @@ test "validateWholeModelPjrtPackageRequest rejects invalid package requests" {
     const base = Options{
         .model_dir = "/tmp/model",
         .prompt = "hello",
-        .backend = .pjrt,
+        .backend = .xla,
         .attention_mode = .paged_prefill,
         .query_seq_len = 8,
         .seq_len = 8,
@@ -2533,7 +2525,7 @@ test "validateWholeModelPjrtPackageRequest rejects invalid package requests" {
 }
 
 test "updateDefaultXlaOutputPathForResolvedKind swaps XLA default extension" {
-    var path = try defaultOutputPath(std.testing.allocator, "/tmp/model-dir", .pjrt, .executable, null, null, 4, 1, "paged_decode");
+    var path = try defaultOutputPath(std.testing.allocator, "/tmp/model-dir", .xla, .executable, null, null, 4, 1, "paged_decode");
     defer std.testing.allocator.free(path);
     try updateDefaultXlaOutputPathForResolvedKind(
         std.testing.allocator,
@@ -2579,20 +2571,20 @@ test "defaultOutputPath matches backend extension" {
     defer std.testing.allocator.free(node_path);
     try std.testing.expect(std.mem.endsWith(u8, node_path, "model-dir/onnx/model-dir.node9.fused_gqa_causal_attention.paged_prefill.s1.q1.onnx"));
 
-    const xla_path = try defaultOutputPath(std.testing.allocator, "/tmp/model-dir", .pjrt, .hlo, null, null, 1, 1, "paged_decode");
+    const xla_path = try defaultOutputPath(std.testing.allocator, "/tmp/model-dir", .xla, .hlo, null, null, 1, 1, "paged_decode");
     defer std.testing.allocator.free(xla_path);
     try std.testing.expect(std.mem.endsWith(u8, xla_path, "tmp/model-dir/xla/model-dir.paged_decode.s1.q1.hlo"));
 
-    const xla_exec_path = try defaultOutputPath(std.testing.allocator, "/tmp/model-dir", .pjrt, .executable, null, null, 1, 1, "paged_decode");
+    const xla_exec_path = try defaultOutputPath(std.testing.allocator, "/tmp/model-dir", .xla, .executable, null, null, 1, 1, "paged_decode");
     defer std.testing.allocator.free(xla_exec_path);
     try std.testing.expect(std.mem.endsWith(u8, xla_exec_path, "tmp/model-dir/xla/model-dir.paged_decode.s1.q1.pjrt_exec"));
 }
 
 test "PJRT artifact kind distinguishes HLO and executable partitions" {
-    try std.testing.expectEqualStrings("pjrt_hlo", artifactKind(.pjrt, false, .hlo));
-    try std.testing.expectEqualStrings("pjrt_partition_hlo", artifactKind(.pjrt, true, .hlo));
-    try std.testing.expectEqualStrings("pjrt_executable", artifactKind(.pjrt, false, .executable));
-    try std.testing.expectEqualStrings("pjrt_partition_executable", artifactKind(.pjrt, true, .executable));
+    try std.testing.expectEqualStrings("pjrt_hlo", artifactKind(.xla, false, .hlo));
+    try std.testing.expectEqualStrings("pjrt_partition_hlo", artifactKind(.xla, true, .hlo));
+    try std.testing.expectEqualStrings("pjrt_executable", artifactKind(.xla, false, .executable));
+    try std.testing.expectEqualStrings("pjrt_partition_executable", artifactKind(.xla, true, .executable));
 }
 
 test "PJRT executable export budget only gates whole-model artifacts" {

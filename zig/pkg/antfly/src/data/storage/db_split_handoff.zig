@@ -1532,8 +1532,9 @@ test "db split status uses source acknowledgement without opening destination" {
         .source_store = &source,
         .progress_db = &progress,
     });
-    try std.testing.expectEqual(SplitTransitionPhase.rolled_back, status.phase);
+    try std.testing.expectEqual(SplitTransitionPhase.finalized, status.phase);
     try std.testing.expect(status.bootstrapped);
+    try std.testing.expect(status.destination_ready_for_reads);
 }
 
 test "db split sync coordinator tracks explicit split transition phases" {
@@ -1566,6 +1567,7 @@ test "db split sync coordinator tracks explicit split transition phases" {
         .dest_root_dir = dst_root,
         .source_group_id = 131,
         .dest_group_id = 132,
+        .source_store = &source,
     });
     defer coord.deinit();
 
@@ -1658,6 +1660,7 @@ test "db split sync coordinator can start source split from prepare" {
         .dest_root_dir = dst_root,
         .source_group_id = 133,
         .dest_group_id = 134,
+        .source_store = &source,
     });
     defer coord.deinit();
 

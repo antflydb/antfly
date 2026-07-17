@@ -19,6 +19,7 @@ pub const roaring = @import("encoding/roaring.zig");
 pub const vellum = @import("antfly_vellum");
 pub const snappy = @import("encoding/snappy.zig");
 pub const streamvbyte = @import("encoding/streamvbyte.zig");
+pub const simd_bitpack = @import("encoding/simd_bitpack.zig");
 pub const chunked_coder = @import("encoding/chunked_coder.zig");
 
 // Vector math & quantization
@@ -132,8 +133,8 @@ pub const synthesizing = @import("antfly_synthesizing");
 pub const asset_producer_runtime = @import("asset_producer_runtime.zig");
 
 // Storage backends
-pub const platform_clock = @import("platform/clock.zig");
-pub const platform_time = @import("platform/time.zig");
+pub const platform_clock = @import("antfly_platform").clock;
+pub const platform_time = @import("antfly_platform").time;
 pub const storage_backend = @import("storage/backend_types.zig");
 pub const storage_backend_erased = @import("storage/backend_erased.zig");
 pub const storage_maintenance = @import("storage/maintenance.zig");
@@ -179,6 +180,7 @@ test {
     _ = vellum;
     _ = snappy;
     _ = streamvbyte;
+    _ = simd_bitpack;
     _ = chunked_coder;
 
     // Vector

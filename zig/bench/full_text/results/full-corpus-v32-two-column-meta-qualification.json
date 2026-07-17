@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "status": "accepted_with_remaining_impact_header_and_query_cpu_gap",
+  "comparison_boundary": "settled_persisted_search_index_only",
+  "corpus": {
+    "documents": 5032105,
+    "normalized_bytes": 8473678432,
+    "sha256": "9078d9ea4783ab764fe246046efdc8062692f07afdd7c8749a74ebfe05c51ff4"
+  },
+  "format": {
+    "wire_version": 32,
+    "accepted_reader_versions": [23, 32],
+    "branch_only_rejected_versions": [24, 25, 26, 27, 28, 29, 30, 31],
+    "postings_per_payload_block": 128,
+    "chunk_metadata_columns": ["absolute_max_doc", "payload_end_delta"],
+    "derived_chunk_metadata": ["chunk_ordinal", "document_count"],
+    "impact_range_documents": 1024,
+    "single_document_postings": "inline_frequency_and_positions",
+    "stored_fields": "omitted_for_index_only_kernel_segments",
+    "merge_output": "term_streamed_through_1MiB_file_sink_buffer"
+  },
+  "correctness": {
+    "ok": true,
+    "queries": 5,
+    "strict_matches": 5,
+    "tie_aware_matches": 0
+  },
+  "settled_layout": {
+    "segments": 10,
+    "completed_merges": 267,
+    "pending_segments": 0,
+    "in_flight_merges": 0,
+    "failed_merges": 0,
+    "quarantined_merges": 0
+  },
+  "index_size": {
+    "antfly_bytes": 3440527184,
+    "tantivy_bytes": 3251494143,
+    "gap_bytes": 189033041,
+    "antfly_to_tantivy_ratio": 1.058137285,
+    "v31_bytes": 3459488164,
+    "reduction_from_v31_bytes": 18960980,
+    "reduction_from_v31_percent": 0.548086
+  },
+  "antfly_components": {
+    "stored_fields": 50,
+    "inverted": 3420396680,
+    "norms": 5032155,
+    "term_dictionary": 85959688,
+    "bloom": 24903880,
+    "postings": 3304500627,
+    "postings_header": 77580937,
+    "impact_records": 173392556,
+    "chunk_metadata": 43793372,
+    "doc_frequency_payload": 1131192527,
+    "positions": 1845350267,
+    "skip": 3102432,
+    "ordinals": 20128470,
+    "section_index": 1170,
+    "postings_terms": 12456319,
+    "single_document_postings_terms": 7743179,
+    "document_term_postings": 622897189
+  },
+  "indexing": {
+    "antfly_elapsed_ns": 422980135000,
+    "antfly_cpu_ns": 409339018000,
+    "antfly_peak_rss_bytes": 2250964992,
+    "repeat_attributed_peak_rss_bytes": 2097807360,
+    "repeat_peak_merge_output_bytes": 780247743,
+    "repeat_peak_merge_physical_footprint_bytes": 310725728,
+    "tantivy_reference_elapsed_ns": 550244512584,
+    "tantivy_reference_peak_rss_bytes": 2810429440,
+    "antfly_to_tantivy_elapsed_ratio": 0.768713,
+    "worst_antfly_to_tantivy_peak_rss_ratio": 0.800933,
+    "worst_peak_rss_advantage_bytes": 559464448,
+    "merge_input_bytes": 18579287802,
+    "merge_output_bytes": 17835044149
+  },
+  "query_resources": {
+    "minimum_wall_seconds_per_class": 3,
+    "antfly_cpu_per_query_ns": {
+      "term": 94859,
+      "union": 268036,
+      "intersection": 245354,
+      "phrase": 601309
+    },
+    "tantivy_reference_cpu_per_query_ns": {
+      "term": 40028,
+      "union": 213284,
+      "intersection": 248616,
+      "phrase": 344910
+    },
+    "antfly_to_tantivy_cpu_ratio": {
+      "term": 2.369816,
+      "union": 1.256709,
+      "intersection": 0.986879,
+      "phrase": 1.743379
+    },
+    "antfly_peak_rss_bytes": 23347200
+  },
+  "decision": {
+    "production_default": "accept_v32_two_column_posting_count_metadata",
+    "remaining_gap": "The net persisted gap is 189.0 MB (5.8 percent). Positions remain smaller than Tantivy. Remaining Antfly-specific overhead is led by 173.4 MB of exact impact records, 77.6 MB of per-term headers, and 43.8 MB of chunk metadata, partly offset by denser positions and the omitted store.",
+    "memory_attribution": "The conservative uninstrumented peak is 2.251 GB. An identical-layout repeat peaked at 2.098 GB; its largest 780.2 MB merge had only 310.7 MB physical footprint, proving the peak variance is mapped input/output page residency rather than v32 metadata heap growth.",
+    "next_size_priority": "Remove derivable per-term header values and evaluate an exact adaptive impact representation without weakening WAND bounds.",
+    "query_priority": "Term and phrase remain 2.37x and 1.74x Tantivy; profile dictionary/query setup and arbitrary-bit positional decode before another codec tradeoff.",
+    "source_artifact": "/private/tmp/antfly-wiki-full-production-v32-two-column-meta",
+    "memory_attribution_artifact": "/private/tmp/antfly-wiki-full-production-v32-rss-attribution",
+    "cross_engine_artifact": "/private/tmp/antfly-wiki-full-production-v32-cross-engine"
+  }
+}

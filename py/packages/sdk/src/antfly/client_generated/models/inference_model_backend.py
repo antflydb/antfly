@@ -7,8 +7,9 @@ class InferenceModelBackend(str, Enum):
     METAL = "metal"
     NATIVE = "native"
     ONNX = "onnx"
-    PJRT = "pjrt"
+    WASM = "wasm"
     WEBGPU = "webgpu"
+    XLA = "xla"
 
     def __str__(self) -> str:
         return str(self.value)

@@ -53,8 +53,6 @@ pub const LoadedVisionReader = struct {
         model_path: []const u8,
         session_manager: *backends.SessionManager,
         model_manager: *model_manager_mod.ModelManager,
-        request_id: ?u64,
-        artifact_selection: manifest_mod.ArtifactSelection,
     ) !LoadedVisionReader {
         const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
 
@@ -65,15 +63,7 @@ pub const LoadedVisionReader = struct {
             return loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, loadPreprocessorConfig(allocator, model_path), session_manager);
         } else |_| {}
 
-        const model = if (request_id) |id|
-            if (!artifact_selection.isEmpty())
-                try model_manager.loadArtifactFromDirForRequest(id, model_path, artifact_selection, null)
-            else
-                try model_manager.loadFromDirForRequest(id, model_path)
-        else if (!artifact_selection.isEmpty())
-            try model_manager.loadArtifactFromDir(model_path, artifact_selection, null)
-        else
-            try model_manager.loadFromDir(model_path);
+        const model = try model_manager.loadFromDir(model_path);
         const florence_config = session_factory.getFlorenceConfig(model.session) orelse return error.InvalidModelForReading;
         const preproc_path = model.manifest.preprocessor_config_path orelse return error.IncompleteFlorence2Bundle;
         const preproc = try loadPreprocessorConfigFile(allocator, preproc_path);

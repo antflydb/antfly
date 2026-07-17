@@ -17,7 +17,7 @@ const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const lsm_backend = @import("../../lsm_backend/mod.zig");
-const platform_time = @import("../../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const supports_native_derived_log = builtin.os.tag != .freestanding;
 const wal = if (supports_native_derived_log) @import("../../wal.zig") else struct {
     pub const CommitBackend = enum {

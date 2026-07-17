@@ -54,8 +54,8 @@ const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const docstore_mod = @import("../storage/docstore.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
-const platform_clock = @import("../platform/clock.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_clock = @import("antfly_platform").clock;
+const platform_time = @import("antfly_platform").time;
 const usermgr = @import("../usermgr/mod.zig");
 const casbin = @import("antfly_casbin");
 

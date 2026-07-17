@@ -17,7 +17,7 @@ const metadata = @import("../metadata/mod.zig");
 const shard_ops = @import("shard_ops.zig");
 const transition_runtime = @import("transition_runtime.zig");
 const data = @import("../data/mod.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const raft_state_machine = @import("state_machine/mod.zig");
 
 const transition_retry_initial_ms: u64 = 100;

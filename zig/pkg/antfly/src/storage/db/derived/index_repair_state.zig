@@ -15,7 +15,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../../common/fs_paths.zig");
 const platform_sync = @import("antfly_platform").sync;
-const platform_time = @import("../../../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const types = @import("../types.zig");
 
 const file_name = "index_repair.checkpoint";
@@ -111,10 +111,9 @@ pub const IndexRepairIntent = struct {
     previous_active_relative_path: ?[]u8 = null,
     detected_sequence: u64,
     build_floor_sequence: u64 = 0,
-    /// Last source-store key durably incorporated into either admission's
-    /// generated-enrichment replay (`detected`) or a reopenable building
-    /// candidate (`building`). Resume scans begin strictly after this key. The
-    /// cumulative count is diagnostic/accounting state, not correctness state.
+    /// Last source-store key durably incorporated into a reopenable building
+    /// candidate. Resume scans begin strictly after this key. The cumulative
+    /// count is diagnostic/accounting state and is not used for correctness.
     build_resume_key: ?[]u8 = null,
     build_reprocessed: u64 = 0,
     candidate_applied_sequence: u64 = 0,
@@ -527,10 +526,8 @@ fn validateEntry(entry: Entry) !void {
     }
     if (intent.last_error) |value| if (value.len > max_error_bytes) return error.InvalidIndexRepairState;
     if (intent.build_resume_key) |value| {
-        const admission_replay_cursor = intent.trigger == .incomplete_bulk_publish and
-            intent.phase == .detected;
         if (value.len == 0 or value.len > max_build_resume_key_bytes or
-            (intent.candidate_relative_path == null and !admission_replay_cursor))
+            intent.candidate_relative_path == null)
         {
             return error.InvalidIndexRepairState;
         }

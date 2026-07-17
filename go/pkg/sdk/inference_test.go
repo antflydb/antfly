@@ -614,57 +614,6 @@ func TestClient_Rerank_ServiceUnavailable(t *testing.T) {
 	assert.Contains(t, err.Error(), "service unavailable")
 }
 
-func TestClient_InferenceConvenienceMethods_ServiceUnavailable(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "MODEL_CAPACITY_REACHED"})
-	}))
-	defer server.Close()
-
-	inferenceClient, err := NewInferenceClient(server.URL, nil)
-	require.NoError(t, err)
-
-	tests := map[string]func() error{
-		"embed": func() error {
-			_, err := inferenceClient.Embed(context.Background(), "model", []string{"text"})
-			return err
-		},
-		"embed multimodal": func() error {
-			_, err := inferenceClient.EmbedMultimodal(context.Background(), "model", nil)
-			return err
-		},
-		"embed JSON": func() error {
-			_, err := inferenceClient.EmbedJSON(context.Background(), "model", []string{"text"})
-			return err
-		},
-		"chunk": func() error {
-			_, err := inferenceClient.Chunk(context.Background(), "text", ChunkConfig{})
-			return err
-		},
-		"chunk media": func() error {
-			_, err := inferenceClient.ChunkMedia(context.Background(), []byte("media"), "audio/wav", MediaChunkConfig{})
-			return err
-		},
-		"sparse embed": func() error {
-			_, err := inferenceClient.SparseEmbed(context.Background(), "model", []string{"text"})
-			return err
-		},
-		"sparse embed JSON": func() error {
-			_, err := inferenceClient.SparseEmbedJSON(context.Background(), "model", []string{"text"})
-			return err
-		},
-	}
-
-	for name, call := range tests {
-		t.Run(name, func(t *testing.T) {
-			err := call()
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), "service unavailable: MODEL_CAPACITY_REACHED")
-		})
-	}
-}
-
 func TestClient_ListModels(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/ai/v1/models", r.URL.Path)

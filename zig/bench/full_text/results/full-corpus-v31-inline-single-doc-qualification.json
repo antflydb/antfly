@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "status": "accepted_with_remaining_postings_metadata_and_query_cpu_gap",
+  "comparison_boundary": "settled_persisted_search_index_only",
+  "corpus": {
+    "documents": 5032105,
+    "normalized_bytes": 8473678432,
+    "sha256": "9078d9ea4783ab764fe246046efdc8062692f07afdd7c8749a74ebfe05c51ff4"
+  },
+  "format": {
+    "wire_version": 31,
+    "accepted_reader_versions": [23, 31],
+    "branch_only_rejected_versions": [24, 25, 26, 27, 28, 29, 30],
+    "postings_per_payload_block": 128,
+    "impact_range_documents": 1024,
+    "position_width_group_documents": 8,
+    "single_document_postings": "zero_doc_frequency_discriminator_then_absolute_doc_freq_locs_and_packed_position_deltas",
+    "stored_fields": "omitted_for_index_only_kernel_segments",
+    "merge_output": "term_streamed_through_1MiB_file_sink_buffer"
+  },
+  "correctness": {
+    "ok": true,
+    "queries": 5,
+    "strict_matches": 5,
+    "tie_aware_matches": 0
+  },
+  "settled_layout": {
+    "segments": 10,
+    "completed_merges": 267,
+    "pending_segments": 0,
+    "in_flight_merges": 0,
+    "failed_merges": 0,
+    "quarantined_merges": 0
+  },
+  "index_size": {
+    "antfly_bytes": 3459488164,
+    "tantivy_bytes": 3251494143,
+    "gap_bytes": 207994021,
+    "antfly_to_tantivy_ratio": 1.063968752,
+    "v30_bytes": 3614059644,
+    "reduction_from_v30_bytes": 154571480,
+    "reduction_from_v30_percent": 4.276949
+  },
+  "antfly_components": {
+    "stored_fields": 50,
+    "inverted": 3439357660,
+    "norms": 5032155,
+    "term_dictionary": 88266677,
+    "bloom": 23331016,
+    "postings": 3322727482,
+    "postings_header": 79660763,
+    "impact_records": 170987968,
+    "chunk_metadata": 63879433,
+    "doc_frequency_payload": 1130549224,
+    "positions": 1845577571,
+    "skip": 3045792,
+    "ordinals": 20128470,
+    "section_index": 1170,
+    "postings_terms": 12785909,
+    "single_document_postings_terms": 7957061,
+    "document_term_postings": 622897189
+  },
+  "indexing": {
+    "antfly_elapsed_ns": 429848497000,
+    "antfly_cpu_ns": 412446643000,
+    "antfly_peak_rss_bytes": 1762033664,
+    "tantivy_reference_elapsed_ns": 550244512584,
+    "tantivy_reference_peak_rss_bytes": 2810429440,
+    "antfly_to_tantivy_elapsed_ratio": 0.781195,
+    "antfly_to_tantivy_peak_rss_ratio": 0.626962,
+    "peak_rss_advantage_bytes": 1048395776,
+    "merge_input_bytes": 18363116373,
+    "merge_output_bytes": 17547596485
+  },
+  "query_resources": {
+    "minimum_wall_seconds_per_class": 3,
+    "antfly_cpu_per_query_ns": {
+      "term": 98770,
+      "union": 253269,
+      "intersection": 234926,
+      "phrase": 591218
+    },
+    "tantivy_reference_cpu_per_query_ns": {
+      "term": 40028,
+      "union": 213284,
+      "intersection": 248616,
+      "phrase": 344910
+    },
+    "antfly_to_tantivy_cpu_ratio": {
+      "term": 2.467523,
+      "union": 1.187473,
+      "intersection": 0.944935,
+      "phrase": 1.714123
+    },
+    "antfly_peak_rss_bytes": 23511040,
+    "change_from_v30_percent": {
+      "term": -3.438365,
+      "union": -4.496348,
+      "intersection": -2.507387,
+      "phrase": -3.945397
+    }
+  },
+  "decision": {
+    "production_default": "accept_v31_inline_single_document_postings",
+    "remaining_gap": "The net persisted gap is 208.0 MB (6.4 percent). Positions are approximately 84.6 MB smaller than Tantivy; remaining Antfly overhead is concentrated in 171.0 MB of impact records, 79.7 MB of per-term headers, and 63.9 MB of chunk metadata, partly offset by the denser positions and omitted store.",
+    "next_size_priority": "Remove derivable posting-count header fields and chunk-id/doc-count metadata columns, then evaluate exact adaptive impact layouts without weakening pruning.",
+    "query_priority": "Profile and reduce term dictionary/setup cost and recover phrase decoder CPU while retaining the v30/v31 dense position representation.",
+    "source_artifact": "/private/tmp/antfly-wiki-full-production-v31-inline-single",
+    "cross_engine_artifact": "/private/tmp/antfly-wiki-full-production-v31-cross-engine"
+  }
+}
