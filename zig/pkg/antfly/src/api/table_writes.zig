@@ -9194,9 +9194,13 @@ pub const ProvisionedTableWriteSource = struct {
             // The structural metadata publication can advance the visible
             // root immediately after this operation returns. The resident DB
             // already contains the reconciled schema, so allow the next lease
-            // to adopt that publication instead of leaving a permanently
-            // mismatched writer that returns ReadUnavailable.
-            if (cached.entry) |entry| entry.allow_generation_adoption = true;
+            // (including a status lease racing the publication) to adopt that
+            // generation instead of leaving a permanently mismatched writer
+            // that returns ReadUnavailable or stale runtime coverage.
+            if (cached.entry) |entry| {
+                entry.allow_generation_adoption = true;
+                entry.allow_active_generation_adoption = true;
+            }
             return false;
         }
 
