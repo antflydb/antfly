@@ -1264,6 +1264,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    platform_mod.link_libc = link_libc;
+    if (link_libc and switch (target.result.os.tag) {
+        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => true,
+        else => false,
+    }) {
+        platform_mod.addCSourceFile(.{
+            .file = b.path("lib/platform/src/filesystem_capacity.c"),
+            .flags = &.{"-std=c11"},
+        });
+    }
     const wasm_platform_mod = b.createModule(.{
         .root_source_file = b.path("lib/platform/src/root.zig"),
         .target = wasm_target,
