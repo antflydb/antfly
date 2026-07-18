@@ -1085,12 +1085,22 @@ fn runtimeHasReadySchemaVersionIndex(
     schema_version: u32,
     read_schema_version: u32,
 ) bool {
+    // Schema cutover must be driven by a current observation of the complete
+    // target projection. A catalog-only placeholder and a newly-created empty
+    // index both look idle, but neither proves that existing documents were
+    // rebuilt under the target schema. Use source identity cardinality rather
+    // than the aggregate runtime doc count: the latter deliberately preserves
+    // conservative visibility and can be inflated by the retained read index.
+    if (!std.mem.eql(u8, runtime.freshness, "fresh")) return false;
+    if (!runtime.doc_identity.complete) return false;
+
     var target_name_buf: [64]u8 = undefined;
     const target_name = if (schema_version == 0)
         @import("../api/tables.zig").default_full_text_index_name
     else
         std.fmt.bufPrint(&target_name_buf, "full_text_index_v{d}", .{schema_version}) catch return false;
-    _ = findReadyRuntimeFullTextIndex(runtime.indexes, target_name) orelse return false;
+    const target = findReadyRuntimeFullTextIndex(runtime.indexes, target_name) orelse return false;
+    if (target.doc_count != runtime.doc_identity.live_ordinals) return false;
     if (schema_version == read_schema_version) return true;
 
     var read_name_buf: [64]u8 = undefined;
@@ -2847,7 +2857,52 @@ test "table provisioner accepts target schema index when retained read index has
         },
     };
     try std.testing.expect(runtimeHasReadySchemaVersionIndex(.{
-        .doc_count = 1000,
+        .freshness = "fresh",
+        .doc_count = 1500,
+        .doc_identity = .{ .live_ordinals = 1000, .complete = true },
         .indexes = @constCast(indexes[0..]),
     }, 1, 0));
+}
+
+test "table provisioner runtime schema progress requires fresh complete target coverage" {
+    var indexes = [_]table_manager.RuntimeIndexStatusReport{
+        .{
+            .name = "full_text_index_v0",
+            .kind = "full_text",
+            .doc_count = 1000,
+            .replay_applied_sequence = 7,
+            .replay_target_sequence = 7,
+        },
+        .{
+            .name = "full_text_index_v1",
+            .kind = "full_text",
+            .doc_count = 0,
+            .replay_applied_sequence = 7,
+            .replay_target_sequence = 7,
+        },
+    };
+    var runtime = table_manager.RuntimeGroupStatusReport{
+        .freshness = "fresh",
+        .doc_count = 1000,
+        .doc_identity = .{ .live_ordinals = 1000, .complete = true },
+        .indexes = &indexes,
+    };
+
+    try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, 1, 0));
+
+    indexes[1].doc_count = 1000;
+    try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, 1, 0));
+
+    runtime.freshness = "stale";
+    try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, 1, 0));
+
+    runtime.freshness = "fresh";
+    runtime.doc_identity.complete = false;
+    try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, 1, 0));
+
+    runtime.doc_identity.complete = true;
+    runtime.doc_count = 0;
+    runtime.doc_identity.live_ordinals = 0;
+    indexes[1].doc_count = 0;
+    try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, 1, 0));
 }
