@@ -556,6 +556,9 @@ repair checkpoint. It is stored in an independently checksummed
 not the process-local visibility generation: cache fencing and in-place metadata
 reconciliation preserve it. Every newly staged directory creates its identity
 before sealing, so atomic publication carries the new identity with the root.
+First creation is serialized by a blocking OS file lock and rechecks the
+checkpoint after acquiring that lock. Concurrent first opens therefore observe
+one durable incarnation rather than retaining different random candidates.
 Derived checkpoint loss or repair cannot change storage identity. A physical
 generation replacement creates a new identity even when the logical contents
 and index catalog are unchanged.

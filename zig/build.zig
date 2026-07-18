@@ -168,18 +168,53 @@ fn addRuntimeTestFilters(run: *std.Build.Step.Run, filters: []const []const u8) 
     }
 }
 
+fn compileFiltersWithAnchors(
+    b: *std.Build,
+    anchors: []const []const u8,
+    runtime_filters: []const []const u8,
+) []const []const u8 {
+    const filters = b.allocator.alloc([]const u8, anchors.len + runtime_filters.len) catch @panic("OOM");
+    var count: usize = 0;
+    for (anchors) |anchor| {
+        filters[count] = anchor;
+        count += 1;
+    }
+    for (runtime_filters) |filter| {
+        var duplicate = false;
+        for (filters[0..count]) |existing| {
+            if (std.mem.eql(u8, existing, filter)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        filters[count] = filter;
+        count += 1;
+    }
+    return filters[0..count];
+}
+
 /// Zig's compile-time filters can retain imported anonymous tests needed for
 /// semantic analysis. Give every filtered artifact the exact-filter runner and
-/// mirror its filters at runtime so focused aliases execute only what they own.
-fn addFilteredTestRunArtifact(b: *std.Build, tests: *std.Build.Step.Compile) *std.Build.Step.Run {
+/// apply the caller's independently selected runtime filters so compile-only
+/// reachability anchors never become executed tests.
+fn addFilteredTestRunArtifactWithRuntimeFilters(
+    b: *std.Build,
+    tests: *std.Build.Step.Compile,
+    runtime_filters: []const []const u8,
+) *std.Build.Step.Run {
     if (tests.test_runner == null) {
         const runner_path = b.path("pkg/antfly/src/test_runner.zig");
         tests.test_runner = .{ .path = runner_path, .mode = .simple };
         runner_path.addStepDependencies(&tests.step);
     }
     const run = b.addRunArtifact(tests);
-    addRuntimeTestFilters(run, tests.filters);
+    addRuntimeTestFilters(run, runtime_filters);
     return run;
+}
+
+fn addFilteredTestRunArtifact(b: *std.Build, tests: *std.Build.Step.Compile) *std.Build.Step.Run {
+    return addFilteredTestRunArtifactWithRuntimeFilters(b, tests, tests.filters);
 }
 
 fn addDelegatedPackageStep(
@@ -3883,15 +3918,20 @@ pub fn build(b: *std.Build) void {
     const lib_db_txn_step = b.step("lib-db-txn-test", "Run root-module DB TTL/transaction tests");
     lib_db_txn_step.dependOn(&run_lib_db_txn_tests.step);
 
+    const lib_metadata_runtime_filters = selectTestFilters(b, &.{"metadata."});
     const lib_metadata_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &.{"metadata."}),
+        .filters = compileFiltersWithAnchors(b, &.{"metadata."}, lib_metadata_runtime_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_lib_metadata_tests = addFilteredTestRunArtifact(b, lib_metadata_tests);
+    const run_lib_metadata_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        lib_metadata_tests,
+        lib_metadata_runtime_filters,
+    );
     const lib_metadata_test_step = b.step("lib-metadata-test", "Run root-module metadata tests only");
     lib_metadata_test_step.dependOn(&run_lib_metadata_tests.step);
 
@@ -5056,39 +5096,44 @@ pub fn build(b: *std.Build) void {
     const lsm_backend_test_step = b.step("lsm-backend-test", "Run LSM backend unit tests only");
     lsm_backend_test_step.dependOn(&run_lsm_backend_tests.step);
 
+    const resource_budget_runtime_filters = [_][]const u8{
+        "resource manager observes over-budget external usage",
+        "resource manager evaluates projected admission with configured action",
+        "resource manager bounds soft write throttling without waiting for compaction publication",
+        "resource manager records index repair activation pause separately from cleanup",
+        "catchUpIndex refuses to open an apply window after its deadline",
+        "cache reports shared byte usage to resource manager",
+        "lsm backend resource manager throttles projected immutable state",
+        "lsm backend resource manager rejects before wal apply",
+        "derived backlog tracker accounts and releases payload bytes",
+        "derived backlog tracker fails closed when sequence accounting allocation fails",
+        "hbc shared cache namespaces entries",
+        "hbc shared cache evicts across namespaces under one resource budget",
+        "hbc cache reports byte usage to resource manager",
+        "hbc cache shrinks to resource budget under pressure",
+        "resource-managed mapped residency evicts cold segments and preserves hot mappings",
+        "provisioned group storage derives all resource budgets",
+        "resource manager capacity source is immutable after composition",
+        "capacity reservation revalidation fails closed when available space falls",
+        "resource manager background deferral follows slice policy",
+    };
+    // Retain the API declaration walk that owns provisioned_storage. Zig
+    // compile filters otherwise prune that module before the exact runtime
+    // filter can select its resource-budget test.
+    const resource_budget_compile_filters = [_][]const u8{"api module compiles"} ++ resource_budget_runtime_filters;
     const resource_budget_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{
-            // Retain the API declaration walk that owns provisioned_storage;
-            // Zig compile filters otherwise prune that module before the
-            // exact runtime filters can select its resource-budget test.
-            "api module compiles",
-            "resource manager observes over-budget external usage",
-            "resource manager evaluates projected admission with configured action",
-            "resource manager bounds soft write throttling without waiting for compaction publication",
-            "resource manager records index repair activation pause separately from cleanup",
-            "catchUpIndex refuses to open an apply window after its deadline",
-            "cache reports shared byte usage to resource manager",
-            "lsm backend resource manager throttles projected immutable state",
-            "lsm backend resource manager rejects before wal apply",
-            "derived backlog tracker accounts and releases payload bytes",
-            "derived backlog tracker fails closed when sequence accounting allocation fails",
-            "hbc shared cache namespaces entries",
-            "hbc shared cache evicts across namespaces under one resource budget",
-            "hbc cache reports byte usage to resource manager",
-            "hbc cache shrinks to resource budget under pressure",
-            "resource-managed mapped residency evicts cold segments and preserves hot mappings",
-            "provisioned group storage derives all resource budgets",
-            "resource manager capacity source is immutable after composition",
-            "capacity reservation revalidation fails closed when available space falls",
-            "resource manager background deferral follows slice policy",
-        },
+        .filters = &resource_budget_compile_filters,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_resource_budget_tests = addFilteredTestRunArtifact(b, resource_budget_tests);
+    const run_resource_budget_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        resource_budget_tests,
+        &resource_budget_runtime_filters,
+    );
     const filesystem_capacity_tests = b.addTest(.{
         .root_module = filesystem_capacity_test_mod,
         .filters = &.{"filesystem capacity probe reports the test volume"},
