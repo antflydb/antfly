@@ -662,6 +662,11 @@ const AsyncContext = struct {
     index_repair_replay_pinned: std.atomic.Value(bool) = .init(false),
     index_repair_state_corrupt: std.atomic.Value(bool) = .init(false),
     index_artifact_cleanup_mutex: std.atomic.Mutex = .unlocked,
+    background_closing: std.atomic.Value(bool) = .init(false),
+    enrichment_lifecycle_mutex: std.atomic.Mutex = .unlocked,
+    enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = null,
+    enrichment_desired_running: std.atomic.Value(bool) = .init(false),
+    enrichment_restart_state: std.atomic.Value(u8) = .init(0),
     dense_maintenance_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
     target_advance_repair_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime = null,
@@ -3643,6 +3648,7 @@ pub const DB = struct {
         const owned = detached.take();
         self.enrichment_append_context = owned.append_ctx;
         self.enrichment_runtime = owned.runtime;
+        self.async_context.enrichment_runtime = owned.runtime;
     }
 
     fn deinitEnrichmentConfig(self: *DB, cfg: *enrichment_runtime_mod.Config) void {
@@ -3685,29 +3691,33 @@ pub const DB = struct {
         }
 
         const should_start_replacement = detached != null and self.open_mode.allowsOptionalRuntimes();
+        const previous_desired = self.async_context.enrichment_desired_running.swap(false, .acq_rel);
         var stopped_existing_runtime = false;
         if (should_start_replacement) {
-            if (self.enrichment_runtime) |runtime| {
+            lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
+            if (self.async_context.enrichment_runtime) |runtime| {
                 runtime.stop();
                 stopped_existing_runtime = true;
             }
+            self.async_context.enrichment_lifecycle_mutex.unlock();
         }
         errdefer if (stopped_existing_runtime) {
-            if (self.enrichment_runtime) |runtime| {
-                runtime.start() catch |err| {
-                    std.log.err("failed to restart previous enrichment runtime after reconfigure failure: {}", .{err});
-                };
-            }
+            self.async_context.enrichment_desired_running.store(previous_desired or stopped_existing_runtime, .release);
+            self.restartEnrichmentAfterStructuralMutation("failed enrichment reconfiguration", "") catch |err| {
+                std.log.err("failed to restart previous enrichment runtime after reconfigure failure: {}", .{err});
+            };
         };
 
         if (should_start_replacement) {
             try detached.?.runtime.?.start();
         }
 
+        lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
         if (self.enrichment_runtime) |runtime| {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
             self.enrichment_runtime = null;
+            self.async_context.enrichment_runtime = null;
         }
         if (self.enrichment_append_context) |ctx| {
             self.runtime_alloc.destroy(ctx);
@@ -3718,7 +3728,10 @@ pub const DB = struct {
             const owned = runtime.take();
             self.enrichment_append_context = owned.append_ctx;
             self.enrichment_runtime = owned.runtime;
+            self.async_context.enrichment_runtime = owned.runtime;
         }
+        self.async_context.enrichment_desired_running.store(should_start_replacement, .release);
+        self.async_context.enrichment_lifecycle_mutex.unlock();
         if (!query_visibility_hook_present) self.setQueryVisibilityHook(null);
     }
 
@@ -3930,7 +3943,10 @@ pub const DB = struct {
 
     fn startOptionalRuntimes(self: *DB) !void {
         try self.startResolverReplayRuntimesIfConfigured();
-        if (self.enrichment_runtime) |runtime| try runtime.start();
+        if (self.enrichment_runtime) |runtime| {
+            try runtime.start();
+            self.async_context.enrichment_desired_running.store(true, .release);
+        }
         if (self.ttl_runtime) |runtime| try runtime.start();
         if (self.transaction_runtime) |runtime| try runtime.start();
         if (self.text_merge_runtime) |runtime| try runtime.start();
@@ -4007,6 +4023,10 @@ pub const DB = struct {
         // stopping. That must not call back into the write/status cache after
         // optional runtimes or index state have started tearing down.
         self.setQueryVisibilityHook(null);
+        self.async_context.background_closing.store(true, .release);
+        self.async_context.enrichment_desired_running.store(false, .release);
+        self.backend_runtime.durable_jobs.closeOwner(self.repair_cleanup_owner_id);
+        self.backend_runtime.durable_jobs.drainOwner(self.repair_cleanup_owner_id);
         self.clearLiveDocSetCache();
         self.clearNonVisibleDocSetCache();
         self.bulk_ingest_coalescer.deinit(self.alloc);
@@ -4058,8 +4078,6 @@ pub const DB = struct {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
         }
-        self.backend_runtime.durable_jobs.closeOwner(self.repair_cleanup_owner_id);
-        self.backend_runtime.durable_jobs.drainOwner(self.repair_cleanup_owner_id);
         self.core.deinit();
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         self.async_context.deinit(self.runtime_alloc);
@@ -6050,7 +6068,9 @@ pub const DB = struct {
         owner_id: u64,
 
         const pages_per_job: usize = 8;
-        const transient_retry_limit: usize = 5;
+        const retries_per_job: usize = 8;
+        const retry_initial_ms: i64 = 25;
+        const retry_max_ms: i64 = 1000;
 
         fn drainOnePage(work: *@This()) !bool {
             lockAtomicWithBackoff(&work.ctx.index_artifact_cleanup_mutex);
@@ -6066,16 +6086,33 @@ pub const DB = struct {
             var pages: usize = 0;
             var retries: usize = 0;
             while (true) {
+                if (work.ctx.background_closing.load(.acquire)) {
+                    work.ctx.index_manager.artifact_cleanup_state.store(0, .release);
+                    return;
+                }
                 const found = work.drainOnePage() catch |err| {
                     retries += 1;
-                    if (retries >= transient_retry_limit) {
-                        work.ctx.index_manager.artifact_cleanup_state.store(0, .release);
-                        std.log.warn("generated-artifact cleanup remains durably pending after retries err={s}", .{@errorName(err)});
-                        return;
-                    }
+                    if (retries == 1 or std.math.isPowerOfTwo(retries))
+                        std.log.warn("generated-artifact cleanup retry attempt={} err={s}", .{ retries, @errorName(err) });
                     if (work.ctx.io) |io| {
-                        const delay_ms: i64 = @as(i64, 25) << @intCast(retries - 1);
+                        const shift: u6 = @intCast(@min(retries - 1, 5));
+                        const delay_ms = if (builtin.is_test) 1 else @min(retry_initial_ms << shift, retry_max_ms);
                         io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
+                    } else {
+                        // Manual/freestanding lanes have no autonomous timer.
+                        // Leave the durable marker pending for the next explicit
+                        // maintenance poll or reopen instead of monopolizing the
+                        // caller that is executing the lane synchronously.
+                        work.ctx.index_manager.artifact_cleanup_state.store(0, .release);
+                        return err;
+                    }
+                    if (retries >= retries_per_job) {
+                        // A persistent failure must not monopolize a shared
+                        // durable-job worker. Requeue at the tail while the
+                        // durable tombstone remains the source of truth.
+                        work.ctx.index_manager.artifact_cleanup_state.store(0, .release);
+                        scheduleGeneratedArtifactCleanupContext(work.ctx, work.lane, work.owner_id);
+                        return;
                     }
                     continue;
                 };
@@ -6107,6 +6144,146 @@ pub const DB = struct {
         }
     };
 
+    const EnrichmentRestartWork = struct {
+        ctx: *AsyncContext,
+        lane: background_runtime_mod.DurableJobLane,
+        owner_id: u64,
+
+        const retry_initial_ms: i64 = 25;
+        const retry_max_ms: i64 = 1000;
+        const retries_per_job: usize = 8;
+
+        fn run(ptr: *anyopaque) anyerror!void {
+            const work: *@This() = @ptrCast(@alignCast(ptr));
+            var retries: usize = 0;
+            while (true) {
+                if (work.ctx.background_closing.load(.acquire)) {
+                    work.ctx.enrichment_restart_state.store(0, .release);
+                    return;
+                }
+                if (!work.ctx.enrichment_desired_running.load(.acquire)) {
+                    if (work.ctx.enrichment_restart_state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
+                    if (work.ctx.enrichment_restart_state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) {
+                        retries = 0;
+                        continue;
+                    }
+                    return;
+                }
+
+                lockAtomicWithBackoff(&work.ctx.enrichment_lifecycle_mutex);
+                const runtime = work.ctx.enrichment_runtime;
+                const should_start = runtime != null and
+                    work.ctx.enrichment_desired_running.load(.acquire) and
+                    !work.ctx.background_closing.load(.acquire) and
+                    !runtime.?.isStarted();
+                const start_result: ?anyerror = if (should_start) blk: {
+                    startEnrichmentRuntimeForLifecycle(runtime.?) catch |err| break :blk err;
+                    break :blk null;
+                } else null;
+                const started = runtime == null or runtime.?.isStarted();
+                work.ctx.enrichment_lifecycle_mutex.unlock();
+
+                if (started) {
+                    notifyQueryVisibilityHook(work.ctx, .status);
+                    if (work.ctx.enrichment_restart_state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
+                    if (work.ctx.enrichment_restart_state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) {
+                        retries = 0;
+                        continue;
+                    }
+                    return;
+                }
+
+                retries += 1;
+                if (retries == 1 or std.math.isPowerOfTwo(retries)) {
+                    std.log.warn("enrichment runtime restart retry attempt={} err={s}", .{
+                        retries,
+                        if (start_result) |err| @errorName(err) else "RuntimeNotStarted",
+                    });
+                }
+                if (work.ctx.io) |io| {
+                    const shift: u6 = @intCast(@min(retries - 1, 5));
+                    const delay_ms = if (builtin.is_test) 1 else @min(retry_initial_ms << shift, retry_max_ms);
+                    io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
+                } else {
+                    work.ctx.enrichment_restart_state.store(0, .release);
+                    return start_result orelse error.EnrichmentRuntimeUnavailable;
+                }
+                if (retries >= retries_per_job) {
+                    // Preserve autonomous recovery while allowing unrelated
+                    // durable work to run on a persistently failing runtime.
+                    work.ctx.enrichment_restart_state.store(0, .release);
+                    scheduleEnrichmentRestartContext(work.ctx, work.lane, work.owner_id);
+                    return;
+                }
+            }
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const work: *@This() = @ptrCast(@alignCast(ptr));
+            std.heap.page_allocator.destroy(work);
+        }
+    };
+
+    var test_enrichment_restart_failures_remaining: std.atomic.Value(u32) = .init(0);
+
+    fn startEnrichmentRuntimeForLifecycle(runtime: *enrichment_runtime_mod.EnrichmentRuntime) !void {
+        if (builtin.is_test) {
+            var remaining = test_enrichment_restart_failures_remaining.load(.acquire);
+            while (remaining != 0) {
+                if (test_enrichment_restart_failures_remaining.cmpxchgWeak(
+                    remaining,
+                    remaining - 1,
+                    .acq_rel,
+                    .acquire,
+                )) |actual| {
+                    remaining = actual;
+                    continue;
+                }
+                return error.TestTransientEnrichmentRestart;
+            }
+        }
+        try runtime.start();
+    }
+
+    fn scheduleEnrichmentRestartContext(
+        ctx: *AsyncContext,
+        lane: background_runtime_mod.DurableJobLane,
+        owner_id: u64,
+    ) void {
+        if (ctx.background_closing.load(.acquire) or
+            !ctx.enrichment_desired_running.load(.acquire)) return;
+        if (ctx.enrichment_restart_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
+            _ = ctx.enrichment_restart_state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
+            return;
+        }
+        const work = std.heap.page_allocator.create(EnrichmentRestartWork) catch {
+            ctx.enrichment_restart_state.store(0, .release);
+            return;
+        };
+        work.* = .{ .ctx = ctx, .lane = lane, .owner_id = owner_id };
+        lane.submit(.{
+            .owner_id = owner_id,
+            .class = .maintenance,
+            .ptr = work,
+            .run = EnrichmentRestartWork.run,
+            .deinit = EnrichmentRestartWork.deinit,
+        }) catch |err| {
+            std.heap.page_allocator.destroy(work);
+            ctx.enrichment_restart_state.store(0, .release);
+            std.log.warn("enrichment runtime restart was not scheduled err={s}", .{@errorName(err)});
+        };
+    }
+
+    fn quiesceEnrichmentForStructuralMutation(self: *DB) bool {
+        const desired = self.async_context.enrichment_desired_running.swap(false, .acq_rel);
+        lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
+        defer self.async_context.enrichment_lifecycle_mutex.unlock();
+        const runtime = self.async_context.enrichment_runtime orelse return desired;
+        const started = runtime.isStarted();
+        if (started) runtime.stop();
+        return desired or started;
+    }
+
     fn scheduleGeneratedArtifactCleanup(self: *DB) void {
         scheduleGeneratedArtifactCleanupContext(
             self.async_context,
@@ -6120,6 +6297,7 @@ pub const DB = struct {
         lane: background_runtime_mod.DurableJobLane,
         owner_id: u64,
     ) void {
+        if (ctx.background_closing.load(.acquire)) return;
         if (ctx.index_manager.artifact_cleanup_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
             _ = ctx.index_manager.artifact_cleanup_state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
             return;
@@ -6170,28 +6348,16 @@ pub const DB = struct {
         };
     }
 
-    fn drainOneRetiredIndexCleanupForAdmission(self: *DB, cfg: types.IndexConfig) !bool {
+    fn rejectConflictingRetiredIndexCleanupForAdmission(self: *DB, cfg: types.IndexConfig) !void {
         lockAtomicWithBackoff(&self.async_context.index_artifact_cleanup_mutex);
         defer self.async_context.index_artifact_cleanup_mutex.unlock();
         const retired_name = (try self.core.index_manager.pendingGeneratedArtifactCleanupIndexForConfigAlloc(
             self.core.store,
             cfg,
-        )) orelse return false;
+        )) orelse return;
         defer self.alloc.free(retired_name);
-
-        var result = try self.core.index_manager.drainGeneratedArtifactCleanupForIndexPage(
-            self.core.store,
-            retired_name,
-        );
-        defer result.deinit();
-        if (result.completed) try self.finalizeRetiredIndexCleanup(result.index_name, result.key);
-        return result.found;
-    }
-
-    fn drainRetiredIndexCleanupForAdmission(self: *DB, cfg: types.IndexConfig) !void {
-        while (true) {
-            if (!try self.drainOneRetiredIndexCleanupForAdmission(cfg)) return;
-        }
+        self.scheduleGeneratedArtifactCleanup();
+        return error.IndexArtifactCleanupPending;
     }
 
     fn beginIndexRepairLease(self: *DB, index_name: []const u8) !bool {
@@ -13251,9 +13417,22 @@ pub const DB = struct {
     }
 
     fn restartEnrichmentAfterStructuralMutation(self: *DB, operation: []const u8, index_name: []const u8) !void {
-        const runtime = self.enrichment_runtime orelse return;
-        runtime.start() catch |err| {
+        self.async_context.enrichment_desired_running.store(true, .release);
+        lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
+        const runtime = self.async_context.enrichment_runtime orelse {
+            self.async_context.enrichment_lifecycle_mutex.unlock();
+            return;
+        };
+        const start_result = if (!runtime.isStarted()) startEnrichmentRuntimeForLifecycle(runtime) else {};
+        self.async_context.enrichment_lifecycle_mutex.unlock();
+        start_result catch |err| {
             std.log.err("failed to restart enrichment runtime after {s} index={s} err={s}", .{ operation, index_name, @errorName(err) });
+            scheduleEnrichmentRestartContext(
+                self.async_context,
+                self.backend_runtime.durable_jobs,
+                self.repair_cleanup_owner_id,
+            );
+            notifyQueryVisibilityHook(self.async_context, .status);
             return err;
         };
     }
@@ -13343,12 +13522,11 @@ pub const DB = struct {
     fn addIndexWithAdmission(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode) !?u128 {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         // Generated artifact namespaces can be shared across differently named
-        // indexes. Cooperatively finish only conflicting retired generations
-        // before taking the apply lock; pages are bounded and unrelated
-        // writes/indexes remain available.
-        try self.drainRetiredIndexCleanupForAdmission(cfg);
-        const restart_enrichment = if (self.enrichment_runtime) |runtime| runtime.isStarted() else false;
-        if (restart_enrichment) self.enrichment_runtime.?.stop();
+        // indexes. Cleanup is durable and owner-driven; never turn index
+        // admission into an unbounded corpus scan. Metadata reconciliation can
+        // retry after the conflicting generation's tombstone is retired.
+        try self.rejectConflictingRetiredIndexCleanupForAdmission(cfg);
+        const restart_enrichment = self.quiesceEnrichmentForStructuralMutation();
         var enrichment_restarted = false;
         errdefer if (restart_enrichment and !enrichment_restarted) {
             self.restartEnrichmentAfterStructuralMutation("failed index creation", cfg.name) catch |restart_err| {
@@ -14594,8 +14772,7 @@ pub const DB = struct {
 
     pub fn deleteIndex(self: *DB, name: []const u8) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        const restart_enrichment = if (self.enrichment_runtime) |runtime| runtime.isStarted() else false;
-        if (restart_enrichment) self.enrichment_runtime.?.stop();
+        const restart_enrichment = self.quiesceEnrichmentForStructuralMutation();
         const removed = self.deleteIndexWhileEnrichmentQuiesced(name) catch |delete_err| {
             if (restart_enrichment) self.restartEnrichmentAfterStructuralMutation("failed index deletion", name) catch |restart_err| {
                 std.log.err("failed to restore enrichment runtime after index deletion error index={s} err={s}", .{ name, @errorName(restart_err) });
@@ -14696,7 +14873,7 @@ pub const DB = struct {
         return .{
             .derived_target_sequence = self.core.nextDerivedSequence(),
             .has_async_indexes = self.executor.hasWorkers(),
-            .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+            .enrichment = self.enrichmentStatsWithSupervisorState(.{}),
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
@@ -17355,21 +17532,41 @@ pub const DB = struct {
         return try self.managedIndexReplayTargetSequence(alloc, cfg.name, cfg.kind, applied_sequence);
     }
 
-    fn overlayRuntimeStatusRuntimeOnly(self: *DB, runtime_stats: *types.DBStats) void {
-        runtime_stats.async_indexing = self.snapshotAsyncIndexingStats();
-        runtime_stats.enrichment = if (self.enrichment_runtime) |runtime|
+    fn enrichmentStatsWithSupervisorState(self: *DB, fallback: types.EnrichmentStats) types.EnrichmentStats {
+        lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
+        defer self.async_context.enrichment_lifecycle_mutex.unlock();
+        var enrichment_status = if (self.async_context.enrichment_runtime) |runtime|
             runtime.stats()
         else
-            self.persistedEnrichmentStats() catch runtime_stats.enrichment;
+            self.persistedEnrichmentStats() catch fallback;
+        const desired = self.async_context.enrichment_desired_running.load(.acquire);
+        const started = if (self.async_context.enrichment_runtime) |runtime| runtime.isStarted() else false;
+        if (desired and !started) {
+            const supervised = self.async_context.enrichment_restart_state.load(.acquire) != 0;
+            enrichment_status.retrying = supervised;
+            enrichment_status.worker_failed = !supervised;
+            enrichment_status.projection_checkpoint_status = if (supervised) "retrying" else "failed";
+        }
+        return enrichment_status;
+    }
+
+    fn overlayRuntimeStatusRuntimeOnly(self: *DB, runtime_stats: *types.DBStats) void {
+        runtime_stats.async_indexing = self.snapshotAsyncIndexingStats();
+        runtime_stats.enrichment = self.enrichmentStatsWithSupervisorState(runtime_stats.enrichment);
         runtime_stats.resolution = self.resolutionStageStats();
         runtime_stats.promotion = self.promotionStageStats();
         runtime_stats.ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else runtime_stats.ttl_cleanup;
         runtime_stats.transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else runtime_stats.transaction_recovery;
 
-        for (runtime_stats.indexes) |*item| {
-            if (self.enrichment_runtime) |runtime| {
+        lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
+        if (self.async_context.enrichment_runtime) |runtime| {
+            for (runtime_stats.indexes) |*item| {
                 item.enrichment_failed = runtime.indexHasIsolatedFailure(item.name);
             }
+        }
+        self.async_context.enrichment_lifecycle_mutex.unlock();
+
+        for (runtime_stats.indexes) |*item| {
             const dense_catch_up = item.kind == .dense_vector and runtime_stats.async_indexing.dense_catch_up.active;
             if (!dense_catch_up) if (self.executor.appliedSequence(item.name)) |live_applied| {
                 item.replay_applied_sequence = @max(item.replay_applied_sequence, live_applied);
@@ -17581,7 +17778,7 @@ pub const DB = struct {
                 .async_indexing = self.snapshotAsyncIndexingStats(),
                 .doc_set_planning = self.snapshotDocSetPlanningStats(),
                 .visibility = self.snapshotVisibilityStats(),
-                .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+                .enrichment = self.enrichmentStatsWithSupervisorState(.{}),
                 .resolution = self.resolutionStageStats(),
                 .promotion = self.promotionStageStats(),
                 .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
@@ -17893,7 +18090,7 @@ pub const DB = struct {
             .doc_identity = identity_stats,
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .visibility = self.snapshotVisibilityStats(),
-            .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+            .enrichment = self.enrichmentStatsWithSupervisorState(.{}),
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
             .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
@@ -18095,7 +18292,7 @@ pub const DB = struct {
             .doc_identity = identity_stats,
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .visibility = self.snapshotVisibilityStats(),
-            .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else try self.persistedEnrichmentStats(),
+            .enrichment = self.enrichmentStatsWithSupervisorState(.{}),
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
             .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
@@ -37563,6 +37760,39 @@ test "db enrichment reconfigure preserves active runtime when replacement cannot
         .dense_embedder = replacement_embedder.interface(),
     }));
     try std.testing.expectEqual(original_runtime, db.enrichment_runtime.?);
+}
+
+test "db enrichment restart supervisor recovers transient start failures" {
+    const alloc = std.testing.allocator;
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(runtime.isStarted());
+    try std.testing.expect(db.quiesceEnrichmentForStructuralMutation());
+    try std.testing.expect(!runtime.isStarted());
+
+    DB.test_enrichment_restart_failures_remaining.store(std.math.maxInt(u32), .release);
+    defer DB.test_enrichment_restart_failures_remaining.store(0, .release);
+    try std.testing.expectError(
+        error.TestTransientEnrichmentRestart,
+        db.restartEnrichmentAfterStructuralMutation("test", "semantic_idx"),
+    );
+    const degraded = db.enrichmentStatsWithSupervisorState(.{});
+    try std.testing.expect(degraded.retrying);
+    try std.testing.expect(!degraded.worker_failed);
+    DB.test_enrichment_restart_failures_remaining.store(12, .release);
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+
+    try std.testing.expectEqual(@as(u32, 0), DB.test_enrichment_restart_failures_remaining.load(.acquire));
+    try std.testing.expect(db.async_context.enrichment_desired_running.load(.acquire));
+    try std.testing.expect(runtime.isStarted());
 }
 
 test "db ttl cleanup enabled requires backend runtime io" {
@@ -60469,6 +60699,8 @@ test "db managed index deletion remains successful after post-commit cleanup fai
 
     index_manager_mod.test_inject_index_removal_cleanup_error = error.TestPostCommitCleanup;
     defer index_manager_mod.test_inject_index_removal_cleanup_error = null;
+    index_manager_mod.test_generated_artifact_cleanup_failures_remaining.store(std.math.maxInt(u32), .release);
+    defer index_manager_mod.test_generated_artifact_cleanup_failures_remaining.store(0, .release);
     DB.test_fail_managed_index_repair_cleanup_after_catalog_commit = true;
     defer DB.test_fail_managed_index_repair_cleanup_after_catalog_commit = false;
     try std.testing.expect(try db.deleteIndex(index_name));
@@ -60481,8 +60713,17 @@ test "db managed index deletion remains successful after post-commit cleanup fai
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, admission_key));
     try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
 
-    // Immediate same-name recreation retries the orphan cleanup before the
-    // fresh catalog generation can adopt repair state by public name.
+    // Same-name recreation is bounded: it reports the durable retirement debt
+    // instead of scanning the corpus on the request thread. The generation
+    // owner drains that debt and reconciliation can then retry admission.
+    try std.testing.expectError(error.IndexArtifactCleanupPending, db.admitManagedFullTextIndex(.{
+        .name = index_name,
+        .kind = .full_text,
+        .config_json = "{}",
+    }));
+    index_manager_mod.test_generated_artifact_cleanup_failures_remaining.store(0, .release);
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+
     const new_repair_id = (try db.admitManagedFullTextIndex(.{
         .name = index_name,
         .kind = .full_text,
@@ -60490,6 +60731,37 @@ test "db managed index deletion remains successful after post-commit cleanup fai
     })) orelse return error.TestUnexpectedResult;
     try std.testing.expect(new_repair_id != old_repair_id);
     try std.testing.expect(db.core.index_manager.get(index_name) != null);
+}
+
+test "db generated artifact cleanup retries beyond the transient burst" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    const cfg: types.IndexConfig = .{
+        .name = "full_text_index_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    };
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(cfg);
+
+    index_manager_mod.test_generated_artifact_cleanup_failures_remaining.store(12, .release);
+    defer index_manager_mod.test_generated_artifact_cleanup_failures_remaining.store(0, .release);
+    try std.testing.expect(try db.deleteIndex(cfg.name));
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        index_manager_mod.test_generated_artifact_cleanup_failures_remaining.load(.acquire),
+    );
+    try db.addIndex(cfg);
 }
 
 test "db managed admission drain preserves a generation requested during the pass" {

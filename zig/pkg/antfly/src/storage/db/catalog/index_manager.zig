@@ -215,6 +215,7 @@ pub var test_text_backfill_invocations: usize = 0;
 pub var test_inject_index_open_error: ?anyerror = null;
 pub var test_inject_index_removal_cleanup_error: ?anyerror = null;
 pub var test_inject_generated_artifact_cleanup_error: ?anyerror = null;
+pub var test_generated_artifact_cleanup_failures_remaining: std.atomic.Value(u32) = .init(0);
 const sparse_backfill_batch_size: usize = 1024;
 pub var test_sparse_backfill_batch_size: ?usize = null;
 pub var test_abort_sparse_backfill_after_batches: ?usize = null;
@@ -3938,6 +3939,19 @@ pub const IndexManager = struct {
         const record = try decodeGeneratedArtifactCleanupRecord(raw);
         if (builtin.is_test) {
             if (test_inject_generated_artifact_cleanup_error) |err| return err;
+            var remaining = test_generated_artifact_cleanup_failures_remaining.load(.acquire);
+            while (remaining != 0) {
+                if (test_generated_artifact_cleanup_failures_remaining.cmpxchgWeak(
+                    remaining,
+                    remaining - 1,
+                    .acq_rel,
+                    .acquire,
+                )) |actual| {
+                    remaining = actual;
+                    continue;
+                }
+                return error.TestTransientGeneratedArtifactCleanup;
+            }
         }
         switch (record.phase) {
             .dense_metadata => {
@@ -4094,7 +4108,44 @@ pub const IndexManager = struct {
     pub fn drainGeneratedArtifactCleanupOutboxPage(self: *IndexManager, store: anytype) !GeneratedArtifactCleanupDrainResult {
         const prefix = try internal_keys.indexArtifactCleanupRootPrefixAlloc(self.alloc);
         defer self.alloc.free(prefix);
-        return try self.drainGeneratedArtifactCleanupPrefixPage(store, prefix);
+        const page_limit: usize = 32;
+        var after_key: ?[]u8 = null;
+        defer if (after_key) |key| self.alloc.free(key);
+        var first_err: ?anyerror = null;
+
+        // A malformed or temporarily unavailable tombstone must fail its own
+        // namespace closed without starving cleanup for unrelated indexes.
+        while (true) {
+            const rows = try store.scanPrefixPage(self.alloc, prefix, after_key, page_limit);
+            defer docstore_mod.DocStore.freeResults(self.alloc, rows);
+            if (rows.len == 0) {
+                if (first_err) |err| return err;
+                return .{};
+            }
+            for (rows) |row| {
+                const index_name = internal_keys.indexArtifactCleanupNameAlloc(self.alloc, row.key) catch |err| {
+                    if (first_err == null) first_err = err;
+                    continue;
+                };
+                var result = self.drainGeneratedArtifactCleanupRecordPage(store, row.key, row.value) catch |err| {
+                    self.alloc.free(index_name);
+                    if (first_err == null) first_err = err;
+                    continue;
+                };
+                result.alloc = self.alloc;
+                result.index_name = index_name;
+                errdefer result.deinit();
+                result.key = try self.alloc.dupe(u8, row.key);
+                return result;
+            }
+            if (rows.len < page_limit) {
+                if (first_err) |err| return err;
+                return .{};
+            }
+            const next = try self.alloc.dupe(u8, rows[rows.len - 1].key);
+            if (after_key) |key| self.alloc.free(key);
+            after_key = next;
+        }
     }
 
     pub fn drainGeneratedArtifactCleanupForIndexPage(
@@ -4162,23 +4213,30 @@ pub const IndexManager = struct {
     }
 
     pub fn finalizeRetiredIndexStorage(self: *IndexManager, store: anytype, name: []const u8) !void {
-        self.catalog_mutex.lockExclusive();
-        defer self.catalog_mutex.unlockExclusive();
-        if (self.get(name) != null) return error.IndexGenerationStillActive;
+        const canonical_path = try self.indexPath(name);
+        defer self.alloc.free(canonical_path);
+        const active_path = try self.activeIndexPath(name);
+        defer self.alloc.free(active_path);
 
+        self.catalog_mutex.lockExclusive();
+        if (self.get(name) != null) {
+            self.catalog_mutex.unlockExclusive();
+            return error.IndexGenerationStillActive;
+        }
+        self.invalidateIndexPathCaches(active_path);
+        self.invalidateIndexPathCaches(canonical_path);
+        self.catalog_mutex.unlockExclusive();
+
+        // The durable cleanup tombstone prevents same-name admission until
+        // finalization succeeds, so checkpoint and filesystem I/O need not hold
+        // the catalog lock used by unrelated indexes.
         try apply_state.clearAppliedSequenceWithCheckpoint(
             self.alloc,
             store,
             self.applied_sequence_checkpoint_path,
             name,
         );
-        const canonical_path = try self.indexPath(name);
-        defer self.alloc.free(canonical_path);
-        const active_path = try self.activeIndexPath(name);
-        defer self.alloc.free(active_path);
-        self.invalidateIndexPathCaches(active_path);
         if (!std.mem.eql(u8, active_path, canonical_path)) try self.deleteIndexDirUsingIoIfPresentFallible(active_path);
-        self.invalidateIndexPathCaches(canonical_path);
         try self.deleteIndexDirUsingIoIfPresentFallible(canonical_path);
     }
 
@@ -4217,7 +4275,7 @@ pub const IndexManager = struct {
                 defer self.dropIndexLoadStateNoLock(name);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 self.clearAppliedSequenceAfterCatalogRemoval(store, name);
-                self.deleteIndexRootForName(name, index_path);
+                self.invalidateIndexRootForName(name, index_path);
                 return true;
             }
         }
@@ -4250,7 +4308,7 @@ pub const IndexManager = struct {
                 defer self.dropIndexLoadStateNoLock(name);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 self.clearAppliedSequenceAfterCatalogRemoval(store, name);
-                self.deleteIndexRootForName(name, index_path);
+                self.invalidateIndexRootForName(name, index_path);
                 return true;
             }
         }
@@ -4283,7 +4341,7 @@ pub const IndexManager = struct {
                 defer self.dropIndexLoadStateNoLock(name);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 self.clearAppliedSequenceAfterCatalogRemoval(store, name);
-                self.deleteIndexRootForName(name, index_path);
+                self.invalidateIndexRootForName(name, index_path);
                 return true;
             }
         }
@@ -4304,7 +4362,7 @@ pub const IndexManager = struct {
                 defer self.dropIndexLoadStateNoLock(name);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 self.clearAppliedSequenceAfterCatalogRemoval(store, name);
-                self.deleteIndexRootForName(name, index_path);
+                self.invalidateIndexRootForName(name, index_path);
                 return true;
             }
         }
@@ -4325,7 +4383,7 @@ pub const IndexManager = struct {
                 defer self.dropIndexLoadStateNoLock(name);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 self.clearAppliedSequenceAfterCatalogRemoval(store, name);
-                self.deleteIndexRootForName(name, index_path);
+                self.invalidateIndexRootForName(name, index_path);
                 return true;
             }
         }
@@ -4643,7 +4701,7 @@ pub const IndexManager = struct {
 
             self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
             self.clearAppliedSequenceAfterCatalogRemoval(store, name);
-            self.deleteIndexRootForName(name, index_path);
+            self.invalidateIndexRootForName(name, index_path);
             return true;
         }
         return false;
@@ -8344,14 +8402,22 @@ pub const IndexManager = struct {
     }
 
     fn deleteIndexRootForName(self: *const IndexManager, name: []const u8, canonical_path: []const u8) void {
+        self.invalidateIndexRootForName(name, canonical_path);
+        const active_path = self.activeIndexPath(name) catch null;
+        defer if (active_path) |path| self.alloc.free(path);
+        if (active_path) |path| {
+            if (!std.mem.eql(u8, path, canonical_path)) self.deleteIndexDirUsingIoIfPresent(path);
+        }
+        self.deleteIndexDirUsingIoIfPresent(canonical_path);
+    }
+
+    fn invalidateIndexRootForName(self: *const IndexManager, name: []const u8, canonical_path: []const u8) void {
         const active_path = self.activeIndexPath(name) catch null;
         defer if (active_path) |path| self.alloc.free(path);
         if (active_path) |path| {
             self.invalidateIndexPathCaches(path);
-            if (!std.mem.eql(u8, path, canonical_path)) self.deleteIndexDirUsingIoIfPresent(path);
         }
         self.invalidateIndexPathCaches(canonical_path);
-        self.deleteIndexDirUsingIoIfPresent(canonical_path);
     }
 
     fn pruneCanonicalIndexRootAfterPointerInstall(canonical_path: []const u8) !void {
@@ -20551,6 +20617,47 @@ test "remove persists generated artifact cleanup debt until same-name recreation
     try std.testing.expectError(error.NotFound, store.get(alloc, coverage_probe));
     try std.testing.expectError(error.NotFound, store.get(alloc, cleanup_key));
     try manager.addManaged(&store, cfg, null);
+}
+
+test "generated artifact cleanup isolates malformed tombstones" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "artifact-cleanup-isolation");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+
+    const cleanup_prefix = try internal_keys.indexArtifactCleanupRootPrefixAlloc(alloc);
+    defer alloc.free(cleanup_prefix);
+    const malformed_key = try std.mem.concat(alloc, u8, &.{ cleanup_prefix, "a" });
+    defer alloc.free(malformed_key);
+    const malformed_value_key = try internal_keys.indexArtifactCleanupKeyAlloc(alloc, "b_corrupt", 1);
+    defer alloc.free(malformed_value_key);
+    const valid_key = try internal_keys.indexArtifactCleanupKeyAlloc(alloc, "c_valid", 2);
+    defer alloc.free(valid_key);
+    const valid_value = try manager.encodeGeneratedArtifactCleanupRecord(.finalization, null, null, null);
+    defer alloc.free(valid_value);
+    const writes = [_]docstore_mod.KVPair{
+        .{ .key = malformed_key, .value = valid_value },
+        .{ .key = malformed_value_key, .value = "invalid" },
+        .{ .key = valid_key, .value = valid_value },
+    };
+    try store.putBatch(&writes, &.{});
+
+    var result = try manager.drainGeneratedArtifactCleanupOutboxPage(&store);
+    defer result.deinit();
+    try std.testing.expect(result.found);
+    try std.testing.expect(result.completed);
+    try std.testing.expectEqualStrings("c_valid", result.index_name);
+    try store.delete(result.key);
+
+    try std.testing.expectError(
+        error.InvalidInternalUserKey,
+        manager.drainGeneratedArtifactCleanupOutboxPage(&store),
+    );
 }
 
 test "remove status-only dense config drops owned generated artifacts" {

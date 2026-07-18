@@ -34540,7 +34540,7 @@ test "provisioned leader admission rejects uncommitted writes under dense repair
 
     // Normal pressure-free writes avoid the cache scan and remain admitted even
     // while a repair owns a replay pin.
-    entry.db.index_repair_replay_pinned.store(true, .release);
+    entry.db.async_context.index_repair_replay_pinned.store(true, .release);
     try source.preflightDenseRepairWriteAdmission(7001, "docs");
 
     var tracked: u64 = 0;
@@ -34554,7 +34554,7 @@ test "provisioned leader admission rejects uncommitted writes under dense repair
     // Pressure on one group must not reject unrelated groups, and clearing the
     // durable repair pin immediately reopens admission for this group.
     try source.preflightDenseRepairWriteAdmission(7002, "docs");
-    entry.db.index_repair_replay_pinned.store(false, .release);
+    entry.db.async_context.index_repair_replay_pinned.store(false, .release);
     try source.preflightDenseRepairWriteAdmission(7001, "docs");
 }
 
