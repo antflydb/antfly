@@ -50,10 +50,12 @@ const artifact_ids = @import("artifact_ids.zig");
 const apply_state = @import("derived/apply_state.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
 const index_generation_manifest = @import("derived/index_generation_manifest.zig");
+const root_identity = @import("root_identity.zig");
 
 test {
     _ = index_repair_state;
     _ = index_generation_manifest;
+    _ = root_identity;
 }
 const change_journal_mod = @import("derived/change_journal.zig");
 const ha_effects_mod = @import("../ha/effects.zig");
@@ -2112,6 +2114,22 @@ fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
     return std.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
+fn loadOrCreateDurableRootIdentity(
+    alloc: Allocator,
+    backend_runtime: ?*background_runtime_mod.BackendRuntime,
+    path: []const u8,
+) !root_identity.State {
+    if (backend_runtime) |runtime| {
+        if (runtime.io()) |io| return try root_identity.loadOrCreate(alloc, io, path);
+    }
+    // Manual executors intentionally have no shared I/O lane. Keep the
+    // fallback at this operation boundary so every identity helper still uses
+    // one caller-owned Io rather than constructing its own executor.
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    return try root_identity.loadOrCreate(alloc, io_impl.io(), path);
+}
+
 fn monotonicTimeNs() u64 {
     return platform_time.monotonicNs();
 }
@@ -3231,6 +3249,10 @@ pub const DB = struct {
             try db.initAsyncInfrastructure(effective_executor, opts.resource_manager);
             profile.init_async_infrastructure_ns = elapsedSince(init_async_started_ns);
             executor_ready = true;
+            if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
+                const identity = try loadOrCreateDurableRootIdentity(alloc, db.backend_runtime, path);
+                db.root_incarnation = identity.incarnation;
+            }
             if (opts.schema_before_index_load) |table_schema| {
                 // This option is used by the metadata-authoritative local
                 // provisioner. Persist directly through the core before index
@@ -3274,7 +3296,6 @@ pub const DB = struct {
                     else => return err,
                 };
                 if (repair_state) |*state| {
-                    db.root_incarnation = state.identity.db_identity;
                     db.index_repair_replay_pinned.store(state.minimumRetainAfterSequence() != null, .release);
                     state.deinit(alloc);
                 }
@@ -11771,6 +11792,11 @@ pub const DB = struct {
         try doc_identity.validateStoreAlloc(alloc, &opened_primary.store);
         try validateRestoredIdentityNamespace(&opened_primary.store, opts);
         try db_core.importChangeJournalSnapshot(alloc, &opened_primary.store, snapshot_root);
+        // The candidate root owns its identity. Creating it while the staged
+        // capability is still held makes identity part of the durable tree
+        // that is sealed and atomically published, rather than an open-time
+        // side effect after the generation becomes visible.
+        _ = try loadOrCreateDurableRootIdentity(alloc, opts.backend_runtime, path);
         if (restore_identity) |identity| try markRestorePrimaryRestoredForPath(
             alloc,
             path,
@@ -58924,7 +58950,7 @@ test "db root generation rollover preserves activated repair debt fail closed" {
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 }
 
-test "db durable root incarnation survives restart and changes on root replacement" {
+test "db durable root incarnation follows the physical root rather than visibility generations" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -58952,6 +58978,20 @@ test "db durable root incarnation survives restart and changes on root replaceme
         defer db.close();
         try std.testing.expectEqual(first_incarnation, try db.durableRootIncarnation());
     }
+    const repair_checkpoint_path = try std.fmt.allocPrint(alloc, "{s}/index_repair.checkpoint", .{std.mem.span(path)});
+    defer alloc.free(repair_checkpoint_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = repair_checkpoint_path, .data = "corrupt-derived-state" });
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .lsm_root_generation = 1,
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try std.testing.expectEqual(first_incarnation, try db.durableRootIncarnation());
+        try std.testing.expect(db.index_repair_state_corrupt.load(.acquire));
+    }
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
             .lsm_root_generation = 2,
@@ -58960,9 +59000,37 @@ test "db durable root incarnation survives restart and changes on root replaceme
             .ttl_cleanup = .{ .enabled = false },
         });
         defer db.close();
-        const replacement_incarnation = try db.durableRootIncarnation();
-        try std.testing.expect(replacement_incarnation != 0);
-        try std.testing.expect(replacement_incarnation != first_incarnation);
+        try std.testing.expectEqual(first_incarnation, try db.durableRootIncarnation());
+    }
+
+    var transition = try generation_lifecycle.beginProcessExclusive(std.mem.span(path));
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+    var staged_incarnation: u128 = 0;
+    {
+        var db = try DB.open(alloc, staged.path(), .{
+            .lsm_root_generation = 2,
+            .staged_generation = &staged,
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        staged_incarnation = try db.durableRootIncarnation();
+        try std.testing.expect(staged_incarnation != first_incarnation);
+    }
+    _ = try staged.publish();
+    transition.deinit();
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .lsm_root_generation = 3,
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try std.testing.expectEqual(staged_incarnation, try db.durableRootIncarnation());
     }
 }
 

@@ -4495,7 +4495,7 @@ pub const DataServer = struct {
     }
 
     fn resourcePressureDefersBackgroundMaintenance(self: *DataServer) bool {
-        return self.provisioned_storage.resource_manager.sliceStats(.lsm_compaction_work).pressure == .hard;
+        return self.provisioned_storage.resource_manager.shouldDeferBackgroundWork(.lsm_compaction_work);
     }
 
     fn deferLsmMaintenance(self: *DataServer, now_ns: u64, delay_ns: u64) void {
@@ -6287,27 +6287,31 @@ pub const DataServer = struct {
         }
         transition_activity.allowReads();
         if (fallback_transition_activity) |*activity| activity.allowReads();
-        if (try transition_activity.leaseCachedWriter(self.alloc)) |cached_db| {
-            var cached = cached_db;
-            defer cached.deinit(self.alloc);
-            return try self.reconcileSplitSourceApplyStoreFromDb(
-                source_store,
-                source_group_id,
-                cached.db,
-                watermark,
-                capture_handoff,
-            );
-        }
-
-        var db = transition_activity.openMaintenanceWriter(self.alloc) catch |err| switch (err) {
+        var result: SplitProjectionReconcileResult = undefined;
+        transition_activity.withWriter(
+            self.alloc,
+            reconcileSplitSourceApplyStoreWithScopedDb,
+            .{ self, source_store, source_group_id, watermark, capture_handoff, &result },
+        ) catch |err| switch (err) {
             error.FileNotFound => return error.SplitSourceProjectionNotReady,
             else => return err,
         };
-        defer db.close();
-        return try self.reconcileSplitSourceApplyStoreFromDb(
+        return result;
+    }
+
+    fn reconcileSplitSourceApplyStoreWithScopedDb(
+        db: *antfly.db.DB,
+        self: *DataServer,
+        source_store: *antfly.data.RaftApplyStore,
+        source_group_id: u64,
+        watermark: ?antfly.data.AppliedDataBatch,
+        capture_handoff: bool,
+        result: *SplitProjectionReconcileResult,
+    ) !void {
+        result.* = try self.reconcileSplitSourceApplyStoreFromDb(
             source_store,
             source_group_id,
-            &db,
+            db,
             watermark,
             capture_handoff,
         );
@@ -13592,36 +13596,18 @@ test "data runtime local group status status-only open preserves replay debt" {
             .config_json = "{\"field\":\"embedding\",\"dims\":2}",
         });
 
-        const stored_key = try antfly.db.internal_keys.documentKeyAlloc(alloc, "doc:a");
-        defer alloc.free(stored_key);
-        try db.core.store.putBatch(&.{
-            .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
-        }, &.{});
-
-        const artifact_key = try antfly.db.internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
-        defer alloc.free(artifact_key);
-        const payload = try antfly.db.enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &[_]f32{ 1, 0 });
-        defer alloc.free(payload);
-        try db.core.store.put(artifact_key, payload);
-
-        var dense_embeddings = try alloc.alloc(antfly.db.derived_types.DerivedDenseEmbeddingWrite, 1);
-        var batch = antfly.db.derived_types.DerivedBatch{
-            .dense_embeddings = dense_embeddings,
-        };
-        defer antfly.db.derived_types.deinitDerivedBatch(alloc, &batch);
-        dense_embeddings[0] = .{
-            .index_name = try alloc.dupe(u8, "dv_v1"),
-            .doc_key = try alloc.dupe(u8, "doc:a"),
-            .artifact_key = try alloc.dupe(u8, artifact_key),
-            .vector = try alloc.dupe(f32, &[_]f32{ 1, 0 }),
-        };
-
-        appended_sequence = db.core.store.nextReplaySequence(1);
-        var record = try change_journal_mod.recordFromDerivedBatch(alloc, batch, appended_sequence);
-        defer change_journal_mod.deinitRecord(alloc, &record);
-        const encoded = try change_journal_mod.encodeRecord(alloc, record);
-        defer alloc.free(encoded);
-        try db.core.store.appendReplayOpaque(alloc, appended_sequence, encoded);
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dv_v1\":[1,0]}}",
+            }},
+            .sync_level = .write,
+        });
+        const seeded_stats = try db.stats(alloc);
+        defer antfly.db.types.freeDBStats(alloc, seeded_stats);
+        appended_sequence = seeded_stats.indexes[0].replay_target_sequence;
+        try std.testing.expect(appended_sequence != 0);
+        try std.testing.expectEqual(@as(u64, 0), seeded_stats.indexes[0].replay_applied_sequence);
     }
 
     {
@@ -14329,9 +14315,11 @@ test "data runtime split apply store seeding reuses cached source writer" {
     const namespace = (try server.identityNamespaceForSplitDestination(180, 181)) orelse return error.TestUnexpectedResult;
     try std.testing.expect(namespace.eql(source_namespace));
 
-    const transition_lease = (try server.leaseTransitionDbForTableGroup(180, 181, namespace)) orelse return error.TestUnexpectedResult;
-    defer transition_lease.release();
-    try std.testing.expect(transition_lease.db.core.identity_namespace.eql(source_namespace));
+    {
+        const transition_lease = (try server.leaseTransitionDbForTableGroup(180, 181, namespace)) orelse return error.TestUnexpectedResult;
+        defer transition_lease.release();
+        try std.testing.expect(transition_lease.db.core.identity_namespace.eql(source_namespace));
+    }
 
     // Replica replacement can preserve this DB while a new Raft generation
     // has only its empty bootstrap entry.
@@ -14358,6 +14346,19 @@ test "data runtime split apply store seeding reuses cached source writer" {
     held.?.deinit(alloc);
     held = null;
     try server.ensureSplitSourceApplyStoreSeeded(source_db_path, 180);
+
+    // The uncached path must release its maintenance writer before the scoped
+    // operation returns. A direct authoritative open proves no owner escaped.
+    try server.write_source.clearWriteCache();
+    server.write_source.write_cache = null;
+    try server.ensureSplitSourceApplyStoreSeeded(source_db_path, 180);
+    {
+        var reopened = try antfly.db.DB.open(alloc, source_db_path, .{
+            .identity_namespace = source_namespace,
+            .start_index_workers = false,
+        });
+        defer reopened.close();
+    }
 
     var source_store = try antfly.data.RaftApplyStore.init(alloc, .{ .root_dir = source_db_path });
     defer source_store.deinit();
@@ -15212,7 +15213,7 @@ test "data runtime local group refresh prefers runtime status snapshot over DB o
     try std.testing.expect(!server.local_group_status_cache.group_statuses[0].empty);
 }
 
-test "data runtime background runtime snapshot warm populates cold status cache without query cache opens" {
+test "data runtime background refresh publishes a cold placeholder without DB opens" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -15335,13 +15336,17 @@ test "data runtime background runtime snapshot warm populates cold status cache 
 
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(@as(u64, 77), statuses.items[0].group_id);
-    try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.doc_count);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.synthetic_config, statuses.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, statuses.items[0].metadata.freshness);
+    try std.testing.expectEqual(@as(u64, 0), statuses.items[0].stats.doc_count);
     try std.testing.expectEqual(@as(usize, 0), server.provisioned_storage.read_cache.entries.items.len);
     try std.testing.expectEqual(@as(u64, 1), server.runtime_status_refresh_started.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), server.runtime_status_refresh_completed.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), server.runtime_status_refresh_failed.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), server.runtime_status_refresh_last_table_count.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), server.runtime_status_refresh_last_group_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), server.runtime_status_refresh_last_db_opens.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), server.runtime_status_refresh_last_placeholder_group_count.load(.monotonic));
     try std.testing.expect(server.runtime_status_refresh_last_duration_ns.load(.monotonic) > 0);
 }
 
@@ -16942,36 +16947,18 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
         coverage_incarnation = configs[0].coverage_generation;
         try std.testing.expect(coverage_incarnation != 0);
 
-        const stored_key = try antfly.db.internal_keys.documentKeyAlloc(alloc, "doc:a");
-        defer alloc.free(stored_key);
-        try db.core.store.putBatch(&.{
-            .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
-        }, &.{});
-
-        const artifact_key = try antfly.db.internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
-        defer alloc.free(artifact_key);
-        const payload = try antfly.db.enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &[_]f32{ 1, 0 });
-        defer alloc.free(payload);
-        try db.core.store.put(artifact_key, payload);
-
-        var dense_embeddings = try alloc.alloc(antfly.db.derived_types.DerivedDenseEmbeddingWrite, 1);
-        var batch = antfly.db.derived_types.DerivedBatch{
-            .dense_embeddings = dense_embeddings,
-        };
-        defer antfly.db.derived_types.deinitDerivedBatch(alloc, &batch);
-        dense_embeddings[0] = .{
-            .index_name = try alloc.dupe(u8, "dv_v1"),
-            .doc_key = try alloc.dupe(u8, "doc:a"),
-            .artifact_key = try alloc.dupe(u8, artifact_key),
-            .vector = try alloc.dupe(f32, &[_]f32{ 1, 0 }),
-        };
-
-        appended_sequence = db.core.store.nextReplaySequence(1);
-        var record = try change_journal_mod.recordFromDerivedBatch(alloc, batch, appended_sequence);
-        defer change_journal_mod.deinitRecord(alloc, &record);
-        const encoded = try change_journal_mod.encodeRecord(alloc, record);
-        defer alloc.free(encoded);
-        try db.core.store.appendReplayOpaque(alloc, appended_sequence, encoded);
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value = "{\"title\":\"alpha\",\"embedding\":[1,0]}",
+            }},
+            .sync_level = .write,
+        });
+        const seeded_stats = try db.stats(alloc);
+        defer antfly.db.types.freeDBStats(alloc, seeded_stats);
+        appended_sequence = seeded_stats.indexes[0].replay_target_sequence;
+        try std.testing.expect(appended_sequence != 0);
+        try std.testing.expectEqual(@as(u64, 0), seeded_stats.indexes[0].replay_applied_sequence);
     }
 
     const indexes_json = try std.fmt.allocPrint(
@@ -17703,8 +17690,10 @@ test "data runtime startup catch-up retries unresolved leadership and observes l
     try std.testing.expectEqual(@as(u64, 2), server.provisioned_startup_catch_up_started.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 2), server.provisioned_startup_catch_up_completed.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_last_group_count.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 0), server.provisioned_startup_catch_up_last_groups_with_debt.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 0), server.provisioned_startup_catch_up_last_groups_cleared.load(.monotonic));
+    // Leadership admission exposes the pending replay to the authoritative
+    // writer; this pass both observes and clears that debt.
+    try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_last_groups_with_debt.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_last_groups_cleared.load(.monotonic));
     try std.testing.expect(!server.provisioned_startup_catch_up_dirty.load(.monotonic));
 
     {
@@ -21941,8 +21930,14 @@ test "data runtime lsm maintenance scheduler defers under resource pressure" {
     server.deferLsmMaintenance(100, 50);
     try std.testing.expectEqual(@as(u64, 150), server.lsm_maintenance_next_eligible_ns.load(.monotonic));
 
-    var reservation = try server.provisioned_storage.resource_manager.reserve(.lsm_compaction_work, 769 * 1024 * 1024);
-    defer reservation.release();
+    const budget = server.provisioned_storage.resource_manager.sliceStats(.lsm_compaction_work);
+    var observed_bytes: u64 = 0;
+    server.provisioned_storage.resource_manager.observeUsage(
+        .lsm_compaction_work,
+        &observed_bytes,
+        budget.soft_limit_bytes +| 1,
+    );
+    defer server.provisioned_storage.resource_manager.observeUsage(.lsm_compaction_work, &observed_bytes, 0);
     try std.testing.expect(server.resourcePressureDefersBackgroundMaintenance());
 }
 

@@ -410,7 +410,18 @@ fn allocMembershipChangesWithLocalPolicy(
     defer desired_voters.deinit(alloc);
     var desired_learners = std.ArrayListUnmanaged(u64).empty;
     defer desired_learners.deinit(alloc);
-    for (learner_node_ids) |node_id| try appendUniqueNodeId(alloc, &desired_learners, node_id);
+    for (learner_node_ids) |node_id| {
+        // Raft membership is monotonic through relocation. Metadata can
+        // transiently replay an older learner intent after promotion, but an
+        // existing voter must never be demoted in place. Retain it as a voter;
+        // the next fresh intent will either confirm promotion or remove it
+        // through the ordinary contraction path.
+        if (containsNodeId(current_voters, node_id)) {
+            try appendUniqueNodeId(alloc, &desired_voters, node_id);
+        } else {
+            try appendUniqueNodeId(alloc, &desired_learners, node_id);
+        }
+    }
     if (retain_local_voter and !containsNodeId(desired_learners.items, local_node_id))
         try appendUniqueNodeId(alloc, &desired_voters, local_node_id);
     for (voter_node_ids) |node_id| {
@@ -857,6 +868,20 @@ test "membership reconciliation hydrates learners before voter promotion" {
     try std.testing.expectEqualSlices(raft_engine.core.ConfChangeSingle, &.{
         .{ .change_type = .add_node, .node_id = 3 },
     }, promote);
+}
+
+test "membership reconciliation never demotes a voter from a stale learner intent" {
+    const changes = try allocMembershipChanges(
+        std.testing.allocator,
+        &.{ 1, 2, 3 },
+        &.{},
+        1,
+        &.{ 1, 2 },
+        &.{3},
+    );
+    defer std.testing.allocator.free(changes);
+
+    try std.testing.expectEqual(@as(usize, 0), changes.len);
 }
 
 test "membership reconciliation requires a local voter" {

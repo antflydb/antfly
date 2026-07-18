@@ -5724,25 +5724,27 @@ pub const ProvisionedTableWriteSource = struct {
             self.source.allowGroupOperationReads(self.table_name, self.group_id);
         }
 
-        pub fn leaseCachedWriter(
+        /// Runs one operation against the authoritative writer while this
+        /// capability owns transition admission. The callback has no return
+        /// payload, so it cannot return the DB borrow to its caller; it must
+        /// copy any result into caller-owned output and must not retain `db`.
+        /// Cached and maintenance owners are both released before return.
+        pub fn withWriter(
             self: *GroupTransitionActivity,
             alloc: std.mem.Allocator,
-        ) !?ProvisionedTableWriteCache.CachedDb {
+            comptime operation: anytype,
+            args: anytype,
+        ) !void {
             if (!self.active) return error.InactiveGroupTransitionActivity;
-            return try self.source.leaseCachedGroupWriter(alloc, self.group_id, self.table_name);
-        }
-
-        /// Opens the authoritative writer only while this capability owns group
-        /// transition admission. This is the uncached maintenance fallback; it
-        /// must never escape the activity lifetime.
-        pub fn openMaintenanceWriter(
-            self: *GroupTransitionActivity,
-            alloc: std.mem.Allocator,
-        ) !db_mod.DB {
-            if (!self.active) return error.InactiveGroupTransitionActivity;
+            if (try self.source.leaseCachedGroupWriter(alloc, self.group_id, self.table_name)) |cached_value| {
+                var cached = cached_value;
+                defer cached.deinit(alloc);
+                try @call(.auto, operation, .{cached.db} ++ args);
+                return;
+            }
             const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.source.replica_root_dir, self.group_id);
             defer alloc.free(path);
-            return try openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGate(
+            var db = try openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGate(
                 alloc,
                 path,
                 self.source.catalog,
@@ -5756,6 +5758,8 @@ pub const ProvisionedTableWriteSource = struct {
                 self.source.ha_write_gate,
                 self.source.ha_async_mirror,
             );
+            defer db.close();
+            try @call(.auto, operation, .{&db} ++ args);
         }
     };
 

@@ -853,6 +853,15 @@ pub const ResourceManager = struct {
         return self.admissionDecision(slice, 0);
     }
 
+    /// Returns whether the configured policy requires background work to yield
+    /// at the slice's current pressure. Rejection is also a deferral signal for
+    /// maintenance: foreground admission owns the remaining capacity.
+    pub fn shouldDeferBackgroundWork(self: *ResourceManager, slice: Slice) bool {
+        const decision = self.pressureDecision(slice);
+        if (decision.pressure == .normal) return false;
+        return decision.action == .defer_background_work or decision.action == .reject_work;
+    }
+
     /// Evaluates an allocation before it joins an externally accounted slice.
     /// The returned epoch can be used to sleep until some producer releases or
     /// otherwise changes accounted usage.
@@ -1295,6 +1304,29 @@ test "resource manager records soft and hard budget pressure" {
     try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserve(.derived_backlog, 9));
     stats = manager.snapshot();
     try std.testing.expectEqual(@as(u64, 1), stats.slices[sliceIndex(.derived_backlog)].hard_limit_rejections);
+}
+
+test "resource manager background deferral follows slice policy" {
+    var budgets = Options.defaultBudgets();
+    var policies = Options.defaultPolicies();
+    budgets[sliceIndex(.lsm_compaction_work)] = .{
+        .soft_limit_bytes = 10,
+        .hard_limit_bytes = 20,
+    };
+    policies[sliceIndex(.lsm_compaction_work)] = .{
+        .soft_action = .defer_background_work,
+        .hard_action = .reject_work,
+    };
+    var manager = ResourceManager.init(.{ .budgets = budgets, .policies = policies });
+
+    var observed: u64 = 0;
+    try std.testing.expect(!manager.shouldDeferBackgroundWork(.lsm_compaction_work));
+    manager.observeUsage(.lsm_compaction_work, &observed, 11);
+    try std.testing.expect(manager.shouldDeferBackgroundWork(.lsm_compaction_work));
+    manager.observeUsage(.lsm_compaction_work, &observed, 21);
+    try std.testing.expect(manager.shouldDeferBackgroundWork(.lsm_compaction_work));
+    manager.observeUsage(.lsm_compaction_work, &observed, 0);
+    try std.testing.expect(!manager.shouldDeferBackgroundWork(.lsm_compaction_work));
 }
 
 test "resource manager bounds and serializes oversized minimum progress" {

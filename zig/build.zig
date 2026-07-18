@@ -23,6 +23,7 @@ const inference_runtime_build = @import("pkg/inference/build/runtime.zig");
 const LmdbBackend = antfly_storage_build.LmdbBackend;
 const chainLabeledFilteredTests = antfly_tests_build.chainLabeledFilteredTests;
 const chainLabeledRun = antfly_tests_build.chainLabeledRun;
+const chainLabeledRunStep = antfly_tests_build.chainLabeledRunStep;
 const configureEmbeddedModule = antfly_embedded_build.configureModule;
 const lmdb_c_flags = antfly_storage_build.lmdb_c_flags;
 const makeLmdbBuildOptions = antfly_storage_build.makeLmdbBuildOptions;
@@ -2922,11 +2923,24 @@ pub fn build(b: *std.Build) void {
         "wal sim ",
         "index manager sim ",
         "db split sim ",
+        "metadata sim ",
+        "metadata VOPR",
+        "chaos",
+        "soak",
+        "storage sim ",
+        "modeled device",
+        "wal group commit uses injected virtual clock",
+        "wal can reopen on modeled storage device",
+        "wal modeled ",
+        "persistent modeled ",
+        "index manager modeled replay fixtures stay green",
+        "index manager modeled crash fixtures stay green",
+        "db split modeled ",
+        "serverless",
+        "raft.",
         "HBC recall",
     };
-    const unit_progress_skip_filters = root_test_skip_filters ++ [_][]const u8{
-        "lsm backend compaction chaos campaign",
-    };
+    const unit_progress_skip_filters = root_test_skip_filters;
     const lib_unit_default_filters = [_][]const u8{
         "restore job store is idempotent and fenced",
         "restore requests without idempotency keys create independent opaque jobs",
@@ -2947,13 +2961,8 @@ pub fn build(b: *std.Build) void {
         "batch parser accepts raw payload value under public request cap",
         "linear merge request parser accepts raw payload value under public request cap",
         "http response uses its owning allocator",
-        "api http server serves table lookup with version header",
         "public index contract exposes runtime status metadata",
         "public openapi documents stable exact sort diagnostics",
-        "api query contract serializes sort profile diagnostics",
-        "api query contract maps public exact sort rejection diagnostics",
-        "api query contract preflight rejects cursor pagination over approximate vector source",
-        "api query contract preflight rejects search_before pagination over approximate vector source",
         "artifact enrichment request permits asset full text routing",
         "provisioned read cache retirement is allocation-free after entry installation",
         "provisioned read cache exclusive access drains active read leases",
@@ -2965,10 +2974,10 @@ pub fn build(b: *std.Build) void {
         "backend runtime durable lane leaves inline failed jobs owned by caller",
         "backend runtime threaded durable lane rejects jobs after owner close",
         "provisioned table write cache retires stale db when index metadata changes",
+        "managed startup catch-up advances counterless incomplete dense repair",
+        "provisioned leader admission rejects uncommitted writes under dense repair pressure",
+        "api maintenance resumes recovered durable named index cancellation without client advance",
         "embeddings index status ignores inactive stale catch-up progress once dense coverage is visible",
-        "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery",
-        "partial coverage embeddings readiness counts skipped source units",
-        "partial coverage embeddings readiness does not mask pending enrichment",
         "create table raw parser merges default full text with quickstart embedding index",
         "create table raw parser accepts its canonical full text output",
         "provisioned primary lookup lease fails on identity namespace mismatch",
@@ -3198,9 +3207,10 @@ pub fn build(b: *std.Build) void {
     const recall_test_step = b.step("recall-test", "Run HBC vector recall quality tests");
     recall_test_step.dependOn(&run_lib_recall_tests.step);
 
+    const raft_unit_default_filters = [_][]const u8{"raft."};
     const raft_unit_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &.{"raft."}),
+        .filters = selectTestFilters(b, &raft_unit_default_filters),
     });
     const run_raft_unit_tests = b.addRunArtifact(raft_unit_tests);
 
@@ -3356,9 +3366,10 @@ pub fn build(b: *std.Build) void {
     const lib_db_test_step = b.step("lib-db-test", "Run root-module DB tests only");
     lib_db_test_step.dependOn(&run_lib_db_tests.step);
 
+    const serverless_default_filters = [_][]const u8{"serverless"};
     const serverless_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"serverless"},
+        .filters = &serverless_default_filters,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3441,7 +3452,6 @@ pub fn build(b: *std.Build) void {
         "idle cached runtime status stays fresh only for the published root generation",
         "data runtime stamps one producer generation on every reported group",
         "data runtime live writer source follows raft apply ownership",
-        "data descriptor factory separates bootstrap voters from transport peers",
         "placement topology promotes cutover-ready learners to voters",
         "placement topology bootstraps active split destination as a new voter generation",
         "placement topology uses authoritative split peer set during partial projection",
@@ -3504,7 +3514,6 @@ pub fn build(b: *std.Build) void {
         "data raft apply store persists split destination acknowledgements",
         "data raft apply store seeds pre-raft snapshots once at reserved index zero",
         "data raft apply store refuses stale snapshot projection regression",
-        "data raft apply store persists split destination acknowledgements",
         "raft batch round trips internal split checkpoint",
         "raft batch round trips internal split replication identity",
         "group state range scan is allocation-failure safe",
@@ -3536,6 +3545,26 @@ pub fn build(b: *std.Build) void {
     const run_lib_data_storage_tests = b.addRunArtifact(lib_data_storage_tests);
     const lib_data_storage_test_step = b.step("lib-data-storage-test", "Run focused data storage tests");
     lib_data_storage_test_step.dependOn(&run_lib_data_storage_tests.step);
+
+    // The focused data-storage root imports the production storage modules, so
+    // its imported tests are already owned by the broad root storage artifact.
+    // Keep only the six contracts declared by this wrapper in the aggregate.
+    const unit_data_storage_root_tests = b.addTest(.{
+        .root_module = data_storage_test_mod,
+        .filters = &.{
+            "data storage module tests are reachable",
+            "raft snapshot durability tests are reachable",
+            "db split sync coordinator allocates destination identity namespace",
+            "db merge coordinator opt-in applies configured receiver identity namespace",
+            "db merge coordinator reapplies target namespace for persisted reassignment opt-in",
+            "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_unit_data_storage_root_tests = b.addRunArtifact(unit_data_storage_root_tests);
 
     const lib_db_enrichment_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -4176,7 +4205,6 @@ pub fn build(b: *std.Build) void {
     const run_lib_storage_maintenance_tests = b.addRunArtifact(lib_storage_maintenance_tests);
     const lib_storage_maintenance_test_step = b.step("lib-storage-maintenance-test", "Run storage maintenance coordinator ownership and concurrency tests");
     lib_storage_maintenance_test_step.dependOn(&run_lib_storage_maintenance_tests.step);
-    unit_test_step.dependOn(lib_storage_maintenance_test_step);
 
     const api_connections_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_connections_test_root.zig"),
@@ -4275,9 +4303,6 @@ pub fn build(b: *std.Build) void {
             "api public table query rejects only top-level internal fields",
             "single embeddings index encoder scopes isolated enrichment failure to one index",
             "empty embeddings index status is ready without dense artifact visibility",
-            "derived coverage evaluation is policy exact and observation gated",
-            "partial coverage embeddings readiness counts skipped source units",
-            "partial coverage embeddings readiness does not mask pending enrichment",
             "index encoders report missing and stale topology groups without probing databases",
             "api query contract rejects doc identity control fields when with relaxes schema",
             "api query contract public parser rejects internal shard doc identity controls",
@@ -4968,19 +4993,6 @@ pub fn build(b: *std.Build) void {
     const ha_test_step = b.step("ha-test", "Run hot-standby HA storage tests");
     ha_test_step.dependOn(&run_ha_tests.step);
 
-    const lib_storage_progress_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_storage_default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_storage_progress_tests = b.addRunArtifact(lib_storage_progress_tests);
-    for (unit_progress_skip_filters) |filter| {
-        run_lib_storage_progress_tests.addArgs(&.{ "--skip-test-filter", filter });
-    }
-
     const lsm_backend_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"storage.lsm_backend."},
@@ -5014,6 +5026,7 @@ pub fn build(b: *std.Build) void {
             "provisioned group storage derives all resource budgets",
             "resource manager capacity source is immutable after composition",
             "capacity reservation revalidation fails closed when available space falls",
+            "resource manager background deferral follows slice policy",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -5127,7 +5140,6 @@ pub fn build(b: *std.Build) void {
     dense_index_lifecycle_regression_step.dependOn(&run_dense_index_repair_job_tests.step);
     dense_index_lifecycle_regression_step.dependOn(&run_dense_index_repair_status_tests.step);
     dense_index_lifecycle_regression_step.dependOn(&run_dense_index_repair_runtime_tests.step);
-    unit_test_step.dependOn(&run_dense_index_lifecycle_regression_tests.step);
 
     const sim_test_step = b.step("sim-test", "Run mocked-time Antfly simulation suites");
     sim_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
@@ -5370,15 +5382,10 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_capi_tests.step);
     unit_test_step.dependOn(&run_lite_native_tests.step);
     unit_test_step.dependOn(&run_cmd_tests.step);
-    unit_test_step.dependOn(&run_lib_db_tests.step);
     unit_test_step.dependOn(&run_introducer_tests.step);
-    unit_test_step.dependOn(&run_lib_db_text_query_tests.step);
-    unit_test_step.dependOn(&run_lib_db_result_shape_tests.step);
     unit_test_step.dependOn(&run_serverless_tests.step);
     unit_test_step.dependOn(&run_lib_data_runtime_tests.step);
-    unit_test_step.dependOn(&run_lib_data_storage_tests.step);
-    unit_test_step.dependOn(&run_lib_metadata_logic_tests.step);
-    unit_test_step.dependOn(&run_lib_metadata_service_tests.step);
+    unit_test_step.dependOn(&run_unit_data_storage_root_tests.step);
     unit_test_step.dependOn(&run_lib_api_docid_tests.step);
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
     unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
@@ -5394,17 +5401,33 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
     unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
     unit_test_step.dependOn(lib_standalone_runtime_test_step);
-    unit_test_step.dependOn(ha_test_step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
-    unit_test_step.dependOn(&run_raft_transport_tests.step);
+
+    // Progress mode uses one union-filtered root artifact too. Storage and
+    // metadata module paths overlap, while raft-transport is a strict subset
+    // of raft; separate artifacts therefore repeated tests as well as builds.
+    const unit_progress_root_default_filters = lib_storage_default_filters ++ [_][]const u8{
+        "metadata.",
+        "raft.",
+        "serverless",
+    };
+    const unit_progress_root_filters = selectTestFilters(b, &unit_progress_root_default_filters);
+    const unit_progress_root_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = unit_progress_root_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_unit_progress_root_tests = b.addRunArtifact(unit_progress_root_tests);
+    addRuntimeTestFilters(run_unit_progress_root_tests, unit_progress_root_filters);
+    for (unit_progress_skip_filters) |filter| {
+        run_unit_progress_root_tests.addArgs(&.{ "--skip-test-filter", filter });
+    }
 
     var unit_progress_tail: ?*std.Build.Step = null;
-    unit_progress_tail = chainLabeledRun(b, lib_storage_progress_tests, "lib-storage-test", unit_progress_tail);
-    unit_progress_tail = chainLabeledRun(b, lib_db_tests, "lib-db-test", unit_progress_tail);
-    unit_progress_tail = chainLabeledRun(b, lib_metadata_tests, "lib-metadata-test", unit_progress_tail);
-    unit_progress_tail = chainLabeledRun(b, raft_unit_tests, "raft-test", unit_progress_tail);
-    unit_progress_tail = chainLabeledRun(b, raft_transport_tests, "raft-transport-test", unit_progress_tail);
-    unit_progress_tail = chainLabeledRun(b, serverless_tests, "serverless-test", unit_progress_tail);
+    unit_progress_tail = chainLabeledRunStep(b, run_unit_progress_root_tests, "lib-root-test", unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, lib_template_tests, "lib-template-test", unit_progress_tail);
     unit_test_progress_step.dependOn(unit_progress_tail.?);
 

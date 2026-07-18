@@ -20,8 +20,9 @@ The serving-layer target shape is:
 - one cached read DB owner per table group and visible root generation
 - many read transactions, cursors, lookups, scans, queries, and status reads as
   leases on that read owner
-- short-lived maintenance DB opens only while an exclusive table/group
-  transition lease is held
+- short-lived maintenance DB opens only inside a callback scoped to an
+  exclusive table/group transition lease; raw DB handles cannot escape the
+  callback
 
 Split/merge projection work uses a group-exclusive transition lease. It queues
 ahead of later writers, briefly drains reads while managed auto-bulk state is
@@ -548,6 +549,17 @@ the watermark remain unchanged. If Raft advances during repair, publication
 fails and preparation retries from a new snapshot; only replicated split deltas
 may mutate an active projection.
 
+The incarnation belongs to the core storage generation, not to a derived-index
+repair checkpoint. It is stored in an independently checksummed
+`root_identity.checkpoint`, written through the DB runtime's caller-owned
+`std.Io`, synced, and atomically renamed. The identity belongs to the directory,
+not the process-local visibility generation: cache fencing and in-place metadata
+reconciliation preserve it. Every newly staged directory creates its identity
+before sealing, so atomic publication carries the new identity with the root.
+Derived checkpoint loss or repair cannot change storage identity. A physical
+generation replacement creates a new identity even when the logical contents
+and index catalog are unchanged.
+
 Replica relocation and replica-count shrink use two committed membership
 phases. A `draining` source remains a voter, and may remain leader, while
 replacement learners hydrate and the expanded voter set stabilizes. Once any
@@ -566,9 +578,12 @@ forever. Metadata absence is the durable routing and ownership fence; local
 reconciliation removes the persisted Raft catalog record before retiring the DB
 owner. This prevents filesystem and cache retirement from racing a
 still-committed Raft member, including replication-factor-one moves. Membership
-planning and proof lookup are indexed by `(group, node)`, so a reconcile pass is
-linear in placements and status reports, with only replication-factor-bounded
-scans per retiring group.
+planning indexes placement intent by `(group, node)` and runtime evidence by
+`(group, store)`. Hydration, cutover, and retirement accept evidence only from
+the exact store named by the placement. A zero store identity is usable only
+when the node has one unambiguous store; multi-store nodes fail closed. A
+reconcile pass remains linear in placements and status reports, with only
+replication-factor-bounded scans per retiring group.
 
 Relocation hydration is proven by relocation generation, committed Raft apply
 boundary, logical document watermark, and stable voter identity. Source disk

@@ -940,7 +940,14 @@ fn effectivePlacementIntent(
             // voter contraction must not temporarily withdraw read service.
             .serving => .serving,
             .draining => .serving,
-            .planned, .bootstrapping, .replaying, .cutover_ready, .retiring => relocationTargetServingState(current, effective),
+            // Promotion is monotonic as well. A cutover-ready replica may
+            // already be a committed voter by the time a transiently missing
+            // or stale status sample is reconciled. Reclassifying it as a
+            // learner would request an invalid voter demotion and can stall
+            // the relocation indefinitely. Keep it non-serving until stable
+            // membership is proved, but never move it backwards.
+            .cutover_ready => if (relocationTargetReady(current, effective)) .serving else .cutover_ready,
+            .planned, .bootstrapping, .replaying, .retiring => relocationTargetServingState(current, effective),
         };
         return effective;
     }
@@ -982,10 +989,11 @@ fn relocationWatermarkForGroup(current: CurrentMetadataState, group_id: u64) Rel
     }
     for (current.stores) |store| {
         if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) continue;
-        if (!storeHasPlacement(current.placement_intents, group_id, store.node_id)) continue;
+        const placement = findPlacementIntent(current.placement_intents, group_id, store.node_id) orelse continue;
+        const placement_store = findStoreForPlacement(current.stores, placement) orelse continue;
+        if (placement_store.store_id != store.store_id) continue;
         for (store.group_statuses) |status| {
             if (status.group_id != group_id) continue;
-            const placement = findPlacementIntent(current.placement_intents, group_id, store.node_id) orelse continue;
             if (status.relocation_generation != placement.relocation_generation) continue;
             if (relocationStatusHasVisibleDocuments(status.doc_count)) watermark.has_visible_data = true;
             if (status.doc_count > watermark.doc_count) watermark.doc_count = status.doc_count;
@@ -1042,7 +1050,7 @@ fn relocationTargetReady(current: CurrentMetadataState, intent: raft_reconciler.
 }
 
 fn relocationTargetDataReady(current: CurrentMetadataState, intent: raft_reconciler.PlacementIntent) bool {
-    const store = findStoreByNode(current.stores, intent.record.local_node_id) orelse return false;
+    const store = findStoreForPlacement(current.stores, intent) orelse return false;
     if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return false;
 
     for (store.group_statuses) |status| {
@@ -1060,7 +1068,7 @@ fn relocationTargetDataReady(current: CurrentMetadataState, intent: raft_reconci
 
 fn relocationTargetCutoverReady(current: CurrentMetadataState, intent: raft_reconciler.PlacementIntent) bool {
     if (!relocationTargetDataReady(current, intent)) return false;
-    const store = findStoreByNode(current.stores, intent.record.local_node_id) orelse return false;
+    const store = findStoreForPlacement(current.stores, intent) orelse return false;
 
     for (store.group_statuses) |status| {
         if (status.group_id != intent.record.group_id) continue;
@@ -1081,7 +1089,7 @@ fn relocationTargetCutoverReady(current: CurrentMetadataState, intent: raft_reco
 }
 
 fn relocationTargetHasDataReport(current: CurrentMetadataState, intent: raft_reconciler.PlacementIntent) bool {
-    const store = findStoreByNode(current.stores, intent.record.local_node_id) orelse return false;
+    const store = findStoreForPlacement(current.stores, intent) orelse return false;
     for (store.group_statuses) |status| {
         if (status.group_id == intent.record.group_id) return true;
     }
@@ -1112,15 +1120,16 @@ const MembershipTransitionIndex = struct {
     groups: std.AutoHashMapUnmanaged(u64, GroupState) = .empty,
     current_by_member: std.AutoHashMapUnmanaged(u128, *const raft_reconciler.PlacementIntent) = .empty,
     desired_by_member: std.AutoHashMapUnmanaged(u128, *const raft_reconciler.PlacementIntent) = .empty,
-    stores_by_node: std.AutoHashMapUnmanaged(u64, *const table_manager.StoreRecord) = .empty,
-    status_by_member: std.AutoHashMapUnmanaged(u128, *const table_manager.GroupStatusReport) = .empty,
+    stores: []const table_manager.StoreRecord,
+    stores_by_id: std.AutoHashMapUnmanaged(u64, *const table_manager.StoreRecord) = .empty,
+    status_by_store_group: std.AutoHashMapUnmanaged(u128, *const table_manager.GroupStatusReport) = .empty,
 
     fn init(
         alloc: std.mem.Allocator,
         current: CurrentMetadataState,
         desired: []const raft_reconciler.PlacementIntent,
     ) !MembershipTransitionIndex {
-        var self = MembershipTransitionIndex{ .alloc = alloc };
+        var self = MembershipTransitionIndex{ .alloc = alloc, .stores = current.stores };
         errdefer self.deinit();
 
         for (current.placement_intents) |*intent| {
@@ -1144,9 +1153,9 @@ const MembershipTransitionIndex = struct {
             }
         }
         for (current.stores) |*store| {
-            try self.stores_by_node.put(alloc, store.node_id, store);
+            try self.stores_by_id.put(alloc, store.store_id, store);
             for (store.group_statuses) |*status| {
-                try self.status_by_member.put(alloc, placementNodeKey(status.group_id, store.node_id), status);
+                try self.status_by_store_group.put(alloc, placementStoreKey(status.group_id, store.store_id), status);
             }
         }
         for (current.placement_intents) |*intent| {
@@ -1192,7 +1201,7 @@ const MembershipTransitionIndex = struct {
         for (current.placement_intents) |*intent| {
             if (intent.serving_state != .serving and intent.serving_state != .draining) continue;
             if (!self.memberReadyForContraction(intent.*)) continue;
-            const status = self.status_by_member.get(placementNodeKey(intent.record.group_id, intent.record.local_node_id)).?;
+            const status = self.statusForIntent(intent.*).?;
             if (status.local_leader) self.groups.getPtr(intent.record.group_id).?.expanded_leader = true;
         }
         return self;
@@ -1202,8 +1211,8 @@ const MembershipTransitionIndex = struct {
         self.groups.deinit(self.alloc);
         self.current_by_member.deinit(self.alloc);
         self.desired_by_member.deinit(self.alloc);
-        self.stores_by_node.deinit(self.alloc);
-        self.status_by_member.deinit(self.alloc);
+        self.stores_by_id.deinit(self.alloc);
+        self.status_by_store_group.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -1214,12 +1223,35 @@ const MembershipTransitionIndex = struct {
     }
 
     fn memberReadyForContraction(self: *const MembershipTransitionIndex, intent: raft_reconciler.PlacementIntent) bool {
-        const store = self.stores_by_node.get(intent.record.local_node_id) orelse return false;
+        const store = self.storeForIntent(intent) orelse return false;
         if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return false;
-        const status = self.status_by_member.get(placementNodeKey(intent.record.group_id, intent.record.local_node_id)) orelse return false;
+        const status = self.statusForStore(intent.record.group_id, store.store_id) orelse return false;
         if (!status.local_voter or status.joint_consensus or status.transition_pending) return false;
         if (status.replay_required and !status.replay_caught_up) return false;
         return voterSetMatchesIntent(status.*, intent);
+    }
+
+    fn storeForIntent(self: *const MembershipTransitionIndex, intent: raft_reconciler.PlacementIntent) ?*const table_manager.StoreRecord {
+        if (intent.store_id != 0) {
+            const store = self.stores_by_id.get(intent.store_id) orelse return null;
+            return if (store.node_id == intent.record.local_node_id) store else null;
+        }
+        var match: ?*const table_manager.StoreRecord = null;
+        for (self.stores) |*store| {
+            if (store.node_id != intent.record.local_node_id) continue;
+            if (match != null) return null;
+            match = store;
+        }
+        return match;
+    }
+
+    fn statusForStore(self: *const MembershipTransitionIndex, group_id: u64, store_id: u64) ?*const table_manager.GroupStatusReport {
+        return self.status_by_store_group.get(placementStoreKey(group_id, store_id));
+    }
+
+    fn statusForIntent(self: *const MembershipTransitionIndex, intent: raft_reconciler.PlacementIntent) ?*const table_manager.GroupStatusReport {
+        const store = self.storeForIntent(intent) orelse return null;
+        return self.statusForStore(intent.record.group_id, store.store_id);
     }
 
     fn currentIntent(self: *const MembershipTransitionIndex, group_id: u64, node_id: u64) ?raft_reconciler.PlacementIntent {
@@ -1279,9 +1311,9 @@ const MembershipTransitionIndex = struct {
         const final_peers = state.latched_final_peers orelse return false;
         if (containsU64(final_peers, source.record.local_node_id)) return false;
 
-        if (self.stores_by_node.get(source.record.local_node_id)) |store| {
+        if (self.storeForIntent(source)) |store| {
             if (store.live and std.mem.eql(u8, store.health_class, "healthy")) {
-                if (self.status_by_member.get(placementNodeKey(source.record.group_id, source.record.local_node_id))) |status| {
+                if (self.statusForStore(source.record.group_id, store.store_id)) |status| {
                     if (status.local_voter or status.joint_consensus or status.transition_pending) return false;
                 }
             }
@@ -1289,9 +1321,10 @@ const MembershipTransitionIndex = struct {
 
         var final_leader_proved = false;
         for (final_peers) |node_id| {
-            const store = self.stores_by_node.get(node_id) orelse continue;
+            const intent = self.currentIntent(source.record.group_id, node_id) orelse return false;
+            const store = self.storeForIntent(intent) orelse continue;
             if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) continue;
-            const status = self.status_by_member.get(placementNodeKey(source.record.group_id, node_id)) orelse continue;
+            const status = self.statusForStore(source.record.group_id, store.store_id) orelse continue;
             if (!status.local_voter or status.joint_consensus or status.transition_pending or
                 !status.voter_set_known or @as(usize, status.voter_count) != state.latched_voter_count or
                 !std.mem.eql(u8, &status.voter_set_fingerprint, &state.latched_fingerprint.?))
@@ -1334,11 +1367,24 @@ fn findRelocationSourceIntent(
     return null;
 }
 
-fn findStoreByNode(stores: []const table_manager.StoreRecord, node_id: u64) ?table_manager.StoreRecord {
-    for (stores) |store| {
-        if (store.node_id == node_id) return store;
+fn findStoreForPlacement(
+    stores: []const table_manager.StoreRecord,
+    intent: raft_reconciler.PlacementIntent,
+) ?table_manager.StoreRecord {
+    if (intent.store_id != 0) {
+        for (stores) |store| {
+            if (store.store_id != intent.store_id) continue;
+            return if (store.node_id == intent.record.local_node_id) store else null;
+        }
+        return null;
     }
-    return null;
+    var match: ?table_manager.StoreRecord = null;
+    for (stores) |store| {
+        if (store.node_id != intent.record.local_node_id) continue;
+        if (match != null) return null;
+        match = store;
+    }
+    return match;
 }
 
 fn findRestoreProgress(
@@ -1489,6 +1535,10 @@ test "metadata reconciler protects desired split quorum before admission project
 
 fn placementNodeKey(group_id: u64, node_id: u64) u128 {
     return (@as(u128, group_id) << 64) | @as(u128, node_id);
+}
+
+fn placementStoreKey(group_id: u64, store_id: u64) u128 {
+    return (@as(u128, group_id) << 64) | @as(u128, store_id);
 }
 
 fn findPlacementIntentForGroup(
@@ -3677,6 +3727,125 @@ test "metadata reconciler requires logical document watermark and tolerates comp
     try std.testing.expect(relocationTargetCutoverReady(.{ .stores = (&[_]table_manager.StoreRecord{caught_up_store})[0..] }, intent));
 }
 
+test "metadata reconciler accepts relocation evidence only from the placement store" {
+    const intent: raft_reconciler.PlacementIntent = .{
+        .record = .{ .group_id = 2245, .replica_id = 3, .local_node_id = 104 },
+        .store_id = 1040,
+        .peer_node_ids = &.{ 101, 102, 104 },
+        .serving_state = .replaying,
+        .relocation_generation = 17,
+        .relocation_doc_count_watermark = 12,
+        .relocation_target_sequence = 91,
+    };
+    const fingerprint = table_manager.voterSetFingerprint(&.{ 101, 102, 104 }, null);
+    var owner_status: table_manager.GroupStatusReport = .{
+        .group_id = 2245,
+        .relocation_generation = 17,
+        .raft_applied_index = 90,
+        .doc_count = 11,
+        .local_voter = true,
+        .voter_count = 3,
+        .voter_set_known = true,
+        .voter_set_fingerprint = fingerprint,
+    };
+    const wrong_store_status: table_manager.GroupStatusReport = .{
+        .group_id = 2245,
+        .relocation_generation = 17,
+        .raft_applied_index = 91,
+        .doc_count = 12,
+        .local_leader = true,
+        .local_voter = true,
+        .voter_count = 3,
+        .voter_set_known = true,
+        .voter_set_fingerprint = fingerprint,
+    };
+    var stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 1040,
+            .node_id = 104,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{owner_status})[0..]),
+        },
+        .{
+            .store_id = 1041,
+            .node_id = 104,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{wrong_store_status})[0..]),
+        },
+    };
+
+    try std.testing.expect(!relocationTargetCutoverReady(.{ .stores = &stores }, intent));
+    owner_status.raft_applied_index = intent.relocation_target_sequence;
+    owner_status.doc_count = intent.relocation_doc_count_watermark;
+    stores[0].group_statuses = @constCast((&[_]table_manager.GroupStatusReport{owner_status})[0..]);
+    try std.testing.expect(relocationTargetCutoverReady(.{ .stores = &stores }, intent));
+}
+
+test "metadata reconciler accepts retirement proof only from each placement store" {
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{
+            .record = .{ .group_id = 2246, .replica_id = 1, .local_node_id = 101 },
+            .store_id = 1010,
+            .peer_node_ids = &.{102},
+            .serving_state = .retiring,
+        },
+        .{
+            .record = .{ .group_id = 2246, .replica_id = 2, .local_node_id = 102 },
+            .store_id = 1020,
+            .peer_node_ids = &.{102},
+            .serving_state = .serving,
+        },
+    };
+    const desired = [_]raft_reconciler.PlacementIntent{current[1]};
+    const final_fingerprint = table_manager.voterSetFingerprint(&.{102}, null);
+    var owner_status: table_manager.GroupStatusReport = .{
+        .group_id = 2246,
+        .local_voter = true,
+        .voter_count = 1,
+        .voter_set_known = true,
+        .voter_set_fingerprint = final_fingerprint,
+    };
+    const wrong_store_status: table_manager.GroupStatusReport = .{
+        .group_id = 2246,
+        .local_leader = true,
+        .local_voter = true,
+        .voter_count = 1,
+        .voter_set_known = true,
+        .voter_set_fingerprint = final_fingerprint,
+    };
+    var stores = [_]table_manager.StoreRecord{
+        .{ .store_id = 1010, .node_id = 101, .group_statuses = &.{} },
+        .{
+            .store_id = 1020,
+            .node_id = 102,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{owner_status})[0..]),
+        },
+        .{
+            .store_id = 1021,
+            .node_id = 102,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{wrong_store_status})[0..]),
+        },
+    };
+
+    {
+        var index = try MembershipTransitionIndex.init(
+            std.testing.allocator,
+            .{ .placement_intents = &current, .stores = &stores },
+            &desired,
+        );
+        defer index.deinit();
+        try std.testing.expect(!index.placementSafeToRemove(current[0]));
+    }
+
+    owner_status.local_leader = true;
+    stores[1].group_statuses = @constCast((&[_]table_manager.GroupStatusReport{owner_status})[0..]);
+    var index = try MembershipTransitionIndex.init(
+        std.testing.allocator,
+        .{ .placement_intents = &current, .stores = &stores },
+        &desired,
+    );
+    defer index.deinit();
+    try std.testing.expect(index.placementSafeToRemove(current[0]));
+}
+
 test "metadata reconciler requires matching relocation generation and raft apply boundary" {
     const intent: raft_reconciler.PlacementIntent = .{
         .record = .{ .group_id = 2243, .replica_id = 3, .local_node_id = 104 },
@@ -3761,6 +3930,33 @@ test "metadata reconciler promotes a hydrated relocation learner before serving"
     try std.testing.expectEqual(
         raft_reconciler.PlacementServingState.bootstrapping,
         relocationTargetServingState(.{}, intent),
+    );
+}
+
+test "metadata reconciler never regresses a promoted relocation voter to learner" {
+    const current_intent: raft_reconciler.PlacementIntent = .{
+        .record = .{ .group_id = 2245, .replica_id = 3, .local_node_id = 104 },
+        .store_id = 104,
+        .peer_node_ids = &.{ 101, 102, 104 },
+        .serving_state = .cutover_ready,
+        .relocation_generation = 17,
+        .relocation_source_node_id = 105,
+        .relocation_source_store_id = 105,
+        .relocation_doc_count_watermark = 12,
+        .relocation_target_sequence = 91,
+    };
+    var desired = current_intent;
+    desired.serving_state = .serving;
+
+    const effective = effectivePlacementIntent(
+        .{ .placement_intents = (&[_]raft_reconciler.PlacementIntent{current_intent})[0..] },
+        &.{},
+        &.{},
+        desired,
+    );
+    try std.testing.expectEqual(
+        raft_reconciler.PlacementServingState.cutover_ready,
+        effective.serving_state,
     );
 }
 
