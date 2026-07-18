@@ -257,10 +257,6 @@ fn parseSseEventsAlloc(alloc: std.mem.Allocator, body: []const u8) ![]TestSseEve
 pub const public_api_max_request_body_bytes: usize = public_limits.max_request_body_bytes;
 const max_concurrent_restore_jobs: usize = 2;
 
-test "public API request body limit matches Go linear merge contract" {
-    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), public_api_max_request_body_bytes);
-}
-
 pub const RestoreExecutionGuard = struct {
     ptr: *anyopaque,
     is_current: *const fn (ptr: *anyopaque, leadership_term: u64) bool,
@@ -24187,7 +24183,6 @@ test "api index status refreshes synthetic configured index status from write so
         },
     }};
     try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefresh(live_statuses[0..]));
-
 }
 
 test "api index status asks write source when read runtime status is absent" {

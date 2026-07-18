@@ -244,6 +244,7 @@ pub const Handle = struct {
                 opts.index_backends.sparse_lsm_storage = storage;
                 opts.index_backends.graph_lsm_storage = storage;
                 opts.external_derived_checkpoints = false;
+                opts.physical_root_mode = .external_backend;
             },
             .native_single_file => {
                 if (opts.resource_manager == null) {
@@ -268,6 +269,7 @@ pub const Handle = struct {
                 opts.index_base_path = native_index_base_path;
                 opts.index_open_parallelism = 1;
                 opts.external_derived_checkpoints = false;
+                opts.physical_root_mode = .external_backend;
             },
         }
     }
@@ -337,6 +339,7 @@ pub const Handle = struct {
         opts.index_base_path = runtime.index_base_path;
         opts.index_open_parallelism = 1;
         opts.external_derived_checkpoints = false;
+        opts.physical_root_mode = .external_backend;
     }
 
     /// Permanently maps an existing embedded root database to a standalone
@@ -1012,6 +1015,10 @@ test "lite backend native engine creates and checks aflite file" {
     try std.testing.expectEqualStrings(native_index_base_path, db_opts.index_base_path.?);
     try std.testing.expectEqual(@as(?usize, 1), db_opts.index_open_parallelism);
     try std.testing.expect(!db_opts.external_derived_checkpoints);
+    try std.testing.expectEqual(
+        db_mod.OpenOptions.PhysicalRootMode.external_backend,
+        db_opts.physical_root_mode,
+    );
 
     const vacuumed = try handle.vacuum();
     try std.testing.expectEqual(report.file_size, vacuumed.before_size);
@@ -1291,6 +1298,7 @@ test "lite backend native engine can back db primary documents" {
 
         var db = try db_mod.DB.open(allocator, path, db_opts);
         defer db.close();
+        try std.testing.expectError(error.DurableRootIncarnationUnavailable, db.durableRootIncarnation());
 
         try db.batch(.{
             .writes = &.{.{
@@ -1335,6 +1343,10 @@ test "lite backend namespaced db options isolate tables in one file" {
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-namespaced-db.aflite");
     defer allocator.free(path);
+    const logical_path_a = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/table/a", .{tmp.sub_path});
+    defer allocator.free(logical_path_a);
+    const logical_path_b = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/table/b", .{tmp.sub_path});
+    defer allocator.free(logical_path_b);
 
     var handle = try Handle.create(allocator, path, true);
     defer handle.deinit();
@@ -1345,9 +1357,9 @@ test "lite backend namespaced db options isolate tables in one file" {
     const runtime_a = try handle.runtimeStoreForNamespace("table/a");
     try std.testing.expect(runtime_a == try handle.runtimeStoreForNamespace("table/a"));
     try std.testing.expectEqual(@as(usize, 2), handle.namespace_runtimes.count());
-    var db_a = try db_mod.DB.open(allocator, "table/a", opts_a);
+    var db_a = try db_mod.DB.open(allocator, logical_path_a, opts_a);
     defer db_a.close();
-    var db_b = try db_mod.DB.open(allocator, "table/b", opts_b);
+    var db_b = try db_mod.DB.open(allocator, logical_path_b, opts_b);
     defer db_b.close();
 
     try db_a.batch(.{ .writes = &.{.{ .key = "doc:same", .value = "{\"table\":\"a\"}" }}, .sync_level = .write });
@@ -1367,6 +1379,8 @@ test "lite backend adopts embedded root into a move-stable standalone namespace"
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "embedded-standalone.aflite");
     defer allocator.free(path);
+    const logical_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/group-42/table-db", .{tmp.sub_path});
+    defer allocator.free(logical_path);
 
     // Model data produced by `antfly lite batch` in the embedded root.
     {
@@ -1390,7 +1404,7 @@ test "lite backend adopts embedded root into a move-stable standalone namespace"
         var opts = db_mod.OpenOptions{ .open_mode = .writer_no_replay, .start_index_workers = false, .start_optional_runtimes = false };
         try handle.configureDbOpenOptionsForNamespace(&opts, "/different/root/group-42/table-db");
         try std.testing.expectEqualStrings(native_index_base_path, opts.index_base_path.?);
-        var db = try db_mod.DB.open(allocator, "group-42/table-db", opts);
+        var db = try db_mod.DB.open(allocator, logical_path, opts);
         defer db.close();
         const value = (try db.get(allocator, "doc:portable")) orelse return error.MissingAdoptedEmbeddedDocument;
         defer allocator.free(value);
@@ -1405,7 +1419,7 @@ test "lite backend adopts embedded root into a move-stable standalone namespace"
         try std.testing.expect(handle.hasStandaloneRootAdoption());
         var opts = db_mod.OpenOptions{ .open_mode = .query_readonly, .start_index_workers = false, .start_optional_runtimes = false };
         try handle.configureDbOpenOptionsForNamespace(&opts, "/mnt/restored/group-42/table-db");
-        var db = try db_mod.DB.open(allocator, "group-42/table-db", opts);
+        var db = try db_mod.DB.open(allocator, logical_path, opts);
         defer db.close();
         const value = (try db.get(allocator, "doc:portable")) orelse return error.MissingReopenedAdoptedDocument;
         defer allocator.free(value);

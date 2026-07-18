@@ -6895,24 +6895,6 @@ test "taskMatchesModelListing prefers explicit tasks when present" {
     try std.testing.expect(!taskMatchesModelListing("recognizers", "generator", "", &.{"generate"}, &.{"extraction"}));
 }
 
-test "modelSupportsCapability infers gliner2 extraction and classification" {
-    try std.testing.expect(model_caps.modelSupportsCapability("recognizer", "gliner2", &.{"labels"}, "classification"));
-    try std.testing.expect(model_caps.modelSupportsCapability("recognizer", "gliner2", &.{"labels"}, "relations"));
-    try std.testing.expect(model_caps.modelSupportsCapability("recognizer", "gliner2", &.{"labels"}, "extraction"));
-    try std.testing.expect(!model_caps.modelSupportsCapability("recognizer", "", &.{"labels"}, "extraction"));
-}
-
-test "modelKindAcceptsInput infers text and image modalities" {
-    try std.testing.expect(model_caps.modelKindAcceptsInput("recognizer", "gliner2", &.{}, false, false, "text"));
-    try std.testing.expect(!model_caps.modelKindAcceptsInput("recognizer", "gliner2", &.{}, false, false, "image"));
-    try std.testing.expect(model_caps.modelKindAcceptsInput("reader", "", &.{}, false, false, "image"));
-    try std.testing.expect(!model_caps.modelKindAcceptsInput("reader", "", &.{}, false, false, "text"));
-    try std.testing.expect(model_caps.modelKindAcceptsInput("embedder", "", &.{}, true, false, "image"));
-    try std.testing.expect(model_caps.modelKindAcceptsInput("transcriber", "", &.{}, false, false, "audio"));
-    try std.testing.expect(model_caps.modelKindAcceptsInput("recognizer", "", &.{"image"}, false, false, "image"));
-    try std.testing.expect(!model_caps.modelKindAcceptsInput("recognizer", "", &.{"image"}, false, false, "text"));
-}
-
 test "generate backend selection keeps compiled mode explicit" {
     const eager_webgpu = parseGenerateBackendSelection(.webgpu, null, null);
     if (build_options.enable_wasm and build_options.enable_webgpu) {

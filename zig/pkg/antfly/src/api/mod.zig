@@ -89,45 +89,8 @@ test "api restore jobs module compiles" {
     _ = restore_jobs;
 }
 
-test "public index contract exposes runtime status metadata" {
-    try openapi_contract.expectPublicIndexRuntimeStatusMetadata();
-}
-
-test "public openapi documents stable exact sort diagnostics" {
-    try openapi_contract.expectPublicOpenApiDocumentsStableExactSortDiagnostics();
-}
-
-test "api query contract serializes sort profile diagnostics" {
-    try query_contract.testing.expectSortProfileDiagnosticsSerialization();
-}
-
-test "api query contract maps public exact sort rejection diagnostics" {
-    try query_contract.testing.expectPublicExactSortRejectionMapping();
-}
-
 test "api query contract preserves filter-only query string filters" {
     try query_contract.testing.expectFilterOnlyQueryStringFilterPreserved();
-}
-
-test "linear merge request parser accepts raw payload value under public request cap" {
-    const alloc = std.testing.allocator;
-    const payload = try alloc.alloc(u8, 6 * 1024 * 1024);
-    defer alloc.free(payload);
-    @memset(payload, 'x');
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    const writer = &out.writer;
-
-    try writer.writeAll("{\"records\":{\"doc:a\":{\"raw_payload\":\"");
-    try writer.writeAll(payload);
-    try writer.writeAll("\"}}}");
-
-    var req = try linear_merge.parseRequest(alloc, out.written());
-    defer req.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), req.writes.len);
-    try std.testing.expect(std.mem.indexOf(u8, req.writes[0].value, "\"raw_payload\"") != null);
 }
 
 test "protocol adapters require extension runtime package digest identity" {

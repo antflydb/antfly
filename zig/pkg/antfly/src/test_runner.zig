@@ -14,7 +14,6 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const structlog = @import("structlog");
 const testing = std.testing;
 
 pub const std_options: std.Options = .{
@@ -214,5 +213,10 @@ pub fn log(
     if (@intFromEnum(message_level) <= @intFromEnum(std.log.Level.err)) {
         log_err_count +|= 1;
     }
-    structlog.logFn(message_level, scope, format, args);
+    std.debug.print("[{s}] ({s}): ", .{
+        @tagName(message_level),
+        @tagName(scope),
+    });
+    std.debug.print(format, args);
+    std.debug.print("\n", .{});
 }

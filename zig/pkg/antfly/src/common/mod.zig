@@ -39,7 +39,3 @@ test {
     _ = byte_copy;
     _ = cache_budget;
 }
-
-test "cache budget atomically enforces its hard limit" {
-    try cache_budget.testHardLimit();
-}

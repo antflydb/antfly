@@ -249,6 +249,15 @@ test "document extraction templated inline source size is rejected before persis
 }
 
 pub const OpenOptions = struct {
+    pub const PhysicalRootMode = enum {
+        /// The DB path names a directory-backed physical root. DB owns its
+        /// publication lease and persists the projection incarnation there.
+        filesystem_managed,
+        /// The DB path is only a logical namespace. An external backend owns
+        /// physical publication, locking, and durability for that namespace.
+        external_backend,
+    };
+
     pub const OpenMode = enum {
         writer,
         writer_no_replay,
@@ -305,6 +314,7 @@ pub const OpenOptions = struct {
     start_optional_runtimes: bool = true,
     start_optional_runtime_workers: bool = true,
     external_derived_checkpoints: bool = true,
+    physical_root_mode: PhysicalRootMode = .filesystem_managed,
     enrichment: ?enrichment_runtime_mod.Config = null,
     ttl_cleanup: ttl_runtime_mod.Config = .{},
     transaction_recovery: transaction_runtime_mod.Config = .{},
@@ -3074,7 +3084,10 @@ pub const DB = struct {
             var generation_read_lease = if (opts.staged_generation) |staged_generation| staged_blk: {
                 try staged_generation.validatePath(path);
                 break :staged_blk null;
-            } else try generation_lifecycle.acquirePublishedGenerationReadWithRuntime(alloc, path, opts.backend_runtime);
+            } else if (opts.physical_root_mode == .external_backend)
+                null
+            else
+                try generation_lifecycle.acquirePublishedGenerationReadWithRuntime(alloc, path, opts.backend_runtime);
             errdefer if (generation_read_lease) |*lease| lease.deinit();
             const open_started_ns = monotonicTimeNs();
             const ha_write_gate = if (opts.ha_write_gate) |gate| gate.pinned() else null;
@@ -3249,7 +3262,9 @@ pub const DB = struct {
             try db.initAsyncInfrastructure(effective_executor, opts.resource_manager);
             profile.init_async_infrastructure_ns = elapsedSince(init_async_started_ns);
             executor_ready = true;
-            if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
+            if (!openModeRequiresReadOnlyBackends(opts.open_mode) and
+                opts.physical_root_mode == .filesystem_managed)
+            {
                 const identity = try loadOrCreateDurableRootIdentity(alloc, db.backend_runtime, path);
                 db.root_incarnation = identity.incarnation;
             }
@@ -11796,7 +11811,9 @@ pub const DB = struct {
         // capability is still held makes identity part of the durable tree
         // that is sealed and atomically published, rather than an open-time
         // side effect after the generation becomes visible.
-        _ = try loadOrCreateDurableRootIdentity(alloc, opts.backend_runtime, path);
+        if (opts.physical_root_mode == .filesystem_managed) {
+            _ = try loadOrCreateDurableRootIdentity(alloc, opts.backend_runtime, path);
+        }
         if (restore_identity) |identity| try markRestorePrimaryRestoredForPath(
             alloc,
             path,
@@ -59110,6 +59127,11 @@ test "db durable root incarnation follows the physical root rather than visibili
     defer transition.deinit();
     var staged = try transition.beginStaging();
     defer staged.deinit();
+    const retired_path = try alloc.dupeZ(u8, staged.path());
+    defer {
+        cleanupTempDir(retired_path);
+        alloc.free(retired_path);
+    }
     var staged_incarnation: u128 = 0;
     {
         var db = try DB.open(alloc, staged.path(), .{

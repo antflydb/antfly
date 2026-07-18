@@ -1099,6 +1099,54 @@ fn relocationTargetHasDataReport(current: CurrentMetadataState, intent: raft_rec
     return false;
 }
 
+const StoreEvidenceIndex = struct {
+    alloc: std.mem.Allocator,
+    stores_by_id: std.AutoHashMapUnmanaged(u64, ?*const table_manager.StoreRecord) = .empty,
+    stores_by_node: std.AutoHashMapUnmanaged(u64, ?*const table_manager.StoreRecord) = .empty,
+    status_by_store_group: std.AutoHashMapUnmanaged(u128, ?*const table_manager.GroupStatusReport) = .empty,
+
+    fn init(alloc: std.mem.Allocator, stores: []const table_manager.StoreRecord) !StoreEvidenceIndex {
+        var self = StoreEvidenceIndex{ .alloc = alloc };
+        errdefer self.deinit();
+        for (stores) |*store| {
+            const by_id = try self.stores_by_id.getOrPut(alloc, store.store_id);
+            by_id.value_ptr.* = if (by_id.found_existing) null else store;
+            const by_node = try self.stores_by_node.getOrPut(alloc, store.node_id);
+            by_node.value_ptr.* = if (by_node.found_existing) null else store;
+            for (store.group_statuses) |*status| {
+                const entry = try self.status_by_store_group.getOrPut(alloc, placementStoreKey(status.group_id, store.store_id));
+                entry.value_ptr.* = if (entry.found_existing) null else status;
+            }
+        }
+        return self;
+    }
+
+    fn deinit(self: *StoreEvidenceIndex) void {
+        self.stores_by_id.deinit(self.alloc);
+        self.stores_by_node.deinit(self.alloc);
+        self.status_by_store_group.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn storeForIntent(self: *const StoreEvidenceIndex, intent: raft_reconciler.PlacementIntent) ?*const table_manager.StoreRecord {
+        const resolved = if (intent.store_id != 0)
+            self.stores_by_id.get(intent.store_id) orelse return null
+        else
+            self.stores_by_node.get(intent.record.local_node_id) orelse return null;
+        const store = resolved orelse return null;
+        return if (store.node_id == intent.record.local_node_id) store else null;
+    }
+
+    fn statusForStore(self: *const StoreEvidenceIndex, group_id: u64, store_id: u64) ?*const table_manager.GroupStatusReport {
+        return (self.status_by_store_group.get(placementStoreKey(group_id, store_id)) orelse return null) orelse return null;
+    }
+
+    fn statusForIntent(self: *const StoreEvidenceIndex, intent: raft_reconciler.PlacementIntent) ?*const table_manager.GroupStatusReport {
+        const store = self.storeForIntent(intent) orelse return null;
+        return self.statusForStore(intent.record.group_id, store.store_id);
+    }
+};
+
 const MembershipTransitionIndex = struct {
     const GroupState = struct {
         current_count: usize = 0,
@@ -1120,16 +1168,17 @@ const MembershipTransitionIndex = struct {
     groups: std.AutoHashMapUnmanaged(u64, GroupState) = .empty,
     current_by_member: std.AutoHashMapUnmanaged(u128, *const raft_reconciler.PlacementIntent) = .empty,
     desired_by_member: std.AutoHashMapUnmanaged(u128, *const raft_reconciler.PlacementIntent) = .empty,
-    stores: []const table_manager.StoreRecord,
-    stores_by_id: std.AutoHashMapUnmanaged(u64, *const table_manager.StoreRecord) = .empty,
-    status_by_store_group: std.AutoHashMapUnmanaged(u128, *const table_manager.GroupStatusReport) = .empty,
+    evidence: StoreEvidenceIndex,
 
     fn init(
         alloc: std.mem.Allocator,
         current: CurrentMetadataState,
         desired: []const raft_reconciler.PlacementIntent,
     ) !MembershipTransitionIndex {
-        var self = MembershipTransitionIndex{ .alloc = alloc, .stores = current.stores };
+        var self = MembershipTransitionIndex{
+            .alloc = alloc,
+            .evidence = try StoreEvidenceIndex.init(alloc, current.stores),
+        };
         errdefer self.deinit();
 
         for (current.placement_intents) |*intent| {
@@ -1150,12 +1199,6 @@ const MembershipTransitionIndex = struct {
             } else {
                 state.desired_fingerprint = fingerprint;
                 state.desired_voter_count = voter_count;
-            }
-        }
-        for (current.stores) |*store| {
-            try self.stores_by_id.put(alloc, store.store_id, store);
-            for (store.group_statuses) |*status| {
-                try self.status_by_store_group.put(alloc, placementStoreKey(status.group_id, store.store_id), status);
             }
         }
         for (current.placement_intents) |*intent| {
@@ -1211,8 +1254,7 @@ const MembershipTransitionIndex = struct {
         self.groups.deinit(self.alloc);
         self.current_by_member.deinit(self.alloc);
         self.desired_by_member.deinit(self.alloc);
-        self.stores_by_id.deinit(self.alloc);
-        self.status_by_store_group.deinit(self.alloc);
+        self.evidence.deinit();
         self.* = undefined;
     }
 
@@ -1232,21 +1274,11 @@ const MembershipTransitionIndex = struct {
     }
 
     fn storeForIntent(self: *const MembershipTransitionIndex, intent: raft_reconciler.PlacementIntent) ?*const table_manager.StoreRecord {
-        if (intent.store_id != 0) {
-            const store = self.stores_by_id.get(intent.store_id) orelse return null;
-            return if (store.node_id == intent.record.local_node_id) store else null;
-        }
-        var match: ?*const table_manager.StoreRecord = null;
-        for (self.stores) |*store| {
-            if (store.node_id != intent.record.local_node_id) continue;
-            if (match != null) return null;
-            match = store;
-        }
-        return match;
+        return self.evidence.storeForIntent(intent);
     }
 
     fn statusForStore(self: *const MembershipTransitionIndex, group_id: u64, store_id: u64) ?*const table_manager.GroupStatusReport {
-        return self.status_by_store_group.get(placementStoreKey(group_id, store_id));
+        return self.evidence.statusForStore(group_id, store_id);
     }
 
     fn statusForIntent(self: *const MembershipTransitionIndex, intent: raft_reconciler.PlacementIntent) ?*const table_manager.GroupStatusReport {
@@ -1372,11 +1404,14 @@ fn findStoreForPlacement(
     intent: raft_reconciler.PlacementIntent,
 ) ?table_manager.StoreRecord {
     if (intent.store_id != 0) {
+        var match: ?table_manager.StoreRecord = null;
         for (stores) |store| {
             if (store.store_id != intent.store_id) continue;
-            return if (store.node_id == intent.record.local_node_id) store else null;
+            if (match != null) return null;
+            match = store;
         }
-        return null;
+        const store = match orelse return null;
+        return if (store.node_id == intent.record.local_node_id) store else null;
     }
     var match: ?table_manager.StoreRecord = null;
     for (stores) |store| {
@@ -1444,10 +1479,10 @@ fn allocUnconvergedPlacementGroups(
 
     var convergence = std.AutoHashMapUnmanaged(u64, Convergence).empty;
     defer convergence.deinit(alloc);
-    var placements = std.AutoHashMapUnmanaged(u128, *const raft_reconciler.PlacementIntent).empty;
-    defer placements.deinit(alloc);
-    var matched_placements = std.AutoHashMapUnmanaged(u128, void).empty;
-    defer matched_placements.deinit(alloc);
+    var evidence = try StoreEvidenceIndex.init(alloc, current.stores);
+    defer evidence.deinit();
+    var seen_members = std.AutoHashMapUnmanaged(u128, void).empty;
+    defer seen_members.deinit(alloc);
     var busy_groups = std.AutoHashMapUnmanaged(u64, void).empty;
     defer busy_groups.deinit(alloc);
     for (current.split_transitions) |transition| {
@@ -1477,24 +1512,20 @@ fn allocUnconvergedPlacementGroups(
         entry.value_ptr.invalid_lifecycle = entry.value_ptr.invalid_lifecycle or
             intent.serving_state != .serving or
             busy_groups.contains(intent.record.group_id);
-        try placements.put(alloc, placementNodeKey(intent.record.group_id, intent.record.local_node_id), intent);
-    }
-
-    for (current.stores) |store| {
-        if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) continue;
-        for (store.group_statuses) |status| {
-            const key = placementNodeKey(status.group_id, store.node_id);
-            if (matched_placements.contains(key)) continue;
-            const intent = placements.get(key) orelse continue;
-            if (status.relocation_generation != intent.relocation_generation) continue;
-            if (!status.local_voter or status.joint_consensus or status.transition_pending) continue;
-            if (!voterSetMatchesIntent(status, intent.*)) continue;
-
-            const state = convergence.getPtr(status.group_id) orelse continue;
-            state.matched += 1;
-            state.leader_known = state.leader_known or status.local_leader;
-            try matched_placements.put(alloc, key, {});
+        const member = try seen_members.getOrPut(alloc, placementNodeKey(intent.record.group_id, intent.record.local_node_id));
+        if (member.found_existing) {
+            entry.value_ptr.invalid_lifecycle = true;
+            continue;
         }
+        member.value_ptr.* = {};
+        const store = evidence.storeForIntent(intent.*) orelse continue;
+        if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) continue;
+        const status = evidence.statusForStore(intent.record.group_id, store.store_id) orelse continue;
+        if (status.relocation_generation != intent.relocation_generation) continue;
+        if (!status.local_voter or status.joint_consensus or status.transition_pending) continue;
+        if (!voterSetMatchesIntent(status.*, intent.*)) continue;
+        entry.value_ptr.matched += 1;
+        entry.value_ptr.leader_known = entry.value_ptr.leader_known or status.local_leader;
     }
 
     var groups = std.ArrayListUnmanaged(u64).empty;
@@ -1531,6 +1562,68 @@ test "metadata reconciler protects desired split quorum before admission project
     defer std.testing.allocator.free(protected);
 
     try std.testing.expectEqualSlices(u64, &.{15001}, protected);
+}
+
+test "metadata reconciler placement convergence requires the exact placement store" {
+    const intent: raft_reconciler.PlacementIntent = .{
+        .record = .{ .group_id = 15011, .replica_id = 1, .local_node_id = 101 },
+        .store_id = 1010,
+        .peer_node_ids = &.{101},
+        .serving_state = .serving,
+        .relocation_generation = 7,
+    };
+    const status: table_manager.GroupStatusReport = .{
+        .group_id = 15011,
+        .relocation_generation = 7,
+        .local_leader = true,
+        .local_voter = true,
+        .voter_count = 1,
+        .voter_set_known = true,
+        .voter_set_fingerprint = table_manager.voterSetFingerprint(&.{101}, 101),
+    };
+    var stores = [_]table_manager.StoreRecord{
+        .{ .store_id = 1010, .node_id = 101 },
+        .{
+            .store_id = 1011,
+            .node_id = 101,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{status})[0..]),
+        },
+    };
+
+    const protected = try allocUnconvergedPlacementGroups(
+        std.testing.allocator,
+        .{ .placement_intents = &.{intent}, .stores = &stores },
+        &.{},
+        &.{},
+    );
+    defer std.testing.allocator.free(protected);
+    try std.testing.expectEqualSlices(u64, &.{15011}, protected);
+
+    stores[0].group_statuses = @constCast((&[_]table_manager.GroupStatusReport{status})[0..]);
+    const converged = try allocUnconvergedPlacementGroups(
+        std.testing.allocator,
+        .{ .placement_intents = &.{intent}, .stores = &stores },
+        &.{},
+        &.{},
+    );
+    defer std.testing.allocator.free(converged);
+    try std.testing.expectEqual(@as(usize, 0), converged.len);
+}
+
+test "metadata reconciler rejects duplicate exact store identities" {
+    const intent: raft_reconciler.PlacementIntent = .{
+        .record = .{ .group_id = 15012, .replica_id = 1, .local_node_id = 101 },
+        .store_id = 1010,
+    };
+    const stores = [_]table_manager.StoreRecord{
+        .{ .store_id = 1010, .node_id = 101 },
+        .{ .store_id = 1010, .node_id = 101 },
+    };
+    try std.testing.expect(findStoreForPlacement(&stores, intent) == null);
+
+    var evidence = try StoreEvidenceIndex.init(std.testing.allocator, &stores);
+    defer evidence.deinit();
+    try std.testing.expect(evidence.storeForIntent(intent) == null);
 }
 
 fn placementNodeKey(group_id: u64, node_id: u64) u128 {

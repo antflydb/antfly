@@ -560,6 +560,13 @@ Derived checkpoint loss or repair cannot change storage identity. A physical
 generation replacement creates a new identity even when the logical contents
 and index catalog are unchanged.
 
+This checkpoint applies only to `filesystem_managed` roots whose path is the
+published storage directory. Embedded and Lite DBs use `external_backend`: the
+path is a logical namespace while the enclosing single-file engine owns
+locking, durability, and publication. Those handles do not synthesize a
+directory incarnation and fail closed if a distributed projection asks for
+one.
+
 Replica relocation and replica-count shrink use two committed membership
 phases. A `draining` source remains a voter, and may remain leader, while
 replacement learners hydrate and the expanded voter set stabilizes. Once any
@@ -582,8 +589,11 @@ planning indexes placement intent by `(group, node)` and runtime evidence by
 `(group, store)`. Hydration, cutover, and retirement accept evidence only from
 the exact store named by the placement. A zero store identity is usable only
 when the node has one unambiguous store; multi-store nodes fail closed. A
-reconcile pass remains linear in placements and status reports, with only
-replication-factor-bounded scans per retiring group.
+duplicate store identity or duplicate `(store, group)` report is malformed
+evidence and also fails closed instead of choosing an order-dependent winner.
+A reconcile pass builds this evidence index once and remains linear in stores,
+status reports, and placements, with only replication-factor-bounded scans per
+retiring group.
 
 Relocation hydration is proven by relocation generation, committed Raft apply
 boundary, logical document watermark, and stable voter identity. Source disk

@@ -168,6 +168,20 @@ fn addRuntimeTestFilters(run: *std.Build.Step.Run, filters: []const []const u8) 
     }
 }
 
+/// Zig's compile-time filters can retain imported anonymous tests needed for
+/// semantic analysis. Give every filtered artifact the exact-filter runner and
+/// mirror its filters at runtime so focused aliases execute only what they own.
+fn addFilteredTestRunArtifact(b: *std.Build, tests: *std.Build.Step.Compile) *std.Build.Step.Run {
+    if (tests.test_runner == null) {
+        const runner_path = b.path("pkg/antfly/src/test_runner.zig");
+        tests.test_runner = .{ .path = runner_path, .mode = .simple };
+        runner_path.addStepDependencies(&tests.step);
+    }
+    const run = b.addRunArtifact(tests);
+    addRuntimeTestFilters(run, tests.filters);
+    return run;
+}
+
 fn addDelegatedPackageStep(
     b: *std.Build,
     package_step_prefix: []const u8,
@@ -2249,7 +2263,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_capi_tests = b.addRunArtifact(capi_tests);
+    const run_capi_tests = addFilteredTestRunArtifact(b, capi_tests);
     const capi_test_step = b.step("capi-test", "Run C API tests");
     capi_test_step.dependOn(&run_capi_tests.step);
 
@@ -2453,7 +2467,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_api_artifact_reprocess_jobs_tests = b.addRunArtifact(api_artifact_reprocess_jobs_tests);
+    const run_api_artifact_reprocess_jobs_tests = addFilteredTestRunArtifact(b, api_artifact_reprocess_jobs_tests);
     const lib_api_artifact_reprocess_jobs_test_step = b.step("lib-api-artifact-reprocess-jobs-test", "Run artifact reprocess job store tests");
     lib_api_artifact_reprocess_jobs_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
 
@@ -2484,7 +2498,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_api_restore_jobs_tests = b.addRunArtifact(api_restore_jobs_tests);
+    const run_api_restore_jobs_tests = addFilteredTestRunArtifact(b, api_restore_jobs_tests);
     const lib_api_restore_jobs_test_step = b.step("lib-api-restore-jobs-test", "Run durable restore job store tests");
     lib_api_restore_jobs_test_step.dependOn(&run_api_restore_jobs_tests.step);
 
@@ -2505,7 +2519,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_portable_backup_tests = b.addRunArtifact(portable_backup_tests);
+    const run_portable_backup_tests = addFilteredTestRunArtifact(b, portable_backup_tests);
     const lib_portable_backup_test_step = b.step("lib-portable-backup-test", "Run bounded portable backup tests");
     lib_portable_backup_test_step.dependOn(&run_portable_backup_tests.step);
 
@@ -2653,7 +2667,7 @@ pub fn build(b: *std.Build) void {
             "xref parser rejects a cyclic Prev chain",
         },
     });
-    const run_lib_pdf_safety_tests = b.addRunArtifact(lib_pdf_safety_tests);
+    const run_lib_pdf_safety_tests = addFilteredTestRunArtifact(b, lib_pdf_safety_tests);
     const lib_pdf_safety_test_step = b.step("lib-pdf-safety-test", "Run focused PDF OCR rendering and parser safety tests");
     lib_pdf_safety_test_step.dependOn(&run_lib_pdf_safety_tests.step);
 
@@ -2666,7 +2680,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_image_conformance_test_mod,
         .filters = &.{"conformance corpus"},
     });
-    const run_lib_image_conformance_tests = b.addRunArtifact(lib_image_conformance_tests);
+    const run_lib_image_conformance_tests = addFilteredTestRunArtifact(b, lib_image_conformance_tests);
     const lib_image_conformance_run_step = b.step("lib-image-conformance-run", "Run lib/image conformance suites without fetching fixtures");
     lib_image_conformance_run_step.dependOn(&run_lib_image_conformance_tests.step);
 
@@ -2821,7 +2835,7 @@ pub fn build(b: *std.Build) void {
     fetch_lib_image_conformance_fixtures_quiet.addArg("/tmp/openjpeg-data");
     const fetch_lib_image_conformance_fixtures_quiet_step = expectQuietSuccess(fetch_lib_image_conformance_fixtures_quiet);
 
-    const run_lib_image_conformance_tests_after_fetch = b.addRunArtifact(lib_image_conformance_tests);
+    const run_lib_image_conformance_tests_after_fetch = addFilteredTestRunArtifact(b, lib_image_conformance_tests);
     run_lib_image_conformance_tests_after_fetch.step.dependOn(&fetch_lib_image_conformance_fixtures.step);
     const lib_image_conformance_step = b.step("lib-image-conformance", "Fetch and run lib/image conformance suites");
     lib_image_conformance_step.dependOn(&run_lib_image_conformance_tests_after_fetch.step);
@@ -2832,14 +2846,14 @@ pub fn build(b: *std.Build) void {
     lib_image_conformance_step.dependOn(&run_lib_image_corpus_verify_bmp.step);
     lib_image_conformance_step.dependOn(&run_lib_image_corpus_verify_webp.step);
 
-    const run_lib_image_conformance_tests_after_fetch_quiet = b.addRunArtifact(lib_image_conformance_tests);
+    const run_lib_image_conformance_tests_after_fetch_quiet = addFilteredTestRunArtifact(b, lib_image_conformance_tests);
     run_lib_image_conformance_tests_after_fetch_quiet.step.dependOn(fetch_lib_image_conformance_fixtures_quiet_step);
 
     const lib_generating_runtime_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{ "generating backend factory executes fallback chain across providers", "asset producer runtime" },
     });
-    const run_lib_generating_runtime_tests = b.addRunArtifact(lib_generating_runtime_tests);
+    const run_lib_generating_runtime_tests = addFilteredTestRunArtifact(b, lib_generating_runtime_tests);
     const lib_generating_runtime_test_step = b.step("lib-generating-runtime-test", "Run generating backend adapter tests");
     lib_generating_runtime_test_step.dependOn(&run_lib_generating_runtime_tests.step);
 
@@ -2854,7 +2868,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{"reranking runtime"},
     });
-    const run_lib_reranking_runtime_tests = b.addRunArtifact(lib_reranking_runtime_tests);
+    const run_lib_reranking_runtime_tests = addFilteredTestRunArtifact(b, lib_reranking_runtime_tests);
     const lib_reranking_runtime_test_step = b.step("lib-reranking-runtime-test", "Run reranking backend adapter tests");
     lib_reranking_runtime_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
 
@@ -2862,7 +2876,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{ "provider registry", "std http listener", "std http executor" },
     });
-    const run_lib_common_tests = b.addRunArtifact(lib_common_tests);
+    const run_lib_common_tests = addFilteredTestRunArtifact(b, lib_common_tests);
     const lib_common_test_step = b.step("lib-common-test", "Run common/provider registry tests");
     lib_common_test_step.dependOn(&run_lib_common_tests.step);
 
@@ -2874,7 +2888,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_common_config_tests = b.addRunArtifact(lib_common_config_tests);
+    const run_lib_common_config_tests = addFilteredTestRunArtifact(b, lib_common_config_tests);
     run_lib_common_config_tests.setEnvironmentVariable("ANTFLY_TEST_FAIL_ON_ERROR_LOGS", "0");
     const lib_common_config_test_step = b.step("lib-common-config-test", "Run common/config tests");
     lib_common_config_test_step.dependOn(&run_lib_common_config_tests.step);
@@ -2887,7 +2901,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_common_secrets_tests = b.addRunArtifact(lib_common_secrets_tests);
+    const run_lib_common_secrets_tests = addFilteredTestRunArtifact(b, lib_common_secrets_tests);
     const lib_common_secrets_test_step = b.step("lib-common-secrets-test", "Run common/secret store tests");
     lib_common_secrets_test_step.dependOn(&run_lib_common_secrets_tests.step);
 
@@ -2909,7 +2923,7 @@ pub fn build(b: *std.Build) void {
         .root_module = embedded_mod,
         .filters = &.{"embedded"},
     });
-    const run_embedded_tests = b.addRunArtifact(embedded_tests);
+    const run_embedded_tests = addFilteredTestRunArtifact(b, embedded_tests);
     const embedded_test_step = b.step("embedded-test", "Run embedded API tests");
     embedded_test_step.dependOn(&run_embedded_tests.step);
 
@@ -2917,17 +2931,17 @@ pub fn build(b: *std.Build) void {
         .root_module = antfly_embedded_pkg_mod,
         .filters = &.{"pkg antfly embedded root"},
     });
-    const run_antfly_embedded_pkg_tests = b.addRunArtifact(antfly_embedded_pkg_tests);
+    const run_antfly_embedded_pkg_tests = addFilteredTestRunArtifact(b, antfly_embedded_pkg_tests);
     const antfly_embedded_db_pkg_tests = b.addTest(.{
         .root_module = antfly_embedded_db_pkg_mod,
         .filters = &.{"pkg antfly embedded db"},
     });
-    const run_antfly_embedded_db_pkg_tests = b.addRunArtifact(antfly_embedded_db_pkg_tests);
+    const run_antfly_embedded_db_pkg_tests = addFilteredTestRunArtifact(b, antfly_embedded_db_pkg_tests);
     const antfly_embedded_api_pkg_tests = b.addTest(.{
         .root_module = antfly_embedded_api_pkg_mod,
         .filters = &.{"pkg antfly embedded api"},
     });
-    const run_antfly_embedded_api_pkg_tests = b.addRunArtifact(antfly_embedded_api_pkg_tests);
+    const run_antfly_embedded_api_pkg_tests = addFilteredTestRunArtifact(b, antfly_embedded_api_pkg_tests);
     const antfly_embedded_pkg_test_step = b.step("antfly-embedded-test", "Run the standalone antfly-embedded package compile test");
     antfly_embedded_pkg_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
     antfly_embedded_pkg_test_step.dependOn(&run_antfly_embedded_db_pkg_tests.step);
@@ -2937,7 +2951,7 @@ pub fn build(b: *std.Build) void {
         .root_module = antfly_client_pkg_mod,
         .filters = &.{"antfly client pkg compiles"},
     });
-    const run_antfly_client_pkg_tests = b.addRunArtifact(antfly_client_pkg_tests);
+    const run_antfly_client_pkg_tests = addFilteredTestRunArtifact(b, antfly_client_pkg_tests);
     const antfly_client_pkg_test_step = b.step("antfly-client-test", "Run the standalone antfly-client package compile test");
     antfly_client_pkg_test_step.dependOn(&run_antfly_client_pkg_tests.step);
 
@@ -3150,7 +3164,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_introducer_tests = b.addRunArtifact(introducer_tests);
+    const run_introducer_tests = addFilteredTestRunArtifact(b, introducer_tests);
     const introducer_test_step = b.step("introducer-test", "Run segment introducer unit tests");
     introducer_test_step.dependOn(&run_introducer_tests.step);
 
@@ -3168,7 +3182,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lite_native_tests = b.addRunArtifact(lite_native_tests);
+    const run_lite_native_tests = addFilteredTestRunArtifact(b, lite_native_tests);
     const lite_native_test_step = b.step("lite-native-test", "Run Lite native backend tests");
     lite_native_test_step.dependOn(&run_lite_native_tests.step);
 
@@ -3194,7 +3208,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_cmd_tests = b.addRunArtifact(cmd_tests);
+    const run_cmd_tests = addFilteredTestRunArtifact(b, cmd_tests);
     const cmd_test_step = b.step("cmd-test", "Run Antfly command and client CLI tests");
     cmd_test_step.dependOn(&run_cmd_tests.step);
 
@@ -3220,7 +3234,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lite_cmd_tests = b.addRunArtifact(lite_cmd_tests);
+    const run_lite_cmd_tests = addFilteredTestRunArtifact(b, lite_cmd_tests);
     const lite_cmd_test_step = b.step("lite-cmd-test", "Run command tests owned by Antfly Lite profiles");
     lite_cmd_test_step.dependOn(&run_lite_cmd_tests.step);
 
@@ -3235,7 +3249,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_recall_tests = b.addRunArtifact(lib_recall_tests);
+    const run_lib_recall_tests = addFilteredTestRunArtifact(b, lib_recall_tests);
     const recall_test_step = b.step("recall-test", "Run HBC vector recall quality tests");
     recall_test_step.dependOn(&run_lib_recall_tests.step);
 
@@ -3244,13 +3258,16 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = selectTestFilters(b, &raft_unit_default_filters),
     });
-    const run_raft_unit_tests = b.addRunArtifact(raft_unit_tests);
+    const run_raft_unit_tests = addFilteredTestRunArtifact(b, raft_unit_tests);
 
     const raft_transport_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"raft.transport."},
+        // The top-level Raft declaration walk makes the nested transport test
+        // declarations reachable; the qualified filter then keeps execution
+        // scoped to the transport package.
+        .filters = &.{ "raft integration module compiles", "raft.transport." },
     });
-    const run_raft_transport_tests = b.addRunArtifact(raft_transport_tests);
+    const run_raft_transport_tests = addFilteredTestRunArtifact(b, raft_transport_tests);
 
     const lib_raft_sim_default_filters = [_][]const u8{
         "managed host simulation drives add and peer refresh through deterministic steps",
@@ -3268,7 +3285,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &lib_raft_sim_default_filters,
     });
-    const run_lib_raft_sim_tests = b.addRunArtifact(lib_raft_sim_tests);
+    const run_lib_raft_sim_tests = addFilteredTestRunArtifact(b, lib_raft_sim_tests);
     const lib_raft_sim_test_step = b.step("lib-raft-sim-test", "Run raft simulation harness tests");
     lib_raft_sim_test_step.dependOn(&run_lib_raft_sim_tests.step);
 
@@ -3307,7 +3324,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &lib_raft_chaos_default_filters,
     });
-    const run_lib_raft_chaos_tests = b.addRunArtifact(lib_raft_chaos_tests);
+    const run_lib_raft_chaos_tests = addFilteredTestRunArtifact(b, lib_raft_chaos_tests);
     const lib_raft_chaos_test_step = b.step("lib-raft-chaos-test", "Run longer raft restart/HTTP simulation campaigns");
     lib_raft_chaos_test_step.dependOn(&run_lib_raft_chaos_tests.step);
 
@@ -3315,7 +3332,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{"lsm backend simulation"},
     });
-    const run_lib_lsm_backend_sim_tests = b.addRunArtifact(lib_lsm_backend_sim_tests);
+    const run_lib_lsm_backend_sim_tests = addFilteredTestRunArtifact(b, lib_lsm_backend_sim_tests);
     const lib_lsm_backend_sim_test_step = b.step("lib-lsm-backend-sim-test", "Run LSM backend storage workload simulation tests");
     lib_lsm_backend_sim_test_step.dependOn(&run_lib_lsm_backend_sim_tests.step);
 
@@ -3323,7 +3340,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{"lsm backend compaction chaos campaign"},
     });
-    const run_lib_lsm_backend_chaos_tests = b.addRunArtifact(lib_lsm_backend_chaos_tests);
+    const run_lib_lsm_backend_chaos_tests = addFilteredTestRunArtifact(b, lib_lsm_backend_chaos_tests);
     const lib_lsm_backend_chaos_test_step = b.step("lib-lsm-backend-chaos-test", "Run longer LSM backend compaction chaos campaigns");
     lib_lsm_backend_chaos_test_step.dependOn(&run_lib_lsm_backend_chaos_tests.step);
     const lib_ha_chaos_default_filters = [_][]const u8{
@@ -3340,7 +3357,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = selectTestFilters(b, &lib_ha_chaos_default_filters),
     });
-    const run_lib_ha_chaos_tests = b.addRunArtifact(lib_ha_chaos_tests);
+    const run_lib_ha_chaos_tests = addFilteredTestRunArtifact(b, lib_ha_chaos_tests);
     const lib_ha_chaos_test_step = b.step("ha-chaos-test", "Run HA hot-standby crash and partition hardening tests");
     lib_ha_chaos_test_step.dependOn(&run_lib_ha_chaos_tests.step);
     const lib_ha_compat_default_filters = [_][]const u8{
@@ -3359,7 +3376,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = selectTestFilters(b, &lib_ha_compat_default_filters),
     });
-    const run_lib_ha_compat_tests = b.addRunArtifact(lib_ha_compat_tests);
+    const run_lib_ha_compat_tests = addFilteredTestRunArtifact(b, lib_ha_compat_tests);
     const lib_ha_compat_test_step = b.step("ha-compat-test", "Run HA replication format compatibility tests");
     lib_ha_compat_test_step.dependOn(&run_lib_ha_compat_tests.step);
 
@@ -3394,7 +3411,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_db_tests = b.addRunArtifact(lib_db_tests);
+    const run_lib_db_tests = addFilteredTestRunArtifact(b, lib_db_tests);
     const lib_db_test_step = b.step("lib-db-test", "Run root-module DB tests only");
     lib_db_test_step.dependOn(&run_lib_db_tests.step);
 
@@ -3407,7 +3424,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_serverless_tests = b.addRunArtifact(serverless_tests);
+    const run_serverless_tests = addFilteredTestRunArtifact(b, serverless_tests);
     const serverless_test_step = b.step("serverless-test", "Run serverless and serverless transport tests");
     serverless_test_step.dependOn(&run_serverless_tests.step);
 
@@ -3427,7 +3444,7 @@ pub fn build(b: *std.Build) void {
         },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    const run_serverless_manifest_tests = b.addRunArtifact(serverless_manifest_tests);
+    const run_serverless_manifest_tests = addFilteredTestRunArtifact(b, serverless_manifest_tests);
     const serverless_manifest_test_step = b.step("lib-serverless-manifest-test", "Run focused serverless manifest object-store tests");
     serverless_manifest_test_step.dependOn(&run_serverless_manifest_tests.step);
 
@@ -3469,7 +3486,7 @@ pub fn build(b: *std.Build) void {
         "data runtime startup catch-up parks scheduler when only quarantined debt remains",
         "data runtime raft status changes force immediate store status publication",
         "data runtime replicated split policy is identity and phase aware",
-        "data raft draining leader handoff campaigns preferred serving survivor",
+        "data raft draining leader remains stable through membership expansion",
         "data raft removed leader handoff campaigns preferred serving survivor",
         "data raft source split lifecycle commands bypass document db apply",
         "data runtime structural changes preserve writer-published runtime status",
@@ -3516,7 +3533,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_data_runtime_tests = b.addRunArtifact(lib_data_runtime_tests);
+    const run_lib_data_runtime_tests = addFilteredTestRunArtifact(b, lib_data_runtime_tests);
     const lib_data_runtime_test_step = b.step("lib-data-runtime-test", "Run focused data runtime tests");
     lib_data_runtime_test_step.dependOn(&run_lib_data_runtime_tests.step);
 
@@ -3574,29 +3591,28 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_data_storage_tests = b.addRunArtifact(lib_data_storage_tests);
+    const run_lib_data_storage_tests = addFilteredTestRunArtifact(b, lib_data_storage_tests);
     const lib_data_storage_test_step = b.step("lib-data-storage-test", "Run focused data storage tests");
     lib_data_storage_test_step.dependOn(&run_lib_data_storage_tests.step);
 
     // The focused data-storage root imports the production storage modules, so
     // its imported tests are already owned by the broad root storage artifact.
-    // Keep only the six contracts declared by this wrapper in the aggregate.
+    // Keep only the three contracts declared exclusively by this wrapper in
+    // the aggregate; equivalent coordinator tests live with the production
+    // module and are selected by the broad storage artifact.
     const unit_data_storage_root_tests = b.addTest(.{
         .root_module = data_storage_test_mod,
         .filters = &.{
             "data storage module tests are reachable",
             "raft snapshot durability tests are reachable",
-            "db split sync coordinator allocates destination identity namespace",
-            "db merge coordinator opt-in applies configured receiver identity namespace",
             "db merge coordinator reapplies target namespace for persisted reassignment opt-in",
-            "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_unit_data_storage_root_tests = b.addRunArtifact(unit_data_storage_root_tests);
+    const run_unit_data_storage_root_tests = addFilteredTestRunArtifact(b, unit_data_storage_root_tests);
 
     const lib_db_enrichment_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -3619,7 +3635,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db merge-style cutover",
         },
     });
-    const run_lib_db_enrichment_tests = b.addRunArtifact(lib_db_enrichment_tests);
+    const run_lib_db_enrichment_tests = addFilteredTestRunArtifact(b, lib_db_enrichment_tests);
     const lib_db_enrichment_step = b.step("lib-db-enrichment-test", "Run root-module DB enrichment/replay/cutover tests");
     lib_db_enrichment_step.dependOn(&run_lib_db_enrichment_tests.step);
 
@@ -3636,7 +3652,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db dense parent paging",
         },
     });
-    const run_lib_db_enrichment_worker_tests = b.addRunArtifact(lib_db_enrichment_worker_tests);
+    const run_lib_db_enrichment_worker_tests = addFilteredTestRunArtifact(b, lib_db_enrichment_worker_tests);
     const lib_db_enrichment_worker_step = b.step("lib-db-enrichment-worker-test", "Run root-module DB enrichment worker tests");
     lib_db_enrichment_worker_step.dependOn(&run_lib_db_enrichment_worker_tests.step);
 
@@ -3651,7 +3667,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db replay applies dense embeddings from artifact payloads",
         },
     });
-    const run_lib_db_enrichment_replay_tests = b.addRunArtifact(lib_db_enrichment_replay_tests);
+    const run_lib_db_enrichment_replay_tests = addFilteredTestRunArtifact(b, lib_db_enrichment_replay_tests);
     const lib_db_enrichment_replay_step = b.step("lib-db-enrichment-replay-test", "Run root-module DB enrichment replay tests");
     lib_db_enrichment_replay_step.dependOn(&run_lib_db_enrichment_replay_tests.step);
 
@@ -3662,7 +3678,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db merge-style cutover",
         },
     });
-    const run_lib_db_enrichment_cutover_tests = b.addRunArtifact(lib_db_enrichment_cutover_tests);
+    const run_lib_db_enrichment_cutover_tests = addFilteredTestRunArtifact(b, lib_db_enrichment_cutover_tests);
     const lib_db_enrichment_cutover_step = b.step("lib-db-enrichment-cutover-test", "Run root-module DB enrichment cutover tests");
     lib_db_enrichment_cutover_step.dependOn(&run_lib_db_enrichment_cutover_tests.step);
 
@@ -3673,7 +3689,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db split cutover preserves enrichment resume and fencing across reopen",
         },
     });
-    const run_lib_db_enrichment_split_cutover_tests = b.addRunArtifact(lib_db_enrichment_split_cutover_tests);
+    const run_lib_db_enrichment_split_cutover_tests = addFilteredTestRunArtifact(b, lib_db_enrichment_split_cutover_tests);
     const lib_db_enrichment_split_cutover_step = b.step("lib-db-enrichment-split-cutover-test", "Run root-module DB enrichment split cutover tests");
     lib_db_enrichment_split_cutover_step.dependOn(&run_lib_db_enrichment_split_cutover_tests.step);
 
@@ -3684,7 +3700,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db merge-style cutover preserves enrichment resume and fencing across reopen",
         },
     });
-    const run_lib_db_enrichment_merge_cutover_tests = b.addRunArtifact(lib_db_enrichment_merge_cutover_tests);
+    const run_lib_db_enrichment_merge_cutover_tests = addFilteredTestRunArtifact(b, lib_db_enrichment_merge_cutover_tests);
     const lib_db_enrichment_merge_cutover_step = b.step("lib-db-enrichment-merge-cutover-test", "Run root-module DB enrichment merge cutover tests");
     lib_db_enrichment_merge_cutover_step.dependOn(&run_lib_db_enrichment_merge_cutover_tests.step);
 
@@ -3692,7 +3708,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{"storage.db.db.test.db split cutover preserves enrichment resume and fencing across reopen"},
     });
-    const run_lib_db_enrichment_split_cutover_reopen_tests = b.addRunArtifact(lib_db_enrichment_split_cutover_reopen_tests);
+    const run_lib_db_enrichment_split_cutover_reopen_tests = addFilteredTestRunArtifact(b, lib_db_enrichment_split_cutover_reopen_tests);
     const lib_db_enrichment_split_cutover_reopen_step = b.step("lib-db-enrichment-split-cutover-reopen-test", "Run root-module DB split cutover reopen test");
     lib_db_enrichment_split_cutover_reopen_step.dependOn(&run_lib_db_enrichment_split_cutover_reopen_tests.step);
 
@@ -3700,7 +3716,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{"storage.db.db.test.db merge-style cutover preserves enrichment resume and fencing across reopen"},
     });
-    const run_lib_db_enrichment_merge_cutover_reopen_tests = b.addRunArtifact(lib_db_enrichment_merge_cutover_reopen_tests);
+    const run_lib_db_enrichment_merge_cutover_reopen_tests = addFilteredTestRunArtifact(b, lib_db_enrichment_merge_cutover_reopen_tests);
     const lib_db_enrichment_merge_cutover_reopen_step = b.step("lib-db-enrichment-merge-cutover-reopen-test", "Run root-module DB merge cutover reopen test");
     lib_db_enrichment_merge_cutover_reopen_step.dependOn(&run_lib_db_enrichment_merge_cutover_reopen_tests.step);
 
@@ -3792,7 +3808,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_db_text_query_tests = b.addRunArtifact(lib_db_text_query_tests);
+    const run_lib_db_text_query_tests = addFilteredTestRunArtifact(b, lib_db_text_query_tests);
     const lib_db_text_query_step = b.step("lib-db-text-query-test", "Run focused full-text query guardrail tests");
     lib_db_text_query_step.dependOn(&run_lib_db_text_query_tests.step);
 
@@ -3823,7 +3839,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_db_result_shape_tests = b.addRunArtifact(lib_db_result_shape_tests);
+    const run_lib_db_result_shape_tests = addFilteredTestRunArtifact(b, lib_db_result_shape_tests);
     const lib_db_result_shape_step = b.step("lib-db-result-shape-test", "Run focused DB query doc id boundary tests");
     lib_db_result_shape_step.dependOn(&run_lib_db_result_shape_tests.step);
 
@@ -3844,7 +3860,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db updateRange constrains index backfill",
         },
     });
-    const run_lib_db_reopen_tests = b.addRunArtifact(lib_db_reopen_tests);
+    const run_lib_db_reopen_tests = addFilteredTestRunArtifact(b, lib_db_reopen_tests);
     const lib_db_reopen_step = b.step("lib-db-reopen-test", "Run root-module DB reopen/compaction tests");
     lib_db_reopen_step.dependOn(&run_lib_db_reopen_tests.step);
 
@@ -3863,7 +3879,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db batch enforces optimistic version predicates",
         },
     });
-    const run_lib_db_txn_tests = b.addRunArtifact(lib_db_txn_tests);
+    const run_lib_db_txn_tests = addFilteredTestRunArtifact(b, lib_db_txn_tests);
     const lib_db_txn_step = b.step("lib-db-txn-test", "Run root-module DB TTL/transaction tests");
     lib_db_txn_step.dependOn(&run_lib_db_txn_tests.step);
 
@@ -3875,7 +3891,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_metadata_tests = b.addRunArtifact(lib_metadata_tests);
+    const run_lib_metadata_tests = addFilteredTestRunArtifact(b, lib_metadata_tests);
     const lib_metadata_test_step = b.step("lib-metadata-test", "Run root-module metadata tests only");
     lib_metadata_test_step.dependOn(&run_lib_metadata_tests.step);
 
@@ -3890,7 +3906,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_metadata_table_workflow_tests = b.addRunArtifact(lib_metadata_table_workflow_tests);
+    const run_lib_metadata_table_workflow_tests = addFilteredTestRunArtifact(b, lib_metadata_table_workflow_tests);
     const lib_metadata_table_workflow_test_step = b.step("lib-metadata-table-workflow-test", "Run focused metadata table workflow tests");
     lib_metadata_table_workflow_test_step.dependOn(&run_lib_metadata_table_workflow_tests.step);
 
@@ -3903,7 +3919,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_metadata_sim_tests = b.addRunArtifact(lib_metadata_sim_tests);
+    const run_lib_metadata_sim_tests = addFilteredTestRunArtifact(b, lib_metadata_sim_tests);
     const lib_metadata_sim_test_step = b.step("lib-metadata-sim-test", "Run metadata real-HTTP simulation tests only");
     lib_metadata_sim_test_step.dependOn(&run_lib_metadata_sim_tests.step);
 
@@ -3929,7 +3945,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_metadata_sim_core_tests = b.addRunArtifact(lib_metadata_sim_core_tests);
+    const run_lib_metadata_sim_core_tests = addFilteredTestRunArtifact(b, lib_metadata_sim_core_tests);
     const lib_metadata_sim_core_test_step = b.step("lib-metadata-sim-core-test", "Run deterministic metadata virtual-transport simulation tests without public API or chaos");
     lib_metadata_sim_core_test_step.dependOn(&run_lib_metadata_sim_core_tests.step);
 
@@ -3947,7 +3963,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_metadata_sim_smoke_tests = b.addRunArtifact(lib_metadata_sim_smoke_tests);
+    const run_lib_metadata_sim_smoke_tests = addFilteredTestRunArtifact(b, lib_metadata_sim_smoke_tests);
     const lib_metadata_sim_smoke_test_step = b.step("lib-metadata-sim-smoke-test", "Run fast metadata virtual-transport simulation smoke tests");
     lib_metadata_sim_smoke_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
 
@@ -3962,7 +3978,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_metadata_vopr_tests = b.addRunArtifact(lib_metadata_vopr_tests);
+    const run_lib_metadata_vopr_tests = addFilteredTestRunArtifact(b, lib_metadata_vopr_tests);
     const lib_metadata_vopr_test_step = b.step("lib-metadata-vopr-test", "Run seeded metadata virtual-operation campaign tests");
     lib_metadata_vopr_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
 
@@ -3977,7 +3993,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_metadata_vopr_chaos_tests = b.addRunArtifact(lib_metadata_vopr_chaos_tests);
+    const run_lib_metadata_vopr_chaos_tests = addFilteredTestRunArtifact(b, lib_metadata_vopr_chaos_tests);
     const lib_metadata_vopr_chaos_test_step = b.step("lib-metadata-vopr-chaos-test", "Run expanded metadata VOPR generated workload campaigns");
     lib_metadata_vopr_chaos_test_step.dependOn(&run_lib_metadata_vopr_chaos_tests.step);
 
@@ -4053,7 +4069,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_metadata_sim_public_tests = b.addRunArtifact(lib_metadata_sim_public_tests);
+    const run_lib_metadata_sim_public_tests = addFilteredTestRunArtifact(b, lib_metadata_sim_public_tests);
     const lib_metadata_sim_public_test_step = b.step("lib-metadata-sim-public-test", "Run metadata public lifecycle/split/merge simulation tests");
     lib_metadata_sim_public_test_step.dependOn(&run_lib_metadata_sim_public_tests.step);
 
@@ -4146,7 +4162,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_public_api_parity_tests = b.addRunArtifact(public_api_parity_tests);
+    const run_public_api_parity_tests = addFilteredTestRunArtifact(b, public_api_parity_tests);
     run_public_api_parity_tests.step.dependOn(&openapi_root_check.step);
     const public_api_parity_test_step = b.step("public-api-parity-test", "Run focused stateful public API parity tests");
     public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
@@ -4159,7 +4175,7 @@ pub fn build(b: *std.Build) void {
             "DistributedEntitySink",
         },
     });
-    const run_lib_resolution_source_tests = b.addRunArtifact(lib_resolution_source_tests);
+    const run_lib_resolution_source_tests = addFilteredTestRunArtifact(b, lib_resolution_source_tests);
     const lib_resolution_source_test_step = b.step("lib-resolution-source-test", "Run focused cross-shard resolution candidate-source and entity-sink tests");
     lib_resolution_source_test_step.dependOn(&run_lib_resolution_source_tests.step);
 
@@ -4213,7 +4229,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_api_auth_tests = b.addRunArtifact(lib_api_auth_tests);
+    const run_lib_api_auth_tests = addFilteredTestRunArtifact(b, lib_api_auth_tests);
     run_lib_api_auth_tests.step.dependOn(&openapi_root_check.step);
     const lib_api_auth_test_step = b.step("lib-api-auth-test", "Run focused API auth/usermgr HTTP tests");
     lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
@@ -4234,7 +4250,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_storage_maintenance_tests = b.addRunArtifact(lib_storage_maintenance_tests);
+    const run_lib_storage_maintenance_tests = addFilteredTestRunArtifact(b, lib_storage_maintenance_tests);
     const lib_storage_maintenance_test_step = b.step("lib-storage-maintenance-test", "Run storage maintenance coordinator ownership and concurrency tests");
     lib_storage_maintenance_test_step.dependOn(&run_lib_storage_maintenance_tests.step);
 
@@ -4263,7 +4279,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_api_connections_tests = b.addRunArtifact(lib_api_connections_tests);
+    const run_lib_api_connections_tests = addFilteredTestRunArtifact(b, lib_api_connections_tests);
     const lib_api_connections_test_step = b.step("lib-api-connections-test", "Run connection inventory and probe-admission tests");
     lib_api_connections_test_step.dependOn(&run_lib_api_connections_tests.step);
 
@@ -4298,7 +4314,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_api_storage_authority_tests = b.addRunArtifact(lib_api_storage_authority_tests);
+    const run_lib_api_storage_authority_tests = addFilteredTestRunArtifact(b, lib_api_storage_authority_tests);
     const lib_api_storage_authority_test_step = b.step("lib-api-storage-authority-test", "Run remote backup credential-boundary tests");
     lib_api_storage_authority_test_step.dependOn(&run_lib_api_storage_authority_tests.step);
 
@@ -4326,7 +4342,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_api_session_maintenance_tests = b.addRunArtifact(lib_api_session_maintenance_tests);
+    const run_lib_api_session_maintenance_tests = addFilteredTestRunArtifact(b, lib_api_session_maintenance_tests);
     const lib_api_session_maintenance_test_step = b.step("lib-api-session-maintenance-test", "Run durable session concurrency and background-maintenance tests");
     lib_api_session_maintenance_test_step.dependOn(&run_lib_api_session_maintenance_tests.step);
 
@@ -4730,7 +4746,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_api_docid_tests = b.addRunArtifact(lib_api_docid_tests);
+    const run_lib_api_docid_tests = addFilteredTestRunArtifact(b, lib_api_docid_tests);
     const api_derived_coverage_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_derived_coverage_test_root.zig"),
         .target = target,
@@ -4768,16 +4784,16 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_api_derived_coverage_tests = b.addRunArtifact(lib_api_derived_coverage_tests);
+    const run_lib_api_derived_coverage_tests = addFilteredTestRunArtifact(b, lib_api_derived_coverage_tests);
     run_lib_api_derived_coverage_tests.step.dependOn(&openapi_root_check.step);
     const lib_api_derived_coverage_test_step = b.step("lib-api-derived-coverage-test", "Run focused public derived coverage tests");
     lib_api_derived_coverage_test_step.dependOn(&run_lib_api_derived_coverage_tests.step);
-    const run_lib_serverless_docid_tests = b.addRunArtifact(lib_serverless_docid_tests);
-    const run_api_transactions_docid_tests = b.addRunArtifact(api_transactions_docid_tests);
-    const run_api_table_writes_docid_tests = b.addRunArtifact(api_table_writes_docid_tests);
-    const run_api_table_reads_docid_tests = b.addRunArtifact(api_table_reads_docid_tests);
-    const run_api_public_table_http_docid_tests = b.addRunArtifact(api_public_table_http_docid_tests);
-    const run_raft_transition_runtime_docid_tests = b.addRunArtifact(raft_transition_runtime_docid_tests);
+    const run_lib_serverless_docid_tests = addFilteredTestRunArtifact(b, lib_serverless_docid_tests);
+    const run_api_transactions_docid_tests = addFilteredTestRunArtifact(b, api_transactions_docid_tests);
+    const run_api_table_writes_docid_tests = addFilteredTestRunArtifact(b, api_table_writes_docid_tests);
+    const run_api_table_reads_docid_tests = addFilteredTestRunArtifact(b, api_table_reads_docid_tests);
+    const run_api_public_table_http_docid_tests = addFilteredTestRunArtifact(b, api_public_table_http_docid_tests);
+    const run_raft_transition_runtime_docid_tests = addFilteredTestRunArtifact(b, raft_transition_runtime_docid_tests);
     const api_table_writes_docid_test_step = b.step("api-table-writes-docid-test", "Run focused API table write tests");
     api_table_writes_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
     const api_table_writes_production_regression_tests = b.addTest(.{
@@ -4828,7 +4844,7 @@ pub fn build(b: *std.Build) void {
             "generation publication marker parsing preserves allocator exhaustion",
         },
     });
-    const run_api_table_writes_production_regression_tests = b.addRunArtifact(api_table_writes_production_regression_tests);
+    const run_api_table_writes_production_regression_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
     const api_table_writes_production_regression_step = b.step("api-table-writes-production-regression-test", "Run focused restore and writer-cache lifecycle regressions");
     api_table_writes_production_regression_step.dependOn(&run_api_table_writes_production_regression_tests.step);
     const api_table_writes_restore_repeat_step = b.step("api-table-writes-restore-repeat-test", "Run the focused shared-owner native restore regression");
@@ -4886,7 +4902,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_docid_lifecycle_tests = b.addRunArtifact(lib_docid_lifecycle_tests);
+    const run_lib_docid_lifecycle_tests = addFilteredTestRunArtifact(b, lib_docid_lifecycle_tests);
     const docid_lifecycle_test_step = b.step("docid-lifecycle-test", "Run focused DOCID lifecycle and distributed snapshot hardening tests");
     docid_lifecycle_test_step.dependOn(&run_lib_docid_lifecycle_tests.step);
     docid_lifecycle_test_step.dependOn(&run_api_transactions_docid_tests.step);
@@ -4927,7 +4943,7 @@ pub fn build(b: *std.Build) void {
             "api http server cluster overwrite stages before replacing metadata without dropping live table",
         },
     });
-    const run_lib_api_standalone_backup_restore_tests = b.addRunArtifact(lib_api_standalone_backup_restore_tests);
+    const run_lib_api_standalone_backup_restore_tests = addFilteredTestRunArtifact(b, lib_api_standalone_backup_restore_tests);
     const lib_api_standalone_backup_restore_test_step = b.step("lib-api-standalone-backup-restore-test", "Run the focused standalone-like backup/restore e2e test");
     lib_api_standalone_backup_restore_test_step.dependOn(&run_lib_api_standalone_backup_restore_tests.step);
 
@@ -4942,7 +4958,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_metadata_sim_forward_tests = b.addRunArtifact(lib_metadata_sim_forward_tests);
+    const run_lib_metadata_sim_forward_tests = addFilteredTestRunArtifact(b, lib_metadata_sim_forward_tests);
     const lib_metadata_sim_forward_test_step = b.step("lib-metadata-sim-forward-test", "Run public table IO forwarding simulation tests only");
     lib_metadata_sim_forward_test_step.dependOn(&run_lib_metadata_sim_forward_tests.step);
 
@@ -4959,7 +4975,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_metadata_service_tests = b.addRunArtifact(lib_metadata_service_tests);
+    const run_lib_metadata_service_tests = addFilteredTestRunArtifact(b, lib_metadata_service_tests);
     const lib_metadata_service_test_step = b.step("lib-metadata-service-test", "Run metadata service/control-loop integration tests");
     lib_metadata_service_test_step.dependOn(&run_lib_metadata_service_tests.step);
 
@@ -4967,11 +4983,11 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "metadata reconciler",
-            "metadata transition state",
+            "transition state",
             "metadata server module compiles",
             "metadata merge request validation rejects incompatible doc identity namespaces",
             "metadata split request validation rejects stale doc identity namespace",
-            "metadata transition actions",
+            "transition actions",
             "placement planner",
             "metadata control loop proposes desired transitions through the service seam",
             "metadata control loop plans placement intents",
@@ -4997,7 +5013,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_metadata_logic_tests = b.addRunArtifact(lib_metadata_logic_tests);
+    const run_lib_metadata_logic_tests = addFilteredTestRunArtifact(b, lib_metadata_logic_tests);
     const lib_metadata_logic_test_step = b.step("lib-metadata-logic-test", "Run metadata logic/state/planner tests");
     lib_metadata_logic_test_step.dependOn(&run_lib_metadata_logic_tests.step);
 
@@ -5012,7 +5028,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_storage_tests = b.addRunArtifact(lib_storage_tests);
+    const run_lib_storage_tests = addFilteredTestRunArtifact(b, lib_storage_tests);
     const lib_storage_test_step = b.step("lib-storage-test", "Run root-module storage tests only");
     lib_storage_test_step.dependOn(&run_lib_storage_tests.step);
 
@@ -5024,7 +5040,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_ha_tests = b.addRunArtifact(ha_tests);
+    const run_ha_tests = addFilteredTestRunArtifact(b, ha_tests);
     const ha_test_step = b.step("ha-test", "Run hot-standby HA storage tests");
     ha_test_step.dependOn(&run_ha_tests.step);
 
@@ -5036,7 +5052,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lsm_backend_tests = b.addRunArtifact(lsm_backend_tests);
+    const run_lsm_backend_tests = addFilteredTestRunArtifact(b, lsm_backend_tests);
     const lsm_backend_test_step = b.step("lsm-backend-test", "Run LSM backend unit tests only");
     lsm_backend_test_step.dependOn(&run_lsm_backend_tests.step);
 
@@ -5068,7 +5084,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_resource_budget_tests = b.addRunArtifact(resource_budget_tests);
+    const run_resource_budget_tests = addFilteredTestRunArtifact(b, resource_budget_tests);
     const filesystem_capacity_tests = b.addTest(.{
         .root_module = filesystem_capacity_test_mod,
         .filters = &.{"filesystem capacity probe reports the test volume"},
@@ -5077,7 +5093,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_filesystem_capacity_tests = b.addRunArtifact(filesystem_capacity_tests);
+    const run_filesystem_capacity_tests = addFilteredTestRunArtifact(b, filesystem_capacity_tests);
     // Keep the filesystem probe in the default resource-budget lane instead of
     // adding another concurrently runnable unit-test process. The default unit
     // graph is intentionally broad, and an extra process here can turn short
@@ -5128,7 +5144,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_dense_index_lifecycle_regression_tests = b.addRunArtifact(dense_index_lifecycle_regression_tests);
+    const run_dense_index_lifecycle_regression_tests = addFilteredTestRunArtifact(b, dense_index_lifecycle_regression_tests);
     const dense_index_repair_job_tests = b.addTest(.{
         .root_module = api_artifact_reprocess_jobs_test_mod,
         .filters = &.{
@@ -5144,7 +5160,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_dense_index_repair_job_tests = b.addRunArtifact(dense_index_repair_job_tests);
+    const run_dense_index_repair_job_tests = addFilteredTestRunArtifact(b, dense_index_repair_job_tests);
     const dense_index_repair_status_tests = b.addTest(.{
         .root_module = api_derived_coverage_test_mod,
         .filters = &.{"index status exposes compact repair state without internal diagnostics"},
@@ -5153,7 +5169,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_dense_index_repair_status_tests = b.addRunArtifact(dense_index_repair_status_tests);
+    const run_dense_index_repair_status_tests = addFilteredTestRunArtifact(b, dense_index_repair_status_tests);
     const dense_index_repair_runtime_tests = b.addTest(.{
         .root_module = data_runtime_test_mod,
         .filters = &.{
@@ -5166,7 +5182,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_dense_index_repair_runtime_tests = b.addRunArtifact(dense_index_repair_runtime_tests);
+    const run_dense_index_repair_runtime_tests = addFilteredTestRunArtifact(b, dense_index_repair_runtime_tests);
     const dense_index_lifecycle_regression_step = b.step(
         "dense-index-lifecycle-regression-test",
         "Run focused durable dense-index repair and admission regressions",
@@ -5391,7 +5407,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const lib_standalone_runtime_test_step = b.step("lib-standalone-runtime-test", "Run focused standalone runtime tests");
-    const run_lib_standalone_runtime_tests = b.addRunArtifact(lib_standalone_runtime_tests);
+    const run_lib_standalone_runtime_tests = addFilteredTestRunArtifact(b, lib_standalone_runtime_tests);
     lib_standalone_runtime_test_step.dependOn(&run_lib_standalone_runtime_tests.step);
 
     const raft_test_step = b.step("raft-test", "Run raft integration unit tests");
@@ -5495,7 +5511,7 @@ pub fn build(b: *std.Build) void {
         .root_module = storage_lmdb_test_mod,
         .filters = &.{"LMDB replay fixtures stay green"},
     });
-    const run_storage_lmdb_replay_tests = b.addRunArtifact(storage_lmdb_replay_tests);
+    const run_storage_lmdb_replay_tests = addFilteredTestRunArtifact(b, storage_lmdb_replay_tests);
     const storage_lmdb_replay_step = b.step("lmdb-replay-fixtures", "Run only the LMDB replay fixture test");
     storage_lmdb_replay_step.dependOn(&run_storage_lmdb_replay_tests.step);
 
@@ -5518,7 +5534,7 @@ pub fn build(b: *std.Build) void {
         .root_module = storage_lmdb_soak_test_mod,
         .filters = &.{"LMDB sim soak stays green"},
     });
-    const run_storage_lmdb_soak_tests = b.addRunArtifact(storage_lmdb_soak_tests);
+    const run_storage_lmdb_soak_tests = addFilteredTestRunArtifact(b, storage_lmdb_soak_tests);
     const storage_lmdb_soak_step = b.step("lmdb-sim-soak", "Run only the LMDB simulation soak test");
     storage_lmdb_soak_step.dependOn(&run_storage_lmdb_soak_tests.step);
 
@@ -5561,7 +5577,7 @@ pub fn build(b: *std.Build) void {
         .root_module = wal_test_mod,
         .filters = &.{"wal sim"},
     });
-    const run_wal_sim_tests = b.addRunArtifact(wal_sim_tests);
+    const run_wal_sim_tests = addFilteredTestRunArtifact(b, wal_sim_tests);
     const wal_sim_test_step = b.step("wal-sim-test", "Run only the WAL simulation workload tests");
     wal_sim_test_step.dependOn(&run_wal_sim_tests.step);
 
@@ -5580,7 +5596,7 @@ pub fn build(b: *std.Build) void {
             "wal modeled storage commit delay uses injected virtual clock",
         },
     });
-    const run_wal_vopr_tests = b.addRunArtifact(wal_vopr_tests);
+    const run_wal_vopr_tests = addFilteredTestRunArtifact(b, wal_vopr_tests);
     const wal_vopr_test_step = b.step("wal-vopr-test", "Run WAL modeled-time VOPR smoke tests");
     wal_vopr_test_step.dependOn(&run_wal_vopr_tests.step);
 
@@ -5588,7 +5604,7 @@ pub fn build(b: *std.Build) void {
         .root_module = wal_test_mod,
         .filters = &.{"wal replay fixtures stay green"},
     });
-    const run_wal_replay_tests = b.addRunArtifact(wal_replay_tests);
+    const run_wal_replay_tests = addFilteredTestRunArtifact(b, wal_replay_tests);
     const wal_replay_step = b.step("wal-replay-fixtures", "Run only the WAL replay fixture tests");
     wal_replay_step.dependOn(&run_wal_replay_tests.step);
 
@@ -5600,7 +5616,7 @@ pub fn build(b: *std.Build) void {
         .root_module = wal_soak_test_mod,
         .filters = &.{"wal sim soak stays green"},
     });
-    const run_wal_soak_tests = b.addRunArtifact(wal_soak_tests);
+    const run_wal_soak_tests = addFilteredTestRunArtifact(b, wal_soak_tests);
     const wal_soak_step = b.step("wal-sim-soak", "Run only the WAL simulation soak test");
     wal_soak_step.dependOn(&run_wal_soak_tests.step);
 
@@ -5637,7 +5653,7 @@ pub fn build(b: *std.Build) void {
             "persistent index preserves deletion of repeated document versions across reopen",
         },
     });
-    const run_persistent_delete_regression_tests = b.addRunArtifact(persistent_delete_regression_tests);
+    const run_persistent_delete_regression_tests = addFilteredTestRunArtifact(b, persistent_delete_regression_tests);
     const persistent_delete_regression_step = b.step("persistent-delete-regression-test", "Run atomic multi-segment deletion regressions");
     persistent_delete_regression_step.dependOn(&run_persistent_delete_regression_tests.step);
 
@@ -5645,7 +5661,7 @@ pub fn build(b: *std.Build) void {
         .root_module = persistent_test_mod,
         .filters = &.{"persistent sim workloads stay green"},
     });
-    const run_persistent_sim_tests = b.addRunArtifact(persistent_sim_tests);
+    const run_persistent_sim_tests = addFilteredTestRunArtifact(b, persistent_sim_tests);
     const persistent_sim_step = b.step("persistent-sim-test", "Run only the persistent simulation workload tests");
     persistent_sim_step.dependOn(&run_persistent_sim_tests.step);
 
@@ -5653,7 +5669,7 @@ pub fn build(b: *std.Build) void {
         .root_module = persistent_test_mod,
         .filters = &.{"persistent replay fixtures stay green"},
     });
-    const run_persistent_replay_tests = b.addRunArtifact(persistent_replay_tests);
+    const run_persistent_replay_tests = addFilteredTestRunArtifact(b, persistent_replay_tests);
     const persistent_replay_step = b.step("persistent-replay-fixtures", "Run only the persistent replay fixture tests");
     persistent_replay_step.dependOn(&run_persistent_replay_tests.step);
 
@@ -5665,7 +5681,7 @@ pub fn build(b: *std.Build) void {
             "persistent modeled full-text compaction publish faults stay green",
         },
     });
-    const run_persistent_vopr_tests = b.addRunArtifact(persistent_vopr_tests);
+    const run_persistent_vopr_tests = addFilteredTestRunArtifact(b, persistent_vopr_tests);
     const persistent_vopr_step = b.step("persistent-vopr-test", "Run persistent modeled-storage VOPR smoke tests");
     persistent_vopr_step.dependOn(&run_persistent_vopr_tests.step);
 
@@ -5682,7 +5698,7 @@ pub fn build(b: *std.Build) void {
         .root_module = persistent_soak_test_mod,
         .filters = &.{"persistent sim soak stays green"},
     });
-    const run_persistent_soak_tests = b.addRunArtifact(persistent_soak_tests);
+    const run_persistent_soak_tests = addFilteredTestRunArtifact(b, persistent_soak_tests);
     const persistent_soak_step = b.step("persistent-sim-soak", "Run only the persistent simulation soak test");
     persistent_soak_step.dependOn(&run_persistent_soak_tests.step);
 
@@ -5707,7 +5723,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_index_manager_unit_tests = b.addRunArtifact(index_manager_unit_tests);
+    const run_index_manager_unit_tests = addFilteredTestRunArtifact(b, index_manager_unit_tests);
 
     const index_manager_test_step = b.step("index-manager-test", "Run storage/db/catalog/index_manager unit tests");
     index_manager_test_step.dependOn(&run_index_manager_unit_tests.step);
@@ -5716,7 +5732,7 @@ pub fn build(b: *std.Build) void {
         .root_module = index_manager_test_mod,
         .filters = &.{"text merge resource manager accounts pending bytes and active buffers"},
     });
-    const run_index_manager_resource_tests = b.addRunArtifact(index_manager_resource_tests);
+    const run_index_manager_resource_tests = addFilteredTestRunArtifact(b, index_manager_resource_tests);
     const index_manager_resource_step = b.step("index-manager-resource-test", "Run index manager resource-manager accounting tests");
     index_manager_resource_step.dependOn(&run_index_manager_resource_tests.step);
 
@@ -5724,7 +5740,7 @@ pub fn build(b: *std.Build) void {
         .root_module = index_manager_test_mod,
         .filters = &.{"index manager sim workloads stay green"},
     });
-    const run_index_manager_sim_tests = b.addRunArtifact(index_manager_sim_tests);
+    const run_index_manager_sim_tests = addFilteredTestRunArtifact(b, index_manager_sim_tests);
     const index_manager_sim_step = b.step("index-manager-sim-test", "Run only the index manager simulation workload tests");
     index_manager_sim_step.dependOn(&run_index_manager_sim_tests.step);
 
@@ -5732,7 +5748,7 @@ pub fn build(b: *std.Build) void {
         .root_module = index_manager_test_mod,
         .filters = &.{"index manager replay fixtures stay green"},
     });
-    const run_index_manager_replay_tests = b.addRunArtifact(index_manager_replay_tests);
+    const run_index_manager_replay_tests = addFilteredTestRunArtifact(b, index_manager_replay_tests);
     const index_manager_replay_step = b.step("index-manager-replay-fixtures", "Run only the index manager replay fixture tests");
     index_manager_replay_step.dependOn(&run_index_manager_replay_tests.step);
 
@@ -5743,7 +5759,7 @@ pub fn build(b: *std.Build) void {
             "index manager modeled crash fixtures stay green",
         },
     });
-    const run_index_manager_vopr_tests = b.addRunArtifact(index_manager_vopr_tests);
+    const run_index_manager_vopr_tests = addFilteredTestRunArtifact(b, index_manager_vopr_tests);
     const index_manager_vopr_step = b.step("index-manager-vopr-test", "Run index manager modeled-storage VOPR smoke tests");
     index_manager_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
 
@@ -5784,7 +5800,7 @@ pub fn build(b: *std.Build) void {
         .root_module = db_test_mod,
         .filters = selectTestFilters(b, &db_split_sim_default_filters),
     });
-    const run_db_split_sim_tests = b.addRunArtifact(db_split_sim_tests);
+    const run_db_split_sim_tests = addFilteredTestRunArtifact(b, db_split_sim_tests);
     const db_split_sim_step = b.step("db-split-sim-test", "Run only the DB split simulation workload tests");
     db_split_sim_step.dependOn(&run_db_split_sim_tests.step);
 
@@ -5795,7 +5811,7 @@ pub fn build(b: *std.Build) void {
             "db split modeled sim workloads stay green",
         },
     });
-    const run_db_split_vopr_tests = b.addRunArtifact(db_split_vopr_tests);
+    const run_db_split_vopr_tests = addFilteredTestRunArtifact(b, db_split_vopr_tests);
     const db_split_vopr_step = b.step("db-split-vopr-test", "Run only the DB split modeled-storage replay fixture tests");
     db_split_vopr_step.dependOn(&run_db_split_vopr_tests.step);
 
@@ -5829,7 +5845,7 @@ pub fn build(b: *std.Build) void {
         .root_module = db_test_mod,
         .filters = &.{"db restore snapshot repeatedly validates run-backed doc identity metadata"},
     });
-    const run_db_restore_identity_tests = b.addRunArtifact(db_restore_identity_tests);
+    const run_db_restore_identity_tests = addFilteredTestRunArtifact(b, db_restore_identity_tests);
     const db_restore_identity_step = b.step("db-restore-identity-test", "Run the focused run-backed identity restore regression");
     db_restore_identity_step.dependOn(&run_db_restore_identity_tests.step);
 
@@ -5843,7 +5859,7 @@ pub fn build(b: *std.Build) void {
         .root_module = db_test_mod,
         .filters = &.{"enrichment"},
     });
-    const run_db_enrichment_tests = b.addRunArtifact(db_enrichment_tests);
+    const run_db_enrichment_tests = addFilteredTestRunArtifact(b, db_enrichment_tests);
     const db_enrichment_test_step = b.step("db-enrichment-test", "Run storage/db enrichment-related unit tests");
     db_enrichment_test_step.dependOn(&run_db_enrichment_tests.step);
 
@@ -5851,7 +5867,7 @@ pub fn build(b: *std.Build) void {
         .root_module = db_test_mod,
         .filters = &.{"db dense index can reference existing whole-doc embedding enrichment"},
     });
-    const run_db_enrichment_single_tests = b.addRunArtifact(db_enrichment_single_tests);
+    const run_db_enrichment_single_tests = addFilteredTestRunArtifact(b, db_enrichment_single_tests);
     const db_enrichment_single_step = b.step("db-enrichment-single-test", "Run the focused whole-doc enrichment DB test");
     db_enrichment_single_step.dependOn(&run_db_enrichment_single_tests.step);
 
@@ -5859,7 +5875,7 @@ pub fn build(b: *std.Build) void {
         .root_module = db_test_mod,
         .filters = &.{"db restore snapshot replays managed chunked dense embeddings"},
     });
-    const run_db_restore_managed_tests = b.addRunArtifact(db_restore_managed_tests);
+    const run_db_restore_managed_tests = addFilteredTestRunArtifact(b, db_restore_managed_tests);
     const db_restore_managed_step = b.step("db-restore-managed-test", "Run the focused managed chunked dense restore DB test");
     db_restore_managed_step.dependOn(&run_db_restore_managed_tests.step);
 
@@ -5867,7 +5883,7 @@ pub fn build(b: *std.Build) void {
         .root_module = db_test_mod,
         .filters = &.{"provisioned write cache invalidation closes failed managed enrichment db without aborting"},
     });
-    const run_provisioned_write_cache_failed_close_tests = b.addRunArtifact(provisioned_write_cache_failed_close_tests);
+    const run_provisioned_write_cache_failed_close_tests = addFilteredTestRunArtifact(b, provisioned_write_cache_failed_close_tests);
     const provisioned_write_cache_failed_close_step = b.step(
         "provisioned-write-cache-failed-close-test",
         "Run the focused provisioned write-cache failed-enrichment close regression",
@@ -5893,7 +5909,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_provisioned_query_visibility_tests = b.addRunArtifact(provisioned_query_visibility_tests);
+    const run_provisioned_query_visibility_tests = addFilteredTestRunArtifact(b, provisioned_query_visibility_tests);
     const provisioned_query_visibility_step = b.step(
         "provisioned-query-visibility-test",
         "Run the focused managed dense query-visibility cache invalidation regression",
@@ -5905,7 +5921,7 @@ pub fn build(b: *std.Build) void {
         .root_module = db_test_mod,
         .filters = &.{"db document _embeddings update vector index and strip stored special fields"},
     });
-    const run_db_embeddings_update_tests = b.addRunArtifact(db_embeddings_update_tests);
+    const run_db_embeddings_update_tests = addFilteredTestRunArtifact(b, db_embeddings_update_tests);
     const db_embeddings_update_step = b.step("db-embeddings-update-test", "Run the explicit _embeddings update DB test");
     db_embeddings_update_step.dependOn(&run_db_embeddings_update_tests.step);
 
@@ -5913,7 +5929,7 @@ pub fn build(b: *std.Build) void {
         .root_module = db_test_mod,
         .filters = &.{"db merge-style cutover preserves enrichment resume and fencing across reopen"},
     });
-    const run_db_merge_cutover_tests = b.addRunArtifact(db_merge_cutover_tests);
+    const run_db_merge_cutover_tests = addFilteredTestRunArtifact(b, db_merge_cutover_tests);
     const db_merge_cutover_step = b.step("db-merge-cutover-test", "Run the merge cutover enrichment reopen DB test");
     db_merge_cutover_step.dependOn(&run_db_merge_cutover_tests.step);
 
@@ -5921,7 +5937,7 @@ pub fn build(b: *std.Build) void {
         .root_module = db_test_mod,
         .filters = &.{"db shared embedding enrichment feeds multiple dense indexes"},
     });
-    const run_db_shared_embedding_tests = b.addRunArtifact(db_shared_embedding_tests);
+    const run_db_shared_embedding_tests = addFilteredTestRunArtifact(b, db_shared_embedding_tests);
     const db_shared_embedding_step = b.step("db-shared-embedding-test", "Run the shared embedding enrichment DB test");
     db_shared_embedding_step.dependOn(&run_db_shared_embedding_tests.step);
 
@@ -5929,7 +5945,7 @@ pub fn build(b: *std.Build) void {
         .root_module = db_test_mod,
         .filters = &.{"db dense parent paging fetches enough chunk hits before grouping"},
     });
-    const run_db_dense_parent_paging_tests = b.addRunArtifact(db_dense_parent_paging_tests);
+    const run_db_dense_parent_paging_tests = addFilteredTestRunArtifact(b, db_dense_parent_paging_tests);
     const db_dense_parent_paging_step = b.step("db-dense-parent-paging-test", "Run the dense parent paging enrichment DB test");
     db_dense_parent_paging_step.dependOn(&run_db_dense_parent_paging_tests.step);
 
@@ -5937,7 +5953,7 @@ pub fn build(b: *std.Build) void {
         .root_module = db_test_mod,
         .filters = &.{"db split replay fixtures stay green"},
     });
-    const run_db_split_replay_tests = b.addRunArtifact(db_split_replay_tests);
+    const run_db_split_replay_tests = addFilteredTestRunArtifact(b, db_split_replay_tests);
     const db_split_replay_step = b.step("db-split-replay-fixtures", "Run only the DB split replay fixture tests");
     db_split_replay_step.dependOn(&run_db_split_replay_tests.step);
 
@@ -6739,7 +6755,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_search_performance_tests = b.addRunArtifact(search_performance_tests);
+    const run_search_performance_tests = addFilteredTestRunArtifact(b, search_performance_tests);
     const search_performance_test_step = b.step("search-performance-test", "Run focused full-text scorer regression tests");
     search_performance_test_step.dependOn(&run_search_performance_tests.step);
 
@@ -7797,7 +7813,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lite_core_main_tests = b.addRunArtifact(lite_core_main_tests);
+    const run_lite_core_main_tests = addFilteredTestRunArtifact(b, lite_core_main_tests);
     const lite_core_test_step = b.step("lite-core-test", "Run Antfly Lite core wrapper tests");
     lite_core_test_step.dependOn(&run_lite_core_main_tests.step);
     lite_core_test_step.dependOn(&run_lite_cmd_tests.step);
