@@ -78,7 +78,7 @@ const commands = [_]common.CommandSpec{
     .{
         .name = "eval-gliner2-autodiff-adapter-dataset",
         .root_source_file = "src/finetune/tools/eval_gliner2_autodiff_adapter_dataset.zig",
-        .description = "Evaluate saved GLiNER2 autodiff PEFT adapter exact-match entity precision/recall/F1 on JSONL data",
+        .description = "Evaluate a saved GLiNER2 autodiff PEFT adapter across structured full-task JSONL data",
         .imports = &.{ .build_options, .ml, .inference_internal, .inference_hf_tokenizer, .inference_linalg },
         .native_link = .default,
     },
@@ -127,13 +127,6 @@ const commands = [_]common.CommandSpec{
         .root_source_file = "src/finetune/train/train_eval_gliner2_top_layer_boundary_task_head.zig",
         .description = "Train a bounded GLiNER2 label-aware boundary task head and report before/after metrics",
         .imports = gliner_boundary_train_imports,
-        .native_link = .default,
-    },
-    .{
-        .name = "train-eval-gliner2-lora-bundle",
-        .root_source_file = "src/finetune/train/train_eval_gliner2_lora_bundle.zig",
-        .description = "Train GLiNER2 LoRA adapters using cached top-layer boundary representations and report before/after MSE",
-        .imports = &.{ .build_options, .ml, .inference_internal, .pjrt },
         .native_link = .default,
     },
     .{

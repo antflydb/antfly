@@ -1,0 +1,8 @@
+{"input":"iPhone 15 costs $999 and is available in blue.","output":{"json_structures":[{"product":{"name":"iPhone 15","price":"$999","color":"blue","status":{"value":"available","choices":["available","sold out"]}}}]}}
+{"input":"The laptop from Acme costs $1200 and is sold in gray.","output":{"json_structures":[{"product":{"name":"laptop","price":"$1200","color":"gray"}}]}}
+{"input":"Mary booked a room in Paris for March.","output":{"json_structures":[{"booking":{"guest":"Mary","city":"Paris","month":"March"}}]}}
+{"input":"John ordered a phone from Globex in London.","output":{"json_structures":[{"order":{"buyer":"John","item":"phone","seller":"Globex"}}]}}
+{"input":"The meeting is in Seattle on Monday at noon.","output":{"json_structures":[{"event":{"city":"Seattle","day":"Monday","time":"noon"}}]}}
+{"input":"Acme released a tablet that is sold out in red.","output":{"json_structures":[{"product":{"name":"tablet","color":"red","status":{"value":"sold out","choices":["available","sold out"]}}}]}}
+{"input":"Globex opened an office in Paris with twenty staff.","output":{"json_structures":[{"office":{"company":"Globex","city":"Paris","size":"twenty"}}]}}
+{"input":"The phone costs $499 and ships from Seattle.","output":{"json_structures":[{"product":{"name":"phone","price":"$499"},"shipment":{"origin":"Seattle"}}]}}

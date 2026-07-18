@@ -1,0 +1,3 @@
+{"input":"The weather in the city was mild all week.","output":{"classifications":[{"task":"sentiment","labels":["positive","negative"],"true_label":[]}]}}
+{"input":"Nothing happened on Tuesday.","output":{"classifications":[{"task":"priority","labels":["low","normal","urgent"],"true_label":[]}]}}
+{"input":"It rained in the valley overnight.","output":{"classifications":[{"task":"topic","labels":["sports","business","technology"],"true_label":[]}]}}

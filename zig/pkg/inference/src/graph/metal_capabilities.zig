@@ -74,6 +74,9 @@ pub fn supportsMetalEagerGraph(op: OpCode) bool {
         .fused_layer_norm,
         .fused_rms_norm,
         .fused_gelu,
+        .fused_gelu_exact,
+        .fused_gelu_backward,
+        .fused_gelu_exact_backward,
         .fused_relu,
         .fused_silu,
         .fused_quick_gelu,
@@ -100,6 +103,8 @@ pub fn supportsMetalEagerGraph(op: OpCode) bool {
         .fused_sdpa,
         .fused_softmax,
         .fused_log_softmax,
+        .fused_masked_bce_with_logits_loss,
+        .fused_masked_bce_with_logits_backward,
         .fused_conv1d,
         .fused_conv2d,
         .fused_take_rows,
@@ -314,7 +319,7 @@ fn metalEagerGraphNodeHasSupportedResidentShape(query: CapabilityQuery) bool {
         .conv_general => metalConvGeneralHasResidentShape(query),
         .fused_conv1d => metalFusedConv1dHasResidentShape(query),
         .fused_conv2d => metalFusedConv2dHasResidentShape(query),
-        .reduce_sum, .reduce_max, .reduce_mean => metalReduceLastDimHasResidentShape(query),
+        .reduce_sum, .reduce_max, .reduce_mean => metalReduceHasResidentShape(query),
         .broadcast_in_dim => metalBroadcastHasResidentShape(query),
         .gather => metalGatherHasResidentShape(query),
         .scatter_add => metalScatterAddHasResidentShape(query),
@@ -528,7 +533,7 @@ fn metalGatherHasResidentShape(query: CapabilityQuery) bool {
     return shapeHasConcreteElements(input_shape) and shapeHasConcreteElements(indices_shape);
 }
 
-fn metalReduceLastDimHasResidentShape(query: CapabilityQuery) bool {
+fn metalReduceHasResidentShape(query: CapabilityQuery) bool {
     const attrs = switch (query.op) {
         .reduce_sum, .reduce_max, .reduce_mean => |attrs| attrs,
         else => return false,
@@ -537,8 +542,9 @@ fn metalReduceLastDimHasResidentShape(query: CapabilityQuery) bool {
     const input_shape = nodeInputShape(query, 0) orelse return false;
     if (input_shape.dtype != .f32) return false;
     const rank = input_shape.rank();
-    if (rank == 0 or attrs.axes[0] != rank - 1) return false;
-    if (input_shape.dim(rank - 1) <= 0) return false;
+    if (rank == 0 or attrs.axes[0] >= rank) return false;
+    if (std.meta.activeTag(query.op) == .reduce_max and attrs.axes[0] != rank - 1) return false;
+    if (input_shape.dim(attrs.axes[0]) <= 0) return false;
     return shapeHasConcreteElements(input_shape);
 }
 

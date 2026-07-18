@@ -1,0 +1,9 @@
+{"input":"This support ticket is urgent and negative.","output":{"classifications":[{"task":"sentiment","labels":["positive","negative"],"true_label":["negative"]},{"task":"priority","labels":["low","normal","urgent"],"true_label":["urgent"]}]}}
+{"input":"The team in Paris was happy with the launch.","output":{"classifications":[{"task":"sentiment","labels":["positive","negative"],"true_label":["positive"]}]}}
+{"input":"Mary said the meeting in London was fine.","output":{"classifications":[{"task":"sentiment","labels":["positive","negative"],"true_label":["positive"]},{"task":"priority","labels":["low","normal","urgent"],"true_label":["normal"]}]}}
+{"input":"The server at Acme is down and customers are angry.","output":{"classifications":[{"task":"priority","labels":["low","normal","urgent"],"true_label":["urgent"]},{"task":"topic","labels":["sports","business","technology"],"true_label":["technology"]}]}}
+{"input":"John wrote about the game between two city teams.","output":{"classifications":[{"task":"topic","labels":["sports","business","technology"],"true_label":["sports"]}]}}
+{"input":"Globex reported strong sales in Seattle this quarter.","output":{"classifications":[{"task":"topic","labels":["sports","business","technology"],"true_label":["business"]},{"task":"sentiment","labels":["positive","negative"],"true_label":["positive"]}]}}
+{"input":"The printer issue can wait until next week.","output":{"classifications":[{"task":"priority","labels":["low","normal","urgent"],"true_label":["low"]}]}}
+{"input":"The article covers both business and technology news.","output":{"classifications":[{"task":"topic","labels":["sports","business","technology"],"true_label":["business","technology"]}]}}
+{"input":"Mary was unhappy with the slow reply from Acme.","output":{"classifications":[{"task":"sentiment","labels":["positive","negative"],"true_label":["negative"]},{"task":"priority","labels":["low","normal","urgent"],"true_label":["normal"]}]}}

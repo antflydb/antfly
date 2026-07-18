@@ -1,0 +1,71 @@
+from __future__ import annotations
+
+import io
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import benchmark_gliner2_lora_perf as benchmark
+
+
+class BenchmarkGateTest(unittest.TestCase):
+    def test_run_compare_does_not_reuse_stale_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            run_dir = out_dir / "run-01"
+            run_dir.mkdir()
+            (run_dir / "comparison_report.json").write_text(
+                json.dumps({"summary": {"step_count_valid": True}}), encoding="utf-8"
+            )
+            completed = SimpleNamespace(returncode=0, stdout="help only")
+            with mock.patch.object(benchmark.subprocess, "run", return_value=completed):
+                result = benchmark.run_compare(["--help"], out_dir, 1, 1, None)
+            self.assertEqual(1, result["returncode"])
+            self.assertEqual({}, result["summary"])
+            self.assertIn("missing or invalid current comparison report", result["output_tail"])
+
+    def test_metric_rejects_nonfinite_values(self) -> None:
+        self.assertIsNone(benchmark.metric({"value": float("nan")}, "value"))
+        self.assertIsNone(benchmark.metric({"value": float("inf")}, "value"))
+
+    def test_loss_parity_must_be_true_in_every_requested_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = {
+                "run": 1,
+                "returncode": 0,
+                "elapsed_seconds": 0.0,
+                "argv": [],
+                "report_path": "unused",
+                "summary": {"step_count_valid": True},
+                "output_tail": "",
+            }
+            argv = ["benchmark", "--runs", "1", "--out-dir", tmp, "--require-loss-parity"]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(benchmark, "run_compare", return_value=result),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+            ):
+                self.assertEqual(1, benchmark.main())
+            report = json.loads((Path(tmp) / "perf_summary.json").read_text(encoding="utf-8"))
+            self.assertIn("loss parity was required", " ".join(report["summary"]["failures"]))
+
+    def test_rejects_nonfinite_limits_before_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = ["benchmark", "--runs", "1", "--out-dir", tmp, "--max-zig-median-ms", "nan"]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(benchmark, "run_compare") as run,
+                mock.patch.object(sys, "stderr", io.StringIO()),
+            ):
+                with self.assertRaisesRegex(SystemExit, "2"):
+                    benchmark.main()
+                run.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -23,9 +23,6 @@ const gemma4_mm_real_autodiff = @import("gemma4_multimodal_real_autodiff.zig");
 const qwen2_real_autodiff = @import("qwen2_real_autodiff.zig");
 const gemma_chat_data = @import("gemma_chat_data.zig");
 const real_autodiff = @import("real_autodiff_trainer.zig");
-const gliner2 = @import("gliner2.zig");
-const gliner2_boundary = @import("gliner2_boundary.zig");
-const gliner2_data = @import("gliner2_data.zig");
 const layoutlmv3 = @import("layoutlmv3.zig");
 const colqwen2 = @import("colqwen2.zig");
 const reranker_data = @import("reranker_data.zig");
@@ -34,7 +31,6 @@ const reranker_lora = @import("reranker_lora.zig");
 const reranker = @import("reranker.zig");
 const preference_harness = @import("preference_harness.zig");
 const train_eval_gemma4_lora_bundle = @import("train/train_eval_gemma4_lora_bundle.zig");
-const train_eval_gliner2_lora_bundle = @import("train/train_eval_gliner2_lora_bundle.zig");
 const train_eval_layoutlmv3_lora_sequence = @import("train/train_eval_layoutlmv3_lora_sequence.zig");
 const train_eval_layoutlmv3_lora_token = @import("train/train_eval_layoutlmv3_lora_token.zig");
 const train_eval_colqwen2_lora_bundle = @import("train/train_eval_colqwen2_lora_bundle.zig");
@@ -101,6 +97,7 @@ pub const AdapterConfig = struct {
     path: ?[]const u8 = null,
     rank: ?usize = null,
     alpha: ?f32 = null,
+    dropout: ?f32 = null,
     layer_name: ?[]const u8 = null,
     base_model_name_or_path: ?[]const u8 = null,
     quantization: ?[]const u8 = null,
@@ -113,6 +110,12 @@ pub const AdapterConfig = struct {
 
 pub const OptimizerConfig = struct {
     learning_rate: ?f32 = null,
+    weight_decay: ?f32 = null,
+    lr_scheduler: ?[]const u8 = null,
+    warmup_ratio: ?f32 = null,
+    warmup_steps: ?u32 = null,
+    num_cycles: ?f32 = null,
+    max_steps: ?usize = null,
     epochs: ?usize = null,
     micro_batch_size: ?usize = null,
     gradient_accumulation_steps: ?u32 = null,
@@ -240,6 +243,7 @@ const BackendBuildInfo = struct {
     inference_version: []const u8,
     enable_native: bool,
     enable_onnx: bool,
+    enable_mlx: bool,
     enable_pjrt: bool,
     skip_openapi: bool,
 };
@@ -251,6 +255,12 @@ const BackendMetadata = struct {
 
 const OptimizerSummary = struct {
     learning_rate: ?f32,
+    weight_decay: ?f32,
+    lr_scheduler: ?[]const u8,
+    warmup_ratio: ?f32,
+    warmup_steps: ?u32,
+    num_cycles: ?f32,
+    max_steps: ?usize,
     epochs: ?usize,
     micro_batch_size: ?usize,
     gradient_accumulation_steps: ?u32,
@@ -326,7 +336,6 @@ const FastSmokeMode = enum {
 
 const FastSmokeSetup = enum {
     none,
-    synthetic_gliner2_execute,
     synthetic_qwen2_dpo_execute,
     synthetic_qwen2_grpo_execute,
     synthetic_gemma_dpo_execute,
@@ -368,13 +377,6 @@ const FastSmokeRecipeOverrides = struct {
     max_examples: ?usize = null,
     eval_max_examples: ?usize = null,
     max_seq_len: ?usize = null,
-};
-
-const SyntheticGlinerAssets = struct {
-    model_dir: []const u8,
-    train_path: []const u8,
-    eval_path: []const u8,
-    labels: []const u8,
 };
 
 const SyntheticQwen2Assets = struct {
@@ -468,7 +470,6 @@ fn runFastSmoke(allocator: std.mem.Allocator, io: std.Io, args: []const []const 
 
     const cases = [_]FastSmokeCase{
         .{ .name = "gemma4_dry_run", .recipe_path = "pkg/inference/testdata/recipe_gemma4_lora.json", .mode = .dry_run },
-        .{ .name = "gliner2_dry_run", .recipe_path = "pkg/inference/testdata/recipe_gliner2_lora.json", .mode = .dry_run },
         .{ .name = "layoutlmv3_dry_run", .recipe_path = "pkg/inference/testdata/recipe_layoutlmv3_lora_token.json", .mode = .dry_run },
         .{ .name = "reranker_head_dry_run", .recipe_path = "pkg/inference/testdata/recipe_reranker_head.json", .mode = .dry_run },
         .{ .name = "reranker_lora_dry_run", .recipe_path = "pkg/inference/testdata/recipe_reranker_lora.json", .mode = .dry_run },
@@ -485,7 +486,6 @@ fn runFastSmoke(allocator: std.mem.Allocator, io: std.Io, args: []const []const 
         .{ .name = "grpo_text_colqwen2_dry_run", .recipe_path = "pkg/inference/testdata/recipe_grpo_text_colqwen2_fast.json", .mode = .dry_run },
         .{ .name = "grpo_ci_text_dry_run", .recipe_path = "pkg/inference/testdata/recipe_grpo_text_ci_native_fast.json", .mode = .dry_run },
         .{ .name = "grpo_prefix_text_dry_run", .recipe_path = "pkg/inference/testdata/recipe_grpo_text_prefix_native_fast.json", .mode = .dry_run },
-        .{ .name = "gliner2_direct_execute", .recipe_path = "pkg/inference/testdata/recipe_gliner2_lora.json", .mode = .execute, .setup = .synthetic_gliner2_execute },
         .{ .name = "qwen2_dpo_execute", .recipe_path = "pkg/inference/testdata/recipe_dpo_text_preference_qwen2_fast.json", .mode = .subprocess_execute, .setup = .synthetic_qwen2_dpo_execute },
         .{ .name = "qwen2_grpo_execute", .recipe_path = "pkg/inference/testdata/recipe_grpo_text_qwen2_fast.json", .mode = .execute, .setup = .synthetic_qwen2_grpo_execute },
         .{ .name = "gemma4_dpo_execute", .recipe_path = "pkg/inference/testdata/recipe_dpo_text_preference_gemma_fast.json", .mode = .execute, .setup = .synthetic_gemma_dpo_execute },
@@ -694,19 +694,6 @@ fn setupFastSmokeCase(
 ) !FastSmokeRecipeOverrides {
     return switch (setup) {
         .none => .{},
-        .synthetic_gliner2_execute => blk: {
-            const assets = try writeSyntheticGliner2SmokeAssets(allocator, io, case_root);
-            break :blk .{
-                .model_path = assets.model_dir,
-                .train_path = assets.train_path,
-                .eval_path = assets.eval_path,
-                .labels = assets.labels,
-                .backend = "native",
-                .max_examples = 2,
-                .eval_max_examples = 1,
-                .max_seq_len = 16,
-            };
-        },
         .synthetic_qwen2_dpo_execute => blk: {
             const assets = try writeSyntheticQwen2SmokeAssets(allocator, io, case_root);
             allocator.free(assets.grpo_path);
@@ -774,79 +761,6 @@ fn applyFastSmokeRecipeOverrides(recipe: *Recipe, overrides: FastSmokeRecipeOver
     if (overrides.max_examples) |value| recipe.dataset.max_examples = value;
     if (overrides.eval_max_examples) |value| recipe.dataset.eval_max_examples = value;
     if (overrides.max_seq_len) |value| recipe.dataset.max_seq_len = value;
-}
-
-fn writeSyntheticGliner2SmokeAssets(allocator: std.mem.Allocator, io: std.Io, case_root: []const u8) !SyntheticGlinerAssets {
-    const assets_root = try std.fs.path.join(allocator, &.{ case_root, "synthetic_gliner2" });
-    defer allocator.free(assets_root);
-    try std.Io.Dir.cwd().createDirPath(io, assets_root);
-
-    const model_dir = try std.fs.path.join(allocator, &.{ assets_root, "model" });
-    errdefer allocator.free(model_dir);
-    const encoder_config_dir = try std.fs.path.join(allocator, &.{ model_dir, "encoder_config" });
-    defer allocator.free(encoder_config_dir);
-    try std.Io.Dir.cwd().createDirPath(io, encoder_config_dir);
-
-    try writeOwnedTextFile(allocator, io, try std.fs.path.join(allocator, &.{ model_dir, "config.json" }),
-        \\{"model_name":"synthetic/gliner2-fast-smoke","model_type":"deberta-v3","counting_layer":"count_embed","token_pooling":"first","max_width":4,"hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"max_position_embeddings":16,"position_buckets":16,"count_embed_dim":4,"count_embed_layers":1,"count_embed_heads":1,"count_embed_ffn":8,"max_count_embed":8}
-    );
-    try writeOwnedTextFile(allocator, io, try std.fs.path.join(allocator, &.{ model_dir, "encoder_config", "config.json" }),
-        \\{"vocab_size":8192,"hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"max_position_embeddings":16,"type_vocab_size":0,"position_buckets":16,"relative_attention":true,"hidden_dropout_prob":0.0,"attention_probs_dropout_prob":0.0,"layer_norm_eps":1e-7}
-    );
-    try writeOwnedTextFile(allocator, io, try std.fs.path.join(allocator, &.{ model_dir, "tokenizer_config.json" }),
-        \\{"model_max_length":16,"unk_token":"[UNK]","pad_token":"[PAD]","cls_token":"[CLS]","sep_token":"[SEP]"}
-    );
-    try writeOwnedTextFile(allocator, io, try std.fs.path.join(allocator, &.{ model_dir, "special_tokens_map.json" }),
-        \\{"unk_token":"[UNK]","pad_token":"[PAD]","cls_token":"[CLS]","sep_token":"[SEP]"}
-    );
-    try writeOwnedTextFile(allocator, io, try std.fs.path.join(allocator, &.{ model_dir, "tokenizer.json" }),
-        \\{
-        \\  "version":"1.0",
-        \\  "normalizer":{"type":"BertNormalizer","lowercase":true},
-        \\  "pre_tokenizer":{"type":"WhitespaceSplit"},
-        \\  "post_processor":{"type":"TemplateProcessing","single":[{"SpecialToken":{"id":"[CLS]","type_id":0}},{"Sequence":{"id":"A","type_id":0}},{"SpecialToken":{"id":"[SEP]","type_id":0}}],"special_tokens":{"[CLS]":{"id":"[CLS]","ids":[2],"tokens":["[CLS]"]},"[SEP]":{"id":"[SEP]","ids":[3],"tokens":["[SEP]"]}}},
-        \\  "added_tokens":[
-        \\    {"id":0,"content":"[PAD]"},
-        \\    {"id":1,"content":"[UNK]"},
-        \\    {"id":2,"content":"[CLS]"},
-        \\    {"id":3,"content":"[SEP]"},
-        \\    {"id":4,"content":"[E]"},
-        \\    {"id":5,"content":"[P]"},
-        \\    {"id":6,"content":"[SEP_TEXT]"}
-        \\  ],
-        \\  "model":{
-        \\    "type":"Unigram",
-        \\    "unk_id":1,
-        \\    "vocab":[
-        \\      ["[PAD]",0.0],["[UNK]",0.0],["[CLS]",0.0],["[SEP]",0.0],["[E]",0.0],["[P]",0.0],["[SEP_TEXT]",0.0],
-        \\      ["john",0.0],["works",0.0],["at",0.0],["acme",0.0],["hello",0.0],["world",0.0],["person",0.0],["organization",0.0],["location",0.0]
-        \\    ]
-        \\  }
-        \\}
-    );
-
-    const checkpoint_path = try std.fs.path.join(allocator, &.{ model_dir, gliner2.checkpoint_file_name });
-    defer allocator.free(checkpoint_path);
-    try writeSyntheticGliner2Checkpoint(allocator, checkpoint_path);
-
-    const train_path = try std.fs.path.join(allocator, &.{ assets_root, "train-00000.jsonl" });
-    errdefer allocator.free(train_path);
-    const eval_path = try std.fs.path.join(allocator, &.{ assets_root, "eval-00000.jsonl" });
-    errdefer allocator.free(eval_path);
-    try writeTextFile(io, train_path,
-        \\{"text":"john works at acme","entities":[{"text":"john","label":"person","start":0,"end":4},{"text":"acme","label":"organization","start":14,"end":18}]}
-        \\{"text":"hello world","entities":[{"text":"world","label":"location","start":6,"end":11}]}
-    );
-    try writeTextFile(io, eval_path,
-        \\{"text":"john works at acme","entities":[{"text":"john","label":"person","start":0,"end":4}]}
-    );
-
-    return .{
-        .model_dir = model_dir,
-        .train_path = train_path,
-        .eval_path = eval_path,
-        .labels = "person,organization,location",
-    };
 }
 
 fn writeSyntheticQwen2SmokeAssets(allocator: std.mem.Allocator, io: std.Io, case_root: []const u8) !SyntheticQwen2Assets {
@@ -1097,38 +1011,6 @@ fn appendOwnedGemmaTensor(
     });
 }
 
-fn writeSyntheticGliner2Checkpoint(allocator: std.mem.Allocator, path: []const u8) !void {
-    const hidden: usize = 4;
-    const intermediate: usize = 8;
-    const vocab: usize = 8192;
-    const positions: usize = 16;
-
-    try writeHeaderAndTensorsF32(allocator, path, &.{
-        .{ .name = "deberta.embeddings.word_embeddings.weight", .shape = &.{ vocab, hidden }, .data = try makeRampF32(allocator, vocab * hidden, 0.001) },
-        .{ .name = "deberta.embeddings.LayerNorm.weight", .shape = &.{hidden}, .data = try makeFilledF32(allocator, hidden, 1.0) },
-        .{ .name = "deberta.embeddings.LayerNorm.bias", .shape = &.{hidden}, .data = try makeFilledF32(allocator, hidden, 0.0) },
-        .{ .name = "deberta.encoder.rel_embeddings.weight", .shape = &.{ positions, hidden }, .data = try makeRampF32(allocator, positions * hidden, 0.0005) },
-        .{ .name = "deberta.encoder.LayerNorm.weight", .shape = &.{hidden}, .data = try makeFilledF32(allocator, hidden, 1.0) },
-        .{ .name = "deberta.encoder.LayerNorm.bias", .shape = &.{hidden}, .data = try makeFilledF32(allocator, hidden, 0.0) },
-        .{ .name = "deberta.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ hidden, hidden }, .data = try makeRampF32(allocator, hidden * hidden, 0.001) },
-        .{ .name = "deberta.encoder.layer.0.attention.self.query_proj.bias", .shape = &.{hidden}, .data = try makeFilledF32(allocator, hidden, 0.0) },
-        .{ .name = "deberta.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ hidden, hidden }, .data = try makeRampF32(allocator, hidden * hidden, 0.0015) },
-        .{ .name = "deberta.encoder.layer.0.attention.self.key_proj.bias", .shape = &.{hidden}, .data = try makeFilledF32(allocator, hidden, 0.0) },
-        .{ .name = "deberta.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ hidden, hidden }, .data = try makeRampF32(allocator, hidden * hidden, 0.002) },
-        .{ .name = "deberta.encoder.layer.0.attention.self.value_proj.bias", .shape = &.{hidden}, .data = try makeFilledF32(allocator, hidden, 0.0) },
-        .{ .name = "deberta.encoder.layer.0.attention.output.dense.weight", .shape = &.{ hidden, hidden }, .data = try makeRampF32(allocator, hidden * hidden, 0.0025) },
-        .{ .name = "deberta.encoder.layer.0.attention.output.dense.bias", .shape = &.{hidden}, .data = try makeFilledF32(allocator, hidden, 0.0) },
-        .{ .name = "deberta.encoder.layer.0.attention.output.LayerNorm.weight", .shape = &.{hidden}, .data = try makeFilledF32(allocator, hidden, 1.0) },
-        .{ .name = "deberta.encoder.layer.0.attention.output.LayerNorm.bias", .shape = &.{hidden}, .data = try makeFilledF32(allocator, hidden, 0.0) },
-        .{ .name = "deberta.encoder.layer.0.intermediate.dense.weight", .shape = &.{ intermediate, hidden }, .data = try makeRampF32(allocator, intermediate * hidden, 0.001) },
-        .{ .name = "deberta.encoder.layer.0.intermediate.dense.bias", .shape = &.{intermediate}, .data = try makeFilledF32(allocator, intermediate, 0.0) },
-        .{ .name = "deberta.encoder.layer.0.output.dense.weight", .shape = &.{ hidden, intermediate }, .data = try makeRampF32(allocator, hidden * intermediate, 0.001) },
-        .{ .name = "deberta.encoder.layer.0.output.dense.bias", .shape = &.{hidden}, .data = try makeFilledF32(allocator, hidden, 0.0) },
-        .{ .name = "deberta.encoder.layer.0.output.LayerNorm.weight", .shape = &.{hidden}, .data = try makeFilledF32(allocator, hidden, 1.0) },
-        .{ .name = "deberta.encoder.layer.0.output.LayerNorm.bias", .shape = &.{hidden}, .data = try makeFilledF32(allocator, hidden, 0.0) },
-    });
-}
-
 fn writeOwnedTextFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, contents: []const u8) !void {
     defer allocator.free(path);
     try writeTextFile(io, path, contents);
@@ -1293,58 +1175,43 @@ fn buildGemma4LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
 fn buildGliner2LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     const model_path = recipe.model.path orelse return error.MissingModelPath;
     const train_path = trainDatasetPath(recipe) orelse return error.MissingDatasetPath;
-    const eval_path = evalDatasetPath(recipe);
-    const train_cache_path = trainCachePath(recipe) orelse recipe.artifacts.prepared_path orelse try defaultArtifactPath(allocator, recipe, "gliner2_train_boundary_cache.json");
-    const eval_cache_path = evalCachePath(recipe) orelse if (eval_path != null) try defaultArtifactPath(allocator, recipe, "gliner2_eval_boundary_cache.json") else train_cache_path;
-    const bootstrap_dir = adapterBootstrapDir(recipe) orelse try defaultArtifactPath(allocator, recipe, "adapter-bootstrap");
-    const trained_dir = recipe.artifacts.trained_adapter_dir orelse recipe.artifacts.adapter_dir orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
+    const out_dir = recipe.artifacts.trained_adapter_dir orelse recipe.artifacts.adapter_dir orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
     const adapter = recipe.adapter orelse AdapterConfig{};
 
     var steps: std.ArrayList(Step) = .empty;
     errdefer freeSteps(allocator, steps.items);
-    var bootstrap_argv: std.ArrayList([]const u8) = .empty;
-    try appendMany(allocator, &bootstrap_argv, &.{ "bootstrap-gliner2-lora", model_path, bootstrap_dir });
-    try appendGenericBootstrapAdapterArgs(allocator, &bootstrap_argv, adapter, .lora_sft);
-    try steps.append(allocator, .{ .name = "bootstrap-adapter", .argv = try bootstrap_argv.toOwnedSlice(allocator) });
-    const entity_types = recipe.dataset.labels orelse recipe.dataset.format orelse return error.MissingEntityTypes;
-    try steps.append(allocator, .{ .name = "prepare", .argv = try argv(allocator, &.{
-        "prepare-gliner2-top-layer-boundary-cache",
+    var train_argv: std.ArrayList([]const u8) = .empty;
+    try appendMany(allocator, &train_argv, &.{
+        "train-gliner2-autodiff",
+        "--model-dir",
         model_path,
+        "--train-data",
         train_path,
-        entity_types,
-        train_cache_path,
-        recipe.dataset.train_split orelse "train",
-        recipe.backend orelse "native",
-        try fmtInt(allocator, recipe.dataset.max_examples orelse 128),
-        try fmtInt(allocator, recipe.dataset.max_seq_len orelse 256),
-        "8",
-        "1",
-    }) });
-    if (eval_path) |path| {
-        try steps.append(allocator, .{ .name = "prepare-eval", .argv = try argv(allocator, &.{
-            "prepare-gliner2-top-layer-boundary-cache",
-            model_path,
-            path,
-            entity_types,
-            eval_cache_path,
-            recipe.dataset.eval_split orelse "eval",
-            recipe.backend orelse "native",
-            try fmtInt(allocator, recipe.dataset.eval_max_examples orelse evalMaxExamples(recipe) orelse 128),
-            try fmtInt(allocator, recipe.dataset.max_seq_len orelse 256),
-            "8",
-            "1",
-        }) });
-    }
-    try steps.append(allocator, .{ .name = "train-eval", .argv = try argv(allocator, &.{
-        "train-eval-gliner2-lora-bundle", model_path,                                                           bootstrap_dir,    train_cache_path,                                             eval_cache_path, trained_dir,
-        "--lr",                           try fmtFloat(allocator, recipe.optimizer.learning_rate orelse 0.001), "--max-examples", try fmtInt(allocator, recipe.dataset.max_examples orelse 32), "--epochs",      try fmtInt(allocator, recipe.optimizer.epochs orelse 1),
-        "--backend",                      recipe.backend orelse "native",
-    }) });
-    if (recipe.artifacts.materialized_dir) |out_dir| {
-        try steps.append(allocator, .{ .name = "materialize", .argv = try argv(allocator, &.{
-            "materialize-gliner2-lora", model_path, trained_dir, out_dir,
-        }) });
-    }
+        "--out-dir",
+        out_dir,
+        "--objective",
+        "gliner2-total-loss",
+        "--lora-only-trainables",
+    });
+    if (recipe.optimizer.epochs) |epochs| try appendMany(allocator, &train_argv, &.{ "--epochs", try fmtInt(allocator, epochs) });
+    if (recipe.optimizer.learning_rate) |lr| try appendMany(allocator, &train_argv, &.{ "--learning-rate", try fmtFloat(allocator, lr) });
+    if (recipe.optimizer.weight_decay) |decay| try appendMany(allocator, &train_argv, &.{ "--weight-decay", try fmtFloat(allocator, decay) });
+    if (recipe.optimizer.lr_scheduler) |scheduler| try appendMany(allocator, &train_argv, &.{ "--lr-scheduler", scheduler });
+    if (recipe.optimizer.warmup_ratio) |ratio| try appendMany(allocator, &train_argv, &.{ "--warmup-ratio", try fmtFloat(allocator, ratio) });
+    if (recipe.optimizer.warmup_steps) |warmup| try appendMany(allocator, &train_argv, &.{ "--warmup-steps", try fmtInt(allocator, warmup) });
+    if (recipe.optimizer.num_cycles) |cycles| try appendMany(allocator, &train_argv, &.{ "--num-cycles", try fmtFloat(allocator, cycles) });
+    if (recipe.optimizer.max_steps) |max_steps| try appendMany(allocator, &train_argv, &.{ "--max-steps", try fmtInt(allocator, max_steps) });
+    if (recipe.optimizer.micro_batch_size) |batch| try appendMany(allocator, &train_argv, &.{ "--batch-size", try fmtInt(allocator, batch) });
+    if (recipe.optimizer.gradient_accumulation_steps) |steps_count| try appendMany(allocator, &train_argv, &.{ "--grad-accum", try fmtInt(allocator, steps_count) });
+    if (recipe.optimizer.max_grad_norm) |norm| try appendMany(allocator, &train_argv, &.{ "--max-grad-norm", try fmtFloat(allocator, norm) });
+    if (adapter.rank) |rank| try appendMany(allocator, &train_argv, &.{ "--lora-rank", try fmtInt(allocator, rank) });
+    if (adapter.alpha) |alpha| try appendMany(allocator, &train_argv, &.{ "--lora-alpha", try fmtFloat(allocator, alpha) });
+    if (adapter.dropout) |dropout| try appendMany(allocator, &train_argv, &.{ "--lora-dropout", try fmtFloat(allocator, dropout) });
+    if (adapter.target_modules) |modules| try appendMany(allocator, &train_argv, &.{ "--lora-targets", try std.mem.join(allocator, ",", modules) });
+    if (recipe.dataset.max_examples) |max| try appendMany(allocator, &train_argv, &.{ "--max-examples", try fmtInt(allocator, max) });
+    if (recipe.backend) |backend| try appendMany(allocator, &train_argv, &.{ "--backend", backend });
+    try steps.append(allocator, .{ .name = "train-eval", .argv = try train_argv.toOwnedSlice(allocator) });
+
     return .{ .steps = try steps.toOwnedSlice(allocator) };
 }
 
@@ -1849,22 +1716,6 @@ fn runDirectCommandAdapter(allocator: std.mem.Allocator, io: std.Io, recipe: Rec
         try runDirectTrainEvalGemma4LoraBundle(allocator, io, step.argv);
         return true;
     }
-    if (std.mem.eql(u8, command, "bootstrap-gliner2-lora")) {
-        try runDirectBootstrapGliner2Lora(allocator, io, step.argv);
-        return true;
-    }
-    if (std.mem.eql(u8, command, "prepare-gliner2-top-layer-boundary-cache")) {
-        try runDirectPrepareGliner2TopLayerBoundaryCache(allocator, io, step.argv);
-        return true;
-    }
-    if (std.mem.eql(u8, command, "train-eval-gliner2-lora-bundle")) {
-        try runDirectTrainEvalGliner2LoraBundle(allocator, io, step.argv);
-        return true;
-    }
-    if (std.mem.eql(u8, command, "materialize-gliner2-lora")) {
-        try runDirectMaterializeGliner2Lora(allocator, io, step.argv);
-        return true;
-    }
     if (std.mem.eql(u8, command, "bootstrap-layoutlmv3-lora")) {
         try runDirectBootstrapLayoutlmv3Lora(allocator, io, step.argv);
         return true;
@@ -2170,12 +2021,19 @@ fn collectStaticMetadata(allocator: std.mem.Allocator, io: std.Io, recipe: Recip
                 .inference_version = build_options.inference_version,
                 .enable_native = build_options.enable_native,
                 .enable_onnx = build_options.enable_onnx,
+                .enable_mlx = false,
                 .enable_pjrt = build_options.enable_pjrt,
                 .skip_openapi = build_options.skip_openapi,
             },
         },
         .optimizer = .{
             .learning_rate = recipe.optimizer.learning_rate,
+            .weight_decay = recipe.optimizer.weight_decay,
+            .lr_scheduler = recipe.optimizer.lr_scheduler,
+            .warmup_ratio = recipe.optimizer.warmup_ratio,
+            .warmup_steps = recipe.optimizer.warmup_steps,
+            .num_cycles = recipe.optimizer.num_cycles,
+            .max_steps = recipe.optimizer.max_steps,
             .epochs = recipe.optimizer.epochs,
             .micro_batch_size = recipe.optimizer.micro_batch_size,
             .gradient_accumulation_steps = recipe.optimizer.gradient_accumulation_steps,
@@ -2261,15 +2119,6 @@ fn appendArtifactPathsFromPlan(allocator: std.mem.Allocator, planned: *std.Array
                     try appendUniquePlannedPath(allocator, planned, "adapter_bootstrap", step.argv[2]);
                 } else if (std.mem.eql(u8, command, "train-eval-gemma4-lora-bundle")) {
                     try appendUniquePlannedPath(allocator, planned, "trained_adapter", step.argv[4]);
-                } else if (std.mem.eql(u8, command, "prepare-gliner2-top-layer-boundary-cache")) {
-                    const label = if (std.mem.eql(u8, step.name, "prepare-eval")) "eval_cache" else "train_cache";
-                    try appendUniquePlannedPath(allocator, planned, label, step.argv[4]);
-                } else if (std.mem.eql(u8, command, "bootstrap-gliner2-lora")) {
-                    try appendUniquePlannedPath(allocator, planned, "adapter_bootstrap", step.argv[2]);
-                } else if (std.mem.eql(u8, command, "train-eval-gliner2-lora-bundle")) {
-                    try appendUniquePlannedPath(allocator, planned, "trained_adapter", step.argv[5]);
-                } else if (std.mem.eql(u8, command, "materialize-gliner2-lora")) {
-                    try appendUniquePlannedPath(allocator, planned, "materialized_model", step.argv[3]);
                 } else if (std.mem.eql(u8, command, "bootstrap-layoutlmv3-lora")) {
                     try appendUniquePlannedPath(allocator, planned, "adapter_bootstrap", step.argv[2]);
                 } else if (std.mem.eql(u8, command, "train-eval-layoutlmv3-lora-sequence") or std.mem.eql(u8, command, "train-eval-layoutlmv3-lora-token")) {
@@ -2673,136 +2522,6 @@ fn gemmaMessagesHaveMedia(examples: []const gemma_chat_data.Example) bool {
     return false;
 }
 
-fn runDirectBootstrapGliner2Lora(allocator: std.mem.Allocator, io: std.Io, argv_in: []const []const u8) !void {
-    _ = io;
-    if (argv_in.len < 3) return error.InvalidArguments;
-    const model_dir = argv_in[1];
-    const out_dir = argv_in[2];
-    var rank = default_lora_rank;
-    var alpha = default_lora_alpha;
-    var base_model_name_or_path: ?[]const u8 = null;
-    var target_modules: ?[]const []const u8 = null;
-    defer if (target_modules) |modules| allocator.free(modules);
-    var i: usize = 3;
-    if (i < argv_in.len and !std.mem.startsWith(u8, argv_in[i], "--")) {
-        rank = try std.fmt.parseUnsigned(usize, argv_in[i], 10);
-        i += 1;
-    }
-    if (i < argv_in.len and !std.mem.startsWith(u8, argv_in[i], "--")) {
-        alpha = try std.fmt.parseFloat(f32, argv_in[i]);
-        i += 1;
-    }
-    while (i < argv_in.len) : (i += 1) {
-        const arg = argv_in[i];
-        if (std.mem.eql(u8, arg, "--target-modules")) {
-            if (target_modules != null) return error.InvalidArguments;
-            i += 1;
-            if (i >= argv_in.len) return error.InvalidArguments;
-            target_modules = try parseCsvBorrowed(allocator, argv_in[i]);
-        } else if (base_model_name_or_path == null) {
-            base_model_name_or_path = arg;
-        } else {
-            return error.InvalidArguments;
-        }
-    }
-
-    var summary = try gliner2.bootstrapLoRABundle(allocator, model_dir, out_dir, .{
-        .rank = rank,
-        .alpha = alpha,
-        .base_model_name_or_path = base_model_name_or_path,
-        .target_modules = target_modules,
-    });
-    defer gliner2.freeBootstrapSummary(allocator, &summary);
-    print("direct adapter: {s}\n", .{argv_in[0]});
-}
-
-fn runDirectPrepareGliner2TopLayerBoundaryCache(allocator: std.mem.Allocator, io: std.Io, argv_in: []const []const u8) !void {
-    _ = io;
-    if (argv_in.len < 5) return error.InvalidArguments;
-    const model_dir = argv_in[1];
-    const input_path = argv_in[2];
-    const entity_types_csv = argv_in[3];
-    const out_path = argv_in[4];
-    const split = if (argv_in.len >= 6) argv_in[5] else null;
-    const backend_arg = if (argv_in.len >= 7) argv_in[6] else "native";
-    const max_examples = if (argv_in.len >= 8) try std.fmt.parseUnsigned(usize, argv_in[7], 10) else 128;
-    const max_length = if (argv_in.len >= 9) try std.fmt.parseUnsigned(usize, argv_in[8], 10) else 256;
-    const max_span_width = if (argv_in.len >= 10) try std.fmt.parseUnsigned(usize, argv_in[9], 10) else 8;
-    const top_layer_count = if (argv_in.len >= 11) try std.fmt.parseUnsigned(usize, argv_in[10], 10) else 1;
-
-    const backend = try parseGlinerBackend(backend_arg);
-    const entity_types = try parseCsvOwned(allocator, entity_types_csv);
-    defer {
-        for (entity_types) |item| allocator.free(item);
-        allocator.free(entity_types);
-    }
-
-    var loaded = try gliner2_data.loadExamples(allocator, input_path, split);
-    defer loaded.deinit();
-    const summary = try gliner2_boundary.prepareCachedBoundarySummary(
-        allocator,
-        model_dir,
-        input_path,
-        split,
-        loaded.examples,
-        entity_types,
-        backend,
-        max_examples,
-        max_length,
-        max_span_width,
-        top_layer_count,
-    );
-    defer {
-        var owned = summary;
-        gliner2_boundary.freeCachedBoundarySummary(allocator, &owned);
-    }
-    try gliner2_boundary.saveCachedBoundarySummary(allocator, out_path, summary);
-    print("direct adapter: {s}\n", .{argv_in[0]});
-}
-
-fn runDirectTrainEvalGliner2LoraBundle(allocator: std.mem.Allocator, io: std.Io, argv_in: []const []const u8) !void {
-    if (argv_in.len < 6) return error.InvalidArguments;
-    try train_eval_gliner2_lora_bundle.runFromArgs(allocator, io, argv_in[1..]);
-    print("direct adapter: {s}\n", .{argv_in[0]});
-}
-
-fn runDirectMaterializeGliner2Lora(allocator: std.mem.Allocator, io: std.Io, argv_in: []const []const u8) !void {
-    _ = io;
-    if (argv_in.len != 4) return error.InvalidArguments;
-    const summary = try gliner2.materializeMergedModel(allocator, argv_in[1], argv_in[2], argv_in[3]);
-    defer {
-        allocator.free(summary.artifact_family_version);
-        allocator.free(summary.base_model_dir);
-        allocator.free(summary.adapter_model_dir);
-        allocator.free(summary.output_dir);
-        allocator.free(summary.output_checkpoint_path);
-    }
-    print("direct adapter: {s}\n", .{argv_in[0]});
-}
-
-fn parseGlinerBackend(value: []const u8) !reranker.BackendChoice {
-    if (std.mem.eql(u8, value, "native")) return .native;
-    if (std.mem.eql(u8, value, "metal")) return .metal;
-    if (std.mem.eql(u8, value, "auto")) return .auto;
-    return error.InvalidBackend;
-}
-
-fn parseCsvOwned(allocator: std.mem.Allocator, value: []const u8) ![][]const u8 {
-    var out = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer {
-        for (out.items) |item| allocator.free(item);
-        out.deinit(allocator);
-    }
-    var iter = std.mem.splitScalar(u8, value, ',');
-    while (iter.next()) |raw| {
-        const item = std.mem.trim(u8, raw, " \t\r\n");
-        if (item.len == 0) continue;
-        try out.append(allocator, try allocator.dupe(u8, item));
-    }
-    if (out.items.len == 0) return error.EmptyEntityTypes;
-    return try out.toOwnedSlice(allocator);
-}
-
 fn parseCsvBorrowed(allocator: std.mem.Allocator, value: []const u8) ![]const []const u8 {
     var out: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer out.deinit(allocator);
@@ -3175,7 +2894,9 @@ fn runDirectMaterializeRerankerHead(allocator: std.mem.Allocator, io: std.Io, ar
 
 fn parseRerankerBackendChoice(value: []const u8) ?reranker_head.BackendChoice {
     if (std.mem.eql(u8, value, "auto")) return .auto;
-    if (std.mem.eql(u8, value, "native")) return .native;
+    // Accept both the current "blas" spelling and the legacy "native" alias so
+    // recipes that forward "backend": "native" verbatim keep working.
+    if (std.mem.eql(u8, value, "blas") or std.mem.eql(u8, value, "native")) return .native;
     if (std.mem.eql(u8, value, "metal")) return .metal;
     return null;
 }
@@ -5844,41 +5565,54 @@ test "qwen adapter target presets map to supported module sets" {
 test "generic bootstrap families reject unsupported target preset" {
     const recipe = Recipe{
         .recipe = "lora-sft",
-        .model = .{ .path = "/models/gliner2", .family = "gliner2" },
+        .model = .{ .path = "/models/layoutlmv3", .family = "layoutlmv3" },
         .dataset = .{
-            .train_path = "/data/gliner-train.jsonl",
-            .labels = "person,organization",
+            .train_path = "/data/layout-train.jsonl",
         },
         .adapter = .{ .target_preset = "all-linear" },
-        .artifacts = .{ .root = "/tmp/gliner-run" },
+        .artifacts = .{ .root = "/tmp/layout-run" },
     };
     try std.testing.expectError(error.UnsupportedLoRATargetPreset, buildPlan(std.heap.page_allocator, recipe));
 }
 
-test "gliner2 lora recipe keeps distinct train and eval caches" {
+test "gliner2 lora recipe routes to autodiff trainer" {
     const recipe = Recipe{
         .recipe = "lora-sft",
         .model = .{ .path = "/models/gliner2", .family = "gliner2" },
-        .dataset = .{
-            .train_path = "/data/gliner-train.jsonl",
-            .eval_path = "/data/gliner-eval.jsonl",
-            .labels = "person,organization",
-            .max_examples = 8,
-            .eval_max_examples = 4,
+        .dataset = .{ .train_path = "/data/ner-train.jsonl", .max_examples = 8 },
+        .optimizer = .{
+            .learning_rate = 5e-4,
+            .weight_decay = 0.01,
+            .lr_scheduler = "cosine_restarts",
+            .warmup_ratio = 0.1,
+            .warmup_steps = 3,
+            .num_cycles = 2,
+            .max_steps = 10,
+            .epochs = 2,
         },
-        .artifacts = .{ .root = "/tmp/gliner-run", .materialized_dir = "/tmp/gliner-merged" },
+        .adapter = .{ .rank = 16, .alpha = 32, .dropout = 0.05 },
+        .artifacts = .{ .root = "/tmp/gliner2-run", .trained_adapter_dir = "/tmp/gliner2-adapter" },
     };
     const plan = try buildPlan(std.heap.page_allocator, recipe);
     defer freePlan(std.heap.page_allocator, plan);
-    try expectStepCommands(plan, &.{
-        "bootstrap-gliner2-lora",
-        "prepare-gliner2-top-layer-boundary-cache",
-        "prepare-gliner2-top-layer-boundary-cache",
-        "train-eval-gliner2-lora-bundle",
-        "materialize-gliner2-lora",
-    });
-    try std.testing.expectEqualStrings("/tmp/gliner-run/gliner2_train_boundary_cache.json", plan.steps[3].argv[3]);
-    try std.testing.expectEqualStrings("/tmp/gliner-run/gliner2_eval_boundary_cache.json", plan.steps[3].argv[4]);
+    try expectStepCommands(plan, &.{"train-gliner2-autodiff"});
+    const argv_items = plan.steps[0].argv;
+    try std.testing.expectEqualStrings("--model-dir", argv_items[1]);
+    try std.testing.expectEqualStrings("/models/gliner2", argv_items[2]);
+    try std.testing.expectEqualStrings("--train-data", argv_items[3]);
+    try std.testing.expectEqualStrings("/data/ner-train.jsonl", argv_items[4]);
+    try std.testing.expectEqualStrings("--out-dir", argv_items[5]);
+    try std.testing.expectEqualStrings("/tmp/gliner2-adapter", argv_items[6]);
+    try std.testing.expectEqualStrings("--objective", argv_items[7]);
+    try std.testing.expectEqualStrings("gliner2-total-loss", argv_items[8]);
+    try std.testing.expectEqualStrings("--lora-only-trainables", argv_items[9]);
+    try expectArgValue(argv_items, "--weight-decay", "0.01");
+    try expectArgValue(argv_items, "--lr-scheduler", "cosine_restarts");
+    try expectArgValue(argv_items, "--warmup-ratio", "0.1");
+    try expectArgValue(argv_items, "--warmup-steps", "3");
+    try expectArgValue(argv_items, "--num-cycles", "2");
+    try expectArgValue(argv_items, "--max-steps", "10");
+    try expectArgValue(argv_items, "--lora-dropout", "0.05");
 }
 
 test "layoutlmv3 token recipe emits train eval positional paths" {
@@ -6060,10 +5794,6 @@ test "direct command adapter registry covers reranker family steps" {
     try std.testing.expect(isDirectCommandAdapter("prepare-gemma4-lora-inputs"));
     try std.testing.expect(isDirectCommandAdapter("bootstrap-gemma4-lora"));
     try std.testing.expect(isDirectCommandAdapter("train-eval-gemma4-lora-bundle"));
-    try std.testing.expect(isDirectCommandAdapter("bootstrap-gliner2-lora"));
-    try std.testing.expect(isDirectCommandAdapter("prepare-gliner2-top-layer-boundary-cache"));
-    try std.testing.expect(isDirectCommandAdapter("train-eval-gliner2-lora-bundle"));
-    try std.testing.expect(isDirectCommandAdapter("materialize-gliner2-lora"));
     try std.testing.expect(isDirectCommandAdapter("bootstrap-layoutlmv3-lora"));
     try std.testing.expect(isDirectCommandAdapter("train-eval-layoutlmv3-lora-sequence"));
     try std.testing.expect(isDirectCommandAdapter("train-eval-layoutlmv3-lora-token"));
@@ -6089,39 +5819,19 @@ test "text reward modes score as expected" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), scoreTextReward(.prefix_match, "indeed yes", "yes"), 1e-6);
 }
 
-test "synthetic gliner2 smoke assets tokenize within vocab bounds" {
-    const allocator = std.testing.allocator;
-    const root = "/tmp/antfly_inference_recipe_gliner2_smoke_assets_test";
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-
-    const assets = try writeSyntheticGliner2SmokeAssets(allocator, std.testing.io, root);
-    defer {
-        allocator.free(assets.model_dir);
-        allocator.free(assets.train_path);
-        allocator.free(assets.eval_path);
-        compat.cwd().deleteTree(compat.io(), root) catch {};
-    }
-
-    var loaded = try gliner2_data.loadExamples(allocator, assets.train_path, null);
-    defer loaded.deinit();
-    var tokenizer = try gliner2_data.Tokenizer.initGLiNER2HF(allocator, assets.model_dir);
-    defer tokenizer.deinit(allocator);
-    var workspace = try gliner2_data.ReusableBatch.init(allocator, 1, 16, 8, 3);
-    defer workspace.deinit();
-
-    const labels = [_][]const u8{ "person", "organization", "location" };
-    var batch = try gliner2_data.buildSimpleBatchInto(&workspace, &tokenizer, loaded.examples[0..1], labels[0..], 8);
-    defer batch.deinit();
-    for (batch.input_ids, batch.attention_mask) |token_id, mask| {
-        if (mask == 0) continue;
-        try std.testing.expect(token_id >= 0);
-        try std.testing.expect(@as(usize, @intCast(token_id)) < 8192);
-    }
-}
-
 fn expectStepCommands(plan: Plan, expected: []const []const u8) !void {
     try std.testing.expectEqual(expected.len, plan.steps.len);
     for (expected, 0..) |command, i| {
         try std.testing.expectEqualStrings(command, plan.steps[i].argv[0]);
     }
+}
+
+fn expectArgValue(args: []const []const u8, flag: []const u8, expected: []const u8) !void {
+    for (args[0..args.len -| 1], 0..) |arg, idx| {
+        if (std.mem.eql(u8, arg, flag)) {
+            try std.testing.expectEqualStrings(expected, args[idx + 1]);
+            return;
+        }
+    }
+    return error.MissingExpectedArgument;
 }

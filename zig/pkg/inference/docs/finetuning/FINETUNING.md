@@ -86,6 +86,10 @@ Recipe-level LoRA defaults are intentionally PEFT-like:
 - GRPO adapter-training routes default to `rank = 8`, `alpha = 32`; raise rank for larger policy tasks after an eval sweep justifies the extra adapter capacity.
 - Scaling is standard LoRA `alpha / rank`. Recipe `adapter.scaling` currently accepts only `standard` aliases; rank-stabilized scaling is not enabled in the graph trainer path.
 - Gemma4 defaults to `target_preset = "all-linear"`, which expands to attention and MLP linear patterns. Explicit `target_modules` override the preset.
+- GLiNER2 LoRA defaults match the upstream Python GLiNER2 LoRA surface:
+  `rank = 16`, `alpha = 32`, `lora_dropout = 0`, and target groups
+  `encoder,span_rep,classifier,count_embed,count_pred`. The encoder group
+  expands to query/key/value plus dense encoder projections.
 - Qwen/ColQwen optimizer-backed routes default to their all-linear target module lists. They also accept `target_preset = "all-linear"`, `attention-only`, or `mlp-only`; `moe-experts` is rejected until expert-aware rank and routing policy is wired through those bootstraps.
 - `init_lora_weights` and `use_dora` are currently Gemma4-only recipe knobs.
 
@@ -105,22 +109,22 @@ antfly inference finetune smoke-fast
 
 `smoke-fast` runs quick dry-runs across every family adapter fixture, executes synthetic no-download GLiNER2, Qwen2, and Gemma4 recipe cases plus the fast scalar DPO/GRPO recipes, verifies the normalized run artifacts reach `status = "succeeded"`, and writes a suite summary at `/tmp/antfly-inference-finetune-smoke-fast/fast_smoke_summary.json` by default.
 
-### GLiNER2 Production Readiness
+### GLiNER2 Entity-Training Checks and Release Readiness
 
-GLiNER2 resident Metal and MLX fine-tuning are production-ready at the
-infrastructure level once the production-readiness gate passes on a non-toy
-train/eval dataset with a semantic adapter-reload golden and a nonzero quality
-floor. The current model-quality threshold is intentionally modest while
-per-label calibration work continues:
+The native command below is a scoped resident-Metal entity-training and adapter
+reload check. It is not a production-readiness verdict: its JSON always reports
+`production_ready = false` and lists the full-task, cross-runtime, and trainer
+lifecycle blockers that it does not cover. Use the strict release wrapper later
+in this section for the authoritative fail-closed readiness assessment.
 
 ```sh
-zig build -Dmetal=true gliner2-production-readiness -- \
+zig build -Dmetal=true gliner2-entity-training-readiness -- \
   /private/tmp/antfly-inference-models/gliner2 \
   /private/tmp/gliner2-conll2003-train-200.jsonl \
-  /private/tmp/gliner2-conll2003-train-200.jsonl \
+  /private/tmp/gliner2-conll2003-eval-200.jsonl \
   /private/tmp/antfly-inference-gliner2-metal-prod-gate \
   person,organization,location \
-  --production-metal-gate \
+  --entity-metal-readiness \
   --semantic-golden "Microsoft opened an office in London" Microsoft organization 0.03 \
   --quality-eval \
   --quality-max-examples 25 \
@@ -131,25 +135,22 @@ zig build -Dmetal=true gliner2-production-readiness -- \
   --min-entity-f1 0.15
 ```
 
-`--production-metal-gate` is the canonical resident Metal preset: backend
+`--entity-metal-readiness` is the scoped resident Metal preset: backend
 `metal`, compiled required, 200 examples/steps, batch size 1, sequence length
 32, Metal optimizer, zero trainable host/device transfers, nonzero resident
 trainable bytes, finite/decreasing loss, and `avg_step_wall_ms <= 3000`.
-It also runs the same 25-example shaped quality eval and requires
-`f1 >= 0.15`.
-`--production-mlx-gate` is the canonical resident MLX preset: backend `mlx`,
-compiled required, 200 examples/steps, batch size 1, sequence length 32, MLX
-optimizer, zero trainable host/device transfers, nonzero resident trainable bytes,
-finite/decreasing loss, entity-like semantic/quality decoding, and
-`avg_step_wall_ms <= 10000`. It also runs a 25-example shaped quality eval by
-default and requires `f1 >= 0.15`.
-Span-start training defaults to
-`--span-loss bce --span-positive-weight 32 --span-negative-weight 1` to
-optimize sparse positive span labels with a weighted binary objective. Use
-`--span-loss mse` only to reproduce older calibration runs. Metrics and
-manifests include
-`entity_label_positive_counts`, aligned to `entity_labels`, so target-label
-coverage can be audited alongside prediction quality.
+It also runs a 25-example shaped entity-quality eval and requires `f1 >= 0.15`.
+This is useful infrastructure and entity-path evidence, but it is neither a
+full held-out quality evaluation nor a release gate. The command defaults to
+`--objective gliner2-total-loss`, sum-reduced BCE,
+`--span-positive-weight 1`, `--span-negative-weight 1`, and the upstream 0.5
+negative-mask rate. Use
+`--span-loss mse` only to reproduce older calibration runs. For total-loss
+runs, step and epoch metrics report `schema_slot_positive_counts`, whose
+positions are record-local schema slots. Manifests additionally report raw
+`entity_label_positive_counts`, aligned to `entity_labels`, so entity coverage
+remains auditable across heterogeneous records. Regular span-start runs keep
+reporting `entity_label_positive_counts` in step, epoch, and manifest output.
 `--span-hard-negative-weight` adds extra loss weight to negative span labels
 whose candidate span overlaps a gold entity, which is useful when diagnostics
 show partial-span or wrong-label predictions near true entities.
@@ -180,7 +181,7 @@ sweeps report both a global `best_threshold` and
 `--quality-max-predictions-per-example`, and
 `--quality-best-span-per-label-start` provide stricter decode shaping before
 raising model-quality thresholds.
-When quality eval is enabled, the production gate also writes
+When quality eval is enabled, the scoped entity gate also writes
 `quality_summary.json` and `quality_thresholds.csv` in the run directory and
 includes both paths in the final gate JSON. The summary sidecar contains
 per-label metrics, threshold-sweep calibration candidates, a reusable
@@ -189,7 +190,7 @@ controlled by `--quality-diagnostic-limit`. The CSV file can be fed back into
 `--semantic-label-thresholds` or `--quality-label-thresholds` for calibrated
 decode checks.
 
-Example 200-step resident Metal quality gate output from this rollout:
+Example 200-step resident Metal entity-check output from this rollout:
 `avg_step_wall_ms=2792.75`, `max_device_trainable_transfer_count=0`,
 `max_device_trainable_bytes=9486400`, and 25-example shaped quality
 `precision=0.1733`, `recall=0.2766`, `f1=0.2131` at threshold `0.03`.
@@ -199,21 +200,10 @@ current adapter still needs model-side quality work: a stricter candidate
 `person=0.30,organization=0.15,location=0.25` reduced predictions from 75 to
 67 and raised organization precision, but aggregate F1 fell to `0.1930`.
 
-Example 200-step resident MLX quality gate output from this rollout:
-`avg_step_wall_ms=537.53`,
-`supervised_tokens_per_second=242.83`, `optimizer_backend=mlx`,
-`max_device_trainable_transfer_count=0`, `max_device_trainable_bytes=9486400`,
-`max_peak_resident_bytes=1441054720`, and 25-example shaped quality
-`precision=0.1467`, `recall=0.2340`, `f1=0.1803` at threshold `0.03`.
-This gate uses the compiled MLX gradient
-session and keeps LoRA/task-head weights, gradient accumulators, and AdamW
-moments resident as MLX arrays. The trainable-transfer metric counts
-optimizer/trainable host round-trips, not the per-step runtime input rebinding.
-
 For custom thresholds, pass the explicit options instead of the preset:
 
 ```sh
-zig build -Dmetal=true gliner2-production-readiness -- \
+zig build -Dmetal=true gliner2-entity-training-readiness -- \
   /models/gliner2 \
   /data/gliner2_train.jsonl \
   /data/gliner2_eval.jsonl \
@@ -225,17 +215,267 @@ zig build -Dmetal=true gliner2-production-readiness -- \
   --materialized-dir /runs/gliner2-prod-gate/materialized
 ```
 
-The gate performs dataset readiness checks, full autodiff training, artifact
+The scoped entity command rejects duplicate/cycled examples and train/eval text overlap before
+it performs dataset readiness checks, full autodiff training, artifact
 validation, LoRA bundle inspection, fixed-text semantic eval against the
 reloaded adapter, and optional materialization. Use `--dry-run
 --skip-semantic-eval` to verify build wiring without local model/data files.
+
+The authoritative cross-runtime release-readiness gate additionally requires
+deterministic multi-step full-task loss parity and an exact same-artifact
+adapter round-trip. It records independently trained Python/Zig one-step
+adapter deltas as a diagnostic, not a correctness gate: cancellation-sensitive
+near-zero encoder gradients can have different signs across frameworks and
+Adam amplifies those signs even when the forward objective agrees. A production
+claim still requires independently trained held-out convergence/result parity,
+which remains an explicit blocker in the generated readiness report:
+
+```sh
+scripts/run_gliner2_lora_production_readiness.sh \
+  --model-dir /models/gliner2 \
+  --python-model /models/gliner2 \
+  --release-adapter-dir /runs/gliner2-release-adapter \
+  --train-data /data/gliner2_full_task_train.jsonl \
+  --eval-data /data/gliner2_full_task_eval.jsonl \
+  --upstream-source /src/GLiNER2 \
+  --heldout-min entities.micro_f1=0.80 \
+  --heldout-min entities.exact_match=0.80 \
+  --heldout-min classifications.micro_f1=0.80 \
+  --heldout-min classifications.exact_match=0.80 \
+  --heldout-min json_structures.micro_f1=0.80 \
+  --heldout-min json_structures.exact_match=0.80 \
+  --heldout-min relations.micro_f1=0.80 \
+  --heldout-min relations.exact_match=0.80 \
+  --heldout-min count.accuracy=0.80
+```
+
+Both files must be representative and content-disjoint. Checked-in smoke rows,
+cycled records, and empty task-family placeholders are rejected. The production
+gate requires at least `compare_steps * 32` unique training rows, at least 32
+evaluation rows, and non-empty entity, classification, JSON, and relation
+annotations inside the exact bounded training slice used by both runtimes.
+The separately supplied release adapter must contain its Zig training manifest;
+the gate verifies that its SHA-256 training-data and base-model fingerprints
+match these exact inputs. Release provenance also requires `--max-examples 0`,
+`--max-steps 0`, exact completion of every requested epoch and microbatch or a
+mathematically valid recorded early stop,
+no drop-last training records, a batch/accumulation shape that does not trigger
+upstream's trailing-batch floor behavior, and clean base-model initialization
+without an untracked initial adapter checkpoint.
+After parity passes, the script loads that fully trained standard PEFT adapter
+into the pinned clean upstream checkout and streams the eval file through upstream's raw
+decoder on CPU. It reports micro exact-atom F1 and task-level exact match
+for entities, classifications, JSON structures, and head/tail relations, plus
+repeatable JSON/relation count accuracy. All nine deployment-specific floors
+are required; missing floors, missing positive task coverage, unsupported
+relation fields, decode errors, or scores below a floor fail closed.
+The same supplied adapter is then scored across the complete held-out set
+through Antfly's native evaluator, using each record's structured schema. The
+native gate decodes entities, single- and multi-label classifications, JSON
+structures, ordered head/tail relations, and structure/relation counts. It
+requires the same nine caller-supplied floors and positive task coverage;
+missing coverage, unsupported relation fields, decode errors, or scores below
+a floor fail closed. The report keeps the number of entity-bearing records
+separate from the total held-out record count.
+`production_ready` remains false while the other listed production-parity
+blockers remain, even when both full-task quality gates pass.
+The report intentionally keeps
+`upstream_peft_release_gate_ready = false`; the narrower
+`configured_upstream_peft_gate_ready` field does not claim a universal run-count
+or quality-floor policy.
+Training batching and partial accumulation match the pinned upstream trainer:
+datasets no larger than the requested batch use one reduced batch, larger
+datasets drop their final partial batch, and a partial accumulation flush keeps
+the configured accumulation divisor. Reported `loss` and `final_avg_loss` use
+that same upstream-scaled objective; per-microbatch `raw_loss` is retained for
+diagnostics. Manifest `micro_batch_steps`/legacy `total_steps` count forward-
+backward batches, while `optimizer_steps` is the upstream global-step count and
+is what `--min-steps` release thresholds enforce.
+Upstream's public relation decoder returns only `head` and `tail`; held-out
+records with additional relation fields are rejected rather than partially
+scored. Exact atoms use Unicode NFC, collapsed whitespace, and case folding.
+Exact cross-runtime result parity is currently an augmentation-free,
+deterministic-core contract. The harness disables Python encoder/count-
+transformer dropout, LoRA dropout, negative-span masking, SamplingConfig data
+augmentation, training-example shuffle, and task/field shuffling, and pins
+example and schema ordering. That is a
+stricter subset than stock upstream `deterministic=True`. Antfly does not yet
+reproduce upstream's sampling augmentations or stochastic model-internal
+dropout masks, so default upstream training-result parity is not claimed.
+Deterministic schema conditioning includes entity and JSON descriptions,
+classification prompts and few-shot examples, and classification label
+descriptions. Their prompt layout and token IDs match the pinned upstream
+processor. The harness pins upstream's stochastic `example_mode` selection
+(`_process_entities`/`_process_classifications`/`_process_json_structures`)
+and `_transform_schema` description/example shuffles to eval-mode semantics —
+entities/JSON emit every present `[DESCRIPTION]` segment, classifications emit
+`[DESCRIPTION]` plus `[EXAMPLE]`/`[OUTPUT]` — which is exactly the
+deterministic form the Zig data pipeline always emits.
+`gliner2_described_smoke.jsonl` exercises that surface in the full-task parity
+gates. Stock upstream's stochastic conditioning selection remains part of the
+sampling-parity limitation above.
+
+2026-07-17 parity review notes (vs fastino-ai/GLiNER2 `31c8aba`):
+
+- LR schedule with `--grad-accum N > 1` now matches upstream: the schedule
+  horizon and warmup use upstream's floor-based
+  `len(train_loader) // grad_accum` (clamped >= 1) per epoch while the
+  execution plan keeps the ceil-based count, so end-of-epoch partial flushes
+  run at LR 0 exactly as upstream's flush steps do (weight no-ops on both
+  sides).
+- `GlinerAutodiffConfig` struct defaults are now the upstream-parity values
+  (`span_start_positive_weight=1.0`, `span_start_loss_reduction=.sum`); the
+  previous 32.0/`.mean` defaults survived only for callers that bypassed the
+  CLI.
+- Adapter eval tools default `--max-span-width` from the adapter manifest's
+  trained value (trainer default 8 for manifests predating the field) instead
+  of a fixed 4, so evaluation cannot silently use a different candidate-span
+  grid than training.
+- `parseConfig` fails closed on DeBERTa `share_att_key=false`; the training
+  graph reuses the content Q/K projections for the relative-position
+  projections and would silently mis-project such checkpoints.
+- The compare harness defaults to `--zig-objective gliner2-total-loss` so
+  component-loss parity runs by default, and the multi-step e2e gate now
+  exercises decoupled AdamW weight decay (`--weight-decay 0.01`) end to end.
+
+Same-day end-to-end run of every gate (bundle rebuilt from the HF cache)
+surfaced and fixed three further defects the gates had never executed:
+
+- Optimizer step gating now mirrors PyTorch's grad-presence semantics:
+  upstream leaves `grad=None` for head modules whose task family is absent
+  from a batch (no Adam state advance, no decoupled decay), while the Zig
+  graph always produced zero-valued grads and stepped everything. The trainer
+  gains conditional optimizer families
+  (`registerConditionalOptimizerFamily`/`markOptimizerFamilyPresent`,
+  presence ORed across the grad-accum window, reset per optimizer step); the
+  gliner2-total-loss CLI registers `classifier.`, `count_pred.`,
+  `span_rep.`, and `count_embed.` and marks presence from each micro-batch's
+  task ids. The multi-step gate's per-parameter Adam step counts now match
+  exactly. Residuals: gating applies to the host optimizer path (the device/
+  Metal optimizer steps its full enrolled set), and presence is family-level
+  (a structure task with gold count 0 still marks its family; upstream would
+  leave those grads unset).
+- `--require-full-task-parity` slice-coverage checks required every task
+  family in the compared slice unconditionally, which no single-family
+  fixture could satisfy; they now require only the families present in the
+  source fixture, and the multicount fixture moved a multi-instance
+  relations record into the compared slice.
+- The multi-step gate required `trained_adapter_parity_ok`, which the
+  harness never emitted into `strict_checks`; it is now reported alongside
+  `adapter_roundtrip_ok`.
+- `--deterministic` now also pins training data order on both sides (the
+  Zig CLI skips its epoch shuffle; the harness passes the Python loader
+  `--no-train-shuffle`), so deterministic comparisons cannot silently train
+  on permuted batches.
+
+Measured on the deterministic 3-step config (batch 2, seq 64, rank 4):
+Python torch-CPU ≈ 0.2 s/step, Zig native ≈ 15 s/step (the correctness
+reference, not a performance target), Zig Metal ≈ 0.55 s/step; the
+performance target remains the Metal backend at production shapes
+(`run_gliner2_lora_perf_gate.sh`, warm-step median ≤ 1.0× Python at
+batch 32/seq 128). A 5-step data-cycling probe showed ~0.5% relative loss
+drift on a high-loss batch revisit — inside the multi-step gate's lr-scaled
+bound, beyond the single-step 1e-4 tolerance; characterizing that drift
+growth is what the pending multi-seed convergence study is for.
+
+Accepted, deliberately not "fixed":
+
+- FFN GELU uses an erf approximation (Abramowitz–Stegun 7.1.26, ~1.5e-7
+  max per-element error) rather than libm erf. It sits three orders of
+  magnitude inside the 1e-4 loss-parity gate; replacing it would desync the
+  matching Metal kernel implementations and perturb unrelated golden
+  baselines.
+- Bitwise trace parity with stock upstream RNG streams (torch shuffle order,
+  dropout masks, negative-span masking draws) is out of scope by design; the
+  deterministic-core contract above is the parity claim.
+- Preprocess parity asserts the aggregate `structure_positive_count`, not
+  per-cell placement. The Zig side already dumps the full per-cell grid
+  (`span_labels_all`, layout `[sample][span][entity]`, cell value =
+  multiplicity); a positions-multiset comparison
+  (`flat = start_word * max_span_width + (end - start)`) is the intended
+  tightening once the Python dump's span serialization (single `[s,e]` vs
+  list-of-subspans) is pinned against a live run.
+- The Python parity gates and all Metal tests still run in no CI job (no
+  provisioned macOS test runner); this remains the largest untested surface.
+The native trainer supports recoverable optimizer checkpoints at complete
+epoch boundaries with `--checkpoint-every-epochs`, and exact-run resume with
+`--resume-checkpoint`. Checkpoints include trainable weights, Adam moments,
+step counters, and a run fingerprint; resume also restores deterministic data
+order, held-out selection state, and the checkpoint-bound metrics prefix. A
+resumed release retains its source as a content-addressed checkpoint and
+records that file's exact digest and restored counters in the manifest.
+`--checkpoint-keep-last` bounds retained periodic state files to three by
+default. Metal checkpoint/save/resume requires `--compiled-required` so an
+exact run cannot switch between compiled and interpreter execution across
+processes.
+
+Pass a content-disjoint single JSONL file with `--eval-data` for in-process
+epoch loss, `--eval-every-epochs` for cadence, and `--eval-batch-size` for the
+upstream-equivalent logical evaluation batch (default 8, with no drop-last).
+`--early-stopping-patience` enables strict lower-loss stopping and
+`--early-stopping-threshold` sets the required decrease. Evaluation only runs
+after complete epochs, disables LoRA dropout, never advances optimizer or
+training RNG state, and preserves upstream's equal weighting of logical batch
+losses (including its summed full-task loss). Crash-safe, epoch-addressed
+`checkpoints/best-epoch-N.safetensors` files preserve the recoverable best state
+for every retained resume boundary; final PEFT and task-head artifacts are
+exported from the selected epoch. Resume rebuilds best loss/epoch and patience
+from the exact metrics prefix, removes abandoned future bests, and fails closed
+if the selected best checkpoint does not match it.
+Training text splitting is pinned to Python 3.12's Unicode 15.0 behavior for
+`str.lower()`, `\w`, `\s`, URL/email/mention branches, punctuation, emoji,
+and UTF-8 byte boundaries. This is intentionally versioned rather than a claim
+of parity with every Python Unicode release. U+0130 (`İ`) still fails closed:
+Python expands it to two code points, so its lowered offsets cannot map
+one-to-one onto original UTF-8 supervision/decode boundaries. Unicode schema
+conditioning keeps its existing ASCII/lower-Latin-1 restriction. Native
+encoding also verifies the exact Fastino `Strip`/precompiled-charsmap/space-
+replacement normalizer fingerprint and rejects any text, prefix, or schema
+fragment that it cannot prove the unimplemented normalizer would leave
+unchanged; unknown normalizers are rejected at tokenizer initialization. The
+conservative admitted set includes NFKC-stable assigned letters, numbers,
+punctuation, and symbols such as `Москва`, `東京`, and simple emoji. Compatibility
+forms such as `①`, `Ａ`, and `ﬁ`; Unicode marks, separators, and controls; scalars
+that can participate as the second half of canonical composition; U+2581 and
+U+FFFD; leading, trailing, or repeated ASCII spaces; and emoji sequences
+containing marks or joiners fail closed. Regenerate and exhaustively verify the
+scalar/category/context tables with
+`python3 scripts/generate_gliner2_unicode_tables.py --check` under Python 3.12.
+With the pinned model available, add
+`--tokenizer-json <model_dir>/tokenizer.json` to verify the normalizer shape,
+charsmap fingerprint, and every admitted scalar against the real tokenizer.
+
+Full-task training uses per-sample contextual schema slots. Different samples
+can reuse the same slot for different fields and inactive tail slots are masked;
+manifest entity-label coverage remains training-derived. The admitted schema,
+structure-instance, and task limits cover both training and held-out records,
+so evaluation can use wider contextual axes without changing trainable shapes.
+The trainer still fails closed above 256 schema slots and reports the offending
+per-record width before graph construction.
+Each shuffled train or eval batch selects bounded local graph axes: sequence
+length uses eight-token buckets, while schema slots, structure instances, and
+task count use next-power-of-two buckets capped by the admitted dataset limits.
+A deterministic LRU cache retains at most `--graph-cache-capacity` signatures
+(default 2, maximum 8), shares trainables, Adam state, counters, and RNG across
+them, and releases inactive runtime inputs. Cache policy and build/hit/reuse/
+eviction/residency metrics are recorded in the training fingerprint, metrics,
+and manifest. Sequence-length preflight runs the exact tokenizer/prompt encoder
+with bounded scratch space and does not build span grids or labels. The
+conservative admission estimate still budgets the union maxima for safe cache
+construction and accounts for full-task structure-instance scores, schema-task
+classification/count heads, count-transformer attention, and packed targets
+with saturating shape arithmetic.
+Step, epoch, and manifest schema-slot counts are computed from the final active
+loss masks after negative masking; raw entity-label counts remain separate.
+Total-loss adapter evaluation requires explicit `--entity-types`, because a
+dataset-wide raw-label union is not a valid contextual-slot schema.
 
 ### Adapter Matrix
 
 | Recipe | Family | Current route |
 |--------|--------|---------------|
 | `lora-sft`, `qlora-sft` | `gemma4` | `prepare-gemma4-lora-inputs` → `bootstrap-gemma4-lora` → `train-eval-gemma4-lora-bundle` |
-| `lora-sft`, `qlora-sft` | `gliner2` | `bootstrap-gliner2-lora` → `prepare-gliner2-top-layer-boundary-cache` → `train-eval-gliner2-lora-bundle` → optional `materialize-gliner2-lora` |
+| `lora-sft`, `qlora-sft` | `gliner2` | `train-gliner2-autodiff` (real full-encoder autodiff training; the cached probe-surrogate bundle route was removed) |
 | `lora-sft`, `qlora-sft` | `layoutlmv3` | `bootstrap-layoutlmv3-lora` → `train-eval-layoutlmv3-lora-sequence` or `train-eval-layoutlmv3-lora-token` → optional `materialize-layoutlmv3-checkpoint` |
 | `sft` | supported LoRA families | same route as the family `lora-sft` adapter while full-weight SFT backends are still family-specific |
 | `dpo` | scalar preference fixtures | direct internal `preference_loss.zig` adapter over `dataset.format = "scalar-logprobs"` JSONL |
@@ -1005,36 +1245,20 @@ Flags:
   --schedule-free               Enable Schedule-Free AdamW (default: false)
 ```
 
-### GLiNER2 LoRA Bundle
+### GLiNER2 LoRA (Real Autodiff)
 
-This is the backend train/eval command behind `lora-sft` / `qlora-sft`
-GLiNER2 recipes.
+GLiNER2 LoRA fine-tuning runs through `train-gliner2-autodiff`: full
+DeBERTa-v3 encoder forward + autodiff with the upstream GLiNER2 total loss
+(`structure + classification + count`) via `--objective gliner2-total-loss`.
+The earlier cached probe-surrogate bundle route
+(`train-eval-gliner2-lora-bundle`, MSE against deterministic probe targets)
+was removed — it was a smoke fixture, not real GLiNER2 training. Python↔Zig
+loss parity is gated by
+`scripts/compare_gliner2_lora_python_zig.py --strict` (see
+`zig/e2e/inference/test_gliner2_lora_parity.py`).
 
-Uses pre-cached top-layer boundary representations produced by `prepare-gliner2-top-layer-boundary-cache` (no live inference required at train time). Training loop uses cached `hidden_in` tensors from `CachedBoundarySummary`, computes mean-pooled span representations, runs MSE loss against deterministic probe targets, and applies AdamW with optional LLRD, norm clipping, and gradient accumulation.
-
-**Prerequisites:** Run `prepare-gliner2-top-layer-boundary-cache` on train and eval datasets first.
-
-```
-usage: train-eval-gliner2-lora-bundle <base_model_dir> <adapter_model_dir>
-    <train_cache.json> <eval_cache.json> <out_dir> [options]
-
-Flags:
-  --lr, --learning-rate <f>   Learning rate (default: 0.0001)
-  --max-examples <n>          Max training examples (default: 0 = all)
-  --epochs <n>                Number of epochs (default: 1)
-  --layer-name, --layer <str> Scope to a specific layer name
-  --max-grad-norm <f>         Gradient norm clipping threshold (default: 1.0, 0=disabled)
-  --grad-accum <n>            Gradient accumulation steps (default: 1)
-  --llrd-decay <f>            Layer-wise LR decay factor (default: 1.0=disabled)
-
-example: train-eval-gliner2-lora-bundle /tmp/gliner2 /tmp/lora \
-           /tmp/train_cache.json /tmp/eval_cache.json /tmp/out \
-           --lr 0.0001 --epochs 3 --max-grad-norm 1.0 --grad-accum 4 --llrd-decay 0.9
-```
-
-Outputs:
-- `<out_dir>/adapter_model.safetensors`
-- `<out_dir>/train_eval_lora_report.json` — `eval_mse_before`, per-epoch `train_metrics`, `eval_mse_after`
+Adapters are saved in PEFT-compatible format
+(`adapter_model.safetensors` + `adapter_config.json`).
 
 ### Gemma4 LoRA
 
@@ -1230,7 +1454,6 @@ Applies to:
 - `train-eval-layoutlmv3-lora-sequence`
 - `train-eval-layoutlmv3-lora-token`
 - `train-eval-colqwen2-lora-bundle`
-- `train-eval-gliner2-lora-bundle`
 - `train-eval-gliner2-top-layer-boundary-task-head`
 
 ### `run_status.json`

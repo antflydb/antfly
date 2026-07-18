@@ -29,6 +29,8 @@ test "GLiNER2 autodiff run validator accepts complete output" {
     defer allocator.free(metrics_path);
     const adapter_path = try std.fs.path.join(allocator, &.{ out_dir, "encoder.layer.0.attention.self.query_proj.lora_A.bin" });
     defer allocator.free(adapter_path);
+    const unrelated_bin_path = try std.fs.path.join(allocator, &.{ out_dir, "user-data.bin" });
+    defer allocator.free(unrelated_bin_path);
     const peft_config_path = try std.fs.path.join(allocator, &.{ out_dir, "adapter_config.json" });
     defer allocator.free(peft_config_path);
     const peft_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, "adapter_model.safetensors" });
@@ -36,20 +38,22 @@ test "GLiNER2 autodiff run validator accepts complete output" {
     const task_head_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, "task_head.safetensors" });
     defer allocator.free(task_head_checkpoint_path);
 
-    try writeManifestWithRun(allocator, manifest_path, 1, 1, 2, 4, 1, 1, 2, 2, 1.0);
+    try writeManifestWithRun(allocator, manifest_path, 1, 1, 2, 2, 1, 1, 2, 2, 1.25);
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = metrics_path,
         .data =
-        \\{"event":"step","step":1,"loss":1.5,"grad_norm":0.2,"optimizer_stepped":true,"supervised_token_count":10,"entity_token_count":2,"ignored_token_count":3,"entity_token_rate":0.2,"target_build_ms":1.0,"train_step_ms":999.0,"step_wall_ms":1000.0,"graph_build_ms":10.0,"runtime_input_ms":20.0,"autodiff_ms":300.0,"execute_ms":600.0,"extract_ms":5.0,"optimizer_update_ms":2.0,"device_optimizer_ms":0.25,"optimizer_backend":"metal","device_resident_transfer_count":0,"device_trainable_bytes":128,"trainer_total_ms":950.0,"peak_resident_bytes":4096,"supervised_tokens_per_second":10.0}
-        \\{"event":"step","step":2,"loss":1.0,"grad_norm":0.1,"optimizer_stepped":true,"supervised_token_count":8,"entity_token_count":1,"ignored_token_count":5,"entity_token_rate":0.125,"target_build_ms":1.0,"train_step_ms":1999.0,"step_wall_ms":2000.0,"graph_build_ms":1.0,"runtime_input_ms":20.0,"autodiff_ms":500.0,"execute_ms":1400.0,"extract_ms":5.0,"optimizer_update_ms":2.0,"device_optimizer_ms":0.75,"optimizer_backend":"metal","device_resident_transfer_count":0,"device_trainable_bytes":128,"trainer_total_ms":1950.0,"peak_resident_bytes":8192,"supervised_tokens_per_second":4.0}
+        \\{"event":"step","step":1,"loss":1.5,"grad_norm":0.2,"optimizer_stepped":true,"supervised_token_count":10,"entity_token_count":2,"ignored_token_count":3,"entity_token_rate":0.2,"target_build_ms":1.0,"train_step_ms":999.0,"step_wall_ms":1000.0,"graph_build_ms":10.0,"runtime_input_ms":20.0,"autodiff_ms":300.0,"execute_ms":600.0,"extract_ms":5.0,"optimizer_update_ms":2.0,"device_optimizer_ms":0.25,"optimizer_backend":"metal","device_resident_transfer_count":0,"device_trainable_bytes":128,"trainer_total_ms":950.0,"peak_resident_bytes":4096,"supervised_tokens_per_second":10.0,"graph_executor_metal_eager_arena_peak_bytes":1024,"graph_executor_metal_eager_arena_live_bytes":512,"graph_executor_metal_eager_arena_reuse_hits":2,"graph_executor_metal_eager_arena_allocations":1,"graph_executor_metal_eager_arena_spill_bytes":0,"graph_executor_metal_eager_arena_hazard_declines":0,"graph_executor_metal_eager_arena_alias_conflicts":0,"graph_executor_metal_eager_arena_alias_reclaims":1,"graph_executor_metal_eager_arena_alias_reclaim_bytes":256,"graph_executor_metal_chunk_local_output_peak_bytes":4096,"graph_executor_metal_chunk_local_output_live_bytes":0,"graph_executor_metal_chunk_local_output_allocations":2,"graph_executor_metal_chunk_local_output_reuse_hits":1,"graph_executor_metal_chunk_local_output_consumed_hints":3,"graph_executor_metal_chunk_local_output_unconsumed_hints":0,"graph_executor_metal_chunk_local_output_spill_bytes":0,"graph_executor_metal_chunk_local_output_alias_conflicts":0,"graph_executor_metal_chunk_local_output_resets":1,"graph_executor_metal_chunk_local_output_reset_freed_bytes":4096,"graph_executor_metal_chunk_local_output_discard_freed_bytes":0,"graph_executor_metal_chunk_local_output_reset_live_carry_values":0}
+        \\{"event":"step","step":2,"optimizer_step":1,"loss":1.0,"grad_norm":0.1,"optimizer_stepped":false,"supervised_token_count":8,"entity_token_count":1,"ignored_token_count":5,"entity_token_rate":0.125,"target_build_ms":1.0,"train_step_ms":1999.0,"step_wall_ms":2000.0,"graph_build_ms":1.0,"runtime_input_ms":20.0,"autodiff_ms":500.0,"execute_ms":1400.0,"extract_ms":5.0,"optimizer_update_ms":2.0,"device_optimizer_ms":0.75,"optimizer_backend":"metal","device_resident_transfer_count":0,"device_trainable_bytes":128,"trainer_total_ms":1950.0,"peak_resident_bytes":8192,"supervised_tokens_per_second":4.0,"graph_executor_metal_eager_arena_peak_bytes":2048,"graph_executor_metal_eager_arena_live_bytes":1024,"graph_executor_metal_eager_arena_reuse_hits":3,"graph_executor_metal_eager_arena_allocations":2,"graph_executor_metal_eager_arena_spill_bytes":0,"graph_executor_metal_eager_arena_hazard_declines":1,"graph_executor_metal_eager_arena_alias_conflicts":1,"graph_executor_metal_eager_arena_alias_reclaims":2,"graph_executor_metal_eager_arena_alias_reclaim_bytes":512,"graph_executor_metal_chunk_local_output_peak_bytes":8192,"graph_executor_metal_chunk_local_output_live_bytes":0,"graph_executor_metal_chunk_local_output_allocations":4,"graph_executor_metal_chunk_local_output_reuse_hits":2,"graph_executor_metal_chunk_local_output_consumed_hints":5,"graph_executor_metal_chunk_local_output_unconsumed_hints":0,"graph_executor_metal_chunk_local_output_spill_bytes":0,"graph_executor_metal_chunk_local_output_alias_conflicts":1,"graph_executor_metal_chunk_local_output_resets":2,"graph_executor_metal_chunk_local_output_reset_freed_bytes":8192,"graph_executor_metal_chunk_local_output_discard_freed_bytes":1024,"graph_executor_metal_chunk_local_output_reset_live_carry_values":0}
+        \\{"event":"optimizer_step","step":2,"optimizer_step":2,"partial_accumulation":true,"micro_batches":1,"grad_norm":0.1,"learning_rate":0.0005,"optimizer_update_ms":0.5}
         \\{"event":"epoch","epoch":1,"avg_loss":1.25,"supervised_token_count":18,"entity_token_count":3,"ignored_token_count":8,"entity_token_rate":0.16666666666666666,"epoch_wall_ms":3000.0,"supervised_tokens_per_second":6.0}
         \\
         ,
     });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = adapter_path, .data = "LORA" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = unrelated_bin_path, .data = "preserve" });
     try writePeftConfig(peft_config_path);
     try writeOneTensorSafetensors(allocator, peft_checkpoint_path);
-    try writeTaskHeadSafetensors(allocator, task_head_checkpoint_path);
+    try writeTaskHeadSafetensorsWithShape(allocator, task_head_checkpoint_path, 2, 1);
 
     var summary = try validation.validateRun(allocator, out_dir, .{
         .require_loss_decrease = true,
@@ -57,12 +61,18 @@ test "GLiNER2 autodiff run validator accepts complete output" {
         .require_optimizer_backend = "metal",
         .max_device_resident_transfer_count = 0,
         .min_device_trainable_bytes = 128,
+        .max_metal_eager_arena_peak_bytes = 2048,
+        .max_metal_eager_arena_spill_bytes = 0,
+        .max_metal_chunk_local_output_peak_bytes = 8192,
+        .max_metal_chunk_local_output_spill_bytes = 0,
+        .max_metal_chunk_local_output_unconsumed_hints = 0,
+        .min_metal_chunk_local_output_consumed_hints = 8,
     });
     defer validation.freeRunValidationSummary(allocator, &summary);
     try std.testing.expectEqual(@as(usize, 1), summary.adapter_file_count);
     try std.testing.expectEqual(@as(usize, 1), summary.peft_adapter_tensor_count);
     try std.testing.expectEqual(@as(usize, 2), summary.task_head_tensor_count);
-    try std.testing.expectEqual(@as(usize, 4), summary.task_head_num_classes);
+    try std.testing.expectEqual(@as(usize, 2), summary.task_head_num_classes);
     try std.testing.expectEqual(@as(usize, 1), summary.task_head_hidden_size);
     try std.testing.expectEqual(@as(usize, 1), summary.manifest_epochs);
     try std.testing.expectEqual(@as(usize, 2), summary.manifest_example_count);
@@ -71,6 +81,7 @@ test "GLiNER2 autodiff run validator accepts complete output" {
     try std.testing.expectEqual(@as(usize, 64), summary.manifest_seq_len);
     try std.testing.expectEqual(@as(usize, 3), summary.manifest_entity_label_count);
     try std.testing.expectEqualStrings("Metal", summary.manifest_backend);
+    try std.testing.expectEqualStrings("gliner2-total-loss", summary.manifest_objective);
     try std.testing.expectEqual(@as(usize, 2), summary.step_record_count);
     try std.testing.expectEqual(@as(usize, 18), summary.supervised_token_count);
     try std.testing.expectEqual(@as(usize, 3), summary.entity_token_count);
@@ -88,7 +99,37 @@ test "GLiNER2 autodiff run validator accepts complete output" {
     try std.testing.expectEqual(@as(u64, 0), summary.max_device_resident_transfer_count);
     try std.testing.expectEqual(@as(usize, 128), summary.max_device_trainable_bytes);
     try std.testing.expectEqual(@as(usize, 8192), summary.max_peak_resident_bytes);
+    try std.testing.expectEqual(@as(u64, 2048), summary.max_metal_eager_arena_peak_bytes);
+    try std.testing.expectEqual(@as(u64, 1024), summary.max_metal_eager_arena_live_bytes);
+    try std.testing.expectEqual(@as(u64, 5), summary.total_metal_eager_arena_reuse_hits);
+    try std.testing.expectEqual(@as(u64, 3), summary.total_metal_eager_arena_allocations);
+    try std.testing.expectEqual(@as(u64, 0), summary.total_metal_eager_arena_spill_bytes);
+    try std.testing.expectEqual(@as(u64, 1), summary.total_metal_eager_arena_hazard_declines);
+    try std.testing.expectEqual(@as(u64, 1), summary.total_metal_eager_arena_alias_conflicts);
+    try std.testing.expectEqual(@as(u64, 3), summary.total_metal_eager_arena_alias_reclaims);
+    try std.testing.expectEqual(@as(u64, 768), summary.total_metal_eager_arena_alias_reclaim_bytes);
+    try std.testing.expectEqual(@as(u64, 8192), summary.max_metal_chunk_local_output_peak_bytes);
+    try std.testing.expectEqual(@as(u64, 0), summary.max_metal_chunk_local_output_live_bytes);
+    try std.testing.expectEqual(@as(u64, 6), summary.total_metal_chunk_local_output_allocations);
+    try std.testing.expectEqual(@as(u64, 3), summary.total_metal_chunk_local_output_reuse_hits);
+    try std.testing.expectEqual(@as(u64, 8), summary.total_metal_chunk_local_output_consumed_hints);
+    try std.testing.expectEqual(@as(u64, 0), summary.total_metal_chunk_local_output_unconsumed_hints);
+    try std.testing.expectEqual(@as(u64, 0), summary.total_metal_chunk_local_output_spill_bytes);
+    try std.testing.expectEqual(@as(u64, 1), summary.total_metal_chunk_local_output_alias_conflicts);
+    try std.testing.expectEqual(@as(u64, 3), summary.total_metal_chunk_local_output_resets);
+    try std.testing.expectEqual(@as(u64, 12288), summary.total_metal_chunk_local_output_reset_freed_bytes);
+    try std.testing.expectEqual(@as(u64, 1024), summary.total_metal_chunk_local_output_discard_freed_bytes);
     try std.testing.expect(summary.loss_decreased);
+
+    try std.testing.expectError(error.MetalEagerArenaPeakBytesAboveThreshold, validation.validateRun(allocator, out_dir, .{
+        .max_metal_eager_arena_peak_bytes = 2047,
+    }));
+    try std.testing.expectError(error.MetalChunkLocalOutputPeakBytesAboveThreshold, validation.validateRun(allocator, out_dir, .{
+        .max_metal_chunk_local_output_peak_bytes = 8191,
+    }));
+    try std.testing.expectError(error.MetalChunkLocalOutputConsumedHintsBelowThreshold, validation.validateRun(allocator, out_dir, .{
+        .min_metal_chunk_local_output_consumed_hints = 9,
+    }));
 }
 
 test "GLiNER2 autodiff run validator accepts smoothed loss decrease" {
@@ -112,7 +153,7 @@ test "GLiNER2 autodiff run validator accepts smoothed loss decrease" {
     const task_head_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, "task_head.safetensors" });
     defer allocator.free(task_head_checkpoint_path);
 
-    try writeManifestWithRun(allocator, manifest_path, 1, 1, 2, 4, 1, 1, 41, 41, 0.3);
+    try writeManifestWithRun(allocator, manifest_path, 1, 1, 2, 4, 1, 1, 41, 41, 25.5 / 41.0);
     var metrics: std.Io.Writer.Allocating = .init(allocator);
     defer metrics.deinit();
     for (1..42) |step| {
@@ -155,7 +196,7 @@ test "GLiNER2 autodiff run validator rejects manifest metrics mismatch" {
     const metrics_path = try std.fs.path.join(allocator, &.{ out_dir, validation.metrics_file_name });
     defer allocator.free(metrics_path);
 
-    try writeManifestWithRun(allocator, manifest_path, 1, 1, 2, 4, 1, 1, 2, 2, 1.0);
+    try writeManifestWithRun(allocator, manifest_path, 1, 1, 2, 4, 1, 1, 1, 1, 2.0);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = metrics_path, .data = "{\"event\":\"step\",\"loss\":1.0,\"supervised_token_count\":4,\"entity_token_count\":1,\"ignored_token_count\":0,\"target_build_ms\":1.0,\"train_step_ms\":9.0,\"step_wall_ms\":10.0,\"graph_build_ms\":1.0,\"runtime_input_ms\":1.0,\"autodiff_ms\":2.0,\"execute_ms\":3.0,\"extract_ms\":1.0,\"optimizer_update_ms\":1.0,\"trainer_total_ms\":8.0,\"peak_resident_bytes\":1024,\"supervised_tokens_per_second\":400.0}\n{\"event\":\"epoch\",\"avg_loss\":1.0}\n" });
 
     try std.testing.expectError(error.TrainingManifestMetricsMismatch, validation.validateRun(allocator, out_dir, .{}));
@@ -239,9 +280,11 @@ test "GLiNER2 autodiff run validator rejects PEFT config mismatch" {
         .sub_path = peft_config_path,
         .data =
         \\{
+        \\  "auto_mapping": {"base_model_class": "Extractor", "parent_library": "gliner2.model"},
         \\  "base_model_name_or_path": "base-model",
+        \\  "bias": "none",
         \\  "peft_type": "LORA",
-        \\  "task_type": "TOKEN_CLS",
+        \\  "task_type": null,
         \\  "r": 16,
         \\  "lora_alpha": 32,
         \\  "target_modules": ["query_proj", "key_proj"],
@@ -272,7 +315,9 @@ test "GLiNER2 autodiff run validator rejects no entity-positive supervision" {
     try writeManifest(allocator, manifest_path, 1, 1, 2);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = metrics_path, .data = "{\"event\":\"step\",\"loss\":1.0,\"supervised_token_count\":4,\"entity_token_count\":0,\"ignored_token_count\":0,\"target_build_ms\":1.0,\"train_step_ms\":9.0,\"step_wall_ms\":10.0,\"graph_build_ms\":1.0,\"runtime_input_ms\":1.0,\"autodiff_ms\":2.0,\"execute_ms\":3.0,\"extract_ms\":1.0,\"optimizer_update_ms\":1.0,\"trainer_total_ms\":8.0,\"peak_resident_bytes\":1024,\"supervised_tokens_per_second\":400.0}\n{\"event\":\"epoch\",\"avg_loss\":1.0}\n" });
 
-    try std.testing.expectError(error.NoEntityPositiveTokens, validation.validateRun(allocator, out_dir, .{}));
+    try std.testing.expectError(error.EntityTokenCountBelowThreshold, validation.validateRun(allocator, out_dir, .{
+        .min_entity_tokens = 1,
+    }));
 }
 
 test "GLiNER2 autodiff run validator rejects missing performance metrics" {
@@ -360,6 +405,117 @@ test "GLiNER2 autodiff run validator rejects run above requested performance cei
     }));
 }
 
+test "GLiNER2 autodiff run validator enforces Metal graph residency counters" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(out_dir);
+    const manifest_path = try std.fs.path.join(allocator, &.{ out_dir, validation.manifest_file_name });
+    defer allocator.free(manifest_path);
+    const metrics_path = try std.fs.path.join(allocator, &.{ out_dir, validation.metrics_file_name });
+    defer allocator.free(metrics_path);
+
+    try writeManifest(allocator, manifest_path, 1, 1, 2);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = metrics_path,
+        .data =
+        \\{"event":"step","loss":1.0,"supervised_token_count":4,"entity_token_count":1,"ignored_token_count":0,"target_build_ms":1.0,"train_step_ms":9.0,"step_wall_ms":10.0,"graph_build_ms":1.0,"runtime_input_ms":1.0,"autodiff_ms":2.0,"execute_ms":3.0,"extract_ms":1.0,"optimizer_update_ms":1.0,"trainer_total_ms":8.0,"peak_resident_bytes":1024,"supervised_tokens_per_second":400.0,"graph_executor_host_outputs":4,"graph_executor_runtime_region_dispatches":2,"graph_executor_runtime_region_fallbacks":0,"graph_executor_runtime_region_elided_nodes":5,"graph_executor_runtime_frame_metadata_ready":1,"graph_executor_runtime_frame_ineligible_missing_model_metadata":1,"metal_deberta_ffn_forward_regions":1,"metal_deberta_encoder_lora_layer_regions":1,"metal_deberta_encoder_lora_residual_layernorm_regions":1,"metal_deberta_encoder_lora_layer_scaffold_regions":0,"metal_deberta_encoder_lora_layer_fallbacks":0,"metal_deberta_encoder_layer_successes":1,"metal_deberta_attention_flash_calls":1,"metal_deberta_attention_gemm_fallbacks":0,"metal_deberta_ffn_fused_calls":1,"metal_deberta_ffn_fused_fallbacks":0}
+        \\{"event":"epoch","avg_loss":1.0}
+        \\
+        ,
+    });
+
+    try std.testing.expectError(error.GraphRuntimeRegionDispatchCountBelowThreshold, validation.validateRun(allocator, out_dir, .{
+        .min_graph_runtime_region_dispatch_count = 3,
+    }));
+    try std.testing.expectError(error.GraphRuntimeRegionElidedNodeCountBelowThreshold, validation.validateRun(allocator, out_dir, .{
+        .min_graph_runtime_region_elided_node_count = 6,
+    }));
+    try std.testing.expectError(error.MetalDebertaFfnForwardRegionCountBelowThreshold, validation.validateRun(allocator, out_dir, .{
+        .min_metal_deberta_ffn_forward_region_count = 2,
+    }));
+    try std.testing.expectError(error.MetalDebertaEncoderLoraLayerRegionCountBelowThreshold, validation.validateRun(allocator, out_dir, .{
+        .min_metal_deberta_encoder_lora_layer_region_count = 2,
+    }));
+    try std.testing.expectError(error.MetalDebertaEncoderLoraResidualLayerNormRegionCountBelowThreshold, validation.validateRun(allocator, out_dir, .{
+        .min_metal_deberta_encoder_lora_residual_layernorm_region_count = 2,
+    }));
+    try std.testing.expectError(error.MetalDebertaEncoderLayerSuccessCountBelowThreshold, validation.validateRun(allocator, out_dir, .{
+        .min_metal_deberta_encoder_layer_success_count = 2,
+    }));
+    try std.testing.expectError(error.MetalDebertaAttentionFlashCallCountBelowThreshold, validation.validateRun(allocator, out_dir, .{
+        .min_metal_deberta_attention_flash_call_count = 2,
+    }));
+    try std.testing.expectError(error.MetalDebertaFfnFusedCallCountBelowThreshold, validation.validateRun(allocator, out_dir, .{
+        .min_metal_deberta_ffn_fused_call_count = 2,
+    }));
+    try std.testing.expectError(error.GraphHostOutputCountAboveThreshold, validation.validateRun(allocator, out_dir, .{
+        .max_graph_host_output_count = 3,
+    }));
+    try std.testing.expectError(error.RuntimeFrameIneligibleMissingModelMetadataAboveThreshold, validation.validateRun(allocator, out_dir, .{
+        .max_runtime_frame_ineligible_missing_model_metadata = 0,
+    }));
+
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = metrics_path,
+        .data =
+        \\{"event":"step","loss":1.0,"supervised_token_count":4,"entity_token_count":1,"ignored_token_count":0,"target_build_ms":1.0,"train_step_ms":9.0,"step_wall_ms":10.0,"graph_build_ms":1.0,"runtime_input_ms":1.0,"autodiff_ms":2.0,"execute_ms":3.0,"extract_ms":1.0,"optimizer_update_ms":1.0,"trainer_total_ms":8.0,"peak_resident_bytes":1024,"supervised_tokens_per_second":400.0,"graph_executor_runtime_region_dispatches":2,"graph_executor_runtime_region_fallbacks":1,"graph_executor_runtime_region_elided_nodes":5,"metal_deberta_encoder_lora_layer_fallbacks":1,"metal_deberta_attention_flash_calls":1,"metal_deberta_attention_gemm_fallbacks":1,"metal_deberta_ffn_fused_calls":1,"metal_deberta_ffn_fused_fallbacks":1}
+        \\{"event":"epoch","avg_loss":1.0}
+        \\
+        ,
+    });
+
+    try std.testing.expectError(error.GraphRuntimeRegionFallbackCountAboveThreshold, validation.validateRun(allocator, out_dir, .{
+        .max_graph_runtime_region_fallback_count = 0,
+    }));
+    try std.testing.expectError(error.MetalDebertaAttentionGemmFallbackCountAboveThreshold, validation.validateRun(allocator, out_dir, .{
+        .max_metal_deberta_attention_gemm_fallback_count = 0,
+    }));
+    try std.testing.expectError(error.MetalDebertaEncoderLoraLayerFallbackCountAboveThreshold, validation.validateRun(allocator, out_dir, .{
+        .max_metal_deberta_encoder_lora_layer_fallback_count = 0,
+    }));
+    try std.testing.expectError(error.MetalDebertaFfnFusedFallbackCountAboveThreshold, validation.validateRun(allocator, out_dir, .{
+        .max_metal_deberta_ffn_fused_fallback_count = 0,
+    }));
+}
+
+test "GLiNER2 autodiff run validator enforces Metal perf ceilings" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(out_dir);
+    const manifest_path = try std.fs.path.join(allocator, &.{ out_dir, validation.manifest_file_name });
+    defer allocator.free(manifest_path);
+    const metrics_path = try std.fs.path.join(allocator, &.{ out_dir, validation.metrics_file_name });
+    defer allocator.free(metrics_path);
+
+    try writeManifest(allocator, manifest_path, 1, 1, 2);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = metrics_path,
+        .data =
+        \\{"event":"step","loss":1.0,"supervised_token_count":4,"entity_token_count":1,"ignored_token_count":0,"target_build_ms":1.0,"train_step_ms":9.0,"step_wall_ms":10.0,"graph_build_ms":1.0,"runtime_input_ms":1.0,"autodiff_ms":2.0,"execute_ms":3.0,"extract_ms":1.0,"optimizer_update_ms":1.0,"trainer_total_ms":8.0,"peak_resident_bytes":1024,"supervised_tokens_per_second":400.0,"graph_executor_command_dispatches":4492,"metal_frame_gpu_ms":1000.5,"metal_last_frame_compute_encoders":1374}
+        \\{"event":"epoch","avg_loss":1.0}
+        \\
+        ,
+    });
+
+    try std.testing.expectError(error.GraphCommandDispatchCountAboveThreshold, validation.validateRun(allocator, out_dir, .{
+        .max_graph_command_dispatch_count = 1024,
+    }));
+    try std.testing.expectError(error.MetalFrameGpuMsAboveThreshold, validation.validateRun(allocator, out_dir, .{
+        .max_metal_frame_gpu_ms = 500.0,
+    }));
+    try std.testing.expectError(error.MetalLastFrameComputeEncoderCountAboveThreshold, validation.validateRun(allocator, out_dir, .{
+        .max_metal_last_frame_compute_encoder_count = 256,
+    }));
+}
+
 test "GLiNER2 autodiff run validator rejects non-resident Metal optimizer metrics" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -393,6 +549,39 @@ test "GLiNER2 autodiff run validator rejects non-resident Metal optimizer metric
         .require_optimizer_backend = "metal",
         .max_device_resident_transfer_count = 0,
         .min_device_trainable_bytes = 1,
+    }));
+}
+
+test "GLiNER2 autodiff run validator rejects objective mismatch" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(out_dir);
+    const manifest_path = try std.fs.path.join(allocator, &.{ out_dir, validation.manifest_file_name });
+    defer allocator.free(manifest_path);
+    const metrics_path = try std.fs.path.join(allocator, &.{ out_dir, validation.metrics_file_name });
+    defer allocator.free(metrics_path);
+    const adapter_path = try std.fs.path.join(allocator, &.{ out_dir, "encoder.layer.0.attention.self.query_proj.lora_A.bin" });
+    defer allocator.free(adapter_path);
+    const peft_config_path = try std.fs.path.join(allocator, &.{ out_dir, "adapter_config.json" });
+    defer allocator.free(peft_config_path);
+    const peft_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, "adapter_model.safetensors" });
+    defer allocator.free(peft_checkpoint_path);
+    const task_head_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, "task_head.safetensors" });
+    defer allocator.free(task_head_checkpoint_path);
+
+    try writeManifestWithRun(allocator, manifest_path, 1, 1, 2, 4, 1, 1, 1, 1, 1.0);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = metrics_path, .data = "{\"event\":\"step\",\"loss\":1.0,\"supervised_token_count\":4,\"entity_token_count\":1,\"ignored_token_count\":0,\"target_build_ms\":1.0,\"train_step_ms\":9.0,\"step_wall_ms\":10.0,\"graph_build_ms\":1.0,\"runtime_input_ms\":1.0,\"autodiff_ms\":2.0,\"execute_ms\":3.0,\"extract_ms\":1.0,\"optimizer_update_ms\":1.0,\"device_optimizer_ms\":0.5,\"optimizer_backend\":\"metal\",\"device_resident_transfer_count\":0,\"device_trainable_bytes\":128,\"trainer_total_ms\":8.0,\"peak_resident_bytes\":1024,\"supervised_tokens_per_second\":400.0}\n{\"event\":\"epoch\",\"avg_loss\":1.0}\n" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = adapter_path, .data = "LORA" });
+    try writePeftConfig(peft_config_path);
+    try writeOneTensorSafetensors(allocator, peft_checkpoint_path);
+    try writeTaskHeadSafetensors(allocator, task_head_checkpoint_path);
+
+    try std.testing.expectError(error.TrainingObjectiveMismatch, validation.validateRun(allocator, out_dir, .{
+        .require_objective = "span-start",
     }));
 }
 
@@ -509,33 +698,40 @@ fn writeManifestWithRun(
 ) !void {
     const data = try std.fmt.allocPrint(allocator,
         \\{{
-        \\  "schema_version": "gliner2_autodiff_training/v1",
-        \\  "artifact_family_version": "gliner2_autodiff_adapter/v1",
+        \\  "schema_version": "gliner2_autodiff_training/v2",
+        \\  "artifact_family_version": "gliner2_autodiff_adapter/v2",
         \\  "backend": "Metal",
+        \\  "objective": "gliner2-total-loss",
         \\  "metrics_file": "training_metrics.jsonl",
         \\  "adapter_parameter_file_count": {},
         \\  "peft_adapter_checkpoint": "adapter_model.safetensors",
         \\  "peft_adapter_config": "adapter_config.json",
         \\  "peft_adapter_tensor_count": {},
         \\  "regular_trainable_checkpoint": "task_head.safetensors",
+        \\  "regular_trainable_checkpoint_role": "inference_graph_compatibility_only",
         \\  "regular_trainable_tensor_count": {},
+        \\  "model_dropout": "disabled",
         \\  "num_classes": {},
+        \\  "schema_slot_count": {},
         \\  "hidden_size": {},
         \\  "model_dir": "base-model",
         \\  "lora_rank": 16,
         \\  "lora_alpha": 32,
         \\  "lora_targets": "query_proj,value_proj",
+        \\  "resolved_lora_targets": ["query_proj", "value_proj"],
         \\  "entity_labels": ["location", "organization", "person"],
         \\  "entity_label_count": 3,
         \\  "epochs": {},
         \\  "batch_size": 1,
         \\  "seq_len": 64,
         \\  "example_count": {},
+        \\  "micro_batch_steps": {},
         \\  "total_steps": {},
+        \\  "optimizer_steps": {},
         \\  "final_avg_loss": {d}
         \\}}
         \\
-    , .{ adapter_count, peft_tensor_count, task_head_tensor_count, num_classes, hidden_size, epochs, example_count, total_steps, final_avg_loss });
+    , .{ adapter_count, peft_tensor_count, task_head_tensor_count, num_classes, num_classes - 1, hidden_size, epochs, example_count, total_steps, total_steps, total_steps, final_avg_loss });
     defer allocator.free(data);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = data });
 }
@@ -545,9 +741,11 @@ fn writePeftConfig(path: []const u8) !void {
         .sub_path = path,
         .data =
         \\{
+        \\  "auto_mapping": {"base_model_class": "Extractor", "parent_library": "gliner2.model"},
         \\  "base_model_name_or_path": "base-model",
+        \\  "bias": "none",
         \\  "peft_type": "LORA",
-        \\  "task_type": "TOKEN_CLS",
+        \\  "task_type": null,
         \\  "r": 16,
         \\  "lora_alpha": 32,
         \\  "target_modules": ["query_proj", "value_proj"],
@@ -561,7 +759,7 @@ fn writePeftConfig(path: []const u8) !void {
 fn writeOneTensorSafetensors(allocator: std.mem.Allocator, path: []const u8) !void {
     var buf: std.Io.Writer.Allocating = .init(allocator);
     defer buf.deinit();
-    const header = "{\"adapter.test.lora_A.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    const header = "{\"base_model.model.test.lora_A.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
     var len_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &len_buf, header.len, .little);
     try buf.writer.writeAll(&len_buf);

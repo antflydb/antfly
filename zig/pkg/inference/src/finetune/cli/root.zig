@@ -65,7 +65,6 @@ const run_layoutlmv3_lora_smoke_workflow = @import("../train/run_layoutlmv3_lora
 const train_eval_colqwen2_lora_bundle = @import("../train/train_eval_colqwen2_lora_bundle.zig");
 const train_eval_entity_cleanup_head = @import("../train/train_eval_entity_cleanup_head.zig");
 const train_eval_gemma4_lora_bundle = @import("../train/train_eval_gemma4_lora_bundle.zig");
-const train_eval_gliner2_lora_bundle = @import("../train/train_eval_gliner2_lora_bundle.zig");
 const train_eval_gliner2_boundary_head = @import("../train/train_eval_gliner2_top_layer_boundary_head.zig");
 const train_eval_gliner2_boundary_task_head = @import("../train/train_eval_gliner2_top_layer_boundary_task_head.zig");
 const train_eval_layoutlmv3_lora_sequence = @import("../train/train_eval_layoutlmv3_lora_sequence.zig");
@@ -129,7 +128,6 @@ const commands = [_]Command{
     .{ .domain = "adapter", .action = "materialize", .subject = "reranker", .adapter_argv0 = "materialize-reranker-lora", .main_fn = materialize_reranker_lora.main },
 
     .{ .domain = "train", .action = "run", .subject = "gemma4-lora", .adapter_argv0 = "train-eval-gemma4-lora-bundle", .main_fn = train_eval_gemma4_lora_bundle.main },
-    .{ .domain = "train", .action = "run", .subject = "gliner2-lora", .adapter_argv0 = "train-eval-gliner2-lora-bundle", .main_fn = train_eval_gliner2_lora_bundle.main },
     .{ .domain = "train", .action = "run", .subject = "gliner2-autodiff", .adapter_argv0 = "train-gliner2-autodiff", .main_fn = train_gliner2_autodiff.main },
     .{ .domain = "train", .action = "run", .subject = "gliner2-boundary-head", .adapter_argv0 = "train-eval-gliner2-top-layer-boundary-head", .main_fn = train_eval_gliner2_boundary_head.main },
     .{ .domain = "train", .action = "run", .subject = "gliner2-boundary-task-head", .adapter_argv0 = "train-eval-gliner2-top-layer-boundary-task-head", .main_fn = train_eval_gliner2_boundary_task_head.main },

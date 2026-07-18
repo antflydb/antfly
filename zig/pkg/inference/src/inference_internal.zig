@@ -26,6 +26,7 @@ pub const graph = @import("graph/root.zig");
 pub const io = @import("io/io.zig");
 pub const ops = @import("ops/ops.zig");
 pub const run = @import("run/root.zig");
+pub const runtime = @import("runtime/root.zig");
 pub const util = @import("util/util.zig");
 pub const native_backend_guard = @import("native_backend_guard.zig");
 pub const native_backend_choice = @import("native_backend_choice.zig");
