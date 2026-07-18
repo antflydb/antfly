@@ -3,7 +3,6 @@
  * Uses pre-computed embeddings and Antfly inference's /ai/v1/embed for query embedding.
  */
 
-import type { InferenceClient } from "@antfly/sdk";
 import { type CommandMetadata, commandIndex } from "@/data/commands";
 
 export interface SemanticResult {
@@ -42,19 +41,25 @@ function cosineSimilarity(a: number[], b: number[]): number {
  * computes cosine similarity against pre-embedded command vectors.
  *
  * @param query - The user's search query
- * @param inferenceClient - InferenceClient instance for embedding
+ * @param embedUrl - Connection-aware embedding endpoint
  * @param limit - Maximum number of results to return (default: 3)
  * @returns Promise resolving to semantic search results sorted by score
  */
 export async function semanticSearch(
   query: string,
-  inferenceClient: InferenceClient,
+  embedUrl: string,
   limit = 3
 ): Promise<SemanticResult[]> {
   try {
     // Get query embedding from Antfly inference.
     // Use the same model as the pre-computed embeddings
-    const response = await inferenceClient.embed(commandIndex.model, query);
+    const request = await fetch(embedUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: commandIndex.model, input: query }),
+    });
+    if (!request.ok) return [];
+    const response = await request.json();
     const queryVec = response.data[0]?.embedding;
     if (!Array.isArray(queryVec)) {
       return [];

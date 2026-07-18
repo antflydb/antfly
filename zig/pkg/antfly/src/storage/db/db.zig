@@ -22231,7 +22231,7 @@ fn computeDocumentExtractionAssetRequestDerived(
         },
     };
     defer extraction.deinit(alloc);
-    try completeDocumentExtractionGeneratedText(alloc, db.enrichment_runtime, config, source_url, extraction.content_type, &extraction);
+    try completeDocumentExtractionGeneratedText(alloc, db.enrichment_runtime, config, source_url, downloaded_mut.data, extraction.content_type, &extraction);
 
     const byte_source_fingerprint = if (metadata_fingerprint == null)
         try documentExtractionFingerprintAlloc(alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
@@ -22408,24 +22408,51 @@ fn completeDocumentExtractionGeneratedText(
     runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
     config: document_extraction_mod.Config,
     source_url: []const u8,
+    source_bytes: []const u8,
     source_content_type: []const u8,
     extraction: *document_extraction_mod.Result,
 ) !void {
     const active_runtime = runtime orelse return;
     const producer = active_runtime.config.asset_producer orelse return;
     for (extraction.units) |*unit| {
-        if (config.ocr_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_ocr")) {
-            const parts_json = try documentGeneratedTextPartsJsonAlloc(alloc, extraction.route_type, source_content_type, unit.*);
+        if (document_extraction_mod.ocrEnabledForRoute(config, extraction.route_type) and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_ocr")) {
+            var rendered_page: ?[]u8 = null;
+            defer if (rendered_page) |png| alloc.free(png);
+            if (std.mem.eql(u8, extraction.route_type, "pdf")) {
+                rendered_page = document_extraction_mod.renderPdfPagePngAlloc(alloc, source_bytes, unit.page_number orelse 1) catch |err| {
+                    const any_err: anyerror = err;
+                    if (any_err == error.OutOfMemory) return any_err;
+                    try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, any_err);
+                    continue;
+                };
+            }
+            const parts_json = if (rendered_page) |png|
+                try document_extraction_mod.ocrPagePartsJsonAlloc(alloc, extraction.route_type, source_content_type, unit.*, png)
+            else
+                try documentGeneratedTextPartsJsonAlloc(alloc, extraction.route_type, source_content_type, unit.*);
             defer alloc.free(parts_json);
-            const produced = try producer.produce(alloc, .{
+            const produced = producer.produce(alloc, .{
                 .producer_type = .reader,
-                .config_json = config.ocr_config_json,
-                .source_text = source_url,
+                .config_json = document_extraction_mod.effectiveOcrConfigJson(config),
+                .source_text = if (rendered_page != null) "" else source_url,
                 .source_parts_json = parts_json,
                 .content_type = "text/plain",
-            });
+            }) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                if (isUnavailableGeneratedTextModelError(.ocr, err)) {
+                    try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, err);
+                    continue;
+                }
+                if (isRetryableAssetProducerError(err)) return err;
+                try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, err);
+                continue;
+            };
             errdefer alloc.free(produced);
-            try applyGeneratedUnitText(alloc, unit, produced, "ocr_text", "completed", .ocr);
+            applyGeneratedUnitText(alloc, unit, produced, "ocr_text", "completed", .ocr) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                if (isRetryableAssetProducerError(err)) return err;
+                try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, err);
+            };
             continue;
         }
         if (config.transcription_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_transcription")) {
@@ -22446,6 +22473,38 @@ fn completeDocumentExtractionGeneratedText(
 
 const GeneratedUnitTextKind = enum { ocr, transcript };
 
+fn isUnavailableGeneratedTextModelError(kind: GeneratedUnitTextKind, err: anyerror) bool {
+    if (kind != .ocr) return false;
+    return switch (err) {
+        error.ModelNotFound,
+        error.ModelNotSpecified,
+        error.UnsupportedReaderProvider,
+        => true,
+        else => false,
+    };
+}
+
+test "precompute OCR error policy distinguishes unavailable models from transient inference failures" {
+    try std.testing.expect(isUnavailableGeneratedTextModelError(.ocr, error.ModelNotFound));
+    try std.testing.expect(isUnavailableGeneratedTextModelError(.ocr, error.ModelNotSpecified));
+    try std.testing.expect(isUnavailableGeneratedTextModelError(.ocr, error.UnsupportedReaderProvider));
+    try std.testing.expect(!isUnavailableGeneratedTextModelError(.ocr, error.ConnectionTimedOut));
+    try std.testing.expect(isRetryableAssetProducerError(error.ConnectionTimedOut));
+    try std.testing.expect(isRetryableAssetProducerError(error.EmbedRateLimited));
+}
+
+test "db document extraction OCR default is scoped to PDF routes" {
+    const alloc = std.testing.allocator;
+    var defaults = try document_extraction_mod.parseConfig(alloc, "{}");
+    defer defaults.deinit(alloc);
+    try std.testing.expect(document_extraction_mod.ocrEnabledForRoute(defaults, "pdf"));
+    try std.testing.expect(!document_extraction_mod.ocrEnabledForRoute(defaults, "image"));
+
+    var explicit_image = try document_extraction_mod.parseConfig(alloc, "{\"ocr\":true}");
+    defer explicit_image.deinit(alloc);
+    try std.testing.expect(document_extraction_mod.ocrEnabledForRoute(explicit_image, "image"));
+}
+
 fn applyGeneratedUnitText(
     alloc: Allocator,
     unit: *document_extraction_mod.Unit,
@@ -22456,7 +22515,7 @@ fn applyGeneratedUnitText(
 ) !void {
     if (produced.len == 0) {
         alloc.free(produced);
-        return;
+        return error.EmptyGeneratedText;
     }
     defer alloc.free(produced);
     var parsed = try parseGeneratedUnitTextOutputAlloc(alloc, produced);
@@ -22490,6 +22549,50 @@ fn applyGeneratedUnitText(
     const start = unit.char_start orelse 0;
     unit.char_start = start;
     unit.char_end = std.math.cast(u32, @as(usize, @intCast(start)) + unit.text.len);
+}
+
+fn markGeneratedUnitTextFailure(
+    alloc: Allocator,
+    unit: *document_extraction_mod.Unit,
+    method: []const u8,
+    kind: GeneratedUnitTextKind,
+    err: anyerror,
+) !void {
+    const failed_status = switch (kind) {
+        .ocr => "failed_ocr",
+        .transcript => "failed_transcription",
+    };
+    const warning = try std.fmt.allocPrint(alloc, "{s} failed: {s}", .{ method, @errorName(err) });
+    errdefer alloc.free(warning);
+    const owned_text = try alloc.dupe(u8, "");
+    errdefer alloc.free(owned_text);
+    const owned_method = try alloc.dupe(u8, method);
+    errdefer alloc.free(owned_method);
+    const owned_status = try alloc.dupe(u8, failed_status);
+    errdefer alloc.free(owned_status);
+
+    alloc.free(unit.text);
+    alloc.free(unit.method);
+    if (unit.extraction_status) |value| alloc.free(value);
+    if (unit.extraction_warning) |value| alloc.free(value);
+    unit.text = owned_text;
+    unit.method = owned_method;
+    unit.extraction_status = owned_status;
+    unit.extraction_warning = warning;
+    switch (kind) {
+        .ocr => {
+            unit.ocr_used = false;
+            unit.ocr_confidence = null;
+            unit.ocr_bbox = null;
+        },
+        .transcript => {
+            unit.transcript_used = false;
+            unit.transcript_confidence = null;
+        },
+    }
+    const start = unit.char_start orelse 0;
+    unit.char_start = start;
+    unit.char_end = start;
 }
 
 const ParsedGeneratedUnitText = struct {

@@ -73,6 +73,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/connections/{connection_id}/inference/{operation}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Invoke an Antfly-compatible inference connection */
+        post: operations["invokeInferenceConnection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/secrets": {
         parameters: {
             query?: never;
@@ -5806,21 +5823,24 @@ export interface components {
              *
              *     UTF-8 template input is limited to 64 KiB.
              *
-             *     Use this when you want to embed multimodal content (images, PDFs, etc.) instead of
+             *     Use this when you want to embed template-time multimodal content instead of
              *     just text. The template is rendered using dotprompt with access to remote content helpers.
              *
              *     **Available Helpers**:
              *     - `remoteMedia url=<url>` - Fetches and embeds remote images/media
-             *     - `remotePDF url=<url>` - Fetches and extracts content from PDFs
+             *     - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs
              *     - `remoteText url=<url>` - Fetches and includes remote text content
              *
+             *     Use a `document_extraction` asset producer when PDF pages and chunks must be persisted
+             *     and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input.
+             *
              *     **Examples**:
-             *     - PDF search: `{{remotePDF url=this}}`
+             *     - Legacy PDF search: `{{remotePDF url=this}}`
              *     - Image search: `{{remoteMedia url=this}}`
              *     - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}`
              *
              *     When not specified, the semantic_search string is embedded as plain text.
-             * @example {{remotePDF url=this}}
+             * @example {{remoteMedia url=this}}
              */
             embedding_template?: string;
             /**
@@ -12713,6 +12733,66 @@ export interface operations {
                 };
             };
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    invokeInferenceConnection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+                /** @description Requires the connection capability `models.<operation>`. */
+                operation: "embed" | "generate" | "rerank" | "chunk" | "recognize" | "extract" | "rewrite" | "read" | "transcribe";
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Inference provider response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Invalid connection or operation */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized - authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The connection does not declare the capability required by this operation */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Inference provider request failed */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     listSecrets: {

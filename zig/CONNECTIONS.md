@@ -226,10 +226,18 @@ Common capabilities:
 - `models.rerank`
 - `models.chunk`
 - `models.transcribe`
+- `models.recognize`
+- `models.rewrite`
+- `models.read`
 - `models.classify`
 - `models.extract`
 - `agents.use`
 - `indexing.use`
+
+The connection ID `local-inference` is reserved for the inference runtime
+embedded in the Antfly instance and cannot be used by configured connections.
+Proxying an inference operation requires its matching `models.<operation>`
+capability on the selected connection.
 
 ### Web Search
 

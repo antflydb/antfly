@@ -349,3 +349,35 @@ func TestAntflyClusterValidator_ValidateDelete(t *testing.T) {
 		t.Errorf("expected no warnings on delete, got: %v", warnings)
 	}
 }
+
+func TestAntflyClusterValidator_RejectsHotStandbyWhenFeatureGateDisabled(t *testing.T) {
+	v := &AntflyClusterValidator{}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{Mode: antflyv1.HAModeHotStandby},
+		},
+	}
+
+	_, err := v.ValidateCreate(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "--enable-hot-standby-ha=true") {
+		t.Fatalf("expected disabled hot-standby feature-gate error, got %v", err)
+	}
+}
+
+func TestAntflyClusterValidator_AllowsDisablingHotStandbyWhenFeatureGateDisabled(t *testing.T) {
+	v := &AntflyClusterValidator{}
+	oldCluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{
+			MetadataNodes:    antflyv1.MetadataNodesSpec{Replicas: 3},
+			HighAvailability: &antflyv1.HighAvailabilitySpec{Mode: antflyv1.HAModeHotStandby},
+		},
+	}
+	newCluster := oldCluster.DeepCopy()
+	newCluster.Spec.HighAvailability = nil
+
+	if _, err := v.ValidateUpdate(context.Background(), oldCluster, newCluster); err != nil {
+		t.Fatalf("expected disabling hot-standby HA to remain available, got %v", err)
+	}
+}

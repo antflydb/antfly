@@ -19,6 +19,7 @@ const antfly_embedded_build = @import("pkg/antfly/build/embedded.zig");
 const antfly_storage_build = @import("pkg/antfly/build/storage.zig");
 const antfly_tests_build = @import("pkg/antfly/build/tests.zig");
 const inference_runtime_build = @import("pkg/inference/build/runtime.zig");
+const platform_build = @import("lib/platform/build_support.zig");
 
 const LmdbBackend = antfly_storage_build.LmdbBackend;
 const chainLabeledFilteredTests = antfly_tests_build.chainLabeledFilteredTests;
@@ -475,6 +476,9 @@ const AntflyRootImports = struct {
     prometheus: *std.Build.Module,
     structlog: *std.Build.Module,
     platform: *std.Build.Module,
+    platform_link_libc: bool,
+    platform_target: std.Build.ResolvedTarget,
+    filesystem_capacity_source_file: std.Build.LazyPath,
 
     const import_table = [_]struct { name: []const u8, field: []const u8 }{
         .{ .name = "lmdb_engine", .field = "lmdb_engine" },
@@ -540,13 +544,20 @@ const AntflyRootImports = struct {
         .{ .name = "inference_server", .field = "inference_server" },
         .{ .name = "prometheus", .field = "prometheus" },
         .{ .name = "structlog", .field = "structlog" },
-        .{ .name = "antfly_platform", .field = "platform" },
     };
 
     fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
         mod.addOptions("build_options", self.build_options);
         inline for (import_table) |entry| {
             mod.addImport(entry.name, @field(self, entry.field));
+        }
+        mod.addImport("antfly_platform", self.platform);
+        if (link_libc and !self.platform_link_libc) {
+            platform_build.addFilesystemCapacitySource(
+                mod,
+                self.filesystem_capacity_source_file,
+                self.platform_target,
+            );
         }
         mod.addIncludePath(b.path("lib/lmdb"));
         if (include_lmdb_c) {
@@ -1092,6 +1103,7 @@ pub fn build(b: *std.Build) void {
     const with_tla = b.option(bool, "with_tla", "Enable TLA+ trace instrumentation (ndjson event logging)") orelse false;
     const link_libc = b.option(bool, "link-libc", "Link Antfly runtime modules against libc") orelse true;
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer for the Antfly runtime") orelse false;
+    const include_ha_tests_in_aggregates = b.option(bool, "ha-tests", "Include hot-standby HA suites in aggregate test steps") orelse true;
     const edition = b.option(BuildEdition, "edition", "Build edition: full or inference") orelse .full;
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
@@ -1259,15 +1271,19 @@ pub fn build(b: *std.Build) void {
     // Protobuf wire format
     const protobuf_dep = b.dependency("protobuf", .{});
     const protobuf_mod = protobuf_dep.module("protobuf");
-    const platform_mod = b.createModule(.{
+    const platform_mod = platform_build.createModule(b, .{
         .root_source_file = b.path("lib/platform/src/root.zig"),
+        .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
         .target = target,
         .optimize = optimize,
+        .link_libc = link_libc,
     });
-    const wasm_platform_mod = b.createModule(.{
+    const wasm_platform_mod = platform_build.createModule(b, .{
         .root_source_file = b.path("lib/platform/src/root.zig"),
+        .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
         .target = wasm_target,
         .optimize = optimize,
+        .link_libc = false,
     });
     const objectstore_mod = b.createModule(.{
         .root_source_file = b.path("lib/objectstore/src/root.zig"),
@@ -1688,6 +1704,9 @@ pub fn build(b: *std.Build) void {
         .prometheus = prometheus_mod,
         .structlog = structlog_mod,
         .platform = platform_mod,
+        .platform_link_libc = link_libc,
+        .platform_target = target,
+        .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
     };
 
     // Library module
@@ -2626,6 +2645,18 @@ pub fn build(b: *std.Build) void {
     const bench_pdf_step = b.step("bench-pdf", "Run lib/pdf benchmarks");
     bench_pdf_step.dependOn(&run_lib_pdf_bench.step);
 
+    const lib_pdf_safety_tests = b.addTest(.{
+        .root_module = pdf_mod,
+        .filters = &.{
+            "native backend renders simple pdf first page png",
+            "stream decoders enforce the decoded byte budget before growth",
+            "xref parser rejects a cyclic Prev chain",
+        },
+    });
+    const run_lib_pdf_safety_tests = b.addRunArtifact(lib_pdf_safety_tests);
+    const lib_pdf_safety_test_step = b.step("lib-pdf-safety-test", "Run focused PDF OCR rendering and parser safety tests");
+    lib_pdf_safety_test_step.dependOn(&run_lib_pdf_safety_tests.step);
+
     const lib_image_conformance_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/src/mod.zig"),
         .target = target,
@@ -2938,6 +2969,7 @@ pub fn build(b: *std.Build) void {
         "db split modeled ",
         "serverless",
         "raft.",
+        "storage.ha",
         "HBC recall",
     };
     const unit_progress_skip_filters = root_test_skip_filters;
@@ -4217,6 +4249,9 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "object probe cache identity covers every bucket and credential source",
             "connection cache remains valid across every allocation failure",
+            "build response exposes embedded inference as a local connection",
+            "inference connection operations are allowlisted",
+            "inference connection URLs require an HTTP origin",
             "build response reports mock connected and types filter",
             "build response reports configured external io connections",
             "build response reports configured web search connections",
@@ -5155,7 +5190,9 @@ pub fn build(b: *std.Build) void {
     var chaos_progress_tail: ?*std.Build.Step = null;
     chaos_progress_tail = chainLabeledRun(b, lib_metadata_vopr_chaos_tests, "lib-metadata-vopr-chaos-test", chaos_progress_tail);
     chaos_progress_tail = chainLabeledRun(b, lib_lsm_backend_chaos_tests, "lib-lsm-backend-chaos-test", chaos_progress_tail);
-    chaos_progress_tail = chainLabeledRun(b, lib_ha_chaos_tests, "ha-chaos-test", chaos_progress_tail);
+    if (include_ha_tests_in_aggregates) {
+        chaos_progress_tail = chainLabeledRun(b, lib_ha_chaos_tests, "ha-chaos-test", chaos_progress_tail);
+    }
     chaos_test_step.dependOn(chaos_progress_tail.?);
 
     const chaos_soak_test_step = b.step("chaos-soak-test", "Run broad legacy metadata and raft chaos simulation soaks");
@@ -5401,6 +5438,9 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
     unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
     unit_test_step.dependOn(lib_standalone_runtime_test_step);
+    if (include_ha_tests_in_aggregates) {
+        unit_test_step.dependOn(ha_test_step);
+    }
     unit_test_step.dependOn(&run_raft_unit_tests.step);
 
     // Progress mode uses one union-filtered root artifact too. Storage and
@@ -5428,6 +5468,9 @@ pub fn build(b: *std.Build) void {
 
     var unit_progress_tail: ?*std.Build.Step = null;
     unit_progress_tail = chainLabeledRunStep(b, run_unit_progress_root_tests, "lib-root-test", unit_progress_tail);
+    if (include_ha_tests_in_aggregates) {
+        unit_progress_tail = chainLabeledRun(b, ha_tests, "ha-test", unit_progress_tail);
+    }
     unit_progress_tail = chainLabeledRun(b, lib_template_tests, "lib-template-test", unit_progress_tail);
     unit_test_progress_step.dependOn(unit_progress_tail.?);
 
@@ -6597,7 +6640,9 @@ pub fn build(b: *std.Build) void {
     run_compat.addArg("compat/cases");
     const compat_step = b.step("compat", "Run the shared compatibility corpus");
     compat_step.dependOn(&run_compat.step);
-    compat_step.dependOn(&run_lib_ha_compat_tests.step);
+    if (include_ha_tests_in_aggregates) {
+        compat_step.dependOn(&run_lib_ha_compat_tests.step);
+    }
 
     const search_benchmark_index_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/search_benchmark_index.zig"),

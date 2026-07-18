@@ -58,8 +58,8 @@ Fields marked as `link` type will be automatically processed during indexing. Su
 
 AntflyDB provides Handlebars helpers to process remote content in index templates:
 
-- **`{{remoteMedia url="..."}}`** - Downloads and processes images, returns a Genkit media directive
-- **`{{remotePDF url="..."}}`** - Downloads and extracts text from PDFs
+- **`{{remoteMedia url="..."}}`** - Downloads media and prepares it as model inference input
+- **`{{remotePDF url="..."}}`** - **Deprecated.** Downloads and extracts text from born-digital PDFs
 - **`{{remoteText url="..."}}`** - Downloads and preserves text content (HTML, markdown, etc.)
 
 These helpers automatically:
@@ -68,6 +68,22 @@ These helpers automatically:
 - Process images (resize, convert to data URIs)
 - Extract text from PDFs
 - Handle errors gracefully
+
+Template helpers run while a template is rendered. They do not persist PDF page units or make OCR output independently reprocessable. For durable PDF ingestion, configure a `document_extraction` asset producer on the URL field:
+
+```json
+{
+  "name": "document_units_v1",
+  "kind": "asset",
+  "field": "url",
+  "content_type": "application/json",
+  "producer_json": "{\"type\":\"document_extraction\",\"config\":{}}"
+}
+```
+
+`document_extraction` downloads the URL server-side and persists one unit per PDF page. Pages with zero native text are rendered at 150 DPI and sent to the local `antflydb/Florence-2-base` reader by default. Install it explicitly with `antfly inference pull antflydb/Florence-2-base`; Antfly does not download it automatically. If it is absent, the page is stored with `extraction_status: "failed_ocr"`, `ocr_used: false`, and a `ModelNotFound` warning. Install the model and explicitly reprocess the artifact to retry. Set `ocr_fallback` to `false` or `ocr.enabled` to `false` to disable this fallback.
+
+The built-in parser targets unencrypted, born-digital PDFs. For a broader file-ingestion workflow, including formats the built-in parser does not support, use the [docsaf example](https://github.com/antflydb/antfly/tree/main/examples/docsaf).
 
 ## Creating Multimodal Indexes
 
@@ -130,9 +146,9 @@ In this configuration:
 - **`--summarizer`**: LLaVA vision model analyzes the image and generates a description
 - **`--embedder`**: all-minilm creates searchable embeddings from the combined text and image description
 
-### Example: PDF Document Search
+### Legacy example: PDF Document Search with `remotePDF`
 
-For processing PDF documents:
+This compatibility example uses the deprecated `remotePDF` helper. Prefer `document_extraction` for durable ingestion.
 
 ```bash
 antfly table create --table documents \
@@ -268,7 +284,7 @@ antfly query --table product_catalog \
 
 2. **Template Design**:
    - Combine text fields and remote content in templates: `{{name}} {{remoteMedia url=image_url}}`
-   - Use `{{remotePDF}}` for PDF text extraction
+   - For PDFs, use `document_extraction`; `{{remotePDF}}` is deprecated compatibility behavior
    - Use `{{remoteText}}` for HTML articles or other text content
    - Templates work with or without schemas for backward compatibility
 
@@ -298,7 +314,7 @@ antfly query --table product_catalog \
 - WebP
 - Returns Genkit dotprompt media directive for vision models
 
-**PDFs** (via `{{remotePDF}}`):
+**PDFs** (via deprecated `{{remotePDF}}`):
 - Extracts text content from PDF documents
 - Optional `output="markdown"` parameter for formatted output
 - Returns plain text (not a directive)
@@ -367,7 +383,7 @@ The `embedding_template` field in query requests lets you specify how the `seman
 
 **Available helpers:**
 - `{{remoteMedia url=this}}` - Fetches and embeds remote images
-- `{{remotePDF url=this}}` - Fetches and extracts content from PDFs
+- `{{remotePDF url=this}}` - **Deprecated.** Fetches and extracts content from PDFs
 - `{{remoteText url=this}}` - Fetches remote text content
 - `{{media url=this}}` - Embeds inline data URIs (base64 images)
 
@@ -470,9 +486,9 @@ const results = await client.query({
 });
 ```
 
-### Example: Search by PDF Content
+### Legacy example: Search by PDF Content
 
-Find documents similar to a PDF:
+The deprecated `remotePDF` helper remains available for compatibility in query templates:
 
 ```bash
 curl -X POST http://localhost:8080/v1/query \
@@ -511,4 +527,3 @@ curl -X POST http://localhost:8080/v1/query \
 | Ollama + Vision | Any + LLaVA | Via summarizer | Via summarizer |
 
 For providers that don't natively support multimodal embeddings, use the `--summarizer` option to convert images to text descriptions before embedding.
-

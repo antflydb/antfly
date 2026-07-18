@@ -202,6 +202,11 @@ pub fn build(b: *std.Build) void {
         blas_root_opt;
     const antfly_version = b.option([]const u8, "antfly-version", "Antfly version string") orelse "dev";
     const enable_native_quant_dispatch_stats = b.option(bool, "enable-native-quant-dispatch-stats", "Enable native quant dispatch counters for benchmark diagnostics") orelse false;
+    const configured_platform_mod = b.dependency("antfly_platform", .{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    }).module("antfly_platform");
 
     const runtime_graph = runtime_build.create(.{
         .b = b,
@@ -212,6 +217,9 @@ pub fn build(b: *std.Build) void {
             .shared_lib_root = shared_lib_root,
         },
         .register_public_modules = true,
+        .shared = .{
+            .platform = configured_platform_mod,
+        },
         .backend = .{
             .enable_onnx = enable_onnx,
             .onnx_root = effective_onnx_root,
@@ -1307,12 +1315,12 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
             .single_threaded = true,
         });
-        const wasm_platform_mod = b.createModule(.{
-            .root_source_file = b.path(b.fmt("{s}/lib/platform/src/root.zig", .{shared_lib_root})),
+        const wasm_platform_mod = b.dependency("antfly_platform", .{
             .target = wasm_target,
             .optimize = .ReleaseSafe,
-            .single_threaded = true,
-        });
+            .link_libc = false,
+        }).module("antfly_platform");
+        wasm_platform_mod.single_threaded = true;
         const wasm_linalg_mod = b.createModule(.{
             .root_source_file = b.path(b.fmt("{s}/lib/linalg/src/mod.zig", .{shared_lib_root})),
             .target = wasm_target,

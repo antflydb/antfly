@@ -7,9 +7,9 @@ import (
 )
 
 // SetupWithManager registers all admission webhooks with the manager.
-func SetupWithManager(mgr ctrl.Manager) error {
+func SetupWithManager(mgr ctrl.Manager, enableHotStandbyHA bool) error {
 	if err := builder.WebhookManagedBy(mgr, &antflyv1.AntflyCluster{}).
-		WithValidator(&AntflyClusterValidator{}).
+		WithValidator(&AntflyClusterValidator{EnableHotStandbyHA: enableHotStandbyHA}).
 		Complete(); err != nil {
 		return err
 	}

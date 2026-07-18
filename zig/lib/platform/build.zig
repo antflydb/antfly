@@ -13,14 +13,18 @@
 // limitations under the License.
 
 const std = @import("std");
+const platform_build = @import("build_support.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const link_libc = b.option(bool, "link_libc", "Link the platform module against libc") orelse true;
 
-    _ = b.addModule("antfly_platform", .{
+    _ = platform_build.addModule(b, "antfly_platform", .{
         .root_source_file = b.path("src/root.zig"),
+        .filesystem_capacity_source_file = b.path("src/filesystem_capacity.c"),
         .target = target,
         .optimize = optimize,
+        .link_libc = link_libc,
     });
 }
