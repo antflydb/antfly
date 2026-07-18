@@ -1125,6 +1125,27 @@ pub const Reader = struct {
     xref_entries: []XrefEntry,
     trailer: syntax.Object,
 
+    const max_recursive_pdf_objects: usize = 100_000;
+
+    const TraversalGuard = struct {
+        visited: std.AutoHashMapUnmanaged(u64, void) = .empty,
+        nodes: usize = 0,
+
+        fn deinit(self: *TraversalGuard, alloc: Allocator) void {
+            self.visited.deinit(alloc);
+        }
+
+        fn enter(self: *TraversalGuard, alloc: Allocator, value: *const syntax.Object) !void {
+            self.nodes = std.math.add(usize, self.nodes, 1) catch return error.InvalidPageTree;
+            if (self.nodes > max_recursive_pdf_objects) return error.InvalidPageTree;
+            if (value.* != .obj_ref) return;
+            const ptr = value.obj_ref;
+            const key = (@as(u64, ptr.id) << 16) | ptr.gen;
+            const result = try self.visited.getOrPut(alloc, key);
+            if (result.found_existing) return error.InvalidPageTree;
+        }
+    };
+
     pub fn init(alloc: Allocator, bytes: []const u8) !Reader {
         if (bytes.len < 10) return error.InvalidPdfHeader;
         if (!std.mem.startsWith(u8, bytes, "%PDF-1.")) return error.InvalidPdfHeader;
@@ -1194,7 +1215,7 @@ pub const Reader = struct {
     pub fn readRawStreamData(self: *const Reader, obj: *const syntax.Object) ![]u8 {
         if (obj.* != .stream) return error.NotAStream;
         const stream_value = obj.stream;
-        const end = stream_value.data_offset + stream_value.data_length;
+        const end = std.math.add(usize, stream_value.data_offset, stream_value.data_length) catch return error.InvalidObjectOffset;
         if (end > self.bytes.len) return error.InvalidObjectOffset;
         return try self.alloc.dupe(u8, self.bytes[stream_value.data_offset..end]);
     }
@@ -1229,7 +1250,9 @@ pub const Reader = struct {
         defer pages.deinit(self.alloc);
 
         var remaining = page_num;
-        return try self.findPageObject(&pages, &remaining);
+        var guard: TraversalGuard = .{};
+        defer guard.deinit(self.alloc);
+        return try self.findPageObject(&pages, &remaining, 0, &guard);
     }
 
     pub fn extractPageTextAlloc(self: *const Reader, page_num: usize) ![]u8 {
@@ -1889,7 +1912,8 @@ pub const Reader = struct {
         };
     }
 
-    fn findPageObject(self: *const Reader, node: *const syntax.Object, remaining: *usize) anyerror!syntax.Object {
+    fn findPageObject(self: *const Reader, node: *const syntax.Object, remaining: *usize, depth: usize, guard: *TraversalGuard) anyerror!syntax.Object {
+        if (depth > 128) return error.InvalidPageTree;
         if (node.* != .dict) return error.InvalidPageTree;
 
         const ty = node.get("Type") orelse return error.InvalidPageTree;
@@ -1906,6 +1930,7 @@ pub const Reader = struct {
         if (kids.* != .array) return error.InvalidPageTree;
 
         for (kids.array) |kid| {
+            try guard.enter(self.alloc, &kid);
             var resolved = try self.resolveValue(&kid);
             defer resolved.deinit(self.alloc);
 
@@ -1927,7 +1952,7 @@ pub const Reader = struct {
                 }
             }
 
-            if (self.findPageObject(&resolved, remaining)) |page| {
+            if (self.findPageObject(&resolved, remaining, depth + 1, guard)) |page| {
                 return page;
             } else |err| switch (err) {
                 error.PageOutOfRange => {},
@@ -2813,6 +2838,9 @@ pub const Reader = struct {
 
         const width: u32 = @intCast(width_i);
         const height: u32 = @intCast(height_i);
+        const pixel_count = std.math.mul(usize, width, height) catch return error.UnsupportedPdfRendering;
+        if (pixel_count > 100_000_000) return error.RenderedPageTooLarge;
+        const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.UnsupportedPdfRendering;
         if (has_ccitt) {
             const raw = try self.readRawStreamData(obj);
             defer self.alloc.free(raw);
@@ -2820,8 +2848,8 @@ pub const Reader = struct {
             const gray = try decodeCcittGrayAlloc(self.alloc, raw, width, height, filter_param);
             defer self.alloc.free(gray);
 
-            const pixel_count = @as(usize, width) * @as(usize, height);
-            const rgba = try self.alloc.alloc(u8, pixel_count * 4);
+            const rgba = try self.alloc.alloc(u8, rgba_len);
+            errdefer self.alloc.free(rgba);
             if (image_mask) {
                 try decodeGrayMaskToRgba(rgba, gray, obj.get("Decode"));
                 return .{ .rgba = rgba, .width = width, .height = height };
@@ -2879,8 +2907,8 @@ pub const Reader = struct {
         const decoded = try self.readDecodedStreamData(obj);
         errdefer self.alloc.free(decoded);
 
-        const pixel_count = @as(usize, width) * @as(usize, height);
-        const rgba = try self.alloc.alloc(u8, pixel_count * 4);
+        const rgba = try self.alloc.alloc(u8, rgba_len);
+        errdefer self.alloc.free(rgba);
         if (image_mask) {
             try decodeImageMaskToRgba(rgba, width, height, decoded, obj.get("Decode"));
             self.alloc.free(decoded);
@@ -2913,10 +2941,13 @@ pub const Reader = struct {
     }
 
     fn jpeg2000DecodedToRgbaAlloc(alloc: Allocator, decoded: *const image_lib.jpeg2000.DecodedImage) ![]u8 {
-        const pixel_count = @as(usize, decoded.width) * @as(usize, decoded.height);
-        if (decoded.pixels.len != pixel_count * decoded.components) return error.UnsupportedPdfRendering;
+        const pixel_count = std.math.mul(usize, decoded.width, decoded.height) catch return error.UnsupportedPdfRendering;
+        if (pixel_count > 100_000_000) return error.RenderedPageTooLarge;
+        const sample_count = std.math.mul(usize, pixel_count, decoded.components) catch return error.UnsupportedPdfRendering;
+        if (decoded.pixels.len != sample_count) return error.UnsupportedPdfRendering;
 
-        const rgba = try alloc.alloc(u8, pixel_count * 4);
+        const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.UnsupportedPdfRendering;
+        const rgba = try alloc.alloc(u8, rgba_len);
         errdefer alloc.free(rgba);
         switch (decoded.components) {
             1 => {
@@ -3777,10 +3808,27 @@ fn parseXrefTable(
     entries: *std.ArrayList(XrefEntry),
     trailer_out: *?syntax.Object,
 ) anyerror!void {
+    var visited: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    defer visited.deinit(alloc);
+    return try parseXrefTableGuarded(alloc, bytes, offset, entries, trailer_out, &visited);
+}
+
+fn parseXrefTableGuarded(
+    alloc: Allocator,
+    bytes: []const u8,
+    offset: usize,
+    entries: *std.ArrayList(XrefEntry),
+    trailer_out: *?syntax.Object,
+    visited: *std.AutoHashMapUnmanaged(usize, void),
+) anyerror!void {
+    if (offset >= bytes.len) return error.InvalidStartXref;
+    const visit = try visited.getOrPut(alloc, offset);
+    if (visit.found_existing) return error.CyclicXref;
+    if (visited.count() > 4096) return error.InvalidXref;
     var cursor = offset;
     skipPdfWs(bytes, &cursor);
     if (!std.mem.startsWith(u8, bytes[cursor..], "xref")) {
-        return try parseXrefStream(alloc, bytes, cursor, entries, trailer_out);
+        return try parseXrefStream(alloc, bytes, cursor, entries, trailer_out, visited);
     }
     cursor += "xref".len;
 
@@ -3806,17 +3854,15 @@ fn parseXrefTable(
     var scanner = syntax.Scanner.init(alloc, bytes[cursor..]);
     defer scanner.deinit();
     var trailer = try scanner.readObject();
-    errdefer trailer.deinit(alloc);
+    defer trailer.deinit(alloc);
     if (trailer != .dict) return error.ExpectedTrailerDict;
 
     if (trailer_out.* == null) {
         trailer_out.* = try trailer.clone(alloc);
     }
-    defer trailer.deinit(alloc);
-
     if (trailer.get("Prev")) |prev_value| {
         if (prev_value.asInteger()) |prev| {
-            if (prev >= 0) try parseXrefTable(alloc, bytes, @intCast(prev), entries, trailer_out);
+            if (prev >= 0) try parseXrefTableGuarded(alloc, bytes, @intCast(prev), entries, trailer_out, visited);
         }
     }
 }
@@ -3827,6 +3873,7 @@ fn parseXrefStream(
     offset: usize,
     entries: *std.ArrayList(XrefEntry),
     trailer_out: *?syntax.Object,
+    visited: *std.AutoHashMapUnmanaged(usize, void),
 ) anyerror!void {
     if (offset >= bytes.len) return error.InvalidStartXref;
 
@@ -3858,7 +3905,7 @@ fn parseXrefStream(
 
     if (trailer.get("Prev")) |prev_value| {
         if (prev_value.asInteger()) |prev| {
-            if (prev >= 0) try parseXrefTable(alloc, bytes, @intCast(prev), entries, trailer_out);
+            if (prev >= 0) try parseXrefTableGuarded(alloc, bytes, @intCast(prev), entries, trailer_out, visited);
         }
     }
 }
@@ -4202,29 +4249,46 @@ fn applyStreamFilterAlloc(
     name: []const u8,
     param: ?*const syntax.Object,
 ) ![]u8 {
+    const max_decoded_stream_bytes: usize = 256 * 1024 * 1024;
     if (std.mem.eql(u8, name, "FlateDecode")) {
         var in: std.Io.Reader = .fixed(input);
-        var aw: std.Io.Writer.Allocating = .init(alloc);
-        defer aw.deinit();
-        var decompress: std.compress.flate.Decompress = .init(&in, .zlib, &.{});
-        _ = try decompress.reader.streamRemaining(&aw.writer);
-        const inflated = try aw.toOwnedSlice();
+        var flate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+        var decompress: std.compress.flate.Decompress = .init(&in, .zlib, &flate_buffer);
+        var inflated_list = std.ArrayList(u8).empty;
+        defer inflated_list.deinit(alloc);
+        var read_buf: [64 * 1024]u8 = undefined;
+        while (true) {
+            const n = try decompress.reader.readSliceShort(&read_buf);
+            if (n == 0) break;
+            if (inflated_list.items.len > max_decoded_stream_bytes or n > max_decoded_stream_bytes - inflated_list.items.len) return error.DecodedStreamTooLarge;
+            try inflated_list.appendSlice(alloc, read_buf[0..n]);
+        }
+        const inflated = try inflated_list.toOwnedSlice(alloc);
         defer alloc.free(inflated);
-        return try applyPredictorAlloc(alloc, inflated, param);
+        const decoded = try applyPredictorAlloc(alloc, inflated, param);
+        return try enforceDecodedStreamLimit(alloc, decoded, max_decoded_stream_bytes);
     }
     if (std.mem.eql(u8, name, "ASCIIHexDecode")) {
-        return try asciiHexDecodeAlloc(alloc, input);
+        const decoded = try asciiHexDecodeAlloc(alloc, input);
+        return try enforceDecodedStreamLimit(alloc, decoded, max_decoded_stream_bytes);
     }
     if (std.mem.eql(u8, name, "ASCII85Decode")) {
-        return try ascii85DecodeAlloc(alloc, input);
+        const decoded = try ascii85DecodeAlloc(alloc, input);
+        return try enforceDecodedStreamLimit(alloc, decoded, max_decoded_stream_bytes);
     }
     if (std.mem.eql(u8, name, "LZWDecode")) {
-        return try lzwDecodeAlloc(alloc, input, param);
+        return try lzwDecodeAlloc(alloc, input, param, max_decoded_stream_bytes);
     }
     if (std.mem.eql(u8, name, "RunLengthDecode")) {
-        return try runLengthDecodeAlloc(alloc, input);
+        return try runLengthDecodeAlloc(alloc, input, max_decoded_stream_bytes);
     }
     return error.UnsupportedStreamFilter;
+}
+
+fn enforceDecodedStreamLimit(alloc: Allocator, decoded: []u8, max_bytes: usize) ![]u8 {
+    if (decoded.len <= max_bytes) return decoded;
+    alloc.free(decoded);
+    return error.DecodedStreamTooLarge;
 }
 
 fn asciiHexDecodeAlloc(alloc: Allocator, input: []const u8) ![]u8 {
@@ -4288,7 +4352,7 @@ fn ascii85DecodeAlloc(alloc: Allocator, input: []const u8) ![]u8 {
     return try out.toOwnedSlice(alloc);
 }
 
-fn lzwDecodeAlloc(alloc: Allocator, input: []const u8, param: ?*const syntax.Object) ![]u8 {
+fn lzwDecodeAlloc(alloc: Allocator, input: []const u8, param: ?*const syntax.Object, max_bytes: usize) ![]u8 {
     const early_change: u16 = blk: {
         if (param) |obj| {
             if (obj.* == .dict) {
@@ -4343,6 +4407,7 @@ fn lzwDecodeAlloc(alloc: Allocator, input: []const u8, param: ?*const syntax.Obj
         } else return error.MalformedLzw;
         defer alloc.free(entry);
 
+        if (out.items.len > max_bytes or entry.len > max_bytes - out.items.len) return error.DecodedStreamTooLarge;
         try out.appendSlice(alloc, entry);
 
         if (prev_code) |prev| {
@@ -4364,10 +4429,11 @@ fn lzwDecodeAlloc(alloc: Allocator, input: []const u8, param: ?*const syntax.Obj
 
     const decoded = try out.toOwnedSlice(alloc);
     defer alloc.free(decoded);
-    return try applyPredictorAlloc(alloc, decoded, param);
+    const predicted = try applyPredictorAlloc(alloc, decoded, param);
+    return try enforceDecodedStreamLimit(alloc, predicted, max_bytes);
 }
 
-fn runLengthDecodeAlloc(alloc: Allocator, input: []const u8) ![]u8 {
+fn runLengthDecodeAlloc(alloc: Allocator, input: []const u8, max_bytes: usize) ![]u8 {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
 
@@ -4379,6 +4445,7 @@ fn runLengthDecodeAlloc(alloc: Allocator, input: []const u8) ![]u8 {
         if (length <= 127) {
             const literal_len = @as(usize, length) + 1;
             if (i + literal_len > input.len) return error.MalformedRunLength;
+            if (out.items.len > max_bytes or literal_len > max_bytes - out.items.len) return error.DecodedStreamTooLarge;
             try out.appendSlice(alloc, input[i .. i + literal_len]);
             i += literal_len;
             continue;
@@ -4388,6 +4455,7 @@ fn runLengthDecodeAlloc(alloc: Allocator, input: []const u8) ![]u8 {
         const repeat = input[i];
         i += 1;
         const repeat_len = 257 - @as(usize, length);
+        if (out.items.len > max_bytes or repeat_len > max_bytes - out.items.len) return error.DecodedStreamTooLarge;
         try out.appendNTimes(alloc, repeat, repeat_len);
     }
 
@@ -8318,6 +8386,25 @@ test "reader init rejects missing startxref" {
     try std.testing.expectError(error.MissingStartXref, Reader.init(std.testing.allocator, sample));
 }
 
+test "xref parser rejects a cyclic Prev chain" {
+    const alloc = std.testing.allocator;
+    const bytes =
+        "xref\n" ++
+        "0 0\n" ++
+        "trailer\n" ++
+        "<< /Size 1 /Prev 0 >>\n";
+
+    var entries = std.ArrayList(XrefEntry).empty;
+    defer entries.deinit(alloc);
+    var trailer: ?syntax.Object = null;
+    defer if (trailer) |*value| value.deinit(alloc);
+
+    try std.testing.expectError(
+        error.CyclicXref,
+        parseXrefTable(alloc, bytes, 0, &entries, &trailer),
+    );
+}
+
 test "reader can load indirect object from xref table" {
     const alloc = std.testing.allocator;
     const prefix =
@@ -8521,6 +8608,15 @@ test "reader can decode run length stream object" {
     const decoded = try reader.readDecodedStreamData(&obj);
     defer alloc.free(decoded);
     try std.testing.expectEqualStrings("ABCZZZ", decoded);
+}
+
+test "stream decoders enforce the decoded byte budget before growth" {
+    const alloc = std.testing.allocator;
+    const lzw = &.{ 0x80, 0x0b, 0x60, 0x50, 0x22, 0x0c, 0x0c, 0x85, 0x01 };
+    try std.testing.expectError(error.DecodedStreamTooLarge, lzwDecodeAlloc(alloc, lzw, null, 5));
+
+    const run_length = &.{ 2, 'A', 'B', 'C', 254, 'Z', 128 };
+    try std.testing.expectError(error.DecodedStreamTooLarge, runLengthDecodeAlloc(alloc, run_length, 5));
 }
 
 test "reader can extract plain text from simple page content" {
