@@ -1892,6 +1892,114 @@ fn reportHealthyStoreStatuses(
     try std.testing.expectEqual(reports.len, try node.reportStoreStatuses(reports));
 }
 
+fn publishSimulatedRaftGroupStatus(
+    cluster: *MetadataHttpClusterSimulation,
+    proposer_index: usize,
+    group_id: u64,
+    retry_election: bool,
+) !void {
+    var valid_leader = false;
+    var voter_election_in_progress = false;
+    for (0..cluster.cluster.nodes.len) |node_index| {
+        const status = cluster.cluster.node(node_index).raftStatus(group_id) orelse continue;
+        const local_is_voter = std.mem.indexOfScalar(u64, status.conf_state.voters, status.id) != null;
+        if (status.soft.role == .leader and
+            local_is_voter)
+        {
+            valid_leader = true;
+            break;
+        }
+        if (local_is_voter and (status.soft.role == .candidate or status.soft.role == .pre_candidate))
+            voter_election_in_progress = true;
+    }
+    if (!valid_leader and (!voter_election_in_progress or retry_election)) {
+        for (0..cluster.cluster.nodes.len) |node_index| {
+            const status = cluster.cluster.node(node_index).raftStatus(group_id) orelse continue;
+            const local_node_id = cluster.cluster.configs[node_index].host.http.host.local_node_id;
+            if (std.mem.indexOfScalar(u64, status.conf_state.voters, local_node_id) == null) continue;
+            try cluster.node(node_index).campaignGroup(group_id);
+            break;
+        }
+    }
+
+    const proposer = cluster.node(proposer_index);
+    const stores = try proposer.listProjectedStores(cluster.alloc);
+    defer proposer.freeProjectedStores(cluster.alloc, stores);
+    const intents = try proposer.listProjectedPlacementIntents(cluster.alloc);
+    defer proposer.freeProjectedPlacementIntents(cluster.alloc, intents);
+
+    var reports = std.ArrayListUnmanaged(metadata_table_manager.StoreStatusReport).empty;
+    defer {
+        for (reports.items) |report| metadata_table_manager.freeGroupStatuses(cluster.alloc, report.group_statuses);
+        reports.deinit(cluster.alloc);
+    }
+
+    for (stores) |store| {
+        const node_index = cluster.indexForNodeId(store.node_id) orelse continue;
+        const raft_status = cluster.cluster.node(node_index).raftStatus(group_id);
+        var local_intent: ?raft_reconciler.PlacementIntent = null;
+        for (intents) |intent| {
+            if (intent.record.group_id == group_id and intent.record.local_node_id == store.node_id) {
+                local_intent = intent;
+                break;
+            }
+        }
+
+        var statuses = std.ArrayListUnmanaged(metadata_table_manager.GroupStatusReport).empty;
+        errdefer statuses.deinit(cluster.alloc);
+        try statuses.ensureTotalCapacity(cluster.alloc, store.group_statuses.len + @intFromBool(raft_status != null and local_intent != null));
+        var previous: ?metadata_table_manager.GroupStatusReport = null;
+        for (store.group_statuses) |status| {
+            if (status.group_id == group_id) {
+                previous = status;
+            } else {
+                statuses.appendAssumeCapacity(status);
+            }
+        }
+
+        if (raft_status != null and local_intent != null) {
+            const status = raft_status.?;
+            var report = previous orelse metadata_table_manager.GroupStatusReport{ .group_id = group_id };
+            var local_voter = false;
+            for (status.conf_state.voters) |node_id| {
+                if (node_id == store.node_id) {
+                    local_voter = true;
+                    break;
+                }
+            }
+            report.relocation_generation = local_intent.?.relocation_generation;
+            report.raft_applied_index = status.applied_index;
+            report.updated_at_millis = cluster.manual_clock.clock().nowRealtimeMs();
+            report.local_leader = status.soft.role == .leader;
+            report.local_voter = local_voter;
+            report.voter_count = @intCast(status.conf_state.voters.len);
+            report.voter_set_known = true;
+            report.voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(status.conf_state.voters, null);
+            report.joint_consensus = status.conf_state.voters_outgoing.len > 0;
+            statuses.appendAssumeCapacity(report);
+        }
+
+        const owned_statuses = try statuses.toOwnedSlice(cluster.alloc);
+        errdefer metadata_table_manager.freeGroupStatuses(cluster.alloc, owned_statuses);
+        try reports.append(cluster.alloc, .{
+            .store_id = store.store_id,
+            .live = store.live,
+            .health_class = store.health_class,
+            .capacity_bytes = store.capacity_bytes,
+            .available_bytes = store.available_bytes,
+            .lease_pressure = store.lease_pressure,
+            .read_load = store.read_load,
+            .write_load = store.write_load,
+            .active_backfills = store.active_backfills,
+            .backfill_progress_millis = store.backfill_progress_millis,
+            .group_statuses = owned_statuses,
+            .runtime_statuses = store.runtime_statuses,
+        });
+    }
+
+    if (reports.items.len > 0) _ = try proposer.reportStoreStatuses(reports.items);
+}
+
 fn reportSplitCandidateStatus(
     node: anytype,
     group_id: u64,
@@ -2300,6 +2408,7 @@ const TestDescriptorFactory = struct {
                     .heartbeat_tick = 1,
                     .pre_vote = false,
                     .check_quorum = true,
+                    .step_down_on_removal = true,
                 },
                 .storage = store.storage(),
             },
@@ -3459,9 +3568,13 @@ pub const MetadataHttpClusterSimulation = struct {
 
         const local_hash = hashPlacementIntentSlice(local);
         if (self.placement_intent_hash_valid[index] and
-            self.placement_intent_hashes[index] == local_hash and
-            sim.runtime.svc.host.http_host.host.raftStatus(self.metadata_group_id) != null)
+            self.placement_intent_hashes[index] == local_hash)
         {
+            // Membership proposals are retryable runtime state, not metadata
+            // projection state. A dropped proposal or an in-progress joint
+            // configuration must be retried even when the intent hash is
+            // unchanged.
+            _ = try sim.runtime.svc.host.reconcileOnce();
             return;
         }
 
@@ -3967,6 +4080,92 @@ fn requireLeasedReconcile(
         try leader_node.cluster.stepAll();
     }
     return error.ReconcileLeaseNotHeld;
+}
+
+fn reconcileUntilNodeGroupStatus(
+    cluster: *MetadataHttpClusterSimulation,
+    loop: *metadata_control_loop.MetadataControlLoop,
+    node_index: usize,
+    group_id: u64,
+    desired: raft_host.HostedReplicaStatus,
+    max_rounds: usize,
+) !bool {
+    for (0..max_rounds) |round| {
+        if (cluster.node(node_index).status(group_id) == desired) return true;
+        const leader_index = currentMetadataLeaderIndex(cluster) orelse {
+            try cluster.stepAll();
+            continue;
+        };
+        try publishSimulatedRaftGroupStatus(cluster, leader_index, group_id, round > 0 and round % 8 == 0);
+        try cluster.stepAll();
+        _ = requireLeasedReconcile(cluster.node(leader_index), loop) catch |err| switch (err) {
+            error.NotLeader, error.ReconcileLeaseNotHeld => {
+                try cluster.stepAll();
+                continue;
+            },
+            else => return err,
+        };
+        try cluster.stepAll();
+    }
+    if (cluster.node(node_index).status(group_id) == desired) return true;
+    std.debug.print("metadata reconcile status timeout group={d} node={d} desired={s}", .{ group_id, node_index, @tagName(desired) });
+    for (0..cluster.cluster.nodes.len) |index| {
+        std.debug.print(" node{d}={s}", .{ index, @tagName(cluster.node(index).status(group_id)) });
+    }
+    std.debug.print("\n", .{});
+    for (0..cluster.cluster.nodes.len) |index| {
+        const status = cluster.cluster.node(index).raftStatus(group_id) orelse continue;
+        std.debug.print("  raft node={d} id={d} role={s} term={d} leader={?d} voters={any} outgoing={any} commit={d} applied={d}\n", .{
+            index,
+            status.id,
+            @tagName(status.soft.role),
+            status.hard.current_term,
+            status.soft.leader_id,
+            status.conf_state.voters,
+            status.conf_state.voters_outgoing,
+            status.hard.commit_index,
+            status.applied_index,
+        });
+    }
+    if (currentMetadataLeaderIndex(cluster)) |leader_index| {
+        const intents = try cluster.node(leader_index).listProjectedPlacementIntents(cluster.alloc);
+        defer cluster.node(leader_index).freeProjectedPlacementIntents(cluster.alloc, intents);
+        for (intents) |intent| {
+            if (intent.record.group_id != group_id) continue;
+            std.debug.print("  placement node={d} state={s} peers={any} relocation={d} source={d} docs={d} bytes={d}\n", .{
+                intent.record.local_node_id,
+                @tagName(intent.serving_state),
+                intent.peer_node_ids,
+                intent.relocation_generation,
+                intent.relocation_source_node_id,
+                intent.relocation_doc_count_watermark,
+                intent.relocation_disk_bytes_watermark,
+            });
+        }
+        const stores = try cluster.node(leader_index).listProjectedStores(cluster.alloc);
+        defer cluster.node(leader_index).freeProjectedStores(cluster.alloc, stores);
+        for (stores) |store| {
+            for (store.group_statuses) |status| {
+                if (status.group_id != group_id) continue;
+                std.debug.print("  status node={d} live={} health={s} leader={} voter={} count={d} known={} joint={} pending={} replay_required={} caught_up={} docs={d} bytes={d}\n", .{
+                    store.node_id,
+                    store.live,
+                    store.health_class,
+                    status.local_leader,
+                    status.local_voter,
+                    status.voter_count,
+                    status.voter_set_known,
+                    status.joint_consensus,
+                    status.transition_pending,
+                    status.replay_required,
+                    status.replay_caught_up,
+                    status.doc_count,
+                    status.disk_bytes,
+                });
+            }
+        }
+    }
+    return false;
 }
 
 const SplitRetirementSummary = struct {
@@ -5208,7 +5407,14 @@ fn metadataVoprRunExpandedLivenessWorkload(
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, churn_group_id, .active, 64));
     try churn_workflow.setPlacementCandidates(&.{ 2, 3 });
     _ = try requireLeasedReconcile(cluster.node(try metadataVoprLeaderIndex(cluster)), churn_workflow.controlLoop());
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, churn_group_id, .absent, 64));
+    try std.testing.expect(try reconcileUntilNodeGroupStatus(
+        cluster,
+        churn_workflow.controlLoop(),
+        0,
+        churn_group_id,
+        .absent,
+        64,
+    ));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, churn_group_id, .active, 64));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, churn_group_id, .active, 64));
     try metadataVoprRunRandomTransportActions(cluster, random, cfg, state, operation_index, phase_fault_actions);

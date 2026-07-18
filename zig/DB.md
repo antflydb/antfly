@@ -364,6 +364,7 @@ one background runtime owner per shard root
 one cached write DB owner per table group
 one cached read DB owner per table group/generation
 exclusive generation transitions own maintenance opens and publication
+queued exclusive transitions reserve both read and write admission
 transactions retain the backend generation until abort or commit
 cursors retain their parent transaction until cursor close
 returned owned buffers are allocated in an explicit caller ownership domain
@@ -377,7 +378,12 @@ restore. Cache entries own their DB and are retired when invalidated; active
 leases keep retired entries alive until the last operation releases them. The
 transition holds the read-cache exclusive lease through staged restore, repair,
 and publication, invalidates/drains both write caches, and keeps maintenance
-opens uncached. At the storage boundary, LSM transaction opens are rejected
+opens uncached. A maintenance open is nevertheless created by, and remains
+inside, the active transition capability; no fallback path releases exclusivity
+and independently reopens the same root. Once an exclusive transition queues,
+new reads and writes wait behind it while already admitted reads drain, avoiding
+writer starvation under sustained query load. At the storage boundary, LSM
+transaction opens are rejected
 after generation close begins, backend close drains active transaction readers,
 and erased cursors retain their transaction box so transaction cleanup cannot
 free cursor snapshot state. Storage-backed status and schema-capability
@@ -459,12 +465,19 @@ are prepared before commit and installed into the open DB allocation-free after
 success, leaving no post-commit error path that can split durable and in-memory
 ownership state.
 
-Placement changes must also make stale leadership self-healing. If a local
-voter still observes a leader that is draining or no longer appears in the
-current serving placement, the lowest-ID serving voter campaigns after the
-placement is reconciled. Internal leader-only routes return a typed unavailable
-response during that handoff. They do not leave survivors honoring a removed
-leader or collapse retryable topology churn into a generic HTTP failure.
+Placement changes must also make stale leadership self-healing without
+destabilizing membership expansion. A `draining` source and a `cutover_ready`
+target remain valid leaders until the expanded voter set converges. Once a
+leader enters `retiring`, local reconciliation transfers leadership to the
+lowest-ID retained voter before proposing self-removal. If the retiring leader
+has already disappeared, that same lowest-ID serving voter campaigns after
+placement reconciliation. Reconciliation resolves transport endpoints for the
+union of voters and learners before proposing membership changes; otherwise a
+committed learner can remain permanently unable to receive its log or snapshot.
+Internal leader-only routes return a typed
+unavailable response during that handoff. They do not leave survivors honoring
+a removed leader, trigger election storms during expansion, or collapse
+retryable topology churn into a generic HTTP failure.
 
 Replicated source split lifecycle commands have one state-machine owner: the
 durable data-Raft apply store. They are transition-only entries and are never
@@ -521,24 +534,48 @@ Existing projected values are compared through a cursor instead of being
 materialized, and atomic replacement writes directly through one transaction
 instead of constructing another shard-sized write list.
 
-Successful reconciliation records the authoritative DB root generation beside
-the projection. Later split handoffs use an O(1) durable fast-path check: both
-that root generation and the complete Raft watermark identity must match before
-the apply-store projection can be captured without rescanning the DB. Snapshot
-installation naturally drops the marker with the replaced group generation.
-Normal-entry history and the watermark remain unchanged. If Raft advances
-during repair, publication fails and preparation retries from a new snapshot;
-only replicated split deltas may mutate an active projection.
+Successful reconciliation records the authoritative DB root's durable 128-bit
+incarnation beside the projection. This identity is persisted in the staged DB
+before generation sealing and atomic publication; it is stable across a process
+restart but regenerated whenever a physical root is replaced. A process-local
+visible-root generation is not sufficient because it restarts from zero. Later
+split handoffs use an O(1) durable fast-path check: both the root incarnation and
+the complete Raft watermark identity must match before the apply-store
+projection can be captured without rescanning the DB. Missing, zero, malformed,
+or mismatched incarnation markers fail closed. Snapshot installation naturally
+drops the marker with the replaced group generation. Normal-entry history and
+the watermark remain unchanged. If Raft advances during repair, publication
+fails and preparation retries from a new snapshot; only replicated split deltas
+may mutate an active projection.
 
 Replica relocation and replica-count shrink use two committed membership
-phases. A `draining` source remains a voter while replacement learners hydrate
-and the expanded voter set stabilizes. Once a surviving replica owns leadership,
-metadata publishes the final peer set and marks removed replicas `retiring`.
-A retiring replica remains hosted and reports Raft status but is excluded from
-membership and client routing. Its placement row can be deleted only after the
-source reports that it is no longer a voter and every survivor reports the same
-stable final voter set. This prevents filesystem/cache retirement from racing a
-still-committed Raft member, including replication-factor-one moves.
+phases. A `draining` source remains a voter, and may remain leader, while
+replacement learners hydrate and the expanded voter set stabilizes. Once any
+healthy leader proves that exact, non-joint expanded configuration, metadata
+publishes the final peer set and marks removed replicas `retiring`. Local Raft
+reconciliation then transfers a retiring leader to a retained voter before
+proposing contraction. That exact final peer set is latched in the retiring
+placement records; a later planner result cannot replace it midway through the
+phase. Newly proposed peers are deferred and omitted final peers are preserved
+until the phase completes. A retiring replica remains hosted and reports Raft
+status but is excluded from membership and client routing. Its placement row
+can be deleted after a healthy surviving leader proves the exact, non-joint
+final voter set. A healthy source that still reports itself as a voter continues
+to block deletion, but an unavailable removed source cannot deadlock cleanup
+forever. Metadata absence is the durable routing and ownership fence; local
+reconciliation removes the persisted Raft catalog record before retiring the DB
+owner. This prevents filesystem and cache retirement from racing a
+still-committed Raft member, including replication-factor-one moves. Membership
+planning and proof lookup are indexed by `(group, node)`, so a reconcile pass is
+linear in placements and status reports, with only replication-factor-bounded
+scans per retiring group.
+
+Relocation hydration is proven by relocation generation, committed Raft apply
+boundary, logical document watermark, and stable voter identity. Source disk
+bytes are capacity telemetry, not a cutover predicate: compaction, segment
+layout, and cache state can make a logically equivalent target generation
+smaller or larger than its source. Physical-size comparison must therefore
+never strand an otherwise complete learner in replay.
 
 Transition observation reads the source phase, terminal fence,
 acknowledgement, and delta sequence atomically under one apply-store shard lock.

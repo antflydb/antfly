@@ -133,6 +133,7 @@ pub const ReconcileResult = reconciler.ReconcileResult;
 pub const MetadataUpdate = metadata_view.MetadataUpdate;
 pub const MetadataView = metadata_view.MetadataView;
 pub const PlacementIntent = reconciler.PlacementIntent;
+pub const placementMayLeadMembershipTransition = reconciler.placementMayLeadMembershipTransition;
 pub const PlacementProvider = reconciler.PlacementProvider;
 pub const MemoryPlacementProvider = reconciler.MemoryPlacementProvider;
 pub const MetadataPlacementUpdate = reconciler.MetadataPlacementUpdate;
@@ -237,6 +238,7 @@ test "raft integration module compiles" {
     _ = MetadataUpdate;
     _ = MetadataView;
     _ = PlacementIntent;
+    _ = placementMayLeadMembershipTransition;
     _ = PlacementProvider;
     _ = MemoryPlacementProvider;
     _ = MetadataPlacementUpdate;

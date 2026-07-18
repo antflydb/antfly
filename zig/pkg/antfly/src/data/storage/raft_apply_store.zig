@@ -771,7 +771,7 @@ pub const RaftApplyStore = struct {
         self: *RaftApplyStore,
         alloc: std.mem.Allocator,
         group_id: u64,
-        root_generation: u64,
+        root_incarnation: u128,
         byte_range: AppliedDataRange,
         entries: []const AppliedDataKV,
     ) !bool {
@@ -798,10 +798,11 @@ pub const RaftApplyStore = struct {
         defer alloc.free(value);
         std.mem.writeInt(u64, value[0..8], 0, .little);
         @memcpy(value[8..], encoded);
-        const marker_key = try projectionRootGenerationKeyAlloc(alloc, group_id);
+        if (root_incarnation == 0) return error.DurableRootIncarnationUnavailable;
+        const marker_key = try projectionRootIncarnationKeyAlloc(alloc, group_id);
         defer alloc.free(marker_key);
-        var marker_value: [8]u8 = undefined;
-        std.mem.writeInt(u64, &marker_value, root_generation, .little);
+        var marker_value: [16]u8 = undefined;
+        std.mem.writeInt(u128, &marker_value, root_incarnation, .little);
         try shard_state_store.replaceGroupSnapshotWithMetadata(
             &group_store.store,
             alloc,
@@ -828,12 +829,12 @@ pub const RaftApplyStore = struct {
     /// watermark are preserved. Reconciliation replaces only projected
     /// document keys, so active split controls and delta history remain
     /// durable while a relocated generation imports its inherited root.
-    pub fn reconcileGroupSnapshotAtRootGeneration(
+    pub fn reconcileGroupSnapshotAtRootIncarnation(
         self: *RaftApplyStore,
         alloc: std.mem.Allocator,
         group_id: u64,
         expected: AppliedDataBatch,
-        root_generation: u64,
+        root_incarnation: u128,
         byte_range: AppliedDataRange,
         entries: []const AppliedDataKV,
     ) !bool {
@@ -848,7 +849,7 @@ pub const RaftApplyStore = struct {
             expected,
             byte_range,
             entries,
-            root_generation,
+            root_incarnation,
         );
     }
 
@@ -856,12 +857,12 @@ pub const RaftApplyStore = struct {
     /// handoff under the same apply-store lock and Raft watermark. A caller can
     /// therefore never acknowledge a handoff from a different projection
     /// generation than the one it just validated.
-    pub fn reconcileAndCaptureSplitHandoffAtRootGeneration(
+    pub fn reconcileAndCaptureSplitHandoffAtRootIncarnation(
         self: *RaftApplyStore,
         alloc: std.mem.Allocator,
         group_id: u64,
         expected: AppliedDataBatch,
-        root_generation: u64,
+        root_incarnation: u128,
         byte_range: AppliedDataRange,
         entries: []const AppliedDataKV,
     ) !?SplitHandoff {
@@ -876,7 +877,7 @@ pub const RaftApplyStore = struct {
             expected,
             byte_range,
             entries,
-            root_generation,
+            root_incarnation,
         )) return null;
         const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse
             return error.AppliedDataRangeNotFound;
@@ -886,12 +887,12 @@ pub const RaftApplyStore = struct {
     /// Fast path for a projection already reconciled against this DB root.
     /// The marker is durable and root-scoped; the exact Raft watermark check
     /// prevents publication after a concurrent apply.
-    pub fn captureVerifiedSplitHandoffAtRootGeneration(
+    pub fn captureVerifiedSplitHandoffAtRootIncarnation(
         self: *RaftApplyStore,
         alloc: std.mem.Allocator,
         group_id: u64,
         expected: AppliedDataBatch,
-        root_generation: u64,
+        root_incarnation: u128,
     ) !?SplitHandoff {
         const io = self.io_impl.io();
         const shard = self.batchShard(group_id);
@@ -901,14 +902,15 @@ pub const RaftApplyStore = struct {
         const current = (try self.ensureLoaded(shard, group_id)) orelse return null;
         if (!batchIdentityEqual(current.*, expected)) return null;
         const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return null;
-        const marker_key = try projectionRootGenerationKeyAlloc(alloc, group_id);
+        if (root_incarnation == 0) return error.DurableRootIncarnationUnavailable;
+        const marker_key = try projectionRootIncarnationKeyAlloc(alloc, group_id);
         defer alloc.free(marker_key);
         const marker = group_store.store.get(alloc, marker_key) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
         };
         defer alloc.free(marker);
-        if (marker.len != 8 or std.mem.readInt(u64, marker[0..8], .little) != root_generation) return null;
+        if (marker.len != 16 or std.mem.readInt(u128, marker[0..16], .little) != root_incarnation) return null;
         return try shard_state_store.captureSplitHandoff(&group_store.store, alloc, group_id);
     }
 
@@ -920,7 +922,7 @@ pub const RaftApplyStore = struct {
         expected: AppliedDataBatch,
         byte_range: AppliedDataRange,
         entries: []const AppliedDataKV,
-        root_generation: u64,
+        root_incarnation: u128,
     ) !bool {
         try self.requireTransitionReadyLocked(shard, group_id);
         const current = (try self.ensureLoaded(shard, group_id)) orelse return false;
@@ -943,10 +945,11 @@ pub const RaftApplyStore = struct {
         const comparison = try shard_state_store.compareGroupSnapshot(&group_store.store, alloc, group_id, byte_range, entries);
         if (!comparison.contains_projected_keys)
             return error.SplitSourceProjectionNotReady;
-        const marker_key = try projectionRootGenerationKeyAlloc(alloc, group_id);
+        if (root_incarnation == 0) return error.DurableRootIncarnationUnavailable;
+        const marker_key = try projectionRootIncarnationKeyAlloc(alloc, group_id);
         defer alloc.free(marker_key);
-        var marker_value: [8]u8 = undefined;
-        std.mem.writeInt(u64, &marker_value, root_generation, .little);
+        var marker_value: [16]u8 = undefined;
+        std.mem.writeInt(u128, &marker_value, root_incarnation, .little);
         const metadata_writes: []const docstore.KVPair = &.{.{ .key = marker_key, .value = &marker_value }};
         if (std.mem.eql(u8, current_range.start, replacement_range.start) and
             std.mem.eql(u8, current_range.end, replacement_range.end) and comparison.equal)
@@ -1450,8 +1453,8 @@ pub const RaftApplyStore = struct {
         return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:data_raft_apply:{d}", .{group_id});
     }
 
-    fn projectionRootGenerationKeyAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
-        return try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:data_projection_root_generation:{d}", .{group_id});
+    fn projectionRootIncarnationKeyAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
+        return try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:data_projection_root_incarnation:{d}", .{group_id});
     }
 
     fn batchIdentityEqual(left: AppliedDataBatch, right: AppliedDataBatch) bool {
@@ -2552,11 +2555,19 @@ test "data raft apply store reconciles an inherited document root at an exact wa
         .entries_bytes = bootstrap,
     });
     const bootstrap_watermark = (try store.latestBatch(312)) orelse return error.MissingDataBatch;
-    try std.testing.expect(try store.reconcileGroupSnapshotAtRootGeneration(
+    try std.testing.expectError(error.DurableRootIncarnationUnavailable, store.reconcileGroupSnapshotAtRootIncarnation(
         std.testing.allocator,
         312,
         bootstrap_watermark,
-        1,
+        0,
+        .{ .start = "doc:a", .end = "doc:z" },
+        &.{},
+    ));
+    try std.testing.expect(try store.reconcileGroupSnapshotAtRootIncarnation(
+        std.testing.allocator,
+        312,
+        bootstrap_watermark,
+        (@as(u128, 1) << 96) | 1,
         .{ .start = "doc:a", .end = "doc:z" },
         &.{
             .{ .key = "doc:a", .value = "{\"v\":1}" },
@@ -2582,11 +2593,11 @@ test "data raft apply store reconciles an inherited document root at an exact wa
         .commit_index = 2,
         .entries_bytes = advanced,
     });
-    try std.testing.expect(!try store.reconcileGroupSnapshotAtRootGeneration(
+    try std.testing.expect(!try store.reconcileGroupSnapshotAtRootIncarnation(
         std.testing.allocator,
         312,
         bootstrap_watermark,
-        1,
+        (@as(u128, 1) << 96) | 1,
         .{ .start = "doc:a", .end = "doc:z" },
         &.{.{ .key = "doc:stale", .value = "{}" }},
     ));
@@ -2618,11 +2629,11 @@ test "data raft apply store reconciles inherited documents while preserving acti
     });
     const watermark = (try store.latestBatch(314)) orelse return error.MissingDataBatch;
 
-    const handoff = (try store.reconcileAndCaptureSplitHandoffAtRootGeneration(
+    const handoff = (try store.reconcileAndCaptureSplitHandoffAtRootIncarnation(
         std.testing.allocator,
         314,
         watermark,
-        17,
+        (@as(u128, 17) << 96) | 17,
         .{ .start = "", .end = "" },
         &.{
             .{ .key = "doc:000", .value = "left" },
@@ -2647,17 +2658,17 @@ test "data raft apply store reconciles inherited documents while preserving acti
     try std.testing.expectEqualStrings("doc:024", handoff.entries[0].key);
     try std.testing.expectEqualStrings("doc:047", handoff.entries[1].key);
 
-    try std.testing.expect((try store.captureVerifiedSplitHandoffAtRootGeneration(
+    try std.testing.expect((try store.captureVerifiedSplitHandoffAtRootIncarnation(
         std.testing.allocator,
         314,
         watermark,
-        18,
+        (@as(u128, 18) << 96) | 18,
     )) == null);
-    const verified = (try store.captureVerifiedSplitHandoffAtRootGeneration(
+    const verified = (try store.captureVerifiedSplitHandoffAtRootIncarnation(
         std.testing.allocator,
         314,
         watermark,
-        17,
+        (@as(u128, 17) << 96) | 17,
     )) orelse return error.TestExpectedEqual;
     defer shard_state_store.freeHandoff(std.testing.allocator, verified);
     try std.testing.expectEqual(@as(usize, 2), verified.entries.len);
@@ -2687,7 +2698,7 @@ test "data raft apply store rejects a regressing source generation during active
     });
     const watermark = (try store.latestBatch(316)) orelse return error.MissingDataBatch;
 
-    try std.testing.expectError(error.SplitSourceProjectionNotReady, store.reconcileGroupSnapshotAtRootGeneration(
+    try std.testing.expectError(error.SplitSourceProjectionNotReady, store.reconcileGroupSnapshotAtRootIncarnation(
         std.testing.allocator,
         316,
         watermark,
@@ -2731,7 +2742,7 @@ test "data raft apply store transition reads fail fast during generation staging
     defer if (preparation_active) store.cancelGenerationPreparation(313);
     try std.testing.expectError(error.SplitSourceProjectionNotReady, store.latestBatchForTransition(313));
     try std.testing.expectError(error.SplitSourceProjectionNotReady, store.observeSplitControl(std.testing.allocator, 313));
-    try std.testing.expectError(error.SplitSourceProjectionNotReady, store.reconcileGroupSnapshotAtRootGeneration(
+    try std.testing.expectError(error.SplitSourceProjectionNotReady, store.reconcileGroupSnapshotAtRootIncarnation(
         std.testing.allocator,
         313,
         watermark,

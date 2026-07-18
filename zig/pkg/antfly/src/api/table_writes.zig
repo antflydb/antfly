@@ -5122,7 +5122,7 @@ pub const ProvisionedTableWriteSource = struct {
         for (self.active_table_activities.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (entry.group_id == null) continue;
-            if (entry.operation_active and !entry.operation_allows_reads) return true;
+            if (entry.transition_waiters > 0 or (entry.operation_active and !entry.operation_allows_reads)) return true;
         }
         return false;
     }
@@ -5722,6 +5722,40 @@ pub const ProvisionedTableWriteSource = struct {
         pub fn allowReads(self: *GroupTransitionActivity) void {
             if (!self.active) return;
             self.source.allowGroupOperationReads(self.table_name, self.group_id);
+        }
+
+        pub fn leaseCachedWriter(
+            self: *GroupTransitionActivity,
+            alloc: std.mem.Allocator,
+        ) !?ProvisionedTableWriteCache.CachedDb {
+            if (!self.active) return error.InactiveGroupTransitionActivity;
+            return try self.source.leaseCachedGroupWriter(alloc, self.group_id, self.table_name);
+        }
+
+        /// Opens the authoritative writer only while this capability owns group
+        /// transition admission. This is the uncached maintenance fallback; it
+        /// must never escape the activity lifetime.
+        pub fn openMaintenanceWriter(
+            self: *GroupTransitionActivity,
+            alloc: std.mem.Allocator,
+        ) !db_mod.DB {
+            if (!self.active) return error.InactiveGroupTransitionActivity;
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.source.replica_root_dir, self.group_id);
+            defer alloc.free(path);
+            return try openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGate(
+                alloc,
+                path,
+                self.source.catalog,
+                self.table_name,
+                self.group_id,
+                null,
+                null,
+                self.source.visibleRootGeneration(self.group_id),
+                null,
+                self.source.backend_runtime,
+                self.source.ha_write_gate,
+                self.source.ha_async_mirror,
+            );
         }
     };
 
@@ -8090,7 +8124,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         if (self.findTableActivityLocked(table_name, group_id)) |index| {
             const entry = self.active_table_activities.items[index];
-            if (entry.operation_active and !entry.operation_allows_reads) return true;
+            if (entry.transition_waiters > 0 or (entry.operation_active and !entry.operation_allows_reads)) return true;
         }
         return false;
     }
@@ -25551,6 +25585,72 @@ test "provisioned table transition waiter queues ahead of later writers" {
     operation_active = false;
     try std.testing.expect(!source.tryBeginGroupOperation("docs", 7001));
     while (!worker.entered.load(.acquire)) std.atomic.spinLoopHint();
+}
+
+test "provisioned table transition waiter queues ahead of later readers" {
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const TransitionWorker = struct {
+        source: *ProvisionedTableWriteSource,
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var transition = self.source.beginGroupTransitionActivity("docs", 7001);
+            defer transition.deinit();
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    };
+    const ReaderWorker = struct {
+        source: *ProvisionedTableWriteSource,
+        entered: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var read = self.source.readPreparation().beginRead("docs", .general).?;
+            defer read.deinit();
+            self.entered.store(true, .release);
+        }
+    };
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-group-transition-reader-fairness", NoCatalog.iface());
+    var initial_read = source.readPreparation().beginRead("docs", .general).?;
+    var initial_read_active = true;
+    defer if (initial_read_active) initial_read.deinit();
+
+    var transition_worker = TransitionWorker{ .source = &source };
+    const transition_thread = try std.Thread.spawn(.{}, TransitionWorker.run, .{&transition_worker});
+    defer {
+        transition_worker.release.store(true, .release);
+        transition_thread.join();
+    }
+    while (source.testingGroupTransitionWaiterCount("docs", 7001) == 0) std.atomic.spinLoopHint();
+
+    var reader_worker = ReaderWorker{ .source = &source };
+    const reader_thread = try std.Thread.spawn(.{}, ReaderWorker.run, .{&reader_worker});
+    defer {
+        transition_worker.release.store(true, .release);
+        reader_thread.join();
+    }
+    for (0..10_000) |_| std.atomic.spinLoopHint();
+    try std.testing.expect(!reader_worker.entered.load(.acquire));
+
+    initial_read.deinit();
+    initial_read_active = false;
+    while (!transition_worker.entered.load(.acquire)) std.atomic.spinLoopHint();
+    try std.testing.expect(!reader_worker.entered.load(.acquire));
+
+    transition_worker.release.store(true, .release);
+    while (!reader_worker.entered.load(.acquire)) std.atomic.spinLoopHint();
 }
 
 test "table write source restore acquires lifecycle unless caller reserves it" {

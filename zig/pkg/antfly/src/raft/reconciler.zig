@@ -54,6 +54,17 @@ pub fn placementMayServeClientReads(intent: PlacementIntent) bool {
     };
 }
 
+/// Whether an existing placement may remain leader while a membership
+/// transition converges. A cutover-ready target is already a voting member, a
+/// draining source must finish expansion, and a retiring source owns orderly
+/// transfer until Raft elects or confirms its successor.
+pub fn placementMayLeadMembershipTransition(intent: PlacementIntent) bool {
+    return switch (intent.serving_state) {
+        .cutover_ready, .serving, .draining, .retiring => true,
+        .planned, .bootstrapping, .replaying => false,
+    };
+}
+
 pub fn placementReadableWithPeers(intents: []const PlacementIntent, intent: PlacementIntent) bool {
     switch (intent.serving_state) {
         .serving => return true,
@@ -274,6 +285,13 @@ pub const Reconciler = struct {
                         else => return err,
                     };
                 }
+                for (intent.learner_node_ids) |node_id| {
+                    if (node_id == self.host.cfg.local_node_id or containsNodeId(intent.peer_node_ids, node_id)) continue;
+                    result.refreshed_peers += self.host.refreshPeerEndpoints(intent.record.group_id, node_id) catch |err| switch (err) {
+                        error.UnknownPeer => 0,
+                        else => return err,
+                    };
+                }
                 try self.last_intent_hashes.put(self.alloc, intent.record.group_id, intent_hash);
             }
             if (try self.reconcileRaftMembership(intent)) result.membership_proposals += 1;
@@ -309,6 +327,11 @@ pub const Reconciler = struct {
             return true;
         }
 
+        if (retirementLeaderTransferTarget(status, intent)) |transferee| {
+            try self.host.transferLeader(intent.record.group_id, transferee);
+            return true;
+        }
+
         const changes = try allocMembershipChangesWithLocalPolicy(
             self.alloc,
             status.conf_state.voters,
@@ -333,6 +356,22 @@ pub const Reconciler = struct {
         return true;
     }
 };
+
+fn retirementLeaderTransferTarget(
+    status: raft_engine.core.Status,
+    intent: PlacementIntent,
+) ?u64 {
+    if (intent.serving_state != .retiring) return null;
+    if (!containsNodeId(status.conf_state.voters, status.id)) return null;
+    if (containsNodeId(intent.peer_node_ids, status.id)) return null;
+
+    var target: ?u64 = null;
+    for (intent.peer_node_ids) |node_id| {
+        if (!containsNodeId(status.conf_state.voters, node_id)) continue;
+        if (target == null or node_id < target.?) target = node_id;
+    }
+    return target;
+}
 
 fn localNodeCanProposeMembership(status: raft_engine.core.Status) bool {
     return containsNodeId(status.conf_state.voters, status.id) or
@@ -603,6 +642,7 @@ test "reconciler can ensure desired replicas and remove stale ones" {
                 .local_node_id = 1,
             },
             .peer_node_ids = &.{2},
+            .learner_node_ids = &.{ 2, 3 },
         },
     });
 
@@ -615,7 +655,7 @@ test "reconciler can ensure desired replicas and remove stale ones" {
     const result = try reconciler.reconcileOnce();
     try std.testing.expectEqual(@as(usize, 1), result.ensured);
     try std.testing.expectEqual(@as(usize, 1), result.removed);
-    try std.testing.expectEqual(@as(usize, 1), result.refreshed_peers);
+    try std.testing.expectEqual(@as(usize, 2), result.refreshed_peers);
     try std.testing.expectEqual(host_mod.HostedReplicaStatus.absent, host.status(301));
     try std.testing.expectEqual(host_mod.HostedReplicaStatus.active, host.status(302));
 }
@@ -770,6 +810,25 @@ test "membership reconciliation removes a hosted retiring local voter" {
     try std.testing.expectEqualSlices(raft_engine.core.ConfChangeSingle, &.{
         .{ .change_type = .remove_node, .node_id = 7 },
     }, changes);
+}
+
+test "membership reconciliation transfers a retiring leader to a retained voter" {
+    var status: raft_engine.core.Status = .{
+        .id = 7,
+        .group_id = 11,
+        .soft = .{ .leader_id = 7, .role = .leader },
+        .hard = .{},
+        .conf_state = .{ .voters = @constCast((&[_]u64{ 7, 8, 9 })[0..]) },
+    };
+    const retiring = PlacementIntent{
+        .record = .{ .group_id = 11, .replica_id = 7, .local_node_id = 7 },
+        .peer_node_ids = &.{ 9, 8 },
+        .serving_state = .retiring,
+    };
+
+    try std.testing.expectEqual(@as(?u64, 8), retirementLeaderTransferTarget(status, retiring));
+    status.conf_state.voters = @constCast((&[_]u64{7})[0..]);
+    try std.testing.expectEqual(@as(?u64, null), retirementLeaderTransferTarget(status, retiring));
 }
 
 test "membership reconciliation hydrates learners before voter promotion" {

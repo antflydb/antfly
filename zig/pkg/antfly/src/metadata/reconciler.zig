@@ -287,6 +287,8 @@ pub const Reconciler = struct {
         else
             try self.alloc.alloc(raft_reconciler.PlacementIntent, 0);
         defer planner.freeIntents(self.alloc, desired_placements);
+        var membership_index = try MembershipTransitionIndex.init(self.alloc, current, desired_placements);
+        defer membership_index.deinit();
         var table_upserts = std.ArrayListUnmanaged(table_manager.TableRecord).empty;
         var placement_upserts = std.ArrayListUnmanaged(raft_reconciler.PlacementIntent).empty;
         errdefer {
@@ -340,17 +342,21 @@ pub const Reconciler = struct {
 
         for (desired_placements) |desired| {
             {
-                const contracting = groupReadyForMembershipContraction(current, desired_placements, desired.record.group_id);
-                const transition_peers = if (contracting)
+                if (membership_index.deferDesiredPlacement(desired.record.group_id, desired.record.local_node_id)) continue;
+                const contracting = membership_index.contracting(desired.record.group_id);
+                const latched_peers = membership_index.latchedFinalPeers(desired.record.group_id);
+                const transition_peers = if (contracting or latched_peers != null)
+                    null
+                else if (!membership_index.needsExpansion(desired.record.group_id))
                     null
                 else
                     try allocExpandedTransitionPeerNodeIds(self.alloc, current.placement_intents, desired);
                 defer if (transition_peers) |peers| self.alloc.free(peers);
                 var transition_intent = desired;
-                if (transition_peers) |peers| transition_intent.peer_node_ids = peers;
+                transition_intent.peer_node_ids = latched_peers orelse transition_peers orelse desired.peer_node_ids;
 
                 const effective = effectivePlacementIntent(current, desired_tables, desired_ranges, transition_intent);
-                const existing = findPlacementIntent(current.placement_intents, effective.record.group_id, effective.record.local_node_id);
+                const existing = membership_index.currentIntent(effective.record.group_id, effective.record.local_node_id);
                 if (existing == null or !placementIntentsEqual(existing.?, effective)) {
                     try placement_upserts.append(self.alloc, try clonePlacementIntent(self.alloc, effective));
                 }
@@ -454,18 +460,20 @@ pub const Reconciler = struct {
         }
 
         for (current.placement_intents) |intent| {
-            if (findPlacementIntent(desired_placements, intent.record.group_id, intent.record.local_node_id) == null) {
-                if (placementSafeToRemove(current, desired_placements, intent)) {
+            if (!membership_index.hasDesiredMember(intent.record.group_id, intent.record.local_node_id)) {
+                if (membership_index.preserveCurrentPlacement(intent.record.group_id, intent.record.local_node_id)) continue;
+                if (membership_index.placementSafeToRemove(intent)) {
                     try placement_removals.append(self.alloc, .{
                         .group_id = intent.record.group_id,
                         .local_node_id = intent.record.local_node_id,
                     });
                 } else {
                     var draining = intent;
-                    const contracting = groupReadyForMembershipContraction(current, desired_placements, intent.record.group_id);
+                    const contracting = membership_index.contracting(intent.record.group_id);
                     draining.serving_state = if (contracting) .retiring else .draining;
-                    const desired = findPlacementIntentForGroup(desired_placements, intent.record.group_id);
-                    const transition_peers = if (!contracting)
+                    const desired = membership_index.representativeDesired(intent.record.group_id);
+                    const latched_peers = membership_index.latchedFinalPeers(intent.record.group_id);
+                    const transition_peers = if (!contracting and latched_peers == null and membership_index.needsExpansion(intent.record.group_id))
                         if (desired) |value|
                             try allocExpandedTransitionPeerNodeIds(self.alloc, current.placement_intents, value)
                         else
@@ -473,7 +481,11 @@ pub const Reconciler = struct {
                     else
                         null;
                     defer if (transition_peers) |peers| self.alloc.free(peers);
-                    if (desired) |value| draining.peer_node_ids = transition_peers orelse value.peer_node_ids;
+                    if (latched_peers) |peers| {
+                        draining.peer_node_ids = peers;
+                    } else if (desired) |value| {
+                        draining.peer_node_ids = transition_peers orelse value.peer_node_ids;
+                    }
                     const watermark = relocationWatermarkForGroup(current, intent.record.group_id);
                     if (draining.relocation_generation == 0) draining.relocation_generation = intent.record.metadata_version + 1;
                     applyRelocationWatermark(&draining, watermark);
@@ -1005,8 +1017,9 @@ fn applyRelocationWatermark(intent: *raft_reconciler.PlacementIntent, watermark:
     if (intent.relocation_disk_bytes_watermark < watermark.disk_bytes) intent.relocation_disk_bytes_watermark = watermark.disk_bytes;
     // Capture the source's committed apply boundary once. Chasing a moving
     // leader on every reconciliation can starve relocation under sustained
-    // writes; the data and disk watermarks continue to provide conservative
-    // visibility checks after this fixed Raft boundary.
+    // writes. Document count remains a logical cross-check; disk bytes are
+    // retained for capacity telemetry only because compaction can make an
+    // equivalent target generation physically smaller than its source.
     if (intent.relocation_target_sequence == 0) intent.relocation_target_sequence = watermark.raft_target_index;
 }
 
@@ -1038,7 +1051,6 @@ fn relocationTargetDataReady(current: CurrentMetadataState, intent: raft_reconci
         if (status.transition_pending) return false;
         if (status.replay_required and !status.replay_caught_up) return false;
         if (status.doc_count < intent.relocation_doc_count_watermark) return false;
-        if (status.disk_bytes < intent.relocation_disk_bytes_watermark) return false;
         if (intent.relocation_target_sequence != 0 and status.raft_applied_index < intent.relocation_target_sequence)
             return false;
         return true;
@@ -1079,110 +1091,218 @@ fn relocationTargetHasDataReport(current: CurrentMetadataState, intent: raft_rec
     return false;
 }
 
-fn placementSafeToRemove(
-    current: CurrentMetadataState,
-    desired_placements: []const raft_reconciler.PlacementIntent,
-    source: raft_reconciler.PlacementIntent,
-) bool {
-    const desired_count = countPlacementIntents(desired_placements, source.record.group_id);
-    if (desired_count == 0) return true;
-    if (source.serving_state != .retiring) return false;
+const MembershipTransitionIndex = struct {
+    const GroupState = struct {
+        current_count: usize = 0,
+        desired_count: usize = 0,
+        desired_fingerprint: ?table_manager.VoterSetFingerprint = null,
+        desired_voter_count: usize = 0,
+        desired_consistent: bool = true,
+        desired_ready: bool = true,
+        expanded_leader: bool = false,
+        representative_desired: ?*const raft_reconciler.PlacementIntent = null,
+        needs_expansion: bool = false,
+        latched_final_peers: ?[]const u64 = null,
+        latched_fingerprint: ?table_manager.VoterSetFingerprint = null,
+        latched_voter_count: usize = 0,
+        latched_valid: bool = true,
+    };
 
-    const source_store = findStoreByNode(current.stores, source.record.local_node_id) orelse return false;
-    if (!source_store.live or !std.mem.eql(u8, source_store.health_class, "healthy")) return false;
-    var source_retired = false;
-    for (source_store.group_statuses) |status| {
-        if (status.group_id != source.record.group_id) continue;
-        if (status.local_voter or status.joint_consensus or status.transition_pending) return false;
-        source_retired = true;
-        break;
+    alloc: std.mem.Allocator,
+    groups: std.AutoHashMapUnmanaged(u64, GroupState) = .empty,
+    current_by_member: std.AutoHashMapUnmanaged(u128, *const raft_reconciler.PlacementIntent) = .empty,
+    desired_by_member: std.AutoHashMapUnmanaged(u128, *const raft_reconciler.PlacementIntent) = .empty,
+    stores_by_node: std.AutoHashMapUnmanaged(u64, *const table_manager.StoreRecord) = .empty,
+    status_by_member: std.AutoHashMapUnmanaged(u128, *const table_manager.GroupStatusReport) = .empty,
+
+    fn init(
+        alloc: std.mem.Allocator,
+        current: CurrentMetadataState,
+        desired: []const raft_reconciler.PlacementIntent,
+    ) !MembershipTransitionIndex {
+        var self = MembershipTransitionIndex{ .alloc = alloc };
+        errdefer self.deinit();
+
+        for (current.placement_intents) |*intent| {
+            try self.current_by_member.put(alloc, placementNodeKey(intent.record.group_id, intent.record.local_node_id), intent);
+            const state = try self.groupState(intent.record.group_id);
+            state.current_count += 1;
+        }
+        for (desired) |*intent| {
+            try self.desired_by_member.put(alloc, placementNodeKey(intent.record.group_id, intent.record.local_node_id), intent);
+            const state = try self.groupState(intent.record.group_id);
+            state.desired_count += 1;
+            if (state.representative_desired == null) state.representative_desired = intent;
+            const fingerprint = table_manager.voterSetFingerprint(intent.peer_node_ids, intent.record.local_node_id);
+            const voter_count = table_manager.normalizedVoterCount(intent.peer_node_ids, intent.record.local_node_id);
+            if (state.desired_fingerprint) |expected| {
+                if (!std.mem.eql(u8, &expected, &fingerprint) or state.desired_voter_count != voter_count)
+                    state.desired_consistent = false;
+            } else {
+                state.desired_fingerprint = fingerprint;
+                state.desired_voter_count = voter_count;
+            }
+        }
+        for (current.stores) |*store| {
+            try self.stores_by_node.put(alloc, store.node_id, store);
+            for (store.group_statuses) |*status| {
+                try self.status_by_member.put(alloc, placementNodeKey(status.group_id, store.node_id), status);
+            }
+        }
+        for (current.placement_intents) |*intent| {
+            if (!self.desired_by_member.contains(placementNodeKey(intent.record.group_id, intent.record.local_node_id)))
+                self.groups.getPtr(intent.record.group_id).?.needs_expansion = true;
+            if (intent.serving_state != .retiring or
+                self.desired_by_member.contains(placementNodeKey(intent.record.group_id, intent.record.local_node_id))) continue;
+            const state = self.groups.getPtr(intent.record.group_id).?;
+            const fingerprint = table_manager.voterSetFingerprint(intent.peer_node_ids, null);
+            const voter_count = table_manager.normalizedVoterCount(intent.peer_node_ids, null);
+            if (intent.peer_node_ids.len == 0 or containsU64(intent.peer_node_ids, intent.record.local_node_id))
+                state.latched_valid = false;
+            if (state.latched_fingerprint) |expected| {
+                if (!std.mem.eql(u8, &expected, &fingerprint) or state.latched_voter_count != voter_count)
+                    state.latched_valid = false;
+            } else {
+                state.latched_final_peers = intent.peer_node_ids;
+                state.latched_fingerprint = fingerprint;
+                state.latched_voter_count = voter_count;
+            }
+        }
+
+        for (desired) |*intent| {
+            const state = self.groups.getPtr(intent.record.group_id).?;
+            const current_intent = self.current_by_member.get(placementNodeKey(intent.record.group_id, intent.record.local_node_id)) orelse {
+                state.desired_ready = false;
+                continue;
+            };
+            // The final set is published only after the expanded configuration
+            // is stable. Validate the currently committed survivor intent here;
+            // requiring the desired final intent would wait for a configuration
+            // that metadata has not authorized yet.
+            const member_ready = current_intent.serving_state == .serving and
+                self.memberReadyForContraction(current_intent.*);
+            if (!member_ready)
+                state.desired_ready = false;
+        }
+        // The leader that commits contraction may be the member being
+        // removed. Requiring a final-set member to lead before contraction
+        // deadlocks whenever the expanded configuration's leader is the
+        // source. Final-set leadership is proved separately before metadata
+        // removes the retired placement.
+        for (current.placement_intents) |*intent| {
+            if (intent.serving_state != .serving and intent.serving_state != .draining) continue;
+            if (!self.memberReadyForContraction(intent.*)) continue;
+            const status = self.status_by_member.get(placementNodeKey(intent.record.group_id, intent.record.local_node_id)).?;
+            if (status.local_leader) self.groups.getPtr(intent.record.group_id).?.expanded_leader = true;
+        }
+        return self;
     }
-    if (!source_retired) return false;
 
-    var survivor_count: usize = 0;
-    for (desired_placements) |desired| {
-        if (desired.record.group_id != source.record.group_id) continue;
-        if (desired.record.local_node_id == source.record.local_node_id) continue;
-        const current_target = findPlacementIntent(current.placement_intents, desired.record.group_id, desired.record.local_node_id) orelse return false;
-        if (current_target.serving_state != .serving) return false;
-        const store = findStoreByNode(current.stores, desired.record.local_node_id) orelse return false;
+    fn deinit(self: *MembershipTransitionIndex) void {
+        self.groups.deinit(self.alloc);
+        self.current_by_member.deinit(self.alloc);
+        self.desired_by_member.deinit(self.alloc);
+        self.stores_by_node.deinit(self.alloc);
+        self.status_by_member.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn groupState(self: *MembershipTransitionIndex, group_id: u64) !*GroupState {
+        const entry = try self.groups.getOrPut(self.alloc, group_id);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        return entry.value_ptr;
+    }
+
+    fn memberReadyForContraction(self: *const MembershipTransitionIndex, intent: raft_reconciler.PlacementIntent) bool {
+        const store = self.stores_by_node.get(intent.record.local_node_id) orelse return false;
         if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return false;
-        var stable = false;
-        for (store.group_statuses) |status| {
-            if (status.group_id != source.record.group_id) continue;
-            if (!status.local_voter or status.joint_consensus or status.transition_pending) return false;
-            if (!voterSetMatchesIntent(status, desired)) return false;
-            stable = true;
-            break;
-        }
-        if (!stable) return false;
-        survivor_count += 1;
-    }
-    return survivor_count == desired_count;
-}
-
-fn groupReadyForMembershipContraction(
-    current: CurrentMetadataState,
-    desired_placements: []const raft_reconciler.PlacementIntent,
-    group_id: u64,
-) bool {
-    const desired_count = countPlacementIntents(desired_placements, group_id);
-    if (desired_count == 0) return false;
-    if (desired_count >= countPlacementIntents(current.placement_intents, group_id)) return false;
-
-    // Retirement is a latched metadata phase. Re-expanding the voter set while
-    // the final configuration is committing would oscillate membership and can
-    // prevent convergence under a fast reconciliation loop.
-    for (current.placement_intents) |intent| {
-        if (intent.record.group_id != group_id or intent.serving_state != .retiring) continue;
-        if (findPlacementIntent(desired_placements, group_id, intent.record.local_node_id) == null) return true;
-    }
-
-    var survivor_count: usize = 0;
-    var expected_final_fingerprint: ?table_manager.VoterSetFingerprint = null;
-    var expected_final_count: ?usize = null;
-    for (desired_placements) |desired| {
-        if (desired.record.group_id != group_id) continue;
-        const final_fingerprint = table_manager.voterSetFingerprint(desired.peer_node_ids, desired.record.local_node_id);
-        const final_count = table_manager.normalizedVoterCount(desired.peer_node_ids, desired.record.local_node_id);
-        if (expected_final_fingerprint) |expected| {
-            if (!std.mem.eql(u8, &expected, &final_fingerprint) or expected_final_count.? != final_count) return false;
-        } else {
-            expected_final_fingerprint = final_fingerprint;
-            expected_final_count = final_count;
-        }
-        const current_target = findPlacementIntent(current.placement_intents, group_id, desired.record.local_node_id) orelse return false;
-        if (current_target.serving_state != .serving) return false;
-        if (!placementReadyForCompactShrink(current, current_target)) return false;
-        survivor_count += 1;
-    }
-    if (survivor_count != desired_count) return false;
-
-    const group_status = mergedGroupStatus(current, group_id) orelse return false;
-    if (!group_status.leader_known) return false;
-    for (desired_placements) |desired| {
-        if (desired.record.group_id == group_id and desired.store_id != 0 and desired.store_id == group_status.leader_store_id)
-            return true;
-    }
-    return false;
-}
-
-fn placementReadyForCompactShrink(
-    current: CurrentMetadataState,
-    target: raft_reconciler.PlacementIntent,
-) bool {
-    const store = findStoreByNode(current.stores, target.record.local_node_id) orelse return false;
-    if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return false;
-    for (store.group_statuses) |status| {
-        if (status.group_id != target.record.group_id) continue;
-        if (!status.local_voter) return false;
-        if (status.joint_consensus or status.transition_pending) return false;
+        const status = self.status_by_member.get(placementNodeKey(intent.record.group_id, intent.record.local_node_id)) orelse return false;
+        if (!status.local_voter or status.joint_consensus or status.transition_pending) return false;
         if (status.replay_required and !status.replay_caught_up) return false;
-        if (!voterSetMatchesIntent(status, target)) return false;
-        return true;
+        return voterSetMatchesIntent(status.*, intent);
     }
-    return false;
-}
+
+    fn currentIntent(self: *const MembershipTransitionIndex, group_id: u64, node_id: u64) ?raft_reconciler.PlacementIntent {
+        const intent = self.current_by_member.get(placementNodeKey(group_id, node_id)) orelse return null;
+        return intent.*;
+    }
+
+    fn hasDesiredMember(self: *const MembershipTransitionIndex, group_id: u64, node_id: u64) bool {
+        return self.desired_by_member.contains(placementNodeKey(group_id, node_id));
+    }
+
+    fn representativeDesired(self: *const MembershipTransitionIndex, group_id: u64) ?raft_reconciler.PlacementIntent {
+        const state = self.groups.get(group_id) orelse return null;
+        return if (state.representative_desired) |intent| intent.* else null;
+    }
+
+    fn needsExpansion(self: *const MembershipTransitionIndex, group_id: u64) bool {
+        const state = self.groups.get(group_id) orelse return false;
+        return state.needs_expansion;
+    }
+
+    fn contracting(self: *const MembershipTransitionIndex, group_id: u64) bool {
+        const state = self.groups.get(group_id) orelse return false;
+        if (state.latched_final_peers != null) return state.latched_valid;
+        return state.desired_count > 0 and
+            state.desired_count < state.current_count and
+            state.desired_consistent and
+            state.desired_ready and
+            state.expanded_leader;
+    }
+
+    fn latchedFinalPeers(self: *const MembershipTransitionIndex, group_id: u64) ?[]const u64 {
+        const state = self.groups.get(group_id) orelse return null;
+        if (!state.latched_valid) return null;
+        return state.latched_final_peers;
+    }
+
+    fn deferDesiredPlacement(self: *const MembershipTransitionIndex, group_id: u64, node_id: u64) bool {
+        const state = self.groups.get(group_id) orelse return false;
+        if (state.latched_final_peers == null) return false;
+        if (!state.latched_valid) return true;
+        return !containsU64(state.latched_final_peers.?, node_id);
+    }
+
+    fn preserveCurrentPlacement(self: *const MembershipTransitionIndex, group_id: u64, node_id: u64) bool {
+        const state = self.groups.get(group_id) orelse return false;
+        if (state.desired_count == 0) return false;
+        if (state.latched_final_peers == null) return false;
+        if (!state.latched_valid) return true;
+        return containsU64(state.latched_final_peers.?, node_id);
+    }
+
+    fn placementSafeToRemove(self: *const MembershipTransitionIndex, source: raft_reconciler.PlacementIntent) bool {
+        const state = self.groups.get(source.record.group_id) orelse return false;
+        if (state.desired_count == 0) return true;
+        if (source.serving_state != .retiring or !state.latched_valid) return false;
+        const final_peers = state.latched_final_peers orelse return false;
+        if (containsU64(final_peers, source.record.local_node_id)) return false;
+
+        if (self.stores_by_node.get(source.record.local_node_id)) |store| {
+            if (store.live and std.mem.eql(u8, store.health_class, "healthy")) {
+                if (self.status_by_member.get(placementNodeKey(source.record.group_id, source.record.local_node_id))) |status| {
+                    if (status.local_voter or status.joint_consensus or status.transition_pending) return false;
+                }
+            }
+        }
+
+        var final_leader_proved = false;
+        for (final_peers) |node_id| {
+            const store = self.stores_by_node.get(node_id) orelse continue;
+            if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) continue;
+            const status = self.status_by_member.get(placementNodeKey(source.record.group_id, node_id)) orelse continue;
+            if (!status.local_voter or status.joint_consensus or status.transition_pending or
+                !status.voter_set_known or @as(usize, status.voter_count) != state.latched_voter_count or
+                !std.mem.eql(u8, &status.voter_set_fingerprint, &state.latched_fingerprint.?))
+            {
+                return false;
+            }
+            final_leader_proved = final_leader_proved or status.local_leader;
+        }
+        return final_leader_proved;
+    }
+};
 
 fn voterSetMatchesIntent(
     status: table_manager.GroupStatusReport,
@@ -3396,14 +3516,130 @@ test "metadata reconciler preserves empty-group source voters until replacement 
         current[2],
     };
 
-    try std.testing.expect(!placementSafeToRemove(
+    var membership_index = try MembershipTransitionIndex.init(
+        std.testing.allocator,
         .{ .placement_intents = &current },
         &desired,
-        current[0],
-    ));
+    );
+    defer membership_index.deinit();
+    try std.testing.expect(!membership_index.placementSafeToRemove(current[0]));
 }
 
-test "metadata reconciler requires document watermark after stable raft membership" {
+test "metadata reconciler latches final membership across planner churn" {
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{
+            .record = .{ .group_id = 2233, .replica_id = 1, .local_node_id = 101 },
+            .store_id = 101,
+            .peer_node_ids = &.{ 102, 103 },
+            .serving_state = .retiring,
+        },
+        .{
+            .record = .{ .group_id = 2233, .replica_id = 2, .local_node_id = 102 },
+            .store_id = 102,
+            .peer_node_ids = &.{ 102, 103 },
+            .serving_state = .serving,
+        },
+        .{
+            .record = .{ .group_id = 2233, .replica_id = 3, .local_node_id = 103 },
+            .store_id = 103,
+            .peer_node_ids = &.{ 102, 103 },
+            .serving_state = .serving,
+        },
+    };
+    const replanned = [_]raft_reconciler.PlacementIntent{
+        .{
+            .record = .{ .group_id = 2233, .replica_id = 2, .local_node_id = 102 },
+            .store_id = 102,
+            .peer_node_ids = &.{ 102, 104 },
+            .serving_state = .serving,
+        },
+        .{
+            .record = .{ .group_id = 2233, .replica_id = 4, .local_node_id = 104 },
+            .store_id = 104,
+            .peer_node_ids = &.{ 102, 104 },
+            .serving_state = .planned,
+        },
+    };
+
+    var membership_index = try MembershipTransitionIndex.init(
+        std.testing.allocator,
+        .{ .placement_intents = &current },
+        &replanned,
+    );
+    defer membership_index.deinit();
+
+    try std.testing.expect(membership_index.contracting(2233));
+    try std.testing.expectEqualSlices(u64, &.{ 102, 103 }, membership_index.latchedFinalPeers(2233).?);
+    try std.testing.expect(membership_index.deferDesiredPlacement(2233, 104));
+    try std.testing.expect(membership_index.preserveCurrentPlacement(2233, 103));
+    try std.testing.expect(!membership_index.preserveCurrentPlacement(2233, 101));
+}
+
+test "metadata reconciler retires an unavailable source after exact final leader proof" {
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{
+            .record = .{ .group_id = 2234, .replica_id = 1, .local_node_id = 101 },
+            .store_id = 101,
+            .peer_node_ids = &.{ 102, 103 },
+            .serving_state = .retiring,
+        },
+        .{
+            .record = .{ .group_id = 2234, .replica_id = 2, .local_node_id = 102 },
+            .store_id = 102,
+            .peer_node_ids = &.{ 102, 103 },
+            .serving_state = .serving,
+        },
+        .{
+            .record = .{ .group_id = 2234, .replica_id = 3, .local_node_id = 103 },
+            .store_id = 103,
+            .peer_node_ids = &.{ 102, 103 },
+            .serving_state = .serving,
+        },
+    };
+    const desired = [_]raft_reconciler.PlacementIntent{ current[1], current[2] };
+    const final_fingerprint = table_manager.voterSetFingerprint(&.{ 102, 103 }, null);
+    const stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 102,
+            .node_id = 102,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2234,
+                .local_leader = true,
+                .local_voter = true,
+                .voter_count = 2,
+                .voter_set_known = true,
+                .voter_set_fingerprint = final_fingerprint,
+            }})[0..]),
+        },
+        .{
+            .store_id = 103,
+            .node_id = 103,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2234,
+                .local_voter = true,
+                .voter_count = 2,
+                .voter_set_known = true,
+                .voter_set_fingerprint = final_fingerprint,
+            }})[0..]),
+        },
+    };
+
+    var membership_index = try MembershipTransitionIndex.init(
+        std.testing.allocator,
+        .{ .placement_intents = &current, .stores = &stores },
+        &desired,
+    );
+    defer membership_index.deinit();
+    try std.testing.expect(membership_index.placementSafeToRemove(current[0]));
+}
+
+test "metadata reconciler requires logical document watermark and tolerates compacted target" {
     const intent: raft_reconciler.PlacementIntent = .{
         .record = .{ .group_id = 2241, .replica_id = 3, .local_node_id = 104 },
         .store_id = 104,
@@ -3422,7 +3658,7 @@ test "metadata reconciler requires document watermark after stable raft membersh
         .live = true,
         .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
             .group_id = 2241,
-            .doc_count = 12,
+            .doc_count = 11,
             .disk_bytes = 8_192,
             .empty = false,
             .local_voter = true,
@@ -3435,7 +3671,7 @@ test "metadata reconciler requires document watermark after stable raft membersh
     try std.testing.expect(!relocationTargetCutoverReady(.{ .stores = &stores }, intent));
 
     var caught_up_status = stores[0].group_statuses[0];
-    caught_up_status.disk_bytes = intent.relocation_disk_bytes_watermark;
+    caught_up_status.doc_count = intent.relocation_doc_count_watermark;
     var caught_up_store = stores[0];
     caught_up_store.group_statuses = @constCast((&[_]table_manager.GroupStatusReport{caught_up_status})[0..]);
     try std.testing.expect(relocationTargetCutoverReady(.{ .stores = (&[_]table_manager.StoreRecord{caught_up_store})[0..] }, intent));
@@ -3726,8 +3962,11 @@ test "metadata reconciler compact shrink enters retirement after stable expanded
                 .doc_count = 18,
                 .disk_bytes = 2048,
                 .empty = false,
+                .local_leader = true,
                 .local_voter = true,
                 .voter_count = 3,
+                .voter_set_known = true,
+                .voter_set_fingerprint = table_manager.voterSetFingerprint(&.{ 101, 102, 103 }, null),
             }})[0..]),
         },
         .{
@@ -3746,7 +3985,6 @@ test "metadata reconciler compact shrink enters retirement after stable expanded
                 .doc_count = 18,
                 .disk_bytes = 1024,
                 .empty = false,
-                .local_leader = true,
                 .local_voter = true,
                 .voter_count = 3,
                 .voter_set_known = true,

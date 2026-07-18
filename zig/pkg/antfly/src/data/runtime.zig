@@ -5666,7 +5666,6 @@ pub const DataServer = struct {
         // projection and derive the handoff under one exact watermark.
         const handoff = try self.captureReconciledSplitSourceHandoff(
             source_store,
-            source_root_dir,
             source_group_id,
         );
         defer antfly.data.storage.shard_state_store.freeHandoff(self.alloc, handoff);
@@ -6179,11 +6178,11 @@ pub const DataServer = struct {
 
     fn ensureSplitSourceApplyStoreSeeded(self: *DataServer, source_root_dir: []const u8, source_group_id: u64) !void {
         if (self.localTransitionApplyStore()) |source_store| {
-            return try self.ensureSplitSourceApplyStoreSeededInto(source_store, source_root_dir, source_group_id);
+            return try self.ensureSplitSourceApplyStoreSeededInto(source_store, source_group_id);
         }
         var source_store = try antfly.data.RaftApplyStore.init(self.alloc, .{ .root_dir = source_root_dir });
         defer source_store.deinit();
-        try self.ensureSplitSourceApplyStoreSeededInto(&source_store, source_root_dir, source_group_id);
+        try self.ensureSplitSourceApplyStoreSeededInto(&source_store, source_group_id);
     }
 
     fn localTransitionApplyStore(self: *DataServer) ?*antfly.data.RaftApplyStore {
@@ -6194,7 +6193,6 @@ pub const DataServer = struct {
     fn ensureSplitSourceApplyStoreSeededInto(
         self: *DataServer,
         source_store: *antfly.data.RaftApplyStore,
-        source_root_dir: []const u8,
         source_group_id: u64,
     ) !void {
         var initial_observation = try source_store.observeSplitControl(self.alloc, source_group_id);
@@ -6202,13 +6200,12 @@ pub const DataServer = struct {
         if (initial_observation.state != null) {
             return;
         }
-        try self.reconcileSplitSourceApplyStoreDocuments(source_store, source_root_dir, source_group_id);
+        try self.reconcileSplitSourceApplyStoreDocuments(source_store, source_group_id);
     }
 
     fn reconcileSplitSourceApplyStoreDocuments(
         self: *DataServer,
         source_store: *antfly.data.RaftApplyStore,
-        source_root_dir: []const u8,
         source_group_id: u64,
     ) !void {
         // Replica replacement can preserve the authoritative document root
@@ -6227,7 +6224,6 @@ pub const DataServer = struct {
             }
             switch (try self.reconcileSplitSourceApplyStoreFromAuthoritativeDb(
                 source_store,
-                source_root_dir,
                 source_group_id,
                 watermark,
                 false,
@@ -6243,7 +6239,6 @@ pub const DataServer = struct {
     fn captureReconciledSplitSourceHandoff(
         self: *DataServer,
         source_store: *antfly.data.RaftApplyStore,
-        source_root_dir: []const u8,
         source_group_id: u64,
     ) !antfly.data.storage.raft_apply_store.SplitHandoff {
         const max_reconcile_attempts: usize = 4;
@@ -6256,7 +6251,6 @@ pub const DataServer = struct {
             }
             switch (try self.reconcileSplitSourceApplyStoreFromAuthoritativeDb(
                 source_store,
-                source_root_dir,
                 source_group_id,
                 watermark,
                 true,
@@ -6272,44 +6266,40 @@ pub const DataServer = struct {
     fn reconcileSplitSourceApplyStoreFromAuthoritativeDb(
         self: *DataServer,
         source_store: *antfly.data.RaftApplyStore,
-        source_root_dir: []const u8,
         source_group_id: u64,
         watermark: ?antfly.data.AppliedDataBatch,
         capture_handoff: bool,
     ) !SplitProjectionReconcileResult {
-        if (try self.tableNameForLocalGroupAlloc(source_group_id)) |table_name| {
-            defer self.alloc.free(table_name);
-            const live_source = self.liveRuntimeWriteSource();
-            var transition_activity = live_source.beginGroupTransitionActivity(table_name, source_group_id);
-            defer transition_activity.deinit();
-            var fallback_transition_activity: ?@TypeOf(transition_activity) = null;
-            defer if (fallback_transition_activity) |*activity| activity.deinit();
-            if (live_source != &self.write_source) {
-                fallback_transition_activity = self.write_source.beginGroupTransitionActivity(table_name, source_group_id);
-            }
-            try live_source.finishManagedWriterAutoBulkForTransition(source_group_id, table_name);
-            if (live_source != &self.write_source) {
-                try self.write_source.finishManagedWriterAutoBulkForTransition(source_group_id, table_name);
-            }
-            transition_activity.allowReads();
-            if (fallback_transition_activity) |*activity| activity.allowReads();
-            if (try live_source.leaseCachedGroupWriter(self.alloc, source_group_id, table_name)) |cached_db| {
-                var cached = cached_db;
-                defer cached.deinit(self.alloc);
-                return try self.reconcileSplitSourceApplyStoreFromDb(
-                    source_store,
-                    source_group_id,
-                    cached.db,
-                    watermark,
-                    capture_handoff,
-                );
-            }
+        const table_name = (try self.tableNameForLocalGroupAlloc(source_group_id)) orelse
+            return error.SplitSourceProjectionNotReady;
+        defer self.alloc.free(table_name);
+        const live_source = self.liveRuntimeWriteSource();
+        var transition_activity = live_source.beginGroupTransitionActivity(table_name, source_group_id);
+        defer transition_activity.deinit();
+        var fallback_transition_activity: ?@TypeOf(transition_activity) = null;
+        defer if (fallback_transition_activity) |*activity| activity.deinit();
+        if (live_source != &self.write_source) {
+            fallback_transition_activity = self.write_source.beginGroupTransitionActivity(table_name, source_group_id);
+        }
+        try live_source.finishManagedWriterAutoBulkForTransition(source_group_id, table_name);
+        if (live_source != &self.write_source) {
+            try self.write_source.finishManagedWriterAutoBulkForTransition(source_group_id, table_name);
+        }
+        transition_activity.allowReads();
+        if (fallback_transition_activity) |*activity| activity.allowReads();
+        if (try transition_activity.leaseCachedWriter(self.alloc)) |cached_db| {
+            var cached = cached_db;
+            defer cached.deinit(self.alloc);
+            return try self.reconcileSplitSourceApplyStoreFromDb(
+                source_store,
+                source_group_id,
+                cached.db,
+                watermark,
+                capture_handoff,
+            );
         }
 
-        var db = antfly.db.DB.open(self.alloc, source_root_dir, .{}) catch |err| switch (err) {
-            // The projection cannot be declared complete without its
-            // authoritative document generation. Placement/snapshot recovery
-            // may make it available on a later transition retry.
+        var db = transition_activity.openMaintenanceWriter(self.alloc) catch |err| switch (err) {
             error.FileNotFound => return error.SplitSourceProjectionNotReady,
             else => return err,
         };
@@ -6333,11 +6323,11 @@ pub const DataServer = struct {
     ) !SplitProjectionReconcileResult {
         if (capture_handoff) {
             const expected = watermark orelse return error.SplitSourceProjectionNotReady;
-            if (try source_store.captureVerifiedSplitHandoffAtRootGeneration(
+            if (try source_store.captureVerifiedSplitHandoffAtRootIncarnation(
                 self.alloc,
                 source_group_id,
                 expected,
-                db.core.root_generation,
+                try db.durableRootIncarnation(),
             )) |handoff| return .{ .handoff = handoff };
         }
 
@@ -6399,21 +6389,21 @@ pub const DataServer = struct {
         );
         if (watermark) |expected| {
             if (capture_handoff) {
-                const handoff = (try source_store.reconcileAndCaptureSplitHandoffAtRootGeneration(
+                const handoff = (try source_store.reconcileAndCaptureSplitHandoffAtRootIncarnation(
                     self.alloc,
                     source_group_id,
                     expected,
-                    db.core.root_generation,
+                    try db.durableRootIncarnation(),
                     byte_range,
                     entries.items,
                 )) orelse return .advanced;
                 return .{ .handoff = handoff };
             }
-            return if (try source_store.reconcileGroupSnapshotAtRootGeneration(
+            return if (try source_store.reconcileGroupSnapshotAtRootIncarnation(
                 self.alloc,
                 source_group_id,
                 expected,
-                db.core.root_generation,
+                try db.durableRootIncarnation(),
                 byte_range,
                 entries.items,
             )) .reconciled else .advanced;
@@ -6422,7 +6412,7 @@ pub const DataServer = struct {
         return if (try source_store.seedGroupSnapshotIfAbsent(
             self.alloc,
             source_group_id,
-            db.core.root_generation,
+            try db.durableRootIncarnation(),
             byte_range,
             entries.items,
         )) .reconciled else .advanced;
@@ -7302,9 +7292,9 @@ pub const DataServer = struct {
         if (updates.items.len > 0) try raft.host.applyBatch(updates.items);
         for (local_intents.items) |intent| {
             const status = raft.host.http_host.host.raftStatus(intent.record.group_id);
-            if (drainingLeaderShouldHandoff(snapshot.placement_intents, status, intent, registration.node_id)) {
+            if (staleLeaderShouldHandoff(snapshot.placement_intents, status, intent, registration.node_id)) {
                 raft.host.http_host.campaignGroup(intent.record.group_id) catch |err| {
-                    std.log.warn("data raft draining leader handoff campaign failed group_id={} node_id={} err={}", .{
+                    std.log.warn("data raft stale leader handoff campaign failed group_id={} node_id={} err={}", .{
                         intent.record.group_id,
                         registration.node_id,
                         err,
@@ -12002,7 +11992,7 @@ fn localIntentPreferredCampaigner(intent: antfly.raft.PlacementIntent, local_nod
     return local_node_id == min_node_id;
 }
 
-fn drainingLeaderShouldHandoff(
+fn staleLeaderShouldHandoff(
     placement_intents: []const antfly.raft.PlacementIntent,
     status: ?raft_engine.core.Status,
     local_intent: antfly.raft.PlacementIntent,
@@ -12013,25 +12003,22 @@ fn drainingLeaderShouldHandoff(
     const leader_node_id = raft_status.soft.leader_id orelse return false;
     if (leader_node_id == local_node_id) return false;
     if (!DataServer.localRaftStatusIsVoter(raft_status, local_node_id)) return false;
-    // A leader can disappear from the latest placement snapshot before its
-    // followers observe a clean step-down. Treat both an explicitly draining
-    // leader and an absent leader as stale; otherwise every surviving voter
-    // can wait forever on a node that no longer hosts the group.
-    if (groupLeaderPlacementIsServing(placement_intents, local_intent.record.group_id, leader_node_id)) return false;
+    // Expansion and orderly retirement transfer must converge under the
+    // existing leader. The deterministic survivor fallback is only for a
+    // leader that disappeared from placement before followers observed its
+    // step-down.
+    if (groupLeaderPlacementMayLead(placement_intents, local_intent.record.group_id, leader_node_id)) return false;
     return localNodePreferredServingPeer(placement_intents, local_intent.record.group_id, local_node_id);
 }
 
-fn groupLeaderPlacementIsServing(
+fn groupLeaderPlacementMayLead(
     placement_intents: []const antfly.raft.PlacementIntent,
     group_id: u64,
     leader_node_id: u64,
 ) bool {
     for (placement_intents) |intent| {
-        if (intent.record.group_id == group_id and
-            intent.record.local_node_id == leader_node_id and
-            intent.serving_state == .serving)
-        {
-            return true;
+        if (intent.record.group_id == group_id and intent.record.local_node_id == leader_node_id) {
+            return antfly.raft.placementMayLeadMembershipTransition(intent);
         }
     }
     return false;
@@ -13145,7 +13132,7 @@ test "data raft bootstrap campaign retries leaderless voter elections" {
     try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 4));
 }
 
-test "data raft draining leader handoff campaigns preferred serving survivor" {
+test "data raft draining leader remains stable through membership expansion" {
     var voters = [_]u64{ 101, 102, 103 };
     const status = raft_engine.core.Status{
         .id = 102,
@@ -13160,9 +13147,9 @@ test "data raft draining leader handoff campaigns preferred serving survivor" {
         .{ .record = .{ .group_id = 7002, .replica_id = 3, .local_node_id = 103 }, .serving_state = .serving },
     };
 
-    try std.testing.expect(drainingLeaderShouldHandoff(&intents, status, intents[1], 102));
-    try std.testing.expect(!drainingLeaderShouldHandoff(&intents, status, intents[2], 103));
-    try std.testing.expect(!drainingLeaderShouldHandoff(&intents, status, intents[0], 101));
+    try std.testing.expect(!staleLeaderShouldHandoff(&intents, status, intents[1], 102));
+    try std.testing.expect(!staleLeaderShouldHandoff(&intents, status, intents[2], 103));
+    try std.testing.expect(!staleLeaderShouldHandoff(&intents, status, intents[0], 101));
 }
 
 test "data raft removed leader handoff campaigns preferred serving survivor" {
@@ -13180,8 +13167,45 @@ test "data raft removed leader handoff campaigns preferred serving survivor" {
         .{ .record = .{ .group_id = 7003, .replica_id = 3, .local_node_id = 104 }, .serving_state = .serving },
     };
 
-    try std.testing.expect(drainingLeaderShouldHandoff(&intents, status, intents[0], 102));
-    try std.testing.expect(!drainingLeaderShouldHandoff(&intents, status, intents[1], 103));
+    try std.testing.expect(staleLeaderShouldHandoff(&intents, status, intents[0], 102));
+    try std.testing.expect(!staleLeaderShouldHandoff(&intents, status, intents[1], 103));
+}
+
+test "data raft retiring leader awaits orderly transfer" {
+    var voters = [_]u64{ 101, 102, 103 };
+    const status = raft_engine.core.Status{
+        .id = 102,
+        .group_id = 7004,
+        .soft = .{ .leader_id = 101, .role = .follower },
+        .hard = .{},
+        .conf_state = .{ .voters = voters[0..] },
+    };
+    const intents = [_]antfly.raft.PlacementIntent{
+        .{ .record = .{ .group_id = 7004, .replica_id = 1, .local_node_id = 101 }, .serving_state = .retiring },
+        .{ .record = .{ .group_id = 7004, .replica_id = 2, .local_node_id = 102 }, .serving_state = .serving },
+        .{ .record = .{ .group_id = 7004, .replica_id = 3, .local_node_id = 103 }, .serving_state = .serving },
+    };
+
+    try std.testing.expect(!staleLeaderShouldHandoff(&intents, status, intents[1], 102));
+    try std.testing.expect(!staleLeaderShouldHandoff(&intents, status, intents[2], 103));
+}
+
+test "data raft cutover-ready leader remains stable through membership expansion" {
+    var voters = [_]u64{ 101, 102, 103 };
+    const status = raft_engine.core.Status{
+        .id = 102,
+        .group_id = 7005,
+        .soft = .{ .leader_id = 101, .role = .follower },
+        .hard = .{},
+        .conf_state = .{ .voters = voters[0..] },
+    };
+    const intents = [_]antfly.raft.PlacementIntent{
+        .{ .record = .{ .group_id = 7005, .replica_id = 1, .local_node_id = 101 }, .serving_state = .cutover_ready },
+        .{ .record = .{ .group_id = 7005, .replica_id = 2, .local_node_id = 102 }, .serving_state = .serving },
+        .{ .record = .{ .group_id = 7005, .replica_id = 3, .local_node_id = 103 }, .serving_state = .serving },
+    };
+
+    try std.testing.expect(!staleLeaderShouldHandoff(&intents, status, intents[1], 102));
 }
 
 test "data runtime live writer source follows raft apply ownership" {

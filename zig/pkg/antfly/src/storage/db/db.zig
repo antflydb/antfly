@@ -2856,6 +2856,9 @@ pub const DB = struct {
     primary_lsm_storage: ?lsm_backend_mod.Storage,
     index_backends: db_config.IndexBackendOptions,
     core: db_core.DBCore,
+    /// Durable identity of the physical DB root. Unlike `core.root_generation`,
+    /// this survives process restart and changes whenever a root is rebound.
+    root_incarnation: u128 = 0,
     async_context: *AsyncContext,
     backend_runtime: *background_runtime_mod.BackendRuntime,
     backend_owner_id: u64,
@@ -3271,6 +3274,7 @@ pub const DB = struct {
                     else => return err,
                 };
                 if (repair_state) |*state| {
+                    db.root_incarnation = state.identity.db_identity;
                     db.index_repair_replay_pinned.store(state.minimumRetainAfterSequence() != null, .release);
                     state.deinit(alloc);
                 }
@@ -11170,6 +11174,11 @@ pub const DB = struct {
 
     pub fn getRange(self: *DB) types.ByteRange {
         return self.core.byteRange();
+    }
+
+    pub fn durableRootIncarnation(self: *const DB) !u128 {
+        if (self.root_incarnation == 0) return error.DurableRootIncarnationUnavailable;
+        return self.root_incarnation;
     }
 
     pub fn findMedianKey(self: *DB, alloc: Allocator) ![]u8 {
@@ -58913,6 +58922,48 @@ test "db root generation rollover preserves activated repair debt fail closed" {
     defer result.deinit();
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db durable root incarnation survives restart and changes on root replacement" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var first_incarnation: u128 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .lsm_root_generation = 1,
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        first_incarnation = try db.durableRootIncarnation();
+        try std.testing.expect(first_incarnation != 0);
+    }
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .lsm_root_generation = 1,
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try std.testing.expectEqual(first_incarnation, try db.durableRootIncarnation());
+    }
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .lsm_root_generation = 2,
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        const replacement_incarnation = try db.durableRootIncarnation();
+        try std.testing.expect(replacement_incarnation != 0);
+        try std.testing.expect(replacement_incarnation != first_incarnation);
+    }
 }
 
 test "db restart reconciles an activated graph repair without rebuilding" {
