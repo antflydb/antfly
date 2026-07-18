@@ -575,7 +575,7 @@ pub const DBCore = struct {
     pub fn addManagedIndex(
         self: *DBCore,
         cfg: types.IndexConfig,
-        admission: ?index_manager_mod.IndexManager.AtomicCatalogWrite,
+        admission: ?index_manager_mod.IndexManager.AtomicCatalogMutation,
     ) !u64 {
         try self.index_manager.addManaged(self.store, cfg, admission);
         // A managed generation with an admission marker is rebuilt from a
@@ -660,6 +660,10 @@ pub const DBCore = struct {
 
     pub fn deleteIndex(self: *DBCore, name: []const u8) !bool {
         return try self.index_manager.remove(self.store, name);
+    }
+
+    pub fn deleteManagedIndex(self: *DBCore, name: []const u8, admission_key: []const u8) !bool {
+        return try self.index_manager.removeManaged(self.store, name, admission_key);
     }
 
     pub fn deleteEnrichment(self: *DBCore, kind: types.EnrichmentKind, name: []const u8) !bool {

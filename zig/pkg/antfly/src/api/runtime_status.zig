@@ -296,7 +296,19 @@ pub const TableRuntimeSnapshotCache = struct {
         defer self.mutex.unlock();
         token.topology_revision = self.topology_revision;
         token.observation_generation = self.takeObservationGenerationLocked();
-        try token.table_epochs.ensureTotalCapacity(alloc, @intCast(table_names.len));
+        // A complete refresh is also authoritative for tables absent from the
+        // catalog. Capture cached epochs as removal candidates so publication
+        // can prove that an unseen table was not invalidated or recreated
+        // while the catalog snapshot was being inspected.
+        const cached_table_count = if (complete_catalog) self.tables.count() else 0;
+        try token.table_epochs.ensureTotalCapacity(alloc, @intCast(cached_table_count + table_names.len));
+        if (complete_catalog) {
+            var cached_it = self.tables.iterator();
+            while (cached_it.next()) |entry| {
+                const owned_name = try alloc.dupe(u8, entry.key_ptr.*);
+                token.table_epochs.putAssumeCapacityNoClobber(owned_name, entry.value_ptr.epoch);
+            }
+        }
         for (table_names) |table_name| {
             const state = try self.ensureTableLocked(table_name);
             if (token.table_epochs.contains(table_name)) continue;
@@ -1438,7 +1450,9 @@ test "runtime status cache stable absence removal retires the old table epoch" {
         .{ .group_id = 9, .stats = .{ .doc_count = 9 } },
     ));
 
-    const table_names = [_][]const u8{ "docs", "logs" };
+    // Production passes only tables present in the current catalog. A complete
+    // token must still capture the cached epoch for the now-absent table.
+    const table_names = [_][]const u8{"docs"};
     var token = try cache.captureCatalogToken(alloc, &table_names, true);
     defer token.deinit();
     const snapshots = try alloc.alloc(TableRuntimeSnapshot, 1);

@@ -211,6 +211,7 @@ const text_merge_scheduler_default_steps: usize = 1;
 const text_merge_quarantine_backoff_ns: u64 = 30 * std.time.ns_per_s;
 pub var test_text_backfill_batch_size: ?usize = null;
 pub var test_abort_text_backfill_after_batches: ?usize = null;
+pub var test_text_backfill_invocations: usize = 0;
 pub var test_inject_index_open_error: ?anyerror = null;
 const sparse_backfill_batch_size: usize = 1024;
 pub var test_sparse_backfill_batch_size: ?usize = null;
@@ -922,6 +923,11 @@ pub const IndexManager = struct {
     // intent is still in activating/validating; queries must remain closed
     // until DB validation publishes a clean checkpoint.
     repair_unavailable_indexes: std.StringHashMapUnmanaged(void) = .empty,
+    // Primary-store admission markers captured once before catalog open. The
+    // immutable snapshot makes full-text backfill suppression O(1) per index
+    // and lets every open mode install the same fail-closed service gate.
+    managed_admission_mutex: std.atomic.Mutex = .unlocked,
+    managed_admission_indexes: std.StringHashMapUnmanaged(void) = .empty,
     index_load_states: std.StringHashMapUnmanaged(IndexLoadState) = .empty,
 
     pub const FailedIndexLoad = struct {
@@ -1941,6 +1947,8 @@ pub const IndexManager = struct {
         self.failed_index_loads.deinit(self.alloc);
         self.clearRepairUnavailableIndexes();
         self.repair_unavailable_indexes.deinit(self.alloc);
+        self.clearManagedAdmissionSnapshot();
+        self.managed_admission_indexes.deinit(self.alloc);
         self.clearIndexLoadStates();
         self.index_load_states.deinit(self.alloc);
         for (self.enrichments.items) |*entry| entry.deinit(self.alloc);
@@ -2025,6 +2033,59 @@ pub const IndexManager = struct {
         var it = self.repair_unavailable_indexes.keyIterator();
         while (it.next()) |key| self.alloc.free(key.*);
         self.repair_unavailable_indexes.clearRetainingCapacity();
+    }
+
+    fn clearManagedAdmissionSnapshot(self: *IndexManager) void {
+        var it = self.managed_admission_indexes.keyIterator();
+        while (it.next()) |key| self.alloc.free(key.*);
+        self.managed_admission_indexes.clearRetainingCapacity();
+    }
+
+    pub fn replaceManagedAdmissionSnapshot(
+        self: *IndexManager,
+        admissions: []const docstore_mod.OwnedKVPair,
+    ) !void {
+        lockAtomicWithBackoff(&self.managed_admission_mutex);
+        defer self.managed_admission_mutex.unlock();
+        self.clearManagedAdmissionSnapshot();
+        try self.managed_admission_indexes.ensureTotalCapacity(self.alloc, @intCast(admissions.len));
+        for (admissions) |admission| {
+            const name = try internal_keys.managedIndexAdmissionNameAlloc(self.alloc, admission.key);
+            errdefer self.alloc.free(name);
+            const gop = self.managed_admission_indexes.getOrPutAssumeCapacity(name);
+            if (gop.found_existing) {
+                self.alloc.free(name);
+                return error.InvalidManagedIndexAdmission;
+            }
+        }
+    }
+
+    pub fn clearManagedAdmissionSnapshotForIndex(self: *IndexManager, name: []const u8) void {
+        lockAtomicWithBackoff(&self.managed_admission_mutex);
+        defer self.managed_admission_mutex.unlock();
+        if (self.managed_admission_indexes.fetchRemove(name)) |entry| self.alloc.free(entry.key);
+    }
+
+    pub fn markManagedAdmissionsUnavailable(self: *IndexManager) !void {
+        var names = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (names.items) |name| self.alloc.free(name);
+            names.deinit(self.alloc);
+        }
+        {
+            lockAtomicWithBackoff(&self.managed_admission_mutex);
+            defer self.managed_admission_mutex.unlock();
+            try names.ensureTotalCapacity(self.alloc, self.managed_admission_indexes.count());
+            var it = self.managed_admission_indexes.keyIterator();
+            while (it.next()) |name| names.appendAssumeCapacity(try self.alloc.dupe(u8, name.*));
+        }
+        for (names.items) |name| try self.markRepairUnavailable(name);
+    }
+
+    fn managedAdmissionPending(self: *IndexManager, name: []const u8) bool {
+        lockAtomicWithBackoff(&self.managed_admission_mutex);
+        defer self.managed_admission_mutex.unlock();
+        return self.managed_admission_indexes.contains(name);
     }
 
     fn clearFailedIndexLoads(self: *IndexManager) void {
@@ -3299,9 +3360,12 @@ pub const IndexManager = struct {
         }
     }
 
-    pub const AtomicCatalogWrite = struct {
-        key: []const u8,
-        value: []const u8,
+    pub const AtomicCatalogMutation = union(enum) {
+        put: struct {
+            key: []const u8,
+            value: []const u8,
+        },
+        delete: []const u8,
     };
 
     pub fn add(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
@@ -3316,7 +3380,7 @@ pub const IndexManager = struct {
         self: *IndexManager,
         store: anytype,
         cfg: types.IndexConfig,
-        admission: ?AtomicCatalogWrite,
+        admission: ?AtomicCatalogMutation,
     ) !void {
         try self.addWithOptions(store, cfg, false, admission);
     }
@@ -3326,7 +3390,7 @@ pub const IndexManager = struct {
         store: anytype,
         cfg: types.IndexConfig,
         allow_backfill: bool,
-        admission: ?AtomicCatalogWrite,
+        admission: ?AtomicCatalogMutation,
     ) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
@@ -3355,7 +3419,7 @@ pub const IndexManager = struct {
             try self.persistEnrichmentCatalog(store);
             enrichment_catalog_committed = true;
         }
-        self.persistCatalogWithAtomicWrite(store, admission) catch |err| {
+        self.persistCatalogWithAtomicMutation(store, admission) catch |err| {
             self.removeInMemory(stored_cfg.name);
             if (enrichment_catalog_committed) {
                 self.storeGeneratedEnrichmentTargetCache(has_generated_after_enrichments);
@@ -3657,9 +3721,24 @@ pub const IndexManager = struct {
     }
 
     pub fn remove(self: *IndexManager, store: anytype, name: []const u8) !bool {
+        return try self.removeWithAtomicMutation(store, name, null);
+    }
+
+    pub fn removeManaged(self: *IndexManager, store: anytype, name: []const u8, admission_key: []const u8) !bool {
+        return try self.removeWithAtomicMutation(store, name, .{ .delete = admission_key });
+    }
+
+    fn removeWithAtomicMutation(
+        self: *IndexManager,
+        store: anytype,
+        name: []const u8,
+        atomic_mutation: ?AtomicCatalogMutation,
+    ) !bool {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        if (try self.removeStatusOnlyConfig(store, name)) {
+        if (self.get(name) == null) return false;
+
+        if (try self.removeStatusOnlyConfig(store, name, atomic_mutation)) {
             // Quarantined (failed-to-load) indexes live in the status-only
             // list; removing one must also clear its recorded load error so a
             // subsequent recreate starts clean.
@@ -3672,10 +3751,10 @@ pub const IndexManager = struct {
                 const index_path = try self.indexPath(name);
                 defer self.alloc.free(index_path);
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
+                try self.persistCatalogExcludingWithAtomicMutation(store, name, atomic_mutation);
                 self.freeTextIndexEntry(entry);
                 _ = self.text_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
-                try self.persistCatalog(store);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 self.deleteIndexRootForName(name, index_path);
@@ -3697,10 +3776,10 @@ pub const IndexManager = struct {
                     null;
                 defer if (owned_embedding_name) |embedding_name| self.alloc.free(embedding_name);
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
+                try self.persistCatalogExcludingWithAtomicMutation(store, name, atomic_mutation);
                 self.freeDenseIndexEntry(entry);
                 _ = self.dense_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
-                try self.persistCatalog(store);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 try self.deleteDenseIndexMetadata(store, name);
@@ -3724,10 +3803,10 @@ pub const IndexManager = struct {
                     null;
                 defer if (owned_embedding_name) |embedding_name| self.alloc.free(embedding_name);
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
+                try self.persistCatalogExcludingWithAtomicMutation(store, name, atomic_mutation);
                 self.freeSparseIndexEntry(entry);
                 _ = self.sparse_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
-                try self.persistCatalog(store);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
@@ -3740,10 +3819,10 @@ pub const IndexManager = struct {
                 const index_path = try self.indexPath(name);
                 defer self.alloc.free(index_path);
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
+                try self.persistCatalogExcludingWithAtomicMutation(store, name, atomic_mutation);
                 self.freeGraphIndexEntry(entry);
                 _ = self.graph_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
-                try self.persistCatalog(store);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 self.deleteIndexRootForName(name, index_path);
@@ -3755,10 +3834,10 @@ pub const IndexManager = struct {
                 const index_path = try self.indexPath(name);
                 defer self.alloc.free(index_path);
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
+                try self.persistCatalogExcludingWithAtomicMutation(store, name, atomic_mutation);
                 self.freeAlgebraicIndexEntry(entry);
                 _ = self.algebraic_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
-                try self.persistCatalog(store);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 self.deleteIndexRootForName(name, index_path);
@@ -4014,7 +4093,12 @@ pub const IndexManager = struct {
         }
     }
 
-    fn removeStatusOnlyConfig(self: *IndexManager, store: anytype, name: []const u8) !bool {
+    fn removeStatusOnlyConfig(
+        self: *IndexManager,
+        store: anytype,
+        name: []const u8,
+        atomic_mutation: ?AtomicCatalogMutation,
+    ) !bool {
         for (self.status_only_index_configs, 0..) |cfg, i| {
             if (!std.mem.eql(u8, cfg.name, name)) continue;
 
@@ -4039,25 +4123,32 @@ pub const IndexManager = struct {
                 try self.alloc.alloc(types.IndexConfig, self.status_only_index_configs.len - 1)
             else
                 &.{};
+            var replacement_owned = replacement.len > 0;
+            errdefer if (replacement_owned) self.alloc.free(replacement);
             var out: usize = 0;
             var removed = cfg;
+            var removed_owned = false;
+            defer if (removed_owned) removed.deinit(self.alloc);
             for (self.status_only_index_configs, 0..) |existing, existing_i| {
                 if (existing_i == i) continue;
                 replacement[out] = existing;
                 out += 1;
             }
+            // All fallible cleanup planning is complete. Catalog absence and
+            // marker deletion now commit immediately before runtime removal.
+            try self.persistCatalogExcludingWithAtomicMutation(store, name, atomic_mutation);
             self.alloc.free(self.status_only_index_configs);
             self.status_only_index_configs = replacement;
+            replacement_owned = false;
+            removed_owned = true;
             defer self.dropIndexLoadStateNoLock(name);
 
             const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
-            try self.persistCatalog(store);
             self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
             try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
             if (removed.kind == .dense_vector) try self.deleteDenseIndexMetadata(store, name);
             try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
             self.deleteIndexRootForName(name, index_path);
-            removed.deinit(self.alloc);
             return true;
         }
         return false;
@@ -7176,6 +7267,7 @@ pub const IndexManager = struct {
     }
 
     fn backfillTextIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *TextIndex, resume_from: ?[]const u8) !void {
+        if (builtin.is_test) test_text_backfill_invocations += 1;
         self.beginTextBackfill();
         defer self.endTextBackfill();
         const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
@@ -7968,10 +8060,7 @@ pub const IndexManager = struct {
         try self.ensureConfiguredIndexDir(cfg);
         switch (cfg.kind) {
             .full_text => {
-                const managed_admission_pending = if (allow_backfill and !read_only)
-                    try self.managedIndexAdmissionPending(store, cfg.name)
-                else
-                    false;
+                const managed_admission_pending = self.managedAdmissionPending(cfg.name);
                 const allow_full_text_backfill = allow_backfill and !managed_admission_pending;
                 const started_ns = nowNs();
                 var backfill_ns: u64 = 0;
@@ -8455,28 +8544,14 @@ pub const IndexManager = struct {
         }
     }
 
-    fn managedIndexAdmissionPending(self: *IndexManager, store: anytype, index_name: []const u8) !bool {
-        const key = try internal_keys.managedIndexAdmissionKeyAlloc(self.alloc, index_name);
-        defer self.alloc.free(key);
-        var runtime_store = try initRuntimeStore(self.alloc, store);
-        defer runtime_store.deinit();
-        var txn = try runtime_store.store.beginProbe();
-        defer txn.abort();
-        _ = txn.get(key) catch |err| switch (err) {
-            error.NotFound => return false,
-            else => return err,
-        };
-        return true;
-    }
-
     fn persistCatalog(self: *IndexManager, store: anytype) !void {
-        try self.persistCatalogWithAtomicWrite(store, null);
+        try self.persistCatalogWithAtomicMutation(store, null);
     }
 
-    fn persistCatalogWithAtomicWrite(
+    fn persistCatalogWithAtomicMutation(
         self: *IndexManager,
         store: anytype,
-        atomic_write: ?AtomicCatalogWrite,
+        atomic_mutation: ?AtomicCatalogMutation,
     ) !void {
         const data = try serializeCatalog(self.alloc, self);
         defer self.alloc.free(data);
@@ -8485,7 +8560,36 @@ pub const IndexManager = struct {
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
         try txn.put(index_catalog_key, data);
-        if (atomic_write) |write| try txn.put(write.key, write.value);
+        if (atomic_mutation) |mutation| switch (mutation) {
+            .put => |write| try txn.put(write.key, write.value),
+            .delete => |key| txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            },
+        };
+        try txn.commit();
+    }
+
+    fn persistCatalogExcludingWithAtomicMutation(
+        self: *IndexManager,
+        store: anytype,
+        excluded_name: []const u8,
+        atomic_mutation: ?AtomicCatalogMutation,
+    ) !void {
+        const data = try serializeCatalogExcluding(self.alloc, self, excluded_name);
+        defer self.alloc.free(data);
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        var txn = try runtime_store.store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(index_catalog_key, data);
+        if (atomic_mutation) |mutation| switch (mutation) {
+            .put => |write| try txn.put(write.key, write.value),
+            .delete => |key| txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            },
+        };
         try txn.commit();
     }
 
@@ -14144,6 +14248,37 @@ fn serializeCatalog(alloc: Allocator, manager: *const IndexManager) ![]u8 {
     const owned = try alloc.dupe(u8, out.items);
     out.deinit(alloc);
     return owned;
+}
+
+fn serializeCatalogExcluding(alloc: Allocator, manager: *const IndexManager, excluded_name: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    try out.appendSlice(alloc, "AIDX");
+    try appendU32(&out, alloc, 2);
+    std.debug.assert(manager.get(excluded_name) != null);
+    try appendU32(&out, alloc, manager.count() - 1);
+
+    for (manager.text_indexes.items) |entry| {
+        if (!std.mem.eql(u8, entry.config.name, excluded_name)) try appendCatalogConfig(&out, alloc, entry.config);
+    }
+    for (manager.dense_indexes.items) |entry| {
+        if (!std.mem.eql(u8, entry.config.name, excluded_name)) try appendCatalogConfig(&out, alloc, entry.config);
+    }
+    for (manager.sparse_indexes.items) |entry| {
+        if (!std.mem.eql(u8, entry.config.name, excluded_name)) try appendCatalogConfig(&out, alloc, entry.config);
+    }
+    for (manager.graph_indexes.items) |entry| {
+        if (!std.mem.eql(u8, entry.config.name, excluded_name)) try appendCatalogConfig(&out, alloc, entry.config);
+    }
+    for (manager.algebraic_indexes.items) |entry| {
+        if (!std.mem.eql(u8, entry.config.name, excluded_name)) try appendCatalogConfig(&out, alloc, entry.config);
+    }
+    for (manager.status_only_index_configs) |cfg| {
+        if (!std.mem.eql(u8, cfg.name, excluded_name)) try appendCatalogConfig(&out, alloc, cfg);
+    }
+
+    return try out.toOwnedSlice(alloc);
 }
 
 fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]types.IndexConfig {

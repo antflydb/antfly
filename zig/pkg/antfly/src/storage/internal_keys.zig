@@ -542,6 +542,15 @@ pub fn managedIndexAdmissionRootPrefixAlloc(alloc: Allocator) ![]u8 {
     return try alloc.dupe(u8, &[_]u8{ replay_namespace, 0xff, managed_index_admission_kind });
 }
 
+pub fn managedIndexAdmissionNameAlloc(alloc: Allocator, key: []const u8) ![]u8 {
+    const prefix = [_]u8{ replay_namespace, 0xff, managed_index_admission_kind };
+    if (!std.mem.startsWith(u8, key, &prefix)) return error.InvalidInternalUserKey;
+    const name_start = prefix.len;
+    const name_end = findComponentTerminator(key, name_start) orelse return error.InvalidInternalUserKey;
+    if (name_end + 2 != key.len) return error.InvalidInternalUserKey;
+    return try decodeBodyAlloc(alloc, key[name_start..name_end]);
+}
+
 pub fn artifactRepairIssueIndexPrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
@@ -1728,6 +1737,20 @@ test "derived coverage outcome keys are generation scoped" {
     var encoded_count: [8]u8 = undefined;
     const encoded = encodeDerivedCoverageOutcomeCount(&encoded_count, 42);
     try std.testing.expectEqual(@as(u64, 42), try decodeDerivedCoverageOutcomeCount(encoded));
+}
+
+test "managed index admission keys round trip encoded names" {
+    const alloc = std.testing.allocator;
+    const name = "full\x00text";
+    const key = try managedIndexAdmissionKeyAlloc(alloc, name);
+    defer alloc.free(key);
+    const decoded = try managedIndexAdmissionNameAlloc(alloc, key);
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings(name, decoded);
+
+    const malformed = try std.mem.concat(alloc, u8, &.{ key, "trailing" });
+    defer alloc.free(malformed);
+    try std.testing.expectError(error.InvalidInternalUserKey, managedIndexAdmissionNameAlloc(alloc, malformed));
 }
 
 test "decodePrimaryDocumentKeyAlloc round-trips and rejects non-primary keys" {

@@ -896,9 +896,10 @@ primary document store:
    store transaction. Do not synchronously scan or rebuild the corpus.
 3. Materialize that marker idempotently into the generation repair checkpoint.
    The owner repair scheduler performs the bounded shadow rebuild and replay.
-4. Keep the marker while repair is pending. Writable reopen detects it before
-   index open, suppresses in-place backfill, recreates missing sidecar repair
-   state, and keeps the generation unavailable to queries.
+4. Keep the marker while repair is pending. Every DB open captures the marker
+   prefix once before catalog open. Writable open uses the O(1) name set to
+   suppress in-place backfill and recreate missing sidecar state; read-only and
+   status opens use the same snapshot to keep the generation unavailable.
 5. After clean shadow activation, delete the primary-store marker before
    removing the sidecar intent. A crash between those writes leaves redundant,
    resumable repair state rather than an admitted generation without debt.
@@ -910,11 +911,28 @@ sequence and raises that target to the current derived sequence when the durable
 intent is created. Existing repair IDs are reused, so reconciliation, restart,
 and scheduler retries cannot create duplicate rebuilds.
 
-Empty managed tables omit the marker and use the ordinary O(1) initialization
-path because no historical source corpus exists. Ordinary unmanaged DB callers
-retain the explicit synchronous-add behavior. This keeps the durable lifecycle
-protocol at the managed-table boundary instead of inferring migration debt from
-index cardinality or replay lag during every reconciliation pass.
+Empty managed tables omit the marker but still use the managed no-backfill add
+path. The durable zero-live-document identity summary proves that generation
+complete at the current replay head without scanning document keys, including
+tombstone-heavy shards. Ordinary unmanaged DB callers retain the explicit
+synchronous-add behavior. This keeps the durable lifecycle protocol at the
+managed-table boundary instead of inferring migration debt from index
+cardinality or replay lag during every reconciliation pass.
+
+Index deletion uses catalog absence as its commit point. The catalog image
+without the index and deletion of its admission marker commit in one primary
+store transaction while repair remains quiesced and gated. Runtime roots,
+coverage metadata, and repair sidecars are post-commit cleanup. A crash can
+therefore leave reclaimable files or an orphaned sidecar, but cannot leave a
+query-visible catalog entry without admission proof. Writable startup removes
+sidecar intents whose catalog entry is absent before workers start.
+
+The in-memory identity summary is an optimization for status and query
+planning, not admission authority. Admission reads the durable O(1) primary
+summary under the apply lock because an HA mirror failure may occur after the
+primary commit but before the runtime cache is published. Normal query traffic
+does not read admission markers; only a query already rejected by an in-memory
+repair gate performs a point recheck to observe repair completion safely.
 
 Catalog admission and repair activation are separate safety proofs. Metadata
 cutover additionally requires a fresh target observation, complete document

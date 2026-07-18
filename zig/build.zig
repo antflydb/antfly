@@ -4812,6 +4812,7 @@ pub fn build(b: *std.Build) void {
             "derived coverage rejects unknown freshness for aggregate and shard views",
             "cached all-skipped coverage observation is a runtime fact",
             "table runtime snapshot cache clones stored status",
+            "runtime status cache stable absence removal retires the old table epoch",
             "partial coverage embeddings readiness counts skipped source units",
             "partial coverage embeddings readiness does not mask pending enrichment",
             "derived coverage reasons deduplicate overlapping freshness signals",
