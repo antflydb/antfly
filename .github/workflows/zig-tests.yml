@@ -155,14 +155,12 @@ jobs:
             echo "trace_validate=true" >> "$GITHUB_OUTPUT"
           fi
 
-  release-linux-compile:
-    name: release-linux-compile
+  release-linux-package:
+    name: release-linux-package
     needs: changes
     if: >-
       needs.changes.outputs.release_targets == 'true' &&
-      (github.event_name == 'pull_request' ||
-       github.event_name == 'merge_group' ||
-       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
        github.event_name == 'workflow_dispatch')
     uses: ./.github/workflows/antfly-linux-release-build.yml
     with:
@@ -210,6 +208,22 @@ jobs:
 
       - name: Verify Zig version
         run: zig version
+
+      # Keep PR coverage cheap: cross-compile only the platform boundary that
+      # exposed the musl translation failure, without building release archives.
+      - name: Compile platform probe for Linux musl release targets
+        if: needs.changes.outputs.release_targets == 'true'
+        working-directory: zig/lib/platform
+        run: |
+          zig build check -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
+          zig build -j1 check -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSmall
+
+      # This is the exact graph shape that caught the missing C shim when a
+      # libc-enabled test consumed a platform module configured without libc.
+      - name: Verify libc override build graph
+        if: needs.changes.outputs.release_targets == 'true'
+        working-directory: zig
+        run: zig build -j2 resource-budget-test -Dlink-libc=false -Dha-tests=false --summary all
 
       - name: Check generated sources
         run: make zig-generated-check
