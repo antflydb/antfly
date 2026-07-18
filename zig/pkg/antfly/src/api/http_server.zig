@@ -4761,13 +4761,21 @@ pub const ApiHttpServer = struct {
                         },
                         else => return err,
                     };
-                    self.waitForProjectedTableWriteQuorum(table_name) catch |err| switch (err) {
-                        error.TableVisibilityTimeout => {
-                            std.log.err("public create table write quorum timed out table={s}", .{table_name});
-                            return try textResponse(self.alloc, 500, "table create did not converge");
-                        },
-                        else => return err,
-                    };
+                    // A local standalone create is the write-readiness barrier:
+                    // the owned DB has already been opened and initialized before
+                    // createTable returns. Distributed mode additionally requires
+                    // the projected Raft voter quorum and leader to be observable;
+                    // accepting only catalog presence there would acknowledge a
+                    // table before another node can safely route writes to it.
+                    if (!self.cfg.deployment_mode.isStandalone()) {
+                        self.waitForProjectedTableWriteQuorum(table_name) catch |err| switch (err) {
+                            error.TableVisibilityTimeout => {
+                                std.log.err("public create table write quorum timed out table={s}", .{table_name});
+                                return try textResponse(self.alloc, 500, "table create did not converge");
+                            },
+                            else => return err,
+                        };
+                    }
                 } else {
                     const metadata_wait_handled = self.source.waitTableLifecycle(table_name, .present) catch |err| lifecycle: {
                         break :lifecycle switch (err) {

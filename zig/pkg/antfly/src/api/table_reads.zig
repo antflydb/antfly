@@ -7053,6 +7053,33 @@ fn aggregationContextForDb(
     };
 }
 
+fn aggregationContextForCapturedResultDb(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    db: *db_mod.DB,
+) !db_mod.aggregations.Context {
+    const identity_read_generation = currentIdentityReadGenerationForDb(req.identity_read_generation, db) catch |err| switch (err) {
+        // A complete result is already an immutable, exact aggregation input.
+        // If background derived work advanced the DB after that search, do not
+        // mix the captured rows with acceleration state from a newer identity
+        // generation. Stored-row aggregations can still execute exactly; any
+        // aggregation that requires index state remains unsupported and can be
+        // retried by the caller against one coherent generation.
+        error.UnsupportedQueryRequest => return .{
+            .identity_read_generation = req.identity_read_generation,
+        },
+        else => return err,
+    };
+    return .{
+        .index_manager = db.core.index_manager,
+        .doc_store = db.core.store,
+        .full_text_index_name = req.index_name,
+        .algebraic_index_name = req.index_name,
+        .algebraic_available = try algebraicIndexFreshEnoughForRequest(alloc, req, db),
+        .identity_read_generation = identity_read_generation,
+    };
+}
+
 fn currentIdentityReadGenerationForDb(requested: ?u64, db: *db_mod.DB) !u64 {
     return try db.currentIdentityReadGenerationForRequest(requested);
 }
@@ -10121,7 +10148,7 @@ fn applyBoundQueryAggregations(
     if (req.aggregations_json.len == 0) return;
     const aggregation_req = requestWithResultIdentityGeneration(req, result.*);
     if (aggregationCanUseCurrentResult(req, result.*)) {
-        return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, self.db), meta);
+        return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForCapturedResultDb(alloc, aggregation_req, self.db), meta);
     }
 
     const full_req = try aggregationFullResultRequest(req, result.*, "bound");
@@ -10149,7 +10176,7 @@ fn applyProvisionedQueryAggregations(
         defer db.close();
 
         if (aggregationCanUseCurrentResult(req, result.*)) {
-            return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, &db), meta);
+            return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForCapturedResultDb(alloc, aggregation_req, &db), meta);
         }
 
         var reads = raft_mod.FeatureDBReads.init(group_ids[0], self.requester);
@@ -10337,7 +10364,7 @@ fn applyHostedProvisionedQueryAggregations(
                 defer db.close();
 
                 if (aggregationCanUseCurrentResult(req, result.*)) {
-                    return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, &db), meta);
+                    return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForCapturedResultDb(alloc, aggregation_req, &db), meta);
                 }
 
                 var reads = raft_mod.FeatureDBReads.init(group_ids[0], self.requester);
@@ -17770,6 +17797,18 @@ test "aggregation context rejects non-current identity generation" {
     try std.testing.expectError(error.UnsupportedQueryRequest, aggregationContextForDb(alloc, .{
         .identity_read_generation = current + 1,
     }, &db));
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"v\":2}" }},
+        .sync_level = .write,
+    });
+    const captured = try aggregationContextForCapturedResultDb(alloc, .{
+        .identity_read_generation = current,
+    }, &db);
+    try std.testing.expectEqual(@as(?u64, current), captured.identity_read_generation);
+    try std.testing.expect(captured.index_manager == null);
+    try std.testing.expect(captured.doc_store == null);
+    try std.testing.expect(!captured.algebraic_available);
 }
 
 test "aggregation full-result rerun can reuse snapped result identity generation" {

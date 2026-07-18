@@ -210,6 +210,7 @@ test "api module compiles" {
     _ = cluster;
     _ = batch;
     _ = backups;
+    _ = linear_merge;
     _ = query;
     _ = query_contract;
     _ = cluster_api_http;
@@ -229,6 +230,7 @@ test "api module compiles" {
     _ = tables;
     _ = table_contract;
     _ = indexes;
+    _ = openapi_contract;
     _ = http_routes;
     _ = provisioned_storage;
     _ = table_reads;

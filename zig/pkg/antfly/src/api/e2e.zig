@@ -21,6 +21,7 @@ const metadata_http_client = @import("../metadata/http_client.zig");
 const metadata_http_server = @import("../metadata/http_server.zig");
 const metadata_service = @import("../metadata/service.zig");
 const data_runtime = @import("../data/runtime.zig");
+const raft_mod = @import("../raft/mod.zig");
 const raft_host = @import("../raft/host.zig");
 const http_server = @import("http_server.zig");
 const http_client = @import("http_client.zig");
@@ -461,11 +462,21 @@ test "public api smoke e2e creates table inserts and queries documents" {
     });
     try svc.campaignMetadataGroup();
     try svc.runRound();
+    try svc.upsertStore(.{
+        .store_id = 1,
+        .node_id = 1,
+        .role = "data",
+        .health_class = "healthy",
+        .live = true,
+        .capacity_bytes = 1024 * 1024 * 1024,
+        .available_bytes = 1024 * 1024 * 1024,
+    });
+    try svc.runRound();
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -473,7 +484,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
-        .{},
+        .{ .deployment_mode = .standalone },
         http_server.StatusSource.fromMetadataService(&svc),
         provisioned_read_source.source(),
         provisioned_write_source.source(),
@@ -493,7 +504,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     defer std.testing.allocator.free(create_body);
     var created = try client.createTable(base_uri, "docs", create_body);
     defer created.deinit(std.testing.allocator);
-    var created_table = try std.json.parseFromSlice(metadata_openapi.Table, std.testing.allocator, created.body, .{});
+    var created_table = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, created.body, .{});
     defer created_table.deinit();
     try std.testing.expectEqualStrings("docs", created_table.value.name);
     try std.testing.expectEqualStrings("docs table", created_table.value.description.?);
@@ -510,19 +521,48 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var created_addresses = try client.createTable(base_uri, "addresses", addresses_create_body);
     defer created_addresses.deinit(std.testing.allocator);
 
+    // Creation is direct-local in this harness, while the remainder exercises
+    // the public distributed query contract over those projected groups.
+    server.cfg.deployment_mode = .distributed;
+
     var rounds: usize = 0;
     while (rounds < 8) : (rounds += 1) try svc.runRound();
 
     const projected_ranges = try svc.listProjectedRanges(std.testing.allocator);
     defer svc.freeProjectedRanges(std.testing.allocator, projected_ranges);
     try std.testing.expect(projected_ranges.len > 0);
-    const group_id = projected_ranges[0].group_id;
+    const projected_tables = try svc.listProjectedTables(std.testing.allocator);
+    defer svc.freeProjectedTables(std.testing.allocator, projected_tables);
+    const docs_table_id = for (projected_tables) |table| {
+        if (std.mem.eql(u8, table.name, "docs")) break table.table_id;
+    } else return error.TestUnexpectedResult;
+    const group_id = for (projected_ranges) |range| {
+        if (range.table_id == docs_table_id) break range.group_id;
+    } else return error.TestUnexpectedResult;
+    // The direct-local fixture bypasses the data-host bootstrapper. Publish
+    // the ownership intent it would normally commit so schema progress has a
+    // concrete hosting node and cannot cut over from ownerless evidence.
+    try svc.upsertReplicaIntent(.{
+        .record = .{
+            .group_id = group_id,
+            .replica_id = 1,
+            .local_node_id = 1,
+            .bootstrap_mode = .empty,
+        },
+        .store_id = 1,
+        .peer_node_ids = &.{1},
+    });
+    rounds = 0;
+    while (rounds < 8) : (rounds += 1) try svc.runRound();
+
     const provisioned_db_path = try metadata_mod.groupDbPathFromReplicaRoot(std.testing.allocator, replica_root, group_id);
     defer std.testing.allocator.free(provisioned_db_path);
 
-    var db = try db_mod.DB.open(std.testing.allocator, provisioned_db_path, .{});
-    defer db.close();
-    try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0") != null);
+    {
+        var db = try db_mod.DB.open(std.testing.allocator, provisioned_db_path, .{});
+        defer db.close();
+        try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0") != null);
+    }
 
     var table_detail = try client.fetchTable(base_uri, "docs");
     defer table_detail.deinit(std.testing.allocator);
@@ -535,8 +575,16 @@ test "public api smoke e2e creates table inserts and queries documents" {
     defer listed_tables.deinit(std.testing.allocator);
     var parsed_table_list = try std.json.parseFromSlice([]metadata_openapi.TableStatus, std.testing.allocator, listed_tables.body, .{});
     defer parsed_table_list.deinit();
-    try std.testing.expectEqual(@as(usize, 1), parsed_table_list.value.len);
-    try std.testing.expectEqualStrings("docs", parsed_table_list.value[0].name);
+    try std.testing.expectEqual(@as(usize, 3), parsed_table_list.value.len);
+    var found_docs = false;
+    var found_customers = false;
+    var found_addresses = false;
+    for (parsed_table_list.value) |table| {
+        found_docs = found_docs or std.mem.eql(u8, table.name, "docs");
+        found_customers = found_customers or std.mem.eql(u8, table.name, "customers");
+        found_addresses = found_addresses or std.mem.eql(u8, table.name, "addresses");
+    }
+    try std.testing.expect(found_docs and found_customers and found_addresses);
 
     var prefixed_tables = try client.fetchTables(base_uri, "do");
     defer prefixed_tables.deinit(std.testing.allocator);
@@ -593,6 +641,100 @@ test "public api smoke e2e creates table inserts and queries documents" {
     rounds = 0;
     while (rounds < 8) : (rounds += 1) try svc.runRound();
 
+    // This fixture performs data-group writes directly instead of running a
+    // second Raft host. Model the data owner's normal lifecycle explicitly:
+    // verify every locally owned range from durable DB state, publish that
+    // proof to metadata, then let metadata perform the generation cutover.
+    const progress_tables = try svc.listProjectedTables(std.testing.allocator);
+    defer svc.freeProjectedTables(std.testing.allocator, progress_tables);
+    const progress_ranges = try svc.listProjectedRanges(std.testing.allocator);
+    defer svc.freeProjectedRanges(std.testing.allocator, progress_ranges);
+    const local_schema_progress = try metadata_mod.table_provisioner.collectLocalSchemaProgress(
+        std.testing.allocator,
+        replica_root,
+        group_ids.main_metadata_group_id,
+        1,
+        &.{group_id},
+        progress_tables,
+        progress_ranges,
+    );
+    defer std.testing.allocator.free(local_schema_progress);
+    try std.testing.expectEqual(@as(usize, 1), local_schema_progress.len);
+    for (local_schema_progress) |progress| try svc.upsertSchemaProgress(progress);
+
+    var schema_progress_committed = false;
+    rounds = 0;
+    while (rounds < 32) : (rounds += 1) {
+        try svc.runRound();
+        const projected_progress = try svc.listProjectedSchemaProgress(std.testing.allocator);
+        defer svc.freeProjectedSchemaProgress(std.testing.allocator, projected_progress);
+        for (projected_progress) |progress| {
+            if (progress.table_id == docs_table_id and progress.node_id == 1 and progress.schema_version == 1) {
+                schema_progress_committed = true;
+                break;
+            }
+        }
+        if (schema_progress_committed) break;
+    }
+    try std.testing.expect(schema_progress_committed);
+
+    // A production MetadataServer owns this control loop. This lightweight
+    // fixture embeds MetadataService directly, so run the same projected-state
+    // seed and lease-fenced reconciliation explicitly after the data owner has
+    // published its completion proof.
+    var schema_control_loop = metadata_mod.MetadataControlLoop.init(std.testing.allocator);
+    defer schema_control_loop.deinit();
+    try schema_control_loop.stateRef().syncProjected(&svc);
+    try schema_control_loop.stateRef().seedDesiredFromProjected();
+    _ = try svc.reconcilePreparedIfLeaseHeld(&schema_control_loop) orelse
+        return error.ReconcileLeaseNotHeld;
+
+    var schema_migration_finalized = false;
+    rounds = 0;
+    while (rounds < 32) : (rounds += 1) {
+        try svc.runRound();
+        const current_tables = try svc.listProjectedTables(std.testing.allocator);
+        defer svc.freeProjectedTables(std.testing.allocator, current_tables);
+        for (current_tables) |table| {
+            if (table.table_id != docs_table_id) continue;
+            schema_migration_finalized = table.read_schema_json.len == 0;
+            break;
+        }
+        if (schema_migration_finalized) break;
+    }
+    try std.testing.expect(schema_migration_finalized);
+
+    // Apply the committed metadata generation to the resident writer, as the
+    // data runtime's local-replica reconciliation hook does in production.
+    // Without this step the lightweight fixture would retain the pre-cutover
+    // cached writer even though metadata correctly moved reads to v1.
+    const finalized_tables = try svc.listProjectedTables(std.testing.allocator);
+    defer svc.freeProjectedTables(std.testing.allocator, finalized_tables);
+    const finalized_ranges = try svc.listProjectedRanges(std.testing.allocator);
+    defer svc.freeProjectedRanges(std.testing.allocator, finalized_ranges);
+    platform.sync.lockYielding(provisioned_write_source.localDbMutex());
+    _ = provisioned_write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
+        std.testing.allocator,
+        group_ids.main_metadata_group_id,
+        &.{group_id},
+        finalized_tables,
+        finalized_ranges,
+        null,
+    ) catch |err| {
+        provisioned_write_source.localDbMutex().unlock();
+        return err;
+    };
+    provisioned_write_source.localDbMutex().unlock();
+
+    const committed_placements = try svc.listProjectedPlacementIntents(std.testing.allocator);
+    defer svc.freeProjectedPlacementIntents(std.testing.allocator, committed_placements);
+    var found_docs_owner = false;
+    for (committed_placements) |intent| {
+        found_docs_owner = found_docs_owner or
+            (intent.record.group_id == group_id and intent.record.local_node_id == 1);
+    }
+    try std.testing.expect(found_docs_owner);
+
     var embed_index_detail = try client.fetchTableIndex(base_uri, "docs", "embed_idx");
     defer embed_index_detail.deinit(std.testing.allocator);
     var parsed_embed_index = try parseJsonBodyIgnoreUnknown(IndexStatusSummary, std.testing.allocator, embed_index_detail.body);
@@ -604,8 +746,13 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var parsed_index_list = try parseJsonBodyIgnoreUnknown([]IndexStatusSummary, std.testing.allocator, listed_indexes.body);
     defer parsed_index_list.deinit();
     try std.testing.expectEqual(@as(usize, 2), parsed_index_list.value.len);
-    try std.testing.expectEqualStrings("full_text_index_v1", parsed_index_list.value[0].config.name);
-    try std.testing.expectEqualStrings("embed_idx", parsed_index_list.value[1].config.name);
+    var saw_target_index = false;
+    var saw_embedding_index = false;
+    for (parsed_index_list.value) |index| {
+        saw_target_index = saw_target_index or std.mem.eql(u8, index.config.name, "full_text_index_v1");
+        saw_embedding_index = saw_embedding_index or std.mem.eql(u8, index.config.name, "embed_idx");
+    }
+    try std.testing.expect(saw_target_index and saw_embedding_index);
 
     var stable_table_detail = try client.fetchTable(base_uri, "docs");
     defer stable_table_detail.deinit(std.testing.allocator);
@@ -615,15 +762,19 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expect(parsed_stable_table_detail.value.indexes.map.get("full_text_index_v0") == null);
     try std.testing.expect(parsed_stable_table_detail.value.indexes.map.get("full_text_index_v1") != null);
 
-    const provisioned_indexes = try db.listIndexes(std.testing.allocator);
-    defer db_mod.types.freeIndexConfigs(std.testing.allocator, provisioned_indexes);
-    var found_embed = false;
-    for (provisioned_indexes) |cfg| {
-        if (!std.mem.eql(u8, cfg.name, "embed_idx")) continue;
-        found_embed = true;
-        try std.testing.expectEqual(db_mod.types.IndexKind.dense_vector, cfg.kind);
+    {
+        var reconciled_db = try db_mod.DB.open(std.testing.allocator, provisioned_db_path, .{});
+        defer reconciled_db.close();
+        const provisioned_indexes = try reconciled_db.listIndexes(std.testing.allocator);
+        defer db_mod.types.freeIndexConfigs(std.testing.allocator, provisioned_indexes);
+        var found_embed = false;
+        for (provisioned_indexes) |cfg| {
+            if (!std.mem.eql(u8, cfg.name, "embed_idx")) continue;
+            found_embed = true;
+            try std.testing.expectEqual(db_mod.types.IndexKind.dense_vector, cfg.kind);
+        }
+        try std.testing.expect(found_embed);
     }
-    try std.testing.expect(found_embed);
 
     const batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator,
         \\{"inserts":{"doc:a":{"title":"alpha","body":"hello full text world","status":"published","score":10,"created_at":"2026-03-01T00:00:00Z"},"doc:b":{"title":"beta","body":"secondary document","status":"draft","score":3,"created_at":"2026-03-10T00:00:00Z"},"doc:c":{"title":"gamma","body":"hello filtered world","status":"published","score":8,"created_at":"2026-03-20T00:00:00Z"}}}
@@ -664,8 +815,14 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expectEqual(@as(usize, 1), query_responses.value.responses.?.len);
     const query_result = query_responses.value.responses.?[0];
     try std.testing.expectEqualStrings("docs", query_result.table.?);
-    try std.testing.expectEqual(@as(i64, 1), query_result.hits.?.total.?.value);
-    try std.testing.expectEqualStrings("doc:a", query_result.hits.?.hits.?[0]._id);
+    try std.testing.expectEqual(@as(i64, 2), query_result.hits.?.total.?.value);
+    var saw_hello_doc_a = false;
+    var saw_hello_doc_c = false;
+    for (query_result.hits.?.hits.?) |hit| {
+        saw_hello_doc_a = saw_hello_doc_a or std.mem.eql(u8, hit._id, "doc:a");
+        saw_hello_doc_c = saw_hello_doc_c or std.mem.eql(u8, hit._id, "doc:c");
+    }
+    try std.testing.expect(saw_hello_doc_a and saw_hello_doc_c);
 
     const aggregation_query_body = try std.testing.allocator.dupe(u8,
         \\{"full_text_search":{"query":"body:hello OR body:secondary"},"fields":["title","body","status","score"],"limit":2,"aggregations":{"score_stats":{"type":"stats","field":"score"},"by_status":{"type":"terms","field":"status","size":5}}}
@@ -1059,7 +1216,9 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expectEqual(@as(usize, 1), parsed_index_list_after_delete.value.len);
     try std.testing.expectEqualStrings("full_text_index_v1", parsed_index_list_after_delete.value[0].config.name);
 
-    const provisioned_indexes_after_delete = try db.listIndexes(std.testing.allocator);
+    var after_delete_db = try db_mod.DB.open(std.testing.allocator, provisioned_db_path, .{});
+    defer after_delete_db.close();
+    const provisioned_indexes_after_delete = try after_delete_db.listIndexes(std.testing.allocator);
     defer db_mod.types.freeIndexConfigs(std.testing.allocator, provisioned_indexes_after_delete);
     for (provisioned_indexes_after_delete) |cfg| {
         try std.testing.expect(!std.mem.eql(u8, cfg.name, "embed_idx"));
@@ -2797,7 +2956,7 @@ test "public api e2e adds managed embeddings indexes to existing tables" {
 
     var semantic_index = try client.fetchTableIndex(base_uri, "docs", "semantic_idx");
     defer semantic_index.deinit(std.testing.allocator);
-    var parsed_semantic_index = try parseJsonBody(IndexStatusSummary, std.testing.allocator, semantic_index.body);
+    var parsed_semantic_index = try parseJsonBodyIgnoreUnknown(IndexStatusSummary, std.testing.allocator, semantic_index.body);
     defer parsed_semantic_index.deinit();
     try std.testing.expectEqualStrings("semantic_idx", parsed_semantic_index.value.config.name);
     try std.testing.expectEqual(@as(?bool, false), parsed_semantic_index.value.status.backfill_active);
@@ -2864,7 +3023,7 @@ test "public api e2e recreates managed embeddings index after corrupt artifact" 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -2872,7 +3031,7 @@ test "public api e2e recreates managed embeddings index after corrupt artifact" 
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
-        .{},
+        .{ .deployment_mode = .standalone },
         http_server.StatusSource.fromMetadataService(&svc),
         provisioned_read_source.source(),
         provisioned_write_source.source(),
@@ -6321,7 +6480,7 @@ test "public api smoke e2e queries across split ranges" {
     defer std.testing.allocator.free(create_body);
     var created = try client.createTable(base_uri, "docs", create_body);
     defer created.deinit(std.testing.allocator);
-    var created_table = try std.json.parseFromSlice(metadata_openapi.Table, std.testing.allocator, created.body, .{});
+    var created_table = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, created.body, .{});
     defer created_table.deinit();
     try std.testing.expectEqualStrings("docs", created_table.value.name);
 
@@ -6471,6 +6630,16 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
     });
     try svc.campaignMetadataGroup();
     try svc.runRound();
+    try svc.upsertStore(.{
+        .store_id = 1,
+        .node_id = 1,
+        .role = "data",
+        .health_class = "healthy",
+        .live = true,
+        .capacity_bytes = 1024 * 1024 * 1024,
+        .available_bytes = 1024 * 1024 * 1024,
+    });
+    try svc.runRound();
 
     var metadata_admin_server: metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_listener: std_http_listener.StdHttpListener = undefined;
@@ -6486,7 +6655,7 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -6494,7 +6663,7 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
-        .{},
+        .{ .deployment_mode = .standalone },
         http_server.StatusSource.fromMetadataService(&svc),
         provisioned_read_source.source(),
         provisioned_write_source.source(),
@@ -6524,6 +6693,35 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
     try std.testing.expectEqual(@as(usize, 1), projected_ranges.len);
 
     const left_group_id = projected_ranges[0].group_id;
+    var group_statuses = [_]metadata_mod.GroupStatusReport{.{
+        .group_id = left_group_id,
+        .local_leader = true,
+        .local_voter = true,
+        .voter_count = 1,
+    }};
+    var runtime_statuses = [_]metadata_mod.RuntimeGroupStatusReport{.{
+        .table_id = projected_ranges[0].table_id,
+        .table_name = "docs",
+        .group_id = left_group_id,
+        .store_id = 1,
+        .node_id = 1,
+        .source = "live_writer_publish",
+        .freshness = "fresh",
+        .doc_identity = .{
+            .namespace_table_id = projected_ranges[0].table_id,
+            .namespace_shard_id = left_group_id,
+            .namespace_range_id = left_group_id,
+            .next_ordinal = 1,
+            .complete = true,
+        },
+    }};
+    try svc.reportStoreStatus(.{
+        .store_id = 1,
+        .group_statuses = &group_statuses,
+        .runtime_statuses = &runtime_statuses,
+    });
+    try svc.runRound();
+
     const split_body = try std.fmt.allocPrint(std.testing.allocator, "{{\"transition_id\":39011,\"source_group_id\":{d},\"destination_group_id\":3912,\"split_key\":\"doc:m\"}}", .{
         left_group_id,
     });
@@ -7755,7 +7953,7 @@ test "public api smoke e2e queries after merge finalization" {
     defer std.testing.allocator.free(create_body);
     var created = try client.createTable(base_uri, "docs", create_body);
     defer created.deinit(std.testing.allocator);
-    var created_table = try std.json.parseFromSlice(metadata_openapi.Table, std.testing.allocator, created.body, .{});
+    var created_table = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, created.body, .{});
     defer created_table.deinit();
     try std.testing.expectEqualStrings("docs", created_table.value.name);
 

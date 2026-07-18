@@ -9510,12 +9510,7 @@ pub const ProvisionedTableWriteSource = struct {
 
             if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
             if (configured_indexes_storage) |configured_indexes| {
-                if (metadata.target_index_name) |target_index_name| {
-                    _ = cached.db.deleteIndex(target_index_name) catch |err| switch (err) {
-                        error.IndexNotFound => {},
-                        else => return err,
-                    };
-                } else {
+                if (metadata.target_index_name == null) {
                     for (configured_indexes.items) |item| {
                         _ = cached.db.deleteIndex(item.name) catch |err| switch (err) {
                             error.IndexNotFound => {},
@@ -9534,13 +9529,14 @@ pub const ProvisionedTableWriteSource = struct {
                     if (metadata.target_index_name) |target_index_name| {
                         if (!std.mem.eql(u8, item.name, target_index_name)) continue;
                     }
-                    catchUpManagedIndexCreate(alloc, cached.db, item.name) catch |err| {
+                    const repair_pending = catchUpManagedIndexCreate(alloc, cached.db, item.name) catch |err| {
                         lockAtomic(&self.local_db_mutex);
                         defer self.local_db_mutex.unlock();
                         cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
                         cached_active = false;
                         return err;
                     };
+                    if (repair_pending) return true;
                 }
             } else {
                 cached.db.runUntilIdle() catch |err| {
@@ -9551,7 +9547,18 @@ pub const ProvisionedTableWriteSource = struct {
                     return err;
                 };
             }
-            publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db) catch |err| {
+            const publish_schema_identity_proof = if (configured_indexes_storage) |*configured_indexes|
+                configuredIndexesRequireSchemaIdentityProof(configured_indexes)
+            else
+                false;
+            publishStructuralRuntimeStatusSnapshot(
+                self,
+                alloc,
+                table_name,
+                group_id,
+                cached.db,
+                publish_schema_identity_proof,
+            ) catch |err| {
                 lockAtomic(&self.local_db_mutex);
                 defer self.local_db_mutex.unlock();
                 cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
@@ -9608,12 +9615,7 @@ pub const ProvisionedTableWriteSource = struct {
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
         if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, &db, schema_json);
         if (configured_indexes_storage) |configured_indexes| {
-            if (metadata.target_index_name) |target_index_name| {
-                _ = db.deleteIndex(target_index_name) catch |err| switch (err) {
-                    error.IndexNotFound => {},
-                    else => return err,
-                };
-            } else {
+            if (metadata.target_index_name == null) {
                 for (configured_indexes.items) |item| {
                     _ = db.deleteIndex(item.name) catch |err| switch (err) {
                         error.IndexNotFound => {},
@@ -9632,12 +9634,23 @@ pub const ProvisionedTableWriteSource = struct {
                 if (metadata.target_index_name) |target_index_name| {
                     if (!std.mem.eql(u8, item.name, target_index_name)) continue;
                 }
-                try catchUpManagedIndexCreate(alloc, &db, item.name);
+                if (try catchUpManagedIndexCreate(alloc, &db, item.name)) return true;
             }
         } else {
             try db.runUntilIdle();
         }
-        try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, &db);
+        const publish_schema_identity_proof = if (configured_indexes_storage) |*configured_indexes|
+            configuredIndexesRequireSchemaIdentityProof(configured_indexes)
+        else
+            false;
+        try publishStructuralRuntimeStatusSnapshot(
+            self,
+            alloc,
+            table_name,
+            group_id,
+            &db,
+            publish_schema_identity_proof,
+        );
         return false;
     }
 
@@ -14849,7 +14862,21 @@ fn catchUpManagedIndexCreate(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
     index_name: []const u8,
-) !void {
+) !bool {
+    // Managed full-text admission persists a generation-repair intent instead
+    // of rebuilding the existing corpus inline with catalog mutation. Advance
+    // one durable, restartable repair step per structural-reconcile turn. The
+    // outer worker retries without deleting the admitted generation, keeping
+    // large rebuilds bounded and allowing crash recovery to resume the same
+    // shadow candidate.
+    var generation_repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .index_name = index_name,
+        .limit = 1,
+    });
+    defer generation_repair.deinit(alloc);
+    if (generation_repair.debt_remaining) return true;
+
     const requires_enrichment_replay = try db.core.indexRequiresEnrichmentReplay(index_name);
     if (requires_enrichment_replay) {
         if (db.enrichment_runtime != null) {
@@ -14871,6 +14898,7 @@ fn catchUpManagedIndexCreate(
     }
     try drainManagedIndexReplayUntilConverged(alloc, db, index_name);
     try db.core.index_manager.syncAll(true);
+    return false;
 }
 
 const ManagedIndexReplayPosition = struct {
@@ -16000,6 +16028,25 @@ fn publishRuntimeStatusSnapshotConsistent(
     );
 }
 
+fn publishStructuralRuntimeStatusSnapshot(
+    source: *ProvisionedTableWriteSource,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    group_id: u64,
+    db: *db_mod.DB,
+    require_schema_identity_proof: bool,
+) !void {
+    try publishRuntimeStatusSnapshotWithStartupPhaseMode(
+        source,
+        alloc,
+        table_name,
+        group_id,
+        if (source.startup_catch_up_active.load(.monotonic)) .startup_catch_up else .idle,
+        if (require_schema_identity_proof) .diagnostic else .consistent,
+        db,
+    );
+}
+
 fn publishRuntimeStatusSnapshotConsistentIfAvailable(
     source: *ProvisionedTableWriteSource,
     alloc: std.mem.Allocator,
@@ -16033,6 +16080,7 @@ const RuntimeStatusSnapshotMode = enum {
     best_effort,
     consistent,
     consistent_if_available,
+    diagnostic,
 };
 
 fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
@@ -16179,6 +16227,19 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
                 };
                 status_initialized = true;
             },
+            .diagnostic => {
+                const disk_bytes = cached_status.disk_bytes;
+                const created_at_millis = cached_status.created_at_millis;
+                var discard = cached_status;
+                discard.deinit(alloc);
+                status = .{
+                    .group_id = group_id,
+                    .disk_bytes = disk_bytes,
+                    .created_at_millis = created_at_millis,
+                    .stats = try db.diagnosticStats(alloc),
+                };
+                status_initialized = true;
+            },
         }
     }
     if (!status_initialized) {
@@ -16188,6 +16249,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
                 .best_effort => try db.stats(alloc),
                 .consistent => try db.runtimeStatusStatsConsistent(alloc),
                 .consistent_if_available => (try db.runtimeStatusStatsConsistentIfAvailable(alloc)) orelse return error.WriterLocked,
+                .diagnostic => try db.diagnosticStats(alloc),
             },
         };
         status_initialized = true;
@@ -16508,6 +16570,16 @@ const StartupConfiguredIndexes = struct {
         }
     }
 };
+
+fn configuredIndexesRequireSchemaIdentityProof(configured: *const StartupConfiguredIndexes) bool {
+    var full_text_count: usize = 0;
+    for (configured.items) |item| {
+        if (item.kind != .full_text) continue;
+        full_text_count += 1;
+        if (full_text_count > 1) return true;
+    }
+    return false;
+}
 
 fn parseStartupConfiguredIndexes(
     alloc: std.mem.Allocator,

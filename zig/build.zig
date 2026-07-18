@@ -3177,7 +3177,7 @@ pub fn build(b: *std.Build) void {
     const lib_unit_filters = selectTestFilters(b, &lib_unit_default_filters);
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = lib_unit_filters,
+        .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, lib_unit_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4140,9 +4140,9 @@ pub fn build(b: *std.Build) void {
         "api http server serves table query response envelope",
         "api http server serves retrieval agent response envelope",
         "api http server serves table batch writes",
-        "auto bulk max-window session rolls without a following write",
+        "auto bulk max-window request waits for idle finish",
         "auto bulk group writes release leases so idle finish can publish",
-        "auto bulk max-window rolls publish all threshold aligned docs",
+        "auto bulk background finish skips entries with active foreground leases",
         "provisioned table write source seeds doc identity namespace from table range",
         "provisioned table write source cached runtime status does not fetch catalog coverage",
         "managed startup catch-up uses provided indexes json without catalog fetch",
@@ -4183,7 +4183,7 @@ pub fn build(b: *std.Build) void {
         "restore metadata intent topology accepts interrupted prefixes and rejects foreign ranges",
         "restore job list bounds authorization scans with an empty continuation page",
         "api http server backs up and restores a table through public routes",
-        "api http server cluster overwrite restore tolerates already absent metadata drop",
+        "api http server cluster overwrite stages before replacing metadata without dropping live table",
         "api http server durability-pending restore preserves committed metadata",
         "api http server prefers metadata-owned restore over inline write-source restore",
         "api http server retries stale metadata table-exists restore race",
@@ -4194,15 +4194,20 @@ pub fn build(b: *std.Build) void {
         "public api split e2e uses distributed global text stats for bm25 and significant_terms",
         "public api multi-node e2e routes CRUD from a non-host node",
     };
+    const public_api_parity_runtime_filters = selectTestFilters(b, &public_api_parity_default_filters);
     const public_api_parity_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &public_api_parity_default_filters),
+        .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, public_api_parity_runtime_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_public_api_parity_tests = addFilteredTestRunArtifact(b, public_api_parity_tests);
+    const run_public_api_parity_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        public_api_parity_tests,
+        public_api_parity_runtime_filters,
+    );
     run_public_api_parity_tests.step.dependOn(&openapi_root_check.step);
     const public_api_parity_test_step = b.step("public-api-parity-test", "Run focused stateful public API parity tests");
     public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
@@ -4395,7 +4400,6 @@ pub fn build(b: *std.Build) void {
             "single embeddings index encoder scopes isolated enrichment failure to one index",
             "empty embeddings index status is ready without dense artifact visibility",
             "index encoders report missing and stale topology groups without probing databases",
-            "api query contract rejects doc identity control fields when with relaxes schema",
             "api query contract public parser rejects internal shard doc identity controls",
             "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
             "distributed graph rejects doc identity rebuild before cross-range fanout",
@@ -4535,7 +4539,7 @@ pub fn build(b: *std.Build) void {
             "dense metadata prefetch includes legacy ordinal vector ids",
             "db dense index stores stable vector ids with ordinal filter mappings",
             "db dense artifact rebuild preserves stable vector ids distinct from ordinals",
-            "db sparse index keeps physical doc nums distinct from doc identity ordinals",
+            "db sparse index uses identity ordinals as physical doc nums for primary docs",
             "db sparse hits resolve doc ordinals through identity not sparse doc nums",
             "native dense constraints fail closed without ordinal vector mapping",
             "native constraints fail closed when resolved ordinals cannot be represented",
@@ -4641,7 +4645,6 @@ pub fn build(b: *std.Build) void {
     const api_table_writes_docid_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
         .filters = selectTestFilters(b, &.{
-            "api auto bulk ingest does not open sessions for normal online writes",
             "auto bulk group writes release leases so idle finish can publish",
             "provisioned table write source rejects stale doc identity namespace before write",
             "replicated split destination seeds inherited doc identity before range publication",
@@ -4679,8 +4682,6 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source consistent visibility refreshes stale dense status",
             "provisioned table write source visibility hook defers status sampling to runtime owner",
             "provisioned table write source status visibility does not invalidate read cache",
-            "provisioned table restore lifecycle blocks group operations but allows foreground structural mutation",
-            "provisioned table restore lifecycle blocks request admission without blocking foreground structural mutation",
             "provisioned table restore lifecycle reserves forwarded owner and caller sources",
             "provisioned startup catch-up enters through forwarded write owner",
             "provisioned runtime status inspection remains available during structural transition",
@@ -4697,7 +4698,7 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up quarantines repeated zero progress with bounded backoff",
             "managed startup catch-up uses provided indexes json without catalog fetch",
             "managed startup catch-up marks FileNotFound index open terminal degraded",
-            "managed startup catch-up finishes restore repair before terminal index load degradation",
+            "managed startup catch-up preserves restore repair debt while index load is terminal",
             "table runtime snapshot cache clones stored status",
             "table runtime snapshot cache rejects a late stale live observation",
             "table runtime snapshot cache replacement preserves a newer live observation",
@@ -4774,13 +4775,14 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
+    const lib_serverless_docid_runtime_filters = &.{
+        "serverless query module compiles",
+        "search plan rejects internal doc identity controls",
+        "serverless graph plans reject internal doc identity controls",
+    };
     const lib_serverless_docid_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{
-            "serverless query module compiles",
-            "search plan rejects internal doc identity controls",
-            "serverless graph plans reject internal doc identity controls",
-        },
+        .filters = compileFiltersWithAnchors(b, &.{"serverless module compiles"}, lib_serverless_docid_runtime_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4828,7 +4830,11 @@ pub fn build(b: *std.Build) void {
     run_lib_api_derived_coverage_tests.step.dependOn(&openapi_root_check.step);
     const lib_api_derived_coverage_test_step = b.step("lib-api-derived-coverage-test", "Run focused public derived coverage tests");
     lib_api_derived_coverage_test_step.dependOn(&run_lib_api_derived_coverage_tests.step);
-    const run_lib_serverless_docid_tests = addFilteredTestRunArtifact(b, lib_serverless_docid_tests);
+    const run_lib_serverless_docid_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        lib_serverless_docid_tests,
+        lib_serverless_docid_runtime_filters,
+    );
     const run_api_transactions_docid_tests = addFilteredTestRunArtifact(b, api_transactions_docid_tests);
     const run_api_table_writes_docid_tests = addFilteredTestRunArtifact(b, api_table_writes_docid_tests);
     const run_api_table_reads_docid_tests = addFilteredTestRunArtifact(b, api_table_reads_docid_tests);
@@ -5940,7 +5946,7 @@ pub fn build(b: *std.Build) void {
     provisioned_write_cache_failed_close_step.dependOn(&run_provisioned_write_cache_failed_close_tests.step);
 
     const provisioned_query_visibility_tests = b.addTest(.{
-        .root_module = db_test_mod,
+        .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
             "provisioned table write source invalidates cached query db after managed dense replay becomes visible",
             "managed visibility publish hook updates runtime status cache from live writer",
@@ -5949,9 +5955,9 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source runtime status does not inspect read cache hbc stats when dirty",
             "provisioned table write source read cache overlay preserves live replay status",
             "read preparation keeps write cache dirty while auto bulk ingest is active",
-            "dirty runtime status refresh finishes expired auto bulk before collecting leases",
+            "runtime status request does not finish expired auto bulk ingest",
             "managed startup catch-up ignores stale dirty bit after writer cache entry is gone",
-            "provisioned table write source deinit drains restore repair jobs",
+            "provisioned table write source deinit drains restore repair work group",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

@@ -1418,7 +1418,7 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
     defer std.heap.page_allocator.free(create_body);
     var created = try client.createTable(api_base_uris[0], "docs", create_body);
     defer created.deinit(std.heap.page_allocator);
-    var created_table = try std.json.parseFromSlice(metadata_openapi.Table, std.heap.page_allocator, created.body, .{});
+    var created_table = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.heap.page_allocator, created.body, .{});
     defer created_table.deinit();
     try std.testing.expectEqualStrings("docs", created_table.value.name);
 
@@ -1500,7 +1500,7 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
 
     var lookup = try client.fetchLookup(client_base, "docs", "doc:a", null);
     defer lookup.deinit(std.heap.page_allocator);
-    var parsed_lookup = try parseJsonBody(LookupTitle, lookup.body);
+    var parsed_lookup = try parseJsonBodyIgnoreUnknown(LookupTitle, lookup.body);
     defer parsed_lookup.deinit();
     try std.testing.expectEqualStrings("alpha", parsed_lookup.value.title);
 
