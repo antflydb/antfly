@@ -588,8 +588,8 @@ fn validateFrameMetadata(frame: internal_api.openapi.types.HAReplicationFrame, r
 
 fn validateRecordIdentity(record: replication_record.RecordView, expected: standby_mod.Identity) !void {
     if (record.cluster_id != expected.cluster_id) return error.WrongCluster;
-    if (record.shard_id != expected.shard_id) return error.WrongShard;
-    if (record.table_id != expected.table_id) return error.WrongTable;
+    if (expected.shard_id != 0 and record.shard_id != expected.shard_id) return error.WrongShard;
+    if (expected.table_id != 0 and record.table_id != expected.table_id) return error.WrongTable;
     if (record.kind == .timeline_switch) {
         if (record.timeline_id <= expected.timeline_id) return error.InvalidTimelineSwitch;
         if (record.epoch <= expected.epoch) return error.InvalidTimelineSwitch;
@@ -1230,6 +1230,48 @@ test "storage.ha http replication client pulls applies and acknowledges standby 
         .standby_names = &names,
     });
     try std.testing.expectEqual(primary_mod.DurabilityStatus.satisfied, decision.status);
+}
+
+test "storage.ha http replication client replicates mixed tables for whole instance identity" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "replicate-whole-instance");
+    defer paths.deinit(alloc);
+    const identity = standby_mod.Identity{
+        .cluster_id = 100,
+        .shard_id = 0,
+        .table_id = 0,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+
+    var server = http_internal.Server.init(alloc, &primary);
+    var client = Client.init(alloc, server.executor());
+    try client.createReplicationSlotForStandby("http://primary.internal.test", "standby-a", 0, &standby);
+    _ = try primary.append(.{ .shard_id = 10, .table_id = 20, .payload = "one" });
+    _ = try primary.append(.{ .shard_id = 11, .table_id = 21, .payload = "two" });
+
+    var capture = ApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const result = try client.replicateAvailable(
+        "http://primary.internal.test",
+        "standby-a",
+        &standby,
+        &capture,
+        ApplyCapture.apply,
+        .{},
+    );
+    try std.testing.expectEqual(@as(usize, 2), result.received_count);
+    try std.testing.expectEqual(@as(usize, 2), result.applied_count);
+    standby.close();
+
+    var reopened = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer reopened.close();
+    try std.testing.expectEqual(identity, reopened.identity);
+    try std.testing.expectEqual(@as(u64, 2), reopened.currentProgress().safe_read_lsn);
 }
 
 test "storage.ha http replication client verifies upstream identity before streaming" {
