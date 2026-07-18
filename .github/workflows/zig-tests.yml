@@ -106,6 +106,7 @@ jobs:
             ':(glob)zig/**' \
             ':(glob)scripts/packaging/**' \
             .github/workflows/zig-tests.yml \
+            .github/workflows/antfly-linux-release-build.yml \
             .github/workflows/antfly-release.yml
           then
             echo "release_targets=false" >> "$GITHUB_OUTPUT"
@@ -155,7 +156,7 @@ jobs:
           fi
 
   release-linux-compile:
-    name: release-linux-compile (${{ matrix.target }})
+    name: release-linux-compile
     needs: changes
     if: >-
       needs.changes.outputs.release_targets == 'true' &&
@@ -163,52 +164,12 @@ jobs:
        github.event_name == 'merge_group' ||
        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
        github.event_name == 'workflow_dispatch')
-    runs-on: arc-antfly-heavy
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-linux-musl
-            optimize: ReleaseFast
-            archive_arch: x86_64
-            jobs: ""
-          - target: aarch64-linux-musl
-            optimize: ReleaseSmall
-            archive_arch: arm64
-            jobs: "1"
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-
-      - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates
-
-      - name: Set up Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-          use-cache: false
-
-      # Compile and package exactly what the Linux release jobs publish, but do
-      # not upload or execute the cross-target binaries.
-      - name: Build release package
-        shell: bash
-        run: |
-          jobs_arg=()
-          if [ -n "${{ matrix.jobs }}" ]; then
-            jobs_arg=(--jobs "${{ matrix.jobs }}")
-          fi
-          scripts/packaging/build_zig_release_archive.sh \
-            --version "0.0.0-ci" \
-            --target "${{ matrix.target }}" \
-            --optimize "${{ matrix.optimize }}" \
-            "${jobs_arg[@]}" \
-            --archive-name "antfly_0.0.0-ci_Linux_${{ matrix.archive_arch }}.tar.gz" \
-            --out-dir "dist/release-compile/${{ matrix.target }}" \
-            --metal false \
-            --system-blas false
+    uses: ./.github/workflows/antfly-linux-release-build.yml
+    with:
+      tag_name: v0.0.0-ci
+      upload_artifacts: false
+    permissions:
+      contents: read
 
   zig-base:
     name: zig-base

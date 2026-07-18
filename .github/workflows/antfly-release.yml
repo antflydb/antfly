@@ -14,69 +14,28 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  build-zig-runtime-archives:
-    name: Build Zig archive (${{ matrix.artifact_name }})
-    runs-on: ${{ matrix.runner }}
+  build-zig-runtime-archives-linux:
+    name: Build Linux Zig runtime archives
+    uses: ./.github/workflows/antfly-linux-release-build.yml
+    with:
+      tag_name: ${{ github.ref_name }}
+      upload_artifacts: true
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - artifact_name: antfly-zig-linux-amd64
-            runner: arc-antfly-publish
-            os: linux
-            zig_arch: x86_64
-            zig_target: x86_64-linux-musl
-            archive_os: Linux
-            archive_arch: x86_64
-            metal: "false"
-            system_blas: "false"
-            zig_optimize: ReleaseFast
-            zig_jobs: ""
-          - artifact_name: antfly-zig-linux-arm64
-            runner: arc-antfly-publish-arm64
-            os: linux
-            zig_arch: aarch64
-            zig_target: aarch64-linux-musl
-            archive_os: Linux
-            archive_arch: arm64
-            metal: "false"
-            system_blas: "false"
-            zig_optimize: ReleaseSmall
-            zig_jobs: "1"
-          - artifact_name: antfly-zig-darwin-arm64
-            runner: macos-15
-            os: darwin
-            zig_target: aarch64-macos
-            archive_os: Darwin
-            archive_arch: arm64
-            metal: "true"
-            system_blas: "true"
-            zig_optimize: ReleaseFast
-            zig_jobs: ""
+
+  build-zig-runtime-archive-darwin:
+    name: Build Zig archive (antfly-zig-darwin-arm64)
+    runs-on: macos-15
+    timeout-minutes: 120
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           submodules: true
 
-      - name: Install Linux build dependencies
-        if: ${{ matrix.os == 'linux' }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates
-
-      - name: Install Zig (Linux)
-        if: ${{ matrix.os == 'linux' }}
-        run: |
-          curl -L "https://ziglang.org/download/0.16.0/zig-${{ matrix.zig_arch }}-linux-0.16.0.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
-          mkdir -p "$RUNNER_TEMP/zig"
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
-          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
-
-      - name: Install Zig (macOS)
-        if: ${{ matrix.os == 'darwin' }}
+      - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
           version: "0.16.0"
@@ -84,31 +43,28 @@ jobs:
       - name: Build archive
         run: |
           version="${GITHUB_REF_NAME#v}"
-          archive="antfly_${version}_${{ matrix.archive_os }}_${{ matrix.archive_arch }}.tar.gz"
-          jobs_arg=()
-          if [ -n "${{ matrix.zig_jobs }}" ]; then
-            jobs_arg=(--jobs "${{ matrix.zig_jobs }}")
-          fi
+          archive="antfly_${version}_Darwin_arm64.tar.gz"
           scripts/packaging/build_zig_release_archive.sh \
             --version "$version" \
-            --target "${{ matrix.zig_target }}" \
-            --optimize "${{ matrix.zig_optimize }}" \
-            "${jobs_arg[@]}" \
+            --target aarch64-macos \
+            --optimize ReleaseFast \
             --archive-name "$archive" \
             --out-dir dist/release-archives \
-            --metal "${{ matrix.metal }}" \
-            --system-blas "${{ matrix.system_blas }}"
+            --metal true \
+            --system-blas true
 
       - name: Upload archive
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ matrix.artifact_name }}
+          name: antfly-zig-darwin-arm64
           path: dist/release-archives/*.tar.gz
           if-no-files-found: error
 
   publish-release-assets:
     name: Publish release assets
-    needs: build-zig-runtime-archives
+    needs:
+      - build-zig-runtime-archives-linux
+      - build-zig-runtime-archive-darwin
     runs-on: arc-antfly-standard
     steps:
       - name: Checkout
@@ -169,7 +125,8 @@ jobs:
   package-cli-artifacts:
     name: Build CLI package artifacts
     needs:
-      - build-zig-runtime-archives
+      - build-zig-runtime-archives-linux
+      - build-zig-runtime-archive-darwin
       - publish-release-assets
     runs-on: ubuntu-latest
     steps:
@@ -291,7 +248,8 @@ jobs:
   publish-zig-homebrew:
     name: Publish antfly Homebrew formula
     needs:
-      - build-zig-runtime-archives
+      - build-zig-runtime-archives-linux
+      - build-zig-runtime-archive-darwin
       - publish-release-assets
     if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
@@ -337,7 +295,8 @@ jobs:
   # Build and publish container images after release
   publish-container:
     needs:
-      - build-zig-runtime-archives
+      - build-zig-runtime-archives-linux
+      - build-zig-runtime-archive-darwin
       - publish-release-assets
     uses: ./.github/workflows/antfly-container.yml
     with:

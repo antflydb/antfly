@@ -19,6 +19,7 @@ const antfly_embedded_build = @import("pkg/antfly/build/embedded.zig");
 const antfly_storage_build = @import("pkg/antfly/build/storage.zig");
 const antfly_tests_build = @import("pkg/antfly/build/tests.zig");
 const inference_runtime_build = @import("pkg/inference/build/runtime.zig");
+const platform_build = @import("lib/platform/build_support.zig");
 
 const LmdbBackend = antfly_storage_build.LmdbBackend;
 const chainLabeledFilteredTests = antfly_tests_build.chainLabeledFilteredTests;
@@ -474,6 +475,9 @@ const AntflyRootImports = struct {
     prometheus: *std.Build.Module,
     structlog: *std.Build.Module,
     platform: *std.Build.Module,
+    platform_link_libc: bool,
+    platform_target: std.Build.ResolvedTarget,
+    filesystem_capacity_source_file: std.Build.LazyPath,
 
     const import_table = [_]struct { name: []const u8, field: []const u8 }{
         .{ .name = "lmdb_engine", .field = "lmdb_engine" },
@@ -539,13 +543,20 @@ const AntflyRootImports = struct {
         .{ .name = "inference_server", .field = "inference_server" },
         .{ .name = "prometheus", .field = "prometheus" },
         .{ .name = "structlog", .field = "structlog" },
-        .{ .name = "antfly_platform", .field = "platform" },
     };
 
     fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
         mod.addOptions("build_options", self.build_options);
         inline for (import_table) |entry| {
             mod.addImport(entry.name, @field(self, entry.field));
+        }
+        mod.addImport("antfly_platform", self.platform);
+        if (link_libc and !self.platform_link_libc) {
+            platform_build.addFilesystemCapacitySource(
+                mod,
+                self.filesystem_capacity_source_file,
+                self.platform_target,
+            );
         }
         mod.addIncludePath(b.path("lib/lmdb"));
         if (include_lmdb_c) {
@@ -1259,25 +1270,19 @@ pub fn build(b: *std.Build) void {
     // Protobuf wire format
     const protobuf_dep = b.dependency("protobuf", .{});
     const protobuf_mod = protobuf_dep.module("protobuf");
-    const platform_mod = b.createModule(.{
+    const platform_mod = platform_build.createModule(b, .{
         .root_source_file = b.path("lib/platform/src/root.zig"),
+        .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
         .target = target,
         .optimize = optimize,
+        .link_libc = link_libc,
     });
-    platform_mod.link_libc = link_libc;
-    if (link_libc and switch (target.result.os.tag) {
-        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => true,
-        else => false,
-    }) {
-        platform_mod.addCSourceFile(.{
-            .file = b.path("lib/platform/src/filesystem_capacity.c"),
-            .flags = &.{"-std=c11"},
-        });
-    }
-    const wasm_platform_mod = b.createModule(.{
+    const wasm_platform_mod = platform_build.createModule(b, .{
         .root_source_file = b.path("lib/platform/src/root.zig"),
+        .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
         .target = wasm_target,
         .optimize = optimize,
+        .link_libc = false,
     });
     const objectstore_mod = b.createModule(.{
         .root_source_file = b.path("lib/objectstore/src/root.zig"),
@@ -1698,6 +1703,9 @@ pub fn build(b: *std.Build) void {
         .prometheus = prometheus_mod,
         .structlog = structlog_mod,
         .platform = platform_mod,
+        .platform_link_libc = link_libc,
+        .platform_target = target,
+        .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
     };
 
     // Library module
