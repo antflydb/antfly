@@ -572,6 +572,20 @@ pub const DBCore = struct {
         return applied;
     }
 
+    pub fn addManagedIndex(
+        self: *DBCore,
+        cfg: types.IndexConfig,
+        admission: ?index_manager_mod.IndexManager.AtomicCatalogWrite,
+    ) !u64 {
+        try self.index_manager.addManaged(self.store, cfg, admission);
+        // A managed generation with an admission marker is rebuilt from a
+        // stable source snapshot before replay catch-up. Starting at zero is
+        // fail-closed if the process exits before the outbox is materialized.
+        const applied = if (admission == null) self.nextDerivedSequence() else 0;
+        try self.saveAppliedSequence(cfg.name, applied);
+        return applied;
+    }
+
     pub fn addEnrichment(self: *DBCore, cfg: types.EnrichmentConfig) !void {
         try self.index_manager.addEnrichment(self.store, cfg);
     }

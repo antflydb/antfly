@@ -644,15 +644,24 @@ fn ensureIndexDefinition(
         }
     }
     if (existing) |existing_cfg| {
-        if (try indexConfigsEqual(alloc, existing_cfg, desired)) return;
+        if (try indexConfigsEqual(alloc, existing_cfg, desired)) {
+            if (desired.kind == .full_text) {
+                _ = try db.materializeManagedIndexAdmission(alloc, desired.name);
+            }
+            return;
+        }
         if (try db.deleteIndex(desired.name)) summary.removed += 1;
     }
-    try db.addIndex(.{
+    const admitted = db_mod.types.IndexConfig{
         .name = desired.name,
         .kind = desired.kind,
         .config_json = desired.config_json,
         .coverage_generation = desired.coverage_generation,
-    });
+    };
+    if (desired.kind == .full_text)
+        _ = try db.admitManagedFullTextIndex(admitted)
+    else
+        try db.addIndex(admitted);
     summary.added += 1;
 }
 
@@ -1382,6 +1391,48 @@ test "table provisioner materializes array-form metadata indexes" {
     try std.testing.expect(findIndexConfig(configs, "dense_idx").?.kind == .dense_vector);
     try std.testing.expect(findIndexConfig(configs, "sparse_idx").?.kind == .sparse_vector);
     try std.testing.expect(findIndexConfig(configs, "full_text_index_v0").?.kind == .full_text);
+}
+
+test "table provisioner durably enqueues existing corpus full text backfill" {
+    const path = "/tmp/antfly-metadata-table-provisioner-full-text-backfill";
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(std.testing.allocator, path, .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"}}";
+    const first = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, indexes_json, .{});
+    try std.testing.expectEqual(@as(usize, 1), first.indexes_added);
+    try std.testing.expect(try db.hasPendingIndexRepairIntents(std.testing.allocator));
+
+    var initial_state = try db.loadIndexRepairState(std.testing.allocator);
+    defer initial_state.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), initial_state.entries.items.len);
+    const repair_id = initial_state.entries.items[0].intent.repair_id;
+    try std.testing.expectEqualStrings("full_text_index_v1", initial_state.entries.items[0].intent.index_name);
+
+    // Reconciliation is an additional recovery trigger. Re-observing the
+    // admitted empty projection must adopt the same durable generation instead
+    // of dropping or duplicating it.
+    const second = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, indexes_json, .{});
+    try std.testing.expectEqual(@as(usize, 0), second.indexes_added);
+    var repeated_state = try db.loadIndexRepairState(std.testing.allocator);
+    defer repeated_state.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), repeated_state.entries.items.len);
+    try std.testing.expectEqual(repair_id, repeated_state.entries.items[0].intent.repair_id);
 }
 
 test "table provisioner replaces embedding index when metadata incarnation changes" {

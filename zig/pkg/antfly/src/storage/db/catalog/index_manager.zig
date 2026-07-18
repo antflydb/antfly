@@ -3299,7 +3299,35 @@ pub const IndexManager = struct {
         }
     }
 
+    pub const AtomicCatalogWrite = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
     pub fn add(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
+        try self.addWithOptions(store, cfg, true, null);
+    }
+
+    /// Managed admission deliberately leaves corpus reconstruction to the
+    /// bounded owner-side repair scheduler. The supplied outbox row commits in
+    /// the same primary-store transaction as the catalog, so a process crash
+    /// cannot publish an index generation without durable rebuild debt.
+    pub fn addManaged(
+        self: *IndexManager,
+        store: anytype,
+        cfg: types.IndexConfig,
+        admission: ?AtomicCatalogWrite,
+    ) !void {
+        try self.addWithOptions(store, cfg, false, admission);
+    }
+
+    fn addWithOptions(
+        self: *IndexManager,
+        store: anytype,
+        cfg: types.IndexConfig,
+        allow_backfill: bool,
+        admission: ?AtomicCatalogWrite,
+    ) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         self.bindPrimaryStore(store);
@@ -3318,7 +3346,7 @@ pub const IndexManager = struct {
         else
             false;
 
-        try self.openConfiguredIndex(store, stored_cfg, true, false);
+        try self.openConfiguredIndex(store, stored_cfg, allow_backfill, false);
         errdefer {
             self.removeInMemory(stored_cfg.name);
         }
@@ -3327,7 +3355,7 @@ pub const IndexManager = struct {
             try self.persistEnrichmentCatalog(store);
             enrichment_catalog_committed = true;
         }
-        self.persistCatalog(store) catch |err| {
+        self.persistCatalogWithAtomicWrite(store, admission) catch |err| {
             self.removeInMemory(stored_cfg.name);
             if (enrichment_catalog_committed) {
                 self.storeGeneratedEnrichmentTargetCache(has_generated_after_enrichments);
@@ -7940,6 +7968,11 @@ pub const IndexManager = struct {
         try self.ensureConfiguredIndexDir(cfg);
         switch (cfg.kind) {
             .full_text => {
+                const managed_admission_pending = if (allow_backfill and !read_only)
+                    try self.managedIndexAdmissionPending(store, cfg.name)
+                else
+                    false;
+                const allow_full_text_backfill = allow_backfill and !managed_admission_pending;
                 const started_ns = nowNs();
                 var backfill_ns: u64 = 0;
                 const text_cfg = try parseTextConfig(self.alloc, cfg.config_json);
@@ -8052,14 +8085,14 @@ pub const IndexManager = struct {
                 defer if (resume_from) |buf| self.alloc.free(buf);
 
                 var rebuild_from_scratch_after_interruption = false;
-                if (allow_backfill and resume_from != null) {
+                if (allow_full_text_backfill and resume_from != null) {
                     try entry.persistent.resetAllForRebuild();
                     self.alloc.free(resume_from.?);
                     resume_from = null;
                     rebuild_from_scratch_after_interruption = true;
                 }
 
-                if (allow_backfill and (rebuild_from_scratch_after_interruption or resume_from != null or (entry.persistent.snapshot().global_doc_count == 0 and persisted_ranges.len == 0))) {
+                if (allow_full_text_backfill and (rebuild_from_scratch_after_interruption or resume_from != null or (entry.persistent.snapshot().global_doc_count == 0 and persisted_ranges.len == 0))) {
                     const backfill_started_ns = nowNs();
                     try rebuild_state.update(if (resume_from) |buf| buf else "");
                     try self.backfillTextIndex(store, &entry, resume_from);
@@ -8422,7 +8455,29 @@ pub const IndexManager = struct {
         }
     }
 
+    fn managedIndexAdmissionPending(self: *IndexManager, store: anytype, index_name: []const u8) !bool {
+        const key = try internal_keys.managedIndexAdmissionKeyAlloc(self.alloc, index_name);
+        defer self.alloc.free(key);
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        var txn = try runtime_store.store.beginProbe();
+        defer txn.abort();
+        _ = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        return true;
+    }
+
     fn persistCatalog(self: *IndexManager, store: anytype) !void {
+        try self.persistCatalogWithAtomicWrite(store, null);
+    }
+
+    fn persistCatalogWithAtomicWrite(
+        self: *IndexManager,
+        store: anytype,
+        atomic_write: ?AtomicCatalogWrite,
+    ) !void {
         const data = try serializeCatalog(self.alloc, self);
         defer self.alloc.free(data);
         var runtime_store = try initRuntimeStore(self.alloc, store);
@@ -8430,6 +8485,7 @@ pub const IndexManager = struct {
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
         try txn.put(index_catalog_key, data);
+        if (atomic_write) |write| try txn.put(write.key, write.value);
         try txn.commit();
     }
 

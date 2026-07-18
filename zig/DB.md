@@ -884,6 +884,43 @@ from source coverage. Readiness must never substitute physical cardinality for
 the durable `produced` source count because chunked documents can create many
 entries and complete early under that approximation.
 
+### Managed Index Admission
+
+Adding an index to a non-empty managed table is a generation transition, not an
+ordinary catalog insert. The admission path uses a transactional outbox in the
+primary document store:
+
+1. Under the DB apply lock, read the O(1) document-identity summary and capture
+   its live count, identity generation, configuration hash, and replay target.
+2. Commit the index catalog row and a fixed-size admission marker in one primary
+   store transaction. Do not synchronously scan or rebuild the corpus.
+3. Materialize that marker idempotently into the generation repair checkpoint.
+   The owner repair scheduler performs the bounded shadow rebuild and replay.
+4. Keep the marker while repair is pending. Writable reopen detects it before
+   index open, suppresses in-place backfill, recreates missing sidecar repair
+   state, and keeps the generation unavailable to queries.
+5. After clean shadow activation, delete the primary-store marker before
+   removing the sidecar intent. A crash between those writes leaves redundant,
+   resumable repair state rather than an admitted generation without debt.
+
+The identity generation captured by the marker is monotonic evidence. Recovery
+fails closed if the current identity summary regresses below it. Concurrent
+writes after admission are normal: repair targets at least the marker's replay
+sequence and raises that target to the current derived sequence when the durable
+intent is created. Existing repair IDs are reused, so reconciliation, restart,
+and scheduler retries cannot create duplicate rebuilds.
+
+Empty managed tables omit the marker and use the ordinary O(1) initialization
+path because no historical source corpus exists. Ordinary unmanaged DB callers
+retain the explicit synchronous-add behavior. This keeps the durable lifecycle
+protocol at the managed-table boundary instead of inferring migration debt from
+index cardinality or replay lag during every reconciliation pass.
+
+Catalog admission and repair activation are separate safety proofs. Metadata
+cutover additionally requires a fresh target observation, complete document
+identity, and target full-text cardinality equal to the source live-document
+count. No status path may infer readiness solely from catalog presence.
+
 ### Scope
 
 The current durable marker, counter, and public readiness implementation applies

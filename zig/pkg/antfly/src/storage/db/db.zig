@@ -3296,6 +3296,10 @@ pub const DB = struct {
                 profile.load_indexes_ns = elapsedSince(load_indexes_started_ns);
             }
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
+                // Catalog admission and its outbox are one primary-store
+                // commit. Materialize any crash-surviving outbox before replay
+                // or workers can observe the newly loaded generation.
+                try db.materializeManagedIndexAdmissions(alloc);
                 var repair_state: ?index_repair_state.State = db.loadOrCreateCurrentIndexRepairState(alloc) catch |err| switch (err) {
                     error.DurableIndexRepairStateUnavailable => null,
                     error.InvalidIndexRepairState => invalid_state_blk: {
@@ -7910,6 +7914,12 @@ pub const DB = struct {
     }
 
     pub fn hasPendingIndexRepairIntents(self: *const DB, alloc: Allocator) !bool {
+        const admission_prefix = try internal_keys.managedIndexAdmissionRootPrefixAlloc(alloc);
+        defer alloc.free(admission_prefix);
+        const admissions = try self.core.store.scanPrefix(alloc, admission_prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, admissions);
+        if (admissions.len != 0) return true;
+
         const path = try self.indexRepairStatePathAlloc(alloc);
         defer alloc.free(path);
         var state = index_repair_state.load(alloc, path) catch |err| switch (err) {
@@ -7927,7 +7937,8 @@ pub const DB = struct {
         earliest_retry_at_ms: u64 = 0,
     };
 
-    pub fn indexRepairIntentSummary(self: *const DB, alloc: Allocator) !IndexRepairIntentSummary {
+    pub fn indexRepairIntentSummary(self: *DB, alloc: Allocator) !IndexRepairIntentSummary {
+        try self.materializeManagedIndexAdmissions(alloc);
         var state = self.loadIndexRepairState(alloc) catch |err| switch (err) {
             error.FileNotFound => return .{},
             else => return err,
@@ -8536,13 +8547,37 @@ pub const DB = struct {
         operator_job_created_at_ms: u64,
         last_error: ?[]const u8,
     ) !u128 {
+        return try self.createGenerationRepairIntentAtTarget(
+            alloc,
+            cfg,
+            trigger,
+            operator_job_id,
+            operator_job_created_at_ms,
+            last_error,
+            null,
+        );
+    }
+
+    fn createGenerationRepairIntentAtTarget(
+        self: *DB,
+        alloc: Allocator,
+        cfg: types.IndexConfig,
+        trigger: index_repair_state.Trigger,
+        operator_job_id: u64,
+        operator_job_created_at_ms: u64,
+        last_error: ?[]const u8,
+        minimum_target_sequence: ?u64,
+    ) !u128 {
         var state = try self.loadOrCreateCurrentIndexRepairState(alloc);
         defer state.deinit(alloc);
         if (state.findIndex(cfg.name)) |i| return state.entries.items[i].intent.repair_id;
         const path = try self.indexRepairStatePathAlloc(alloc);
         defer alloc.free(path);
         const now_ms = currentTimeNs() / std.time.ns_per_ms;
-        const target_sequence = self.core.nextDerivedSequence();
+        const target_sequence = @max(
+            self.core.nextDerivedSequence(),
+            minimum_target_sequence orelse 0,
+        );
         const repair_id = try index_repair_state.newRepairId(alloc);
         const index_name = try alloc.dupe(u8, cfg.name);
         var intent_allocations_transferred = false;
@@ -8607,6 +8642,98 @@ pub const DB = struct {
             operator_job_created_at_ms,
         );
         return repair_id;
+    }
+
+    /// Materializes one catalog admission outbox row into the generation repair
+    /// checkpoint. The marker remains authoritative until clean shadow
+    /// activation; writable reopen uses it to suppress synchronous in-place
+    /// backfill while the owner scheduler resumes the bounded rebuild.
+    pub fn materializeManagedIndexAdmission(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+    ) !?u128 {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        const key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, index_name);
+        defer alloc.free(key);
+        const raw = self.core.store.get(alloc, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(raw);
+        return try self.materializeManagedIndexAdmissionValue(alloc, index_name, key, raw);
+    }
+
+    fn materializeManagedIndexAdmissionValue(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        key: []const u8,
+        raw: []const u8,
+    ) !?u128 {
+        const marker = try decodeManagedIndexAdmissionMarker(raw);
+        const cfg = self.core.index_manager.get(index_name) orelse {
+            try self.core.store.delete(key);
+            return null;
+        };
+        if (cfg.kind != .full_text or
+            types.indexConfigHash(cfg.*) != marker.config_hash or
+            marker.source_doc_count == 0)
+            return error.InvalidManagedIndexAdmission;
+        const summary = try self.managedAdmissionVisibilitySummary();
+        const current_identity_generation = @max(
+            summary.max_created_generation,
+            summary.max_deleted_generation,
+        );
+        if (current_identity_generation < marker.identity_generation)
+            return error.InvalidDocIdentity;
+
+        return try self.createGenerationRepairIntentAtTarget(
+            alloc,
+            cfg.*,
+            .projection_generation_invalid,
+            0,
+            0,
+            "managed_catalog_admission_rebuild",
+            marker.replay_target_sequence,
+        );
+    }
+
+    fn materializeManagedIndexAdmissions(self: *DB, alloc: Allocator) !void {
+        const prefix = try internal_keys.managedIndexAdmissionRootPrefixAlloc(alloc);
+        defer alloc.free(prefix);
+        const admissions = try self.core.store.scanPrefix(alloc, prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, admissions);
+        if (admissions.len == 0) return;
+
+        var pending = std.StringHashMapUnmanaged([]const u8).empty;
+        defer pending.deinit(alloc);
+        try pending.ensureTotalCapacity(alloc, @intCast(admissions.len));
+        for (admissions) |admission| {
+            pending.putAssumeCapacity(admission.key, admission.value);
+        }
+
+        const configs = try self.core.listIndexes(alloc);
+        defer types.freeIndexConfigs(alloc, configs);
+        for (configs) |cfg| {
+            if (cfg.kind != .full_text) continue;
+            const key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, cfg.name);
+            defer alloc.free(key);
+            const admission = pending.fetchRemove(key) orelse continue;
+            _ = try self.materializeManagedIndexAdmissionValue(
+                alloc,
+                cfg.name,
+                admission.key,
+                admission.value,
+            );
+        }
+
+        // Catalog deletion wins over orphaned outbox rows. This repairs the
+        // only deletion crash window without a corpus scan.
+        var orphan_it = pending.keyIterator();
+        while (orphan_it.next()) |key| {
+            try self.core.store.delete(key.*);
+        }
     }
 
     fn attachOperatorRepairRequest(
@@ -8981,6 +9108,16 @@ pub const DB = struct {
                 break;
             }
         }
+        // For managed admission, clear the primary-store lifecycle marker only
+        // after activation published a clean generation. Do this before
+        // removing the sidecar intent: a crash between the two leaves harmless
+        // resumable sidecar debt, never an admitted generation with no proof.
+        const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, entry.intent.index_name);
+        defer alloc.free(admission_key);
+        self.core.store.delete(admission_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
         try index_repair_state.removeEntryAndPin(alloc, path, state.identity, .{
             .repair_id = repair_id,
             .revision = entry.intent.revision,
@@ -12631,12 +12768,94 @@ pub const DB = struct {
     const InstalledIndex = struct {
         applied: u64,
         needs_enrichment_replay: bool,
+        managed_admission_pending: bool = false,
     };
 
-    fn installIndexWhileEnrichmentQuiesced(self: *DB, cfg: types.IndexConfig) !InstalledIndex {
+    const IndexAdmissionMode = enum {
+        ordinary,
+        managed_full_text,
+    };
+
+    const managed_index_admission_magic: u64 = 0x314d444154584449; // "IDXTADM1"
+    const managed_index_admission_encoded_len = 48;
+
+    const ManagedIndexAdmissionMarker = struct {
+        config_hash: u64,
+        source_doc_count: u64,
+        identity_generation: u64,
+        replay_target_sequence: u64,
+    };
+
+    fn encodeManagedIndexAdmissionMarker(
+        marker: ManagedIndexAdmissionMarker,
+    ) [managed_index_admission_encoded_len]u8 {
+        var out: [managed_index_admission_encoded_len]u8 = undefined;
+        std.mem.writeInt(u64, out[0..8], managed_index_admission_magic, .little);
+        std.mem.writeInt(u64, out[8..16], marker.config_hash, .little);
+        std.mem.writeInt(u64, out[16..24], marker.source_doc_count, .little);
+        std.mem.writeInt(u64, out[24..32], marker.identity_generation, .little);
+        std.mem.writeInt(u64, out[32..40], marker.replay_target_sequence, .little);
+        std.mem.writeInt(u64, out[40..48], 0, .little);
+        return out;
+    }
+
+    fn decodeManagedIndexAdmissionMarker(raw: []const u8) !ManagedIndexAdmissionMarker {
+        if (raw.len != managed_index_admission_encoded_len) return error.InvalidManagedIndexAdmission;
+        if (std.mem.readInt(u64, raw[0..8], .little) != managed_index_admission_magic)
+            return error.InvalidManagedIndexAdmission;
+        if (std.mem.readInt(u64, raw[40..48], .little) != 0)
+            return error.InvalidManagedIndexAdmission;
+        return .{
+            .config_hash = std.mem.readInt(u64, raw[8..16], .little),
+            .source_doc_count = std.mem.readInt(u64, raw[16..24], .little),
+            .identity_generation = std.mem.readInt(u64, raw[24..32], .little),
+            .replay_target_sequence = std.mem.readInt(u64, raw[32..40], .little),
+        };
+    }
+
+    fn managedAdmissionVisibilitySummary(self: *DB) !doc_identity.VisibilitySummary {
+        if (self.identity_visibility_summary_cache) |summary| return summary;
+        if (try doc_identity.visibilitySummaryFromStore(self.core.store)) |summary| return summary;
+        const empty = (try doc_identity.loadAllNewTrustedStateForNamespace(
+            self.core.store,
+            self.core.identity_namespace,
+        )) orelse return error.InvalidDocIdentity;
+        return empty.visibility_summary;
+    }
+
+    fn installIndexWhileEnrichmentQuiesced(
+        self: *DB,
+        cfg: types.IndexConfig,
+        admission_mode: IndexAdmissionMode,
+    ) !InstalledIndex {
         lockApply(self);
         defer self.core.unlockApply();
-        const applied = try self.core.addIndex(cfg);
+        var admission_key: ?[]u8 = null;
+        defer if (admission_key) |key| self.alloc.free(key);
+        var admission_value: [managed_index_admission_encoded_len]u8 = undefined;
+        var admission_write: ?index_manager_mod.IndexManager.AtomicCatalogWrite = null;
+        if (admission_mode == .managed_full_text) {
+            if (cfg.kind != .full_text) return error.InvalidArgument;
+            const summary = try self.managedAdmissionVisibilitySummary();
+            if (summary.live_ordinals != 0) {
+                const key = try internal_keys.managedIndexAdmissionKeyAlloc(self.alloc, cfg.name);
+                admission_key = key;
+                admission_value = encodeManagedIndexAdmissionMarker(.{
+                    .config_hash = types.indexConfigHash(cfg),
+                    .source_doc_count = summary.live_ordinals,
+                    .identity_generation = @max(summary.max_created_generation, summary.max_deleted_generation),
+                    .replay_target_sequence = self.core.nextDerivedSequence(),
+                });
+                admission_write = .{ .key = key, .value = &admission_value };
+            }
+        }
+        // Empty-table creation has no historical corpus debt. Preserve the
+        // ordinary initialization path (including its ready/publication side
+        // effects) unless catalog admission actually carries an outbox row.
+        const applied = if (admission_write == null)
+            try self.core.addIndex(cfg)
+        else
+            try self.core.addManagedIndex(cfg, admission_write);
         try self.initializeDenseArtifactTargetCounterIfNeeded(cfg);
         try saveIndexStatusSnapshots(self.alloc, self.core.store, self.core.index_manager, &[_]apply_state.AppliedSequenceUpdate{.{
             .index_name = cfg.name,
@@ -12646,7 +12865,11 @@ pub const DB = struct {
             self.hydrateAlgebraicObservationStatusForIndexBestEffort(cfg.name);
         }
         const needs_enrichment_replay = try self.core.indexRequiresEnrichmentReplay(cfg.name);
-        return .{ .applied = applied, .needs_enrichment_replay = needs_enrichment_replay };
+        return .{
+            .applied = applied,
+            .needs_enrichment_replay = needs_enrichment_replay,
+            .managed_admission_pending = admission_write != null,
+        };
     }
 
     fn restartEnrichmentAfterStructuralMutation(self: *DB, operation: []const u8, index_name: []const u8) !void {
@@ -12657,7 +12880,7 @@ pub const DB = struct {
         };
     }
 
-    pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
+    fn addIndexWithAdmission(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode) !?u128 {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         const restart_enrichment = if (self.enrichment_runtime) |runtime| runtime.isStarted() else false;
         if (restart_enrichment) self.enrichment_runtime.?.stop();
@@ -12667,7 +12890,12 @@ pub const DB = struct {
                 std.log.err("failed to restore enrichment runtime after index creation error index={s} err={s}", .{ cfg.name, @errorName(restart_err) });
             };
         };
-        const installed = try self.installIndexWhileEnrichmentQuiesced(cfg);
+        const installed = try self.installIndexWhileEnrichmentQuiesced(cfg, admission_mode);
+
+        const repair_id = if (installed.managed_admission_pending)
+            try self.materializeManagedIndexAdmission(self.alloc, cfg.name)
+        else
+            null;
 
         const needs_enrichment_replay = installed.needs_enrichment_replay;
         const applied = installed.applied;
@@ -12724,6 +12952,19 @@ pub const DB = struct {
             const current_target = self.core.nextDerivedSequence();
             if (current_target > worker_applied) self.executor.notifyIndexes(current_target, &.{cfg.name});
         }
+        return repair_id;
+    }
+
+    pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
+        _ = try self.addIndexWithAdmission(cfg, .ordinary);
+    }
+
+    /// Managed table reconciliation uses a crash-consistent catalog/outbox
+    /// admission. Corpus reconstruction remains asynchronous and bounded by
+    /// the owner-side generation repair scheduler.
+    pub fn admitManagedFullTextIndex(self: *DB, cfg: types.IndexConfig) !?u128 {
+        if (cfg.kind != .full_text) return error.InvalidArgument;
+        return try self.addIndexWithAdmission(cfg, .managed_full_text);
     }
 
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
@@ -13913,6 +14154,12 @@ pub const DB = struct {
         try self.abandonIndexRepairForDeletion(self.alloc, name);
         const removed = try self.core.deleteIndex(name);
         if (removed) {
+            const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(self.alloc, name);
+            defer self.alloc.free(admission_key);
+            self.core.store.delete(admission_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
             try self.deleteDerivedCoverageForIndex(name);
             try self.deleteDenseArtifactCounterMetadata(name);
         }
@@ -59518,6 +59765,173 @@ test "db dense repair durably yields and resumes a reopenable building candidate
         try std.testing.expect(!std.mem.eql(u8, hit.id, "doc:d"));
     }
     try std.testing.expect(found_replayed_insert);
+}
+
+test "db managed full text admission survives restart without in-place backfill" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const cfg = types.IndexConfig{
+        .name = "full_text_index_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    };
+    var repair_checkpoint_path: ?[]u8 = null;
+    defer if (repair_checkpoint_path) |value| alloc.free(value);
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
+
+        const repair_id = (try db.admitManagedFullTextIndex(cfg)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(repair_id, (try db.materializeManagedIndexAdmission(alloc, cfg.name)).?);
+        try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
+        repair_checkpoint_path = try alloc.dupe(u8, db.core.index_repair_checkpoint_path.?);
+
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        const target = for (stats.indexes) |item| {
+            if (std.mem.eql(u8, item.name, cfg.name)) break item;
+        } else return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u64, 0), target.doc_count);
+    }
+
+    // Model a crash after the atomic catalog/outbox commit but before the
+    // sidecar projection becomes durable. Reopen must reconstruct the intent
+    // from the primary-store marker without running an in-place backfill.
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().deleteFile(io_impl.io(), repair_checkpoint_path.?);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const reopened_stats = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, reopened_stats);
+    const reopened_target = for (reopened_stats.indexes) |item| {
+        if (std.mem.eql(u8, item.name, cfg.name)) break item;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0), reopened_target.doc_count);
+    const repair_id = (try reopened.materializeManagedIndexAdmission(alloc, cfg.name)) orelse
+        return error.TestUnexpectedResult;
+    const summary = try reopened.indexRepairIntentSummary(alloc);
+    try std.testing.expectEqual(@as(usize, 1), summary.runnable);
+
+    var repaired = false;
+    for (0..16) |_| {
+        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+        if (step.repaired) {
+            repaired = true;
+            break;
+        }
+        try std.testing.expect(!step.terminal);
+    }
+    try std.testing.expect(repaired);
+    try std.testing.expect(!try reopened.hasPendingIndexRepairIntents(alloc));
+    const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, cfg.name);
+    defer alloc.free(admission_key);
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, admission_key));
+
+    var result = try reopened.search(alloc, .{
+        .index_name = cfg.name,
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+}
+
+test "db managed full text admission avoids debt for an empty source" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try std.testing.expect((try db.admitManagedFullTextIndex(.{
+        .name = "full_text_index_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    })) == null);
+    try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+}
+
+test "db managed admission materialization never infers debt from replay lag" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+
+    try std.testing.expect((try db.materializeManagedIndexAdmission(alloc, "ft")) == null);
+    try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+}
+
+test "db managed admission rejects regressed identity evidence" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    const cfg = types.IndexConfig{
+        .name = "full_text_index_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    };
+    _ = (try db.admitManagedFullTextIndex(cfg)) orelse return error.TestUnexpectedResult;
+
+    const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, cfg.name);
+    defer alloc.free(admission_key);
+    const raw = try db.core.store.get(alloc, admission_key);
+    defer alloc.free(raw);
+    var marker = try DB.decodeManagedIndexAdmissionMarker(raw);
+    marker.identity_generation += 1;
+    const regressed_marker = DB.encodeManagedIndexAdmissionMarker(marker);
+    try db.core.store.put(admission_key, &regressed_marker);
+
+    try std.testing.expectError(
+        error.InvalidDocIdentity,
+        db.materializeManagedIndexAdmission(alloc, cfg.name),
+    );
+    try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
 }
 
 test "db dense repair defers before candidate creation when node admission is exhausted" {
