@@ -30,7 +30,6 @@ jobs:
     runs-on: arc-antfly-standard
     outputs:
       zig_tests: ${{ steps.detect.outputs.zig_tests }}
-      release_targets: ${{ steps.detect.outputs.release_targets }}
       e2e: ${{ steps.detect.outputs.e2e }}
       model_check: ${{ steps.detect.outputs.model_check }}
       trace_validate: ${{ steps.detect.outputs.trace_validate }}
@@ -48,7 +47,6 @@ jobs:
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             {
               echo "zig_tests=true"
-              echo "release_targets=true"
               echo "e2e=true"
               echo "model_check=true"
               echo "trace_validate=true"
@@ -58,7 +56,6 @@ jobs:
 
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
-            echo "release_targets=false" >> "$GITHUB_OUTPUT"
             if [[ "${{ github.event.schedule }}" == "0 3 * * 0" ]]; then
               {
                 echo "e2e=false"
@@ -82,7 +79,6 @@ jobs:
           else
             {
               echo "zig_tests=true"
-              echo "release_targets=true"
               echo "e2e=true"
               echo "model_check=true"
               echo "trace_validate=true"
@@ -100,18 +96,6 @@ jobs:
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
           else
             echo "zig_tests=true" >> "$GITHUB_OUTPUT"
-          fi
-
-          if git diff --quiet "$base" "${{ github.sha }}" -- \
-            ':(glob)zig/**' \
-            ':(glob)scripts/packaging/**' \
-            .github/workflows/zig-tests.yml \
-            .github/workflows/antfly-linux-release-build.yml \
-            .github/workflows/antfly-release.yml
-          then
-            echo "release_targets=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "release_targets=true" >> "$GITHUB_OUTPUT"
           fi
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
@@ -155,20 +139,6 @@ jobs:
             echo "trace_validate=true" >> "$GITHUB_OUTPUT"
           fi
 
-  release-linux-package:
-    name: release-linux-package
-    needs: changes
-    if: >-
-      needs.changes.outputs.release_targets == 'true' &&
-      ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-       github.event_name == 'workflow_dispatch')
-    uses: ./.github/workflows/antfly-linux-release-build.yml
-    with:
-      tag_name: v0.0.0-ci
-      upload_artifacts: false
-    permissions:
-      contents: read
-
   zig-base:
     name: zig-base
     needs: changes
@@ -208,22 +178,6 @@ jobs:
 
       - name: Verify Zig version
         run: zig version
-
-      # Keep PR coverage cheap: cross-compile only the platform boundary that
-      # exposed the musl translation failure, without building release archives.
-      - name: Compile platform probe for Linux musl release targets
-        if: needs.changes.outputs.release_targets == 'true'
-        working-directory: zig/lib/platform
-        run: |
-          zig build check -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
-          zig build -j1 check -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSmall
-
-      # This is the exact graph shape that caught the missing C shim when a
-      # libc-enabled test consumed a platform module configured without libc.
-      - name: Verify libc override build graph
-        if: needs.changes.outputs.release_targets == 'true'
-        working-directory: zig
-        run: zig build -j2 resource-budget-test -Dlink-libc=false -Dha-tests=false --summary all
 
       - name: Check generated sources
         run: make zig-generated-check

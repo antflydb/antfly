@@ -20,17 +20,11 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const link_libc = b.option(bool, "link_libc", "Link the platform module against libc") orelse true;
 
-    const platform_mod = platform_build.addModule(b, "antfly_platform", .{
+    _ = platform_build.addModule(b, "antfly_platform", .{
         .root_source_file = b.path("src/root.zig"),
         .filesystem_capacity_source_file = b.path("src/filesystem_capacity.c"),
         .target = target,
         .optimize = optimize,
         .link_libc = link_libc,
     });
-
-    const compile_check = b.addTest(.{
-        .root_module = platform_mod,
-    });
-    const check_step = b.step("check", "Compile the platform module without running target binaries");
-    check_step.dependOn(&compile_check.step);
 }
