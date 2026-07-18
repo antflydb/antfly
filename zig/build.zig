@@ -5059,6 +5059,10 @@ pub fn build(b: *std.Build) void {
     const resource_budget_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
+            // Retain the API declaration walk that owns provisioned_storage;
+            // Zig compile filters otherwise prune that module before the
+            // exact runtime filters can select its resource-budget test.
+            "api module compiles",
             "resource manager observes over-budget external usage",
             "resource manager evaluates projected admission with configured action",
             "resource manager bounds soft write throttling without waiting for compaction publication",
