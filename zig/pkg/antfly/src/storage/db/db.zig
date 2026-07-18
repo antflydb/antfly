@@ -2951,10 +2951,12 @@ pub const DB = struct {
     index_repair_barriers: std.atomic.Value(u32) = .init(0),
     index_repair_replay_pinned: std.atomic.Value(bool) = .init(false),
     index_repair_state_corrupt: std.atomic.Value(bool) = .init(false),
-    // True only while primary-store admission outbox rows may not yet have a
-    // sidecar projection. It avoids rescanning markers on every scheduler
-    // status poll after successful materialization.
-    managed_admission_materialization_pending: std.atomic.Value(bool) = .init(false),
+    // Managed admission is a durable outbox. Requested/completed generations
+    // prevent a drain from erasing work committed while its marker snapshot is
+    // in flight; the mutex makes concurrent drainers a single-flight loop.
+    managed_admission_materialization_requested: std.atomic.Value(u64) = .init(0),
+    managed_admission_materialization_completed: std.atomic.Value(u64) = .init(0),
+    managed_admission_materialization_mutex: std.atomic.Mutex = .unlocked,
     published_dense_searches: std.atomic.Value(u32) = .init(0),
     index_repair_mutex: std.atomic.Mutex = .unlocked,
     generation_replace_mutex: std.atomic.Mutex = .unlocked,
@@ -3293,10 +3295,9 @@ pub const DB = struct {
             const managed_admissions = try db.core.store.scanPrefix(alloc, admission_prefix);
             defer docstore_mod.DocStore.freeResults(alloc, managed_admissions);
             try db.core.index_manager.replaceManagedAdmissionSnapshot(managed_admissions);
-            db.managed_admission_materialization_pending.store(
-                managed_admissions.len != 0 and !openModeRequiresReadOnlyBackends(opts.open_mode),
-                .release,
-            );
+            if (managed_admissions.len != 0 and !openModeRequiresReadOnlyBackends(opts.open_mode)) {
+                db.requestManagedAdmissionMaterialization();
+            }
 
             if (opts.open_mode == .status_only) {
                 try db.core.loadIndexCatalogOnly();
@@ -3313,8 +3314,7 @@ pub const DB = struct {
                 // Catalog admission and its outbox are one primary-store
                 // commit. Materialize any crash-surviving outbox before replay
                 // or workers can observe the newly loaded generation.
-                try db.materializeManagedIndexAdmissionRows(alloc, managed_admissions);
-                db.managed_admission_materialization_pending.store(false, .release);
+                try db.drainManagedIndexAdmissions(alloc);
                 var repair_state: ?index_repair_state.State = db.loadOrCreateCurrentIndexRepairState(alloc) catch |err| switch (err) {
                     error.DurableIndexRepairStateUnavailable => null,
                     error.InvalidIndexRepairState => invalid_state_blk: {
@@ -7969,10 +7969,7 @@ pub const DB = struct {
     };
 
     pub fn indexRepairIntentSummary(self: *DB, alloc: Allocator) !IndexRepairIntentSummary {
-        if (self.managed_admission_materialization_pending.load(.acquire)) {
-            try self.materializeManagedIndexAdmissions(alloc);
-            self.managed_admission_materialization_pending.store(false, .release);
-        }
+        if (self.managedAdmissionMaterializationPending()) try self.drainManagedIndexAdmissions(alloc);
         var state = self.loadIndexRepairState(alloc) catch |err| switch (err) {
             error.FileNotFound => return .{},
             else => return err,
@@ -8035,12 +8032,14 @@ pub const DB = struct {
         }
     }
 
-    /// A cached reader can observe durable repair debt immediately before the
-    /// owning writer removes it. Reader retirement is the primary visibility
-    /// mechanism, but a request already holding that reader must not remain
-    /// wedged behind an in-memory copy of debt that no longer exists. Recheck
-    /// only the rejected index so healthy queries never perform checkpoint I/O.
+    /// A writable generation may clear its gate after activating the repaired
+    /// root. A query-only DB is pinned to the root it opened, so it must retain
+    /// every startup gate until retirement; durable sidecar completion can
+    /// describe a newer root and is not authority to expose the pinned one.
+    /// Writable DBs recheck only rejected indexes, keeping healthy queries free
+    /// of checkpoint I/O.
     fn refreshIndexRepairAvailabilityForIndex(self: *DB, alloc: Allocator, index_name: []const u8) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return;
         var state = self.loadIndexRepairState(alloc) catch |err| switch (err) {
             error.FileNotFound => {
                 try self.clearRepairGateIfAdmissionCompleted(alloc, index_name);
@@ -8702,6 +8701,11 @@ pub const DB = struct {
         index_name: []const u8,
     ) !?u128 {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        // Catalog entries are owned by the apply lifecycle. Hold its exclusive
+        // lock through marker validation and sidecar publication so deletion or
+        // replacement cannot free the config or commit absence in between.
+        lockApply(self);
+        defer self.core.unlockApply();
         const key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, index_name);
         defer alloc.free(key);
         const raw = self.core.store.get(alloc, key) catch |err| switch (err) {
@@ -8709,10 +8713,12 @@ pub const DB = struct {
             else => return err,
         };
         defer alloc.free(raw);
-        return try self.materializeManagedIndexAdmissionValue(alloc, index_name, key, raw);
+        return try self.materializeManagedIndexAdmissionValueLocked(alloc, index_name, key, raw);
     }
 
-    fn materializeManagedIndexAdmissionValue(
+    /// Requires the DB apply lock. The returned catalog pointer remains valid
+    /// until the repair intent has durably adopted its identity.
+    fn materializeManagedIndexAdmissionValueLocked(
         self: *DB,
         alloc: Allocator,
         index_name: []const u8,
@@ -8724,6 +8730,11 @@ pub const DB = struct {
             try self.core.store.delete(key);
             return null;
         };
+        if (builtin.is_test) {
+            if (test_managed_admission_materialization_hook) |hook| {
+                if (hook.after_config_lookup) |after_lookup| after_lookup(hook.ptr, self, index_name);
+            }
+        }
         if (cfg.kind != .full_text or
             types.indexConfigHash(cfg.*) != marker.config_hash or
             marker.source_doc_count == 0)
@@ -8747,52 +8758,84 @@ pub const DB = struct {
         );
     }
 
-    fn materializeManagedIndexAdmissions(self: *DB, alloc: Allocator) !void {
+    fn requestManagedAdmissionMaterialization(self: *DB) void {
+        _ = self.managed_admission_materialization_requested.fetchAdd(1, .release);
+    }
+
+    fn managedAdmissionMaterializationPending(self: *const DB) bool {
+        return self.managed_admission_materialization_completed.load(.acquire) !=
+            self.managed_admission_materialization_requested.load(.acquire);
+    }
+
+    /// Drain every generation observed while a pass is in flight. A marker
+    /// commit increments requested after its atomic catalog transaction; the
+    /// completed generation advances only to the snapshot owned by one
+    /// successful pass, so a concurrent commit necessarily forces another.
+    fn drainManagedIndexAdmissions(self: *DB, alloc: Allocator) !void {
+        lockAtomicWithBackoff(&self.managed_admission_materialization_mutex);
+        defer self.managed_admission_materialization_mutex.unlock();
+
+        while (true) {
+            const target_generation = self.managed_admission_materialization_requested.load(.acquire);
+            if (self.managed_admission_materialization_completed.load(.acquire) == target_generation) return;
+            try self.materializeManagedIndexAdmissionsOnce(alloc);
+            self.managed_admission_materialization_completed.store(target_generation, .release);
+        }
+    }
+
+    fn materializeManagedIndexAdmissionsOnce(self: *DB, alloc: Allocator) !void {
+        // This is intentionally a structural lock, not a general repair lock:
+        // the primary marker, catalog membership, and borrowed config must
+        // remain one lifecycle observation through sidecar publication.
+        lockApply(self);
+        defer self.core.unlockApply();
         const prefix = try internal_keys.managedIndexAdmissionRootPrefixAlloc(alloc);
         defer alloc.free(prefix);
         const admissions = try self.core.store.scanPrefix(alloc, prefix);
         defer docstore_mod.DocStore.freeResults(alloc, admissions);
-        try self.materializeManagedIndexAdmissionRows(alloc, admissions);
+        try self.materializeManagedIndexAdmissionRowsLocked(alloc, admissions);
+        if (builtin.is_test) {
+            if (test_managed_admission_materialization_hook) |hook| {
+                if (hook.after_pass) |after_pass| after_pass(hook.ptr, self);
+            }
+        }
     }
 
-    fn materializeManagedIndexAdmissionRows(
+    /// Requires the DB apply lock.
+    fn materializeManagedIndexAdmissionRowsLocked(
         self: *DB,
         alloc: Allocator,
         admissions: []const docstore_mod.OwnedKVPair,
     ) !void {
         if (admissions.len == 0) return;
 
-        var pending = std.StringHashMapUnmanaged([]const u8).empty;
-        defer pending.deinit(alloc);
-        try pending.ensureTotalCapacity(alloc, @intCast(admissions.len));
-        for (admissions) |admission| {
-            pending.putAssumeCapacity(admission.key, admission.value);
-        }
-
         const configs = try self.core.listIndexes(alloc);
         defer types.freeIndexConfigs(alloc, configs);
-        for (configs) |cfg| {
-            if (cfg.kind != .full_text) continue;
-            const key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, cfg.name);
-            defer alloc.free(key);
-            const admission = pending.fetchRemove(key) orelse continue;
-            _ = try self.materializeManagedIndexAdmissionValue(
+        var configs_by_name = std.StringHashMapUnmanaged(*const types.IndexConfig).empty;
+        defer configs_by_name.deinit(alloc);
+        try configs_by_name.ensureTotalCapacity(alloc, @intCast(configs.len));
+        for (configs) |*cfg| {
+            configs_by_name.putAssumeCapacity(cfg.name, cfg);
+        }
+
+        for (admissions) |admission| {
+            const index_name = try internal_keys.managedIndexAdmissionNameAlloc(alloc, admission.key);
+            defer alloc.free(index_name);
+            if (configs_by_name.get(index_name) == null) {
+                // Catalog deletion wins over an orphaned outbox row. Only
+                // catalog absence proves orphanhood; a same-name kind/hash
+                // mismatch is corruption and retains its fail-closed marker.
+                try self.core.store.delete(admission.key);
+                self.core.index_manager.clearManagedAdmissionSnapshotForIndex(index_name);
+                self.core.index_manager.clearRepairUnavailable(index_name);
+                continue;
+            }
+            _ = try self.materializeManagedIndexAdmissionValueLocked(
                 alloc,
-                cfg.name,
+                index_name,
                 admission.key,
                 admission.value,
             );
-        }
-
-        // Catalog deletion wins over orphaned outbox rows. This repairs the
-        // only deletion crash window without a corpus scan.
-        var orphan_it = pending.keyIterator();
-        while (orphan_it.next()) |key| {
-            try self.core.store.delete(key.*);
-            const index_name = try internal_keys.managedIndexAdmissionNameAlloc(alloc, key.*);
-            defer alloc.free(index_name);
-            self.core.index_manager.clearManagedAdmissionSnapshotForIndex(index_name);
-            self.core.index_manager.clearRepairUnavailable(index_name);
         }
     }
 
@@ -9122,6 +9165,14 @@ pub const DB = struct {
             }
         }
         for (orphan_ids.items) |repair_id| try self.removeIndexRepairIntentAndPin(alloc, repair_id);
+    }
+
+    /// Requires the DB apply lock. Fresh admission must not adopt repair state
+    /// from a catalog generation whose deletion already committed.
+    fn removeOrphanedIndexRepairIntentForFreshAdmission(self: *DB, alloc: Allocator, index_name: []const u8) !void {
+        if (self.core.index_manager.get(index_name) != null) return;
+        const repair_id = (try self.indexRepairIdForIndex(alloc, index_name)) orelse return;
+        try self.removeIndexRepairIntentAndPin(alloc, repair_id);
     }
 
     fn recordIndexRepairAttemptFailure(
@@ -12858,6 +12909,7 @@ pub const DB = struct {
     const managed_index_admission_magic: u64 = 0x314d444154584449; // "IDXTADM1"
     const managed_index_admission_encoded_len = 48;
     var test_fail_managed_index_delete_after_catalog_commit = false;
+    var test_fail_managed_index_repair_cleanup_after_catalog_commit = false;
 
     const ManagedIndexAdmissionMarker = struct {
         config_hash: u64,
@@ -12865,6 +12917,14 @@ pub const DB = struct {
         identity_generation: u64,
         replay_target_sequence: u64,
     };
+
+    const ManagedAdmissionMaterializationTestHook = struct {
+        ptr: *anyopaque,
+        after_config_lookup: ?*const fn (*anyopaque, *DB, []const u8) void = null,
+        after_pass: ?*const fn (*anyopaque, *DB) void = null,
+    };
+
+    var test_managed_admission_materialization_hook: ?ManagedAdmissionMaterializationTestHook = null;
 
     fn encodeManagedIndexAdmissionMarker(
         marker: ManagedIndexAdmissionMarker,
@@ -12913,6 +12973,7 @@ pub const DB = struct {
     ) !InstalledIndex {
         lockApply(self);
         defer self.core.unlockApply();
+        try self.removeOrphanedIndexRepairIntentForFreshAdmission(self.alloc, cfg.name);
         var admission_key: ?[]u8 = null;
         defer if (admission_key) |key| self.alloc.free(key);
         var admission_value: [managed_index_admission_encoded_len]u8 = undefined;
@@ -12938,10 +12999,8 @@ pub const DB = struct {
             // catalog and marker become durable, allocation failure must not
             // create an ungated window in the current process.
             try self.core.index_manager.markRepairUnavailable(cfg.name);
-            self.managed_admission_materialization_pending.store(true, .release);
         }
         errdefer if (!catalog_committed and admission_write != null) {
-            self.managed_admission_materialization_pending.store(false, .release);
             self.core.index_manager.clearRepairUnavailable(cfg.name);
         };
 
@@ -12953,6 +13012,10 @@ pub const DB = struct {
             .managed_full_text => try self.core.addManagedIndex(cfg, admission_write),
         };
         catalog_committed = true;
+        // Publish outbox work only after the catalog/marker transaction is
+        // durable. Any later failure leaves a generation that the scheduler
+        // can drain without relying on the failed request to reach its tail.
+        if (admission_write != null) self.requestManagedAdmissionMaterialization();
         try self.initializeDenseArtifactTargetCounterIfNeeded(cfg);
         try saveIndexStatusSnapshots(self.alloc, self.core.store, self.core.index_manager, &[_]apply_state.AppliedSequenceUpdate{.{
             .index_name = cfg.name,
@@ -12994,12 +13057,9 @@ pub const DB = struct {
             // may have committed before a transient sidecar failure; clearing
             // the process-local pending bit is valid only after all markers
             // have been projected.
-            try self.materializeManagedIndexAdmissions(self.alloc);
+            try self.drainManagedIndexAdmissions(self.alloc);
             break :repair_blk try self.indexRepairIdForIndex(self.alloc, cfg.name);
         } else null;
-        if (installed.managed_admission_pending) {
-            self.managed_admission_materialization_pending.store(false, .release);
-        }
 
         const needs_enrichment_replay = installed.needs_enrichment_replay;
         const applied = installed.applied;
@@ -14264,9 +14324,21 @@ pub const DB = struct {
             if (builtin.is_test and test_fail_managed_index_delete_after_catalog_commit)
                 return error.TestManagedIndexDeleteCrash;
             self.core.index_manager.clearManagedAdmissionSnapshotForIndex(name);
-            if (repair_id) |id| try self.removeIndexRepairIntentAndPin(self.alloc, id);
-            try self.deleteDerivedCoverageForIndex(name);
-            try self.deleteDenseArtifactCounterMetadata(name);
+            if (repair_id) |id| {
+                const repair_cleanup = if (builtin.is_test and test_fail_managed_index_repair_cleanup_after_catalog_commit)
+                    error.TestPostCommitRepairCleanup
+                else
+                    self.removeIndexRepairIntentAndPin(self.alloc, id);
+                repair_cleanup catch |err| {
+                    std.log.warn("index removal committed with stale repair intent name={s} err={s}", .{ name, @errorName(err) });
+                };
+            }
+            self.deleteDerivedCoverageForIndex(name) catch |err| {
+                std.log.warn("index removal committed with stale coverage metadata name={s} err={s}", .{ name, @errorName(err) });
+            };
+            self.deleteDenseArtifactCounterMetadata(name) catch |err| {
+                std.log.warn("index removal committed with stale dense coverage counters name={s} err={s}", .{ name, @errorName(err) });
+            };
         }
         return removed;
     }
@@ -15273,8 +15345,10 @@ pub const DB = struct {
 
     fn initializeDenseArtifactTargetCounterIfNeeded(self: *DB, cfg: types.IndexConfig) !void {
         if (!try index_manager_mod.denseConfigRequiresArtifactCoverage(self.alloc, cfg)) return;
-        if (try loadDenseArtifactTargetCounter(self.alloc, self.core.store, cfg.name) != null) return;
 
+        // Every catalog add owns a fresh coverage generation. Reset this
+        // name-scoped counter so debris from an interrupted deletion cannot
+        // become coverage evidence for a recreated generation.
         const key = try denseArtifactTargetCounterKeyAlloc(self.alloc, cfg.name);
         defer self.alloc.free(key);
         var value: [8]u8 = undefined;
@@ -59919,18 +59993,16 @@ test "db managed full text admission survives restart without in-place backfill"
 
     // A read-only/status process cannot materialize the sidecar, but the
     // primary marker must still close service during this crash window.
-    {
-        var readonly = try DB.open(alloc, std.mem.span(path), .{
-            .open_mode = .query_readonly,
-            .start_index_workers = false,
-            .ttl_cleanup = .{ .enabled = false },
-        });
-        defer readonly.close();
-        try std.testing.expectError(error.IndexRebuilding, readonly.search(alloc, .{
-            .index_name = cfg.name,
-            .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
-        }));
-    }
+    var readonly = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .query_readonly,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer readonly.close();
+    try std.testing.expectError(error.IndexRebuilding, readonly.search(alloc, .{
+        .index_name = cfg.name,
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+    }));
 
     var reopened = try DB.open(alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,
@@ -59964,6 +60036,14 @@ test "db managed full text admission survives restart without in-place backfill"
     const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, cfg.name);
     defer alloc.free(admission_key);
     try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, admission_key));
+
+    // This reader still owns the pre-activation root. Sidecar completion is
+    // not permission to expose it; cache retirement and a fresh open publish
+    // the repaired generation to subsequent requests.
+    try std.testing.expectError(error.IndexRebuilding, readonly.search(alloc, .{
+        .index_name = cfg.name,
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+    }));
 
     var result = try reopened.search(alloc, .{
         .index_name = cfg.name,
@@ -60069,6 +60149,203 @@ test "db managed index deletion commits catalog absence with marker removal" {
     try std.testing.expect(!try reopened.hasPendingIndexRepairIntents(alloc));
 }
 
+test "db managed index deletion remains successful after post-commit cleanup failure" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    const index_name = "full_text_index_v1";
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    const old_repair_id = (try db.admitManagedFullTextIndex(.{
+        .name = index_name,
+        .kind = .full_text,
+        .config_json = "{}",
+    })) orelse return error.TestUnexpectedResult;
+
+    index_manager_mod.test_inject_index_removal_cleanup_error = error.TestPostCommitCleanup;
+    defer index_manager_mod.test_inject_index_removal_cleanup_error = null;
+    DB.test_fail_managed_index_repair_cleanup_after_catalog_commit = true;
+    defer DB.test_fail_managed_index_repair_cleanup_after_catalog_commit = false;
+    try std.testing.expect(try db.deleteIndex(index_name));
+    index_manager_mod.test_inject_index_removal_cleanup_error = null;
+    DB.test_fail_managed_index_repair_cleanup_after_catalog_commit = false;
+
+    try std.testing.expect(db.core.index_manager.get(index_name) == null);
+    const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, index_name);
+    defer alloc.free(admission_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, admission_key));
+    try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
+
+    // Immediate same-name recreation retries the orphan cleanup before the
+    // fresh catalog generation can adopt repair state by public name.
+    const new_repair_id = (try db.admitManagedFullTextIndex(.{
+        .name = index_name,
+        .kind = .full_text,
+        .config_json = "{}",
+    })) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(new_repair_id != old_repair_id);
+    try std.testing.expect(db.core.index_manager.get(index_name) != null);
+}
+
+test "db managed admission drain preserves a generation requested during the pass" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const Hook = struct {
+        passes: usize = 0,
+
+        fn afterPass(ptr: *anyopaque, hooked_db: *DB) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.passes += 1;
+            if (self.passes == 1) hooked_db.requestManagedAdmissionMaterialization();
+        }
+    };
+    var hook = Hook{};
+    DB.test_managed_admission_materialization_hook = .{
+        .ptr = &hook,
+        .after_pass = Hook.afterPass,
+    };
+    defer DB.test_managed_admission_materialization_hook = null;
+
+    db.requestManagedAdmissionMaterialization();
+    try db.drainManagedIndexAdmissions(alloc);
+    try std.testing.expectEqual(@as(usize, 2), hook.passes);
+    try std.testing.expect(!db.managedAdmissionMaterializationPending());
+}
+
+test "db managed admission materialization serializes with index deletion" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    const index_name = "full_text_index_v1";
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    _ = try db.installIndexWhileEnrichmentQuiesced(.{
+        .name = index_name,
+        .kind = .full_text,
+        .config_json = "{}",
+    }, .managed_full_text);
+
+    const Race = struct {
+        db: *DB,
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        delete_started: std.atomic.Value(bool) = .init(false),
+        delete_completed: std.atomic.Value(bool) = .init(false),
+        materialize_result: ?u128 = null,
+        materialize_err: ?anyerror = null,
+        delete_result: bool = false,
+        delete_err: ?anyerror = null,
+
+        fn afterConfigLookup(ptr: *anyopaque, _: *DB, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+        }
+
+        fn materialize(self: *@This()) void {
+            self.materialize_result = self.db.materializeManagedIndexAdmission(self.db.alloc, index_name) catch |err| {
+                self.materialize_err = err;
+                return;
+            };
+        }
+
+        fn delete(self: *@This()) void {
+            self.delete_started.store(true, .release);
+            self.delete_result = self.db.deleteIndex(index_name) catch |err| {
+                self.delete_err = err;
+                self.delete_completed.store(true, .release);
+                return;
+            };
+            self.delete_completed.store(true, .release);
+        }
+    };
+
+    var race = Race{ .db = &db };
+    DB.test_managed_admission_materialization_hook = .{
+        .ptr = &race,
+        .after_config_lookup = Race.afterConfigLookup,
+    };
+    defer DB.test_managed_admission_materialization_hook = null;
+
+    var materialize_thread = try std.Thread.spawn(.{}, Race.materialize, .{&race});
+    var entered = false;
+    for (0..100_000) |_| {
+        if (race.entered.load(.acquire)) {
+            entered = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    if (!entered) {
+        race.release.store(true, .release);
+        materialize_thread.join();
+        return error.TestTimeout;
+    }
+
+    var delete_thread = std.Thread.spawn(.{}, Race.delete, .{&race}) catch |err| {
+        race.release.store(true, .release);
+        materialize_thread.join();
+        return err;
+    };
+    var delete_started = false;
+    for (0..100_000) |_| {
+        if (race.delete_started.load(.acquire)) {
+            delete_started = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    if (!delete_started) {
+        race.release.store(true, .release);
+        materialize_thread.join();
+        delete_thread.join();
+        return error.TestTimeout;
+    }
+    for (0..256) |_| std.Thread.yield() catch {};
+    const deletion_crossed_materialization = race.delete_completed.load(.acquire);
+    race.release.store(true, .release);
+    materialize_thread.join();
+    delete_thread.join();
+
+    try std.testing.expect(!deletion_crossed_materialization);
+    try std.testing.expect(race.materialize_err == null);
+    try std.testing.expect(race.materialize_result != null);
+    try std.testing.expect(race.delete_err == null);
+    try std.testing.expect(race.delete_result);
+    try std.testing.expect(db.core.index_manager.get(index_name) == null);
+    try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+}
+
 test "db managed admission materialization never infers debt from replay lag" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -60128,6 +60405,43 @@ test "db managed admission rejects regressed identity evidence" {
         db.materializeManagedIndexAdmission(alloc, cfg.name),
     );
     try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
+}
+
+test "db managed admission reconciliation retains same-name catalog mismatches" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    const index_name = "dense_idx";
+    try db.addIndex(.{
+        .name = index_name,
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
+    });
+
+    const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, index_name);
+    defer alloc.free(admission_key);
+    const marker = DB.encodeManagedIndexAdmissionMarker(.{
+        .config_hash = 1,
+        .source_doc_count = 1,
+        .identity_generation = 0,
+        .replay_target_sequence = db.core.nextDerivedSequence(),
+    });
+    try db.core.store.put(admission_key, &marker);
+    db.requestManagedAdmissionMaterialization();
+
+    try std.testing.expectError(error.InvalidManagedIndexAdmission, db.drainManagedIndexAdmissions(alloc));
+    const retained = try db.core.store.get(alloc, admission_key);
+    defer alloc.free(retained);
+    try std.testing.expectEqualSlices(u8, &marker, retained);
+    try std.testing.expect(db.managedAdmissionMaterializationPending());
 }
 
 test "db dense repair defers before candidate creation when node admission is exhausted" {

@@ -213,6 +213,7 @@ pub var test_text_backfill_batch_size: ?usize = null;
 pub var test_abort_text_backfill_after_batches: ?usize = null;
 pub var test_text_backfill_invocations: usize = 0;
 pub var test_inject_index_open_error: ?anyerror = null;
+pub var test_inject_index_removal_cleanup_error: ?anyerror = null;
 const sparse_backfill_batch_size: usize = 1024;
 pub var test_sparse_backfill_batch_size: ?usize = null;
 pub var test_abort_sparse_backfill_after_batches: ?usize = null;
@@ -3410,6 +3411,10 @@ pub const IndexManager = struct {
         else
             false;
 
+        // Catalog absence is the generation boundary. A prior removal may
+        // have committed before best-effort physical cleanup completed; never
+        // let a fresh generation reopen name-scoped roots or dense mappings.
+        try self.prepareStorageForFreshCatalogEntry(store, stored_cfg);
         try self.openConfiguredIndex(store, stored_cfg, allow_backfill, false);
         errdefer {
             self.removeInMemory(stored_cfg.name);
@@ -3728,6 +3733,36 @@ pub const IndexManager = struct {
         return try self.removeWithAtomicMutation(store, name, .{ .delete = admission_key });
     }
 
+    fn clearAppliedSequenceAfterCatalogRemoval(self: *IndexManager, store: anytype, name: []const u8) void {
+        if (builtin.is_test) {
+            if (test_inject_index_removal_cleanup_error) |err| {
+                std.log.warn("index removal committed with injected stale applied-sequence metadata name={s} err={s}", .{ name, @errorName(err) });
+                return;
+            }
+        }
+        apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name) catch |err| {
+            std.log.warn("index removal committed with stale applied-sequence metadata name={s} err={s}", .{ name, @errorName(err) });
+        };
+    }
+
+    fn deleteDenseMetadataAfterCatalogRemoval(self: *IndexManager, store: anytype, name: []const u8) void {
+        self.deleteDenseIndexMetadata(store, name) catch |err| {
+            std.log.warn("dense index removal committed with stale mapping metadata name={s} err={s}", .{ name, @errorName(err) });
+        };
+    }
+
+    fn deleteGeneratedArtifactsAfterCatalogRemoval(
+        self: *IndexManager,
+        store: anytype,
+        name: []const u8,
+        owned_chunk_name: ?[]const u8,
+        owned_embedding_name: ?[]const u8,
+    ) void {
+        self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name) catch |err| {
+            std.log.warn("index removal committed with stale generated artifacts name={s} err={s}", .{ name, @errorName(err) });
+        };
+    }
+
     fn removeWithAtomicMutation(
         self: *IndexManager,
         store: anytype,
@@ -3756,7 +3791,7 @@ pub const IndexManager = struct {
                 _ = self.text_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
-                try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
+                self.clearAppliedSequenceAfterCatalogRemoval(store, name);
                 self.deleteIndexRootForName(name, index_path);
                 return true;
             }
@@ -3781,9 +3816,9 @@ pub const IndexManager = struct {
                 _ = self.dense_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
-                try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
-                try self.deleteDenseIndexMetadata(store, name);
-                try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
+                self.clearAppliedSequenceAfterCatalogRemoval(store, name);
+                self.deleteDenseMetadataAfterCatalogRemoval(store, name);
+                self.deleteGeneratedArtifactsAfterCatalogRemoval(store, name, owned_chunk_name, owned_embedding_name);
                 self.deleteIndexRootForName(name, index_path);
                 return true;
             }
@@ -3808,8 +3843,8 @@ pub const IndexManager = struct {
                 _ = self.sparse_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
-                try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
-                try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
+                self.clearAppliedSequenceAfterCatalogRemoval(store, name);
+                self.deleteGeneratedArtifactsAfterCatalogRemoval(store, name, owned_chunk_name, owned_embedding_name);
                 self.deleteIndexRootForName(name, index_path);
                 return true;
             }
@@ -3824,7 +3859,7 @@ pub const IndexManager = struct {
                 _ = self.graph_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
-                try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
+                self.clearAppliedSequenceAfterCatalogRemoval(store, name);
                 self.deleteIndexRootForName(name, index_path);
                 return true;
             }
@@ -3839,7 +3874,7 @@ pub const IndexManager = struct {
                 _ = self.algebraic_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
-                try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
+                self.clearAppliedSequenceAfterCatalogRemoval(store, name);
                 self.deleteIndexRootForName(name, index_path);
                 return true;
             }
@@ -4134,6 +4169,11 @@ pub const IndexManager = struct {
                 replacement[out] = existing;
                 out += 1;
             }
+            // Status-only configs are deliberately excluded from the runtime
+            // generated-target cache, so this value is unchanged by removal.
+            // Compute it before the catalog commit to keep the commit boundary
+            // free of fallible planning.
+            const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
             // All fallible cleanup planning is complete. Catalog absence and
             // marker deletion now commit immediately before runtime removal.
             try self.persistCatalogExcludingWithAtomicMutation(store, name, atomic_mutation);
@@ -4143,11 +4183,10 @@ pub const IndexManager = struct {
             removed_owned = true;
             defer self.dropIndexLoadStateNoLock(name);
 
-            const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
             self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
-            try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
-            if (removed.kind == .dense_vector) try self.deleteDenseIndexMetadata(store, name);
-            try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
+            self.clearAppliedSequenceAfterCatalogRemoval(store, name);
+            if (removed.kind == .dense_vector) self.deleteDenseMetadataAfterCatalogRemoval(store, name);
+            self.deleteGeneratedArtifactsAfterCatalogRemoval(store, name, owned_chunk_name, owned_embedding_name);
             self.deleteIndexRootForName(name, index_path);
             return true;
         }
@@ -7674,6 +7713,19 @@ pub const IndexManager = struct {
 
     fn indexPath(self: *const IndexManager, name: []const u8) ![]u8 {
         return std.fmt.allocPrint(self.alloc, "{s}/indexes/{s}", .{ self.base_path, name });
+    }
+
+    fn prepareStorageForFreshCatalogEntry(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
+        const canonical_path = try self.indexPath(cfg.name);
+        defer self.alloc.free(canonical_path);
+        const active_path = try self.activeIndexPath(cfg.name);
+        defer self.alloc.free(active_path);
+        if (!std.mem.eql(u8, active_path, canonical_path)) {
+            try deleteIndexDirIfPresentFallible(active_path);
+        }
+        try deleteIndexDirIfPresentFallible(canonical_path);
+        if (cfg.kind == .dense_vector) try self.deleteDenseIndexMetadata(store, cfg.name);
+        try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, cfg.name);
     }
 
     fn activeIndexRootPointerPath(self: *const IndexManager, canonical_path: []const u8) ![]u8 {
@@ -15955,6 +16007,14 @@ fn deleteIndexDirIfPresent(path: []const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+}
+
+fn deleteIndexDirIfPresentFallible(path: []const u8) !void {
+    if (builtin.os.tag == .freestanding) return;
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), path);
 }
 
 fn repairShadowRootInProgress(path: []const u8) bool {
