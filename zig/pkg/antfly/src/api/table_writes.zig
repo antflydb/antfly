@@ -5540,31 +5540,6 @@ pub const ProvisionedTableWriteSource = struct {
         self.waitForNoStructuralActivityLocked(table_name);
     }
 
-    fn waitForNoReadBlockingActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
-        while (true) {
-            if (self.findTableActivityLocked(table_name, null)) |index| {
-                const entry = self.active_table_activities.items[index];
-                if (entry.structural_active or entry.table_request_active > 0) {
-                    self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
-                    continue;
-                }
-            }
-            if (self.hasAnyActiveGroupOperationLocked(table_name)) {
-                self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
-                continue;
-            }
-            return;
-        }
-    }
-
-    fn waitForNoReadBlockingActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
-        self.table_activity_mutex.lockUncancelable(io);
-        defer self.table_activity_mutex.unlock(io);
-        self.waitForNoReadBlockingActivityLocked(table_name);
-    }
-
     fn beginTableRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
@@ -8653,13 +8628,13 @@ pub const ProvisionedTableWriteSource = struct {
     fn prepareForRead(ptr: *anyopaque, table_name: []const u8, kind: table_reads.ReadPreparation.Kind) void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.local_write_owner) |owner| return prepareForRead(owner, table_name, kind);
-        self.waitForNoReadBlockingActivity(table_name);
         if (!self.isWriteCacheDirtyForTable(table_name)) return;
 
-        // Data writes and derived catch-up are intentionally eventually visible
-        // to queries. A read can discard its cached reader and reopen the latest
-        // published view, but it must not wait behind writer-cache maintenance
-        // or close the live writer cache from the query path.
+        // This compatibility hook coordinates caches only. Read admission is
+        // owned by beginRead/endRead below; waiting here can deadlock before the
+        // caller has acquired that activity lease. Data writes and derived
+        // catch-up are intentionally eventually visible, so discard only the
+        // cached reader and never close the live writer cache from this path.
         self.invalidateReadCache(table_name);
         if (self.hasActiveBulkIngestSessionForTableBestEffort(table_name)) return;
         self.clearDirtyWriteTable(table_name);
@@ -21212,12 +21187,10 @@ test "provisioned read preparation does not block on same-table batch after earl
 
     _ = try source.source().createTable(alloc, "docs", .{});
 
-    lockAtomic(&source.local_db_mutex);
     {
         var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default, null, null);
         defer cached.deinit(alloc);
     }
-    source.local_db_mutex.unlock();
 
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));
@@ -21231,7 +21204,6 @@ test "provisioned read preparation does not block on same-table batch after earl
 
     var batch_worker = BatchWorker{ .source = &source, .alloc = alloc };
     const batch_thread = try std.Thread.spawn(.{}, BatchWorker.run, .{&batch_worker});
-    defer batch_thread.join();
 
     const ReadWorker = struct {
         source: *ProvisionedTableWriteSource,
@@ -21248,16 +21220,41 @@ test "provisioned read preparation does not block on same-table batch after earl
     while (!probe.entered.load(.acquire)) std.atomic.spinLoopHint();
 
     var read_worker = ReadWorker{ .source = &source };
-    const read_thread = try std.Thread.spawn(.{}, ReadWorker.run, .{&read_worker});
-    defer read_thread.join();
+    const read_thread = std.Thread.spawn(.{}, ReadWorker.run, .{&read_worker}) catch |err| {
+        probe.release.store(true, .release);
+        batch_thread.join();
+        return err;
+    };
+    var threads_joined = false;
+    defer if (!threads_joined) {
+        // A failed assertion must release both workers before joining them;
+        // otherwise this regression masks the failure as a hung test shard.
+        probe.release.store(true, .release);
+        read_thread.join();
+        batch_thread.join();
+    };
 
     while (!read_worker.started.load(.acquire)) std.atomic.spinLoopHint();
-    for (0..1000) |_| std.atomic.spinLoopHint();
-    try std.testing.expect(read_worker.completed.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
-    try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));
+    var completed_before_batch_release = false;
+    for (0..100_000) |_| {
+        if (read_worker.completed.load(.acquire)) {
+            completed_before_batch_release = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    const cached_entries_before_batch_release = write_cache.entries.items.len;
+    const dirty_before_batch_release = source.isWriteCacheDirtyForTable("docs");
 
     probe.release.store(true, .release);
+    read_thread.join();
+    batch_thread.join();
+    threads_joined = true;
+
+    try std.testing.expect(completed_before_batch_release);
+    try std.testing.expectEqual(@as(usize, 1), cached_entries_before_batch_release);
+    try std.testing.expect(!dirty_before_batch_release);
+
     if (batch_worker.err) |err| return err;
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expect(source.isWriteCacheDirtyForTable("docs"));
@@ -23826,6 +23823,33 @@ test "provisioned table write source invalidates cached query db after managed d
             return "[0,0,1]";
         }
 
+        fn successBody(arena: std.mem.Allocator, input: std.json.Value) ![]u8 {
+            var out = std.ArrayListUnmanaged(u8).empty;
+            try out.appendSlice(arena, "{\"object\":\"list\",\"data\":[");
+            const inputs = switch (input) {
+                .array => |array| array.items,
+                else => null,
+            };
+            if (inputs) |items| {
+                for (items, 0..) |item, i| {
+                    if (i != 0) try out.append(arena, ',');
+                    try out.print(
+                        arena,
+                        "{{\"object\":\"embedding\",\"index\":{},\"embedding\":{s}}}",
+                        .{ i, vectorForInput(item) },
+                    );
+                }
+            } else {
+                try out.print(
+                    arena,
+                    "{{\"object\":\"embedding\",\"index\":0,\"embedding\":{s}}}",
+                    .{vectorForInput(input)},
+                );
+            }
+            try out.appendSlice(arena, "],\"model\":\"test-embed\",\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}");
+            return try out.toOwnedSlice(arena);
+        }
+
         fn executor() http_common.RequestExecutor {
             return .{
                 .ptr = undefined,
@@ -23842,8 +23866,8 @@ test "provisioned table write source invalidates cached query db after managed d
             var parsed_req = try parseJsonBodyIgnoreUnknown(TestEmbeddingRequest, arena, req.body);
             defer parsed_req.deinit();
 
-            const request_index = request_count.fetchAdd(1, .monotonic);
-            if (request_index != 0 and !allow_all.load(.acquire)) {
+            _ = request_count.fetchAdd(1, .monotonic);
+            if (!allow_all.load(.acquire)) {
                 _ = rate_limited_count.fetchAdd(1, .monotonic);
                 const body = try arena.dupe(u8,
                     \\{"error":{"message":"rate limited","type":"rate_limit_exceeded"}}
@@ -23855,11 +23879,7 @@ test "provisioned table write source invalidates cached query db after managed d
                 };
             }
 
-            const body = try std.fmt.allocPrint(
-                arena,
-                "{{\"object\":\"list\",\"data\":[{{\"object\":\"embedding\",\"index\":0,\"embedding\":{s}}}],\"model\":\"test-embed\",\"usage\":{{\"prompt_tokens\":1,\"total_tokens\":1}}}}",
-                .{vectorForInput(parsed_req.value.input)},
-            );
+            const body = try successBody(arena, parsed_req.value.input);
             return .{
                 .status = 200,
                 .content_type = try arena.dupe(u8, "application/json"),

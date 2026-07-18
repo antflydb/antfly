@@ -562,13 +562,16 @@ pub const DBCore = struct {
         try range_state_mod.clearSplitBootstrapMarker(self.store);
     }
 
-    pub fn addIndex(self: *DBCore, cfg: types.IndexConfig) !u64 {
-        try self.index_manager.add(self.store, cfg);
+    pub fn addIndex(
+        self: *DBCore,
+        cfg: types.IndexConfig,
+        admission: ?index_manager_mod.IndexManager.AtomicCatalogMutation,
+    ) !u64 {
+        try self.index_manager.addWithAtomicMutation(self.store, cfg, admission);
         const applied = if (try self.index_manager.requiresEnrichmentReplay(cfg.name))
             0
         else
             self.nextDerivedSequence();
-        try self.saveAppliedSequence(cfg.name, applied);
         return applied;
     }
 
@@ -582,7 +585,6 @@ pub const DBCore = struct {
         // stable source snapshot before replay catch-up. Starting at zero is
         // fail-closed if the process exits before the outbox is materialized.
         const applied = if (admission == null) self.nextDerivedSequence() else 0;
-        try self.saveAppliedSequence(cfg.name, applied);
         return applied;
     }
 

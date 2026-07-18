@@ -214,6 +214,7 @@ pub var test_abort_text_backfill_after_batches: ?usize = null;
 pub var test_text_backfill_invocations: usize = 0;
 pub var test_inject_index_open_error: ?anyerror = null;
 pub var test_inject_index_removal_cleanup_error: ?anyerror = null;
+pub var test_inject_generated_artifact_cleanup_error: ?anyerror = null;
 const sparse_backfill_batch_size: usize = 1024;
 pub var test_sparse_backfill_batch_size: ?usize = null;
 pub var test_abort_sparse_backfill_after_batches: ?usize = null;
@@ -887,6 +888,7 @@ pub const IndexManager = struct {
     lsm_cache: ?*lsm_backend_mod.Cache,
     hbc_cache: ?*hbc_mod.Cache,
     lsm_root_generation: u64,
+    io: ?std.Io,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     bind_cache_resource_manager: bool,
@@ -895,6 +897,9 @@ pub const IndexManager = struct {
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
     /// 0 = idle, 1 = queued/running, 2 = rerun requested while active.
     repair_cleanup_state: std.atomic.Value(u8) = .init(0),
+    /// Durable generated-artifact cleanup uses the same single-flight shape,
+    /// but runs in bounded pages so it cannot monopolize structural locks.
+    artifact_cleanup_state: std.atomic.Value(u8) = .init(0),
     // Bulk text backfill performs its own policy compaction at durable batch
     // boundaries. Keep the asynchronous scheduler from competing with it (or
     // compacting an older schema generation) for CPU, mmap residency, and the
@@ -1516,6 +1521,7 @@ pub const IndexManager = struct {
             .lsm_cache = opts.lsm_cache,
             .hbc_cache = opts.hbc_cache,
             .lsm_root_generation = opts.lsm_root_generation,
+            .io = null,
             .resource_manager = resource_manager,
             .owned_resource_manager = owned_resource_manager,
             .bind_cache_resource_manager = bind_cache_resource_manager,
@@ -3367,10 +3373,79 @@ pub const IndexManager = struct {
             value: []const u8,
         },
         delete: []const u8,
+        put_delete: struct {
+            put: struct {
+                key: []const u8,
+                value: []const u8,
+            },
+            delete: []const u8,
+        },
+    };
+
+    const generated_artifact_cleanup_magic: u64 = 0x32504e4c43414641; // "AFACLNP2"
+    const generated_artifact_cleanup_null_len = std.math.maxInt(u32);
+    const generated_artifact_cleanup_header_len = @sizeOf(u64) + 4 * @sizeOf(u32);
+    const generated_artifact_cleanup_scan_limit: usize = 512;
+
+    const GeneratedArtifactCleanupPhase = enum(u32) {
+        generated_artifacts = 1,
+        dense_metadata = 2,
+        derived_coverage = 3,
+        finalization = 4,
+    };
+
+    const GeneratedArtifactCleanupRecord = struct {
+        phase: GeneratedArtifactCleanupPhase,
+        chunk_name: ?[]const u8,
+        embedding_name: ?[]const u8,
+        cursor: ?[]const u8,
+    };
+
+    pub const GeneratedArtifactCleanupDrainResult = struct {
+        alloc: ?Allocator = null,
+        found: bool = false,
+        completed: bool = false,
+        key: []u8 = &.{},
+        index_name: []u8 = &.{},
+
+        pub fn deinit(self: *@This()) void {
+            const alloc = self.alloc orelse {
+                self.* = .{};
+                return;
+            };
+            if (self.key.len != 0) alloc.free(self.key);
+            if (self.index_name.len != 0) alloc.free(self.index_name);
+            self.* = .{};
+        }
+    };
+
+    pub fn setIo(self: *IndexManager, io: ?std.Io) void {
+        self.io = io;
+    }
+
+    const GeneratedArtifactCleanupPlan = struct {
+        alloc: Allocator,
+        key: ?[]u8 = null,
+        value: ?[]u8 = null,
+
+        fn deinit(self: *@This()) void {
+            if (self.key) |key| self.alloc.free(key);
+            if (self.value) |value| self.alloc.free(value);
+            self.* = undefined;
+        }
     };
 
     pub fn add(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
         try self.addWithOptions(store, cfg, true, null);
+    }
+
+    pub fn addWithAtomicMutation(
+        self: *IndexManager,
+        store: anytype,
+        cfg: types.IndexConfig,
+        admission: ?AtomicCatalogMutation,
+    ) !void {
+        try self.addWithOptions(store, cfg, true, admission);
     }
 
     /// Managed admission deliberately leaves corpus reconstruction to the
@@ -3398,8 +3473,13 @@ pub const IndexManager = struct {
         self.bindPrimaryStore(store);
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
 
-        var stored_cfg = try indexConfigWithCoverageGeneration(self.alloc, cfg);
+        var stored_cfg = try indexConfigWithCoverageGeneration(self.alloc, self.io, cfg);
         defer stored_cfg.deinit(self.alloc);
+
+        // Catalog absence is the generation boundary. Reject any
+        // crash-surviving artifact cleanup before the new config can bind the
+        // same public artifact names, then discard name-scoped index state.
+        try self.prepareStorageForFreshCatalogEntry(store, stored_cfg);
 
         const enrichment_checkpoint = self.enrichments.items.len;
         var enrichment_catalog_committed = false;
@@ -3411,10 +3491,6 @@ pub const IndexManager = struct {
         else
             false;
 
-        // Catalog absence is the generation boundary. A prior removal may
-        // have committed before best-effort physical cleanup completed; never
-        // let a fresh generation reopen name-scoped roots or dense mappings.
-        try self.prepareStorageForFreshCatalogEntry(store, stored_cfg);
         try self.openConfiguredIndex(store, stored_cfg, allow_backfill, false);
         errdefer {
             self.removeInMemory(stored_cfg.name);
@@ -3447,7 +3523,7 @@ pub const IndexManager = struct {
             self.alloc.free(stored_configs);
         }
         for (configs, 0..) |cfg, i| {
-            stored_configs[i] = try indexConfigWithCoverageGeneration(self.alloc, cfg);
+            stored_configs[i] = try indexConfigWithCoverageGeneration(self.alloc, self.io, cfg);
             stored_initialized += 1;
         }
 
@@ -3498,7 +3574,7 @@ pub const IndexManager = struct {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
-        var stored_cfg = try indexConfigWithCoverageGeneration(self.alloc, cfg);
+        var stored_cfg = try indexConfigWithCoverageGeneration(self.alloc, self.io, cfg);
         defer stored_cfg.deinit(self.alloc);
         try self.openConfiguredIndex(store, stored_cfg, true, false);
         errdefer {
@@ -3745,22 +3821,365 @@ pub const IndexManager = struct {
         };
     }
 
-    fn deleteDenseMetadataAfterCatalogRemoval(self: *IndexManager, store: anytype, name: []const u8) void {
-        self.deleteDenseIndexMetadata(store, name) catch |err| {
-            std.log.warn("dense index removal committed with stale mapping metadata name={s} err={s}", .{ name, @errorName(err) });
-        };
+    fn encodeGeneratedArtifactCleanupRecord(
+        self: *IndexManager,
+        phase: GeneratedArtifactCleanupPhase,
+        chunk_name: ?[]const u8,
+        embedding_name: ?[]const u8,
+        cursor: ?[]const u8,
+    ) ![]u8 {
+        const chunk_len = if (chunk_name) |value|
+            std.math.cast(u32, value.len) orelse return error.NameTooLong
+        else
+            generated_artifact_cleanup_null_len;
+        const embedding_len = if (embedding_name) |value|
+            std.math.cast(u32, value.len) orelse return error.NameTooLong
+        else
+            generated_artifact_cleanup_null_len;
+        const cursor_len = if (cursor) |value|
+            std.math.cast(u32, value.len) orelse return error.KeyTooLong
+        else
+            generated_artifact_cleanup_null_len;
+        const payload_len = (if (chunk_name) |value| value.len else 0) +
+            (if (embedding_name) |value| value.len else 0) +
+            (if (cursor) |value| value.len else 0);
+        const out = try self.alloc.alloc(u8, generated_artifact_cleanup_header_len + payload_len);
+        std.mem.writeInt(u64, out[0..8], generated_artifact_cleanup_magic, .little);
+        std.mem.writeInt(u32, out[8..12], @intFromEnum(phase), .little);
+        std.mem.writeInt(u32, out[12..16], chunk_len, .little);
+        std.mem.writeInt(u32, out[16..20], embedding_len, .little);
+        std.mem.writeInt(u32, out[20..24], cursor_len, .little);
+        var offset: usize = generated_artifact_cleanup_header_len;
+        if (chunk_name) |value| {
+            @memcpy(out[offset .. offset + value.len], value);
+            offset += value.len;
+        }
+        if (embedding_name) |value| {
+            @memcpy(out[offset .. offset + value.len], value);
+            offset += value.len;
+        }
+        if (cursor) |value| {
+            @memcpy(out[offset .. offset + value.len], value);
+        }
+        return out;
     }
 
-    fn deleteGeneratedArtifactsAfterCatalogRemoval(
+    fn decodeGeneratedArtifactCleanupRecord(raw: []const u8) !GeneratedArtifactCleanupRecord {
+        if (raw.len < generated_artifact_cleanup_header_len) return error.InvalidGeneratedArtifactCleanup;
+        if (std.mem.readInt(u64, raw[0..8], .little) != generated_artifact_cleanup_magic)
+            return error.InvalidGeneratedArtifactCleanup;
+        const phase = std.enums.fromInt(GeneratedArtifactCleanupPhase, std.mem.readInt(u32, raw[8..12], .little)) orelse
+            return error.InvalidGeneratedArtifactCleanup;
+        const chunk_len_raw = std.mem.readInt(u32, raw[12..16], .little);
+        const embedding_len_raw = std.mem.readInt(u32, raw[16..20], .little);
+        const cursor_len_raw = std.mem.readInt(u32, raw[20..24], .little);
+        const chunk_len: usize = if (chunk_len_raw == generated_artifact_cleanup_null_len) 0 else chunk_len_raw;
+        const embedding_len: usize = if (embedding_len_raw == generated_artifact_cleanup_null_len) 0 else embedding_len_raw;
+        const cursor_len: usize = if (cursor_len_raw == generated_artifact_cleanup_null_len) 0 else cursor_len_raw;
+        const expected_len = generated_artifact_cleanup_header_len + chunk_len + embedding_len + cursor_len;
+        if (raw.len != expected_len) return error.InvalidGeneratedArtifactCleanup;
+        var offset: usize = generated_artifact_cleanup_header_len;
+        const chunk_name: ?[]const u8 = if (chunk_len_raw == generated_artifact_cleanup_null_len)
+            null
+        else blk: {
+            const value = raw[offset .. offset + chunk_len];
+            offset += chunk_len;
+            break :blk value;
+        };
+        const embedding_name: ?[]const u8 = if (embedding_len_raw == generated_artifact_cleanup_null_len)
+            null
+        else blk: {
+            const value = raw[offset .. offset + embedding_len];
+            offset += embedding_len;
+            break :blk value;
+        };
+        const cursor: ?[]const u8 = if (cursor_len_raw == generated_artifact_cleanup_null_len)
+            null
+        else
+            raw[offset .. offset + cursor_len];
+        return .{ .phase = phase, .chunk_name = chunk_name, .embedding_name = embedding_name, .cursor = cursor };
+    }
+
+    fn prepareGeneratedArtifactCleanupPlan(
         self: *IndexManager,
-        store: anytype,
         name: []const u8,
+        coverage_generation: u64,
         owned_chunk_name: ?[]const u8,
         owned_embedding_name: ?[]const u8,
-    ) void {
-        self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name) catch |err| {
-            std.log.warn("index removal committed with stale generated artifacts name={s} err={s}", .{ name, @errorName(err) });
+    ) !GeneratedArtifactCleanupPlan {
+        var plan = GeneratedArtifactCleanupPlan{ .alloc = self.alloc };
+        errdefer plan.deinit();
+        plan.key = try internal_keys.indexArtifactCleanupKeyAlloc(self.alloc, name, coverage_generation);
+        plan.value = try self.encodeGeneratedArtifactCleanupRecord(.generated_artifacts, owned_chunk_name, owned_embedding_name, null);
+        return plan;
+    }
+
+    fn combineRemovalCatalogMutation(
+        base: ?AtomicCatalogMutation,
+        cleanup: *const GeneratedArtifactCleanupPlan,
+    ) !?AtomicCatalogMutation {
+        const cleanup_key = cleanup.key orelse return base;
+        const cleanup_value = cleanup.value.?;
+        return if (base) |mutation| switch (mutation) {
+            .delete => |key| .{ .put_delete = .{
+                .put = .{ .key = cleanup_key, .value = cleanup_value },
+                .delete = key,
+            } },
+            .put, .put_delete => error.InvalidArgument,
+        } else .{ .put = .{ .key = cleanup_key, .value = cleanup_value } };
+    }
+
+    fn drainGeneratedArtifactCleanupRecordPage(
+        self: *IndexManager,
+        store: anytype,
+        key: []const u8,
+        raw: []const u8,
+    ) !GeneratedArtifactCleanupDrainResult {
+        const record = try decodeGeneratedArtifactCleanupRecord(raw);
+        if (builtin.is_test) {
+            if (test_inject_generated_artifact_cleanup_error) |err| return err;
+        }
+        switch (record.phase) {
+            .dense_metadata => {
+                const index_name = try internal_keys.indexArtifactCleanupNameAlloc(self.alloc, key);
+                defer self.alloc.free(index_name);
+                const prefix = try denseIndexMetadataPrefixAlloc(self.alloc, index_name);
+                defer self.alloc.free(prefix);
+                return try self.drainGeneratedArtifactCleanupMetadataPage(store, key, record, prefix, .derived_coverage);
+            },
+            .derived_coverage => {
+                const index_name = try internal_keys.indexArtifactCleanupNameAlloc(self.alloc, key);
+                defer self.alloc.free(index_name);
+                const prefix = try internal_keys.derivedCoverageOutcomePrefixAlloc(self.alloc, index_name);
+                defer self.alloc.free(prefix);
+                return try self.drainGeneratedArtifactCleanupMetadataPage(store, key, record, prefix, .finalization);
+            },
+            .finalization => return .{ .found = true, .completed = true },
+            .generated_artifacts => {},
+        }
+
+        if (record.chunk_name == null and record.embedding_name == null) {
+            const next_value = try self.encodeGeneratedArtifactCleanupRecord(.dense_metadata, null, null, null);
+            defer self.alloc.free(next_value);
+            try store.put(key, next_value);
+            return .{ .found = true, .completed = false };
+        }
+        const lower = try internal_keys.documentRangeLowerAlloc(self.alloc, "");
+        defer self.alloc.free(lower);
+        const upper_owned = try internal_keys.documentRangeUpperAlloc(self.alloc, "");
+        defer if (upper_owned) |upper| self.alloc.free(upper);
+
+        const ScanState = struct {
+            manager: *IndexManager,
+            chunk_name: ?[]const u8,
+            embedding_name: ?[]const u8,
+            deletes: std.ArrayListUnmanaged([]u8) = .empty,
+            last_key: ?[]u8 = null,
+            scanned: usize = 0,
+            stopped: bool = false,
+
+            fn deinit(state: *@This()) void {
+                for (state.deletes.items) |delete_key| state.manager.alloc.free(delete_key);
+                state.deletes.deinit(state.manager.alloc);
+                if (state.last_key) |last_key| state.manager.alloc.free(last_key);
+            }
+
+            fn scanEntry(ctx: ?*anyopaque, candidate: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                state.scanned += 1;
+
+                var should_delete = false;
+                if (state.chunk_name) |chunk_name| {
+                    should_delete = (internal_keys.isChunkArtifactRecordKey(candidate) and internal_keys.matchesChunkArtifactName(candidate, chunk_name)) or
+                        (internal_keys.isDerivedEmbeddingArtifactKey(candidate) and try state.manager.derivedEmbeddingBaseMatchesChunk(candidate, chunk_name));
+                }
+                if (!should_delete) if (state.embedding_name) |embedding_name| {
+                    should_delete = (internal_keys.isEmbeddingArtifactKey(candidate) and internal_keys.matchesEmbeddingArtifactName(candidate, embedding_name)) or
+                        (internal_keys.isDerivedEmbeddingArtifactKey(candidate) and internal_keys.matchesDerivedEmbeddingArtifactName(candidate, embedding_name));
+                };
+                if (should_delete) try state.deletes.append(state.manager.alloc, try state.manager.alloc.dupe(u8, candidate));
+
+                if (state.scanned >= generated_artifact_cleanup_scan_limit) {
+                    state.last_key = try state.manager.alloc.dupe(u8, candidate);
+                    state.stopped = true;
+                    return .stop;
+                }
+                return .@"continue";
+            }
         };
+
+        var state = ScanState{
+            .manager = self,
+            .chunk_name = record.chunk_name,
+            .embedding_name = record.embedding_name,
+        };
+        defer state.deinit();
+        try store.scanWithContext(
+            record.cursor orelse lower,
+            if (upper_owned) |upper| upper else "",
+            .{ .lower_exclusive = record.cursor != null },
+            &state,
+            ScanState.scanEntry,
+        );
+
+        var delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer delete_keys.deinit(self.alloc);
+        try delete_keys.ensureTotalCapacity(self.alloc, state.deletes.items.len + 1);
+        for (state.deletes.items) |delete_key| delete_keys.appendAssumeCapacity(delete_key);
+
+        if (state.stopped) {
+            const next_value = try self.encodeGeneratedArtifactCleanupRecord(.generated_artifacts, record.chunk_name, record.embedding_name, state.last_key.?);
+            defer self.alloc.free(next_value);
+            const writes = [_]docstore_mod.KVPair{.{ .key = key, .value = next_value }};
+            try store.putBatch(&writes, delete_keys.items);
+            return .{ .found = true, .completed = false };
+        }
+
+        const next_value = try self.encodeGeneratedArtifactCleanupRecord(.dense_metadata, record.chunk_name, record.embedding_name, null);
+        defer self.alloc.free(next_value);
+        const writes = [_]docstore_mod.KVPair{.{ .key = key, .value = next_value }};
+        try store.putBatch(&writes, delete_keys.items);
+        return .{ .found = true, .completed = false };
+    }
+
+    fn drainGeneratedArtifactCleanupMetadataPage(
+        self: *IndexManager,
+        store: anytype,
+        key: []const u8,
+        record: GeneratedArtifactCleanupRecord,
+        prefix: []const u8,
+        next_phase: GeneratedArtifactCleanupPhase,
+    ) !GeneratedArtifactCleanupDrainResult {
+        const rows = try store.scanPrefixPage(
+            self.alloc,
+            prefix,
+            record.cursor,
+            generated_artifact_cleanup_scan_limit,
+        );
+        defer docstore_mod.DocStore.freeResults(self.alloc, rows);
+
+        const delete_keys = try self.alloc.alloc([]const u8, rows.len);
+        defer self.alloc.free(delete_keys);
+        for (rows, 0..) |row, i| delete_keys[i] = row.key;
+
+        if (rows.len == generated_artifact_cleanup_scan_limit) {
+            const next_value = try self.encodeGeneratedArtifactCleanupRecord(
+                record.phase,
+                record.chunk_name,
+                record.embedding_name,
+                rows[rows.len - 1].key,
+            );
+            defer self.alloc.free(next_value);
+            const writes = [_]docstore_mod.KVPair{.{ .key = key, .value = next_value }};
+            try store.putBatch(&writes, delete_keys);
+            return .{ .found = true, .completed = false };
+        }
+
+        if (next_phase == .finalization) {
+            if (delete_keys.len != 0) try store.putBatch(&.{}, delete_keys);
+            return .{ .found = true, .completed = true };
+        }
+        const next_value = try self.encodeGeneratedArtifactCleanupRecord(
+            next_phase,
+            record.chunk_name,
+            record.embedding_name,
+            null,
+        );
+        defer self.alloc.free(next_value);
+        const writes = [_]docstore_mod.KVPair{.{ .key = key, .value = next_value }};
+        try store.putBatch(&writes, delete_keys);
+        return .{ .found = true, .completed = false };
+    }
+
+    pub fn drainGeneratedArtifactCleanupOutboxPage(self: *IndexManager, store: anytype) !GeneratedArtifactCleanupDrainResult {
+        const prefix = try internal_keys.indexArtifactCleanupRootPrefixAlloc(self.alloc);
+        defer self.alloc.free(prefix);
+        return try self.drainGeneratedArtifactCleanupPrefixPage(store, prefix);
+    }
+
+    pub fn drainGeneratedArtifactCleanupForIndexPage(
+        self: *IndexManager,
+        store: anytype,
+        index_name: []const u8,
+    ) !GeneratedArtifactCleanupDrainResult {
+        const prefix = try internal_keys.indexArtifactCleanupIndexPrefixAlloc(self.alloc, index_name);
+        defer self.alloc.free(prefix);
+        return try self.drainGeneratedArtifactCleanupPrefixPage(store, prefix);
+    }
+
+    fn drainGeneratedArtifactCleanupPrefixPage(
+        self: *IndexManager,
+        store: anytype,
+        prefix: []const u8,
+    ) !GeneratedArtifactCleanupDrainResult {
+        const rows = try store.scanPrefixPage(self.alloc, prefix, null, 1);
+        defer docstore_mod.DocStore.freeResults(self.alloc, rows);
+        if (rows.len == 0) return .{};
+        var result = try self.drainGeneratedArtifactCleanupRecordPage(store, rows[0].key, rows[0].value);
+        result.alloc = self.alloc;
+        errdefer result.deinit();
+        result.key = try self.alloc.dupe(u8, rows[0].key);
+        result.index_name = try internal_keys.indexArtifactCleanupNameAlloc(self.alloc, rows[0].key);
+        return result;
+    }
+
+    /// Return the retired index whose cleanup owns a namespace needed by cfg.
+    /// Cleanup rows are structural metadata, so this scan is proportional to
+    /// outstanding deletion debt rather than document count and is paged to
+    /// keep temporary memory bounded.
+    pub fn pendingGeneratedArtifactCleanupIndexForConfigAlloc(
+        self: *IndexManager,
+        store: anytype,
+        cfg: types.IndexConfig,
+    ) !?[]u8 {
+        var refs = try self.artifactRefsFromConfig(cfg);
+        defer refs.deinit(self.alloc);
+        const prefix = try internal_keys.indexArtifactCleanupRootPrefixAlloc(self.alloc);
+        defer self.alloc.free(prefix);
+
+        const page_limit: usize = 128;
+        var after_key: ?[]u8 = null;
+        defer if (after_key) |key| self.alloc.free(key);
+        while (true) {
+            const rows = try store.scanPrefixPage(self.alloc, prefix, after_key, page_limit);
+            defer docstore_mod.DocStore.freeResults(self.alloc, rows);
+            if (rows.len == 0) return null;
+            for (rows) |row| {
+                const retired_name = try internal_keys.indexArtifactCleanupNameAlloc(self.alloc, row.key);
+                errdefer self.alloc.free(retired_name);
+                const record = try decodeGeneratedArtifactCleanupRecord(row.value);
+                const conflicts = std.mem.eql(u8, retired_name, cfg.name) or
+                    (refs.chunk_name != null and record.chunk_name != null and std.mem.eql(u8, refs.chunk_name.?, record.chunk_name.?)) or
+                    (refs.embedding_name != null and record.embedding_name != null and std.mem.eql(u8, refs.embedding_name.?, record.embedding_name.?));
+                if (conflicts) return retired_name;
+                self.alloc.free(retired_name);
+            }
+            if (rows.len < page_limit) return null;
+            const next = try self.alloc.dupe(u8, rows[rows.len - 1].key);
+            if (after_key) |key| self.alloc.free(key);
+            after_key = next;
+        }
+    }
+
+    pub fn finalizeRetiredIndexStorage(self: *IndexManager, store: anytype, name: []const u8) !void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        if (self.get(name) != null) return error.IndexGenerationStillActive;
+
+        try apply_state.clearAppliedSequenceWithCheckpoint(
+            self.alloc,
+            store,
+            self.applied_sequence_checkpoint_path,
+            name,
+        );
+        const canonical_path = try self.indexPath(name);
+        defer self.alloc.free(canonical_path);
+        const active_path = try self.activeIndexPath(name);
+        defer self.alloc.free(active_path);
+        self.invalidateIndexPathCaches(active_path);
+        if (!std.mem.eql(u8, active_path, canonical_path)) try self.deleteIndexDirUsingIoIfPresentFallible(active_path);
+        self.invalidateIndexPathCaches(canonical_path);
+        try self.deleteIndexDirUsingIoIfPresentFallible(canonical_path);
     }
 
     fn removeWithAtomicMutation(
@@ -3786,7 +4205,13 @@ pub const IndexManager = struct {
                 const index_path = try self.indexPath(name);
                 defer self.alloc.free(index_path);
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
-                try self.persistCatalogExcludingWithAtomicMutation(store, name, atomic_mutation);
+                var cleanup = try self.prepareGeneratedArtifactCleanupPlan(name, coverageGenerationForConfig(entry.config), null, null);
+                defer cleanup.deinit();
+                try self.persistCatalogExcludingWithAtomicMutation(
+                    store,
+                    name,
+                    try combineRemovalCatalogMutation(atomic_mutation, &cleanup),
+                );
                 self.freeTextIndexEntry(entry);
                 _ = self.text_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
@@ -3811,14 +4236,20 @@ pub const IndexManager = struct {
                     null;
                 defer if (owned_embedding_name) |embedding_name| self.alloc.free(embedding_name);
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
-                try self.persistCatalogExcludingWithAtomicMutation(store, name, atomic_mutation);
+                var artifact_cleanup = try self.prepareGeneratedArtifactCleanupPlan(
+                    name,
+                    coverageGenerationForConfig(entry.config),
+                    owned_chunk_name,
+                    owned_embedding_name,
+                );
+                defer artifact_cleanup.deinit();
+                const commit_mutation = try combineRemovalCatalogMutation(atomic_mutation, &artifact_cleanup);
+                try self.persistCatalogExcludingWithAtomicMutation(store, name, commit_mutation);
                 self.freeDenseIndexEntry(entry);
                 _ = self.dense_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 self.clearAppliedSequenceAfterCatalogRemoval(store, name);
-                self.deleteDenseMetadataAfterCatalogRemoval(store, name);
-                self.deleteGeneratedArtifactsAfterCatalogRemoval(store, name, owned_chunk_name, owned_embedding_name);
                 self.deleteIndexRootForName(name, index_path);
                 return true;
             }
@@ -3838,13 +4269,20 @@ pub const IndexManager = struct {
                     null;
                 defer if (owned_embedding_name) |embedding_name| self.alloc.free(embedding_name);
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
-                try self.persistCatalogExcludingWithAtomicMutation(store, name, atomic_mutation);
+                var artifact_cleanup = try self.prepareGeneratedArtifactCleanupPlan(
+                    name,
+                    coverageGenerationForConfig(entry.config),
+                    owned_chunk_name,
+                    owned_embedding_name,
+                );
+                defer artifact_cleanup.deinit();
+                const commit_mutation = try combineRemovalCatalogMutation(atomic_mutation, &artifact_cleanup);
+                try self.persistCatalogExcludingWithAtomicMutation(store, name, commit_mutation);
                 self.freeSparseIndexEntry(entry);
                 _ = self.sparse_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 self.clearAppliedSequenceAfterCatalogRemoval(store, name);
-                self.deleteGeneratedArtifactsAfterCatalogRemoval(store, name, owned_chunk_name, owned_embedding_name);
                 self.deleteIndexRootForName(name, index_path);
                 return true;
             }
@@ -3854,7 +4292,13 @@ pub const IndexManager = struct {
                 const index_path = try self.indexPath(name);
                 defer self.alloc.free(index_path);
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
-                try self.persistCatalogExcludingWithAtomicMutation(store, name, atomic_mutation);
+                var cleanup = try self.prepareGeneratedArtifactCleanupPlan(name, coverageGenerationForConfig(entry.config), null, null);
+                defer cleanup.deinit();
+                try self.persistCatalogExcludingWithAtomicMutation(
+                    store,
+                    name,
+                    try combineRemovalCatalogMutation(atomic_mutation, &cleanup),
+                );
                 self.freeGraphIndexEntry(entry);
                 _ = self.graph_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
@@ -3869,7 +4313,13 @@ pub const IndexManager = struct {
                 const index_path = try self.indexPath(name);
                 defer self.alloc.free(index_path);
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
-                try self.persistCatalogExcludingWithAtomicMutation(store, name, atomic_mutation);
+                var cleanup = try self.prepareGeneratedArtifactCleanupPlan(name, coverageGenerationForConfig(entry.config), null, null);
+                defer cleanup.deinit();
+                try self.persistCatalogExcludingWithAtomicMutation(
+                    store,
+                    name,
+                    try combineRemovalCatalogMutation(atomic_mutation, &cleanup),
+                );
                 self.freeAlgebraicIndexEntry(entry);
                 _ = self.algebraic_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
@@ -4174,9 +4624,17 @@ pub const IndexManager = struct {
             // Compute it before the catalog commit to keep the commit boundary
             // free of fallible planning.
             const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
+            var artifact_cleanup = try self.prepareGeneratedArtifactCleanupPlan(
+                name,
+                coverageGenerationForConfig(cfg),
+                owned_chunk_name,
+                owned_embedding_name,
+            );
+            defer artifact_cleanup.deinit();
+            const commit_mutation = try combineRemovalCatalogMutation(atomic_mutation, &artifact_cleanup);
             // All fallible cleanup planning is complete. Catalog absence and
             // marker deletion now commit immediately before runtime removal.
-            try self.persistCatalogExcludingWithAtomicMutation(store, name, atomic_mutation);
+            try self.persistCatalogExcludingWithAtomicMutation(store, name, commit_mutation);
             self.alloc.free(self.status_only_index_configs);
             self.status_only_index_configs = replacement;
             replacement_owned = false;
@@ -4185,8 +4643,6 @@ pub const IndexManager = struct {
 
             self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
             self.clearAppliedSequenceAfterCatalogRemoval(store, name);
-            if (removed.kind == .dense_vector) self.deleteDenseMetadataAfterCatalogRemoval(store, name);
-            self.deleteGeneratedArtifactsAfterCatalogRemoval(store, name, owned_chunk_name, owned_embedding_name);
             self.deleteIndexRootForName(name, index_path);
             return true;
         }
@@ -5518,49 +5974,6 @@ pub const IndexManager = struct {
         const legacy_prefix = try legacyDenseIndexMetadataPrefixAlloc(self.alloc, index_name);
         defer self.alloc.free(legacy_prefix);
         try self.deleteKeysWithPrefix(store, legacy_prefix);
-    }
-
-    fn deleteOwnedGeneratedArtifacts(
-        self: *IndexManager,
-        store: anytype,
-        owned_chunk_name: ?[]const u8,
-        owned_embedding_name: ?[]const u8,
-    ) !void {
-        if (owned_chunk_name == null and owned_embedding_name == null) return;
-
-        const lower = try internal_keys.documentRangeLowerAlloc(self.alloc, "");
-        defer self.alloc.free(lower);
-        const entries = try store.scanRange(self.alloc, lower, "");
-        defer docstore_mod.DocStore.freeResults(self.alloc, entries);
-        if (entries.len == 0) return;
-
-        var deletes = std.ArrayListUnmanaged([]const u8).empty;
-        defer deletes.deinit(self.alloc);
-
-        for (entries) |entry| {
-            if (owned_chunk_name) |chunk_name| {
-                if (internal_keys.isChunkArtifactRecordKey(entry.key) and internal_keys.matchesChunkArtifactName(entry.key, chunk_name)) {
-                    try deletes.append(self.alloc, entry.key);
-                    continue;
-                }
-                if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key) and try self.derivedEmbeddingBaseMatchesChunk(entry.key, chunk_name)) {
-                    try deletes.append(self.alloc, entry.key);
-                    continue;
-                }
-            }
-            if (owned_embedding_name) |embedding_name| {
-                if (internal_keys.isEmbeddingArtifactKey(entry.key) and internal_keys.matchesEmbeddingArtifactName(entry.key, embedding_name)) {
-                    try deletes.append(self.alloc, entry.key);
-                    continue;
-                }
-                if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key) and internal_keys.matchesDerivedEmbeddingArtifactName(entry.key, embedding_name)) {
-                    try deletes.append(self.alloc, entry.key);
-                    continue;
-                }
-            }
-        }
-
-        if (deletes.items.len > 0) try store.putBatch(&.{}, deletes.items);
     }
 
     fn derivedEmbeddingBaseMatchesChunk(self: *IndexManager, key: []const u8, chunk_name: []const u8) !bool {
@@ -7716,16 +8129,44 @@ pub const IndexManager = struct {
     }
 
     fn prepareStorageForFreshCatalogEntry(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
+        // Artifact records use public names, so a delayed retire operation and
+        // a replacement generation cannot safely mutate them concurrently.
+        if (try self.pendingGeneratedArtifactCleanupIndexForConfigAlloc(store, cfg)) |retired_name| {
+            self.alloc.free(retired_name);
+            return error.IndexArtifactCleanupPending;
+        }
         const canonical_path = try self.indexPath(cfg.name);
         defer self.alloc.free(canonical_path);
         const active_path = try self.activeIndexPath(cfg.name);
         defer self.alloc.free(active_path);
         if (!std.mem.eql(u8, active_path, canonical_path)) {
-            try deleteIndexDirIfPresentFallible(active_path);
+            self.invalidateIndexPathCaches(active_path);
+            try self.deleteIndexDirUsingIoIfPresentFallible(active_path);
         }
-        try deleteIndexDirIfPresentFallible(canonical_path);
+        self.invalidateIndexPathCaches(canonical_path);
+        try self.deleteIndexDirUsingIoIfPresentFallible(canonical_path);
         if (cfg.kind == .dense_vector) try self.deleteDenseIndexMetadata(store, cfg.name);
         try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, cfg.name);
+    }
+
+    fn invalidateIndexPathCaches(self: *const IndexManager, path: []const u8) void {
+        if (self.lsm_cache) |cache| cache.invalidatePrefix(path);
+        if (self.hbc_cache) |cache| cache.invalidatePath(path);
+    }
+
+    fn deleteIndexDirUsingIoIfPresent(self: *const IndexManager, path: []const u8) void {
+        self.deleteIndexDirUsingIoIfPresentFallible(path) catch {};
+    }
+
+    fn deleteIndexDirUsingIoIfPresentFallible(self: *const IndexManager, path: []const u8) !void {
+        if (builtin.os.tag == .freestanding) return;
+        if (self.io) |io| {
+            try std.Io.Dir.cwd().deleteTree(io, path);
+            return;
+        }
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        try std.Io.Dir.cwd().deleteTree(io_impl.io(), path);
     }
 
     fn activeIndexRootPointerPath(self: *const IndexManager, canonical_path: []const u8) ![]u8 {
@@ -7906,9 +8347,11 @@ pub const IndexManager = struct {
         const active_path = self.activeIndexPath(name) catch null;
         defer if (active_path) |path| self.alloc.free(path);
         if (active_path) |path| {
-            if (!std.mem.eql(u8, path, canonical_path)) deleteIndexDirIfPresent(path);
+            self.invalidateIndexPathCaches(path);
+            if (!std.mem.eql(u8, path, canonical_path)) self.deleteIndexDirUsingIoIfPresent(path);
         }
-        deleteIndexDirIfPresent(canonical_path);
+        self.invalidateIndexPathCaches(canonical_path);
+        self.deleteIndexDirUsingIoIfPresent(canonical_path);
     }
 
     fn pruneCanonicalIndexRootAfterPointerInstall(canonical_path: []const u8) !void {
@@ -8618,6 +9061,13 @@ pub const IndexManager = struct {
                 error.NotFound => {},
                 else => return err,
             },
+            .put_delete => |writes| {
+                try txn.put(writes.put.key, writes.put.value);
+                txn.delete(writes.delete) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+            },
         };
         try txn.commit();
     }
@@ -8640,6 +9090,13 @@ pub const IndexManager = struct {
             .delete => |key| txn.delete(key) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
+            },
+            .put_delete => |writes| {
+                try txn.put(writes.put.key, writes.put.value);
+                txn.delete(writes.delete) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
             },
         };
         try txn.commit();
@@ -14221,17 +14678,18 @@ fn isPrimaryDocumentCandidate(key: []const u8) bool {
     return true;
 }
 
-fn newCoverageGeneration() !u64 {
+fn newCoverageGeneration(runtime_io: ?std.Io) !u64 {
+    if (runtime_io) |io| return try coverage_identity.generate(io);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try coverage_identity.generate(io_impl.io());
 }
 
-fn indexConfigWithCoverageGeneration(alloc: Allocator, cfg: types.IndexConfig) !types.IndexConfig {
+fn indexConfigWithCoverageGeneration(alloc: Allocator, runtime_io: ?std.Io, cfg: types.IndexConfig) !types.IndexConfig {
     var stored_cfg = try types.IndexConfig.clone(alloc, cfg);
     errdefer stored_cfg.deinit(alloc);
     if (stored_cfg.coverage_generation == 0) {
-        stored_cfg.coverage_generation = try newCoverageGeneration();
+        stored_cfg.coverage_generation = try newCoverageGeneration(runtime_io);
     } else if (!coverage_identity.isValid(stored_cfg.coverage_generation)) {
         return error.InvalidIndexConfig;
     }
@@ -14501,7 +14959,7 @@ test "index create preserves authoritative coverage generation" {
 }
 
 test "index create rejects coverage generation outside metadata persistence domain" {
-    try std.testing.expectError(error.InvalidIndexConfig, indexConfigWithCoverageGeneration(std.testing.allocator, .{
+    try std.testing.expectError(error.InvalidIndexConfig, indexConfigWithCoverageGeneration(std.testing.allocator, null, .{
         .name = "semantic_idx",
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":3}",
@@ -16007,14 +16465,6 @@ fn deleteIndexDirIfPresent(path: []const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-}
-
-fn deleteIndexDirIfPresentFallible(path: []const u8) !void {
-    if (builtin.os.tag == .freestanding) return;
-
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    try std.Io.Dir.cwd().deleteTree(io_impl.io(), path);
 }
 
 fn repairShadowRootInProgress(path: []const u8) bool {
@@ -19963,6 +20413,15 @@ test "remove drops generated embedding artifacts while retaining reusable chunk 
     try store.put(embedding_artifact_key, "bad-artifact");
 
     try std.testing.expect(try manager.remove(&store, "semantic_idx"));
+    while (true) {
+        var result = try manager.drainGeneratedArtifactCleanupOutboxPage(&store);
+        defer result.deinit();
+        if (!result.found) break;
+        if (result.completed) {
+            try manager.finalizeRetiredIndexStorage(&store, result.index_name);
+            try store.delete(result.key);
+        }
+    }
 
     try std.testing.expect(manager.getEnrichment(.chunk, "body_chunks") != null);
     try std.testing.expect(manager.getEnrichment(.embedding, "semantic_idx") != null);
@@ -19975,6 +20434,123 @@ test "remove drops generated embedding artifacts while retaining reusable chunk 
     defer alloc.free(stored_chunk);
     try std.testing.expectEqualStrings("chunk-payload", stored_chunk);
     try std.testing.expectError(error.NotFound, store.get(alloc, embedding_artifact_key));
+}
+
+test "remove persists generated artifact cleanup debt until same-name recreation drains it" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "managed-artifact-remove-outbox");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    const cfg: types.IndexConfig = .{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"metric":"cosine","generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic_idx"}}
+        ,
+    };
+    try manager.addAllNoBackfill(&store, &.{cfg});
+    const removed_generation = manager.coverageGenerationForIndex(cfg.name) orelse return error.TestUnexpectedResult;
+
+    const embedding_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "semantic_idx");
+    defer alloc.free(embedding_artifact_key);
+    try store.put(embedding_artifact_key, "stale-generation-artifact");
+
+    var corpus_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer corpus_writes.deinit(alloc);
+    var corpus_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (corpus_keys.items) |key| alloc.free(key);
+        corpus_keys.deinit(alloc);
+    }
+    for (0..IndexManager.generated_artifact_cleanup_scan_limit + 32) |i| {
+        const doc_id = try std.fmt.allocPrint(alloc, "cleanup-page-{d:0>4}", .{i});
+        defer alloc.free(doc_id);
+        const key = try internal_keys.documentKeyAlloc(alloc, doc_id);
+        try corpus_keys.append(alloc, key);
+        try corpus_writes.append(alloc, .{ .key = key, .value = "{}" });
+    }
+    for (0..IndexManager.generated_artifact_cleanup_scan_limit + 1) |i| {
+        const dense_key = try denseVectorOrdinalMappingKey(alloc, cfg.name, @intCast(i + 1));
+        try corpus_keys.append(alloc, dense_key);
+        try corpus_writes.append(alloc, .{ .key = dense_key, .value = "dense-meta" });
+
+        const doc_id = try std.fmt.allocPrint(alloc, "coverage-page-{d:0>4}", .{i});
+        defer alloc.free(doc_id);
+        const coverage_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(
+            alloc,
+            cfg.name,
+            removed_generation,
+            doc_id,
+        );
+        try corpus_keys.append(alloc, coverage_key);
+        try corpus_writes.append(alloc, .{ .key = coverage_key, .value = "produced" });
+    }
+    try store.putBatch(corpus_writes.items, &.{});
+
+    test_inject_generated_artifact_cleanup_error = error.TestPostCommitArtifactCleanup;
+    defer test_inject_generated_artifact_cleanup_error = null;
+    try std.testing.expect(try manager.remove(&store, cfg.name));
+    test_inject_generated_artifact_cleanup_error = null;
+
+    const stale_artifact = try store.get(alloc, embedding_artifact_key);
+    defer alloc.free(stale_artifact);
+    try std.testing.expectEqualStrings("stale-generation-artifact", stale_artifact);
+
+    const cleanup_key = try internal_keys.indexArtifactCleanupKeyAlloc(alloc, cfg.name, removed_generation);
+    defer alloc.free(cleanup_key);
+    const cleanup_record = try store.get(alloc, cleanup_key);
+    alloc.free(cleanup_record);
+
+    // Fresh admission fails closed while an older generation still owns
+    // public artifact names. The bounded cleanup worker advances durable
+    // cursor pages; admission becomes safe only after the tombstone is gone.
+    try std.testing.expectError(error.IndexArtifactCleanupPending, manager.addManaged(&store, cfg, null));
+    const renamed_cfg: types.IndexConfig = .{
+        .name = "semantic_idx_v2",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"metric":"cosine","generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic_idx"}}
+        ,
+    };
+    try std.testing.expectError(error.IndexArtifactCleanupPending, manager.addManaged(&store, renamed_cfg, null));
+    var first_page = try manager.drainGeneratedArtifactCleanupOutboxPage(&store);
+    defer first_page.deinit();
+    try std.testing.expect(first_page.found);
+    try std.testing.expect(!first_page.completed);
+    var cleanup_pages: usize = 1;
+    while (true) {
+        var result = try manager.drainGeneratedArtifactCleanupOutboxPage(&store);
+        defer result.deinit();
+        if (!result.found) break;
+        cleanup_pages += 1;
+        if (result.completed) {
+            try manager.finalizeRetiredIndexStorage(&store, result.index_name);
+            try store.delete(result.key);
+        }
+    }
+    try std.testing.expect(cleanup_pages >= 6);
+    try std.testing.expectError(error.NotFound, store.get(alloc, embedding_artifact_key));
+    const dense_probe = try denseVectorOrdinalMappingKey(alloc, cfg.name, 1);
+    defer alloc.free(dense_probe);
+    try std.testing.expectError(error.NotFound, store.get(alloc, dense_probe));
+    const coverage_probe = try internal_keys.derivedCoverageOutcomeKeyAlloc(
+        alloc,
+        cfg.name,
+        removed_generation,
+        "coverage-page-0000",
+    );
+    defer alloc.free(coverage_probe);
+    try std.testing.expectError(error.NotFound, store.get(alloc, coverage_probe));
+    try std.testing.expectError(error.NotFound, store.get(alloc, cleanup_key));
+    try manager.addManaged(&store, cfg, null);
 }
 
 test "remove status-only dense config drops owned generated artifacts" {
@@ -20012,6 +20588,15 @@ test "remove status-only dense config drops owned generated artifacts" {
     try store.put(embedding_artifact_key, "embedding-payload");
 
     try std.testing.expect(try manager.remove(&store, "semantic_idx"));
+    while (true) {
+        var result = try manager.drainGeneratedArtifactCleanupOutboxPage(&store);
+        defer result.deinit();
+        if (!result.found) break;
+        if (result.completed) {
+            try manager.finalizeRetiredIndexStorage(&store, result.index_name);
+            try store.delete(result.key);
+        }
+    }
     try std.testing.expectError(error.NotFound, store.get(alloc, chunk_artifact_key));
     try std.testing.expectError(error.NotFound, store.get(alloc, embedding_artifact_key));
 

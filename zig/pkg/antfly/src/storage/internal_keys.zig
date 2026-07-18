@@ -51,6 +51,7 @@ pub const artifact_repair_summary_ready_kind: u8 = 0x28;
 pub const artifact_repair_summary_progress_kind: u8 = 0x29;
 pub const artifact_repair_summary_rebuild_kind: u8 = 0x2a;
 pub const managed_index_admission_kind: u8 = 0x2b;
+pub const index_artifact_cleanup_kind: u8 = 0x2c;
 pub const embedding_artifact_repair_issue_kind: u8 = artifact_repair_issue_kind;
 pub const identity_doc_to_ordinal_kind: u8 = 0x01;
 pub const identity_ordinal_to_doc_kind: u8 = 0x02;
@@ -549,6 +550,49 @@ pub fn managedIndexAdmissionNameAlloc(alloc: Allocator, key: []const u8) ![]u8 {
     const name_end = findComponentTerminator(key, name_start) orelse return error.InvalidInternalUserKey;
     if (name_end + 2 != key.len) return error.InvalidInternalUserKey;
     return try decodeBodyAlloc(alloc, key[name_start..name_end]);
+}
+
+pub fn indexArtifactCleanupKeyAlloc(alloc: Allocator, index_name: []const u8, coverage_generation: u64) ![]u8 {
+    if (coverage_generation == 0) return error.InvalidInternalUserKey;
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, index_artifact_cleanup_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    const generation_be = std.mem.nativeToBig(u64, coverage_generation);
+    try list.appendSlice(alloc, std.mem.asBytes(&generation_be));
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn indexArtifactCleanupRootPrefixAlloc(alloc: Allocator) ![]u8 {
+    return try alloc.dupe(u8, &[_]u8{ replay_namespace, 0xff, index_artifact_cleanup_kind });
+}
+
+pub fn indexArtifactCleanupIndexPrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, index_artifact_cleanup_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn indexArtifactCleanupNameAlloc(alloc: Allocator, key: []const u8) ![]u8 {
+    const prefix = [_]u8{ replay_namespace, 0xff, index_artifact_cleanup_kind };
+    if (!std.mem.startsWith(u8, key, &prefix)) return error.InvalidInternalUserKey;
+    const name_start = prefix.len;
+    const name_end = findComponentTerminator(key, name_start) orelse return error.InvalidInternalUserKey;
+    if (name_end + 2 + @sizeOf(u64) != key.len) return error.InvalidInternalUserKey;
+    return try decodeBodyAlloc(alloc, key[name_start..name_end]);
+}
+
+pub fn indexArtifactCleanupCoverageGeneration(key: []const u8) !u64 {
+    const prefix = [_]u8{ replay_namespace, 0xff, index_artifact_cleanup_kind };
+    if (!std.mem.startsWith(u8, key, &prefix)) return error.InvalidInternalUserKey;
+    const name_end = findComponentTerminator(key, prefix.len) orelse return error.InvalidInternalUserKey;
+    const generation_start = name_end + 2;
+    if (generation_start + @sizeOf(u64) != key.len) return error.InvalidInternalUserKey;
+    const generation = std.mem.bigToNative(u64, std.mem.bytesToValue(u64, key[generation_start..][0..@sizeOf(u64)]));
+    if (generation == 0) return error.InvalidInternalUserKey;
+    return generation;
 }
 
 pub fn artifactRepairIssueIndexPrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
@@ -1751,6 +1795,26 @@ test "managed index admission keys round trip encoded names" {
     const malformed = try std.mem.concat(alloc, u8, &.{ key, "trailing" });
     defer alloc.free(malformed);
     try std.testing.expectError(error.InvalidInternalUserKey, managedIndexAdmissionNameAlloc(alloc, malformed));
+}
+
+test "index artifact cleanup keys round trip encoded names" {
+    const alloc = std.testing.allocator;
+    const name = "dense\x00index";
+    const generation: u64 = 0x1234_5678_9abc_def0;
+    const root = try indexArtifactCleanupRootPrefixAlloc(alloc);
+    defer alloc.free(root);
+    const key = try indexArtifactCleanupKeyAlloc(alloc, name, generation);
+    defer alloc.free(key);
+    try std.testing.expect(std.mem.startsWith(u8, key, root));
+    const decoded = try indexArtifactCleanupNameAlloc(alloc, key);
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings(name, decoded);
+    try std.testing.expectEqual(generation, try indexArtifactCleanupCoverageGeneration(key));
+
+    const malformed = try std.mem.concat(alloc, u8, &.{ key, "trailing" });
+    defer alloc.free(malformed);
+    try std.testing.expectError(error.InvalidInternalUserKey, indexArtifactCleanupNameAlloc(alloc, malformed));
+    try std.testing.expectError(error.InvalidInternalUserKey, indexArtifactCleanupCoverageGeneration(malformed));
 }
 
 test "decodePrimaryDocumentKeyAlloc round-trips and rejects non-primary keys" {
