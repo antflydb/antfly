@@ -12,16 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-.{
-    .name = .antfly_platform,
-    .version = "0.0.1",
-    .fingerprint = 0x777bb317e35826e7,
-    .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
-    .paths = .{
-        "build.zig",
-        "build.zig.zon",
-        "build_support.zig",
-        "src",
-    },
+#include <stdint.h>
+#include <sys/statvfs.h>
+
+int antfly_platform_filesystem_capacity(
+    const char *path,
+    uint64_t *fragment_bytes,
+    uint64_t *blocks,
+    uint64_t *available_blocks
+) {
+    struct statvfs stat;
+    if (statvfs(path, &stat) != 0) {
+        return -1;
+    }
+
+    *fragment_bytes = (uint64_t)(stat.f_frsize != 0 ? stat.f_frsize : stat.f_bsize);
+    *blocks = (uint64_t)stat.f_blocks;
+    *available_blocks = (uint64_t)stat.f_bavail;
+    return 0;
 }
