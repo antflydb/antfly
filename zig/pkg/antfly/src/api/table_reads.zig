@@ -9886,8 +9886,11 @@ fn aggregationCanUseCurrentResult(req: db_mod.types.SearchRequest, result: db_mo
 
 fn aggregationFullResultLimit(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult, operation: []const u8) !u32 {
     try checkQueryDeadline(req);
-    if (result.total_hits_relation != .exact) return error.UnsupportedQueryRequest;
     const budget = aggregationFullResultBudget();
+    // An inexact first page is a lower bound, not a safe allocation size.
+    // Rerun up to the configured budget and require that execution to prove
+    // completeness before computing aggregations.
+    if (result.total_hits_relation != .exact) return budget;
     if (result.total_hits > budget) {
         std.log.warn("query aggregation full-result rerun budget exceeded operation={s} total_hits={d} budget={d}", .{
             operation,
@@ -9897,6 +9900,26 @@ fn aggregationFullResultLimit(req: db_mod.types.SearchRequest, result: db_mod.ty
         return error.QueryCandidateBudgetExceeded;
     }
     return result.total_hits;
+}
+
+fn requireCompleteAggregationFullResult(
+    req: db_mod.types.SearchRequest,
+    result: db_mod.types.SearchResult,
+    operation: []const u8,
+) !void {
+    try checkQueryDeadline(req);
+    if (aggregationCanUseCurrentResult(req, result)) return;
+    std.log.warn("query aggregation bounded full-result rerun remained incomplete operation={s} relation={s} total_hits={d} returned_hits={d} budget={d}", .{
+        operation,
+        @tagName(result.total_hits_relation),
+        result.total_hits,
+        result.hits.len,
+        aggregationFullResultBudget(),
+    });
+    if (result.total_hits_relation == .gte or result.total_hits >= aggregationFullResultBudget()) {
+        return error.QueryCandidateBudgetExceeded;
+    }
+    return error.UnsupportedQueryRequest;
 }
 
 fn aggregationFullResultRequest(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult, operation: []const u8) !db_mod.types.SearchRequest {
@@ -9942,7 +9965,7 @@ test "aggregation completeness requires exact total relation" {
         .total_hits = 1,
         .total_hits_relation = .gte,
     }));
-    try std.testing.expectError(error.UnsupportedQueryRequest, aggregationFullResultLimit(.{}, .{
+    try std.testing.expectEqual(aggregationFullResultBudget(), try aggregationFullResultLimit(.{}, .{
         .alloc = std.testing.allocator,
         .hits = @constCast(hits[0..]),
         .total_hits = 1,
@@ -9998,6 +10021,7 @@ fn applyBoundQueryAggregations(
     const full_req = try aggregationFullResultRequest(req, result.*, "bound");
     var full_result = try self.reads.searchWithConsistency(alloc, self.db, full_req, consistency);
     defer full_result.deinit();
+    try requireCompleteAggregationFullResult(full_req, full_result, "bound");
     return try applyAggregationResults(alloc, full_req, full_result, try aggregationContextForDb(alloc, full_req, self.db), meta);
 }
 
@@ -10024,10 +10048,31 @@ fn applyProvisionedQueryAggregations(
         }
 
         var reads = raft_mod.FeatureDBReads.init(group_ids[0], self.requester);
-        const full_req = try aggregationFullResultRequest(req, result.*, "provisioned-local");
-        var full_result = try reads.searchWithConsistency(alloc, &db, full_req, consistency);
+        const full_req = aggregationFullResultRequest(req, result.*, "provisioned-local") catch |err| {
+            std.log.warn("local aggregation full-result planning failed table={s} relation={s} total_hits={d} request_generation={?d} result_generation={?d} err={s}", .{
+                table_name,
+                @tagName(result.total_hits_relation),
+                result.total_hits,
+                req.identity_read_generation,
+                result.identity_read_generation,
+                @errorName(err),
+            });
+            return err;
+        };
+        var full_result = reads.searchWithConsistency(alloc, &db, full_req, consistency) catch |err| {
+            std.log.warn("local aggregation full-result search failed table={s} generation={?d} err={s}", .{ table_name, full_req.identity_read_generation, @errorName(err) });
+            return err;
+        };
         defer full_result.deinit();
-        return try applyAggregationResults(alloc, full_req, full_result, try aggregationContextForDb(alloc, full_req, &db), meta);
+        try requireCompleteAggregationFullResult(full_req, full_result, "provisioned-local");
+        const aggregation_ctx = aggregationContextForDb(alloc, full_req, &db) catch |err| {
+            std.log.warn("local aggregation context failed table={s} generation={?d} err={s}", .{ table_name, full_req.identity_read_generation, @errorName(err) });
+            return err;
+        };
+        return applyAggregationResults(alloc, full_req, full_result, aggregation_ctx, meta) catch |err| {
+            std.log.warn("local aggregation execution failed table={s} err={s}", .{ table_name, @errorName(err) });
+            return err;
+        };
     }
 
     if (try tryApplyProvisionedAlgebraicDistributedAggregations(self, alloc, group_ids, table_name, aggregation_req, meta)) return;
@@ -10046,6 +10091,7 @@ fn applyProvisionedQueryAggregations(
     const full_req = try aggregationFullResultRequest(req, result.*, "provisioned-distributed");
     var full_result = try queryProvisionedAcrossGroups(self, alloc, group_ids, full_req, table_name, consistency);
     defer full_result.deinit();
+    try requireCompleteAggregationFullResult(full_req, full_result, "provisioned-distributed");
     const full_agg_stats = try collectProvisionedAggregationTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, full_agg_stats);
     const full_bg_stats = try collectProvisionedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits);
@@ -10215,6 +10261,7 @@ fn applyHostedProvisionedQueryAggregations(
                 const full_req = try aggregationFullResultRequest(req, result.*, "hosted-local");
                 var full_result = try reads.searchWithConsistency(alloc, &db, full_req, consistency);
                 defer full_result.deinit();
+                try requireCompleteAggregationFullResult(full_req, full_result, "hosted-local");
                 return try applyAggregationResults(alloc, full_req, full_result, try aggregationContextForDb(alloc, full_req, &db), meta);
             },
             .remote => {},
@@ -10237,6 +10284,7 @@ fn applyHostedProvisionedQueryAggregations(
     const full_req = try aggregationFullResultRequest(req, result.*, "hosted-distributed");
     var full_result = try queryHostedAcrossGroups(self, alloc, group_ids, full_req, table_name, consistency);
     defer full_result.deinit();
+    try requireCompleteAggregationFullResult(full_req, full_result, "hosted-distributed");
     const full_agg_stats = try collectHostedAggregationTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits, consistency);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, full_agg_stats);
     const full_bg_stats = try collectHostedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits, consistency);

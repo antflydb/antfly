@@ -4854,6 +4854,21 @@ fn appendPublicFilterClausesAlloc(
     try list.append(alloc, encoded);
 }
 
+/// Canonicalizes one public filter value before an internal caller composes it
+/// with additional structured predicates. Without this boundary, wrapping a
+/// query-string filter inside a bool/conjunction makes the outer request parser
+/// treat the nested public syntax as already-canonical storage DSL.
+pub fn normalizePublicFilterQueryJsonAlloc(
+    alloc: std.mem.Allocator,
+    filter_query: std.json.Value,
+    limit: u32,
+) ![]u8 {
+    var clauses = std.ArrayListUnmanaged([]u8).empty;
+    defer deinitOwnedStringArrayList(alloc, &clauses);
+    try appendPublicFilterClausesAlloc(alloc, &clauses, filter_query, limit);
+    return try buildStructuredFilterClausesJsonAlloc(alloc, clauses.items, .all);
+}
+
 fn appendRawStructuredFilterClausesAlloc(
     alloc: std.mem.Allocator,
     list: *std.ArrayListUnmanaged([]u8),
@@ -5157,31 +5172,40 @@ fn directDslFieldValue(object: std.json.ObjectMap) ?std.json.Value {
 
 fn parseDirectDslDateRangeQueryAlloc(alloc: std.mem.Allocator, query: std.json.Value) !?db_mod.types.TextQuery {
     if (query != .object) return null;
-    if (query.object.get("start") == null and query.object.get("end") == null) return null;
-    if (query.object.get("min") != null or query.object.get("max") != null) return error.UnsupportedQueryRequest;
+    const raw_start = query.object.get("start");
+    const raw_end = query.object.get("end");
+    const start_value = if (raw_start != null and raw_start.? != .null) raw_start else null;
+    const end_value = if (raw_end != null and raw_end.? != .null) raw_end else null;
+    if (start_value == null and end_value == null) return null;
+    if ((query.object.get("min") orelse .null) != .null or (query.object.get("max") orelse .null) != .null) return error.UnsupportedQueryRequest;
     const field = directDslFieldValue(query.object) orelse return error.UnsupportedQueryRequest;
     if (field != .string) return error.UnsupportedQueryRequest;
-    const start_ns = if (query.object.get("start")) |start| blk: {
+    const start_ns = if (start_value) |start| blk: {
         if (start != .string) return error.UnsupportedQueryRequest;
         break :blk (try parseDateTimeOptionalToNs(start.string)) orelse return error.UnsupportedQueryRequest;
     } else null;
-    const end_ns = if (query.object.get("end")) |end| blk: {
+    const end_ns = if (end_value) |end| blk: {
         if (end != .string) return error.UnsupportedQueryRequest;
         break :blk (try parseDateTimeOptionalToNs(end.string)) orelse return error.UnsupportedQueryRequest;
     } else null;
+    const inclusive_start = try optionalBoolOrDefault(query.object.get("inclusive_start"), true);
+    const inclusive_end = try optionalBoolOrDefault(query.object.get("inclusive_end"), false);
     return .{ .date_range = .{
         .field = try alloc.dupe(u8, field.string),
         .start_ns = start_ns,
         .end_ns = end_ns,
-        .inclusive_start = if (query.object.get("inclusive_start")) |inclusive_start| switch (inclusive_start) {
-            .bool => inclusive_start.bool,
-            else => return error.UnsupportedQueryRequest,
-        } else true,
-        .inclusive_end = if (query.object.get("inclusive_end")) |inclusive_end| switch (inclusive_end) {
-            .bool => inclusive_end.bool,
-            else => return error.UnsupportedQueryRequest,
-        } else false,
+        .inclusive_start = inclusive_start,
+        .inclusive_end = inclusive_end,
     } };
+}
+
+fn optionalBoolOrDefault(value: ?std.json.Value, default_value: bool) !bool {
+    const item = value orelse return default_value;
+    return switch (item) {
+        .null => default_value,
+        .bool => item.bool,
+        else => error.UnsupportedQueryRequest,
+    };
 }
 
 fn parseDirectDslBoolTextQuery(alloc: std.mem.Allocator, query: std.json.Value) anyerror!db_mod.types.TextQuery {
@@ -5315,6 +5339,7 @@ fn normalizeGeneratedBleveQuery(alloc: std.mem.Allocator, query: std.json.Value)
             if (directDslFieldValue(wrapped.object)) |field| try obj.put(alloc, "field", field);
             if (wrapped.object.get("fuzziness")) |fuzziness| try obj.put(alloc, "fuzziness", fuzziness);
             if (wrapped.object.get("prefix_length")) |prefix_length| try obj.put(alloc, "prefix_length", prefix_length);
+            if (wrapped.object.get("boost")) |boost| try obj.put(alloc, "boost", boost);
             return .{ .object = obj };
         }
     }
@@ -6872,6 +6897,19 @@ test "api query contract parses direct JSON-pointer path aliases" {
     try std.testing.expectEqualStrings("gild", fuzzy_query.fuzzy.term);
     try std.testing.expectEqual(@as(u8, 1), fuzzy_query.fuzzy.prefix_len);
     try std.testing.expectEqual(@as(u8, 1), fuzzy_query.fuzzy.max_edits);
+
+    var generated_fuzzy_json = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"term":"gild","field":"/tier","prefix_length":1,"fuzziness":1,"boost":2}
+    , .{});
+    defer generated_fuzzy_json.deinit();
+    const generated_fuzzy_query = try parseSupportedFullTextQuery(alloc, generated_fuzzy_json.value, 10);
+    defer freeTextQuery(alloc, generated_fuzzy_query);
+    try std.testing.expect(generated_fuzzy_query == .fuzzy);
+    try std.testing.expectEqualStrings("/tier", generated_fuzzy_query.fuzzy.field);
+    try std.testing.expectEqualStrings("gild", generated_fuzzy_query.fuzzy.term);
+    try std.testing.expectEqual(@as(u8, 1), generated_fuzzy_query.fuzzy.prefix_len);
+    try std.testing.expectEqual(@as(u8, 1), generated_fuzzy_query.fuzzy.max_edits);
+    try std.testing.expectEqual(@as(f32, 2), generated_fuzzy_query.fuzzy.boost);
 
     var range_json = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"path":"/amount","min":10,"max":20}

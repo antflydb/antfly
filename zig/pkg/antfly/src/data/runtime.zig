@@ -4622,7 +4622,13 @@ pub const DataServer = struct {
         return try listener.baseUri(alloc);
     }
 
-    fn localShardOperationAdapter(self: *DataServer) antfly.raft.ShardOperationAdapter {
+    pub fn refreshRemoteMetadataSnapshot(self: *DataServer) !void {
+        const remote_metadata = self.remote_metadata orelse return;
+        var snapshot = try remote_metadata.fetchSnapshot();
+        freeAdminSnapshotOwned(self.alloc, &snapshot);
+    }
+
+    pub fn localShardOperationAdapter(self: *DataServer) antfly.raft.ShardOperationAdapter {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -6005,22 +6011,54 @@ pub const DataServer = struct {
     fn observeLocalSplit(self: *DataServer, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !antfly.data.SplitTransitionStatus {
         const source_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, source_group_id);
         defer self.alloc.free(source_root_dir);
+        const destination_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, destination_group_id);
+        defer self.alloc.free(destination_root_dir);
         try self.ensureSplitSourceApplyStoreSeeded(source_root_dir, source_group_id);
-        const source_namespace = try self.identityNamespaceForLocalGroup(source_group_id);
-        const source_lease = try self.leaseTransitionDbForTableGroup(source_group_id, source_group_id, source_namespace);
-        defer if (source_lease) |lease| lease.release();
-        const progress_db = if (source_lease) |lease| lease.db else return error.MissingSplitProgressStore;
-        return try antfly.data.storage.observeSplitStatus(self.alloc, .{
+        const destination_namespace = try self.identityNamespaceForSplitDestination(source_group_id, destination_group_id);
+        const destination_lease = try self.leaseTransitionDbForTableGroup(source_group_id, destination_group_id, destination_namespace);
+        defer if (destination_lease) |lease| lease.release();
+        const destination_status = antfly.data.storage.observeSplitStatus(self.alloc, .{
             .transition_id = transition_id,
             .attempt_epoch = attempt_epoch,
             .source_root_dir = source_root_dir,
-            .dest_root_dir = "",
+            .dest_root_dir = destination_root_dir,
             .source_group_id = source_group_id,
             .dest_group_id = destination_group_id,
             .source = .{ .root_dir = source_root_dir },
             .source_store = self.localTransitionApplyStore(),
-            .progress_db = progress_db,
+            .dest = .{
+                .root_dir = destination_root_dir,
+                .db = .{ .identity_namespace = destination_namespace },
+            },
+            .progress_db = if (destination_lease) |lease| lease.db else null,
         });
+        return destination_status catch |err| switch (err) {
+            // Before bootstrap publishes the destination root, status is
+            // derived from the source transition state and its zero progress
+            // watermark. Once the destination exists, all observations above
+            // are generation-owned by that destination.
+            error.FileNotFound => {
+                const source_namespace = try self.identityNamespaceForLocalGroup(source_group_id);
+                const source_lease = try self.leaseTransitionDbForTableGroup(source_group_id, source_group_id, source_namespace);
+                defer if (source_lease) |lease| lease.release();
+                return try antfly.data.storage.observeSplitStatus(self.alloc, .{
+                    .transition_id = transition_id,
+                    .attempt_epoch = attempt_epoch,
+                    .source_root_dir = source_root_dir,
+                    .dest_root_dir = source_root_dir,
+                    .source_group_id = source_group_id,
+                    .dest_group_id = destination_group_id,
+                    .source = .{ .root_dir = source_root_dir },
+                    .source_store = self.localTransitionApplyStore(),
+                    .dest = .{
+                        .root_dir = source_root_dir,
+                        .db = .{ .identity_namespace = source_namespace },
+                    },
+                    .progress_db = if (source_lease) |lease| lease.db else null,
+                });
+            },
+            else => return err,
+        };
     }
 
     fn observeReplicatedSplit(self: *DataServer, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !antfly.data.SplitTransitionStatus {
@@ -14193,12 +14231,30 @@ test "data runtime local split fallback preserves source identity namespace" {
         .source_group_id = 180,
         .destination_group_id = 181,
     } });
+    const pre_bootstrap = try ops.observeSplit(.{
+        .transition_id = 9001,
+        .attempt_epoch = 1,
+        .source_group_id = 180,
+        .destination_group_id = 181,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
+    });
+    try std.testing.expect(!pre_bootstrap.status.bootstrapped);
     try ops.execute(.{ .bootstrap_split_destination = .{
         .transition_id = 9001,
         .attempt_epoch = 1,
         .source_group_id = 180,
         .destination_group_id = 181,
     } });
+    const bootstrapped = try ops.observeSplit(.{
+        .transition_id = 9001,
+        .attempt_epoch = 1,
+        .source_group_id = 180,
+        .destination_group_id = 181,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
+    });
+    try std.testing.expect(bootstrapped.status.bootstrapped);
     try ops.execute(.{ .catch_up_split_destination = .{
         .transition_id = 9001,
         .attempt_epoch = 1,
@@ -17297,7 +17353,7 @@ test "data runtime startup catch-up clears dirty bit for terminal degraded index
     try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
     try std.testing.expect(statuses.items[0].stats.indexes[0].repair_degraded);
     try std.testing.expect(statuses.items[0].stats.indexes[0].load_error != null);
-    try std.testing.expectEqualStrings("startup catch-up open failed: FileNotFound", statuses.items[0].stats.indexes[0].load_error.?);
+    try std.testing.expectEqualStrings("FileNotFound", statuses.items[0].stats.indexes[0].load_error.?);
 }
 
 test "data runtime startup catch-up clears no-debt busy writer groups" {

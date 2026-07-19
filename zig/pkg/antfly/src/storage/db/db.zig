@@ -315,6 +315,9 @@ pub const OpenOptions = struct {
     start_optional_runtime_workers: bool = true,
     external_derived_checkpoints: bool = true,
     physical_root_mode: PhysicalRootMode = .filesystem_managed,
+    /// Optional enrichment providers. `DB.open` takes ownership of every
+    /// non-null provider when called, including when the open subsequently
+    /// fails. A successfully opened DB releases them from `close`.
     enrichment: ?enrichment_runtime_mod.Config = null,
     ttl_cleanup: ttl_runtime_mod.Config = .{},
     transaction_recovery: transaction_runtime_mod.Config = .{},
@@ -364,6 +367,21 @@ pub const OpenOptions = struct {
 };
 
 pub const OpenMode = OpenOptions.OpenMode;
+
+fn deinitOwnedEnrichmentConfig(alloc: Allocator, cfg: *enrichment_runtime_mod.Config) void {
+    if (cfg.dense_embedder) |dense_embedder| {
+        dense_embedder.deinit(alloc);
+        cfg.dense_embedder = null;
+    }
+    if (cfg.sparse_embedder) |sparse_embedder| {
+        sparse_embedder.deinit(alloc);
+        cfg.sparse_embedder = null;
+    }
+    if (cfg.asset_producer) |producer| {
+        producer.deinit(alloc);
+        cfg.asset_producer = null;
+    }
+}
 
 pub const HAAsyncEffectMirror = struct {
     primary: *ha_primary_mod.Primary,
@@ -3088,6 +3106,10 @@ pub const DB = struct {
     pub fn open(alloc: Allocator, path: []const u8, requested_opts: OpenOptions) !DB {
         return blk: {
             var opts = requested_opts;
+            // Provider interfaces are move-only. Keep them in the mutable
+            // options until a runtime has adopted them so partial opens have
+            // exactly one cleanup owner.
+            errdefer if (opts.enrichment) |*cfg| deinitOwnedEnrichmentConfig(alloc, cfg);
             if (opts.backend_runtime) |runtime| {
                 if (runtime.db_open_configurator) |configurator| {
                     try configurator.configure(path, &opts);
@@ -3293,8 +3315,14 @@ pub const DB = struct {
             db.optional_runtime_workers_enabled = optional_runtime_workers_enabled;
             if (optional_runtimes_initialized) {
                 const init_optional_started_ns = monotonicTimeNs();
-                try db.initOptionalRuntimes(opts);
+                try db.initOptionalRuntimes(&opts);
                 profile.init_optional_runtimes_ns = elapsedSince(init_optional_started_ns);
+            } else if (opts.enrichment) |*cfg| {
+                // Read-only/status and standby opens never construct an
+                // enrichment runtime, but the open contract still owns the
+                // moved providers.
+                deinitOwnedEnrichmentConfig(alloc, cfg);
+                opts.enrichment = null;
             }
 
             const admission_prefix = try internal_keys.managedIndexAdmissionRootPrefixAlloc(alloc);
@@ -3652,18 +3680,7 @@ pub const DB = struct {
     }
 
     fn deinitEnrichmentConfig(self: *DB, cfg: *enrichment_runtime_mod.Config) void {
-        if (cfg.dense_embedder) |dense_embedder| {
-            dense_embedder.deinit(self.runtime_alloc);
-            cfg.dense_embedder = null;
-        }
-        if (cfg.sparse_embedder) |sparse_embedder| {
-            sparse_embedder.deinit(self.runtime_alloc);
-            cfg.sparse_embedder = null;
-        }
-        if (cfg.asset_producer) |producer| {
-            producer.deinit(self.runtime_alloc);
-            cfg.asset_producer = null;
-        }
+        deinitOwnedEnrichmentConfig(self.runtime_alloc, cfg);
     }
 
     pub fn reconfigureEnrichmentRuntime(self: *DB, cfg: enrichment_runtime_mod.Config) !void {
@@ -3917,7 +3934,7 @@ pub const DB = struct {
         self.async_context.sparse_compaction_runtime = runtime;
     }
 
-    fn initOptionalRuntimes(self: *DB, opts: OpenOptions) !void {
+    fn initOptionalRuntimes(self: *DB, opts: *OpenOptions) !void {
         // Created before enrichment so the enrichment append context can notify
         // it when extraction artifacts land.
         try self.initResolutionRuntime();
@@ -3930,6 +3947,9 @@ pub const DB = struct {
             if (enrichment_cfg.remote_content == null) enrichment_cfg.remote_content = opts.remote_content;
             if (enrichment_cfg.resource_manager == null) enrichment_cfg.resource_manager = opts.resource_manager;
             try self.initOptionalEnrichmentRuntime(enrichment_cfg);
+            // A successful initialization transfers every provider into the
+            // runtime; later open failures are then cleaned up with the DB.
+            opts.enrichment = null;
         }
         if (opts.ttl_cleanup.enabled) {
             try self.initOptionalTtlRuntime(opts.ttl_cleanup);
@@ -11679,6 +11699,14 @@ pub const DB = struct {
 
     fn indexRepairRequired(self: *DB, alloc: Allocator, index_name: []const u8) !bool {
         if (self.core.index_manager.loadFailure(index_name) != null) return true;
+        // A durable generation intent is itself authoritative repair debt.
+        // Managed catalog admission can intentionally leave the active
+        // checkpoint clean while a shadow replacement is pending, so looking
+        // only at checkpoint/artifact state would make the ordinary named
+        // repair entry point skip work that has already been admitted and is
+        // fail-closing service. Healthy indexes still require `force` because
+        // they have neither an intent nor any of the conditions below.
+        if (try self.indexRepairIdForIndex(alloc, index_name) != null) return true;
         const checkpoint = try self.core.loadProjectionCheckpoint(alloc, index_name);
         switch (checkpoint.status) {
             .degraded, .repair_required => return true,
@@ -19218,7 +19246,7 @@ pub const DB = struct {
             AlgebraicDocFilterRequest{ .req = req };
         defer algebraic_filter.deinit();
         var execution_req = algebraic_filter.req;
-        var resolved_text_filter = try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req, .{
+        const maybe_resolved_text_filter = try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -19228,9 +19256,15 @@ pub const DB = struct {
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = execution_req.identity_read_generation,
         });
-        defer if (resolved_text_filter) |*filter| filter.deinit(alloc);
-        if (resolved_text_filter) |*filter| {
-            execution_req.resolved_text_doc_filter = filter;
+        var resolved_text_filter_storage: db_query_search.ResolvedTextDocNumFilter = undefined;
+        var has_resolved_text_filter = false;
+        defer {
+            if (has_resolved_text_filter) resolved_text_filter_storage.deinit(alloc);
+        }
+        if (maybe_resolved_text_filter) |filter| {
+            resolved_text_filter_storage = filter;
+            has_resolved_text_filter = true;
+            execution_req.resolved_text_doc_filter = &resolved_text_filter_storage;
             execution_req.filter_query_json = "";
             execution_req.exclusion_query_json = "";
         }
@@ -60531,6 +60565,50 @@ test "db managed full text admission survives restart without in-place backfill"
     }));
 
     var result = try reopened.search(alloc, .{
+        .index_name = cfg.name,
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+}
+
+test "db named repair advances managed full text admission without force" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+
+    const cfg = types.IndexConfig{
+        .name = "full_text_index_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    };
+    try std.testing.expect((try db.admitManagedFullTextIndex(cfg)) != null);
+    try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
+
+    var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .index_name = cfg.name,
+        .limit = 1,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    try std.testing.expect(!repair.debt_remaining);
+    try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+
+    var result = try db.search(alloc, .{
         .index_name = cfg.name,
         .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
     });

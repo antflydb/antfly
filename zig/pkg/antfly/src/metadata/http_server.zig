@@ -630,12 +630,9 @@ pub const AdminSource = struct {
             .split_key = req.split_key,
         });
         try flushMetadataServiceMutation(svc);
-        var committed = try svc.adminSnapshot();
-        defer svc.freeAdminSnapshot(&committed);
-        const accepted = findSplitById(committed.split_transitions, transition_id) orelse return error.SplitInProgress;
-        if (!splitRequestMatches(accepted, transition_id, source_group_id, destination_group_id, req.split_key)) {
-            return error.SplitInProgress;
-        }
+        // This route returns 202: a successful durable proposal is the
+        // acceptance boundary. Projection is asynchronous, so requiring the
+        // transition to be visible here spuriously rejects a valid admission.
     }
 
     fn metadataServiceRequestMerge(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: MergeRequest) !void {
@@ -952,12 +949,8 @@ pub const AdminSource = struct {
             .split_key = req.split_key,
         });
         try flushMetadataHttpServiceMutation(svc);
-        var committed = try svc.adminSnapshot();
-        defer svc.freeAdminSnapshot(&committed);
-        const accepted = findSplitById(committed.split_transitions, transition_id) orelse return error.SplitInProgress;
-        if (!splitRequestMatches(accepted, transition_id, source_group_id, destination_group_id, req.split_key)) {
-            return error.SplitInProgress;
-        }
+        // A 202 acknowledges the durable proposal. The Raft apply/projection
+        // boundary is asynchronous and must be observed through status APIs.
     }
 
     fn metadataHttpServiceRequestMerge(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: MergeRequest) !void {

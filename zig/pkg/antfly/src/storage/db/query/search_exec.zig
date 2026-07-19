@@ -1829,14 +1829,14 @@ pub fn resolveStructuredDocFilterForComposedAlloc(
     defer cache.deinit(alloc);
 
     var out = doc_set.ResolvedDocFilter{};
-    errdefer out.deinit(alloc);
+    var owns_out = true;
+    defer if (owns_out) out.deinit(alloc);
     var changed = false;
 
     if (req.filter_query_json.len > 0) {
         var include = (try collectStructuredFilterResolvedDocSetCachedAlloc(alloc, req, active_executor, &cache, req.filter_query_json)) orelse return null;
         defer include.deinit(alloc);
-        var next_include = (try doc_set.intersectAlloc(alloc, &out.include, &include)) orelse return null;
-        errdefer next_include.deinit(alloc);
+        const next_include = (try doc_set.intersectAlloc(alloc, &out.include, &include)) orelse return null;
         out.include.deinit(alloc);
         out.include = next_include;
         changed = true;
@@ -1845,14 +1845,15 @@ pub fn resolveStructuredDocFilterForComposedAlloc(
     if (req.exclusion_query_json.len > 0) {
         var exclude = (try collectStructuredFilterResolvedDocSetCachedAlloc(alloc, req, active_executor, &cache, req.exclusion_query_json)) orelse return null;
         defer exclude.deinit(alloc);
-        var next_exclude = (try doc_set.unionAlloc(alloc, &out.exclude, &exclude)) orelse return null;
-        errdefer next_exclude.deinit(alloc);
+        const next_exclude = (try doc_set.unionAlloc(alloc, &out.exclude, &exclude)) orelse return null;
         out.exclude.deinit(alloc);
         out.exclude = next_exclude;
         changed = true;
     }
 
-    return if (changed) out else null;
+    if (!changed) return null;
+    owns_out = false;
+    return out;
 }
 
 pub fn resolveStructuredTextDocNumFilterForComposedAlloc(
@@ -1872,7 +1873,8 @@ pub fn resolveStructuredTextDocNumFilterForComposedAlloc(
     if (!all_visible) return null;
 
     var out = ResolvedTextDocNumFilter{};
-    errdefer out.deinit(alloc);
+    var owns_out = true;
+    defer if (owns_out) out.deinit(alloc);
     var changed = false;
 
     if (req.filter_query_json.len > 0) {
@@ -1889,7 +1891,9 @@ pub fn resolveStructuredTextDocNumFilterForComposedAlloc(
         changed = true;
     }
 
-    return if (changed) out else null;
+    if (!changed) return null;
+    owns_out = false;
+    return out;
 }
 
 const StructuredFilterDocSetCache = struct {
@@ -11142,11 +11146,18 @@ pub fn searchTextQuery(
 
         owns_hits = false;
         const postprocess_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
+        const exhaustive_candidate_window = paging.offset == 0 and
+            paging.limit >= full_candidate_limit and
+            result.hits.len == @as(usize, result.total_hits);
         var out = try executor.postprocess(executor.ctx, alloc, postprocess_req, .{
             .alloc = alloc,
             .hits = hits,
             .total_hits = result.total_hits,
-            .total_hits_relation = switch (result.total_hits_relation) {
+            // The scorer may conservatively label a top-k count as `gte`.
+            // When k covers the complete candidate upper bound and every
+            // reported match was returned, the query layer has a stronger
+            // exactness proof. Limited pages keep the scorer's relation.
+            .total_hits_relation = if (exhaustive_candidate_window) .exact else switch (result.total_hits_relation) {
                 .exact => .exact,
                 .gte => .gte,
             },

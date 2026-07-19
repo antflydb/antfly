@@ -7497,7 +7497,10 @@ pub const ProvisionedTableWriteSource = struct {
             metadata.index_repair_options,
         );
         self.retireReadersAfterIndexRepairCompletion(table_name, result);
-        if (result.index_repair_attempted or result.index_repair_repaired or result.terminal_degraded) {
+        if (result.terminal_degraded) {
+            // catchUpManagedDb publishes the terminal observation with startup
+            // provenance. Do not relabel it as a fresh live-writer snapshot.
+        } else if (result.index_repair_attempted or result.index_repair_repaired) {
             // Repair completion changes durable lifecycle fields that the
             // bounded best-effort overlay intentionally does not reload. Take
             // one authoritative snapshot at that boundary so a removed repair
@@ -8342,12 +8345,40 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
     ) !?runtime_status.LocalTableRuntimeStatuses {
+        if (self.runtime_status_cache == null) {
+            // Standalone/uncached sources have no owner-published status plane
+            // to consult. Their caller holds status admission, so a cold
+            // read-only inspection is serialized with structural publication
+            // without opening a competing writer or changing cache semantics.
+            var recovered = (try snapshotLocalTableRuntimeStatusesUncachedMode(
+                alloc,
+                self.catalog,
+                self.replica_root_dir,
+                self.backend_runtime,
+                table_name,
+                .status_only,
+            )) orelse return null;
+            errdefer recovered.deinit(alloc);
+            if (runtimeStatusesNeedColdVisibilityRefresh(&recovered)) {
+                recovered.deinit(alloc);
+                recovered = (try snapshotLocalTableRuntimeStatusesUncachedMode(
+                    alloc,
+                    self.catalog,
+                    self.replica_root_dir,
+                    self.backend_runtime,
+                    table_name,
+                    .query_readonly,
+                )) orelse return null;
+            }
+            markRecoveredRuntimeStatuses(&recovered);
+            return recovered;
+        }
         // Keep the hot HTTP status path on the cached status plane. After a
         // process restart the cache is empty, or can contain only a synthetic
         // dense placeholder; recover once from durable status snapshots, and
         // only load query-visible index state when the cheap snapshot is
         // clearly missing dense visibility for existing primary documents.
-        const snapshot_cache = self.runtime_status_cache orelse return null;
+        const snapshot_cache = self.runtime_status_cache.?;
         var cached = (try snapshot_cache.snapshot(alloc, table_name)) orelse return try self.recoverRuntimeStatusesFromStorage(alloc, table_name);
         errdefer cached.deinit(alloc);
         const needs_cold_refresh = runtimeStatusesNeedColdVisibilityRefresh(&cached);
@@ -9484,17 +9515,10 @@ pub const ProvisionedTableWriteSource = struct {
             defer if (cached_active) cached.deinit(alloc);
 
             if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
-            if (configured_indexes_storage) |configured_indexes| {
-                if (metadata.target_index_name == null) {
-                    for (configured_indexes.items) |item| {
-                        _ = cached.db.deleteIndex(item.name) catch |err| switch (err) {
-                            error.IndexNotFound => {},
-                            else => return err,
-                        };
-                    }
-                }
-            }
             if (metadata.indexes_json) |indexes_json| {
+                // Reconciliation owns the desired-state diff. Pre-deleting
+                // configured names would turn an unchanged generation into a
+                // destructive rebuild and race its durable cleanup fence.
                 _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
                     .drain_resolver_backfill = false,
                 });
@@ -9589,17 +9613,9 @@ pub const ProvisionedTableWriteSource = struct {
         defer db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
         if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, &db, schema_json);
-        if (configured_indexes_storage) |configured_indexes| {
-            if (metadata.target_index_name == null) {
-                for (configured_indexes.items) |item| {
-                    _ = db.deleteIndex(item.name) catch |err| switch (err) {
-                        error.IndexNotFound => {},
-                        else => return err,
-                    };
-                }
-            }
-        }
         if (metadata.indexes_json) |indexes_json| {
+            // Preserve matching generations and let the provisioner retire
+            // only definitions whose desired configuration actually changed.
             _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
                 .drain_resolver_backfill = false,
             });
@@ -9927,7 +9943,6 @@ pub const ProvisionedTableWriteSource = struct {
                 try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
                 if (indexes_json) |value| {
                     _ = try metadata_table_provisioner.reconcileDbIndexes(alloc, cached.db, value);
-                    try rebuildEmptyVersionedFullTextIndexesAfterSchemaUpdate(alloc, cached.db, value);
                 }
                 try drainManagedDbBeforeClose(cached.db);
                 try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db);
@@ -9953,7 +9968,6 @@ pub const ProvisionedTableWriteSource = struct {
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try applyLocalTableSchemaJson(alloc, &db, schema_json);
-            if (indexes_json) |value| try rebuildEmptyVersionedFullTextIndexesAfterSchemaUpdate(alloc, &db, value);
             try drainManagedDbBeforeClose(&db);
             try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, &db);
         }
@@ -14347,8 +14361,7 @@ fn applyIndexCreateToCachedDb(
     var enrichments = try createManagedDbEnrichments(db.runtime_alloc, indexes_json, backend_runtime, antfly_provider, inference_api_url, secret_store, remote_content);
     errdefer enrichments.deinit(db.runtime_alloc);
     if (enrichments.enabled()) {
-        try db.reconfigureEnrichmentRuntime(enrichments.config());
-        enrichments.forgetTransferred();
+        try db.reconfigureEnrichmentRuntime(enrichments.takeConfig());
     }
     try reconcileDbArtifactEnrichmentsFromIndexesJson(alloc, db, indexes_json);
     db.addIndex(.{
@@ -15450,6 +15463,12 @@ const ManagedDbEnrichmentSet = struct {
         self.asset_runtime = null;
         self.generated = false;
     }
+
+    fn takeConfig(self: *@This()) db_mod.enrichment_runtime.Config {
+        const owned = self.config();
+        self.forgetTransferred();
+        return owned;
+    }
 };
 
 fn createManagedDbEnrichments(
@@ -15745,9 +15764,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
     }.run;
 
     var db = blk: {
-        const enrichment_cfg = if (enrichments.enabled()) enrichments.config() else null;
+        const enrichment_cfg = if (enrichments.enabled()) enrichments.takeConfig() else null;
         const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace, options);
-        enrichments.forgetTransferred();
         break :blk opened;
     };
     var db_open = true;
@@ -15755,6 +15773,15 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
 
     try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
     if (mode == .status_only or mode == .query_readonly) return db;
+
+    if (mode == .startup_catch_up and db.core.index_manager.hasLoadFailures()) {
+        // Startup maintenance must preserve the failed generation so status
+        // publication and repair discovery can report the original failure.
+        // Catalog reconciliation is a structural-owner responsibility; doing
+        // it here could delete a quarantined index and immediately collide
+        // with the durable same-name cleanup fence.
+        return db;
+    }
 
     const summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
         .drain_resolver_backfill = options.drain_resolver_backfill,
@@ -15769,9 +15796,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
         else
             try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.inference_api_url, secret_store, remote_content);
         db = blk: {
-            const enrichment_cfg = if (enrichments.enabled()) enrichments.config() else null;
+            const enrichment_cfg = if (enrichments.enabled()) enrichments.takeConfig() else null;
             const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace, options);
-            enrichments.forgetTransferred();
             break :blk opened;
         };
         db_open = true;
@@ -16058,6 +16084,11 @@ const RuntimeStatusSnapshotMode = enum {
     diagnostic,
 };
 
+const RuntimeStatusPublicationKind = enum {
+    runtime,
+    terminal_startup,
+};
+
 fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
     source: *ProvisionedTableWriteSource,
     alloc: std.mem.Allocator,
@@ -16084,6 +16115,33 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
         publication_token,
         phase,
         mode,
+        .runtime,
+        db,
+    );
+}
+
+fn publishTerminalStartupRuntimeStatusSnapshot(
+    source: *ProvisionedTableWriteSource,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    group_id: u64,
+    db: *db_mod.DB,
+) !void {
+    const snapshot_cache = source.runtime_status_cache orelse return;
+    const publication_token = try snapshot_cache.capturePublicationToken(table_name);
+    const visible_root_generation = source.visibleRootGeneration(group_id);
+    const opened_root_generation = db.core.index_manager.lsm_root_generation;
+    if (opened_root_generation != visible_root_generation) return;
+    try publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
+        snapshot_cache,
+        alloc,
+        table_name,
+        group_id,
+        opened_root_generation,
+        publication_token,
+        .idle,
+        .consistent,
+        .terminal_startup,
         db,
     );
 }
@@ -16105,6 +16163,7 @@ fn publishRuntimeStatusSnapshotToCacheConsistent(
         publication_token,
         .idle,
         .consistent,
+        .runtime,
         db,
     );
 }
@@ -16118,6 +16177,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
     publication_token: runtime_status.TableRuntimeSnapshotCache.PublicationToken,
     phase: db_mod.types.StartupCatchUpPhase,
     mode: RuntimeStatusSnapshotMode,
+    publication_kind: RuntimeStatusPublicationKind,
     db: *db_mod.DB,
 ) !void {
     const async_stats = db.snapshotAsyncIndexingStats();
@@ -16243,7 +16303,10 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
         markClearedStartupRuntimeStatus(&status);
         try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, status);
     } else {
-        markRuntimeStatusFromDb(&status, phase);
+        if (publication_kind == .terminal_startup)
+            markStartupRuntimeStatus(&status, startup)
+        else
+            markRuntimeStatusFromDb(&status, phase);
         status.metadata.lsm_root_generation = lsm_root_generation;
         try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, status);
     }
@@ -17175,7 +17238,7 @@ fn catchUpManagedDb(
         };
     }
     if (repair_summary.terminal != 0) {
-        try publishRuntimeStatusSnapshotWithStartupPhaseMode(source, alloc, table_name, group_id, .idle, .consistent, db);
+        try publishTerminalStartupRuntimeStatusSnapshot(source, alloc, table_name, group_id, db);
         return .{
             .had_debt = true,
             .terminal_degraded = true,
@@ -17183,7 +17246,7 @@ fn catchUpManagedDb(
         };
     }
     if (try managedDbHasIndexLoadFailure(alloc, db)) {
-        try publishRuntimeStatusSnapshotWithStartupPhaseMode(source, alloc, table_name, group_id, .idle, .consistent, db);
+        try publishTerminalStartupRuntimeStatusSnapshot(source, alloc, table_name, group_id, db);
         return .{
             .had_debt = true,
             .terminal_degraded = true,
@@ -17711,47 +17774,6 @@ fn applyLocalTableSchemaJson(
 
     try db.setSchema(runtime_schema);
     try db.core.store.put(local_schema_json_key, schema_json);
-}
-
-fn rebuildEmptyVersionedFullTextIndexesAfterSchemaUpdate(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    indexes_json: []const u8,
-) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, if (indexes_json.len == 0) "{}" else indexes_json, .{});
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidTableIndexMetadata,
-    };
-
-    const stats = try db.stats(alloc);
-    defer db_mod.types.freeDBStats(alloc, stats);
-
-    var it = root.iterator();
-    while (it.next()) |entry| {
-        const index_name = entry.key_ptr.*;
-        if (!std.mem.startsWith(u8, index_name, "full_text_index_v")) continue;
-        if ((try parseIndexKind(entry.value_ptr.*)) != .full_text) continue;
-        const current = findDbIndexStats(stats.indexes, index_name) orelse continue;
-        if (current.doc_count != 0) continue;
-
-        _ = try db.deleteIndex(index_name);
-        const config_json = try extractIndexConfigJson(alloc, index_name, entry.value_ptr.*);
-        defer alloc.free(config_json);
-        try db.addIndex(.{
-            .name = index_name,
-            .kind = .full_text,
-            .config_json = config_json,
-        });
-    }
-}
-
-fn findDbIndexStats(indexes: []const db_mod.types.DBIndexStats, index_name: []const u8) ?db_mod.types.DBIndexStats {
-    for (indexes) |index| {
-        if (std.mem.eql(u8, index.name, index_name)) return index;
-    }
-    return null;
 }
 
 fn loadTableIndexesJson(
@@ -30397,7 +30419,7 @@ test "managed startup catch-up marks FileNotFound index open terminal degraded" 
     try std.testing.expectEqual(@as(usize, 1), status.stats.indexes.len);
     try std.testing.expect(status.stats.indexes[0].repair_degraded);
     try std.testing.expect(status.stats.indexes[0].load_error != null);
-    try std.testing.expectEqualStrings("startup catch-up open failed: FileNotFound", status.stats.indexes[0].load_error.?);
+    try std.testing.expectEqualStrings("FileNotFound", status.stats.indexes[0].load_error.?);
 }
 
 test "managed startup catch-up preserves restore repair debt while index load is terminal" {

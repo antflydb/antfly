@@ -220,6 +220,18 @@ pub const ManagedHostService = struct {
         return null;
     }
 
+    pub fn replaceTransitionOps(self: *ManagedHostService, ops: shard_ops.ShardOperationAdapter) !void {
+        if (self.transition_svc) |*transition_svc| transition_svc.deinit();
+        self.transition_svc = null;
+        self.transition_svc = transition_service.TransitionService.initWithRetryClock(self.alloc, ops, self.transition_retry_clock);
+        errdefer {
+            if (self.transition_svc) |*transition_svc| transition_svc.deinit();
+            self.transition_svc = null;
+        }
+        try self.seedTransitionsFromMetadataStore(self.host.host.cfg.metadata_group_id);
+        self.syncTransitionMetrics();
+    }
+
     pub fn prepareEnrichmentRead(
         self: *ManagedHostService,
         group_id: u64,

@@ -4189,6 +4189,7 @@ pub fn build(b: *std.Build) void {
         "api http server retries stale metadata table-exists restore race",
         "api http server retries interrupted metadata restore publication",
         "public API request body limit matches Go linear merge contract",
+        "api query contract parses direct JSON-pointer path aliases",
         "public api smoke e2e creates table inserts and queries documents",
         "public api e2e recreates managed embeddings index after corrupt artifact",
         "public api split e2e uses distributed global text stats for bm25 and significant_terms",

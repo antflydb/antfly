@@ -2012,7 +2012,13 @@ pub const MetadataService = struct {
         if (self.local_replica_root_reconcile_permit_hook) |hook| {
             if (!hook.shouldReconcile()) return .{};
         }
-        const summary = try metadata_table_provisioner.reconcileReplicaRootWithOptions(
+        const summary: metadata_table_provisioner.ProvisionSummary = if (self.local_replica_root_reconcile_hook) |hook| owner: {
+            // A configured hook is the local writer owner. Delegating avoids
+            // opening a second DB writer and then notifying the owner after
+            // the mutation has already happened.
+            try hook.run();
+            break :owner .{};
+        } else try metadata_table_provisioner.reconcileReplicaRootWithOptions(
             self.alloc,
             replica_root_dir,
             self.metadata_group_id,
@@ -2023,7 +2029,6 @@ pub const MetadataService = struct {
                 .backend_runtime = try self.ensureBackendRuntime(),
             },
         );
-        if (self.local_replica_root_reconcile_hook) |hook| try hook.run();
         self.local_table_provisioning_fingerprint = fingerprint;
         try self.refreshLocalRestoreProgress(group_ids, tables, ranges);
         self.local_schema_progress_epoch = null;
@@ -3941,7 +3946,10 @@ pub const MetadataHttpService = struct {
         if (self.local_replica_root_reconcile_permit_hook) |hook| {
             if (!hook.shouldReconcile()) return .{};
         }
-        const summary = try metadata_table_provisioner.reconcileReplicaRootWithOptions(
+        const summary: metadata_table_provisioner.ProvisionSummary = if (self.local_replica_root_reconcile_hook) |hook| owner: {
+            try hook.run();
+            break :owner .{};
+        } else try metadata_table_provisioner.reconcileReplicaRootWithOptions(
             self.alloc,
             replica_root_dir,
             self.metadata_group_id,
@@ -3952,7 +3960,6 @@ pub const MetadataHttpService = struct {
                 .backend_runtime = try self.ensureBackendRuntime(),
             },
         );
-        if (self.local_replica_root_reconcile_hook) |hook| try hook.run();
         self.local_table_provisioning_fingerprint = fingerprint;
         try self.refreshLocalRestoreProgress(group_ids, inputs.tables, inputs.ranges, inputs.restore_progresses);
         self.local_schema_progress_epoch = null;
