@@ -22,6 +22,7 @@ const backup_restore = @import("../raft/storage/backup_restore.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
+const internal_keys = @import("../storage/internal_keys.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const coverage_policy = @import("../api/coverage_policy.zig");
 const indexes_api = @import("../api/indexes.zig");
@@ -38,12 +39,27 @@ pub const ProvisionSummary = struct {
     dbs_opened: usize = 0,
     indexes_added: usize = 0,
     indexes_removed: usize = 0,
+    indexes_pending: usize = 0,
     enrichments_added: usize = 0,
     enrichments_updated: usize = 0,
     enrichments_removed: usize = 0,
     resolvers_added: usize = 0,
     resolvers_updated: usize = 0,
     resolvers_removed: usize = 0,
+
+    pub fn merge(self: *@This(), other: @This()) void {
+        self.groups_considered += other.groups_considered;
+        self.dbs_opened += other.dbs_opened;
+        self.indexes_added += other.indexes_added;
+        self.indexes_removed += other.indexes_removed;
+        self.indexes_pending += other.indexes_pending;
+        self.enrichments_added += other.enrichments_added;
+        self.enrichments_updated += other.enrichments_updated;
+        self.enrichments_removed += other.enrichments_removed;
+        self.resolvers_added += other.resolvers_added;
+        self.resolvers_updated += other.resolvers_updated;
+        self.resolvers_removed += other.resolvers_removed;
+    }
 
     pub fn indexManagerCatalogChanged(self: @This()) bool {
         return self.indexes_added > 0 or
@@ -183,14 +199,7 @@ pub fn reconcileReplicaRootWithOptions(
         defer db.close();
         summary.dbs_opened += 1;
         const index_summary = try reconcileDbIndexes(alloc, &db, table.indexes_json);
-        summary.indexes_removed += index_summary.indexes_removed;
-        summary.indexes_added += index_summary.indexes_added;
-        summary.enrichments_added += index_summary.enrichments_added;
-        summary.enrichments_updated += index_summary.enrichments_updated;
-        summary.enrichments_removed += index_summary.enrichments_removed;
-        summary.resolvers_added += index_summary.resolvers_added;
-        summary.resolvers_updated += index_summary.resolvers_updated;
-        summary.resolvers_removed += index_summary.resolvers_removed;
+        summary.merge(index_summary);
     }
     return summary;
 }
@@ -262,6 +271,7 @@ pub fn reconcileDbIndexesWithOptions(
         .dbs_opened = 0,
         .indexes_added = index_summary.added,
         .indexes_removed = indexes_removed,
+        .indexes_pending = index_summary.pending,
         .enrichments_added = enrichment_summary.added,
         .enrichments_updated = enrichment_summary.updated,
         .enrichments_removed = enrichments_removed,
@@ -574,6 +584,7 @@ fn removeMissingIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: 
 const IndexEnsureSummary = struct {
     added: usize = 0,
     removed: usize = 0,
+    pending: usize = 0,
 };
 
 fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !IndexEnsureSummary {
@@ -629,11 +640,18 @@ fn ensureIndexDefinition(
     else
         try extractIndexConfigJsonForKind(alloc, name, kind, config_value);
     defer alloc.free(config_json);
+    const configured_coverage_generation = coverage_policy.incarnation(config_value) orelse 0;
     const desired = db_mod.types.IndexConfig{
         .name = name,
         .kind = kind,
         .config_json = config_json,
-        .coverage_generation = coverage_policy.incarnation(config_value) orelse 0,
+        // The catalog persists the effective derived generation. Normalize
+        // desired state at the same boundary so a reopen cannot misclassify
+        // an unchanged vector index as a replacement.
+        .coverage_generation = if (kind == .dense_vector or kind == .sparse_vector)
+            internal_keys.derivedCoverageGenerationForConfig(configured_coverage_generation, config_json)
+        else
+            configured_coverage_generation,
     };
     const existing = findIndexConfig(current, name);
     if (existing) |existing_cfg| {
@@ -650,7 +668,16 @@ fn ensureIndexDefinition(
             }
             return;
         }
-        if (try db.deleteIndex(desired.name)) summary.removed += 1;
+        if (try db.deleteIndex(desired.name)) {
+            summary.removed += 1;
+            summary.pending += 1;
+            // Retirement publishes a durable cleanup tombstone. Re-admitting
+            // the same artifact namespace in this pass would either race the
+            // owner or require an unbounded request-thread corpus scan. The
+            // cleanup owner advances the tombstone in bounded pages and the
+            // next idempotent reconcile admits the desired generation.
+            return;
+        }
     }
     const admitted = db_mod.types.IndexConfig{
         .name = desired.name,
@@ -658,10 +685,23 @@ fn ensureIndexDefinition(
         .config_json = desired.config_json,
         .coverage_generation = desired.coverage_generation,
     };
-    if (desired.kind == .full_text)
-        _ = try db.admitManagedFullTextIndex(admitted)
-    else
-        try db.addIndex(admitted);
+    if (desired.kind == .full_text) {
+        _ = db.admitManagedFullTextIndex(admitted) catch |err| switch (err) {
+            error.IndexArtifactCleanupPending => {
+                summary.pending += 1;
+                return;
+            },
+            else => return err,
+        };
+    } else {
+        db.addIndex(admitted) catch |err| switch (err) {
+            error.IndexArtifactCleanupPending => {
+                summary.pending += 1;
+                return;
+            },
+            else => return err,
+        };
+    }
     summary.added += 1;
 }
 
@@ -1457,9 +1497,19 @@ test "table provisioner replaces embedding index when metadata incarnation chang
     const initial = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, first, .{});
     try std.testing.expectEqual(@as(usize, 1), initial.indexes_added);
 
-    const replaced = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, second, .{});
-    try std.testing.expectEqual(@as(usize, 1), replaced.indexes_removed);
-    try std.testing.expectEqual(@as(usize, 1), replaced.indexes_added);
+    const retired = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, second, .{});
+    try std.testing.expectEqual(@as(usize, 1), retired.indexes_removed);
+    try std.testing.expectEqual(@as(usize, 0), retired.indexes_added);
+    try std.testing.expectEqual(@as(usize, 1), retired.indexes_pending);
+
+    // Replacement is intentionally a multi-pass desired-state transition:
+    // the durable owner retires the old artifact namespace before a later
+    // reconcile admits the new coverage incarnation.
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    const admitted = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, second, .{});
+    try std.testing.expectEqual(@as(usize, 0), admitted.indexes_removed);
+    try std.testing.expectEqual(@as(usize, 1), admitted.indexes_added);
+    try std.testing.expectEqual(@as(usize, 0), admitted.indexes_pending);
 
     const configs = try db.listIndexes(std.testing.allocator);
     defer db_mod.types.freeIndexConfigs(std.testing.allocator, configs);

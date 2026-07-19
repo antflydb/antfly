@@ -9815,6 +9815,7 @@ pub const DataServer = struct {
             return;
         }
 
+        var indexes_pending: usize = 0;
         const fingerprint = blk: {
             const next_fingerprint = blk_fingerprint: {
                 lockAtomic(refresh_write_source.localDbMutex());
@@ -9848,7 +9849,7 @@ pub const DataServer = struct {
                     {
                         lockAtomic(refresh_write_source.localDbMutex());
                         defer refresh_write_source.localDbMutex().unlock();
-                        _ = try refresh_write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
+                        const summary = try refresh_write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
                             self.alloc,
                             head.metadata_group_id,
                             group_ids_one[0..],
@@ -9856,6 +9857,7 @@ pub const DataServer = struct {
                             snapshot.ranges,
                             backend_runtime,
                         );
+                        indexes_pending += summary.indexes_pending;
                     }
                 }
             }
@@ -9868,6 +9870,17 @@ pub const DataServer = struct {
         };
 
         self.pruneStaleVisibleWriteCaches();
+        if (indexes_pending != 0) {
+            // Same-name replacement is a bounded multi-pass transition. Keep
+            // the desired-state refresh armed while the durable cleanup owner
+            // retires the old artifact namespace; this is expected progress,
+            // not a failed metadata refresh.
+            self.last_provision_metadata_epoch = head.metadata_epoch;
+            self.last_provision_fingerprint = null;
+            self.provisioned_root_refresh_dirty.store(true, .release);
+            self.runtime_status_dirty.store(true, .release);
+            return;
+        }
         self.last_provision_fingerprint = fingerprint;
         self.last_provision_metadata_epoch = head.metadata_epoch;
         self.clearProvisionedStartupCatchUpBackoffs();

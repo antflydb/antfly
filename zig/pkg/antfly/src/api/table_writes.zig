@@ -7046,14 +7046,7 @@ pub const ProvisionedTableWriteSource = struct {
                 try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, cached.db);
                 try applyLocalTableSchemaJson(alloc, cached.db, table.schema_json);
                 const index_summary = try metadata_table_provisioner.reconcileDbIndexes(alloc, cached.db, table.indexes_json);
-                summary.indexes_removed += index_summary.indexes_removed;
-                summary.indexes_added += index_summary.indexes_added;
-                summary.enrichments_added += index_summary.enrichments_added;
-                summary.enrichments_updated += index_summary.enrichments_updated;
-                summary.enrichments_removed += index_summary.enrichments_removed;
-                summary.resolvers_added += index_summary.resolvers_added;
-                summary.resolvers_updated += index_summary.resolvers_updated;
-                summary.resolvers_removed += index_summary.resolvers_removed;
+                summary.merge(index_summary);
                 try cache.replaceTableMetadataLocked(table.name, table.indexes_json, table.schema_json);
                 continue;
             }
@@ -7076,6 +7069,13 @@ pub const ProvisionedTableWriteSource = struct {
             summary.dbs_opened += 1;
 
             try applyLocalTableSchemaJson(alloc, &opened.?, table.schema_json);
+            // The open helper performs initial desired-state reconciliation,
+            // but intentionally returns only the DB. Reconcile once more at
+            // this cache-admission boundary so a staged same-name retirement
+            // cannot lose its pending retry signal. This pass is idempotent;
+            // if cleanup already completed it admits the replacement now.
+            const index_summary = try metadata_table_provisioner.reconcileDbIndexes(alloc, &opened.?, table.indexes_json);
+            summary.merge(index_summary);
             try cache.seedCreatedDbLocked(&opened, group_id, lsm_root_generation, table.name, table.indexes_json, table.schema_json);
         }
         return summary;
@@ -9519,9 +9519,10 @@ pub const ProvisionedTableWriteSource = struct {
                 // Reconciliation owns the desired-state diff. Pre-deleting
                 // configured names would turn an unchanged generation into a
                 // destructive rebuild and race its durable cleanup fence.
-                _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
+                const reconcile_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
                     .drain_resolver_backfill = false,
                 });
+                if (reconcile_summary.indexes_pending != 0) return true;
             }
             if (configured_indexes_storage) |configured_indexes| {
                 for (configured_indexes.items) |item| {
@@ -9616,9 +9617,10 @@ pub const ProvisionedTableWriteSource = struct {
         if (metadata.indexes_json) |indexes_json| {
             // Preserve matching generations and let the provisioner retire
             // only definitions whose desired configuration actually changed.
-            _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
+            const reconcile_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
                 .drain_resolver_backfill = false,
             });
+            if (reconcile_summary.indexes_pending != 0) return true;
         }
         if (configured_indexes_storage) |configured_indexes| {
             for (configured_indexes.items) |item| {
@@ -15774,7 +15776,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
     try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
     if (mode == .status_only or mode == .query_readonly) return db;
 
-    if (mode == .startup_catch_up and db.core.index_manager.hasLoadFailures()) {
+    if ((mode == .startup_catch_up or mode == .restore_repair) and db.core.index_manager.hasLoadFailures()) {
         // Startup maintenance must preserve the failed generation so status
         // publication and repair discovery can report the original failure.
         // Catalog reconciliation is a structural-owner responsibility; doing
@@ -17055,6 +17057,19 @@ fn catchUpManagedDb(
         else => return err,
     };
     const initial_repair_debt = had_debt or restore_repair_needed or needs_dense_artifact_rebuild or initial_index_load_failure or initial_index_repair_intents;
+
+    if (restore_repair_needed and initial_index_load_failure) {
+        // Restore repair mutates every managed projection and eventually
+        // clears the table-level restore marker. A quarantined generation
+        // cannot participate in that proof, so preserve both debts and fail
+        // closed until the index repair owner has recovered (or an operator
+        // has replaced) the unavailable generation.
+        try publishTerminalStartupRuntimeStatusSnapshot(source, alloc, table_name, group_id, db);
+        return .{
+            .had_debt = true,
+            .terminal_degraded = true,
+        };
+    }
 
     var repaired_restore_runtime = false;
     var repaired_dense_artifacts: usize = 0;

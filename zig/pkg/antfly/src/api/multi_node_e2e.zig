@@ -693,6 +693,10 @@ fn startPublicApiServersWithSharedSessionStorePath(
             forward_executor.executor(),
         );
         _ = write_sources[i].withBackendRuntime(cluster.backendRuntime(i));
+        // These stateful API fixtures issue visibility assertions immediately
+        // after writes. Opt into the hosted source's explicit foreground
+        // derived-progress contract instead of depending on worker timing.
+        _ = write_sources[i].withForegroundDerivedProgress();
         servers[i] = try api_http_server.ApiHttpServer.initWithConfig(
             std.testing.allocator,
             .{
@@ -747,6 +751,7 @@ fn startPublicApiServersWithOptionalSessions(
             forward_executor,
         );
         _ = write_sources[i].withBackendRuntime(cluster.backendRuntime(i));
+        _ = write_sources[i].withForegroundDerivedProgress();
         servers[i] = api_http_server.ApiHttpServer.init(
             std.testing.allocator,
             .{

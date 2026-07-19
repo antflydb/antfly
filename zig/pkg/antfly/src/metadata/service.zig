@@ -2029,8 +2029,9 @@ pub const MetadataService = struct {
                 .backend_runtime = try self.ensureBackendRuntime(),
             },
         );
-        self.local_table_provisioning_fingerprint = fingerprint;
         try self.refreshLocalRestoreProgress(group_ids, tables, ranges);
+        if (summary.indexes_pending != 0) return summary;
+        self.local_table_provisioning_fingerprint = fingerprint;
         self.local_schema_progress_epoch = null;
         self.local_schema_progress_group_ids_fingerprint = null;
         self.last_local_schema_progress_refresh_at_ms = 0;
@@ -3960,8 +3961,9 @@ pub const MetadataHttpService = struct {
                 .backend_runtime = try self.ensureBackendRuntime(),
             },
         );
-        self.local_table_provisioning_fingerprint = fingerprint;
         try self.refreshLocalRestoreProgress(group_ids, inputs.tables, inputs.ranges, inputs.restore_progresses);
+        if (summary.indexes_pending != 0) return summary;
+        self.local_table_provisioning_fingerprint = fingerprint;
         self.local_schema_progress_epoch = null;
         self.local_schema_progress_group_ids_fingerprint = null;
         self.last_local_schema_progress_refresh_at_ms = 0;

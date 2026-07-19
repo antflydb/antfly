@@ -49399,6 +49399,7 @@ test "db managed dense delete quiesces rate-limited enrichment and recreates cle
     try std.testing.expect(monotonicTimeNs() - delete_started_ns < 2 * std.time.ns_per_s);
 
     gated.allowAll();
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
     try db.addIndex(cfg);
     try db.runUntilIdle();
 
@@ -49503,6 +49504,7 @@ test "db open quarantines dense index with unsupported artifact version" {
     // Drop + recreate recovers and clears the recorded failure.
     try std.testing.expect(try db.deleteIndex("dv_quarantine"));
     try std.testing.expect(db.core.index_manager.loadFailure("dv_quarantine") == null);
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
     try db.addIndex(dense_cfg);
     try db.runUntilIdle();
     try std.testing.expect(db.core.denseIndex("dv_quarantine") != null);
@@ -49604,6 +49606,7 @@ test "db drops quarantined dense index after persisted index directory corruptio
     try std.testing.expect(try db.deleteIndex("dv_corrupt"));
     try std.testing.expect(db.core.index_manager.loadFailure("dv_corrupt") == null);
     try std.testing.expect(db.core.index_manager.get("dv_corrupt") == null);
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
 
     var io_impl = threadedIo();
     defer io_impl.deinit();
@@ -49791,6 +49794,7 @@ test "db managed dense enrichment delete recreate recovers after corrupt artifac
     try db.core.store.put(artifact_key, "bad-artifact");
 
     try std.testing.expect(try db.deleteIndex("semantic_idx"));
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
     try db.addIndex(cfg);
     try db.runUntilIdle();
 
@@ -49864,6 +49868,7 @@ test "db managed dense enrichment delete recreate recovers after corrupt artifac
     defer reopened.close();
 
     try std.testing.expect(try reopened.deleteIndex("semantic_idx"));
+    reopened.backend_runtime.durable_jobs.drainOwner(reopened.repair_cleanup_owner_id);
     try reopened.addIndex(cfg);
     try reopened.runUntilIdle();
 
@@ -50188,6 +50193,7 @@ test "db recreated managed dense index converges replay and irrelevant resolver 
 
     try noteTargetAdvanceRepairRun(db.async_context, "dv_v1", monotonicTimeNs());
     try std.testing.expect(try db.deleteIndex("dv_v1"));
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
     try db.addIndex(config);
     try db.runUntilIdle();
 
