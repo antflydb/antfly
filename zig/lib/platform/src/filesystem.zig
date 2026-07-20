@@ -20,16 +20,12 @@ pub const capacity_supported = builtin.link_libc and switch (builtin.os.tag) {
     else => false,
 };
 
-const c = if (!capacity_supported)
-    struct {}
-else if (builtin.os.tag == .linux)
-    @cImport({
-        @cInclude("sys/statfs.h");
-    })
-else
-    @cImport({
-        @cInclude("sys/statvfs.h");
-    });
+extern fn antfly_platform_filesystem_capacity(
+    path: [*:0]const u8,
+    fragment_bytes: *u64,
+    blocks: *u64,
+    available_blocks: *u64,
+) c_int;
 
 pub const Capacity = struct {
     total_bytes: u64,
@@ -40,28 +36,23 @@ pub const Capacity = struct {
 /// contains `path`. Saturating overflow handling keeps the observation safe on
 /// unusual filesystems that report sentinel block counts.
 pub fn capacity(path: []const u8) !Capacity {
-    if (comptime !capacity_supported) return error.UnsupportedPlatform;
+    if (!capacity_supported) return error.UnsupportedPlatform;
     if (path.len > std.fs.max_path_bytes) return error.NameTooLong;
 
     var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
     @memcpy(path_buf[0..path.len], path);
     path_buf[path.len] = 0;
 
-    if (comptime builtin.os.tag == .linux) {
-        var stat: c.struct_statfs = undefined;
-        if (c.statfs(@ptrCast(&path_buf), &stat) != 0) return error.CapacityProbeFailed;
-        return capacityFromStat(stat);
-    }
+    var fragment_bytes: u64 = undefined;
+    var blocks: u64 = undefined;
+    var available_blocks: u64 = undefined;
+    if (antfly_platform_filesystem_capacity(
+        @ptrCast(&path_buf),
+        &fragment_bytes,
+        &blocks,
+        &available_blocks,
+    ) != 0) return error.CapacityProbeFailed;
 
-    var stat: c.struct_statvfs = undefined;
-    if (c.statvfs(@ptrCast(&path_buf), &stat) != 0) return error.CapacityProbeFailed;
-    return capacityFromStat(stat);
-}
-
-fn capacityFromStat(stat: anytype) Capacity {
-    const fragment_bytes: u64 = @intCast(if (stat.f_frsize != 0) stat.f_frsize else stat.f_bsize);
-    const blocks: u64 = @intCast(stat.f_blocks);
-    const available_blocks: u64 = @intCast(stat.f_bavail);
     return .{
         .total_bytes = std.math.mul(u64, fragment_bytes, blocks) catch std.math.maxInt(u64),
         .available_bytes = std.math.mul(u64, fragment_bytes, available_blocks) catch std.math.maxInt(u64),
