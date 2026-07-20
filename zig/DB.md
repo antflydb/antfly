@@ -768,14 +768,23 @@ degraded = complete and terminal_failed > 0
 
 This keeps "no work remains" distinct from "all desired outputs exist".
 
-`source_total` comes from the durable document-identity `live_ordinals`
-cardinality maintained in the primary write transaction. It is O(1) to read and
-does not depend on query-visible index entries. This distinction is required for
-chunked projections, where one source document may produce many physical vector
-entries. Distributed projections sum cardinality and outcomes only from fresh
-shard observations; `observation_complete` is false if any expected shard is
-missing, stale, remotely unknown, reports an incomplete counter summary, or
-reports a stored-config fingerprint different from the requested index config.
+`source_total` comes from a durable range-local document cardinality maintained
+in the same primary write transaction as document identity. It is O(1) to read
+and does not depend on query-visible index entries. The identity namespace and
+its `live_ordinals` summary remain shared across split descendants, so they are
+not an ownership proof for an individual shard. Split preparation and
+finalization therefore rebase both the range cardinality and each active
+generation's mutually exclusive outcome counters from the documents and
+outcome markers retained by that range. A missing range counter is recovered by
+one bounded range scan, then subsequent inserts and deletes update it by the
+identity visibility delta in the caller's atomic primary batch.
+
+This distinction is required for chunked projections, where one source document
+may produce many physical vector entries. Distributed projections sum
+cardinality and outcomes only from fresh shard observations;
+`observation_complete` is false if any expected shard is missing, stale,
+remotely unknown, reports an incomplete counter summary, or reports a
+stored-config fingerprint different from the requested index config.
 An incomplete observation can never report complete or healthy coverage and
 includes structured reasons such as `missing_group`, `stale_group`,
 `summary_unavailable`, and `config_mismatch`. The configuration fingerprint is

@@ -963,6 +963,62 @@ pub const IndexManager = struct {
         compaction_pending: bool = false,
     };
 
+    pub const OwnedFieldAnalyzer = struct {
+        field: []u8,
+        analyzer: analysis_mod.Analyzer,
+        char_filters: []analysis_mod.CharFilter,
+        filters: []analysis_mod.TokenFilter,
+
+        fn init(alloc: Allocator, field: []const u8, analyzer: *const analysis_mod.Analyzer) !OwnedFieldAnalyzer {
+            const owned_field = try alloc.dupe(u8, field);
+            errdefer alloc.free(owned_field);
+            const char_filters = try alloc.dupe(analysis_mod.CharFilter, analyzer.char_filters);
+            errdefer alloc.free(char_filters);
+            const filters = try alloc.dupe(analysis_mod.TokenFilter, analyzer.filters);
+            errdefer alloc.free(filters);
+            return .{
+                .field = owned_field,
+                .analyzer = .{
+                    .char_filters = char_filters,
+                    .tokenizer = analyzer.tokenizer,
+                    .filters = filters,
+                },
+                .char_filters = char_filters,
+                .filters = filters,
+            };
+        }
+
+        fn deinit(self: *OwnedFieldAnalyzer, alloc: Allocator) void {
+            alloc.free(self.field);
+            alloc.free(self.char_filters);
+            alloc.free(self.filters);
+            self.* = undefined;
+        }
+    };
+
+    /// Immutable resources needed by text-query work that outlives the DB's
+    /// catalog/apply lease. The persistent snapshot pins segment storage while
+    /// owned analyzer pipelines avoid borrowing schema-generation memory.
+    pub const TextQueryLease = struct {
+        alloc: Allocator,
+        snapshot: *index_mod.IndexSnapshot,
+        analyzers: []OwnedFieldAnalyzer,
+
+        pub fn analyzerForField(self: *const TextQueryLease, field: []const u8) ?*const analysis_mod.Analyzer {
+            for (self.analyzers) |*item| {
+                if (std.mem.eql(u8, item.field, field)) return &item.analyzer;
+            }
+            return null;
+        }
+
+        pub fn deinit(self: *TextQueryLease) void {
+            self.snapshot.release();
+            for (self.analyzers) |*item| item.deinit(self.alloc);
+            self.alloc.free(self.analyzers);
+            self.* = undefined;
+        }
+    };
+
     pub const ObservedDynamicFieldCapabilitySet = struct {
         index_name: []u8,
         field_capabilities: []schema_mod.FieldCapability,
@@ -5345,6 +5401,39 @@ pub const IndexManager = struct {
         return introducer_mod.resolveAnalyzerName(analyzer_name, entry.text_analysis);
     }
 
+    pub fn acquireTextQueryLease(
+        self: *IndexManager,
+        alloc: Allocator,
+        name: ?[]const u8,
+        fields: []const []const u8,
+    ) !?TextQueryLease {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+
+        const entry = self.textIndexEntry(name) orelse return null;
+        const snapshot = entry.persistent.acquireSnapshot();
+        errdefer snapshot.release();
+
+        const analyzers = try alloc.alloc(OwnedFieldAnalyzer, fields.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (analyzers[0..initialized]) |*item| item.deinit(alloc);
+            alloc.free(analyzers);
+        }
+        for (fields, 0..) |field, i| {
+            const analyzer_name = textFieldAnalyzerName(entry, field) orelse return error.InvalidIndexConfig;
+            const analyzer = introducer_mod.resolveAnalyzerName(analyzer_name, entry.text_analysis) orelse
+                return error.InvalidIndexConfig;
+            analyzers[i] = try OwnedFieldAnalyzer.init(alloc, field, analyzer);
+            initialized += 1;
+        }
+        return .{
+            .alloc = alloc,
+            .snapshot = snapshot,
+            .analyzers = analyzers,
+        };
+    }
+
     pub fn observedDynamicFieldCapabilitiesAlloc(
         self: *IndexManager,
         alloc: Allocator,
@@ -8676,7 +8765,7 @@ pub const IndexManager = struct {
                 errdefer if (!runtime_schema_moved) {
                     if (runtime_schema) |schema| schema_mod.freeSchema(self.alloc, schema);
                 };
-                var text_analysis = parseTextAnalysisForTextIndex(self.alloc, cfg.config_json, runtime_schema) catch |err| {
+                var text_analysis = parseTextAnalysisForIndexConfig(self.alloc, cfg.config_json, runtime_schema) catch |err| {
                     std.log.warn("full_text open failed step=text_analysis name={s} err={s}", .{
                         cfg.name,
                         @errorName(err),
@@ -15522,7 +15611,7 @@ fn parseTextConfig(alloc: Allocator, raw: []const u8) !TextConfig {
     };
 }
 
-fn parseTextAnalysisForTextIndex(
+pub fn parseTextAnalysisForIndexConfig(
     alloc: Allocator,
     raw: []const u8,
     runtime_schema: ?schema_mod.TableSchema,
@@ -19278,6 +19367,43 @@ test "observed full text analyzers publish shared dictionary ownership" {
         algebraic_mod.lexical.RegistryClaim.owned_by_other,
         try algebraic_mod.lexical.claimRegistryOwnerTxn(alloc, &txn, identity, "algebraic:path-promotion", .lexicon_postings_rows, "ready"),
     );
+}
+
+test "text query lease retains snapshot and analyzer across catalog removal" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"analysis_config\":{\"field_analyzers\":{\"body\":\"keyword\"}}}",
+    }});
+    try manager.indexBatch(&store, &.{.{
+        .key = "doc:a",
+        .value = "{\"body\":\"New York\"}",
+    }});
+
+    var lease = (try manager.acquireTextQueryLease(alloc, "ft_v1", &.{"body"})).?;
+    defer lease.deinit();
+    try std.testing.expect(try manager.remove(&store, "ft_v1"));
+
+    const analyzer = lease.analyzerForField("body") orelse return error.TestExpectedEqual;
+    const tokens = try analyzer.analyze(alloc, "New York");
+    defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
+    try std.testing.expectEqual(@as(usize, 1), tokens.len);
+    try std.testing.expectEqualStrings("New York", tokens[0].term);
+    try std.testing.expectEqual(@as(u32, 1), try lease.snapshot.termDocFreq(alloc, "body", "New York"));
 }
 
 test "observed dynamic sortable field capability reports covered queryable state" {

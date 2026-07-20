@@ -40,6 +40,8 @@ const hbc_mod = @import("../storage/hbc_adapter.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const db_query_search = @import("../storage/db/query/search_exec.zig");
+const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
+const introducer_mod = @import("../introducer.zig");
 const graph_mod = @import("../graph/graph.zig");
 const graph_paths = @import("../graph/paths.zig");
 const graph_query_mod = @import("../graph/query.zig");
@@ -106,7 +108,8 @@ fn aggregationFullResultBudgetFromRaw(raw: ?[*:0]u8) u32 {
     const slice = std.mem.span(value);
     if (slice.len == 0) return default_aggregation_full_result_budget;
     const parsed = std.fmt.parseUnsigned(u32, slice, 10) catch return default_aggregation_full_result_budget;
-    return if (parsed == 0) std.math.maxInt(u32) else parsed;
+    if (parsed == 0) return default_aggregation_full_result_budget;
+    return @min(parsed, @as(u32, @intCast(db_mod.aggregations.max_aggregation_source_hits)));
 }
 
 fn aggregationFullResultBudget() u32 {
@@ -6895,6 +6898,60 @@ fn loadTableIndexesJson(
     return try alloc.dupe(u8, table.indexes_json);
 }
 
+fn catalogValueIsFullTextIndex(value: std.json.Value) !bool {
+    if (value != .object) return error.InvalidTableIndexMetadata;
+    const kind = value.object.get("type") orelse return true;
+    if (kind != .string) return error.InvalidTableIndexMetadata;
+    return std.mem.eql(u8, kind.string, "full_text");
+}
+
+fn loadTableAggregationTextAnalysis(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    requested_index_name: ?[]const u8,
+) !introducer_mod.TextAnalysisConfig {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+
+    var parsed_indexes = try std.json.parseFromSlice(std.json.Value, alloc, table.indexes_json, .{});
+    defer parsed_indexes.deinit();
+    if (parsed_indexes.value != .object) return error.InvalidTableIndexMetadata;
+    const indexes = parsed_indexes.value.object;
+
+    var selected: ?std.json.Value = null;
+    if (requested_index_name) |name| {
+        if (indexes.get(name)) |value| {
+            if (try catalogValueIsFullTextIndex(value)) selected = value;
+        }
+    }
+    if (selected == null) {
+        if (indexes.get(tables_api.default_full_text_index_name)) |value| {
+            if (try catalogValueIsFullTextIndex(value)) selected = value;
+        }
+    }
+    if (selected == null) {
+        var it = indexes.iterator();
+        while (it.next()) |entry| {
+            if (!try catalogValueIsFullTextIndex(entry.value_ptr.*)) continue;
+            if (selected != null) return error.InvalidQueryRequest;
+            selected = entry.value_ptr.*;
+        }
+    }
+    const config_json = try std.json.Stringify.valueAlloc(alloc, selected orelse return error.IndexNotFound, .{});
+    defer alloc.free(config_json);
+
+    if (table.schema_json.len == 0) {
+        return try index_manager_mod.parseTextAnalysisForIndexConfig(alloc, config_json, null);
+    }
+    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, table.schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+    return try index_manager_mod.parseTextAnalysisForIndexConfig(alloc, config_json, runtime_schema);
+}
+
 fn loadTableIdentityNamespaceForGroup(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -10167,14 +10224,17 @@ fn applyProvisionedQueryAggregations(
 
     if (try tryApplyProvisionedAlgebraicDistributedAggregations(self, alloc, group_ids, table_name, aggregation_req, meta)) return;
 
-    const current_agg_stats = try collectProvisionedAggregationTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits);
+    var text_analysis = try loadTableAggregationTextAnalysis(alloc, self.catalog, table_name, aggregation_req.index_name);
+    defer introducer_mod.freeTextAnalysisConfig(alloc, text_analysis);
+    const current_agg_stats = try collectProvisionedAggregationTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits, &text_analysis);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, current_agg_stats);
-    const current_bg_stats = try collectProvisionedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits);
+    const current_bg_stats = try collectProvisionedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits, &text_analysis);
     defer db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, current_bg_stats);
     if (aggregationCanUseCurrentResult(req, result.*)) {
         return try applyAggregationResults(alloc, aggregation_req, result.*, .{
             .distributed_text_stats = current_agg_stats,
             .distributed_background_text_stats = current_bg_stats,
+            .text_analysis = &text_analysis,
         }, meta);
     }
 
@@ -10182,13 +10242,14 @@ fn applyProvisionedQueryAggregations(
     var full_result = try queryProvisionedAcrossGroups(self, alloc, group_ids, full_req, table_name, consistency);
     defer full_result.deinit();
     try requireCompleteAggregationFullResult(full_req, full_result, "provisioned-distributed");
-    const full_agg_stats = try collectProvisionedAggregationTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits);
+    const full_agg_stats = try collectProvisionedAggregationTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits, &text_analysis);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, full_agg_stats);
-    const full_bg_stats = try collectProvisionedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits);
+    const full_bg_stats = try collectProvisionedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits, &text_analysis);
     defer db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, full_bg_stats);
     return try applyAggregationResults(alloc, full_req, full_result, .{
         .distributed_text_stats = full_agg_stats,
         .distributed_background_text_stats = full_bg_stats,
+        .text_analysis = &text_analysis,
     }, meta);
 }
 
@@ -10355,14 +10416,17 @@ fn applyHostedProvisionedQueryAggregations(
 
     if (try tryApplyHostedAlgebraicDistributedAggregations(self, alloc, group_ids, table_name, aggregation_req, meta, consistency)) return;
 
-    const current_agg_stats = try collectHostedAggregationTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits, consistency);
+    var text_analysis = try loadTableAggregationTextAnalysis(alloc, self.catalog, table_name, aggregation_req.index_name);
+    defer introducer_mod.freeTextAnalysisConfig(alloc, text_analysis);
+    const current_agg_stats = try collectHostedAggregationTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits, &text_analysis, consistency);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, current_agg_stats);
-    const current_bg_stats = try collectHostedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits, consistency);
+    const current_bg_stats = try collectHostedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits, &text_analysis, consistency);
     defer db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, current_bg_stats);
     if (aggregationCanUseCurrentResult(req, result.*)) {
         return try applyAggregationResults(alloc, aggregation_req, result.*, .{
             .distributed_text_stats = current_agg_stats,
             .distributed_background_text_stats = current_bg_stats,
+            .text_analysis = &text_analysis,
         }, meta);
     }
 
@@ -10370,13 +10434,14 @@ fn applyHostedProvisionedQueryAggregations(
     var full_result = try queryHostedAcrossGroups(self, alloc, group_ids, full_req, table_name, consistency);
     defer full_result.deinit();
     try requireCompleteAggregationFullResult(full_req, full_result, "hosted-distributed");
-    const full_agg_stats = try collectHostedAggregationTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits, consistency);
+    const full_agg_stats = try collectHostedAggregationTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits, &text_analysis, consistency);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, full_agg_stats);
-    const full_bg_stats = try collectHostedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits, consistency);
+    const full_bg_stats = try collectHostedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits, &text_analysis, consistency);
     defer db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, full_bg_stats);
     return try applyAggregationResults(alloc, full_req, full_result, .{
         .distributed_text_stats = full_agg_stats,
         .distributed_background_text_stats = full_bg_stats,
+        .text_analysis = &text_analysis,
     }, meta);
 }
 
@@ -12166,6 +12231,7 @@ fn collectSignificantTermsFieldRequests(
     alloc: std.mem.Allocator,
     requests: []const db_mod.aggregations.SearchAggregationRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
 ) ![]OwnedTextStatsFieldRequest {
     var grouped = std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(void)){};
     defer {
@@ -12179,7 +12245,7 @@ fn collectSignificantTermsFieldRequests(
         grouped.deinit(alloc);
     }
 
-    try collectSignificantTermsFieldRequestsRecursive(alloc, &grouped, requests, hits);
+    try collectSignificantTermsFieldRequestsRecursive(alloc, &grouped, requests, hits, text_analysis);
     if (grouped.count() == 0) return &.{};
 
     const out = try alloc.alloc(OwnedTextStatsFieldRequest, grouped.count());
@@ -12211,13 +12277,14 @@ fn collectSignificantTermsBackgroundFieldRequests(
     alloc: std.mem.Allocator,
     requests: []const db_mod.aggregations.SearchAggregationRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
 ) ![]OwnedBackgroundTextStatsFieldRequest {
     var out = std.ArrayListUnmanaged(OwnedBackgroundTextStatsFieldRequest).empty;
     errdefer {
         for (out.items) |*item| item.deinit(alloc);
         out.deinit(alloc);
     }
-    try collectSignificantTermsBackgroundFieldRequestsRecursive(alloc, &out, requests, hits);
+    try collectSignificantTermsBackgroundFieldRequestsRecursive(alloc, &out, requests, hits, text_analysis);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -12226,16 +12293,19 @@ fn collectSignificantTermsBackgroundFieldRequestsRecursive(
     out: *std.ArrayListUnmanaged(OwnedBackgroundTextStatsFieldRequest),
     requests: []const db_mod.aggregations.SearchAggregationRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
 ) !void {
     for (requests) |request| {
         if (std.mem.eql(u8, request.type, "significant_terms") and request.background_query != null) {
+            const candidate_limit = try db_mod.aggregations.significantTermsCandidateLimit(@intCast(if (request.size > 0) request.size else 10));
             var seen_terms = std.StringHashMapUnmanaged(void){};
             defer {
                 var term_it = seen_terms.keyIterator();
                 while (term_it.next()) |term| alloc.free(term.*);
                 seen_terms.deinit(alloc);
             }
-            try collectSignificantTermsFromHits(alloc, hits, request.field, &seen_terms);
+            const analyzer = try tableAggregationAnalyzerForField(text_analysis, request.field);
+            try collectSignificantTermsFromHits(alloc, hits, request.field, analyzer, candidate_limit, &seen_terms);
             if (seen_terms.count() > 0) {
                 const terms = try alloc.alloc([]const u8, seen_terms.count());
                 var term_index: usize = 0;
@@ -12252,7 +12322,7 @@ fn collectSignificantTermsBackgroundFieldRequestsRecursive(
                 });
             }
         }
-        try collectSignificantTermsBackgroundFieldRequestsRecursive(alloc, out, request.aggregations, hits);
+        try collectSignificantTermsBackgroundFieldRequestsRecursive(alloc, out, request.aggregations, hits, text_analysis);
     }
 }
 
@@ -12278,17 +12348,20 @@ fn collectSignificantTermsFieldRequestsRecursive(
     grouped: *std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(void)),
     requests: []const db_mod.aggregations.SearchAggregationRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
 ) !void {
     for (requests) |request| {
         if (std.mem.eql(u8, request.type, "significant_terms") and request.background_query == null) {
+            const candidate_limit = try db_mod.aggregations.significantTermsCandidateLimit(@intCast(if (request.size > 0) request.size else 10));
             const gop = try grouped.getOrPut(alloc, request.field);
             if (!gop.found_existing) {
                 gop.key_ptr.* = try alloc.dupe(u8, request.field);
                 gop.value_ptr.* = .{};
             }
-            try collectSignificantTermsFromHits(alloc, hits, request.field, gop.value_ptr);
+            const analyzer = try tableAggregationAnalyzerForField(text_analysis, request.field);
+            try collectSignificantTermsFromHits(alloc, hits, request.field, analyzer, candidate_limit, gop.value_ptr);
         }
-        try collectSignificantTermsFieldRequestsRecursive(alloc, grouped, request.aggregations, hits);
+        try collectSignificantTermsFieldRequestsRecursive(alloc, grouped, request.aggregations, hits, text_analysis);
     }
 }
 
@@ -12296,33 +12369,41 @@ fn collectSignificantTermsFromHits(
     alloc: std.mem.Allocator,
     hits: []const db_mod.types.SearchHit,
     field: []const u8,
+    analyzer: *const @import("../search/analysis.zig").Analyzer,
+    candidate_limit: usize,
     seen_terms: *std.StringHashMapUnmanaged(void),
 ) !void {
-    for (hits) |hit| try collectSignificantTermsFromStoredAlloc(alloc, hit.stored_data orelse continue, field, seen_terms);
+    for (hits) |hit| try collectSignificantTermsFromStoredAlloc(alloc, hit.stored_data orelse continue, field, analyzer, candidate_limit, seen_terms);
 }
 
 fn collectSignificantTermsFromStoredAlloc(
     alloc: std.mem.Allocator,
     stored: []const u8,
     field: []const u8,
+    analyzer: *const @import("../search/analysis.zig").Analyzer,
+    candidate_limit: usize,
     seen_terms: *std.StringHashMapUnmanaged(void),
 ) !void {
     var parsed = (try parseJsonPathValueAlloc(alloc, stored, field)) orelse return;
     defer parsed.deinit();
-    try collectSignificantTermsFromValue(alloc, parsed.value, seen_terms);
+    try collectSignificantTermsFromValue(alloc, parsed.value, analyzer, candidate_limit, seen_terms);
 }
 
 fn collectSignificantTermsFromValue(
     alloc: std.mem.Allocator,
     value: std.json.Value,
+    analyzer: *const @import("../search/analysis.zig").Analyzer,
+    candidate_limit: usize,
     seen_terms: *std.StringHashMapUnmanaged(void),
 ) !void {
     switch (value) {
-        .array => |arr| for (arr.items) |item| try collectSignificantTermsFromValue(alloc, item, seen_terms),
+        .array => |arr| for (arr.items) |item| try collectSignificantTermsFromValue(alloc, item, analyzer, candidate_limit, seen_terms),
         .string => {
-            const tokens = try @import("../search/analysis.zig").default_analyzer.analyze(alloc, value.string);
+            const tokens = try analyzer.analyze(alloc, value.string);
             defer @import("../search/analysis.zig").Analyzer.freeTokens(alloc, tokens);
             for (tokens) |tok| {
+                if (!seen_terms.contains(tok.term) and seen_terms.count() >= candidate_limit)
+                    return error.QueryCandidateBudgetExceeded;
                 const entry = try seen_terms.getOrPut(alloc, tok.term);
                 if (entry.found_existing) continue;
                 entry.key_ptr.* = try alloc.dupe(u8, tok.term);
@@ -12330,6 +12411,23 @@ fn collectSignificantTermsFromValue(
         },
         else => {},
     }
+}
+
+fn tableAggregationAnalyzerForField(
+    cfg: *const introducer_mod.TextAnalysisConfig,
+    field: []const u8,
+) !*const @import("../search/analysis.zig").Analyzer {
+    var analyzer_name: ?[]const u8 = null;
+    for (cfg.field_analyzers) |item| {
+        if (!std.mem.eql(u8, item.field_name, field)) continue;
+        if (analyzer_name) |existing| {
+            if (!std.mem.eql(u8, existing, item.analyzer_name)) return error.InvalidTableIndexMetadata;
+        } else {
+            analyzer_name = item.analyzer_name;
+        }
+    }
+    return introducer_mod.resolveAnalyzerName(analyzer_name orelse "standard", cfg.*) orelse
+        error.InvalidTableIndexMetadata;
 }
 
 fn extractJsonValueAtPath(value: std.json.Value, path: []const u8) ?std.json.Value {
@@ -12825,12 +12923,13 @@ fn collectProvisionedAggregationTextStats(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
 ) ![]const distributed_stats_mod.TextFieldStats {
     if (group_ids.len <= 1 or req.aggregations_json.len == 0) return &.{};
     try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
     const requests = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
-    const field_requests = try collectSignificantTermsFieldRequests(alloc, requests, hits);
+    const field_requests = try collectSignificantTermsFieldRequests(alloc, requests, hits, text_analysis);
     defer {
         for (field_requests) |*item| item.deinit(alloc);
         if (field_requests.len > 0) alloc.free(field_requests);
@@ -12861,12 +12960,13 @@ fn collectProvisionedAggregationBackgroundTextStats(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
 ) ![]const db_mod.aggregations.DistributedBackgroundTextStats {
     if (group_ids.len <= 1 or req.aggregations_json.len == 0) return &.{};
     try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
     const requests = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
-    const field_requests = try collectSignificantTermsBackgroundFieldRequests(alloc, requests, hits);
+    const field_requests = try collectSignificantTermsBackgroundFieldRequests(alloc, requests, hits, text_analysis);
     defer {
         for (field_requests) |*item| item.deinit(alloc);
         if (field_requests.len > 0) alloc.free(field_requests);
@@ -12897,13 +12997,14 @@ fn collectHostedAggregationTextStats(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
     consistency: raft_mod.ReadConsistency,
 ) ![]const distributed_stats_mod.TextFieldStats {
     if (group_ids.len <= 1 or req.aggregations_json.len == 0) return &.{};
     try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
     const requests = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
-    const field_requests = try collectSignificantTermsFieldRequests(alloc, requests, hits);
+    const field_requests = try collectSignificantTermsFieldRequests(alloc, requests, hits, text_analysis);
     defer {
         for (field_requests) |*item| item.deinit(alloc);
         if (field_requests.len > 0) alloc.free(field_requests);
@@ -12939,13 +13040,14 @@ fn collectHostedAggregationBackgroundTextStats(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
     consistency: raft_mod.ReadConsistency,
 ) ![]const db_mod.aggregations.DistributedBackgroundTextStats {
     if (group_ids.len <= 1 or req.aggregations_json.len == 0) return &.{};
     try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
     const requests = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
-    const field_requests = try collectSignificantTermsBackgroundFieldRequests(alloc, requests, hits);
+    const field_requests = try collectSignificantTermsBackgroundFieldRequests(alloc, requests, hits, text_analysis);
     defer {
         for (field_requests) |*item| item.deinit(alloc);
         if (field_requests.len > 0) alloc.free(field_requests);
@@ -16831,11 +16933,12 @@ test "distributed table reads reject stale doc identity before multigroup fanout
         .id = try alloc.dupe(u8, "doc:a"),
         .stored_data = try alloc.dupe(u8, "{\"body\":\"alpha beta\"}"),
     };
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
     try std.testing.expect((try collectProvisionedAlgebraicDistributedPartials(&healthy_source, alloc, group_ids[0..], "docs", resolved_explicit_req, "alg", &.{}, .{
         .output = .{ .input = 0 },
     })) == null);
-    try std.testing.expectError(error.UnsupportedQueryRequest, collectProvisionedAggregationTextStats(&healthy_source, alloc, group_ids[0..], "docs", resolved_explicit_req, stats_hits));
-    try std.testing.expectError(error.UnsupportedQueryRequest, collectProvisionedAggregationBackgroundTextStats(&healthy_source, alloc, group_ids[0..], "docs", resolved_background_req, stats_hits));
+    try std.testing.expectError(error.UnsupportedQueryRequest, collectProvisionedAggregationTextStats(&healthy_source, alloc, group_ids[0..], "docs", resolved_explicit_req, stats_hits, &text_analysis));
+    try std.testing.expectError(error.UnsupportedQueryRequest, collectProvisionedAggregationBackgroundTextStats(&healthy_source, alloc, group_ids[0..], "docs", resolved_background_req, stats_hits, &text_analysis));
 
     const rebuild_required = [_]metadata_reconciler.MergedGroupStatus{
         .{ .group_id = 7001, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7001, .namespace_range_id = 7001, .allocated_ordinals = 1 } },
@@ -16850,10 +16953,10 @@ test "distributed table reads reject stale doc identity before multigroup fanout
     }, "docs"));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, collectProvisionedAggregationTextStats(&source, alloc, group_ids[0..], "docs", .{
         .aggregations_json = "unparsed because doc identity guard runs first",
-    }, &.{}));
+    }, &.{}, &text_analysis));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, collectProvisionedAggregationBackgroundTextStats(&source, alloc, group_ids[0..], "docs", .{
         .aggregations_json = "unparsed because doc identity guard runs first",
-    }, &.{}));
+    }, &.{}, &text_analysis));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, collectProvisionedAlgebraicDistributedPartials(&source, alloc, group_ids[0..], "docs", .{}, "alg", &.{}, .{
         .output = .{ .input = 0 },
     }));
@@ -19199,7 +19302,8 @@ test "collect significant terms field requests gathers unique field terms from h
         },
     };
 
-    const field_requests = try collectSignificantTermsFieldRequests(alloc, &requests, hits);
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const field_requests = try collectSignificantTermsFieldRequests(alloc, &requests, hits, &text_analysis);
     defer {
         for (field_requests) |*item| item.deinit(alloc);
         if (field_requests.len > 0) alloc.free(field_requests);
@@ -19220,6 +19324,50 @@ test "collect significant terms field requests gathers unique field terms from h
     try std.testing.expectEqual(@as(usize, 2), nested.terms.len);
     try std.testing.expect(std.mem.eql(u8, nested.terms[0], "beta") or std.mem.eql(u8, nested.terms[1], "beta"));
     try std.testing.expect(std.mem.eql(u8, nested.terms[0], "gamma") or std.mem.eql(u8, nested.terms[1], "gamma"));
+}
+
+test "distributed significant terms candidates use configured analyzers and bounded memory" {
+    const alloc = std.testing.allocator;
+    var text_analysis = try introducer_mod.parseTextAnalysisConfig(
+        alloc,
+        "{\"analysis_config\":{\"field_analyzers\":{\"body\":\"keyword\"}}}",
+    );
+    defer introducer_mod.freeTextAnalysisConfig(alloc, text_analysis);
+
+    const hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    defer {
+        hits[0].deinit(alloc);
+        alloc.free(hits);
+    }
+    hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .stored_data = try alloc.dupe(u8, "{\"body\":\"New York\"}"),
+    };
+    const requests = [_]db_mod.aggregations.SearchAggregationRequest{.{
+        .name = "sig_body",
+        .type = "significant_terms",
+        .field = "body",
+        .size = 1,
+    }};
+    const field_requests = try collectSignificantTermsFieldRequests(alloc, &requests, hits, &text_analysis);
+    defer {
+        for (field_requests) |*item| item.deinit(alloc);
+        if (field_requests.len != 0) alloc.free(field_requests);
+    }
+    try std.testing.expectEqual(@as(usize, 1), field_requests.len);
+    try std.testing.expectEqual(@as(usize, 1), field_requests[0].terms.len);
+    try std.testing.expectEqualStrings("New York", field_requests[0].terms[0]);
+
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |term| alloc.free(term.*);
+        seen.deinit(alloc);
+    }
+    try std.testing.expectError(
+        error.QueryCandidateBudgetExceeded,
+        collectSignificantTermsFromValue(alloc, .{ .string = "alpha beta" }, &@import("../search/analysis.zig").default_analyzer, 1, &seen),
+    );
 }
 
 test "hosted textStatsGroupLocal serves only the local group" {

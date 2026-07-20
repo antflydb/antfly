@@ -1585,7 +1585,7 @@ pub const HttpHandler = struct {
             }
 
             execution.plan.request.offset = 0;
-            execution.plan.request.limit = std.math.maxInt(usize);
+            execution.plan.request.limit = db_mod.aggregations.max_aggregation_source_hits + 1;
             execution.plan.request.count_only = false;
 
             var aggregation_stats = query_mod.QuerySearchExecutionStats{};
@@ -1597,6 +1597,8 @@ pub const HttpHandler = struct {
             );
         };
         defer if (source_hits.ptr != execution.hits.ptr) query_mod.freeSearchHits(self.alloc, source_hits);
+        if (source_hits.len > db_mod.aggregations.max_aggregation_source_hits)
+            return error.QueryCandidateBudgetExceeded;
 
         var ctx_owned = try @This().collectServerlessAggregationContextAlloc(
             self.alloc,
