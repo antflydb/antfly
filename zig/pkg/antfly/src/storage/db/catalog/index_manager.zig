@@ -42,6 +42,7 @@ const lsm_backend_mod = @import("../../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const docstore_mod = @import("../../docstore.zig");
 const schema_mod = @import("../../schema.zig");
+const analysis_mod = @import("../../../search/analysis.zig");
 const ttl_mod = @import("../../ttl.zig");
 const lmdb = @import("../../lmdb.zig");
 const mapper = @import("../document_mapper.zig");
@@ -5336,6 +5337,12 @@ pub const IndexManager = struct {
 
         if (self.text_indexes.items.len == 1) return &self.text_indexes.items[0];
         return null;
+    }
+
+    pub fn textAnalyzerForField(self: *IndexManager, name: ?[]const u8, field: []const u8) ?*const analysis_mod.Analyzer {
+        const entry = self.textIndexEntry(name) orelse return null;
+        const analyzer_name = textFieldAnalyzerName(entry, field) orelse return null;
+        return introducer_mod.resolveAnalyzerName(analyzer_name, entry.text_analysis);
     }
 
     pub fn observedDynamicFieldCapabilitiesAlloc(

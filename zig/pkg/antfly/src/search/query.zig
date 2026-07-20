@@ -1612,6 +1612,66 @@ pub fn executeFilter(
     return try alloc.dupe(u32, all_ids.items);
 }
 
+/// Execute a filter into one global bitmap without first materializing an
+/// intermediate array of document IDs.
+pub fn executeFilterBitmap(
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    filter: Filter,
+) !roaring.RoaringBitmap {
+    var result = roaring.RoaringBitmap.init(alloc);
+    errdefer result.deinit();
+
+    var doc_offset: u32 = 0;
+    var has_result = false;
+    for (snap.segments) |*seg| {
+        var local = try filter.executeWithOffset(alloc, seg, doc_offset);
+        defer local.deinit();
+        if (seg.shared.deleted) |d| local.andNotWith(&d);
+
+        const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch
+            return error.CountOverflow;
+        var shifted = try local.addOffset(doc_offset);
+        defer shifted.deinit();
+        if (!has_result) {
+            result.deinit();
+            result = shifted;
+            shifted = roaring.RoaringBitmap.init(alloc);
+            has_result = true;
+        } else {
+            try result.orWith(&shifted);
+        }
+        doc_offset = next_offset;
+    }
+    return result;
+}
+
+/// Count filter matches that also occur in a global document bitmap. Memory is
+/// bounded by one segment posting bitmap rather than global posting cardinality.
+pub fn countFilterIntersection(
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    filter: Filter,
+    global_docs: *const roaring.RoaringBitmap,
+) !usize {
+    var total: usize = 0;
+    var doc_offset: u32 = 0;
+    for (snap.segments) |*seg| {
+        var local = try filter.executeWithOffset(alloc, seg, doc_offset);
+        defer local.deinit();
+        if (seg.shared.deleted) |d| local.andNotWith(&d);
+
+        const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch
+            return error.CountOverflow;
+        var shifted = try local.addOffset(doc_offset);
+        defer shifted.deinit();
+        shifted.andWith(global_docs);
+        total = std.math.add(usize, total, shifted.cardinality()) catch return error.CountOverflow;
+        doc_offset = next_offset;
+    }
+    return total;
+}
+
 /// Count a filter across all segments without materializing matching document IDs.
 ///
 /// The filter implementation still builds its per-segment bitmap, which is also
@@ -1984,6 +2044,17 @@ test "multi-segment filter execution" {
     try testing.expectEqual(@as(u32, 0), results[0]);
     try testing.expectEqual(@as(u32, 2), results[1]);
     try testing.expectEqual(@as(usize, 2), try countFilter(alloc, snap, filter));
+
+    var bitmap = try executeFilterBitmap(alloc, snap, filter);
+    defer bitmap.deinit();
+    try testing.expectEqual(@as(usize, 2), bitmap.cardinality());
+    try testing.expect(bitmap.contains(0));
+    try testing.expect(bitmap.contains(2));
+
+    var intersection = roaring.RoaringBitmap.init(alloc);
+    defer intersection.deinit();
+    try intersection.add(2);
+    try testing.expectEqual(@as(usize, 1), try countFilterIntersection(alloc, snap, filter, &intersection));
 }
 
 test "fuzzy filter finds similar terms" {

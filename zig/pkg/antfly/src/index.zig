@@ -649,6 +649,19 @@ pub const IndexSnapshot = struct {
         return query_mod.executeFilter(alloc, self, filter);
     }
 
+    pub fn executeFilterBitmap(self: *const IndexSnapshot, alloc: Allocator, filter: query_mod.Filter) !roaring.RoaringBitmap {
+        return query_mod.executeFilterBitmap(alloc, self, filter);
+    }
+
+    pub fn countFilterIntersection(
+        self: *const IndexSnapshot,
+        alloc: Allocator,
+        filter: query_mod.Filter,
+        global_docs: *const roaring.RoaringBitmap,
+    ) !usize {
+        return query_mod.countFilterIntersection(alloc, self, filter, global_docs);
+    }
+
     /// Count filter matches without materializing global document IDs.
     pub fn countFilter(self: *const IndexSnapshot, alloc: Allocator, filter: query_mod.Filter) !usize {
         return query_mod.countFilter(alloc, self, filter);

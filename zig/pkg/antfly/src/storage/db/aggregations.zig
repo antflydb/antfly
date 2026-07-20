@@ -29,6 +29,8 @@ const doc_identity = @import("doc_identity.zig");
 const doc_set = @import("doc_set.zig");
 const roaring = @import("../../encoding/roaring.zig");
 
+const max_significant_terms_candidates: usize = 100_000;
+
 pub const NumericRangeRequest = struct {
     name: []const u8 = "",
     start: ?f64 = null,
@@ -6677,11 +6679,16 @@ fn computeSignificantTermsAggregation(
 ) anyerror!SearchAggregationResult {
     if (request.field.len == 0) return error.InvalidAggregation;
     const manager = ctx.index_manager;
-    const text_index = if (manager) |mgr| mgr.textIndex(ctx.full_text_index_name) else null;
-    const snapshot = if (text_index) |index| index.snapshot() else null;
+    const text_entry = if (manager) |mgr| mgr.textIndexEntry(ctx.full_text_index_name) else null;
+    const snapshot = if (text_entry) |entry| entry.persistent.acquireSnapshot() else null;
+    defer if (snapshot) |snap| snap.release();
+    const field_analyzer = if (manager) |mgr|
+        mgr.textAnalyzerForField(ctx.full_text_index_name, request.field) orelse &analysis_mod.default_analyzer
+    else
+        &analysis_mod.default_analyzer;
     const distributed_stats = findDistributedTextStats(ctx.distributed_text_stats, request.field);
     const distributed_background_stats = findDistributedBackgroundTextStats(ctx.distributed_background_text_stats, request.name, request.field);
-    if (text_index == null and distributed_stats == null and distributed_background_stats == null) return error.UnsupportedAggregation;
+    if (text_entry == null and distributed_stats == null and distributed_background_stats == null) return error.UnsupportedAggregation;
 
     var foreground = std.StringHashMap(i64).init(alloc);
     defer {
@@ -6716,6 +6723,8 @@ fn computeSignificantTermsAggregation(
         if (distributed_background_stats) |stats| {
             background_doc_count = @intCast(stats.background_doc_count);
             for (stats.term_doc_freqs) |term| {
+                if (!background_counts.contains(term.term) and background_counts.count() >= max_significant_terms_candidates)
+                    return error.QueryCandidateBudgetExceeded;
                 const bg_entry = try background_counts.getOrPut(term.term);
                 if (bg_entry.found_existing) {
                     bg_entry.value_ptr.* = @intCast(term.doc_freq);
@@ -6739,7 +6748,13 @@ fn computeSignificantTermsAggregation(
             while (it.next()) |key| alloc.free(key.*);
             seen_terms.deinit();
         }
-        try collectSignificantTermsFromValue(alloc, value, &seen_terms);
+        try collectSignificantTermsFromValue(
+            alloc,
+            value,
+            field_analyzer,
+            max_significant_terms_candidates,
+            &seen_terms,
+        );
 
         var it = seen_terms.keyIterator();
         while (it.next()) |term_ptr| {
@@ -6747,6 +6762,8 @@ fn computeSignificantTermsAggregation(
             if (request.term_prefix.len > 0 and !std.mem.startsWith(u8, term, request.term_prefix)) continue;
             if (request.term_pattern.len > 0 and !(try regexMatches(alloc, request.term_pattern, term))) continue;
 
+            if (!foreground.contains(term) and foreground.count() >= max_significant_terms_candidates)
+                return error.QueryCandidateBudgetExceeded;
             const count_entry = try foreground.getOrPut(term);
             if (count_entry.found_existing) {
                 count_entry.value_ptr.* += 1;
@@ -6764,30 +6781,27 @@ fn computeSignificantTermsAggregation(
     if (request.background_query) |background_query| {
         if (distributed_background_stats == null) {
             const snap = snapshot orelse return error.UnsupportedAggregation;
-            var background_result = try executeBackgroundQuery(alloc, snap, background_query);
-            defer background_result.deinit();
-            background_doc_count = @intCast(background_result.total_hits);
-
-            var background_docs = roaring.RoaringBitmap.init(alloc);
+            var background_docs = try executeBackgroundQueryBitmap(
+                alloc,
+                snap,
+                background_query,
+                manager.?,
+                ctx.full_text_index_name,
+            );
             defer background_docs.deinit();
-            for (background_result.hits) |hit| try background_docs.add(hit.doc_id);
+            background_doc_count = @intCast(background_docs.cardinality());
 
             var foreground_it = foreground.keyIterator();
             while (foreground_it.next()) |term_ptr| {
                 const term = term_ptr.*;
-                const doc_nums = try snap.executeFilter(alloc, .{ .term = .{
+                if ((foreground.get(term) orelse 0) < min_doc_count) continue;
+                const count = try snap.countFilterIntersection(alloc, .{ .term = .{
                     .field = request.field,
                     .term = term,
-                } });
-                defer alloc.free(doc_nums);
-
-                var count: i64 = 0;
-                for (doc_nums) |doc_num| {
-                    if (background_docs.contains(doc_num)) count += 1;
-                }
+                } }, &background_docs);
                 const bg_entry = try background_counts.getOrPut(term);
                 if (!bg_entry.found_existing) bg_entry.key_ptr.* = try alloc.dupe(u8, term);
-                bg_entry.value_ptr.* = count;
+                bg_entry.value_ptr.* = @intCast(count);
             }
         }
     }
@@ -6910,27 +6924,29 @@ fn findDistributedBackgroundTextStats(
     return null;
 }
 
-fn executeBackgroundQuery(
+fn executeBackgroundQueryBitmap(
     alloc: Allocator,
     snapshot: *const @import("../../index.zig").IndexSnapshot,
     query: BackgroundQuery,
-) !search_mod.SearchResult {
-    const request: search_mod.SearchRequest = .{
-        .query = switch (query) {
-            .match_all => .{ .match_all = {} },
-            .match => |match| .{ .match = .{
-                .field = match.field,
-                .text = match.text,
-            } },
-            .term => |term| .{ .term = .{
-                .field = term.field,
-                .term = term.term,
-            } },
-        },
-        .k = snapshot.global_doc_count,
-        .include_stored = false,
+    manager: *index_manager_mod.IndexManager,
+    index_name: ?[]const u8,
+) !roaring.RoaringBitmap {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const search_query: search_mod.SearchQuery = switch (query) {
+        .match_all => .{ .match_all = {} },
+        .match => |match| .{ .match = .{
+            .field = match.field,
+            .text = match.text,
+            .analyzer = manager.textAnalyzerForField(index_name, match.field) orelse &analysis_mod.default_analyzer,
+        } },
+        .term => |term| .{ .term = .{
+            .field = term.field,
+            .term = term.term,
+        } },
     };
-    return search_mod.execute(alloc, snapshot, request);
+    const filter = try search_mod.searchQueryToFilterArena(arena.allocator(), search_query);
+    return try snapshot.executeFilterBitmap(alloc, filter);
 }
 
 fn computeHistogramAggregation(
@@ -7889,14 +7905,24 @@ fn calculatePercentage(fg_count: i64, fg_total: i64, bg_count: i64, bg_total: i6
 fn collectSignificantTermsFromValue(
     alloc: Allocator,
     value: std.json.Value,
+    analyzer: *const analysis_mod.Analyzer,
+    candidate_limit: usize,
     seen_terms: *std.StringHashMap(void),
 ) !void {
     switch (value) {
-        .array => |arr| for (arr.items) |item| try collectSignificantTermsFromValue(alloc, item, seen_terms),
+        .array => |arr| for (arr.items) |item| try collectSignificantTermsFromValue(
+            alloc,
+            item,
+            analyzer,
+            candidate_limit,
+            seen_terms,
+        ),
         .string => {
-            const tokens = try analysis_mod.default_analyzer.analyze(alloc, value.string);
+            const tokens = try analyzer.analyze(alloc, value.string);
             defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
             for (tokens) |tok| {
+                if (!seen_terms.contains(tok.term) and seen_terms.count() >= candidate_limit)
+                    return error.QueryCandidateBudgetExceeded;
                 const entry = try seen_terms.getOrPut(tok.term);
                 if (entry.found_existing) continue;
                 entry.key_ptr.* = try alloc.dupe(u8, tok.term);
@@ -8120,6 +8146,90 @@ test "significant_terms local background stats use postings without stored index
     try std.testing.expectEqual(@as(i64, 2), aggregations[0].buckets[0].bg_count.?);
     try std.testing.expectEqualStrings("\"beta\"", aggregations[0].buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 1), aggregations[0].buckets[1].bg_count.?);
+}
+
+test "significant_terms uses the configured field analyzer for foreground and background" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/configured-analyzer", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try index_manager_mod.IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{\"analysis_config\":{\"field_analyzers\":{\"body\":\"keyword\"}}}",
+    }});
+
+    const writes = [_]types.BatchWrite{
+        .{ .key = "doc:a", .value = "{\"body\":\"New York\"}" },
+        .{ .key = "doc:b", .value = "{\"body\":\"Boston\"}" },
+    };
+    try manager.indexBatch(&store, &writes);
+
+    const hits = try alloc.alloc(types.SearchHit, writes.len);
+    defer {
+        for (hits) |*hit| hit.deinit(alloc);
+        alloc.free(hits);
+    }
+    for (writes, 0..) |write, i| {
+        hits[i] = .{
+            .id = try alloc.dupe(u8, write.key),
+            .stored_data = try alloc.dupe(u8, write.value),
+        };
+    }
+
+    const requests = [_]SearchAggregationRequest{.{
+        .name = "sig_terms",
+        .type = "significant_terms",
+        .field = "body",
+        .size = 10,
+        .background_query = .{ .match_all = {} },
+    }};
+    const aggregations = try computeSearchAggregations(alloc, &requests, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = @intCast(hits.len),
+    }, .{
+        .index_manager = &manager,
+        .full_text_index_name = "full_text_index_v0",
+    });
+    defer deinitResults(alloc, aggregations);
+
+    try std.testing.expectEqual(@as(usize, 2), aggregations[0].buckets.len);
+    try std.testing.expectEqualStrings("\"Boston\"", aggregations[0].buckets[0].key_json);
+    try std.testing.expectEqualStrings("\"New York\"", aggregations[0].buckets[1].key_json);
+    try std.testing.expectEqual(@as(i64, 1), aggregations[0].buckets[0].bg_count.?);
+    try std.testing.expectEqual(@as(i64, 1), aggregations[0].buckets[1].bg_count.?);
+}
+
+test "significant_terms rejects candidate growth at the admission boundary" {
+    const alloc = std.testing.allocator;
+    var seen_terms = std.StringHashMap(void).init(alloc);
+    defer {
+        var it = seen_terms.keyIterator();
+        while (it.next()) |term| alloc.free(term.*);
+        seen_terms.deinit();
+    }
+
+    try std.testing.expectError(
+        error.QueryCandidateBudgetExceeded,
+        collectSignificantTermsFromValue(
+            alloc,
+            .{ .string = "one two" },
+            &analysis_mod.default_analyzer,
+            1,
+            &seen_terms,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), seen_terms.count());
 }
 
 test "algebraic distributed partials build exact terms response" {
