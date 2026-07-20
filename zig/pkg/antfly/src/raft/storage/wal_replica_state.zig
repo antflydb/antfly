@@ -23,6 +23,7 @@ const storage_iface = raft_engine.runtime.storage_iface;
 const magic: u32 = 0x41524654; // ARFT
 const version: u32 = 2;
 const delta_magic: u32 = 0x4152444c; // ARDL
+const legacy_delta_version: u32 = 1;
 const delta_version: u32 = 2;
 const applied_watermark_magic: u32 = 0x4152574d; // ARWM
 const applied_watermark_version: u32 = 1;
@@ -614,7 +615,7 @@ pub const WalReplicaState = struct {
         var cursor: usize = 0;
         if (try readInt(u32, bytes, &cursor) != delta_magic) return error.InvalidReplicaState;
         const file_version = try readInt(u32, bytes, &cursor);
-        if (file_version != delta_version) return error.UnsupportedReplicaStateVersion;
+        if (file_version != legacy_delta_version and file_version != delta_version) return error.UnsupportedReplicaStateVersion;
 
         const kind_tag = if (cursor < bytes.len) bytes[cursor] else return error.InvalidReplicaState;
         cursor += 1;
@@ -652,7 +653,7 @@ pub const WalReplicaState = struct {
                     for (entries) |*entry| entry.* = try decodeEntry(self.alloc, bytes, &cursor);
                     try self.store.append(entries);
                 }
-                if (try readBool(bytes, &cursor)) {
+                if (file_version >= 2 and try readBool(bytes, &cursor)) {
                     var conf_state = try decodeConfState(self.alloc, bytes, &cursor);
                     defer conf_state.deinit(self.alloc);
                     try self.store.setConfState(conf_state);
@@ -826,6 +827,41 @@ pub const WalReplicaState = struct {
 
 test "wal replica state defaults to lsm backend" {
     try std.testing.expectEqual(wal_mod.StorageBackend.lsm, ((WalReplicaStateConfig{}).wal).resolvedBackend());
+}
+
+test "wal replica state replays version 1 ready deltas" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-v1-delta", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(std.testing.allocator, root, 176, 3);
+    defer layout.deinit(std.testing.allocator);
+
+    var state = try WalReplicaState.init(std.testing.allocator, layout, .{});
+    defer state.deinit();
+
+    var delta = std.ArrayListUnmanaged(u8).empty;
+    defer delta.deinit(std.testing.allocator);
+    try WalReplicaState.appendInt(u32, std.testing.allocator, &delta, delta_magic);
+    try WalReplicaState.appendInt(u32, std.testing.allocator, &delta, legacy_delta_version);
+    try delta.append(std.testing.allocator, @intFromEnum(DeltaRecordKind.ready));
+    try WalReplicaState.appendBool(std.testing.allocator, &delta, true);
+    try WalReplicaState.appendInt(u64, std.testing.allocator, &delta, 2);
+    try WalReplicaState.appendBool(std.testing.allocator, &delta, true);
+    try WalReplicaState.appendInt(u64, std.testing.allocator, &delta, 3);
+    try WalReplicaState.appendInt(u64, std.testing.allocator, &delta, 1);
+    try WalReplicaState.appendBool(std.testing.allocator, &delta, false);
+    try WalReplicaState.appendInt(u32, std.testing.allocator, &delta, 0);
+
+    try state.decodeDeltaIntoStore(delta.items);
+
+    var initial = try state.storage().initialState(std.testing.allocator);
+    defer initial.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 2), initial.hard_state.current_term);
+    try std.testing.expectEqual(@as(?u64, 3), initial.hard_state.voted_for);
+    try std.testing.expectEqual(@as(u64, 1), initial.hard_state.commit_index);
 }
 
 test "wal replica state persists ready updates across reopen" {

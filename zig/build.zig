@@ -1752,6 +1752,13 @@ pub fn build(b: *std.Build) void {
     });
     antfly_imports.configure(b, data_storage_test_mod, true, true);
 
+    const wal_replica_state_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/wal_replica_state_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, wal_replica_state_test_mod, true, true);
+
     const usermgr_storage_lib_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
         .target = target,
@@ -3208,6 +3215,12 @@ pub fn build(b: *std.Build) void {
         .filters = selectTestFilters(b, &.{"raft."}),
     });
     const run_raft_unit_tests = b.addRunArtifact(raft_unit_tests);
+
+    const wal_v1_compat_tests = b.addTest(.{
+        .root_module = wal_replica_state_test_mod,
+        .filters = &.{"wal replica state replays version 1 ready deltas"},
+    });
+    const run_wal_v1_compat_tests = b.addRunArtifact(wal_v1_compat_tests);
 
     const raft_transport_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -5275,11 +5288,13 @@ pub fn build(b: *std.Build) void {
 
     const raft_test_step = b.step("raft-test", "Run raft integration unit tests");
     raft_test_step.dependOn(&run_raft_unit_tests.step);
+    raft_test_step.dependOn(&run_wal_v1_compat_tests.step);
 
     const raft_transport_test_step = b.step("raft-transport-test", "Run raft transport unit tests");
     raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
 
     unit_test_step.dependOn(&run_lib_regex_tests.step);
+    unit_test_step.dependOn(&run_wal_v1_compat_tests.step);
     unit_test_step.dependOn(&run_lib_jsonschema_tests.step);
     unit_test_step.dependOn(&run_lib_generating_tests.step);
     unit_test_step.dependOn(&run_lib_embeddings_tests.step);
